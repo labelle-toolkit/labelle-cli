@@ -2,7 +2,7 @@
 //
 // Handles resolving labelle-engine versions from:
 // - "latest" -> fetches latest release from GitHub
-// - "0.33.0" -> specific version
+// - "0.33.0" -> specific version (validated against releases)
 // - Local path (for development)
 
 const std = @import("std");
@@ -15,15 +15,125 @@ pub const ResolvedVersion = struct {
     allocated: bool,
 };
 
+pub const VersionError = error{
+    NoStdout,
+    InvalidResponse,
+    FetchFailed,
+    EmptyHash,
+    VersionNotFound,
+    NoReleasesFound,
+};
+
 /// Resolve a version string to a concrete version.
 /// "latest" fetches from GitHub API.
-/// Specific versions are returned as-is.
-pub fn resolveVersion(allocator: std.mem.Allocator, version: []const u8) !ResolvedVersion {
+/// Specific versions are validated against available releases.
+pub fn resolveVersion(allocator: std.mem.Allocator, version: []const u8, validate: bool) !ResolvedVersion {
     if (std.mem.eql(u8, version, "latest")) {
         const latest = try getLatestVersion(allocator);
         return .{ .version = latest, .allocated = true };
     }
+
+    // Validate that the version exists in releases
+    if (validate) {
+        const versions = try getAvailableVersions(allocator);
+        defer {
+            for (versions) |v| allocator.free(v);
+            allocator.free(versions);
+        }
+
+        var found = false;
+        for (versions) |v| {
+            if (std.mem.eql(u8, v, version)) {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            std.debug.print("Error: Version '{s}' not found in releases.\n", .{version});
+            std.debug.print("\nAvailable versions:\n", .{});
+            for (versions, 0..) |v, i| {
+                if (i >= 10) {
+                    std.debug.print("  ... and {d} more\n", .{versions.len - 10});
+                    break;
+                }
+                std.debug.print("  - {s}\n", .{v});
+            }
+            return VersionError.VersionNotFound;
+        }
+    }
+
     return .{ .version = version, .allocated = false };
+}
+
+/// Fetch all available release versions from GitHub.
+/// Returns versions sorted by newest first (as returned by GitHub API).
+pub fn getAvailableVersions(allocator: std.mem.Allocator) ![][]const u8 {
+    // Use curl to fetch from GitHub API
+    var child = std.process.Child.init(&.{
+        "curl",
+        "-s",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        github_releases_url,
+    }, allocator);
+
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    const stdout = child.stdout orelse return VersionError.NoStdout;
+    const output = try stdout.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(output);
+
+    _ = try child.wait();
+
+    // Parse JSON to extract all tag_name values
+    var versions: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (versions.items) |v| allocator.free(v);
+        versions.deinit(allocator);
+    }
+
+    const marker = "\"tag_name\":";
+    var pos: usize = 0;
+
+    while (std.mem.indexOfPos(u8, output, pos, marker)) |tag_start| {
+        const after_colon = tag_start + marker.len;
+        const quote_start = std.mem.indexOfPos(u8, output, after_colon, "\"") orelse break;
+        const quote_end = std.mem.indexOfPos(u8, output, quote_start + 1, "\"") orelse break;
+
+        var version = output[quote_start + 1 .. quote_end];
+        // Strip 'v' prefix if present
+        if (version.len > 0 and version[0] == 'v') {
+            version = version[1..];
+        }
+
+        try versions.append(allocator, try allocator.dupe(u8, version));
+        pos = quote_end + 1;
+    }
+
+    if (versions.items.len == 0) {
+        return VersionError.NoReleasesFound;
+    }
+
+    return try versions.toOwnedSlice(allocator);
+}
+
+/// Print all available versions
+pub fn printAvailableVersions(allocator: std.mem.Allocator) !void {
+    const versions = try getAvailableVersions(allocator);
+    defer {
+        for (versions) |v| allocator.free(v);
+        allocator.free(versions);
+    }
+
+    std.debug.print("Available labelle-engine versions:\n", .{});
+    for (versions) |v| {
+        std.debug.print("  {s}\n", .{v});
+    }
+    std.debug.print("\nTotal: {d} versions\n", .{versions.len});
 }
 
 /// Fetch the latest release version from GitHub.
@@ -42,7 +152,7 @@ pub fn getLatestVersion(allocator: std.mem.Allocator) ![]const u8 {
 
     try child.spawn();
 
-    const stdout = child.stdout orelse return error.NoStdout;
+    const stdout = child.stdout orelse return VersionError.NoStdout;
     const output = try stdout.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(output);
 
@@ -52,14 +162,14 @@ pub fn getLatestVersion(allocator: std.mem.Allocator) ![]const u8 {
     // Simple parsing - look for "tag_name": "vX.Y.Z"
     // JSON format: "tag_name": "v0.33.0"
     const marker = "\"tag_name\":";
-    const tag_start = std.mem.indexOf(u8, output, marker) orelse return error.InvalidResponse;
+    const tag_start = std.mem.indexOf(u8, output, marker) orelse return VersionError.InvalidResponse;
 
     // Find the opening quote of the value (skip whitespace)
     const after_colon = tag_start + marker.len;
-    const quote_start = std.mem.indexOfPos(u8, output, after_colon, "\"") orelse return error.InvalidResponse;
+    const quote_start = std.mem.indexOfPos(u8, output, after_colon, "\"") orelse return VersionError.InvalidResponse;
 
     // Find the closing quote
-    const quote_end = std.mem.indexOfPos(u8, output, quote_start + 1, "\"") orelse return error.InvalidResponse;
+    const quote_end = std.mem.indexOfPos(u8, output, quote_start + 1, "\"") orelse return VersionError.InvalidResponse;
 
     var version = output[quote_start + 1 .. quote_end];
     // Strip 'v' prefix if present
@@ -90,19 +200,19 @@ fn fetchPackageHash(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
 
     try child.spawn();
 
-    const stdout = child.stdout orelse return error.NoStdout;
+    const stdout = child.stdout orelse return VersionError.NoStdout;
     const output = try stdout.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(output);
 
     const result = try child.wait();
     if (result.Exited != 0) {
-        return error.FetchFailed;
+        return VersionError.FetchFailed;
     }
 
     // stdout contains the hash (trimmed)
     const hash = std.mem.trim(u8, output, &std.ascii.whitespace);
     if (hash.len == 0) {
-        return error.EmptyHash;
+        return VersionError.EmptyHash;
     }
 
     return try allocator.dupe(u8, hash);
@@ -195,8 +305,13 @@ pub fn runEngineGenerator(allocator: std.mem.Allocator, version: []const u8, pro
     std.debug.print("Fetching labelle-engine {s}...\n", .{version});
 
     const hash = fetchPackageHash(allocator, engine_url) catch |err| {
-        std.debug.print("Error fetching engine: {}\n", .{err});
-        return error.FetchFailed;
+        if (err == VersionError.FetchFailed) {
+            std.debug.print("Error: Could not fetch engine version '{s}'.\n", .{version});
+            std.debug.print("The version tag may not exist. Use 'labelle upgrade --list' to see available versions.\n", .{});
+        } else {
+            std.debug.print("Error fetching engine: {}\n", .{err});
+        }
+        return VersionError.FetchFailed;
     };
     defer allocator.free(hash);
 
@@ -235,8 +350,8 @@ fn isVersionCached(allocator: std.mem.Allocator, version: []const u8) !bool {
     return true;
 }
 
-test "resolveVersion returns version as-is for non-latest" {
-    const resolved = try resolveVersion(std.testing.allocator, "0.33.0");
+test "resolveVersion returns version as-is for non-latest without validation" {
+    const resolved = try resolveVersion(std.testing.allocator, "0.33.0", false);
     try std.testing.expectEqualStrings("0.33.0", resolved.version);
     try std.testing.expect(!resolved.allocated);
 }

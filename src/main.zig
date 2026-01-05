@@ -50,6 +50,7 @@ const Options = struct {
     upgrade_check_only: bool = false,
     upgrade_version: ?[]const u8 = null,
     upgrade_force: bool = false,
+    upgrade_list: bool = false,
 };
 
 pub fn main() !void {
@@ -119,6 +120,8 @@ fn parseArgs(args: []const []const u8) Options {
             options.fetch_hashes = false;
         } else if (std.mem.eql(u8, arg, "--check")) {
             options.upgrade_check_only = true;
+        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
+            options.upgrade_list = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
             options.upgrade_force = true;
         } else if (std.mem.startsWith(u8, arg, "--engine=")) {
@@ -151,9 +154,14 @@ fn runInit(allocator: std.mem.Allocator, options: Options) !void {
 
     std.debug.print("Creating new labelle project: {s}\n", .{project_name});
 
-    // Resolve engine version (default to latest)
+    // Resolve engine version (default to latest, validate against releases)
     const engine_version = options.engine_version orelse "latest";
-    const resolved = try engine_resolver.resolveVersion(allocator, engine_version);
+    const resolved = engine_resolver.resolveVersion(allocator, engine_version, true) catch |err| {
+        if (err == engine_resolver.VersionError.VersionNotFound) {
+            return; // Error already printed
+        }
+        return err;
+    };
     defer if (resolved.allocated) allocator.free(resolved.version);
 
     std.debug.print("Using labelle-engine {s}\n", .{resolved.version});
@@ -224,13 +232,23 @@ fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
     defer config.deinit(allocator);
 
     const engine_version = config.engine_version orelse "latest";
-    const resolved = try engine_resolver.resolveVersion(allocator, engine_version);
+    const resolved = engine_resolver.resolveVersion(allocator, engine_version, true) catch |err| {
+        if (err == engine_resolver.VersionError.VersionNotFound) {
+            return; // Error already printed
+        }
+        return err;
+    };
     defer if (resolved.allocated) allocator.free(resolved.version);
 
     std.debug.print("Using labelle-engine {s}\n", .{resolved.version});
 
     // Fetch engine and run its generator
-    try engine_resolver.runEngineGenerator(allocator, resolved.version, ".");
+    engine_resolver.runEngineGenerator(allocator, resolved.version, ".") catch |err| {
+        if (err == engine_resolver.VersionError.FetchFailed) {
+            return; // Error already printed
+        }
+        return err;
+    };
 }
 
 fn runBuild(allocator: std.mem.Allocator, options: Options) !void {
@@ -293,6 +311,12 @@ fn runUpdate(allocator: std.mem.Allocator, options: Options) !void {
 }
 
 fn runUpgrade(allocator: std.mem.Allocator, options: Options) !void {
+    // Handle --list flag
+    if (options.upgrade_list) {
+        try engine_resolver.printAvailableVersions(allocator);
+        return;
+    }
+
     // Read current project config
     const config = project_config.readProjectConfig(allocator, ".") catch |err| {
         std.debug.print("Error reading project.labelle: {}\n", .{err});
@@ -317,7 +341,18 @@ fn runUpgrade(allocator: std.mem.Allocator, options: Options) !void {
         return;
     }
 
+    // Validate target version exists
     const target_version = options.upgrade_version orelse latest;
+    if (options.upgrade_version != null) {
+        // Validate the specified version
+        _ = engine_resolver.resolveVersion(allocator, target_version, true) catch |err| {
+            if (err == engine_resolver.VersionError.VersionNotFound) {
+                return; // Error already printed
+            }
+            return err;
+        };
+    }
+
     std.debug.print("Upgrading from {s} to {s}...\n", .{ current_version, target_version });
 
     // Update project.labelle with new version
@@ -390,6 +425,7 @@ fn printCommandHelp(command: Command) void {
             \\Usage: labelle upgrade [options]
             \\
             \\Options:
+            \\  --list, -l      List all available versions
             \\  --check         Only check for updates, don't upgrade
             \\  --version=VER   Upgrade to specific version
             \\  --force         Force upgrade even if on same version
