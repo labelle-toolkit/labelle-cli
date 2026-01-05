@@ -303,8 +303,9 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
 fn runUpdate(allocator: std.mem.Allocator, options: Options) !void {
     std.debug.print("Clearing caches and regenerating...\n", .{});
 
-    // Clear .labelle directory
+    // Clear generated and bootstrap directories
     std.fs.cwd().deleteTree(".labelle") catch {};
+    std.fs.cwd().deleteTree(".labelle-bootstrap") catch {};
 
     // Regenerate
     try runGenerate(allocator, options);
