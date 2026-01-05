@@ -61,6 +61,38 @@ fn extractStringField(content: []const u8, field: []const u8) ?[]const u8 {
     return content[quote_start + 1 .. quote_end];
 }
 
+/// Update the engine_version field in project.labelle
+pub fn updateEngineVersion(allocator: std.mem.Allocator, project_path: []const u8, new_version: []const u8) !void {
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/project.labelle", .{project_path});
+    defer allocator.free(file_path);
+
+    // Read current content
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    file.close();
+    defer allocator.free(content);
+
+    // Find and replace engine_version value
+    const field = ".engine_version";
+    const field_pos = std.mem.indexOf(u8, content, field) orelse return error.FieldNotFound;
+    const eq_pos = std.mem.indexOfPos(u8, content, field_pos, "=") orelse return error.FieldNotFound;
+    const quote_start = std.mem.indexOfPos(u8, content, eq_pos, "\"") orelse return error.FieldNotFound;
+    const quote_end = std.mem.indexOfPos(u8, content, quote_start + 1, "\"") orelse return error.FieldNotFound;
+
+    // Build new content: before + new version + after
+    const new_content = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        content[0 .. quote_start + 1],
+        new_version,
+        content[quote_end..],
+    });
+    defer allocator.free(new_content);
+
+    // Write back
+    const write_file = try std.fs.cwd().createFile(file_path, .{});
+    defer write_file.close();
+    try write_file.writeAll(new_content);
+}
+
 test "extractStringField" {
     const content =
         \\.{

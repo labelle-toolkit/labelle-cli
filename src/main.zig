@@ -353,12 +353,25 @@ fn runUpgrade(allocator: std.mem.Allocator, options: Options) !void {
         };
     }
 
+    if (std.mem.eql(u8, current_version, target_version) and !options.upgrade_force) {
+        std.debug.print("Already on version {s}. Use --force to reinstall.\n", .{target_version});
+        return;
+    }
+
     std.debug.print("Upgrading from {s} to {s}...\n", .{ current_version, target_version });
 
     // Update project.labelle with new version
-    // TODO: Implement project.labelle update logic
+    project_config.updateEngineVersion(allocator, ".", target_version) catch |err| {
+        std.debug.print("Error updating project.labelle: {}\n", .{err});
+        return;
+    };
 
-    std.debug.print("Upgrade complete. Run 'labelle generate' to regenerate files.\n", .{});
+    // Clear .labelle directory to force regeneration with new version
+    std.fs.cwd().deleteTree(".labelle") catch {};
+    std.fs.cwd().deleteTree(".labelle-bootstrap") catch {};
+
+    std.debug.print("Updated engine_version to {s} in project.labelle\n", .{target_version});
+    std.debug.print("Run 'labelle generate' to regenerate files with the new version.\n", .{});
 }
 
 fn printHelp() void {
