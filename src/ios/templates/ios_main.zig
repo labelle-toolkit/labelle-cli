@@ -1,25 +1,32 @@
 //! iOS Main Entry Point for labelle-engine games
 //!
 //! This file provides the sokol_app callbacks for iOS:
-//! - init: Initialize graphics
+//! - init: Initialize graphics and load initial scene
 //! - frame: Update and render each frame
 //! - event: Handle touch and keyboard input
 //! - cleanup: Free resources on app termination
 //!
 //! Touch events are tracked and accessible via getTouchCount/getTouch.
 //!
-//! Note: This is a standalone sokol demo. Full labelle-engine integration
-//! requires fixing the raylib iOS dependency in labelle-gfx.
+//! This template integrates with labelle-engine for full game support
+//! including scenes, ECS, physics, and scripts.
 
 const std = @import("std");
+const engine = @import("labelle-engine");
 
-// Sokol bindings - for iOS with Metal backend
-const sokol = @import("sokol");
+// Sokol bindings - re-exported from engine for iOS callback architecture
+// This avoids module conflicts when both engine and app import sokol
+const sokol = engine.sokol;
 const sg = sokol.gfx;
+const sgl = sokol.gl;
 const sapp = sokol.app;
 
+// Game types from engine
+const Game = engine.Game;
+const ProjectConfig = engine.ProjectConfig;
+
 // ============================================================================
-// Touch Input Types (placeholder until issue #218 is implemented)
+// Touch Input Types
 // ============================================================================
 
 pub const TouchPhase = enum {
@@ -44,7 +51,11 @@ const MAX_TOUCHES = 10;
 
 const State = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
+    game: ?*Game = null,
+    scene: ?*engine.Scene = null,
     initialized: bool = false,
+    should_quit: bool = false,
+    ci_test: bool = false,
     frame_count: u32 = 0,
 
     // Touch input state
@@ -54,24 +65,56 @@ const State = struct {
     // Screen dimensions (updated on resize)
     screen_width: f32 = 0,
     screen_height: f32 = 0,
-
-    // Clear color (changes with touch)
-    clear_r: f32 = 0.2,
-    clear_g: f32 = 0.3,
-    clear_b: f32 = 0.4,
 };
 
 var state: State = .{};
+
+// Allocated storage for game and scene (needed because sokol callbacks can't return errors)
+var game_storage: Game = undefined;
+var scene_storage: engine.Scene = undefined;
+
+// ============================================================================
+// Project Configuration (embedded at compile time for iOS)
+// ============================================================================
+
+// TODO: These should be generated from project.labelle
+const window_width: u32 = 800;
+const window_height: u32 = 600;
+const window_title = "Labelle Game";
+const clear_color = .{ .r = 30, .g = 35, .b = 45 };
+
+// ============================================================================
+// Registries (should be generated based on project)
+// ============================================================================
+
+pub const Prefabs = engine.PrefabRegistry(.{});
+pub const Components = engine.ComponentRegistry(struct {
+    // Engine built-in components
+    pub const Position = engine.Position;
+    pub const Sprite = engine.Sprite;
+    pub const Shape = engine.Shape;
+    pub const Text = engine.Text;
+});
+pub const Scripts = engine.ScriptRegistry(struct {});
+
+pub const Loader = engine.SceneLoader(Prefabs, Components, Scripts);
 
 // ============================================================================
 // Sokol App Callbacks
 // ============================================================================
 
-/// Initialize the graphics system
+/// Initialize the graphics system and load initial scene
 export fn init() callconv(.c) void {
-    // Initialize sokol_gfx with Metal backend (automatic on iOS)
+    state.ci_test = std.posix.getenv("CI_TEST") != null;
+
+    // Initialize sokol_gfx with sokol_app's rendering context
     sg.setup(.{
         .environment = sokol.glue.environment(),
+        .logger = .{ .func = sokol.log.func },
+    });
+
+    // Initialize sokol_gl for 2D drawing (must be after sg.setup)
+    sgl.setup(.{
         .logger = .{ .func = sokol.log.func },
     });
 
@@ -85,35 +128,69 @@ export fn init() callconv(.c) void {
     }
     state.touch_count = 0;
 
+    // Use page allocator for simplicity in callback context
+    state.allocator = std.heap.page_allocator;
+
+    // Initialize game with embedded config (iOS doesn't load from filesystem)
+    game_storage = Game.init(state.allocator, .{
+        .window = .{
+            .width = window_width,
+            .height = window_height,
+            .title = window_title,
+            .target_fps = 60,
+        },
+        .clear_color = clear_color,
+    }) catch |err| {
+        std.debug.print("Failed to initialize game: {}\n", .{err});
+        sapp.quit();
+        return;
+    };
+    state.game = &game_storage;
+    state.game.?.fixPointers();
+
+    // TODO: Load initial scene from project configuration
+    // const ctx = engine.SceneContext.init(state.game.?);
+    // scene_storage = Loader.load(initial_scene, ctx) catch |err| {
+    //     std.debug.print("Failed to load scene: {}\n", .{err});
+    //     sapp.quit();
+    //     return;
+    // };
+    // state.scene = &scene_storage;
+
     state.initialized = true;
 
-    std.log.info("labelle_ios initialized", .{});
-    std.log.info("Screen size: {d:.0}x{d:.0}", .{ state.screen_width, state.screen_height });
+    std.debug.print("labelle-engine iOS initialized successfully!\n", .{});
+    std.debug.print("Window size: {}x{}\n", .{ sapp.width(), sapp.height() });
 }
 
 /// Called every frame - update game state and render
 export fn frame() callconv(.c) void {
-    if (!state.initialized) return;
+    if (!state.initialized or state.game == null) return;
 
+    // CI test mode: exit after 10 frames
     state.frame_count += 1;
+    if (state.ci_test) {
+        if (state.frame_count > 10) {
+            state.should_quit = true;
+            sapp.quit();
+            return;
+        }
+    }
 
     // Update screen dimensions (may change on rotation)
     state.screen_width = @floatFromInt(sapp.width());
     state.screen_height = @floatFromInt(sapp.height());
 
-    // Update clear color based on touch (visual feedback)
-    if (state.touch_count > 0) {
-        // Normalize first touch position to color
-        const touch = state.touches[0];
-        state.clear_r = touch.x / state.screen_width;
-        state.clear_g = touch.y / state.screen_height;
-        state.clear_b = 0.5;
-    } else {
-        // Default color when no touch
-        state.clear_r = 0.2;
-        state.clear_g = 0.3;
-        state.clear_b = 0.4;
+    // Get delta time from sokol
+    const dt: f32 = @floatCast(sapp.frameDuration());
+
+    // Update scene if loaded (runs scripts, etc.)
+    if (state.scene) |scene| {
+        scene.update(dt);
     }
+
+    // Sync ECS components to graphics
+    state.game.?.getPipeline().sync(state.game.?.getRegistry());
 
     // Clear per-frame touch state (touches that ended last frame)
     var i: u32 = 0;
@@ -130,24 +207,24 @@ export fn frame() callconv(.c) void {
         }
     }
 
-    // Begin render pass with dynamic clear color
+    // Begin sokol render pass
     var pass_action: sg.PassAction = .{};
     pass_action.colors[0] = .{
         .load_action = .CLEAR,
-        .clear_value = .{
-            .r = state.clear_r,
-            .g = state.clear_g,
-            .b = state.clear_b,
-            .a = 1.0,
-        },
+        .clear_value = .{ .r = 0.118, .g = 0.137, .b = 0.176, .a = 1.0 },
     };
-
     sg.beginPass(.{
         .action = pass_action,
         .swapchain = sokol.glue.swapchain(),
     });
 
-    // End render pass and commit
+    // Render using the retained engine
+    const re = state.game.?.getRetainedEngine();
+    re.beginFrame();
+    re.render();
+    re.endFrame();
+
+    // End sokol render pass and commit
     sg.endPass();
     sg.commit();
 }
@@ -174,15 +251,15 @@ export fn event(ev: ?*const sapp.Event) callconv(.c) void {
         .RESIZED => {
             state.screen_width = @floatFromInt(sapp.width());
             state.screen_height = @floatFromInt(sapp.height());
-            std.log.info("Screen resized to {d:.0}x{d:.0}", .{ state.screen_width, state.screen_height });
+            std.debug.print("Screen resized to {d:.0}x{d:.0}\n", .{ state.screen_width, state.screen_height });
         },
 
         // App lifecycle
         .SUSPENDED => {
-            std.log.info("App suspended", .{});
+            std.debug.print("App suspended\n", .{});
         },
         .RESUMED => {
-            std.log.info("App resumed", .{});
+            std.debug.print("App resumed\n", .{});
         },
 
         else => {},
@@ -191,8 +268,23 @@ export fn event(ev: ?*const sapp.Event) callconv(.c) void {
 
 /// Cleanup resources on app termination
 export fn cleanup() callconv(.c) void {
-    std.log.info("labelle_ios cleanup", .{});
+    // Cleanup scene
+    if (state.scene) |scene| {
+        scene.deinit();
+        state.scene = null;
+    }
+
+    // Cleanup game
+    if (state.game) |game| {
+        game.deinit();
+        state.game = null;
+    }
+
+    // Cleanup sokol in reverse order of initialization
+    sgl.shutdown();
     sg.shutdown();
+
+    std.debug.print("labelle-engine iOS cleanup complete.\n", .{});
 }
 
 // ============================================================================
@@ -273,9 +365,9 @@ pub fn main() void {
         .frame_cb = frame,
         .cleanup_cb = cleanup,
         .event_cb = event,
-        .width = 390,
-        .height = 844,
-        .window_title = "Labelle iOS",
+        .width = window_width,
+        .height = window_height,
+        .window_title = window_title,
         .high_dpi = true,
         .fullscreen = true,
         .icon = .{ .sokol_default = true },

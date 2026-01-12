@@ -427,12 +427,16 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
 
     // Note: The fingerprint will be validated by Zig on first build.
     // If it fails, Zig will suggest the correct value.
+    // sokol dependency is needed for linking sokol_clib, but the Zig module
+    // is accessed through engine.sokol to avoid module conflicts
     const build_zon_content = try std.fmt.allocPrint(allocator,
         \\.{{
         \\    .fingerprint = 0xb8a8f4e73d5c1a92,
         \\    .name = .{s}_ios,
         \\    .version = "0.1.0",
         \\    .dependencies = .{{
+        \\        // sokol for linking sokol_clib (C library)
+        \\        // Zig module accessed via engine.sokol to avoid conflicts
         \\        .sokol = .{{
         \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
         \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
@@ -711,11 +715,14 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\//! Usage:
         \\//!   zig build ios       # Build for iOS device
         \\//!   zig build ios-sim   # Build for iOS simulator
+        \\//!
+        \\//! Note: The sokol Zig module is accessed through engine.sokol to avoid
+        \\//! module conflicts. The sokol dependency is only used for linking sokol_clib.
+        \\//! The ios_main.zig template uses `const sokol = engine.sokol;`
         \\
         \\const std = @import("std");
         \\
         \\pub fn build(b: *std.Build) void {{
-        \\    const target = b.standardTargetOptions(.{{}});
         \\    const optimize = b.standardOptimizeOption(.{{}});
         \\
         \\    const app_name = "{s}";
@@ -734,27 +741,15 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_m1 }},
         \\    }});
         \\
-        \\    // Sokol dependency
-        \\    const sokol_dep = b.dependency("sokol", .{{
-        \\        .target = target,
-        \\        .optimize = optimize,
-        \\    }});
-        \\
-        \\    // Engine dependency
-        \\    const engine_dep = b.dependency("labelle-engine", .{{
-        \\        .target = target,
-        \\        .optimize = optimize,
-        \\        .backend = .sokol,
-        \\        .physics = {s},
-        \\    }});
-        \\
         \\    // iOS Device build
+        \\    // sokol dependency for linking C library (dont_link_system_libs=true for iOS)
         \\    const ios_sokol = b.dependency("sokol", .{{
         \\        .target = ios_device_target,
         \\        .optimize = optimize,
         \\        .dont_link_system_libs = true,
         \\    }});
         \\
+        \\    // Engine provides sokol through engine.sokol (re-exported to avoid module conflicts)
         \\    const ios_engine = b.dependency("labelle-engine", .{{
         \\        .target = ios_device_target,
         \\        .optimize = optimize,
@@ -769,12 +764,13 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\            .target = ios_device_target,
         \\            .optimize = optimize,
         \\            .imports = &.{{
+        \\                // Only import engine - sokol Zig module accessed via engine.sokol
         \\                .{{ .name = "labelle-engine", .module = ios_engine.module("labelle-engine") }},
-        \\                .{{ .name = "sokol", .module = ios_sokol.module("sokol") }},
         \\            }},
         \\        }}),
         \\    }});
         \\
+        \\    // Link sokol C library (for iOS Metal backend)
         \\    ios_exe.linkLibrary(ios_sokol.artifact("sokol_clib"));
         \\    ios_exe.linkLibC();
         \\
@@ -814,12 +810,13 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\            .target = ios_sim_target,
         \\            .optimize = optimize,
         \\            .imports = &.{{
+        \\                // Only import engine - sokol Zig module accessed via engine.sokol
         \\                .{{ .name = "labelle-engine", .module = sim_engine.module("labelle-engine") }},
-        \\                .{{ .name = "sokol", .module = sim_sokol.module("sokol") }},
         \\            }},
         \\        }}),
         \\    }});
         \\
+        \\    // Link sokol C library (for iOS Simulator Metal backend)
         \\    sim_exe.linkLibrary(sim_sokol.artifact("sokol_clib"));
         \\    sim_exe.linkLibC();
         \\
@@ -836,14 +833,10 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    const sim_step = b.step("ios-sim", "Build for iOS simulator");
         \\    sim_step.dependOn(&sim_exe.step);
         \\    sim_step.dependOn(&b.addInstallArtifact(sim_exe, .{{}}).step);
-        \\
-        \\    _ = sokol_dep;
-        \\    _ = engine_dep;
         \\}}
         \\
     , .{
         ios_config.app_name,
-        if (ios_config.physics_enabled) "true" else "false",
         if (ios_config.physics_enabled) "true" else "false",
         if (ios_config.physics_enabled) "true" else "false",
     });
