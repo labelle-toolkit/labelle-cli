@@ -13,6 +13,7 @@
 //   run         Build and run the project
 //   update      Clear caches and regenerate
 //   upgrade     Upgrade to a newer labelle-engine version
+//   self-update Update the labelle CLI itself
 //   help        Show help information
 //   version     Show CLI version
 
@@ -33,6 +34,7 @@ const Command = enum {
     run,
     update,
     upgrade,
+    self_update,
     ios,
     wasm,
     help,
@@ -83,6 +85,7 @@ pub fn main() !void {
         .run => try runRun(allocator, options),
         .update => try runUpdate(allocator, options),
         .upgrade => try runUpgrade(allocator, options),
+        .self_update => try runSelfUpdate(allocator),
         .ios => try ios_commands.handleIos(allocator, options.ios_args),
         .wasm => try wasm_commands.handleWasm(allocator, options.wasm_args),
         .help => printHelp(),
@@ -110,6 +113,8 @@ fn parseArgs(args: []const []const u8) Options {
         options.command = .update;
     } else if (std.mem.eql(u8, cmd_str, "upgrade")) {
         options.command = .upgrade;
+    } else if (std.mem.eql(u8, cmd_str, "self-update")) {
+        options.command = .self_update;
     } else if (std.mem.eql(u8, cmd_str, "ios")) {
         options.command = .ios;
         // Pass all remaining args to ios_commands
@@ -399,6 +404,184 @@ fn runUpgrade(allocator: std.mem.Allocator, options: Options) !void {
     std.debug.print("Run 'labelle generate' to regenerate files with the new version.\n", .{});
 }
 
+fn runSelfUpdate(allocator: std.mem.Allocator) !void {
+    const github_cli_releases_url = "https://api.github.com/repos/labelle-toolkit/labelle-cli/releases/latest";
+
+    std.debug.print("Checking for labelle-cli updates...\n", .{});
+    std.debug.print("Current version: {s}\n\n", .{cli_version});
+
+    // Fetch latest version from GitHub
+    var child = std.process.Child.init(&.{
+        "curl",
+        "-s",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        github_cli_releases_url,
+    }, allocator);
+
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    _ = child.spawn() catch |err| {
+        std.debug.print("Error: Failed to check for updates: {}\n", .{err});
+        std.debug.print("Make sure curl is installed and you have network access.\n", .{});
+        return;
+    };
+
+    const stdout = child.stdout orelse return;
+    const response = stdout.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        std.debug.print("Error reading response: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(response);
+
+    _ = child.wait() catch |err| {
+        std.debug.print("Error waiting for curl: {}\n", .{err});
+        return;
+    };
+
+    // Parse tag_name from response (simple string search)
+    // GitHub API returns JSON with spaces: "tag_name": "v0.3.2"
+    const tag_prefix = "\"tag_name\": \"";
+    const tag_start = std.mem.indexOf(u8, response, tag_prefix) orelse {
+        std.debug.print("Error: Could not find latest version. Check GitHub manually.\n", .{});
+        std.debug.print("URL: https://github.com/labelle-toolkit/labelle-cli/releases\n", .{});
+        return;
+    };
+
+    const version_start = tag_start + tag_prefix.len;
+    const version_end = std.mem.indexOfPos(u8, response, version_start, "\"") orelse {
+        std.debug.print("Error: Invalid response from GitHub API.\n", .{});
+        return;
+    };
+
+    var latest_version = response[version_start..version_end];
+    // Strip 'v' prefix if present
+    if (std.mem.startsWith(u8, latest_version, "v")) {
+        latest_version = latest_version[1..];
+    }
+
+    // Compare versions using semantic versioning
+    const current_order = parseVersion(cli_version);
+    const latest_order = parseVersion(latest_version);
+
+    if (current_order >= latest_order) {
+        if (current_order > latest_order) {
+            std.debug.print("You are running a newer version ({s}) than the latest release ({s}).\n", .{ cli_version, latest_version });
+        } else {
+            std.debug.print("You are already on the latest version ({s}).\n", .{cli_version});
+        }
+        return;
+    }
+
+    std.debug.print("New version available: {s}\n\n", .{latest_version});
+
+    // Check if we're in a git repository (source install)
+    const git_check = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "git", "rev-parse", "--git-dir" },
+    }) catch {
+        // Not in a git repo, show manual instructions
+        printManualUpdateInstructions(latest_version);
+        return;
+    };
+    defer allocator.free(git_check.stdout);
+    defer allocator.free(git_check.stderr);
+
+    if (git_check.term != .Exited or git_check.term.Exited != 0) {
+        printManualUpdateInstructions(latest_version);
+        return;
+    }
+
+    // We're in a git repo - offer to update via git
+    std.debug.print("Detected source installation. Updating via git...\n\n", .{});
+
+    // Git fetch and pull
+    std.debug.print("Running: git fetch origin\n", .{});
+    const fetch_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "git", "fetch", "origin" },
+    }) catch |err| {
+        std.debug.print("Error fetching: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(fetch_result.stdout);
+    defer allocator.free(fetch_result.stderr);
+
+    const version_tag = std.fmt.allocPrint(allocator, "v{s}", .{latest_version}) catch return;
+    defer allocator.free(version_tag);
+
+    std.debug.print("Running: git checkout {s}\n", .{version_tag});
+    const checkout_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "git", "checkout", version_tag },
+    }) catch |err| {
+        std.debug.print("Error checking out version: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(checkout_result.stdout);
+    defer allocator.free(checkout_result.stderr);
+
+    if (checkout_result.term != .Exited or checkout_result.term.Exited != 0) {
+        std.debug.print("Error: Could not checkout v{s}\n", .{latest_version});
+        std.debug.print("{s}\n", .{checkout_result.stderr});
+        return;
+    }
+
+    // Rebuild
+    std.debug.print("Running: zig build -Doptimize=ReleaseSafe\n", .{});
+    var build_child = std.process.Child.init(&.{ "zig", "build", "-Doptimize=ReleaseSafe" }, allocator);
+    build_child.stdin_behavior = .Inherit;
+    build_child.stdout_behavior = .Inherit;
+    build_child.stderr_behavior = .Inherit;
+
+    const build_term = build_child.spawnAndWait() catch |err| {
+        std.debug.print("Error building: {}\n", .{err});
+        return;
+    };
+
+    if (build_term != .Exited or build_term.Exited != 0) {
+        std.debug.print("\nBuild failed. You may need to update manually.\n", .{});
+        return;
+    }
+
+    std.debug.print("\n", .{});
+    std.debug.print("Successfully updated to v{s}!\n", .{latest_version});
+    std.debug.print("\n", .{});
+    std.debug.print("The new binary is at: zig-out/bin/labelle\n", .{});
+    std.debug.print("Copy it to your PATH to complete the update.\n", .{});
+}
+
+fn printManualUpdateInstructions(latest_version: []const u8) void {
+    std.debug.print("To update, run:\n\n", .{});
+    std.debug.print("  git clone https://github.com/labelle-toolkit/labelle-cli.git\n", .{});
+    std.debug.print("  cd labelle-cli\n", .{});
+    std.debug.print("  git checkout v{s}\n", .{latest_version});
+    std.debug.print("  zig build -Doptimize=ReleaseSafe\n", .{});
+    std.debug.print("  # Copy zig-out/bin/labelle to your PATH\n", .{});
+}
+
+/// Parse semantic version string into a comparable number.
+/// "0.3.2" -> 0*10000 + 3*100 + 2 = 302
+fn parseVersion(version: []const u8) u32 {
+    var result: u32 = 0;
+    var multiplier: u32 = 10000;
+    var current: u32 = 0;
+
+    for (version) |c| {
+        if (c == '.') {
+            result += current * multiplier;
+            multiplier /= 100;
+            current = 0;
+        } else if (c >= '0' and c <= '9') {
+            current = current * 10 + (c - '0');
+        }
+    }
+    result += current * multiplier;
+
+    return result;
+}
+
 fn printHelp() void {
     std.debug.print(
         \\Labelle CLI v{s}
@@ -412,6 +595,7 @@ fn printHelp() void {
         \\  run             Build and run the project
         \\  update          Clear caches and regenerate
         \\  upgrade         Upgrade to a newer labelle-engine version
+        \\  self-update     Update the labelle CLI itself
         \\  ios             iOS build and deployment commands
         \\  wasm            WebAssembly build and serve commands
         \\  help            Show this help
@@ -473,6 +657,22 @@ fn printCommandHelp(command: Command) void {
             \\  --check         Only check for updates, don't upgrade
             \\  --version=VER   Upgrade to specific version
             \\  --force         Force upgrade even if on same version
+            \\
+        , .{}),
+        .self_update => std.debug.print(
+            \\Update the labelle CLI itself to the latest version
+            \\
+            \\Usage: labelle self-update
+            \\
+            \\This command checks for new versions of labelle-cli on GitHub
+            \\and updates if a newer version is available.
+            \\
+            \\If installed from source (git), it will:
+            \\  1. Fetch latest changes
+            \\  2. Checkout the new version tag
+            \\  3. Rebuild with zig build
+            \\
+            \\Otherwise, it will show manual update instructions.
             \\
         , .{}),
         .ios => std.debug.print(
