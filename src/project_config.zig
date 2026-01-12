@@ -10,6 +10,7 @@ pub const ProjectConfig = struct {
     engine_version: ?[]const u8 = null,
     initial_scene: ?[]const u8 = null,
     output_dir: ?[]const u8 = null,
+    physics_enabled: bool = false,
     raw_content: []const u8,
 
     pub fn deinit(self: *const ProjectConfig, allocator: std.mem.Allocator) void {
@@ -39,8 +40,31 @@ pub fn readProjectConfig(allocator: std.mem.Allocator, project_path: []const u8)
     config.engine_version = extractStringField(content, ".engine_version");
     config.initial_scene = extractStringField(content, ".initial_scene");
     config.output_dir = extractStringField(content, ".output_dir");
+    config.physics_enabled = isPhysicsEnabled(content);
 
     return config;
+}
+
+/// Check if physics is enabled in the project config.
+/// Looks for .physics = .{ ... .enabled = true ... }
+fn isPhysicsEnabled(content: []const u8) bool {
+    // Find .physics section
+    const physics_pos = std.mem.indexOf(u8, content, ".physics") orelse return false;
+
+    // Find the opening brace after .physics
+    const brace_pos = std.mem.indexOfPos(u8, content, physics_pos, ".{") orelse return false;
+
+    // Look for .enabled = true within the physics section
+    // Find the closing brace to bound our search
+    var depth: usize = 1;
+    var end_pos = brace_pos + 2;
+    while (end_pos < content.len and depth > 0) : (end_pos += 1) {
+        if (content[end_pos] == '{') depth += 1;
+        if (content[end_pos] == '}') depth -= 1;
+    }
+
+    const physics_section = content[brace_pos..end_pos];
+    return std.mem.indexOf(u8, physics_section, ".enabled = true") != null;
 }
 
 /// Extract a string field value from ZON content.

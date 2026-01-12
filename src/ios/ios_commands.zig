@@ -24,6 +24,7 @@ pub const IosConfig = struct {
     minimum_ios: []const u8 = "15.0",
     orientation: Orientation = .all,
     engine_version: []const u8 = "latest",
+    physics_enabled: bool = false,
 
     pub const Orientation = enum {
         portrait,
@@ -51,6 +52,7 @@ pub const IosConfig = struct {
                 .app_name = try allocator.dupe(u8, proj_config.name orelse "LabelleGame"),
                 .bundle_id = try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{proj_config.name orelse "game"}),
                 .engine_version = engine_version,
+                .physics_enabled = proj_config.physics_enabled,
             };
         };
         defer file.close();
@@ -65,9 +67,11 @@ pub const IosConfig = struct {
             std.debug.print("Warning: could not parse ios.labelle, using defaults. Error: {any}\n", .{err});
             return IosConfig{
                 .engine_version = engine_version,
+                .physics_enabled = proj_config.physics_enabled,
             };
         };
         ios_config.engine_version = engine_version;
+        ios_config.physics_enabled = proj_config.physics_enabled;
         return ios_config;
     }
 };
@@ -741,6 +745,7 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .target = target,
         \\        .optimize = optimize,
         \\        .backend = .sokol,
+        \\        .physics = {s},
         \\    }});
         \\
         \\    // iOS Device build
@@ -754,6 +759,7 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .target = ios_device_target,
         \\        .optimize = optimize,
         \\        .backend = .sokol,
+        \\        .physics = {s},
         \\    }});
         \\
         \\    const ios_exe = b.addExecutable(.{{
@@ -798,6 +804,7 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .target = ios_sim_target,
         \\        .optimize = optimize,
         \\        .backend = .sokol,
+        \\        .physics = {s},
         \\    }});
         \\
         \\    const sim_exe = b.addExecutable(.{{
@@ -834,7 +841,12 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    _ = engine_dep;
         \\}}
         \\
-    , .{ios_config.app_name});
+    , .{
+        ios_config.app_name,
+        if (ios_config.physics_enabled) "true" else "false",
+        if (ios_config.physics_enabled) "true" else "false",
+        if (ios_config.physics_enabled) "true" else "false",
+    });
 }
 
 fn generateInfoPlist(allocator: std.mem.Allocator, ios_config: IosConfig) ![]const u8 {
