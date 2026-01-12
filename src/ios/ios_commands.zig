@@ -13,6 +13,9 @@
 const std = @import("std");
 const project_config = @import("../project_config.zig");
 
+/// Embedded iOS main template
+const ios_main_template = @embedFile("templates/ios_main.zig");
+
 /// iOS build configuration from ios.labelle or defaults
 pub const IosConfig = struct {
     app_name: []const u8 = "LabelleGame",
@@ -20,6 +23,7 @@ pub const IosConfig = struct {
     team_id: ?[]const u8 = null,
     minimum_ios: []const u8 = "15.0",
     orientation: Orientation = .all,
+    engine_version: []const u8 = "latest",
 
     pub const Orientation = enum {
         portrait,
@@ -29,20 +33,24 @@ pub const IosConfig = struct {
 
     /// Load iOS config from ios.labelle file, or return defaults
     pub fn load(allocator: std.mem.Allocator, project_path: []const u8) !IosConfig {
+        // Always read project.labelle first to get engine_version
+        const proj_config = project_config.readProjectConfig(allocator, project_path) catch |err| {
+            std.debug.print("Warning: could not load project.labelle, using defaults. Error: {any}\n", .{err});
+            return IosConfig{};
+        };
+        defer proj_config.deinit(allocator);
+
+        const engine_version = try allocator.dupe(u8, proj_config.engine_version orelse "latest");
+
         const ios_config_path = try std.fs.path.join(allocator, &.{ project_path, "ios.labelle" });
         defer allocator.free(ios_config_path);
 
         const file = std.fs.cwd().openFile(ios_config_path, .{}) catch {
             // No ios.labelle file, use defaults from project.labelle
-            const config = project_config.readProjectConfig(allocator, project_path) catch |err| {
-                std.debug.print("Warning: could not load project.labelle, using defaults. Error: {any}\n", .{err});
-                return IosConfig{}; // Return defaults
-            };
-            defer config.deinit(allocator);
-
             return IosConfig{
-                .app_name = try allocator.dupe(u8, config.name orelse "LabelleGame"),
-                .bundle_id = try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{config.name orelse "game"}),
+                .app_name = try allocator.dupe(u8, proj_config.name orelse "LabelleGame"),
+                .bundle_id = try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{proj_config.name orelse "game"}),
+                .engine_version = engine_version,
             };
         };
         defer file.close();
@@ -53,10 +61,14 @@ pub const IosConfig = struct {
         defer allocator.free(content);
         _ = try file.readAll(content);
 
-        return std.zon.parse.fromSlice(IosConfig, allocator, content, null, .{}) catch |err| {
+        var ios_config = std.zon.parse.fromSlice(IosConfig, allocator, content, null, .{}) catch |err| {
             std.debug.print("Warning: could not parse ios.labelle, using defaults. Error: {any}\n", .{err});
-            return IosConfig{}; // Return defaults on parse error
+            return IosConfig{
+                .engine_version = engine_version,
+            };
         };
+        ios_config.engine_version = engine_version;
+        return ios_config;
     }
 };
 
@@ -178,17 +190,86 @@ fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8) !void 
 
     std.debug.print("\nRunning: zig build {s}\n", .{if (simulator) "ios-sim" else "ios"});
 
-    var child = std.process.Child.init(cmd_args.items, allocator);
-    child.cwd = ios_dir;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
+    // Run zig build and capture output to check for fingerprint errors
+    const run_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = cmd_args.items,
+        .cwd = ios_dir,
+    }) catch |err| {
+        std.debug.print("Failed to run zig build: {}\n", .{err});
+        return err;
+    };
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
 
-    const term = try child.spawnAndWait();
-
-    if (term == .Exited and term.Exited == 0) {
+    if (run_result.term == .Exited and run_result.term.Exited == 0) {
         std.debug.print("\nBuild successful!\n", .{});
         std.debug.print("Binary: {s}/zig-out/bin/{s}\n", .{ ios_dir, ios_config.app_name });
+        return;
+    }
+
+    // Check if it's a fingerprint error and try to fix it
+    const prefix = "use this value: 0x";
+    if (std.mem.indexOf(u8, run_result.stderr, prefix)) |start| {
+        const fp_start = start + prefix.len;
+        if (fp_start + 16 <= run_result.stderr.len) {
+            const suggested_fp = run_result.stderr[fp_start .. fp_start + 16];
+
+            std.debug.print("Fixing fingerprint and retrying...\n", .{});
+
+            // Update build.zig.zon with correct fingerprint
+            const build_zon_path = try std.fs.path.join(allocator, &.{ ios_dir, "build.zig.zon" });
+            defer allocator.free(build_zon_path);
+
+            try fixFingerprint(allocator, build_zon_path, suggested_fp);
+
+            // Retry build with inherited IO
+            var retry_child = std.process.Child.init(cmd_args.items, allocator);
+            retry_child.cwd = ios_dir;
+            retry_child.stdin_behavior = .Inherit;
+            retry_child.stdout_behavior = .Inherit;
+            retry_child.stderr_behavior = .Inherit;
+
+            const retry_term = try retry_child.spawnAndWait();
+
+            if (retry_term == .Exited and retry_term.Exited == 0) {
+                std.debug.print("\nBuild successful!\n", .{});
+                std.debug.print("Binary: {s}/zig-out/bin/{s}\n", .{ ios_dir, ios_config.app_name });
+                return;
+            }
+        }
+    } else {
+        // Print the error output if not a fingerprint error
+        std.debug.print("{s}", .{run_result.stderr});
+    }
+}
+
+fn fixFingerprint(allocator: std.mem.Allocator, path: []const u8, new_fp: []const u8) !void {
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    const stat = try file.stat();
+    const content = try allocator.alloc(u8, stat.size);
+    defer allocator.free(content);
+    _ = try file.readAll(content);
+    file.close();
+
+    // Find and replace fingerprint
+    const fp_prefix = ".fingerprint = 0x";
+    if (std.mem.indexOf(u8, content, fp_prefix)) |start| {
+        const fp_start = start + fp_prefix.len;
+        if (fp_start + 16 <= content.len) {
+            // Create new content with updated fingerprint
+            var new_content: std.ArrayListUnmanaged(u8) = .empty;
+            defer new_content.deinit(allocator);
+
+            try new_content.appendSlice(allocator, content[0..fp_start]);
+            try new_content.appendSlice(allocator, new_fp);
+            try new_content.appendSlice(allocator, content[fp_start + 16 ..]);
+
+            // Write back
+            const out_file = try std.fs.cwd().createFile(path, .{});
+            defer out_file.close();
+            try out_file.writeAll(new_content.items);
+        }
     }
 }
 
@@ -328,23 +409,39 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     const build_zon_path = try std.fs.path.join(allocator, &.{ ios_dir, "build.zig.zon" });
     defer allocator.free(build_zon_path);
 
+    // Sanitize app name for Zig identifier (replace hyphens with underscores)
+    const sanitized_app_name = try sanitizeName(allocator, ios_config.app_name);
+    defer allocator.free(sanitized_app_name);
+
+    // Try to read engine hash from main project's .labelle/build.zig.zon
+    const engine_hash = readEngineHash(allocator, project_path) catch |err| {
+        std.debug.print("Warning: Could not read engine hash from .labelle/build.zig.zon: {}\n", .{err});
+        std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
+        return err;
+    };
+    defer allocator.free(engine_hash);
+
+    // Note: The fingerprint will be validated by Zig on first build.
+    // If it fails, Zig will suggest the correct value.
     const build_zon_content = try std.fmt.allocPrint(allocator,
         \\.{{
-        \\    .name = .@"{s}-ios",
+        \\    .fingerprint = 0xb8a8f4e73d5c1a92,
+        \\    .name = .{s}_ios,
         \\    .version = "0.1.0",
         \\    .dependencies = .{{
         \\        .sokol = .{{
-        \\            .url = "git+https://github.com/floooh/sokol-zig.git#v0.1.0",
+        \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
         \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
         \\        }},
         \\        .@"labelle-engine" = .{{
-        \\            .path = "../../labelle-engine",
+        \\            .url = "git+https://github.com/labelle-toolkit/labelle-engine#v{s}",
+        \\            .hash = "{s}",
         \\        }},
         \\    }},
         \\    .paths = .{{ "build.zig", "build.zig.zon" }},
         \\}}
         \\
-    , .{ios_config.app_name});
+    , .{ sanitized_app_name, ios_config.engine_version, engine_hash });
     defer allocator.free(build_zon_content);
 
     const build_zon_file = try std.fs.cwd().createFile(build_zon_path, .{});
@@ -383,6 +480,18 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     const launch_screen_file = try std.fs.cwd().createFile(launch_screen_path, .{});
     defer launch_screen_file.close();
     try launch_screen_file.writeAll(launch_screen_content);
+
+    // Generate ios_main.zig in project root
+    const ios_main_path = try std.fs.path.join(allocator, &.{ project_path, "ios_main.zig" });
+    defer allocator.free(ios_main_path);
+
+    // Only create if it doesn't exist (don't overwrite user modifications)
+    std.fs.cwd().access(ios_main_path, .{}) catch {
+        const ios_main_file = try std.fs.cwd().createFile(ios_main_path, .{});
+        defer ios_main_file.close();
+        try ios_main_file.writeAll(ios_main_template);
+        std.debug.print("Generated: {s}\n", .{ios_main_path});
+    };
 
     std.debug.print("Generated iOS build files in: {s}\n", .{ios_dir});
 }
@@ -533,6 +642,31 @@ fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return result;
 }
 
+/// Read the labelle-engine hash from the main project's .labelle/build.zig.zon
+fn readEngineHash(allocator: std.mem.Allocator, project_path: []const u8) ![]const u8 {
+    const build_zon_path = try std.fs.path.join(allocator, &.{ project_path, ".labelle", "build.zig.zon" });
+    defer allocator.free(build_zon_path);
+
+    const file = try std.fs.cwd().openFile(build_zon_path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    const content = try allocator.alloc(u8, stat.size);
+    defer allocator.free(content);
+    _ = try file.readAll(content);
+
+    // Look for .hash = "labelle_engine-..." pattern
+    const hash_prefix = ".hash = \"labelle_engine-";
+    if (std.mem.indexOf(u8, content, hash_prefix)) |start| {
+        const hash_start = start + ".hash = \"".len;
+        if (std.mem.indexOfPos(u8, content, hash_start, "\"")) |end| {
+            return try allocator.dupe(u8, content[hash_start..end]);
+        }
+    }
+
+    return error.HashNotFound;
+}
+
 /// Copy directory recursively
 fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
     var src_dir = try std.fs.cwd().openDir(src, .{ .iterate = true });
@@ -588,11 +722,12 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .os_tag = .ios,
         \\    }});
         \\
-        \\    // iOS Simulator Target
+        \\    // iOS Simulator Target (Apple Silicon Macs)
         \\    const ios_sim_target = b.resolveTargetQuery(.{{
         \\        .cpu_arch = .aarch64,
         \\        .os_tag = .ios,
         \\        .abi = .simulator,
+        \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_m1 }},
         \\    }});
         \\
         \\    // Sokol dependency
@@ -637,6 +772,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    ios_exe.linkLibrary(ios_sokol.artifact("sokol_clib"));
         \\    ios_exe.linkLibC();
         \\
+        \\    // Add iOS Device SDK framework search path
+        \\    ios_exe.root_module.addFrameworkPath(.{{ .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/System/Library/Frameworks" }});
+        \\
         \\    // Link iOS frameworks
         \\    ios_exe.root_module.linkFramework("Foundation", .{{}});
         \\    ios_exe.root_module.linkFramework("UIKit", .{{}});
@@ -677,6 +815,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\
         \\    sim_exe.linkLibrary(sim_sokol.artifact("sokol_clib"));
         \\    sim_exe.linkLibC();
+        \\
+        \\    // Add iOS Simulator SDK framework search path
+        \\    sim_exe.root_module.addFrameworkPath(.{{ .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk/System/Library/Frameworks" }});
         \\
         \\    sim_exe.root_module.linkFramework("Foundation", .{{}});
         \\    sim_exe.root_module.linkFramework("UIKit", .{{}});
