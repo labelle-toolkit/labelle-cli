@@ -27,6 +27,10 @@ labelle-cli is a thin bootstrap CLI that manages [labelle-engine](https://github
 - **main.zig** - CLI entry point, argument parsing, command dispatch
 - **engine_resolver.zig** - Version resolution, GitHub API integration, bootstrap mechanism
 - **project_config.zig** - Reads `project.labelle` configuration files
+- **ios/** - iOS build and deployment commands
+  - **ios_commands.zig** - Main iOS command handler (build, xcode, run)
+  - **generate_xcode.zig** - Xcode project generator
+  - **templates/** - iOS templates (Info.plist, LaunchScreen.storyboard, etc.)
 
 ### Key Concepts
 
@@ -53,6 +57,17 @@ This ensures projects always use their pinned engine version.
 | `run` | Generate + run `zig build run` in output directory |
 | `update` | Clear `.labelle/` cache and regenerate |
 | `upgrade` | Check/upgrade engine version |
+| `ios` | iOS build and deployment commands |
+
+### iOS Commands
+
+| Command | Description |
+|---------|-------------|
+| `ios build` | Build for iOS device (arm64-ios) |
+| `ios build --simulator` | Build for iOS simulator (arm64-ios-simulator) |
+| `ios build --release` | Build release configuration |
+| `ios xcode` | Generate Xcode project for code signing |
+| `ios run --simulator` | Build and run on iOS simulator |
 
 ### Options
 

@@ -19,6 +19,7 @@
 const std = @import("std");
 const engine_resolver = @import("engine_resolver.zig");
 const project_config = @import("project_config.zig");
+const ios_commands = @import("ios/ios_commands.zig");
 
 // Version from build.zig.zon
 const build_zon = @import("build_zon");
@@ -31,6 +32,7 @@ const Command = enum {
     run,
     update,
     upgrade,
+    ios,
     help,
     version,
 };
@@ -51,6 +53,8 @@ const Options = struct {
     upgrade_version: ?[]const u8 = null,
     upgrade_force: bool = false,
     upgrade_list: bool = false,
+    // iOS options - pass remaining args to ios_commands
+    ios_args: []const []const u8 = &.{},
 };
 
 pub fn main() !void {
@@ -75,6 +79,7 @@ pub fn main() !void {
         .run => try runRun(allocator, options),
         .update => try runUpdate(allocator, options),
         .upgrade => try runUpgrade(allocator, options),
+        .ios => try ios_commands.handleIos(allocator, options.ios_args),
         .help => printHelp(),
         .version => printVersion(),
     }
@@ -100,6 +105,13 @@ fn parseArgs(args: []const []const u8) Options {
         options.command = .update;
     } else if (std.mem.eql(u8, cmd_str, "upgrade")) {
         options.command = .upgrade;
+    } else if (std.mem.eql(u8, cmd_str, "ios")) {
+        options.command = .ios;
+        // Pass all remaining args to ios_commands
+        if (args.len > 2) {
+            options.ios_args = args[2..];
+        }
+        return options;
     } else if (std.mem.eql(u8, cmd_str, "help") or std.mem.eql(u8, cmd_str, "--help") or std.mem.eql(u8, cmd_str, "-h")) {
         options.command = .help;
     } else if (std.mem.eql(u8, cmd_str, "version") or std.mem.eql(u8, cmd_str, "--version") or std.mem.eql(u8, cmd_str, "-v")) {
@@ -388,6 +400,7 @@ fn printHelp() void {
         \\  run             Build and run the project
         \\  update          Clear caches and regenerate
         \\  upgrade         Upgrade to a newer labelle-engine version
+        \\  ios             iOS build and deployment commands
         \\  help            Show this help
         \\  version         Show CLI version
         \\
@@ -402,6 +415,8 @@ fn printHelp() void {
         \\  labelle run
         \\  labelle run --release
         \\  labelle upgrade --check
+        \\  labelle ios build --simulator
+        \\  labelle ios xcode
         \\
     , .{cli_version});
 }
@@ -443,6 +458,19 @@ fn printCommandHelp(command: Command) void {
             \\  --check         Only check for updates, don't upgrade
             \\  --version=VER   Upgrade to specific version
             \\  --force         Force upgrade even if on same version
+            \\
+        , .{}),
+        .ios => std.debug.print(
+            \\iOS build and deployment commands
+            \\
+            \\Usage: labelle ios <command> [options]
+            \\
+            \\Commands:
+            \\  build           Build for iOS device or simulator
+            \\  xcode           Generate Xcode project
+            \\  run             Build and run on device/simulator
+            \\
+            \\Run 'labelle ios' for full iOS help.
             \\
         , .{}),
         else => printHelp(),
