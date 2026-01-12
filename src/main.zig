@@ -20,6 +20,7 @@ const std = @import("std");
 const engine_resolver = @import("engine_resolver.zig");
 const project_config = @import("project_config.zig");
 const ios_commands = @import("ios/ios_commands.zig");
+const wasm_commands = @import("wasm/wasm_commands.zig");
 
 // Version from build.zig.zon
 const build_zon = @import("build_zon");
@@ -33,6 +34,7 @@ const Command = enum {
     update,
     upgrade,
     ios,
+    wasm,
     help,
     version,
 };
@@ -55,6 +57,8 @@ const Options = struct {
     upgrade_list: bool = false,
     // iOS options - pass remaining args to ios_commands
     ios_args: []const []const u8 = &.{},
+    // WASM options - pass remaining args to wasm_commands
+    wasm_args: []const []const u8 = &.{},
 };
 
 pub fn main() !void {
@@ -80,6 +84,7 @@ pub fn main() !void {
         .update => try runUpdate(allocator, options),
         .upgrade => try runUpgrade(allocator, options),
         .ios => try ios_commands.handleIos(allocator, options.ios_args),
+        .wasm => try wasm_commands.handleWasm(allocator, options.wasm_args),
         .help => printHelp(),
         .version => printVersion(),
     }
@@ -110,6 +115,13 @@ fn parseArgs(args: []const []const u8) Options {
         // Pass all remaining args to ios_commands
         if (args.len > 2) {
             options.ios_args = args[2..];
+        }
+        return options;
+    } else if (std.mem.eql(u8, cmd_str, "wasm") or std.mem.eql(u8, cmd_str, "web")) {
+        options.command = .wasm;
+        // Pass all remaining args to wasm_commands
+        if (args.len > 2) {
+            options.wasm_args = args[2..];
         }
         return options;
     } else if (std.mem.eql(u8, cmd_str, "help") or std.mem.eql(u8, cmd_str, "--help") or std.mem.eql(u8, cmd_str, "-h")) {
@@ -401,6 +413,7 @@ fn printHelp() void {
         \\  update          Clear caches and regenerate
         \\  upgrade         Upgrade to a newer labelle-engine version
         \\  ios             iOS build and deployment commands
+        \\  wasm            WebAssembly build and serve commands
         \\  help            Show this help
         \\  version         Show CLI version
         \\
@@ -417,6 +430,8 @@ fn printHelp() void {
         \\  labelle upgrade --check
         \\  labelle ios build --simulator
         \\  labelle ios xcode
+        \\  labelle wasm build
+        \\  labelle wasm serve
         \\
     , .{cli_version});
 }
@@ -471,6 +486,19 @@ fn printCommandHelp(command: Command) void {
             \\  run             Build and run on device/simulator
             \\
             \\Run 'labelle ios' for full iOS help.
+            \\
+        , .{}),
+        .wasm => std.debug.print(
+            \\WebAssembly build and serve commands
+            \\
+            \\Usage: labelle wasm <command> [options]
+            \\
+            \\Commands:
+            \\  build           Build for WebAssembly
+            \\  serve           Build and serve locally
+            \\  export          Create optimized production build
+            \\
+            \\Run 'labelle wasm' for full WASM help.
             \\
         , .{}),
         else => printHelp(),

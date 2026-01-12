@@ -11,6 +11,10 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     output_dir: ?[]const u8 = null,
     physics_enabled: bool = false,
+    // Window configuration
+    window_width: ?i32 = null,
+    window_height: ?i32 = null,
+    window_title: ?[]const u8 = null,
     raw_content: []const u8,
 
     pub fn deinit(self: *const ProjectConfig, allocator: std.mem.Allocator) void {
@@ -42,6 +46,11 @@ pub fn readProjectConfig(allocator: std.mem.Allocator, project_path: []const u8)
     config.output_dir = extractStringField(content, ".output_dir");
     config.physics_enabled = isPhysicsEnabled(content);
 
+    // Window configuration
+    config.window_width = extractIntField(content, ".width");
+    config.window_height = extractIntField(content, ".height");
+    config.window_title = extractStringField(content, ".title");
+
     return config;
 }
 
@@ -65,6 +74,34 @@ fn isPhysicsEnabled(content: []const u8) bool {
 
     const physics_section = content[brace_pos..end_pos];
     return std.mem.indexOf(u8, physics_section, ".enabled = true") != null;
+}
+
+/// Extract an integer field value from ZON content.
+/// Looks for patterns like: .field_name = 123
+fn extractIntField(content: []const u8, field: []const u8) ?i32 {
+    // Look for the field
+    const field_pos = std.mem.indexOf(u8, content, field) orelse return null;
+
+    // Find the equals sign
+    const eq_pos = std.mem.indexOfPos(u8, content, field_pos, "=") orelse return null;
+
+    // Skip whitespace after equals
+    var start = eq_pos + 1;
+    while (start < content.len and (content[start] == ' ' or content[start] == '\t')) {
+        start += 1;
+    }
+
+    // Find end of number (comma, space, newline, or closing brace)
+    var end = start;
+    while (end < content.len) {
+        const c = content[end];
+        if (c == ',' or c == ' ' or c == '\n' or c == '\r' or c == '}') break;
+        end += 1;
+    }
+
+    if (start >= end) return null;
+
+    return std.fmt.parseInt(i32, content[start..end], 10) catch null;
 }
 
 /// Extract a string field value from ZON content.

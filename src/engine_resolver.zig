@@ -193,7 +193,7 @@ fn getBootstrapDir(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 /// Fetch the package hash for a given URL using zig fetch
-fn fetchPackageHash(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+pub fn fetchPackageHash(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     var child = std.process.Child.init(&.{ "zig", "fetch", url }, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
