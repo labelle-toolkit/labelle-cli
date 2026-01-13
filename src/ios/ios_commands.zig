@@ -367,15 +367,251 @@ fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
         // Build for simulator
         try handleIosBuild(allocator, &.{ project_path, "--simulator" });
 
-        // Run on simulator using xcrun simctl
-        std.debug.print("\nLaunching on simulator...\n", .{});
-        std.debug.print("Note: Simulator launch requires an Xcode project.\n", .{});
-        std.debug.print("Run 'labelle ios xcode' first, then open in Xcode to run on simulator.\n", .{});
+        // Deploy to simulator
+        std.debug.print("\nDeploying to simulator...\n", .{});
+        try deployToSimulator(allocator, project_path, ios_config);
     } else {
         std.debug.print("Building and running {s} on iOS Device...\n", .{ios_config.app_name});
         std.debug.print("\nNote: Running on device requires code signing.\n", .{});
         std.debug.print("Run 'labelle ios xcode' first, then deploy via Xcode.\n", .{});
     }
+}
+
+/// Deploy app to iOS Simulator using xcrun simctl
+fn deployToSimulator(allocator: std.mem.Allocator, project_path: []const u8, ios_config: IosConfig) !void {
+    const sanitized_name = try sanitizeName(allocator, ios_config.app_name);
+    defer allocator.free(sanitized_name);
+
+    // Path to simulator binary
+    const binary_path = try std.fmt.allocPrint(allocator, "{s}/ios/zig-out/bin/{s}_sim", .{ project_path, sanitized_name });
+    defer allocator.free(binary_path);
+
+    // Check binary exists
+    std.fs.cwd().access(binary_path, .{}) catch {
+        std.debug.print("Error: Binary not found at {s}\n", .{binary_path});
+        return error.BinaryNotFound;
+    };
+
+    // Create temporary .app bundle
+    const app_bundle = try std.fmt.allocPrint(allocator, "{s}/ios/{s}.app", .{ project_path, sanitized_name });
+    defer allocator.free(app_bundle);
+
+    // Create app directory
+    std.fs.cwd().makePath(app_bundle) catch {};
+
+    // Copy binary to app bundle
+    const app_binary = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ app_bundle, sanitized_name });
+    defer allocator.free(app_binary);
+
+    // Copy binary using file operations
+    const src_file = std.fs.cwd().openFile(binary_path, .{}) catch |err| {
+        std.debug.print("Error opening binary: {}\n", .{err});
+        return err;
+    };
+    defer src_file.close();
+
+    const dst_file = std.fs.cwd().createFile(app_binary, .{}) catch |err| {
+        std.debug.print("Error creating app binary: {}\n", .{err});
+        return err;
+    };
+    defer dst_file.close();
+
+    // Copy contents
+    const stat = src_file.stat() catch |err| {
+        std.debug.print("Error getting file stats: {}\n", .{err});
+        return err;
+    };
+
+    var buf: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (total < stat.size) {
+        const bytes_read = src_file.read(&buf) catch |err| {
+            std.debug.print("Error reading binary: {}\n", .{err});
+            return err;
+        };
+        if (bytes_read == 0) break;
+        dst_file.writeAll(buf[0..bytes_read]) catch |err| {
+            std.debug.print("Error writing binary: {}\n", .{err});
+            return err;
+        };
+        total += bytes_read;
+    }
+
+    // Make executable using chmod
+    _ = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "chmod", "+x", app_binary },
+    }) catch {};
+
+    // Generate Info.plist
+    const info_plist_path = try std.fmt.allocPrint(allocator, "{s}/Info.plist", .{app_bundle});
+    defer allocator.free(info_plist_path);
+
+    const info_plist_content = try generateSimulatorInfoPlist(allocator, ios_config);
+    defer allocator.free(info_plist_content);
+
+    const info_file = try std.fs.cwd().createFile(info_plist_path, .{});
+    defer info_file.close();
+    try info_file.writeAll(info_plist_content);
+
+    // Ensure a simulator is booted
+    const booted_udid = try ensureSimulatorBooted(allocator);
+
+    // Install app on simulator
+    std.debug.print("Installing app...\n", .{});
+    const install_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "xcrun", "simctl", "install", booted_udid, app_bundle },
+    }) catch |err| {
+        std.debug.print("Error running simctl install: {}\n", .{err});
+        return err;
+    };
+    defer allocator.free(install_result.stdout);
+    defer allocator.free(install_result.stderr);
+
+    if (install_result.term != .Exited or install_result.term.Exited != 0) {
+        std.debug.print("Install failed: {s}\n", .{install_result.stderr});
+        return error.InstallFailed;
+    }
+
+    // Launch app on simulator
+    std.debug.print("Launching app...\n", .{});
+    const launch_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "xcrun", "simctl", "launch", booted_udid, ios_config.bundle_id },
+    }) catch |err| {
+        std.debug.print("Error running simctl launch: {}\n", .{err});
+        return err;
+    };
+    defer allocator.free(launch_result.stdout);
+    defer allocator.free(launch_result.stderr);
+
+    if (launch_result.term != .Exited or launch_result.term.Exited != 0) {
+        std.debug.print("Launch failed: {s}\n", .{launch_result.stderr});
+        return error.LaunchFailed;
+    }
+
+    // Parse PID from output (format: "com.bundle.id: 12345")
+    if (std.mem.indexOf(u8, launch_result.stdout, ": ")) |colon_pos| {
+        const pid = std.mem.trim(u8, launch_result.stdout[colon_pos + 2 ..], &.{ ' ', '\n', '\r' });
+        std.debug.print("\nApp launched successfully! (PID: {s})\n", .{pid});
+    } else {
+        std.debug.print("\nApp launched successfully!\n", .{});
+    }
+
+    // Clean up app bundle (optional - leave it for reinstalls)
+    // std.fs.cwd().deleteTree(app_bundle) catch {};
+}
+
+/// Ensure an iOS simulator is booted, boot one if needed
+fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
+    // Check for booted simulator
+    const list_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "xcrun", "simctl", "list", "devices", "booted", "-j" },
+    }) catch |err| {
+        std.debug.print("Error listing simulators: {}\n", .{err});
+        return err;
+    };
+    defer allocator.free(list_result.stdout);
+    defer allocator.free(list_result.stderr);
+
+    // Simple check: if output contains a UDID pattern, a simulator is booted
+    // Look for pattern like "udid" : "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+    if (std.mem.indexOf(u8, list_result.stdout, "\"udid\"")) |_| {
+        // Extract first UDID from JSON
+        const udid_key = "\"udid\" : \"";
+        if (std.mem.indexOf(u8, list_result.stdout, udid_key)) |start| {
+            const udid_start = start + udid_key.len;
+            if (std.mem.indexOfPos(u8, list_result.stdout, udid_start, "\"")) |end| {
+                const udid = list_result.stdout[udid_start..end];
+                std.debug.print("Using booted simulator: {s}\n", .{udid});
+                // Return a copy since we're freeing list_result
+                return allocator.dupe(u8, udid) catch "booted";
+            }
+        }
+        // Fallback to "booted" which simctl understands
+        return "booted";
+    }
+
+    // No simulator booted, try to boot one
+    std.debug.print("No simulator booted. Starting iPhone simulator...\n", .{});
+
+    // Get available simulators
+    const avail_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "xcrun", "simctl", "list", "devices", "available" },
+    }) catch {
+        return "booted"; // Fallback
+    };
+    defer allocator.free(avail_result.stdout);
+    defer allocator.free(avail_result.stderr);
+
+    // Find an iPhone simulator UDID (look for pattern like "(XXXXXXXX-XXXX-")
+    var lines = std.mem.splitScalar(u8, avail_result.stdout, '\n');
+    while (lines.next()) |line| {
+        // Look for iPhone lines with UDID
+        if (std.mem.indexOf(u8, line, "iPhone") != null) {
+            if (std.mem.indexOf(u8, line, "(")) |paren_start| {
+                if (std.mem.indexOfPos(u8, line, paren_start, ")")) |paren_end| {
+                    const udid = line[paren_start + 1 .. paren_end];
+                    // Verify it looks like a UDID (36 chars with dashes)
+                    if (udid.len == 36 and udid[8] == '-') {
+                        std.debug.print("Booting simulator: {s}\n", .{std.mem.trim(u8, line, " \t")});
+
+                        // Boot this simulator
+                        var boot_child = std.process.Child.init(&.{ "xcrun", "simctl", "boot", udid }, allocator);
+                        _ = boot_child.spawnAndWait() catch {};
+
+                        // Wait a moment for boot
+                        std.Thread.sleep(2 * std.time.ns_per_s);
+
+                        return allocator.dupe(u8, udid) catch "booted";
+                    }
+                }
+            }
+        }
+    }
+
+    return "booted"; // Fallback
+}
+
+/// Generate minimal Info.plist for simulator app bundle
+fn generateSimulatorInfoPlist(allocator: std.mem.Allocator, ios_config: IosConfig) ![]const u8 {
+    const sanitized_name = try sanitizeName(allocator, ios_config.app_name);
+    defer allocator.free(sanitized_name);
+
+    return std.fmt.allocPrint(allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleExecutable</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleIdentifier</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleName</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleVersion</key>
+        \\    <string>1.0</string>
+        \\    <key>CFBundleShortVersionString</key>
+        \\    <string>1.0</string>
+        \\    <key>LSRequiresIPhoneOS</key>
+        \\    <true/>
+        \\    <key>UIRequiredDeviceCapabilities</key>
+        \\    <array>
+        \\        <string>arm64</string>
+        \\    </array>
+        \\    <key>UISupportedInterfaceOrientations</key>
+        \\    <array>
+        \\        <string>UIInterfaceOrientationPortrait</string>
+        \\        <string>UIInterfaceOrientationLandscapeLeft</string>
+        \\        <string>UIInterfaceOrientationLandscapeRight</string>
+        \\    </array>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ sanitized_name, ios_config.bundle_id, ios_config.app_name });
 }
 
 // ============================================================================
