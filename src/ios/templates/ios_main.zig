@@ -14,6 +14,9 @@
 const std = @import("std");
 const engine = @import("labelle-engine");
 
+// Import project's main module for registries and scenes
+const project = @import("main");
+
 // Sokol bindings - re-exported from engine for iOS callback architecture
 // This avoids module conflicts when both engine and app import sokol
 const sokol = engine.sokol;
@@ -23,7 +26,10 @@ const sapp = sokol.app;
 
 // Game types from engine
 const Game = engine.Game;
-const ProjectConfig = engine.ProjectConfig;
+
+// Use project's registries and loader
+const Loader = project.Loader;
+const initial_scene = project.initial_scene;
 
 // ============================================================================
 // Touch Input Types
@@ -49,10 +55,12 @@ const MAX_TOUCHES = 10;
 // Global State
 // ============================================================================
 
+const Scene = engine.scene.Scene;
+
 const State = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     game: ?*Game = null,
-    scene: ?*engine.Scene = null,
+    scene: ?*Scene = null,
     initialized: bool = false,
     should_quit: bool = false,
     ci_test: bool = false,
@@ -71,7 +79,7 @@ var state: State = .{};
 
 // Allocated storage for game and scene (needed because sokol callbacks can't return errors)
 var game_storage: Game = undefined;
-var scene_storage: engine.Scene = undefined;
+var scene_storage: Scene = undefined;
 
 // ============================================================================
 // Project Configuration (embedded at compile time for iOS)
@@ -82,22 +90,6 @@ const window_width: u32 = 800;
 const window_height: u32 = 600;
 const window_title = "Labelle Game";
 const clear_color: engine.Color = .{ .r = 30, .g = 35, .b = 45 };
-
-// ============================================================================
-// Registries (should be generated based on project)
-// ============================================================================
-
-pub const Prefabs = engine.PrefabRegistry(.{});
-pub const Components = engine.ComponentRegistry(struct {
-    // Engine built-in components
-    pub const Position = engine.Position;
-    pub const Sprite = engine.Sprite;
-    pub const Shape = engine.Shape;
-    pub const Text = engine.Text;
-});
-pub const Scripts = engine.ScriptRegistry(struct {});
-
-pub const Loader = engine.SceneLoader(Prefabs, Components, Scripts);
 
 // ============================================================================
 // Sokol App Callbacks
@@ -148,18 +140,19 @@ export fn init() callconv(.c) void {
     state.game = &game_storage;
     state.game.?.fixPointers();
 
-    // TODO: Load initial scene from project configuration
-    // const ctx = engine.SceneContext.init(state.game.?);
-    // scene_storage = Loader.load(initial_scene, ctx) catch |err| {
-    //     std.debug.print("Failed to load scene: {}\n", .{err});
-    //     sapp.quit();
-    //     return;
-    // };
-    // state.scene = &scene_storage;
+    // Load initial scene from project
+    const ctx = engine.SceneContext.init(state.game.?);
+    scene_storage = Loader.load(initial_scene, ctx) catch |err| {
+        std.debug.print("Failed to load scene: {}\n", .{err});
+        sapp.quit();
+        return;
+    };
+    state.scene = &scene_storage;
 
     state.initialized = true;
 
     std.debug.print("labelle-engine iOS initialized successfully!\n", .{});
+    std.debug.print("Scene: {s}\n", .{initial_scene.name});
     std.debug.print("Window size: {}x{}\n", .{ sapp.width(), sapp.height() });
 }
 

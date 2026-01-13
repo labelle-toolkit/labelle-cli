@@ -1001,6 +1001,16 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .physics = {s},
         \\    }});
         \\
+        \\    // Create main module from project's main.zig (contains registries and scenes)
+        \\    const ios_main_mod = b.createModule(.{{
+        \\        .root_source_file = b.path("../main.zig"),
+        \\        .target = ios_device_target,
+        \\        .optimize = optimize,
+        \\        .imports = &.{{
+        \\            .{{ .name = "labelle-engine", .module = ios_engine.module("labelle-engine") }},
+        \\        }},
+        \\    }});
+        \\
         \\    const ios_exe = b.addExecutable(.{{
         \\        .name = app_name,
         \\        .root_module = b.createModule(.{{
@@ -1008,8 +1018,8 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\            .target = ios_device_target,
         \\            .optimize = optimize,
         \\            .imports = &.{{
-        \\                // Only import engine - sokol Zig module accessed via engine.sokol
         \\                .{{ .name = "labelle-engine", .module = ios_engine.module("labelle-engine") }},
+        \\                .{{ .name = "main", .module = ios_main_mod }},
         \\            }},
         \\        }}),
         \\    }});
@@ -1047,6 +1057,16 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .physics = {s},
         \\    }});
         \\
+        \\    // Create main module from project's main.zig (contains registries and scenes)
+        \\    const sim_main_mod = b.createModule(.{{
+        \\        .root_source_file = b.path("../main.zig"),
+        \\        .target = ios_sim_target,
+        \\        .optimize = optimize,
+        \\        .imports = &.{{
+        \\            .{{ .name = "labelle-engine", .module = sim_engine.module("labelle-engine") }},
+        \\        }},
+        \\    }});
+        \\
         \\    const sim_exe = b.addExecutable(.{{
         \\        .name = app_name ++ "_sim",
         \\        .root_module = b.createModule(.{{
@@ -1054,8 +1074,8 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\            .target = ios_sim_target,
         \\            .optimize = optimize,
         \\            .imports = &.{{
-        \\                // Only import engine - sokol Zig module accessed via engine.sokol
         \\                .{{ .name = "labelle-engine", .module = sim_engine.module("labelle-engine") }},
+        \\                .{{ .name = "main", .module = sim_main_mod }},
         \\            }},
         \\        }}),
         \\    }});
