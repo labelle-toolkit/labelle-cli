@@ -81,7 +81,7 @@ var scene_storage: engine.Scene = undefined;
 const window_width: u32 = 800;
 const window_height: u32 = 600;
 const window_title = "Labelle Game";
-const clear_color = .{ .r = 30, .g = 35, .b = 45 };
+const clear_color: engine.Color = .{ .r = 30, .g = 35, .b = 45 };
 
 // ============================================================================
 // Registries (should be generated based on project)
