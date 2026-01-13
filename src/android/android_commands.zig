@@ -516,16 +516,7 @@ fn generateAndroidBuildFiles(allocator: Allocator, project_path: []const u8, con
     defer zig_file.close();
     try zig_file.writeAll(build_zig_content);
 
-    // Generate android_libc.conf
-    const libc_conf_content = try generateAndroidLibcConf(allocator);
-    defer allocator.free(libc_conf_content);
-
-    const libc_conf_path = try std.fs.path.join(allocator, &.{ android_dir, "android_libc.conf" });
-    defer allocator.free(libc_conf_path);
-
-    const libc_file = try std.fs.cwd().createFile(libc_conf_path, .{});
-    defer libc_file.close();
-    try libc_file.writeAll(libc_conf_content);
+    // Note: android_libc.conf is now generated dynamically by build.zig
 
     // Generate AndroidManifest.xml
     const manifest_content = try generateAndroidManifest(allocator, config);
@@ -591,9 +582,8 @@ fn generateAndroidBuildZig(allocator: Allocator, config: AndroidConfig) ![]const
         \\const std = @import("std");
         \\const builtin = @import("builtin");
         \\
-        \\// Android SDK configuration - adjust these to match your installation
+        \\// Android SDK configuration
         \\const ANDROID_API_VERSION = "{d}";
-        \\const ANDROID_NDK_VERSION = "26.1.10909125";
         \\
         \\const APP_NAME = "{s}";
         \\
@@ -613,7 +603,28 @@ fn generateAndroidBuildZig(allocator: Allocator, config: AndroidConfig) ![]const
         \\        return;
         \\    }};
         \\
-        \\    const ndk_path = try std.fs.path.join(b.allocator, &.{{ android_home, "ndk", ANDROID_NDK_VERSION }});
+        \\    // Auto-detect NDK version (find highest version in ndk/ directory)
+        \\    const ndk_dir = try std.fs.path.join(b.allocator, &.{{ android_home, "ndk" }});
+        \\    var ndk_version: ?[]const u8 = null;
+        \\    if (std.fs.openDirAbsolute(ndk_dir, .{{ .iterate = true }})) |dir| {{
+        \\        var d = dir;
+        \\        var iter = d.iterate();
+        \\        while (iter.next() catch null) |entry| {{
+        \\            if (entry.kind == .directory) {{
+        \\                // Keep highest version (simple string compare works for semver)
+        \\                if (ndk_version == null or std.mem.order(u8, entry.name, ndk_version.?) == .gt) {{
+        \\                    ndk_version = b.allocator.dupe(u8, entry.name) catch null;
+        \\                }}
+        \\            }}
+        \\        }}
+        \\    }} else |_| {{}}
+        \\
+        \\    if (ndk_version == null) {{
+        \\        std.log.err("No NDK found in {{s}}/ndk/", .{{android_home}});
+        \\        return;
+        \\    }}
+        \\
+        \\    const ndk_path = try std.fs.path.join(b.allocator, &.{{ android_home, "ndk", ndk_version.? }});
         \\
         \\    // Detect host OS for NDK toolchain
         \\    const host_tag: []const u8 = switch (builtin.os.tag) {{
@@ -677,8 +688,22 @@ fn generateAndroidBuildZig(allocator: Allocator, config: AndroidConfig) ![]const
         \\        }}),
         \\    }});
         \\
+        \\    // Generate android_libc.conf dynamically
+        \\    const libc_conf = try std.fmt.allocPrint(b.allocator,
+        \\        \\# Android NDK libc configuration (generated)
+        \\        \\include_dir={{s}}
+        \\        \\sys_include_dir={{s}}
+        \\        \\crt_dir={{s}}
+        \\        \\msvc_lib_dir=
+        \\        \\kernel32_lib_dir=
+        \\        \\gcc_dir=
+        \\        \\
+        \\    , .{{ inc_path, arch_inc_path, lib_path }});
+        \\    const libc_conf_file = b.addWriteFiles();
+        \\    const libc_path = libc_conf_file.add("android_libc.conf", libc_conf);
+        \\
         \\    // Set custom libc for Android NDK
-        \\    android_lib.setLibCFile(b.path("android_libc.conf"));
+        \\    android_lib.setLibCFile(libc_path);
         \\
         \\    // Set sysroot for NDK toolchain
         \\    android_lib.root_module.addSystemIncludePath(.{{ .cwd_relative = arch_inc_path }});
@@ -709,25 +734,6 @@ fn generateAndroidBuildZig(allocator: Allocator, config: AndroidConfig) ![]const
         sanitized_name,
         if (config.physics_enabled) "true" else "false",
     });
-}
-
-fn generateAndroidLibcConf(allocator: Allocator) ![]const u8 {
-    // Get ANDROID_HOME for paths
-    const android_home = std.process.getEnvVarOwned(allocator, "ANDROID_HOME") catch {
-        return error.AndroidHomeNotSet;
-    };
-    defer allocator.free(android_home);
-
-    return std.fmt.allocPrint(allocator,
-        \\# Android NDK libc configuration
-        \\include_dir={s}/ndk/26.1.10909125/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/include
-        \\sys_include_dir={s}/ndk/26.1.10909125/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/include/aarch64-linux-android
-        \\crt_dir={s}/ndk/26.1.10909125/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/34
-        \\msvc_lib_dir=
-        \\kernel32_lib_dir=
-        \\gcc_dir=
-        \\
-    , .{ android_home, android_home, android_home });
 }
 
 fn generateAndroidManifest(allocator: Allocator, config: AndroidConfig) ![]const u8 {
