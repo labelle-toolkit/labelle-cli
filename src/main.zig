@@ -22,6 +22,7 @@ const engine_resolver = @import("engine_resolver.zig");
 const project_config = @import("project_config.zig");
 const ios_commands = @import("ios/ios_commands.zig");
 const wasm_commands = @import("wasm/wasm_commands.zig");
+const android_commands = @import("android/android_commands.zig");
 
 // Version from build.zig.zon
 const build_zon = @import("build_zon");
@@ -37,6 +38,7 @@ const Command = enum {
     self_update,
     ios,
     wasm,
+    android,
     help,
     version,
 };
@@ -61,6 +63,8 @@ const Options = struct {
     ios_args: []const []const u8 = &.{},
     // WASM options - pass remaining args to wasm_commands
     wasm_args: []const []const u8 = &.{},
+    // Android options - pass remaining args to android_commands
+    android_args: []const []const u8 = &.{},
 };
 
 pub fn main() !void {
@@ -88,6 +92,7 @@ pub fn main() !void {
         .self_update => try runSelfUpdate(allocator),
         .ios => try ios_commands.handleIos(allocator, options.ios_args),
         .wasm => try wasm_commands.handleWasm(allocator, options.wasm_args),
+        .android => try android_commands.handleAndroid(allocator, options.android_args),
         .help => printHelp(),
         .version => printVersion(),
     }
@@ -127,6 +132,13 @@ fn parseArgs(args: []const []const u8) Options {
         // Pass all remaining args to wasm_commands
         if (args.len > 2) {
             options.wasm_args = args[2..];
+        }
+        return options;
+    } else if (std.mem.eql(u8, cmd_str, "android") or std.mem.eql(u8, cmd_str, "apk")) {
+        options.command = .android;
+        // Pass all remaining args to android_commands
+        if (args.len > 2) {
+            options.android_args = args[2..];
         }
         return options;
     } else if (std.mem.eql(u8, cmd_str, "help") or std.mem.eql(u8, cmd_str, "--help") or std.mem.eql(u8, cmd_str, "-h")) {
@@ -598,6 +610,7 @@ fn printHelp() void {
         \\  self-update     Update the labelle CLI itself
         \\  ios             iOS build and deployment commands
         \\  wasm            WebAssembly build and serve commands
+        \\  android         Android APK build and deployment commands
         \\  help            Show this help
         \\  version         Show CLI version
         \\
@@ -616,6 +629,8 @@ fn printHelp() void {
         \\  labelle ios xcode
         \\  labelle wasm build
         \\  labelle wasm serve
+        \\  labelle android build
+        \\  labelle android install
         \\
     , .{cli_version});
 }
@@ -699,6 +714,20 @@ fn printCommandHelp(command: Command) void {
             \\  export          Create optimized production build
             \\
             \\Run 'labelle wasm' for full WASM help.
+            \\
+        , .{}),
+        .android => std.debug.print(
+            \\Android APK build and deployment commands
+            \\
+            \\Usage: labelle android <command> [options]
+            \\
+            \\Commands:
+            \\  build           Build APK for Android
+            \\  install         Install APK to connected device/emulator
+            \\  run             Build and run on device/emulator
+            \\  emulator        List or launch Android emulators
+            \\
+            \\Run 'labelle android' for full Android help.
             \\
         , .{}),
         else => printHelp(),
