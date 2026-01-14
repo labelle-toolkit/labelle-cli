@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xa3d95bf7e69e1d1e,
     .name = .labelle_cli,
-    .version = "0.3.9",
+    .version = "0.3.10",
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         // Template engine for code generation
