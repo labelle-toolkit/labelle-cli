@@ -48,6 +48,7 @@ const Options = struct {
     project_path: []const u8 = ".",
     project_name: ?[]const u8 = null,
     engine_version: ?[]const u8 = null,
+    engine_path: ?[]const u8 = null, // Local engine path (for development/CI)
     main_only: bool = false,
     release: bool = false,
     backend: ?[]const u8 = null,
@@ -75,7 +76,15 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const options = parseArgs(args);
+    var options = parseArgs(args);
+
+    // Check for LABELLE_ENGINE_PATH environment variable (cross-platform)
+    var env_engine_path: ?[]const u8 = null;
+    if (options.engine_path == null) {
+        env_engine_path = std.process.getEnvVarOwned(allocator, "LABELLE_ENGINE_PATH") catch null;
+        options.engine_path = env_engine_path;
+    }
+    defer if (env_engine_path) |p| allocator.free(p);
 
     if (options.show_help) {
         printCommandHelp(options.command);
@@ -167,6 +176,8 @@ fn parseArgs(args: []const []const u8) Options {
             options.upgrade_force = true;
         } else if (std.mem.startsWith(u8, arg, "--engine=")) {
             options.engine_version = arg["--engine=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            options.engine_path = arg["--engine-path=".len..];
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             options.backend = arg["--backend=".len..];
         } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
@@ -261,8 +272,17 @@ fn runInit(allocator: std.mem.Allocator, options: Options) !void {
 }
 
 fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
-    _ = options;
     std.debug.print("Generating project files...\n", .{});
+
+    // Check if using local engine path
+    if (options.engine_path) |local_path| {
+        // Use local engine path (for development/CI)
+        engine_resolver.runEngineGeneratorWithLocalPath(allocator, local_path) catch |err| {
+            std.debug.print("Error running generator with local path: {}\n", .{err});
+            return;
+        };
+        return;
+    }
 
     // Read project.labelle to get engine version
     const config = project_config.readProjectConfig(allocator, ".") catch |err| {
@@ -284,7 +304,7 @@ fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
     std.debug.print("Using labelle-engine {s}\n", .{resolved.version});
 
     // Fetch engine and run its generator
-    engine_resolver.runEngineGenerator(allocator, resolved.version, ".") catch |err| {
+    engine_resolver.runEngineGenerator(allocator, resolved.version) catch |err| {
         if (err == engine_resolver.VersionError.FetchFailed) {
             return; // Error already printed
         }
@@ -615,9 +635,13 @@ fn printHelp() void {
         \\  version         Show CLI version
         \\
         \\Options:
-        \\  --engine=VER    Specify labelle-engine version (default: from project.labelle)
-        \\  --release, -r   Build in release mode
-        \\  --help, -h      Show help for a command
+        \\  --engine=VER        Specify labelle-engine version (default: from project.labelle)
+        \\  --engine-path=PATH  Use local engine path instead of fetching from registry
+        \\  --release, -r       Build in release mode
+        \\  --help, -h          Show help for a command
+        \\
+        \\Environment Variables:
+        \\  LABELLE_ENGINE_PATH   Path to local labelle-engine checkout (for development/CI)
         \\
         \\Examples:
         \\  labelle init my-game
@@ -631,6 +655,10 @@ fn printHelp() void {
         \\  labelle wasm serve
         \\  labelle android build
         \\  labelle android install
+        \\
+        \\  # Using local engine (for development/CI)
+        \\  labelle build --engine-path=/path/to/labelle-engine
+        \\  LABELLE_ENGINE_PATH=/path/to/engine labelle build
         \\
     , .{cli_version});
 }
@@ -658,8 +686,12 @@ fn printCommandHelp(command: Command) void {
             \\Usage: labelle generate [options]
             \\
             \\Options:
-            \\  --main-only     Only regenerate main.zig
-            \\  --no-fetch      Skip fetching dependency hashes
+            \\  --main-only         Only regenerate main.zig
+            \\  --no-fetch          Skip fetching dependency hashes
+            \\  --engine-path=PATH  Use local engine instead of fetching from registry
+            \\
+            \\Environment Variables:
+            \\  LABELLE_ENGINE_PATH   Path to local labelle-engine checkout
             \\
         , .{}),
         .upgrade => std.debug.print(
