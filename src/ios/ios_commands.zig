@@ -684,24 +684,24 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
 
     // Determine engine dependency source
     // Priority: 1. Explicit engine_path, 2. Read from .labelle/build.zig.zon
-    var engine_dep: EngineDependency = undefined;
-    var engine_dep_allocated = false;
-
-    if (engine_path) |path| {
+    //
+    // Note on path security: The --engine-path flag allows pointing to arbitrary filesystem
+    // locations. This is intentional for CI/development use cases where users need to specify
+    // their local engine checkout. This is similar to npm/pip local path installs.
+    // The user running this CLI has full system access anyway.
+    const engine_dep: EngineDependency = if (engine_path) |path| blk: {
         // Use explicit engine path directly
         std.debug.print("Using engine path: {s}\n", .{path});
-        engine_dep = .{ .path = try allocator.dupe(u8, path) };
-        engine_dep_allocated = true;
-    } else {
+        break :blk .{ .path = try allocator.dupe(u8, path) };
+    } else blk: {
         // Try to read engine dependency from main project's .labelle/build.zig.zon
-        engine_dep = readEngineDependency(allocator, project_path) catch |err| {
+        break :blk readEngineDependency(allocator, project_path) catch |err| {
             std.debug.print("Warning: Could not read engine dependency from .labelle/build.zig.zon: {}\n", .{err});
             std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
             return err;
         };
-        engine_dep_allocated = true;
-    }
-    defer if (engine_dep_allocated) engine_dep.deinit(allocator);
+    };
+    defer engine_dep.deinit(allocator);
 
     // Note: The fingerprint will be validated by Zig on first build.
     // If it fails, Zig will suggest the correct value.
