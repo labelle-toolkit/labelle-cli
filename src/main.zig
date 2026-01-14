@@ -99,7 +99,7 @@ pub fn main() !void {
         .update => try runUpdate(allocator, options),
         .upgrade => try runUpgrade(allocator, options),
         .self_update => try runSelfUpdate(allocator),
-        .ios => try ios_commands.handleIos(allocator, options.ios_args),
+        .ios => try ios_commands.handleIos(allocator, options.ios_args, options.engine_path),
         .wasm => try wasm_commands.handleWasm(allocator, options.wasm_args),
         .android => try android_commands.handleAndroid(allocator, options.android_args),
         .help => printHelp(),

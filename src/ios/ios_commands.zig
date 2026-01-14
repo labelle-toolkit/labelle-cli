@@ -77,7 +77,7 @@ pub const IosConfig = struct {
 };
 
 /// Main iOS command dispatcher
-pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8) !void {
+pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, engine_path: ?[]const u8) !void {
     if (args.len == 0) {
         printIosHelp();
         return;
@@ -86,11 +86,11 @@ pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const subcommand = args[0];
 
     if (std.mem.eql(u8, subcommand, "build")) {
-        try handleIosBuild(allocator, args[1..]);
+        try handleIosBuild(allocator, args[1..], engine_path);
     } else if (std.mem.eql(u8, subcommand, "xcode")) {
-        try handleIosXcode(allocator, args[1..]);
+        try handleIosXcode(allocator, args[1..], engine_path);
     } else if (std.mem.eql(u8, subcommand, "run")) {
-        try handleIosRun(allocator, args[1..]);
+        try handleIosRun(allocator, args[1..], engine_path);
     } else if (std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h")) {
         printIosHelp();
     } else {
@@ -111,18 +111,21 @@ fn printIosHelp() void {
         \\  run         Build and run on device/simulator
         \\
         \\Build Options:
-        \\  --simulator       Build for iOS simulator instead of device
-        \\  --release         Build release configuration
-        \\  --app-name NAME   Override app name
-        \\  --bundle-id ID    Override bundle identifier
+        \\  --simulator           Build for iOS simulator instead of device
+        \\  --release             Build release configuration
+        \\  --engine-path=PATH    Use local engine path instead of fetching from registry
+        \\  --app-name NAME       Override app name
+        \\  --bundle-id ID        Override bundle identifier
         \\
         \\Xcode Options:
-        \\  --team-id ID      Apple Developer Team ID for signing
-        \\  --output DIR      Output directory (default: ./ios-xcode)
+        \\  --team-id ID          Apple Developer Team ID for signing
+        \\  --output DIR          Output directory (default: ./ios-xcode)
+        \\  --engine-path=PATH    Use local engine path
         \\
         \\Run Options:
-        \\  --simulator       Run on iOS simulator
-        \\  --device          Run on connected device (default)
+        \\  --simulator           Run on iOS simulator
+        \\  --device              Run on connected device (default)
+        \\  --engine-path=PATH    Use local engine path
         \\
         \\Configuration:
         \\  Create ios.labelle in your project for iOS-specific settings:
@@ -136,10 +139,11 @@ fn printIosHelp() void {
         \\  }}
         \\
         \\Examples:
-        \\  labelle ios build              # Build for iOS device
-        \\  labelle ios build --simulator  # Build for simulator
-        \\  labelle ios xcode              # Generate Xcode project
-        \\  labelle ios run --simulator    # Run on simulator
+        \\  labelle ios build                                   # Build for iOS device
+        \\  labelle ios build --simulator                       # Build for simulator
+        \\  labelle ios build --engine-path=/path/to/engine     # Build with local engine
+        \\  labelle ios xcode                                   # Generate Xcode project
+        \\  labelle ios run --simulator                         # Run on simulator
         \\
     , .{});
 }
@@ -148,10 +152,11 @@ fn printIosHelp() void {
 // iOS Build Command
 // ============================================================================
 
-fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8, global_engine_path: ?[]const u8) !void {
     var project_path: []const u8 = ".";
     var simulator = false;
     var release = false;
+    var local_engine_path: ?[]const u8 = null;
 
     // Parse args
     var i: usize = 0;
@@ -161,10 +166,15 @@ fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8) !void 
             simulator = true;
         } else if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) {
             release = true;
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            local_engine_path = arg["--engine-path=".len..];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             project_path = arg;
         }
     }
+
+    // Use local override if provided, otherwise use global engine path
+    const engine_path = local_engine_path orelse global_engine_path;
 
     // Load iOS config
     const ios_config = try IosConfig.load(allocator, project_path);
@@ -176,9 +186,12 @@ fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8) !void 
     std.debug.print("Building {s} for iOS...\n", .{ios_config.app_name});
     std.debug.print("  Target: {s}\n", .{if (simulator) "iOS Simulator (arm64)" else "iOS Device (arm64)"});
     std.debug.print("  Configuration: {s}\n", .{if (release) "Release" else "Debug"});
+    if (engine_path) |ep| {
+        std.debug.print("  Engine: {s}\n", .{ep});
+    }
 
     // Ensure iOS build files exist
-    try ensureIosBuildFiles(allocator, project_path, ios_config);
+    try ensureIosBuildFiles(allocator, project_path, ios_config, engine_path);
 
     // Get iOS build directory
     const ios_dir = try std.fs.path.join(allocator, &.{ project_path, "ios" });
@@ -285,10 +298,11 @@ fn fixFingerprint(allocator: std.mem.Allocator, path: []const u8, new_fp: []cons
 // iOS Xcode Command
 // ============================================================================
 
-fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8, global_engine_path: ?[]const u8) !void {
     var project_path: []const u8 = ".";
     var team_id: ?[]const u8 = null;
     var output_dir: []const u8 = "./ios-xcode";
+    var local_engine_path: ?[]const u8 = null;
 
     // Parse args
     var i: usize = 0;
@@ -304,10 +318,15 @@ fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8) !void 
             if (i < args.len) output_dir = args[i];
         } else if (std.mem.startsWith(u8, arg, "--output=")) {
             output_dir = arg["--output=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            local_engine_path = arg["--engine-path=".len..];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             project_path = arg;
         }
     }
+
+    // Use local override if provided, otherwise use global engine path
+    const engine_path = local_engine_path orelse global_engine_path;
 
     // Load iOS config
     var ios_config = try IosConfig.load(allocator, project_path);
@@ -319,7 +338,7 @@ fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8) !void 
 
     // First, build the iOS binary
     std.debug.print("\nStep 1: Building iOS binary...\n", .{});
-    try handleIosBuild(allocator, &.{project_path});
+    try handleIosBuild(allocator, &.{project_path}, engine_path);
 
     // Generate Xcode project
     std.debug.print("\nStep 2: Generating Xcode project...\n", .{});
@@ -341,9 +360,10 @@ fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8) !void 
 // iOS Run Command
 // ============================================================================
 
-fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8, global_engine_path: ?[]const u8) !void {
     var project_path: []const u8 = ".";
     var simulator = false;
+    var local_engine_path: ?[]const u8 = null;
 
     // Parse args
     var i: usize = 0;
@@ -353,10 +373,15 @@ fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
             simulator = true;
         } else if (std.mem.eql(u8, arg, "--device") or std.mem.eql(u8, arg, "-d")) {
             simulator = false;
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            local_engine_path = arg["--engine-path=".len..];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             project_path = arg;
         }
     }
+
+    // Use local override if provided, otherwise use global engine path
+    const engine_path = local_engine_path orelse global_engine_path;
 
     // Load iOS config
     const ios_config = try IosConfig.load(allocator, project_path);
@@ -365,7 +390,7 @@ fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("Building and running {s} on iOS Simulator...\n", .{ios_config.app_name});
 
         // Build for simulator
-        try handleIosBuild(allocator, &.{ project_path, "--simulator" });
+        try handleIosBuild(allocator, &.{ project_path, "--simulator" }, engine_path);
 
         // Deploy to simulator
         std.debug.print("\nDeploying to simulator...\n", .{});
@@ -619,7 +644,7 @@ fn generateSimulatorInfoPlist(allocator: std.mem.Allocator, ios_config: IosConfi
 // ============================================================================
 
 /// Ensure iOS build directory and files exist
-fn ensureIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8, ios_config: IosConfig) !void {
+fn ensureIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8, ios_config: IosConfig, engine_path: ?[]const u8) !void {
     const ios_dir = try std.fs.path.join(allocator, &.{ project_path, "ios" });
     defer allocator.free(ios_dir);
 
@@ -633,12 +658,12 @@ fn ensureIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8, i
     std.fs.cwd().access(build_zig_path, .{}) catch {
         // Generate iOS build files
         std.debug.print("Generating iOS build files...\n", .{});
-        try generateIosBuildFiles(allocator, project_path, ios_config);
+        try generateIosBuildFiles(allocator, project_path, ios_config, engine_path);
     };
 }
 
 /// Generate iOS build.zig and build.zig.zon
-fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8, ios_config: IosConfig) !void {
+fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8, ios_config: IosConfig, engine_path: ?[]const u8) !void {
     const ios_dir = try std.fs.path.join(allocator, &.{ project_path, "ios" });
     defer allocator.free(ios_dir);
 
@@ -657,11 +682,24 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     const sanitized_app_name = try sanitizeName(allocator, ios_config.app_name);
     defer allocator.free(sanitized_app_name);
 
-    // Try to read engine dependency from main project's .labelle/build.zig.zon
-    const engine_dep = readEngineDependency(allocator, project_path) catch |err| {
-        std.debug.print("Warning: Could not read engine dependency from .labelle/build.zig.zon: {}\n", .{err});
-        std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
-        return err;
+    // Determine engine dependency source
+    // Priority: 1. Explicit engine_path, 2. Read from .labelle/build.zig.zon
+    //
+    // Note on path security: The --engine-path flag allows pointing to arbitrary filesystem
+    // locations. This is intentional for CI/development use cases where users need to specify
+    // their local engine checkout. This is similar to npm/pip local path installs.
+    // The user running this CLI has full system access anyway.
+    const engine_dep: EngineDependency = if (engine_path) |path| blk: {
+        // Use explicit engine path directly
+        std.debug.print("Using engine path: {s}\n", .{path});
+        break :blk .{ .path = try allocator.dupe(u8, path) };
+    } else blk: {
+        // Try to read engine dependency from main project's .labelle/build.zig.zon
+        break :blk readEngineDependency(allocator, project_path) catch |err| {
+            std.debug.print("Warning: Could not read engine dependency from .labelle/build.zig.zon: {}\n", .{err});
+            std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
+            return err;
+        };
     };
     defer engine_dep.deinit(allocator);
 
@@ -671,10 +709,30 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     // is accessed through engine.sokol to avoid module conflicts
     const build_zon_content = switch (engine_dep) {
         .path => |path| blk: {
-            // Adjust path for ios/ subdirectory - prepend ../ to navigate out of ios/ first
-            // The path from .labelle/build.zig.zon is relative to project root,
-            // but ios/build.zig.zon needs path relative to ios/ directory
-            const adjusted_path = try std.fmt.allocPrint(allocator, "../{s}", .{path});
+            // Zig build system requires relative paths in .path dependencies.
+            // We need to compute the relative path from ios/ directory to the engine.
+            const adjusted_path = if (std.fs.path.isAbsolute(path)) adj: {
+                // Convert absolute path to relative path from ios/ directory
+                // Get the absolute path of the ios directory
+                const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch {
+                    // Fallback: use ../ prefix and hope for the best
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+                defer allocator.free(cwd);
+
+                const ios_abs = std.fs.path.join(allocator, &.{ cwd, ios_dir }) catch {
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+                defer allocator.free(ios_abs);
+
+                // Compute relative path from ios/ to engine
+                break :adj std.fs.path.relative(allocator, ios_abs, path) catch {
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+            } else adj: {
+                // Relative paths (from project root) need ../ to navigate out of ios/
+                break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+            };
             defer allocator.free(adjusted_path);
 
             break :blk try std.fmt.allocPrint(allocator,
