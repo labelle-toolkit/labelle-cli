@@ -670,26 +670,34 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     // sokol dependency is needed for linking sokol_clib, but the Zig module
     // is accessed through engine.sokol to avoid module conflicts
     const build_zon_content = switch (engine_dep) {
-        .path => |path| try std.fmt.allocPrint(allocator,
-            \\.{{
-            \\    .fingerprint = 0xb8a8f4e73d5c1a92,
-            \\    .name = .{s}_ios,
-            \\    .version = "0.1.0",
-            \\    .dependencies = .{{
-            \\        // sokol for linking sokol_clib (C library)
-            \\        // Zig module accessed via engine.sokol to avoid conflicts
-            \\        .sokol = .{{
-            \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
-            \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
-            \\        }},
-            \\        .@"labelle-engine" = .{{
-            \\            .path = "{s}",
-            \\        }},
-            \\    }},
-            \\    .paths = .{{ "build.zig", "build.zig.zon" }},
-            \\}}
-            \\
-        , .{ sanitized_app_name, path }),
+        .path => |path| blk: {
+            // Adjust path for ios/ subdirectory - prepend ../ to navigate out of ios/ first
+            // The path from .labelle/build.zig.zon is relative to project root,
+            // but ios/build.zig.zon needs path relative to ios/ directory
+            const adjusted_path = try std.fmt.allocPrint(allocator, "../{s}", .{path});
+            defer allocator.free(adjusted_path);
+
+            break :blk try std.fmt.allocPrint(allocator,
+                \\.{{
+                \\    .fingerprint = 0xb8a8f4e73d5c1a92,
+                \\    .name = .{s}_ios,
+                \\    .version = "0.1.0",
+                \\    .dependencies = .{{
+                \\        // sokol for linking sokol_clib (C library)
+                \\        // Zig module accessed via engine.sokol to avoid conflicts
+                \\        .sokol = .{{
+                \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
+                \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
+                \\        }},
+                \\        .@"labelle-engine" = .{{
+                \\            .path = "{s}",
+                \\        }},
+                \\    }},
+                \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+                \\}}
+                \\
+            , .{ sanitized_app_name, adjusted_path });
+        },
         .hash => |hash| try std.fmt.allocPrint(allocator,
             \\.{{
             \\    .fingerprint = 0xb8a8f4e73d5c1a92,
@@ -939,12 +947,16 @@ fn readEngineDependency(allocator: std.mem.Allocator, project_path: []const u8) 
     defer allocator.free(content);
     _ = try file.readAll(content);
 
-    // First check for path-based dependency: .path = "..."
-    // Look for labelle-engine section first
+    // Look for labelle-engine dependency block and extract path or hash
+    // Scope the search to just the labelle-engine block to avoid matching other dependencies
     if (std.mem.indexOf(u8, content, ".@\"labelle-engine\"")) |engine_start| {
-        const section = content[engine_start..];
+        const after_engine = content[engine_start..];
 
-        // Check for .path within this section
+        // Find the end of this dependency block (closing "},")
+        const block_end = std.mem.indexOf(u8, after_engine, "},") orelse after_engine.len;
+        const section = after_engine[0..block_end];
+
+        // Check for .path within this block only
         if (std.mem.indexOf(u8, section, ".path = \"")) |path_start| {
             const value_start = path_start + ".path = \"".len;
             if (std.mem.indexOfPos(u8, section, value_start, "\"")) |value_end| {
@@ -952,7 +964,7 @@ fn readEngineDependency(allocator: std.mem.Allocator, project_path: []const u8) 
             }
         }
 
-        // Check for .hash within this section
+        // Check for .hash within this block only
         if (std.mem.indexOf(u8, section, ".hash = \"")) |hash_start| {
             const value_start = hash_start + ".hash = \"".len;
             if (std.mem.indexOfPos(u8, section, value_start, "\"")) |value_end| {
