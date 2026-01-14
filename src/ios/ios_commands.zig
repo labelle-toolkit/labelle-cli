@@ -978,11 +978,12 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    }});
         \\
         \\    // iOS Simulator Target (Apple Silicon Macs)
+        \\    // Use apple_a14 to enable NEON SIMD features required by box2d physics
         \\    const ios_sim_target = b.resolveTargetQuery(.{{
         \\        .cpu_arch = .aarch64,
         \\        .os_tag = .ios,
         \\        .abi = .simulator,
-        \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_m1 }},
+        \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_a14 }},
         \\    }});
         \\
         \\    // iOS Device build
