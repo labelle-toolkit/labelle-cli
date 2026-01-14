@@ -1048,13 +1048,11 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    const app_name = "{s}";
         \\
         \\    // Detect iOS SDK path using xcrun (required for C header includes)
-        \\    // Use simulator SDK as it works for both device and simulator builds
-        \\    // (simulator SDK is a superset that includes both architectures)
-        \\    if (getIosSdkPath(b, "iphonesimulator")) |sdk_path| {{
-        \\        b.sysroot = sdk_path;
-        \\    }} else if (getIosSdkPath(b, "iphoneos")) |sdk_path| {{
-        \\        b.sysroot = sdk_path;
-        \\    }}
+        \\    // Note: We don't set b.sysroot to avoid path doubling issues during linking.
+        \\    // Instead, we manually add SDK paths to all artifacts.
+        \\    const sdk_path = getIosSdkPath(b, "iphonesimulator") orelse
+        \\        getIosSdkPath(b, "iphoneos") orelse
+        \\        @panic("Could not find iOS SDK. Is Xcode installed?");
         \\
         \\    // iOS Device Target
         \\    const ios_device_target = b.resolveTargetQuery(.{{
@@ -1071,10 +1069,6 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_a14 }},
         \\    }});
         \\
-        \\    // iOS SDK paths (use non-versioned paths which are symlinks to current SDK)
-        \\    const ios_device_sdk = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk";
-        \\    const ios_sim_sdk = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk";
-        \\
         \\    // iOS Device build
         \\    // sokol dependency for linking C library (dont_link_system_libs=true for iOS)
         \\    const ios_sokol = b.dependency("sokol", .{{
@@ -1085,9 +1079,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\
         \\    // Configure sokol for iOS - add SDK include paths for C header compilation
         \\    const ios_sokol_clib = ios_sokol.artifact("sokol_clib");
-        \\    ios_sokol_clib.root_module.addSystemIncludePath(.{{ .cwd_relative = ios_device_sdk ++ "/usr/include" }});
-        \\    ios_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = ios_device_sdk ++ "/System/Library/Frameworks" }});
-        \\    ios_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = ios_device_sdk ++ "/System/Library/SubFrameworks" }});
+        \\    ios_sokol_clib.root_module.addSystemIncludePath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "usr/include" }}) }});
+        \\    ios_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/Frameworks" }}) }});
+        \\    ios_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/SubFrameworks" }}) }});
         \\
         \\    // Engine provides sokol through engine.sokol (re-exported to avoid module conflicts)
         \\    // iOS requires sokol backend (raylib not available)
@@ -1125,8 +1119,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    ios_exe.linkLibrary(ios_sokol.artifact("sokol_clib"));
         \\    ios_exe.linkLibC();
         \\
-        \\    // Add iOS Device SDK framework search path
-        \\    ios_exe.root_module.addFrameworkPath(.{{ .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/System/Library/Frameworks" }});
+        \\    // Add iOS SDK library and framework search paths
+        \\    ios_exe.root_module.addLibraryPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "usr/lib" }}) }});
+        \\    ios_exe.root_module.addFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/Frameworks" }}) }});
         \\
         \\    // Link iOS frameworks
         \\    ios_exe.root_module.linkFramework("Foundation", .{{}});
@@ -1149,9 +1144,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\
         \\    // Configure sokol for iOS Simulator - add SDK include paths for C header compilation
         \\    const sim_sokol_clib = sim_sokol.artifact("sokol_clib");
-        \\    sim_sokol_clib.root_module.addSystemIncludePath(.{{ .cwd_relative = ios_sim_sdk ++ "/usr/include" }});
-        \\    sim_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = ios_sim_sdk ++ "/System/Library/Frameworks" }});
-        \\    sim_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = ios_sim_sdk ++ "/System/Library/SubFrameworks" }});
+        \\    sim_sokol_clib.root_module.addSystemIncludePath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "usr/include" }}) }});
+        \\    sim_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/Frameworks" }}) }});
+        \\    sim_sokol_clib.root_module.addSystemFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/SubFrameworks" }}) }});
         \\
         \\    // iOS requires sokol backend (raylib not available)
         \\    const sim_engine = b.dependency("labelle-engine", .{{
@@ -1188,8 +1183,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    sim_exe.linkLibrary(sim_sokol.artifact("sokol_clib"));
         \\    sim_exe.linkLibC();
         \\
-        \\    // Add iOS Simulator SDK framework search path
-        \\    sim_exe.root_module.addFrameworkPath(.{{ .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk/System/Library/Frameworks" }});
+        \\    // Add iOS SDK library and framework search paths
+        \\    sim_exe.root_module.addLibraryPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "usr/lib" }}) }});
+        \\    sim_exe.root_module.addFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/Frameworks" }}) }});
         \\
         \\    sim_exe.root_module.linkFramework("Foundation", .{{}});
         \\    sim_exe.root_module.linkFramework("UIKit", .{{}});
