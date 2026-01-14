@@ -521,11 +521,18 @@ pub fn runEngineGeneratorWithLocalPath(allocator: std.mem.Allocator, local_path:
 
     std.debug.print("Running generator...\n", .{});
 
+    // Pass --engine-path to the generator so it knows to use local path
+    // for the output build.zig.zon (skip GitHub fetching)
+    const engine_path_arg = try std.fmt.allocPrint(allocator, "--engine-path={s}", .{local_path});
+    defer allocator.free(engine_path_arg);
+
     // Run the generator from the bootstrap directory
     var child = std.process.Child.init(&.{
         "zig",
         "build",
         "run",
+        "--", // Separator for arguments passed to the generator
+        engine_path_arg,
     }, allocator);
     child.cwd = bootstrap_dir_path;
 

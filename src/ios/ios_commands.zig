@@ -657,39 +657,61 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     const sanitized_app_name = try sanitizeName(allocator, ios_config.app_name);
     defer allocator.free(sanitized_app_name);
 
-    // Try to read engine hash from main project's .labelle/build.zig.zon
-    const engine_hash = readEngineHash(allocator, project_path) catch |err| {
-        std.debug.print("Warning: Could not read engine hash from .labelle/build.zig.zon: {}\n", .{err});
+    // Try to read engine dependency from main project's .labelle/build.zig.zon
+    const engine_dep = readEngineDependency(allocator, project_path) catch |err| {
+        std.debug.print("Warning: Could not read engine dependency from .labelle/build.zig.zon: {}\n", .{err});
         std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
         return err;
     };
-    defer allocator.free(engine_hash);
+    defer engine_dep.deinit(allocator);
 
     // Note: The fingerprint will be validated by Zig on first build.
     // If it fails, Zig will suggest the correct value.
     // sokol dependency is needed for linking sokol_clib, but the Zig module
     // is accessed through engine.sokol to avoid module conflicts
-    const build_zon_content = try std.fmt.allocPrint(allocator,
-        \\.{{
-        \\    .fingerprint = 0xb8a8f4e73d5c1a92,
-        \\    .name = .{s}_ios,
-        \\    .version = "0.1.0",
-        \\    .dependencies = .{{
-        \\        // sokol for linking sokol_clib (C library)
-        \\        // Zig module accessed via engine.sokol to avoid conflicts
-        \\        .sokol = .{{
-        \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
-        \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
-        \\        }},
-        \\        .@"labelle-engine" = .{{
-        \\            .url = "git+https://github.com/labelle-toolkit/labelle-engine#v{s}",
-        \\            .hash = "{s}",
-        \\        }},
-        \\    }},
-        \\    .paths = .{{ "build.zig", "build.zig.zon" }},
-        \\}}
-        \\
-    , .{ sanitized_app_name, ios_config.engine_version, engine_hash });
+    const build_zon_content = switch (engine_dep) {
+        .path => |path| try std.fmt.allocPrint(allocator,
+            \\.{{
+            \\    .fingerprint = 0xb8a8f4e73d5c1a92,
+            \\    .name = .{s}_ios,
+            \\    .version = "0.1.0",
+            \\    .dependencies = .{{
+            \\        // sokol for linking sokol_clib (C library)
+            \\        // Zig module accessed via engine.sokol to avoid conflicts
+            \\        .sokol = .{{
+            \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
+            \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
+            \\        }},
+            \\        .@"labelle-engine" = .{{
+            \\            .path = "{s}",
+            \\        }},
+            \\    }},
+            \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+            \\}}
+            \\
+        , .{ sanitized_app_name, path }),
+        .hash => |hash| try std.fmt.allocPrint(allocator,
+            \\.{{
+            \\    .fingerprint = 0xb8a8f4e73d5c1a92,
+            \\    .name = .{s}_ios,
+            \\    .version = "0.1.0",
+            \\    .dependencies = .{{
+            \\        // sokol for linking sokol_clib (C library)
+            \\        // Zig module accessed via engine.sokol to avoid conflicts
+            \\        .sokol = .{{
+            \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
+            \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
+            \\        }},
+            \\        .@"labelle-engine" = .{{
+            \\            .url = "git+https://github.com/labelle-toolkit/labelle-engine#v{s}",
+            \\            .hash = "{s}",
+            \\        }},
+            \\    }},
+            \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+            \\}}
+            \\
+        , .{ sanitized_app_name, ios_config.engine_version, hash }),
+    };
     defer allocator.free(build_zon_content);
 
     const build_zon_file = try std.fs.cwd().createFile(build_zon_path, .{});
@@ -890,8 +912,22 @@ fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return result;
 }
 
-/// Read the labelle-engine hash from the main project's .labelle/build.zig.zon
-fn readEngineHash(allocator: std.mem.Allocator, project_path: []const u8) ![]const u8 {
+/// Engine dependency - either a hash (for URL-based) or path (for local)
+const EngineDependency = union(enum) {
+    hash: []const u8,
+    path: []const u8,
+
+    pub fn deinit(self: EngineDependency, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .hash => |h| allocator.free(h),
+            .path => |p| allocator.free(p),
+        }
+    }
+};
+
+/// Read the labelle-engine dependency from the main project's .labelle/build.zig.zon
+/// Returns either a hash (for URL-based dependency) or a path (for local dependency)
+fn readEngineDependency(allocator: std.mem.Allocator, project_path: []const u8) !EngineDependency {
     const build_zon_path = try std.fs.path.join(allocator, &.{ project_path, ".labelle", "build.zig.zon" });
     defer allocator.free(build_zon_path);
 
@@ -903,12 +939,25 @@ fn readEngineHash(allocator: std.mem.Allocator, project_path: []const u8) ![]con
     defer allocator.free(content);
     _ = try file.readAll(content);
 
-    // Look for .hash = "labelle_engine-..." pattern
-    const hash_prefix = ".hash = \"labelle_engine-";
-    if (std.mem.indexOf(u8, content, hash_prefix)) |start| {
-        const hash_start = start + ".hash = \"".len;
-        if (std.mem.indexOfPos(u8, content, hash_start, "\"")) |end| {
-            return try allocator.dupe(u8, content[hash_start..end]);
+    // First check for path-based dependency: .path = "..."
+    // Look for labelle-engine section first
+    if (std.mem.indexOf(u8, content, ".@\"labelle-engine\"")) |engine_start| {
+        const section = content[engine_start..];
+
+        // Check for .path within this section
+        if (std.mem.indexOf(u8, section, ".path = \"")) |path_start| {
+            const value_start = path_start + ".path = \"".len;
+            if (std.mem.indexOfPos(u8, section, value_start, "\"")) |value_end| {
+                return .{ .path = try allocator.dupe(u8, section[value_start..value_end]) };
+            }
+        }
+
+        // Check for .hash within this section
+        if (std.mem.indexOf(u8, section, ".hash = \"")) |hash_start| {
+            const value_start = hash_start + ".hash = \"".len;
+            if (std.mem.indexOfPos(u8, section, value_start, "\"")) |value_end| {
+                return .{ .hash = try allocator.dupe(u8, section[value_start..value_end]) };
+            }
         }
     }
 
