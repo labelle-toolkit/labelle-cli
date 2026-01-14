@@ -709,13 +709,30 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     // is accessed through engine.sokol to avoid module conflicts
     const build_zon_content = switch (engine_dep) {
         .path => |path| blk: {
-            // Adjust path for ios/ subdirectory
-            // - Absolute paths (start with /) are used directly
-            // - Relative paths (from project root) need ../ to navigate out of ios/
-            const adjusted_path = if (std.fs.path.isAbsolute(path))
-                try allocator.dupe(u8, path)
-            else
-                try std.fmt.allocPrint(allocator, "../{s}", .{path});
+            // Zig build system requires relative paths in .path dependencies.
+            // We need to compute the relative path from ios/ directory to the engine.
+            const adjusted_path = if (std.fs.path.isAbsolute(path)) adj: {
+                // Convert absolute path to relative path from ios/ directory
+                // Get the absolute path of the ios directory
+                const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch {
+                    // Fallback: use ../ prefix and hope for the best
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+                defer allocator.free(cwd);
+
+                const ios_abs = std.fs.path.join(allocator, &.{ cwd, ios_dir }) catch {
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+                defer allocator.free(ios_abs);
+
+                // Compute relative path from ios/ to engine
+                break :adj std.fs.path.relative(allocator, ios_abs, path) catch {
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+            } else adj: {
+                // Relative paths (from project root) need ../ to navigate out of ios/
+                break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+            };
             defer allocator.free(adjusted_path);
 
             break :blk try std.fmt.allocPrint(allocator,
