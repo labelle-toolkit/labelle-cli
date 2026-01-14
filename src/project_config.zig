@@ -5,6 +5,12 @@
 
 const std = @import("std");
 
+pub const WindowConfig = struct {
+    title: ?[]const u8 = null,
+    width: ?i32 = null,
+    height: ?i32 = null,
+};
+
 pub const ProjectConfig = struct {
     name: ?[]const u8 = null,
     engine_version: ?[]const u8 = null,
@@ -15,6 +21,7 @@ pub const ProjectConfig = struct {
     window_width: ?i32 = null,
     window_height: ?i32 = null,
     window_title: ?[]const u8 = null,
+    window: ?WindowConfig = null,
     raw_content: []const u8,
 
     pub fn deinit(self: *const ProjectConfig, allocator: std.mem.Allocator) void {
@@ -50,6 +57,15 @@ pub fn readProjectConfig(allocator: std.mem.Allocator, project_path: []const u8)
     config.window_width = extractIntField(content, ".width");
     config.window_height = extractIntField(content, ".height");
     config.window_title = extractStringField(content, ".title");
+
+    // Create WindowConfig if any window field is set
+    if (config.window_width != null or config.window_height != null or config.window_title != null) {
+        config.window = WindowConfig{
+            .width = config.window_width,
+            .height = config.window_height,
+            .title = config.window_title,
+        };
+    }
 
     return config;
 }
