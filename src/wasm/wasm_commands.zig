@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 
 /// WASM subcommand
 const WasmCommand = enum {
+    init,
     build,
     serve,
     @"export",
@@ -46,6 +47,7 @@ pub fn handleWasm(allocator: Allocator, args: []const []const u8) !void {
     }
 
     switch (options.command) {
+        .init => try handleWasmInit(allocator),
         .build => try handleWasmBuild(allocator, options),
         .serve => try handleWasmServe(allocator, options),
         .@"export" => try handleWasmExport(allocator, options),
@@ -62,7 +64,9 @@ fn parseWasmArgs(args: []const []const u8) WasmOptions {
 
     // Parse subcommand
     const cmd_str = args[0];
-    if (std.mem.eql(u8, cmd_str, "build")) {
+    if (std.mem.eql(u8, cmd_str, "init")) {
+        options.command = .init;
+    } else if (std.mem.eql(u8, cmd_str, "build")) {
         options.command = .build;
     } else if (std.mem.eql(u8, cmd_str, "serve")) {
         options.command = .serve;
@@ -271,6 +275,154 @@ fn handleWasmExport(allocator: Allocator, options: WasmOptions) !void {
     }
 
     std.debug.print("\nExport complete! Ready to deploy.\n", .{});
+}
+
+fn handleWasmInit(allocator: Allocator) !void {
+    // Read project config
+    const config = project_config.readProjectConfig(allocator, ".") catch |err| {
+        std.debug.print("Error reading project.labelle: {}\n", .{err});
+        std.debug.print("Run 'labelle init <name>' to create a new project first\n", .{});
+        return;
+    };
+    defer config.deinit(allocator);
+
+    const project_name = config.name orelse "game";
+    const engine_version = config.engine_version orelse "latest";
+    const window_title = config.window_title orelse project_name;
+
+    // Check if wasm/ already exists
+    if (std.fs.cwd().statFile("wasm/build.zig")) |_| {
+        std.debug.print("wasm/ directory already exists. Use 'labelle wasm build' to build.\n", .{});
+        return;
+    } else |_| {}
+
+    std.debug.print("Initializing WASM project for {s}...\n", .{project_name});
+
+    // Resolve engine version
+    const resolved = engine_resolver.resolveVersion(allocator, engine_version, false) catch |err| {
+        std.debug.print("Error resolving engine version: {}\n", .{err});
+        return;
+    };
+    defer if (resolved.allocated) allocator.free(resolved.version);
+
+    // Fetch engine hash
+    const engine_url = try std.fmt.allocPrint(allocator, "git+https://github.com/labelle-toolkit/labelle-engine#v{s}", .{resolved.version});
+    defer allocator.free(engine_url);
+
+    std.debug.print("  Fetching engine hash for v{s}...\n", .{resolved.version});
+    const engine_hash = engine_resolver.fetchPackageHash(allocator, engine_url) catch |err| {
+        std.debug.print("Error fetching engine hash: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(engine_hash);
+
+    // Create wasm directory
+    std.fs.cwd().makeDir("wasm") catch |err| {
+        if (err != error.PathAlreadyExists) {
+            std.debug.print("Error creating wasm directory: {}\n", .{err});
+            return;
+        }
+    };
+
+    // Convert hyphens to underscores for valid Zig identifier
+    const safe_name = try allocator.dupe(u8, project_name);
+    defer allocator.free(safe_name);
+    for (safe_name) |*c| {
+        if (c.* == '-') c.* = '_';
+    }
+
+    // Generate fingerprint from project name
+    var fingerprint: u64 = 0;
+    for (safe_name) |c| {
+        fingerprint = fingerprint *% 31 +% c;
+    }
+    const fingerprint_str = try std.fmt.allocPrint(allocator, "{x:0>16}", .{fingerprint});
+    defer allocator.free(fingerprint_str);
+
+    // Template substitutions
+    const substitutions = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "{{NAME}}", .value = project_name },
+        .{ .key = "{{SAFE_NAME}}", .value = safe_name },
+        .{ .key = "{{TITLE}}", .value = window_title },
+        .{ .key = "{{ENGINE_VERSION}}", .value = resolved.version },
+        .{ .key = "{{ENGINE_HASH}}", .value = engine_hash },
+        .{ .key = "{{FINGERPRINT}}", .value = fingerprint_str },
+    };
+
+    // Embed templates at compile time
+    const index_html_template = @embedFile("templates/index.html");
+    const build_zig_template = @embedFile("templates/build.zig");
+    const build_zig_zon_template = @embedFile("templates/build.zig.zon");
+    const main_zig_template = @embedFile("templates/main.zig");
+    const deploy_pages_template = @embedFile("templates/deploy-pages.yml");
+
+    // Create .github/workflows directory for CI
+    std.fs.cwd().makePath(".github/workflows") catch |err| {
+        if (err != error.PathAlreadyExists) {
+            std.debug.print("Error creating .github/workflows directory: {}\n", .{err});
+            return;
+        }
+    };
+
+    // Write each file with substitutions
+    const files = [_]struct { template: []const u8, path: []const u8 }{
+        .{ .template = index_html_template, .path = "wasm/index.html" },
+        .{ .template = build_zig_template, .path = "wasm/build.zig" },
+        .{ .template = build_zig_zon_template, .path = "wasm/build.zig.zon" },
+        .{ .template = main_zig_template, .path = "wasm/main.zig" },
+        .{ .template = deploy_pages_template, .path = ".github/workflows/deploy-pages.yml" },
+    };
+
+    for (files) |file_info| {
+        var content = try allocator.dupe(u8, file_info.template);
+        defer allocator.free(content);
+
+        // Apply substitutions
+        for (substitutions) |sub| {
+            while (std.mem.indexOf(u8, content, sub.key)) |pos| {
+                const new_len = content.len - sub.key.len + sub.value.len;
+                const new_content = try allocator.alloc(u8, new_len);
+                @memcpy(new_content[0..pos], content[0..pos]);
+                @memcpy(new_content[pos .. pos + sub.value.len], sub.value);
+                @memcpy(new_content[pos + sub.value.len ..], content[pos + sub.key.len ..]);
+                allocator.free(content);
+                content = new_content;
+            }
+        }
+
+        const out_file = std.fs.cwd().createFile(file_info.path, .{}) catch |err| {
+            std.debug.print("Error creating {s}: {}\n", .{ file_info.path, err });
+            return;
+        };
+        defer out_file.close();
+        out_file.writeAll(content) catch |err| {
+            std.debug.print("Error writing {s}: {}\n", .{ file_info.path, err });
+            return;
+        };
+    }
+
+    std.debug.print("\n", .{});
+    std.debug.print("WASM project initialized!\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Created in wasm/:\n", .{});
+    std.debug.print("  index.html    - HTML shell with loading spinner\n", .{});
+    std.debug.print("  build.zig     - Build configuration (raylib + emscripten)\n", .{});
+    std.debug.print("  build.zig.zon - Dependencies\n", .{});
+    std.debug.print("  main.zig      - WASM entry point (customize this)\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Created in .github/workflows/:\n", .{});
+    std.debug.print("  deploy-pages.yml - GitHub Pages deployment workflow\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("To build locally:\n", .{});
+    std.debug.print("  cd wasm && zig build -Dtarget=wasm32-emscripten\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("To serve locally (after build):\n", .{});
+    std.debug.print("  cd wasm/zig-out/web && python3 -m http.server\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("To deploy to GitHub Pages:\n", .{});
+    std.debug.print("  1. Push to GitHub\n", .{});
+    std.debug.print("  2. Go to Settings > Pages > Source: GitHub Actions\n", .{});
+    std.debug.print("  3. The workflow will build and deploy automatically\n", .{});
 }
 
 fn generateWasmBuildFiles(allocator: Allocator, config: project_config.ProjectConfig, options: WasmOptions) !void {
@@ -571,9 +723,17 @@ fn printWasmHelp() void {
         \\Usage: labelle wasm <command> [options]
         \\
         \\Commands:
+        \\  init        Initialize WASM project (creates wasm/ directory)
         \\  build       Build project for WebAssembly
         \\  serve       Build and serve locally
         \\  export      Create optimized production build
+        \\
+        \\Init:
+        \\  Creates a wasm/ directory with:
+        \\    - index.html  - HTML shell with loading spinner
+        \\    - build.zig   - Build configuration (raylib + emscripten)
+        \\    - build.zig.zon - Dependencies
+        \\    - main.zig    - WASM entry point (customize this)
         \\
         \\Build Options:
         \\  --debug, -d         Build with debug info (default: release)
@@ -590,6 +750,7 @@ fn printWasmHelp() void {
         \\  --platform=NAME     Platform-specific build (itch, github-pages)
         \\
         \\Examples:
+        \\  labelle wasm init
         \\  labelle wasm build
         \\  labelle wasm serve --port 3000
         \\  labelle wasm export --zip
