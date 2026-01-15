@@ -39,6 +39,7 @@ const Command = enum {
     ios,
     wasm,
     android,
+    targets,
     help,
     version,
 };
@@ -54,6 +55,9 @@ const Options = struct {
     ecs_backend: ?[]const u8 = null,
     show_help: bool = false,
     fetch_hashes: bool = true,
+    // Target options
+    target: ?[]const u8 = null,
+    build_all_targets: bool = false,
     // Upgrade options
     upgrade_check_only: bool = false,
     upgrade_version: ?[]const u8 = null,
@@ -93,6 +97,7 @@ pub fn main() !void {
         .ios => try ios_commands.handleIos(allocator, options.ios_args),
         .wasm => try wasm_commands.handleWasm(allocator, options.wasm_args),
         .android => try android_commands.handleAndroid(allocator, options.android_args),
+        .targets => try listTargets(allocator),
         .help => printHelp(),
         .version => printVersion(),
     }
@@ -114,6 +119,8 @@ fn parseArgs(args: []const []const u8) Options {
         options.command = .build;
     } else if (std.mem.eql(u8, cmd_str, "run")) {
         options.command = .run;
+    } else if (std.mem.eql(u8, cmd_str, "targets")) {
+        options.command = .targets;
     } else if (std.mem.eql(u8, cmd_str, "update")) {
         options.command = .update;
     } else if (std.mem.eql(u8, cmd_str, "upgrade")) {
@@ -159,12 +166,22 @@ fn parseArgs(args: []const []const u8) Options {
             options.main_only = true;
         } else if (std.mem.eql(u8, arg, "--no-fetch")) {
             options.fetch_hashes = false;
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            options.build_all_targets = true;
         } else if (std.mem.eql(u8, arg, "--check")) {
             options.upgrade_check_only = true;
         } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
             options.upgrade_list = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
             options.upgrade_force = true;
+        } else if (std.mem.startsWith(u8, arg, "--target=")) {
+            options.target = arg["--target=".len..];
+        } else if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) {
+            // Next arg is the target name
+            if (i + 1 < args.len) {
+                i += 1;
+                options.target = args[i];
+            }
         } else if (std.mem.startsWith(u8, arg, "--engine=")) {
             options.engine_version = arg["--engine=".len..];
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
@@ -292,6 +309,100 @@ fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
     };
 }
 
+/// Detect available targets by scanning for *_build.zig files in .labelle directory
+fn detectAvailableTargets(allocator: std.mem.Allocator) ![][]const u8 {
+    var targets: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (targets.items) |target| allocator.free(target);
+        targets.deinit(allocator);
+    }
+
+    const labelle_dir = std.fs.cwd().openDir(".labelle", .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            return &.{};
+        }
+        return err;
+    };
+    var dir = labelle_dir;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+
+        // Look for files matching *_build.zig pattern
+        if (std.mem.endsWith(u8, entry.name, "_build.zig")) {
+            // Extract target name (everything before _build.zig)
+            const target_end = entry.name.len - "_build.zig".len;
+            const target_name = try allocator.dupe(u8, entry.name[0..target_end]);
+            try targets.append(allocator, target_name);
+        }
+    }
+
+    return targets.toOwnedSlice(allocator);
+}
+
+/// Select a target based on options and available targets
+fn selectTarget(allocator: std.mem.Allocator, options: Options, available_targets: []const []const u8) !?[]const u8 {
+    _ = allocator;
+
+    // If --all flag is set, return null to indicate build all
+    if (options.build_all_targets) {
+        return null;
+    }
+
+    // If target is explicitly specified, validate it
+    if (options.target) |target| {
+        for (available_targets) |available| {
+            if (std.mem.eql(u8, target, available)) {
+                return target;
+            }
+        }
+        std.debug.print("Error: Target '{s}' not found.\n", .{target});
+        std.debug.print("Available targets:\n", .{});
+        for (available_targets) |available| {
+            std.debug.print("  - {s}\n", .{available});
+        }
+        return error.TargetNotFound;
+    }
+
+    // If no target specified, auto-select based on available targets
+    if (available_targets.len == 0) {
+        std.debug.print("Error: No targets found. Run 'labelle generate' first.\n", .{});
+        return error.NoTargetsFound;
+    } else if (available_targets.len == 1) {
+        // Single target - use it automatically
+        return available_targets[0];
+    } else {
+        // Multiple targets - require explicit selection
+        std.debug.print("Multiple targets found:\n", .{});
+        for (available_targets) |target| {
+            std.debug.print("  - {s}\n", .{target});
+        }
+        std.debug.print("\nPlease specify a target with --target <name> or use --all to build all targets\n", .{});
+        return error.MultipleTargetsFound;
+    }
+}
+
+/// List available targets
+fn listTargets(allocator: std.mem.Allocator) !void {
+    const targets = try detectAvailableTargets(allocator);
+    defer {
+        for (targets) |target| allocator.free(target);
+        allocator.free(targets);
+    }
+
+    if (targets.len == 0) {
+        std.debug.print("No targets found. Run 'labelle generate' first.\n", .{});
+        return;
+    }
+
+    std.debug.print("Available targets:\n", .{});
+    for (targets) |target| {
+        std.debug.print("  - {s}\n", .{target});
+    }
+}
+
 fn runBuild(allocator: std.mem.Allocator, options: Options) !void {
     // First generate, then build
     try runGenerate(allocator, options);
@@ -307,10 +418,52 @@ fn runBuild(allocator: std.mem.Allocator, options: Options) !void {
         return;
     };
 
-    var child = std.process.Child.init(&.{ "zig", "build" }, allocator);
+    // Detect available targets
+    const available_targets = try detectAvailableTargets(allocator);
+    defer {
+        for (available_targets) |target| allocator.free(target);
+        allocator.free(available_targets);
+    }
+
+    // Select target(s) to build
+    const selected_target = try selectTarget(allocator, options, available_targets);
+
+    if (selected_target) |target| {
+        // Build single target
+        try buildTarget(allocator, output_dir, target, options.release);
+    } else {
+        // Build all targets
+        std.debug.print("Building all targets...\n", .{});
+        for (available_targets) |target| {
+            try buildTarget(allocator, output_dir, target, options.release);
+        }
+    }
+}
+
+fn buildTarget(allocator: std.mem.Allocator, output_dir: []const u8, target: []const u8, release: bool) !void {
+    std.debug.print("Building target: {s}\n", .{target});
+
+    const build_file = try std.fmt.allocPrint(allocator, "{s}_build.zig", .{target});
+    defer allocator.free(build_file);
+
+    const install_prefix = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{target});
+    defer allocator.free(install_prefix);
+
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer args.deinit(allocator);
+
+    try args.appendSlice(allocator, &.{ "zig", "build", "--build-file", build_file, "-p", install_prefix });
+    if (release) {
+        try args.append(allocator, "-Doptimize=ReleaseSafe");
+    }
+
+    var child = std.process.Child.init(args.items, allocator);
     child.cwd = output_dir;
 
-    _ = try child.spawnAndWait();
+    const result = try child.spawnAndWait();
+    if (result != .Exited or result.Exited != 0) {
+        return error.BuildFailed;
+    }
 }
 
 fn runRun(allocator: std.mem.Allocator, options: Options) !void {
@@ -327,10 +480,37 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
         return;
     };
 
+    // Detect available targets
+    const available_targets = try detectAvailableTargets(allocator);
+    defer {
+        for (available_targets) |target| allocator.free(target);
+        allocator.free(available_targets);
+    }
+
+    // Select target to run (can't run multiple targets)
+    if (options.build_all_targets) {
+        std.debug.print("Error: Cannot use --all with 'run' command. Please specify a target with --target.\n", .{});
+        return error.CannotRunAllTargets;
+    }
+
+    const selected_target = try selectTarget(allocator, options, available_targets);
+    const target = selected_target orelse {
+        // This shouldn't happen since build_all_targets is false
+        return error.NoTargetSelected;
+    };
+
+    std.debug.print("Running target: {s}\n", .{target});
+
+    const build_file = try std.fmt.allocPrint(allocator, "{s}_build.zig", .{target});
+    defer allocator.free(build_file);
+
+    const install_prefix = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{target});
+    defer allocator.free(install_prefix);
+
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try args.appendSlice(allocator, &.{ "zig", "build", "run" });
+    try args.appendSlice(allocator, &.{ "zig", "build", "--build-file", build_file, "-p", install_prefix, "run" });
     if (options.release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
     }
@@ -605,6 +785,7 @@ fn printHelp() void {
         \\  generate        Generate project files from project.labelle
         \\  build           Build the project
         \\  run             Build and run the project
+        \\  targets         List available build targets
         \\  update          Clear caches and regenerate
         \\  upgrade         Upgrade to a newer labelle-engine version
         \\  self-update     Update the labelle CLI itself
@@ -615,14 +796,20 @@ fn printHelp() void {
         \\  version         Show CLI version
         \\
         \\Options:
-        \\  --engine=VER    Specify labelle-engine version (default: from project.labelle)
-        \\  --release, -r   Build in release mode
-        \\  --help, -h      Show help for a command
+        \\  --target=NAME, -t NAME  Specify build target (e.g., raylib_desktop)
+        \\  --all                   Build all available targets
+        \\  --engine=VER            Specify labelle-engine version (default: from project.labelle)
+        \\  --release, -r           Build in release mode
+        \\  --help, -h              Show help for a command
         \\
         \\Examples:
         \\  labelle init my-game
         \\  labelle generate
+        \\  labelle targets
         \\  labelle run
+        \\  labelle run --target raylib_desktop
+        \\  labelle build --target raylib_wasm
+        \\  labelle build --all
         \\  labelle run --release
         \\  labelle upgrade --check
         \\  labelle ios build --simulator
@@ -660,6 +847,49 @@ fn printCommandHelp(command: Command) void {
             \\Options:
             \\  --main-only     Only regenerate main.zig
             \\  --no-fetch      Skip fetching dependency hashes
+            \\
+        , .{}),
+        .build => std.debug.print(
+            \\Build the project
+            \\
+            \\Usage: labelle build [options]
+            \\
+            \\Options:
+            \\  --target=NAME, -t NAME  Build specific target (e.g., raylib_desktop)
+            \\  --all                   Build all available targets
+            \\  --release, -r           Build in release mode
+            \\
+            \\Examples:
+            \\  labelle build                      (auto-detect single target)
+            \\  labelle build --target raylib_desktop
+            \\  labelle build --all
+            \\  labelle build --target raylib_wasm --release
+            \\
+        , .{}),
+        .run => std.debug.print(
+            \\Build and run the project
+            \\
+            \\Usage: labelle run [options]
+            \\
+            \\Options:
+            \\  --target=NAME, -t NAME  Run specific target (e.g., raylib_desktop)
+            \\  --release, -r           Build in release mode
+            \\
+            \\Note: Cannot use --all with run command.
+            \\
+            \\Examples:
+            \\  labelle run                      (auto-detect single target)
+            \\  labelle run --target raylib_desktop
+            \\  labelle run --release
+            \\
+        , .{}),
+        .targets => std.debug.print(
+            \\List available build targets
+            \\
+            \\Usage: labelle targets
+            \\
+            \\Shows all targets found in .labelle/*_build.zig files.
+            \\Targets are generated from the .targets field in project.labelle.
             \\
         , .{}),
         .upgrade => std.debug.print(
