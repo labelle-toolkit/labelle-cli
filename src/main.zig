@@ -446,8 +446,31 @@ fn buildTarget(allocator: std.mem.Allocator, output_dir: []const u8, target: []c
     const build_file = try std.fmt.allocPrint(allocator, "{s}_build.zig", .{target});
     defer allocator.free(build_file);
 
+    const build_zon_file = try std.fmt.allocPrint(allocator, "{s}_build.zig.zon", .{target});
+    defer allocator.free(build_zon_file);
+
     const install_prefix = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{target});
     defer allocator.free(install_prefix);
+
+    // Create/update build.zig.zon symlink to point to target-specific .zon
+    // This is required because `zig build --build-file` still looks for build.zig.zon
+    {
+        var dir = try std.fs.cwd().openDir(output_dir, .{});
+        defer dir.close();
+
+        // Remove existing symlink/file if it exists
+        dir.deleteFile("build.zig.zon") catch |err| {
+            if (err != error.FileNotFound) {
+                std.debug.print("Warning: Could not remove existing build.zig.zon: {s}\n", .{@errorName(err)});
+            }
+        };
+
+        // Create new symlink
+        dir.symLink(build_zon_file, "build.zig.zon", .{}) catch |err| {
+            std.debug.print("Warning: Could not create build.zig.zon symlink: {s}\n", .{@errorName(err)});
+            std.debug.print("You may need to manually run: cd {s} && ln -sf {s} build.zig.zon\n", .{ output_dir, build_zon_file });
+        };
+    }
 
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(allocator);
@@ -504,8 +527,30 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
     const build_file = try std.fmt.allocPrint(allocator, "{s}_build.zig", .{target});
     defer allocator.free(build_file);
 
+    const build_zon_file = try std.fmt.allocPrint(allocator, "{s}_build.zig.zon", .{target});
+    defer allocator.free(build_zon_file);
+
     const install_prefix = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{target});
     defer allocator.free(install_prefix);
+
+    // Create/update build.zig.zon symlink to point to target-specific .zon
+    {
+        var dir = try std.fs.cwd().openDir(output_dir, .{});
+        defer dir.close();
+
+        // Remove existing symlink/file if it exists
+        dir.deleteFile("build.zig.zon") catch |err| {
+            if (err != error.FileNotFound) {
+                std.debug.print("Warning: Could not remove existing build.zig.zon: {s}\n", .{@errorName(err)});
+            }
+        };
+
+        // Create new symlink
+        dir.symLink(build_zon_file, "build.zig.zon", .{}) catch |err| {
+            std.debug.print("Warning: Could not create build.zig.zon symlink: {s}\n", .{@errorName(err)});
+            std.debug.print("You may need to manually run: cd {s} && ln -sf {s} build.zig.zon\n", .{ output_dir, build_zon_file });
+        };
+    }
 
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(allocator);
