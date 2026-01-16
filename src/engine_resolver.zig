@@ -338,6 +338,98 @@ pub fn runEngineGenerator(allocator: std.mem.Allocator, version: []const u8, pro
     std.debug.print("Generation complete!\n", .{});
 }
 
+/// Run the engine's generator from a local path (for development).
+/// This creates a bootstrap build.zig that depends on the local engine path.
+pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []const u8, project_path: []const u8) !void {
+    _ = project_path;
+
+    // Resolve to absolute path
+    const abs_engine_path = std.fs.cwd().realpathAlloc(allocator, engine_path) catch |err| {
+        std.debug.print("Error: Could not resolve engine path '{s}': {}\n", .{ engine_path, err });
+        return error.InvalidEnginePath;
+    };
+    defer allocator.free(abs_engine_path);
+
+    // Verify the path exists and contains a build.zig
+    var engine_dir = std.fs.openDirAbsolute(abs_engine_path, .{}) catch |err| {
+        std.debug.print("Error: Engine path '{s}' does not exist: {}\n", .{ abs_engine_path, err });
+        return error.InvalidEnginePath;
+    };
+    defer engine_dir.close();
+
+    const build_zig_path = try std.fs.path.join(allocator, &.{ abs_engine_path, "build.zig" });
+    defer allocator.free(build_zig_path);
+
+    std.fs.accessAbsolute(build_zig_path, .{}) catch {
+        std.debug.print("Error: Engine path '{s}' does not contain build.zig\n", .{abs_engine_path});
+        return error.InvalidEnginePath;
+    };
+
+    const bootstrap_dir_path = try getBootstrapDir(allocator);
+    defer allocator.free(bootstrap_dir_path);
+
+    // Create bootstrap directory
+    std.fs.cwd().makeDir(bootstrap_dir_path) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    var bootstrap_dir = try std.fs.cwd().openDir(bootstrap_dir_path, .{});
+    defer bootstrap_dir.close();
+
+    // Compute relative path from bootstrap dir to engine
+    const abs_bootstrap_path = try std.fs.cwd().realpathAlloc(allocator, bootstrap_dir_path);
+    defer allocator.free(abs_bootstrap_path);
+
+    const rel_engine_path = try std.fs.path.relative(allocator, abs_bootstrap_path, abs_engine_path);
+    defer allocator.free(rel_engine_path);
+
+    // Create bootstrap build.zig.zon with relative path
+    try createLocalBootstrapBuildZon(allocator, bootstrap_dir, rel_engine_path);
+    try createBootstrapBuildZig(bootstrap_dir, ".");
+
+    std.debug.print("Running generator from local engine...\n", .{});
+
+    // Run the generator from the bootstrap directory
+    var child = std.process.Child.init(&.{
+        "zig",
+        "build",
+        "run",
+    }, allocator);
+    child.cwd = bootstrap_dir_path;
+
+    const result = try child.spawnAndWait();
+    if (result.Exited != 0) {
+        std.debug.print("Generator failed with exit code {}\n", .{result.Exited});
+        return error.GeneratorFailed;
+    }
+
+    std.debug.print("Generation complete!\n", .{});
+}
+
+/// Create a bootstrap build.zig.zon that uses a local engine path
+fn createLocalBootstrapBuildZon(allocator: std.mem.Allocator, dir: std.fs.Dir, engine_path: []const u8) !void {
+    const content = try std.fmt.allocPrint(allocator,
+        \\.{{
+        \\    .fingerprint = 0x3dda308fa396ad7d,
+        \\    .name = .labelle_bootstrap,
+        \\    .version = "0.0.0",
+        \\    .minimum_zig_version = "0.15.2",
+        \\    .dependencies = .{{
+        \\        .@"labelle-engine" = .{{
+        \\            .path = "{s}",
+        \\        }},
+        \\    }},
+        \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+        \\}}
+        \\
+    , .{engine_path});
+    defer allocator.free(content);
+
+    var file = try dir.createFile("build.zig.zon", .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
 /// Check if a version exists in the cache
 fn isVersionCached(allocator: std.mem.Allocator, version: []const u8) !bool {
     const cache_dir = try getCacheDir(allocator);

@@ -98,7 +98,7 @@ pub const AndroidConfig = struct {
 };
 
 /// Main Android command dispatcher
-pub fn handleAndroid(allocator: Allocator, args: []const []const u8) !void {
+pub fn handleAndroid(allocator: Allocator, args: []const []const u8, engine_path: ?[]const u8) !void {
     if (args.len == 0) {
         printAndroidHelp();
         return;
@@ -112,9 +112,9 @@ pub fn handleAndroid(allocator: Allocator, args: []const []const u8) !void {
     }
 
     switch (options.command) {
-        .build => try handleAndroidBuild(allocator, options),
+        .build => try handleAndroidBuild(allocator, options, engine_path),
         .install => try handleAndroidInstall(allocator, options),
-        .run => try handleAndroidRun(allocator, options),
+        .run => try handleAndroidRun(allocator, options, engine_path),
         .emulator => try handleAndroidEmulator(allocator, options),
         .help => printAndroidHelp(),
     }
@@ -178,7 +178,7 @@ fn parseAndroidArgs(args: []const []const u8) AndroidOptions {
 // Android Build Command
 // ============================================================================
 
-fn handleAndroidBuild(allocator: Allocator, options: AndroidOptions) !void {
+fn handleAndroidBuild(allocator: Allocator, options: AndroidOptions, engine_path: ?[]const u8) !void {
     const project_path = ".";
 
     // Load Android config
@@ -191,7 +191,7 @@ fn handleAndroidBuild(allocator: Allocator, options: AndroidOptions) !void {
     std.debug.print("\n", .{});
 
     // Step 1: Generate Android build files
-    try ensureAndroidBuildFiles(allocator, project_path, config);
+    try ensureAndroidBuildFiles(allocator, project_path, config, engine_path);
 
     // Step 2: Build the shared library
     std.debug.print("Building native library...\n", .{});
@@ -306,9 +306,9 @@ fn handleAndroidInstall(allocator: Allocator, options: AndroidOptions) !void {
 // Android Run Command
 // ============================================================================
 
-fn handleAndroidRun(allocator: Allocator, options: AndroidOptions) !void {
+fn handleAndroidRun(allocator: Allocator, options: AndroidOptions, engine_path: ?[]const u8) !void {
     // Build first
-    try handleAndroidBuild(allocator, options);
+    try handleAndroidBuild(allocator, options, engine_path);
 
     // Install
     try handleAndroidInstall(allocator, options);
@@ -453,7 +453,7 @@ fn startEmulator(allocator: Allocator, name: []const u8) !void {
 // Build File Generation
 // ============================================================================
 
-fn ensureAndroidBuildFiles(allocator: Allocator, project_path: []const u8, config: AndroidConfig) !void {
+fn ensureAndroidBuildFiles(allocator: Allocator, project_path: []const u8, config: AndroidConfig, engine_path: ?[]const u8) !void {
     const android_dir = try std.fs.path.join(allocator, &.{ project_path, "android" });
     defer allocator.free(android_dir);
 
@@ -467,11 +467,11 @@ fn ensureAndroidBuildFiles(allocator: Allocator, project_path: []const u8, confi
     std.fs.cwd().access(build_zig_path, .{}) catch {
         // Generate Android build files
         std.debug.print("Generating Android build files...\n", .{});
-        try generateAndroidBuildFiles(allocator, project_path, config);
+        try generateAndroidBuildFiles(allocator, project_path, config, engine_path);
     };
 }
 
-fn generateAndroidBuildFiles(allocator: Allocator, project_path: []const u8, config: AndroidConfig) !void {
+fn generateAndroidBuildFiles(allocator: Allocator, project_path: []const u8, config: AndroidConfig, engine_path: ?[]const u8) !void {
     const android_dir = try std.fs.path.join(allocator, &.{ project_path, "android" });
     defer allocator.free(android_dir);
 
@@ -482,20 +482,34 @@ fn generateAndroidBuildFiles(allocator: Allocator, project_path: []const u8, con
     defer allocator.free(apk_build_dir);
     std.fs.cwd().makePath(apk_build_dir) catch {};
 
-    // Read engine hash from main project's .labelle/build.zig.zon
-    const engine_hash = readEngineHash(allocator, project_path) catch |err| {
-        std.debug.print("Warning: Could not read engine hash from .labelle/build.zig.zon: {}\n", .{err});
-        std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
-        return err;
-    };
-    defer allocator.free(engine_hash);
-
     // Sanitize app name
     const sanitized_name = try sanitizeName(allocator, config.app_name);
     defer allocator.free(sanitized_name);
 
-    // Generate build.zig.zon
-    const build_zon_content = try generateAndroidBuildZon(allocator, sanitized_name, config.engine_version, engine_hash);
+    // Generate build.zig.zon based on whether we have a local engine path or not
+    const build_zon_content = if (engine_path) |local_engine_path| blk: {
+        // Using local engine - compute relative path from android/ to engine
+        const abs_android_dir = try std.fs.cwd().realpathAlloc(allocator, android_dir);
+        defer allocator.free(abs_android_dir);
+
+        const abs_engine_path = try std.fs.cwd().realpathAlloc(allocator, local_engine_path);
+        defer allocator.free(abs_engine_path);
+
+        const rel_engine_path = try std.fs.path.relative(allocator, abs_android_dir, abs_engine_path);
+        defer allocator.free(rel_engine_path);
+
+        break :blk try generateAndroidBuildZonWithPath(allocator, sanitized_name, rel_engine_path);
+    } else blk: {
+        // Using versioned engine - read hash from .labelle/
+        const engine_hash = readEngineHash(allocator, project_path) catch |err| {
+            std.debug.print("Warning: Could not read engine hash from .labelle/build.zig.zon: {}\n", .{err});
+            std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
+            return err;
+        };
+        defer allocator.free(engine_hash);
+
+        break :blk try generateAndroidBuildZon(allocator, sanitized_name, config.engine_version, engine_hash);
+    };
     defer allocator.free(build_zon_content);
 
     const build_zon_path = try std.fs.path.join(allocator, &.{ android_dir, "build.zig.zon" });
@@ -567,6 +581,30 @@ fn generateAndroidBuildZon(allocator: Allocator, app_name: []const u8, engine_ve
         \\}}
         \\
     , .{ fingerprint, app_name, engine_version, engine_hash });
+}
+
+fn generateAndroidBuildZonWithPath(allocator: Allocator, app_name: []const u8, engine_path: []const u8) ![]const u8 {
+    // Generate fingerprint from app name
+    var fingerprint: u64 = 0;
+    for (app_name) |c| {
+        fingerprint = fingerprint *% 31 +% c;
+    }
+    fingerprint ^= 0xA11D201D; // Add Android-specific salt
+
+    return std.fmt.allocPrint(allocator,
+        \\.{{
+        \\    .fingerprint = 0x{x:0>16},
+        \\    .name = .{s}_android,
+        \\    .version = "0.1.0",
+        \\    .dependencies = .{{
+        \\        .@"labelle-engine" = .{{
+        \\            .path = "{s}",
+        \\        }},
+        \\    }},
+        \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+        \\}}
+        \\
+    , .{ fingerprint, app_name, engine_path });
 }
 
 fn generateAndroidBuildZig(allocator: Allocator, config: AndroidConfig) ![]const u8 {
