@@ -125,15 +125,27 @@ fn parseArgs(args: []const []const u8) Options {
         options.command = .self_update;
     } else if (std.mem.eql(u8, cmd_str, "ios")) {
         options.command = .ios;
-        // Pass all remaining args to ios_commands
+        // Parse --engine-path from remaining args before passing through
         if (args.len > 2) {
+            for (args[2..]) |arg| {
+                if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+                    options.engine_path = arg["--engine-path=".len..];
+                    break;
+                }
+            }
             options.ios_args = args[2..];
         }
         return options;
     } else if (std.mem.eql(u8, cmd_str, "android") or std.mem.eql(u8, cmd_str, "apk")) {
         options.command = .android;
-        // Pass all remaining args to android_commands
+        // Parse --engine-path from remaining args before passing through
         if (args.len > 2) {
+            for (args[2..]) |arg| {
+                if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+                    options.engine_path = arg["--engine-path=".len..];
+                    break;
+                }
+            }
             options.android_args = args[2..];
         }
         return options;
@@ -284,7 +296,7 @@ fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
         std.debug.print("Using local labelle-engine from: {s}\n", .{local_path});
 
         // Run generator from local path
-        engine_resolver.runLocalEngineGenerator(allocator, local_path, ".") catch |err| {
+        engine_resolver.runLocalEngineGenerator(allocator, local_path) catch |err| {
             std.debug.print("Error running generator from local engine: {}\n", .{err});
             return;
         };
@@ -301,7 +313,7 @@ fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
         std.debug.print("Using labelle-engine {s}\n", .{resolved.version});
 
         // Fetch engine and run its generator
-        engine_resolver.runEngineGenerator(allocator, resolved.version, ".") catch |err| {
+        engine_resolver.runEngineGenerator(allocator, resolved.version) catch |err| {
             if (err == engine_resolver.VersionError.FetchFailed) {
                 return; // Error already printed
             }
@@ -844,8 +856,9 @@ fn printCommandHelp(command: Command) void {
             \\Usage: labelle generate [options]
             \\
             \\Options:
-            \\  --main-only     Only regenerate main.zig
-            \\  --no-fetch      Skip fetching dependency hashes
+            \\  --main-only         Only regenerate main.zig
+            \\  --no-fetch          Skip fetching dependency hashes
+            \\  --engine-path=PATH  Use local engine path (for development)
             \\
         , .{}),
         .build => std.debug.print(

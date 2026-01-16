@@ -259,6 +259,34 @@ fn normalizeToForwardSlashes(allocator: std.mem.Allocator, path: []const u8) ![]
     return result;
 }
 
+/// Validate and sanitize engine path to prevent injection attacks.
+/// Returns the validated absolute path.
+fn validateEnginePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    // Resolve to absolute path to prevent path traversal
+    const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch |err| {
+        std.debug.print("Error: Engine path '{s}' does not exist or cannot be resolved: {}\n", .{ path, err });
+        return error.InvalidEnginePath;
+    };
+    errdefer allocator.free(abs_path);
+
+    // Check if path is a directory
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch |err| {
+        std.debug.print("Error: Engine path '{s}' is not a directory: {}\n", .{ abs_path, err });
+        allocator.free(abs_path);
+        return error.InvalidEnginePath;
+    };
+    defer dir.close();
+
+    // Verify it contains expected engine files (build.zig)
+    dir.access("build.zig", .{}) catch {
+        std.debug.print("Error: Engine path '{s}' does not contain build.zig\n", .{abs_path});
+        allocator.free(abs_path);
+        return error.InvalidEnginePath;
+    };
+
+    return abs_path;
+}
+
 /// Create a bootstrap build.zig.zon using a local engine path.
 /// The path needs to be relative to the bootstrap directory.
 fn createBootstrapBuildZonWithLocalPath(allocator: std.mem.Allocator, dir: std.fs.Dir, local_path: []const u8) !void {
@@ -501,7 +529,6 @@ pub fn runEngineGenerator(allocator: std.mem.Allocator, version: []const u8) !vo
 /// Run the engine's generator using a local engine path.
 /// This is useful for CI testing against a local checkout.
 pub fn runEngineGeneratorWithLocalPath(allocator: std.mem.Allocator, local_path: []const u8) !void {
-
     const bootstrap_dir_path = try getBootstrapDir(allocator);
     defer allocator.free(bootstrap_dir_path);
 
@@ -558,30 +585,10 @@ pub fn runEngineGeneratorWithLocalPath(allocator: std.mem.Allocator, local_path:
 
 /// Run the engine's generator from a local path (for development).
 /// This creates a bootstrap build.zig that depends on the local engine path.
-pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []const u8, project_path: []const u8) !void {
-    _ = project_path;
-
-    // Resolve to absolute path
-    const abs_engine_path = std.fs.cwd().realpathAlloc(allocator, engine_path) catch |err| {
-        std.debug.print("Error: Could not resolve engine path '{s}': {}\n", .{ engine_path, err });
-        return error.InvalidEnginePath;
-    };
+pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []const u8) !void {
+    // Validate and resolve to absolute path
+    const abs_engine_path = try validateEnginePath(allocator, engine_path);
     defer allocator.free(abs_engine_path);
-
-    // Verify the path exists and contains a build.zig
-    var engine_dir = std.fs.openDirAbsolute(abs_engine_path, .{}) catch |err| {
-        std.debug.print("Error: Engine path '{s}' does not exist: {}\n", .{ abs_engine_path, err });
-        return error.InvalidEnginePath;
-    };
-    defer engine_dir.close();
-
-    const build_zig_path = try std.fs.path.join(allocator, &.{ abs_engine_path, "build.zig" });
-    defer allocator.free(build_zig_path);
-
-    std.fs.accessAbsolute(build_zig_path, .{}) catch {
-        std.debug.print("Error: Engine path '{s}' does not contain build.zig\n", .{abs_engine_path});
-        return error.InvalidEnginePath;
-    };
 
     const bootstrap_dir_path = try getBootstrapDir(allocator);
     defer allocator.free(bootstrap_dir_path);
@@ -603,7 +610,7 @@ pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []cons
 
     // Create bootstrap build.zig.zon with relative path
     try createLocalBootstrapBuildZon(allocator, bootstrap_dir, rel_engine_path);
-    try createBootstrapBuildZig(bootstrap_dir, ".");
+    try createBootstrapBuildZig(bootstrap_dir);
 
     std.debug.print("Running generator from local engine...\n", .{});
 
@@ -616,9 +623,25 @@ pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []cons
     child.cwd = bootstrap_dir_path;
 
     const result = try child.spawnAndWait();
-    if (result.Exited != 0) {
-        std.debug.print("Generator failed with exit code {}\n", .{result.Exited});
-        return error.GeneratorFailed;
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("Generator failed with exit code {}\n", .{code});
+                return error.GeneratorFailed;
+            }
+        },
+        .Signal => |sig| {
+            std.debug.print("Generator killed by signal {}\n", .{sig});
+            return error.GeneratorFailed;
+        },
+        .Stopped => |sig| {
+            std.debug.print("Generator stopped by signal {}\n", .{sig});
+            return error.GeneratorFailed;
+        },
+        .Unknown => |code| {
+            std.debug.print("Generator failed with unknown code {}\n", .{code});
+            return error.GeneratorFailed;
+        },
     }
 
     std.debug.print("Generation complete!\n", .{});
@@ -626,6 +649,10 @@ pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []cons
 
 /// Create a bootstrap build.zig.zon that uses a local engine path
 fn createLocalBootstrapBuildZon(allocator: std.mem.Allocator, dir: std.fs.Dir, engine_path: []const u8) !void {
+    // Normalize path for Windows compatibility (convert backslashes to forward slashes)
+    const normalized_path = try normalizeToForwardSlashes(allocator, engine_path);
+    defer allocator.free(normalized_path);
+
     const content = try std.fmt.allocPrint(allocator,
         \\.{{
         \\    .fingerprint = 0x3dda308fa396ad7d,
@@ -640,7 +667,7 @@ fn createLocalBootstrapBuildZon(allocator: std.mem.Allocator, dir: std.fs.Dir, e
         \\    .paths = .{{ "build.zig", "build.zig.zon" }},
         \\}}
         \\
-    , .{engine_path});
+    , .{normalized_path});
     defer allocator.free(content);
 
     var file = try dir.createFile("build.zig.zon", .{});

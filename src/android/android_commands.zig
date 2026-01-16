@@ -488,12 +488,13 @@ fn generateAndroidBuildFiles(allocator: Allocator, project_path: []const u8, con
 
     // Generate build.zig.zon based on whether we have a local engine path or not
     const build_zon_content = if (engine_path) |local_engine_path| blk: {
+        // Validate engine path first
+        const abs_engine_path = try validateEnginePath(allocator, local_engine_path);
+        defer allocator.free(abs_engine_path);
+
         // Using local engine - compute relative path from android/ to engine
         const abs_android_dir = try std.fs.cwd().realpathAlloc(allocator, android_dir);
         defer allocator.free(abs_android_dir);
-
-        const abs_engine_path = try std.fs.cwd().realpathAlloc(allocator, local_engine_path);
-        defer allocator.free(abs_engine_path);
 
         const rel_engine_path = try std.fs.path.relative(allocator, abs_android_dir, abs_engine_path);
         defer allocator.free(rel_engine_path);
@@ -558,6 +559,50 @@ fn generateAndroidBuildFiles(allocator: Allocator, project_path: []const u8, con
     std.debug.print("Generated Android build files in: {s}\n", .{android_dir});
 }
 
+/// Convert backslashes to forward slashes for use in build.zig.zon
+/// Zig's build system accepts forward slashes on all platforms
+fn normalizeToForwardSlashes(allocator: Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.sep == '/') {
+        // Already using forward slashes
+        return try allocator.dupe(u8, path);
+    }
+
+    // Replace backslashes with forward slashes
+    const result = try allocator.alloc(u8, path.len);
+    for (path, 0..) |c, i| {
+        result[i] = if (c == '\\') '/' else c;
+    }
+    return result;
+}
+
+/// Validate engine path to prevent injection attacks.
+/// Returns the validated absolute path.
+fn validateEnginePath(allocator: Allocator, path: []const u8) ![]const u8 {
+    // Resolve to absolute path
+    const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch |err| {
+        std.debug.print("Error: Engine path '{s}' does not exist or cannot be resolved: {}\n", .{ path, err });
+        return error.InvalidEnginePath;
+    };
+    errdefer allocator.free(abs_path);
+
+    // Check if path is a directory
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch |err| {
+        std.debug.print("Error: Engine path '{s}' is not a directory: {}\n", .{ abs_path, err });
+        allocator.free(abs_path);
+        return error.InvalidEnginePath;
+    };
+    defer dir.close();
+
+    // Verify it contains expected engine files (build.zig)
+    dir.access("build.zig", .{}) catch {
+        std.debug.print("Error: Engine path '{s}' does not contain build.zig\n", .{abs_path});
+        allocator.free(abs_path);
+        return error.InvalidEnginePath;
+    };
+
+    return abs_path;
+}
+
 fn generateAndroidBuildZon(allocator: Allocator, app_name: []const u8, engine_version: []const u8, engine_hash: []const u8) ![]const u8 {
     // Generate fingerprint from app name
     var fingerprint: u64 = 0;
@@ -591,6 +636,10 @@ fn generateAndroidBuildZonWithPath(allocator: Allocator, app_name: []const u8, e
     }
     fingerprint ^= 0xA11D201D; // Add Android-specific salt
 
+    // Normalize path for Windows compatibility (convert backslashes to forward slashes)
+    const normalized_path = try normalizeToForwardSlashes(allocator, engine_path);
+    defer allocator.free(normalized_path);
+
     return std.fmt.allocPrint(allocator,
         \\.{{
         \\    .fingerprint = 0x{x:0>16},
@@ -604,7 +653,7 @@ fn generateAndroidBuildZonWithPath(allocator: Allocator, app_name: []const u8, e
         \\    .paths = .{{ "build.zig", "build.zig.zon" }},
         \\}}
         \\
-    , .{ fingerprint, app_name, engine_path });
+    , .{ fingerprint, app_name, normalized_path });
 }
 
 fn generateAndroidBuildZig(allocator: Allocator, config: AndroidConfig) ![]const u8 {
