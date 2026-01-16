@@ -603,13 +603,17 @@ fn validateEnginePath(allocator: Allocator, path: []const u8) ![]const u8 {
     return abs_path;
 }
 
-fn generateAndroidBuildZon(allocator: Allocator, app_name: []const u8, engine_version: []const u8, engine_hash: []const u8) ![]const u8 {
-    // Generate fingerprint from app name
+fn generateAndroidFingerprint(app_name: []const u8) u64 {
     var fingerprint: u64 = 0;
     for (app_name) |c| {
         fingerprint = fingerprint *% 31 +% c;
     }
     fingerprint ^= 0xA11D201D; // Add Android-specific salt
+    return fingerprint;
+}
+
+fn generateAndroidBuildZon(allocator: Allocator, app_name: []const u8, engine_version: []const u8, engine_hash: []const u8) ![]const u8 {
+    const fingerprint = generateAndroidFingerprint(app_name);
 
     return std.fmt.allocPrint(allocator,
         \\.{{
@@ -629,12 +633,7 @@ fn generateAndroidBuildZon(allocator: Allocator, app_name: []const u8, engine_ve
 }
 
 fn generateAndroidBuildZonWithPath(allocator: Allocator, app_name: []const u8, engine_path: []const u8) ![]const u8 {
-    // Generate fingerprint from app name
-    var fingerprint: u64 = 0;
-    for (app_name) |c| {
-        fingerprint = fingerprint *% 31 +% c;
-    }
-    fingerprint ^= 0xA11D201D; // Add Android-specific salt
+    const fingerprint = generateAndroidFingerprint(app_name);
 
     // Normalize path for Windows compatibility (convert backslashes to forward slashes)
     const normalized_path = try normalizeToForwardSlashes(allocator, engine_path);

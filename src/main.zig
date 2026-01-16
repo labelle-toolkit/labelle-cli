@@ -106,101 +106,132 @@ fn parseArgs(args: []const []const u8) Options {
         return options;
     }
 
-    const cmd_str = args[1];
-    if (std.mem.eql(u8, cmd_str, "init")) {
-        options.command = .init;
-    } else if (std.mem.eql(u8, cmd_str, "generate") or std.mem.eql(u8, cmd_str, "gen")) {
-        options.command = .generate;
-    } else if (std.mem.eql(u8, cmd_str, "build")) {
-        options.command = .build;
-    } else if (std.mem.eql(u8, cmd_str, "run")) {
-        options.command = .run;
-    } else if (std.mem.eql(u8, cmd_str, "targets")) {
-        options.command = .targets;
-    } else if (std.mem.eql(u8, cmd_str, "update")) {
-        options.command = .update;
-    } else if (std.mem.eql(u8, cmd_str, "upgrade")) {
-        options.command = .upgrade;
-    } else if (std.mem.eql(u8, cmd_str, "self-update")) {
-        options.command = .self_update;
-    } else if (std.mem.eql(u8, cmd_str, "ios")) {
-        options.command = .ios;
-        // Parse --engine-path from remaining args before passing through
-        if (args.len > 2) {
-            for (args[2..]) |arg| {
-                if (std.mem.startsWith(u8, arg, "--engine-path=")) {
-                    options.engine_path = arg["--engine-path=".len..];
-                    break;
-                }
-            }
-            options.ios_args = args[2..];
-        }
-        return options;
-    } else if (std.mem.eql(u8, cmd_str, "android") or std.mem.eql(u8, cmd_str, "apk")) {
-        options.command = .android;
-        // Parse --engine-path from remaining args before passing through
-        if (args.len > 2) {
-            for (args[2..]) |arg| {
-                if (std.mem.startsWith(u8, arg, "--engine-path=")) {
-                    options.engine_path = arg["--engine-path=".len..];
-                    break;
-                }
-            }
-            options.android_args = args[2..];
-        }
-        return options;
-    } else if (std.mem.eql(u8, cmd_str, "help") or std.mem.eql(u8, cmd_str, "--help") or std.mem.eql(u8, cmd_str, "-h")) {
-        options.command = .help;
-    } else if (std.mem.eql(u8, cmd_str, "version") or std.mem.eql(u8, cmd_str, "--version") or std.mem.eql(u8, cmd_str, "-v")) {
-        options.command = .version;
-    }
-
-    // Parse remaining arguments
-    var i: usize = 2;
+    // First pass: identify command and flags
+    var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            options.show_help = true;
-        } else if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) {
-            options.release = true;
-        } else if (std.mem.eql(u8, arg, "--main-only")) {
-            options.main_only = true;
-        } else if (std.mem.eql(u8, arg, "--no-fetch")) {
-            options.fetch_hashes = false;
-        } else if (std.mem.eql(u8, arg, "--all")) {
-            options.build_all_targets = true;
-        } else if (std.mem.eql(u8, arg, "--check")) {
-            options.upgrade_check_only = true;
-        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
-            options.upgrade_list = true;
-        } else if (std.mem.eql(u8, arg, "--force")) {
-            options.upgrade_force = true;
-        } else if (std.mem.startsWith(u8, arg, "--target=")) {
-            options.target = arg["--target=".len..];
-        } else if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) {
-            // Next arg is the target name
-            if (i + 1 < args.len) {
-                i += 1;
-                options.target = args[i];
+
+        if (std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.eql(u8, arg, "--help")) {
+                options.show_help = true;
+            } else if (std.mem.eql(u8, arg, "--release")) {
+                options.release = true;
+            } else if (std.mem.eql(u8, arg, "--main-only")) {
+                options.main_only = true;
+            } else if (std.mem.eql(u8, arg, "--no-fetch")) {
+                options.fetch_hashes = false;
+            } else if (std.mem.eql(u8, arg, "--all")) {
+                options.build_all_targets = true;
+            } else if (std.mem.eql(u8, arg, "--check")) {
+                options.upgrade_check_only = true;
+            } else if (std.mem.eql(u8, arg, "--list")) {
+                options.upgrade_list = true;
+            } else if (std.mem.eql(u8, arg, "--force")) {
+                options.upgrade_force = true;
+            } else if (std.mem.startsWith(u8, arg, "--target=")) {
+                options.target = arg["--target=".len..];
+            } else if (std.mem.eql(u8, arg, "--target")) {
+                if (i + 1 < args.len) {
+                    i += 1;
+                    options.target = args[i];
+                }
+            } else if (std.mem.startsWith(u8, arg, "--engine=")) {
+                options.engine_version = arg["--engine=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+                options.engine_path = arg["--engine-path=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--backend=")) {
+                options.backend = arg["--backend=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
+                options.ecs_backend = arg["--ecs=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--version=")) {
+                options.upgrade_version = arg["--version=".len..];
             }
-        } else if (std.mem.startsWith(u8, arg, "--engine=")) {
-            options.engine_version = arg["--engine=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
-            options.engine_path = arg["--engine-path=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--backend=")) {
-            options.backend = arg["--backend=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
-            options.ecs_backend = arg["--ecs=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--version=")) {
-            options.upgrade_version = arg["--version=".len..];
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
-            // Positional argument
-            if (options.command == .init and options.project_name == null) {
-                options.project_name = arg;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            // Short flags
+            for (arg[1..]) |c| {
+                switch (c) {
+                    'h' => options.show_help = true,
+                    'r' => options.release = true,
+                    'l' => options.upgrade_list = true,
+                    'v' => options.command = .version,
+                    't' => {
+                        if (i + 1 < args.len) {
+                            i += 1;
+                            options.target = args[i];
+                        }
+                    },
+                    else => {},
+                }
+            }
+        } else {
+            // Positional argument or command
+            if (options.command == .help) { // No command set yet
+                if (std.mem.eql(u8, arg, "init")) {
+                    options.command = .init;
+                } else if (std.mem.eql(u8, arg, "generate") or std.mem.eql(u8, arg, "gen")) {
+                    options.command = .generate;
+                } else if (std.mem.eql(u8, arg, "build")) {
+                    options.command = .build;
+                } else if (std.mem.eql(u8, arg, "run")) {
+                    options.command = .run;
+                } else if (std.mem.eql(u8, arg, "targets")) {
+                    options.command = .targets;
+                } else if (std.mem.eql(u8, arg, "update")) {
+                    options.command = .update;
+                } else if (std.mem.eql(u8, arg, "upgrade")) {
+                    options.command = .upgrade;
+                } else if (std.mem.eql(u8, arg, "self-update")) {
+                    options.command = .self_update;
+                } else if (std.mem.eql(u8, arg, "ios")) {
+                    options.command = .ios;
+                    options.ios_args = args[i + 1 ..];
+                    // Also check for --engine-path in remaining args
+                    for (options.ios_args) |ios_arg| {
+                        if (std.mem.startsWith(u8, ios_arg, "--engine-path=")) {
+                            options.engine_path = ios_arg["--engine-path=".len..];
+                        }
+                    }
+                    return options;
+                } else if (std.mem.eql(u8, arg, "android") or std.mem.eql(u8, arg, "apk")) {
+                    options.command = .android;
+                    options.android_args = args[i + 1 ..];
+                    // Also check for --engine-path in remaining args
+                    for (options.android_args) |android_arg| {
+                        if (std.mem.startsWith(u8, android_arg, "--engine-path=")) {
+                            options.engine_path = android_arg["--engine-path=".len..];
+                        }
+                    }
+                    return options;
+                } else if (std.mem.eql(u8, arg, "help")) {
+                    options.command = .help;
+                } else if (std.mem.eql(u8, arg, "version")) {
+                    options.command = .version;
+                } else {
+                    // Fallback positional arg
+                    if (options.command == .init and options.project_name == null) {
+                        options.project_name = arg;
+                    } else {
+                        options.project_path = arg;
+                    }
+                }
             } else {
-                options.project_path = arg;
+                // Positional argument
+                if (options.command == .init and options.project_name == null) {
+                    options.project_name = arg;
+                } else {
+                    options.project_path = arg;
+                }
             }
         }
+    }
+
+    // Check for LABELLE_ENGINE_PATH environment variable if not provided via flag
+    if (options.engine_path == null) {
+        if (std.process.getEnvVarOwned(std.heap.page_allocator, "LABELLE_ENGINE_PATH")) |path| {
+            options.engine_path = path;
+            // Note: This leaks in page_allocator but it's a CLI tool exiting soon.
+            // Ideally we'd use the main allocator, but we don't have it easily here.
+        } else |_| {}
     }
 
     return options;
