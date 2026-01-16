@@ -111,18 +111,21 @@ fn printIosHelp() void {
         \\  run         Build and run on device/simulator
         \\
         \\Build Options:
-        \\  --simulator       Build for iOS simulator instead of device
-        \\  --release         Build release configuration
-        \\  --app-name NAME   Override app name
-        \\  --bundle-id ID    Override bundle identifier
+        \\  --simulator           Build for iOS simulator instead of device
+        \\  --release             Build release configuration
+        \\  --engine-path=PATH    Use local engine path instead of fetching from registry
+        \\  --app-name NAME       Override app name
+        \\  --bundle-id ID        Override bundle identifier
         \\
         \\Xcode Options:
-        \\  --team-id ID      Apple Developer Team ID for signing
-        \\  --output DIR      Output directory (default: ./ios-xcode)
+        \\  --team-id ID          Apple Developer Team ID for signing
+        \\  --output DIR          Output directory (default: ./ios-xcode)
+        \\  --engine-path=PATH    Use local engine path
         \\
         \\Run Options:
-        \\  --simulator       Run on iOS simulator
-        \\  --device          Run on connected device (default)
+        \\  --simulator           Run on iOS simulator
+        \\  --device              Run on connected device (default)
+        \\  --engine-path=PATH    Use local engine path
         \\
         \\Configuration:
         \\  Create ios.labelle in your project for iOS-specific settings:
@@ -136,10 +139,11 @@ fn printIosHelp() void {
         \\  }}
         \\
         \\Examples:
-        \\  labelle ios build              # Build for iOS device
-        \\  labelle ios build --simulator  # Build for simulator
-        \\  labelle ios xcode              # Generate Xcode project
-        \\  labelle ios run --simulator    # Run on simulator
+        \\  labelle ios build                                   # Build for iOS device
+        \\  labelle ios build --simulator                       # Build for simulator
+        \\  labelle ios build --engine-path=/path/to/engine     # Build with local engine
+        \\  labelle ios xcode                                   # Generate Xcode project
+        \\  labelle ios run --simulator                         # Run on simulator
         \\
     , .{});
 }
@@ -148,10 +152,11 @@ fn printIosHelp() void {
 // iOS Build Command
 // ============================================================================
 
-fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8, engine_path: ?[]const u8) !void {
+fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8, global_engine_path: ?[]const u8) !void {
     var project_path: []const u8 = ".";
     var simulator = false;
     var release = false;
+    var local_engine_path: ?[]const u8 = null;
 
     // Parse args
     var i: usize = 0;
@@ -161,10 +166,15 @@ fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8, engine
             simulator = true;
         } else if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) {
             release = true;
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            local_engine_path = arg["--engine-path=".len..];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             project_path = arg;
         }
     }
+
+    // Use local override if provided, otherwise use global engine path
+    const engine_path = local_engine_path orelse global_engine_path;
 
     // Load iOS config
     const ios_config = try IosConfig.load(allocator, project_path);
@@ -176,6 +186,9 @@ fn handleIosBuild(allocator: std.mem.Allocator, args: []const []const u8, engine
     std.debug.print("Building {s} for iOS...\n", .{ios_config.app_name});
     std.debug.print("  Target: {s}\n", .{if (simulator) "iOS Simulator (arm64)" else "iOS Device (arm64)"});
     std.debug.print("  Configuration: {s}\n", .{if (release) "Release" else "Debug"});
+    if (engine_path) |ep| {
+        std.debug.print("  Engine: {s}\n", .{ep});
+    }
 
     // Ensure iOS build files exist
     try ensureIosBuildFiles(allocator, project_path, ios_config, engine_path);
@@ -285,10 +298,11 @@ fn fixFingerprint(allocator: std.mem.Allocator, path: []const u8, new_fp: []cons
 // iOS Xcode Command
 // ============================================================================
 
-fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8, engine_path: ?[]const u8) !void {
+fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8, global_engine_path: ?[]const u8) !void {
     var project_path: []const u8 = ".";
     var team_id: ?[]const u8 = null;
     var output_dir: []const u8 = "./ios-xcode";
+    var local_engine_path: ?[]const u8 = null;
 
     // Parse args
     var i: usize = 0;
@@ -304,10 +318,15 @@ fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8, engine
             if (i < args.len) output_dir = args[i];
         } else if (std.mem.startsWith(u8, arg, "--output=")) {
             output_dir = arg["--output=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            local_engine_path = arg["--engine-path=".len..];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             project_path = arg;
         }
     }
+
+    // Use local override if provided, otherwise use global engine path
+    const engine_path = local_engine_path orelse global_engine_path;
 
     // Load iOS config
     var ios_config = try IosConfig.load(allocator, project_path);
@@ -341,9 +360,10 @@ fn handleIosXcode(allocator: std.mem.Allocator, args: []const []const u8, engine
 // iOS Run Command
 // ============================================================================
 
-fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8, engine_path: ?[]const u8) !void {
+fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8, global_engine_path: ?[]const u8) !void {
     var project_path: []const u8 = ".";
     var simulator = false;
+    var local_engine_path: ?[]const u8 = null;
 
     // Parse args
     var i: usize = 0;
@@ -353,10 +373,15 @@ fn handleIosRun(allocator: std.mem.Allocator, args: []const []const u8, engine_p
             simulator = true;
         } else if (std.mem.eql(u8, arg, "--device") or std.mem.eql(u8, arg, "-d")) {
             simulator = false;
+        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+            local_engine_path = arg["--engine-path=".len..];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             project_path = arg;
         }
     }
+
+    // Use local override if provided, otherwise use global engine path
+    const engine_path = local_engine_path orelse global_engine_path;
 
     // Load iOS config
     const ios_config = try IosConfig.load(allocator, project_path);
@@ -657,52 +682,81 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
     const sanitized_app_name = try sanitizeName(allocator, ios_config.app_name);
     defer allocator.free(sanitized_app_name);
 
-    // Generate build.zig.zon based on whether we have a local engine path or not
-    const build_zon_content = if (engine_path) |local_engine_path| blk: {
-        // Using local engine - compute relative path from ios/ to engine
-        const abs_ios_dir = try std.fs.cwd().realpathAlloc(allocator, ios_dir);
-        defer allocator.free(abs_ios_dir);
-
-        const abs_engine_path = try std.fs.cwd().realpathAlloc(allocator, local_engine_path);
-        defer allocator.free(abs_engine_path);
-
-        const rel_engine_path = try std.fs.path.relative(allocator, abs_ios_dir, abs_engine_path);
-        defer allocator.free(rel_engine_path);
-
-        break :blk try std.fmt.allocPrint(allocator,
-            \\.{{
-            \\    .fingerprint = 0xb8a8f4e73d5c1a92,
-            \\    .name = .{s}_ios,
-            \\    .version = "0.1.0",
-            \\    .dependencies = .{{
-            \\        // sokol for linking sokol_clib (C library)
-            \\        // Zig module accessed via engine.sokol to avoid conflicts
-            \\        .sokol = .{{
-            \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
-            \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
-            \\        }},
-            \\        .@"labelle-engine" = .{{
-            \\            .path = "{s}",
-            \\        }},
-            \\    }},
-            \\    .paths = .{{ "build.zig", "build.zig.zon" }},
-            \\}}
-            \\
-        , .{ sanitized_app_name, rel_engine_path });
+    // Determine engine dependency source
+    // Priority: 1. Explicit engine_path, 2. Read from .labelle/build.zig.zon
+    //
+    // Note on path security: The --engine-path flag allows pointing to arbitrary filesystem
+    // locations. This is intentional for CI/development use cases where users need to specify
+    // their local engine checkout. This is similar to npm/pip local path installs.
+    // The user running this CLI has full system access anyway.
+    const engine_dep: EngineDependency = if (engine_path) |path| blk: {
+        // Use explicit engine path directly
+        std.debug.print("Using engine path: {s}\n", .{path});
+        break :blk .{ .path = try allocator.dupe(u8, path) };
     } else blk: {
-        // Using versioned engine - read hash from .labelle/
-        const engine_hash = readEngineHash(allocator, project_path) catch |err| {
-            std.debug.print("Warning: Could not read engine hash from .labelle/build.zig.zon: {}\n", .{err});
+        // Try to read engine dependency from main project's .labelle/build.zig.zon
+        break :blk readEngineDependency(allocator, project_path) catch |err| {
+            std.debug.print("Warning: Could not read engine dependency from .labelle/build.zig.zon: {}\n", .{err});
             std.debug.print("Please run 'labelle generate' first to set up the project.\n", .{});
             return err;
         };
-        defer allocator.free(engine_hash);
+    };
+    defer engine_dep.deinit(allocator);
 
-        // Note: The fingerprint will be validated by Zig on first build.
-        // If it fails, Zig will suggest the correct value.
-        // sokol dependency is needed for linking sokol_clib, but the Zig module
-        // is accessed through engine.sokol to avoid module conflicts
-        break :blk try std.fmt.allocPrint(allocator,
+    // Note: The fingerprint will be validated by Zig on first build.
+    // If it fails, Zig will suggest the correct value.
+    // sokol dependency is needed for linking sokol_clib, but the Zig module
+    // is accessed through engine.sokol to avoid module conflicts
+    const build_zon_content = switch (engine_dep) {
+        .path => |path| blk: {
+            // Zig build system requires relative paths in .path dependencies.
+            // We need to compute the relative path from ios/ directory to the engine.
+            const adjusted_path = if (std.fs.path.isAbsolute(path)) adj: {
+                // Convert absolute path to relative path from ios/ directory
+                // Get the absolute path of the ios directory
+                const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch {
+                    // Fallback: use ../ prefix and hope for the best
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+                defer allocator.free(cwd);
+
+                const ios_abs = std.fs.path.join(allocator, &.{ cwd, ios_dir }) catch {
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+                defer allocator.free(ios_abs);
+
+                // Compute relative path from ios/ to engine
+                break :adj std.fs.path.relative(allocator, ios_abs, path) catch {
+                    break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+                };
+            } else adj: {
+                // Relative paths (from project root) need ../ to navigate out of ios/
+                break :adj try std.fmt.allocPrint(allocator, "../{s}", .{path});
+            };
+            defer allocator.free(adjusted_path);
+
+            break :blk try std.fmt.allocPrint(allocator,
+                \\.{{
+                \\    .fingerprint = 0xb8a8f4e73d5c1a92,
+                \\    .name = .{s}_ios,
+                \\    .version = "0.1.0",
+                \\    .dependencies = .{{
+                \\        // sokol for linking sokol_clib (C library)
+                \\        // Zig module accessed via engine.sokol to avoid conflicts
+                \\        .sokol = .{{
+                \\            .url = "git+https://github.com/floooh/sokol-zig.git#bb1a4e95b243e655e788076c545ca6a1f6bf1558",
+                \\            .hash = "sokol-0.1.0-pb1HK_0CLwBZEK_EZfeR-l9Mtt-BBIuucIZ-c5tLDZxc",
+                \\        }},
+                \\        .@"labelle-engine" = .{{
+                \\            .path = "{s}",
+                \\        }},
+                \\    }},
+                \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+                \\}}
+                \\
+            , .{ sanitized_app_name, adjusted_path });
+        },
+        .hash => |hash| try std.fmt.allocPrint(allocator,
             \\.{{
             \\    .fingerprint = 0xb8a8f4e73d5c1a92,
             \\    .name = .{s}_ios,
@@ -722,7 +776,7 @@ fn generateIosBuildFiles(allocator: std.mem.Allocator, project_path: []const u8,
             \\    .paths = .{{ "build.zig", "build.zig.zon" }},
             \\}}
             \\
-        , .{ sanitized_app_name, ios_config.engine_version, engine_hash });
+        , .{ sanitized_app_name, ios_config.engine_version, hash }),
     };
     defer allocator.free(build_zon_content);
 
@@ -924,8 +978,22 @@ fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return result;
 }
 
-/// Read the labelle-engine hash from the main project's .labelle/build.zig.zon
-fn readEngineHash(allocator: std.mem.Allocator, project_path: []const u8) ![]const u8 {
+/// Engine dependency - either a hash (for URL-based) or path (for local)
+const EngineDependency = union(enum) {
+    hash: []const u8,
+    path: []const u8,
+
+    pub fn deinit(self: EngineDependency, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .hash => |h| allocator.free(h),
+            .path => |p| allocator.free(p),
+        }
+    }
+};
+
+/// Read the labelle-engine dependency from the main project's .labelle/build.zig.zon
+/// Returns either a hash (for URL-based dependency) or a path (for local dependency)
+fn readEngineDependency(allocator: std.mem.Allocator, project_path: []const u8) !EngineDependency {
     const build_zon_path = try std.fs.path.join(allocator, &.{ project_path, ".labelle", "build.zig.zon" });
     defer allocator.free(build_zon_path);
 
@@ -937,12 +1005,29 @@ fn readEngineHash(allocator: std.mem.Allocator, project_path: []const u8) ![]con
     defer allocator.free(content);
     _ = try file.readAll(content);
 
-    // Look for .hash = "labelle_engine-..." pattern
-    const hash_prefix = ".hash = \"labelle_engine-";
-    if (std.mem.indexOf(u8, content, hash_prefix)) |start| {
-        const hash_start = start + ".hash = \"".len;
-        if (std.mem.indexOfPos(u8, content, hash_start, "\"")) |end| {
-            return try allocator.dupe(u8, content[hash_start..end]);
+    // Look for labelle-engine dependency block and extract path or hash
+    // Scope the search to just the labelle-engine block to avoid matching other dependencies
+    if (std.mem.indexOf(u8, content, ".@\"labelle-engine\"")) |engine_start| {
+        const after_engine = content[engine_start..];
+
+        // Find the end of this dependency block (closing "},")
+        const block_end = std.mem.indexOf(u8, after_engine, "},") orelse after_engine.len;
+        const section = after_engine[0..block_end];
+
+        // Check for .path within this block only
+        if (std.mem.indexOf(u8, section, ".path = \"")) |path_start| {
+            const value_start = path_start + ".path = \"".len;
+            if (std.mem.indexOfPos(u8, section, value_start, "\"")) |value_end| {
+                return .{ .path = try allocator.dupe(u8, section[value_start..value_end]) };
+            }
+        }
+
+        // Check for .hash within this block only
+        if (std.mem.indexOf(u8, section, ".hash = \"")) |hash_start| {
+            const value_start = hash_start + ".hash = \"".len;
+            if (std.mem.indexOfPos(u8, section, value_start, "\"")) |value_end| {
+                return .{ .hash = try allocator.dupe(u8, section[value_start..value_end]) };
+            }
         }
     }
 
@@ -987,6 +1072,16 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
     const sanitized_app_name = try sanitizeName(allocator, ios_config.app_name);
     defer allocator.free(sanitized_app_name);
 
+    // Generate physics import lines (only when physics is enabled)
+    const ios_physics_import = if (ios_config.physics_enabled)
+        "            .{ .name = \"labelle-physics\", .module = ios_engine.module(\"labelle-physics\") },\n"
+    else
+        "";
+    const sim_physics_import = if (ios_config.physics_enabled)
+        "            .{ .name = \"labelle-physics\", .module = sim_engine.module(\"labelle-physics\") },\n"
+    else
+        "";
+
     return std.fmt.allocPrint(allocator,
         \\//! iOS Build Configuration - Auto-generated by labelle CLI
         \\//!
@@ -1000,10 +1095,47 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\
         \\const std = @import("std");
         \\
+        \\/// Get iOS SDK path using xcrun
+        \\fn getIosSdkPath(b: *std.Build, sdk_name: []const u8) ?[]const u8 {{
+        \\    const result = std.process.Child.run(.{{
+        \\        .allocator = b.allocator,
+        \\        .argv = &.{{ "xcrun", "--sdk", sdk_name, "--show-sdk-path" }},
+        \\    }}) catch return null;
+        \\    defer b.allocator.free(result.stdout);
+        \\    defer b.allocator.free(result.stderr);
+        \\    if (result.term == .Exited and result.term.Exited == 0) {{
+        \\        const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+        \\        if (path.len == 0) return null; // Reject empty paths
+        \\        return b.allocator.dupe(u8, path) catch null;
+        \\    }}
+        \\    return null;
+        \\}}
+        \\
+        \\/// Configure SDK paths for a compile artifact (sokol_clib)
+        \\fn configureSdkPaths(b: *std.Build, artifact: *std.Build.Step.Compile, sdk_path: []const u8) void {{
+        \\    artifact.root_module.addSystemIncludePath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "usr/include" }}) }});
+        \\    artifact.root_module.addSystemFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/Frameworks" }}) }});
+        \\    artifact.root_module.addSystemFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/SubFrameworks" }}) }});
+        \\}}
+        \\
+        \\/// Add SDK library and framework paths to an executable
+        \\fn addExeSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile, sdk_path: []const u8) void {{
+        \\    exe.root_module.addLibraryPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "usr/lib" }}) }});
+        \\    exe.root_module.addFrameworkPath(.{{ .cwd_relative = b.pathJoin(&.{{ sdk_path, "System/Library/Frameworks" }}) }});
+        \\}}
+        \\
         \\pub fn build(b: *std.Build) void {{
         \\    const optimize = b.standardOptimizeOption(.{{}});
         \\
         \\    const app_name = "{s}";
+        \\
+        \\    // Detect iOS SDK paths using xcrun (required for C header includes and linking)
+        \\    // Note: We don't set b.sysroot to avoid path doubling issues during linking.
+        \\    // Device and simulator use different SDKs with architecture-specific libraries.
+        \\    const device_sdk = getIosSdkPath(b, "iphoneos") orelse
+        \\        @panic("Could not find iOS device SDK (iphoneos). Is Xcode installed?");
+        \\    const sim_sdk = getIosSdkPath(b, "iphonesimulator") orelse
+        \\        @panic("Could not find iOS simulator SDK (iphonesimulator). Is Xcode installed?");
         \\
         \\    // iOS Device Target
         \\    const ios_device_target = b.resolveTargetQuery(.{{
@@ -1012,11 +1144,12 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    }});
         \\
         \\    // iOS Simulator Target (Apple Silicon Macs)
+        \\    // Use apple_a14 to enable NEON SIMD features required by box2d physics
         \\    const ios_sim_target = b.resolveTargetQuery(.{{
         \\        .cpu_arch = .aarch64,
         \\        .os_tag = .ios,
         \\        .abi = .simulator,
-        \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_m1 }},
+        \\        .cpu_model = .{{ .explicit = &std.Target.aarch64.cpu.apple_a14 }},
         \\    }});
         \\
         \\    // iOS Device build
@@ -1027,7 +1160,11 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .dont_link_system_libs = true,
         \\    }});
         \\
+        \\    // Configure sokol for iOS device - add SDK include paths for C header compilation
+        \\    configureSdkPaths(b, ios_sokol.artifact("sokol_clib"), device_sdk);
+        \\
         \\    // Engine provides sokol through engine.sokol (re-exported to avoid module conflicts)
+        \\    // iOS requires sokol backend (raylib not available)
         \\    const ios_engine = b.dependency("labelle-engine", .{{
         \\        .target = ios_device_target,
         \\        .optimize = optimize,
@@ -1042,7 +1179,7 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .optimize = optimize,
         \\        .imports = &.{{
         \\            .{{ .name = "labelle-engine", .module = ios_engine.module("labelle-engine") }},
-        \\        }},
+        \\{s}        }},
         \\    }});
         \\
         \\    const ios_exe = b.addExecutable(.{{
@@ -1062,8 +1199,8 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    ios_exe.linkLibrary(ios_sokol.artifact("sokol_clib"));
         \\    ios_exe.linkLibC();
         \\
-        \\    // Add iOS Device SDK framework search path
-        \\    ios_exe.root_module.addFrameworkPath(.{{ .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/System/Library/Frameworks" }});
+        \\    // Add iOS device SDK library and framework search paths
+        \\    addExeSdkPaths(b, ios_exe, device_sdk);
         \\
         \\    // Link iOS frameworks
         \\    ios_exe.root_module.linkFramework("Foundation", .{{}});
@@ -1084,6 +1221,10 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .dont_link_system_libs = true,
         \\    }});
         \\
+        \\    // Configure sokol for iOS Simulator - add SDK include paths for C header compilation
+        \\    configureSdkPaths(b, sim_sokol.artifact("sokol_clib"), sim_sdk);
+        \\
+        \\    // iOS requires sokol backend (raylib not available)
         \\    const sim_engine = b.dependency("labelle-engine", .{{
         \\        .target = ios_sim_target,
         \\        .optimize = optimize,
@@ -1098,7 +1239,7 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\        .optimize = optimize,
         \\        .imports = &.{{
         \\            .{{ .name = "labelle-engine", .module = sim_engine.module("labelle-engine") }},
-        \\        }},
+        \\{s}        }},
         \\    }});
         \\
         \\    const sim_exe = b.addExecutable(.{{
@@ -1118,8 +1259,8 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
         \\    sim_exe.linkLibrary(sim_sokol.artifact("sokol_clib"));
         \\    sim_exe.linkLibC();
         \\
-        \\    // Add iOS Simulator SDK framework search path
-        \\    sim_exe.root_module.addFrameworkPath(.{{ .cwd_relative = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk/System/Library/Frameworks" }});
+        \\    // Add iOS simulator SDK library and framework search paths
+        \\    addExeSdkPaths(b, sim_exe, sim_sdk);
         \\
         \\    sim_exe.root_module.linkFramework("Foundation", .{{}});
         \\    sim_exe.root_module.linkFramework("UIKit", .{{}});
@@ -1136,7 +1277,9 @@ fn generateIosBuildZig(allocator: std.mem.Allocator, ios_config: IosConfig) ![]c
     , .{
         sanitized_app_name,
         if (ios_config.physics_enabled) "true" else "false",
+        ios_physics_import,
         if (ios_config.physics_enabled) "true" else "false",
+        sim_physics_import,
     });
 }
 

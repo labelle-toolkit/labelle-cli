@@ -1,145 +1,113 @@
 name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
+
+env:
+  R2_BUCKET: labelle-releases
+  R2_ENDPOINT: https://f74988a8ee5b060ad531fb71e5a78174.r2.cloudflarestorage.com
 
 jobs:
   build-linux-x86_64:
     runs-on: ubuntu-latest
     name: Build Linux x86_64
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
-
-      - name: Package
-        run: |
-          mkdir -p release
-          cp zig-out/bin/labelle release/
-          cd release && tar -czvf ../labelle-linux-x86_64.tar.gz .
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
+      - run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+      - uses: actions/upload-artifact@v4
         with:
-          files: labelle-linux-x86_64.tar.gz
+          name: labelle-linux-x86_64
+          path: zig-out/bin/labelle
 
   build-linux-arm64:
     runs-on: ubuntu-latest
     name: Build Linux ARM64
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux
-
-      - name: Package
-        run: |
-          mkdir -p release
-          cp zig-out/bin/labelle release/
-          cd release && tar -czvf ../labelle-linux-arm64.tar.gz .
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
+      - run: zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux
+      - uses: actions/upload-artifact@v4
         with:
-          files: labelle-linux-arm64.tar.gz
+          name: labelle-linux-arm64
+          path: zig-out/bin/labelle
 
   build-macos-x86_64:
     runs-on: macos-latest
     name: Build macOS x86_64
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
-
-      - name: Package
-        run: |
-          mkdir -p release
-          cp zig-out/bin/labelle release/
-          cd release && tar -czvf ../labelle-darwin-x86_64.tar.gz .
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
+      - run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
+      - uses: actions/upload-artifact@v4
         with:
-          files: labelle-darwin-x86_64.tar.gz
+          name: labelle-darwin-x86_64
+          path: zig-out/bin/labelle
 
   build-macos-arm64:
     runs-on: macos-latest
     name: Build macOS ARM64
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
-
-      - name: Package
-        run: |
-          mkdir -p release
-          cp zig-out/bin/labelle release/
-          cd release && tar -czvf ../labelle-darwin-arm64.tar.gz .
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
+      - run: zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
+      - uses: actions/upload-artifact@v4
         with:
-          files: labelle-darwin-arm64.tar.gz
+          name: labelle-darwin-arm64
+          path: zig-out/bin/labelle
 
   build-windows-x86_64:
     runs-on: windows-latest
     name: Build Windows x86_64
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
-
-      - name: Package
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release
-          Copy-Item zig-out/bin/labelle.exe release/
-          Compress-Archive -Path release/* -DestinationPath labelle-windows-x86_64.zip
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
+      - run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+      - uses: actions/upload-artifact@v4
         with:
-          files: labelle-windows-x86_64.zip
+          name: labelle-windows-x86_64
+          path: zig-out/bin/labelle.exe
+
+  upload-r2:
+    needs: [build-linux-x86_64, build-linux-arm64, build-macos-x86_64, build-macos-arm64, build-windows-x86_64]
+    runs-on: ubuntu-latest
+    name: Upload to R2
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          pip install awscli
+          VERSION=${GITHUB_REF#refs/tags/}
+          
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            file=$(ls "$dir")
+            aws s3 cp "$dir$file" "s3://$R2_BUCKET/cli/$VERSION/$name" \
+              --endpoint-url $R2_ENDPOINT
+          done
+          
+          echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/cli/latest.txt" \
+            --endpoint-url $R2_ENDPOINT
+          
+          echo "Released $VERSION to R2"
