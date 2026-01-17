@@ -501,6 +501,10 @@ fn buildTarget(allocator: std.mem.Allocator, output_dir: []const u8, target: []c
     if (release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
     }
+    // Add WASM target flag for wasm builds
+    if (std.mem.indexOf(u8, target, "wasm") != null) {
+        try args.append(allocator, "-Dtarget=wasm32-emscripten");
+    }
 
     var child = std.process.Child.init(args.items, allocator);
     child.cwd = target_dir;
@@ -556,6 +560,10 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
     try args.appendSlice(allocator, &.{ "zig", "build", "run" });
     if (options.release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
+    }
+    // Add WASM target flag for wasm builds
+    if (std.mem.indexOf(u8, target, "wasm") != null) {
+        try args.append(allocator, "-Dtarget=wasm32-emscripten");
     }
 
     var child = std.process.Child.init(args.items, allocator);
