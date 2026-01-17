@@ -259,138 +259,32 @@ fn normalizeToForwardSlashes(allocator: std.mem.Allocator, path: []const u8) ![]
     return result;
 }
 
-/// Create a bootstrap build.zig.zon using a local engine path.
-/// The path needs to be relative to the bootstrap directory.
-fn createBootstrapBuildZonWithLocalPath(allocator: std.mem.Allocator, dir: std.fs.Dir, local_path: []const u8) !void {
-    // Convert to relative path from .labelle-bootstrap directory
-    // Since bootstrap is in .labelle-bootstrap/, we need to compute the relative path
-    // from cwd/.labelle-bootstrap to the engine path
-    var relative_path: []const u8 = undefined;
-    var needs_free = false;
+/// Validate and sanitize engine path to prevent injection attacks.
+/// Returns the validated absolute path.
+fn validateEnginePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    // Resolve to absolute path to prevent path traversal
+    const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch |err| {
+        std.debug.print("Error: Engine path '{s}' does not exist or cannot be resolved: {}\n", .{ path, err });
+        return error.InvalidEnginePath;
+    };
+    errdefer allocator.free(abs_path);
 
-    if (std.fs.path.isAbsolute(local_path)) {
-        // For absolute paths, compute relative path from bootstrap dir to engine
-        // Get current working directory
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch {
-            std.debug.print("Error: Could not determine current directory\n", .{});
-            return error.InvalidPath;
-        };
+    // Check if path is a directory
+    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch |err| {
+        std.debug.print("Error: Engine path '{s}' is not a directory: {}\n", .{ abs_path, err });
+        allocator.free(abs_path);
+        return error.InvalidEnginePath;
+    };
+    defer dir.close();
 
-        // Resolve engine path to absolute - propagate error if path doesn't exist
-        var engine_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const engine_abs = std.fs.cwd().realpath(local_path, &engine_buf) catch {
-            std.debug.print("Error: Engine path does not exist: {s}\n", .{local_path});
-            return error.InvalidPath;
-        };
+    // Verify it contains expected engine files (build.zig)
+    dir.access("build.zig", .{}) catch {
+        std.debug.print("Error: Engine path '{s}' does not contain build.zig\n", .{abs_path});
+        allocator.free(abs_path);
+        return error.InvalidEnginePath;
+    };
 
-        // Compute relative path from cwd to engine
-        const rel_from_cwd = try computeRelativePath(allocator, cwd, engine_abs);
-        defer allocator.free(rel_from_cwd);
-
-        // Add parent dir prefix to go up from .labelle-bootstrap to cwd
-        // Always use forward slashes in build.zig.zon (Zig handles this on all platforms)
-        const normalized = try normalizeToForwardSlashes(allocator, rel_from_cwd);
-        defer allocator.free(normalized);
-        relative_path = try std.fmt.allocPrint(allocator, "../{s}", .{normalized});
-        needs_free = true;
-    } else {
-        // Already relative - just add parent dir prefix to go up from bootstrap dir
-        // Always use forward slashes in build.zig.zon (Zig handles this on all platforms)
-        const normalized = try normalizeToForwardSlashes(allocator, local_path);
-        defer allocator.free(normalized);
-        relative_path = try std.fmt.allocPrint(allocator, "../{s}", .{normalized});
-        needs_free = true;
-    }
-
-    defer if (needs_free) allocator.free(relative_path);
-
-    const content = try std.fmt.allocPrint(allocator,
-        \\.{{
-        \\    .fingerprint = 0x3dda308fa396ad7d,
-        \\    .name = .labelle_bootstrap,
-        \\    .version = "0.0.0",
-        \\    .minimum_zig_version = "0.15.2",
-        \\    .dependencies = .{{
-        \\        .@"labelle-engine" = .{{
-        \\            .path = "{s}",
-        \\        }},
-        \\    }},
-        \\    .paths = .{{ "build.zig", "build.zig.zon" }},
-        \\}}
-        \\
-    , .{relative_path});
-    defer allocator.free(content);
-
-    var file = try dir.createFile("build.zig.zon", .{});
-    defer file.close();
-    try file.writeAll(content);
-}
-
-/// Compute relative path from `from` directory to `to` path.
-/// Both paths must be absolute. Uses platform-specific path separator.
-fn computeRelativePath(allocator: std.mem.Allocator, from: []const u8, to: []const u8) ![]const u8 {
-    const sep = std.fs.path.sep;
-
-    // Find common prefix
-    var common_len: usize = 0;
-    var last_sep: usize = 0;
-
-    const min_len = @min(from.len, to.len);
-    for (0..min_len) |i| {
-        if (from[i] != to[i]) break;
-        if (from[i] == sep) last_sep = i;
-        common_len = i + 1;
-    }
-
-    // If one is prefix of the other, last_sep should be at the end of the shorter one
-    if (common_len == min_len) {
-        if (from.len == min_len and (to.len == min_len or to[min_len] == sep)) {
-            last_sep = min_len;
-        } else if (to.len == min_len and from[min_len] == sep) {
-            last_sep = min_len;
-        }
-    }
-
-    // Count how many directories to go up from `from`
-    var up_count: usize = 0;
-    if (last_sep < from.len) {
-        for (from[last_sep..]) |c| {
-            if (c == sep) up_count += 1;
-        }
-    }
-
-    // Build the relative path
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer result.deinit(allocator);
-
-    // Add ../ (or ..\) for each directory to go up
-    for (0..up_count) |_| {
-        try result.appendSlice(allocator, "..");
-        try result.append(allocator, sep);
-    }
-
-    // Add the remaining path from `to`
-    if (last_sep < to.len) {
-        var suffix = to[last_sep..];
-        // Skip leading separator
-        if (suffix.len > 0 and suffix[0] == sep) {
-            suffix = suffix[1..];
-        }
-        try result.appendSlice(allocator, suffix);
-    }
-
-    // Handle edge case: same directory
-    if (result.items.len == 0) {
-        try result.appendSlice(allocator, ".");
-    }
-
-    // Remove trailing separator if present
-    if (result.items.len > 1 and result.items[result.items.len - 1] == sep) {
-        _ = result.pop();
-    }
-
-    return try result.toOwnedSlice(allocator);
+    return abs_path;
 }
 
 /// Create a bootstrap build.zig that runs the engine's generator
@@ -498,9 +392,12 @@ pub fn runEngineGenerator(allocator: std.mem.Allocator, version: []const u8) !vo
     std.debug.print("Generation complete!\n", .{});
 }
 
-/// Run the engine's generator using a local engine path.
-/// This is useful for CI testing against a local checkout.
-pub fn runEngineGeneratorWithLocalPath(allocator: std.mem.Allocator, local_path: []const u8) !void {
+/// Run the engine's generator from a local path (for development).
+/// This creates a bootstrap build.zig that depends on the local engine path.
+pub fn runLocalEngineGenerator(allocator: std.mem.Allocator, engine_path: []const u8) !void {
+    // Validate and resolve to absolute path
+    const abs_engine_path = try validateEnginePath(allocator, engine_path);
+    defer allocator.free(abs_engine_path);
 
     const bootstrap_dir_path = try getBootstrapDir(allocator);
     defer allocator.free(bootstrap_dir_path);
@@ -513,17 +410,22 @@ pub fn runEngineGeneratorWithLocalPath(allocator: std.mem.Allocator, local_path:
     var bootstrap_dir = try std.fs.cwd().openDir(bootstrap_dir_path, .{});
     defer bootstrap_dir.close();
 
-    std.debug.print("Using local engine at: {s}\n", .{local_path});
+    // Compute relative path from bootstrap dir to engine
+    const abs_bootstrap_path = try std.fs.cwd().realpathAlloc(allocator, bootstrap_dir_path);
+    defer allocator.free(abs_bootstrap_path);
 
-    // Create bootstrap build files with local path
-    try createBootstrapBuildZonWithLocalPath(allocator, bootstrap_dir, local_path);
+    const rel_engine_path = try std.fs.path.relative(allocator, abs_bootstrap_path, abs_engine_path);
+    defer allocator.free(rel_engine_path);
+
+    // Create bootstrap build.zig.zon with relative path
+    try createLocalBootstrapBuildZon(allocator, bootstrap_dir, rel_engine_path);
     try createBootstrapBuildZig(bootstrap_dir);
 
-    std.debug.print("Running generator...\n", .{});
+    std.debug.print("Running generator from local engine...\n", .{});
 
     // Pass --engine-path to the generator so it knows to use local path
     // for the output build.zig.zon (skip GitHub fetching)
-    const engine_path_arg = try std.fmt.allocPrint(allocator, "--engine-path={s}", .{local_path});
+    const engine_path_arg = try std.fmt.allocPrint(allocator, "--engine-path={s}", .{abs_engine_path});
     defer allocator.free(engine_path_arg);
 
     // Run the generator from the bootstrap directory
@@ -537,23 +439,56 @@ pub fn runEngineGeneratorWithLocalPath(allocator: std.mem.Allocator, local_path:
     child.cwd = bootstrap_dir_path;
 
     const result = try child.spawnAndWait();
-    const exit_code = switch (result) {
-        .Exited => |code| code,
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("Generator failed with exit code {}\n", .{code});
+                return error.GeneratorFailed;
+            }
+        },
         .Signal => |sig| {
             std.debug.print("Generator killed by signal {}\n", .{sig});
             return error.GeneratorFailed;
         },
-        else => {
-            std.debug.print("Generator terminated abnormally\n", .{});
+        .Stopped => |sig| {
+            std.debug.print("Generator stopped by signal {}\n", .{sig});
             return error.GeneratorFailed;
         },
-    };
-    if (exit_code != 0) {
-        std.debug.print("Generator failed with exit code {}\n", .{exit_code});
-        return error.GeneratorFailed;
+        .Unknown => |code| {
+            std.debug.print("Generator failed with unknown code {}\n", .{code});
+            return error.GeneratorFailed;
+        },
     }
 
     std.debug.print("Generation complete!\n", .{});
+}
+
+/// Create a bootstrap build.zig.zon that uses a local engine path
+fn createLocalBootstrapBuildZon(allocator: std.mem.Allocator, dir: std.fs.Dir, engine_path: []const u8) !void {
+    // Normalize path for Windows compatibility (convert backslashes to forward slashes)
+    const normalized_path = try normalizeToForwardSlashes(allocator, engine_path);
+    defer allocator.free(normalized_path);
+
+    const content = try std.fmt.allocPrint(allocator,
+        \\.{{
+        \\    .fingerprint = 0x3dda308fa396ad7d,
+        \\    .name = .labelle_bootstrap,
+        \\    .version = "0.0.0",
+        \\    .minimum_zig_version = "0.15.2",
+        \\    .dependencies = .{{
+        \\        .@"labelle-engine" = .{{
+        \\            .path = "{s}",
+        \\        }},
+        \\    }},
+        \\    .paths = .{{ "build.zig", "build.zig.zon" }},
+        \\}}
+        \\
+    , .{normalized_path});
+    defer allocator.free(content);
+
+    var file = try dir.createFile("build.zig.zon", .{});
+    defer file.close();
+    try file.writeAll(content);
 }
 
 /// Check if a version exists in the cache
@@ -572,45 +507,4 @@ test "resolveVersion returns version as-is for non-latest without validation" {
     const resolved = try resolveVersion(std.testing.allocator, "0.33.0", false);
     try std.testing.expectEqualStrings("0.33.0", resolved.version);
     try std.testing.expect(!resolved.allocated);
-}
-
-// Helper to build platform-specific test paths
-fn testPath(comptime path: []const u8) []const u8 {
-    comptime {
-        var result: [path.len]u8 = undefined;
-        for (path, 0..) |c, i| {
-            result[i] = if (c == '/') std.fs.path.sep else c;
-        }
-        return &result;
-    }
-}
-
-test "computeRelativePath: engine is ancestor of project" {
-    // Project: /a/b/engine/ci/test, Engine: /a/b/engine
-    // Expected: ../.. (up from test, up from ci)
-    const result = try computeRelativePath(std.testing.allocator, testPath("/a/b/engine/ci/test"), testPath("/a/b/engine"));
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings(testPath("../.."), result);
-}
-
-test "computeRelativePath: engine is sibling of project" {
-    // Project: /a/b/project, Engine: /a/b/engine
-    // Expected: ../engine
-    const result = try computeRelativePath(std.testing.allocator, testPath("/a/b/project"), testPath("/a/b/engine"));
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings(testPath("../engine"), result);
-}
-
-test "computeRelativePath: same directory" {
-    const result = try computeRelativePath(std.testing.allocator, testPath("/a/b/c"), testPath("/a/b/c"));
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings(".", result);
-}
-
-test "computeRelativePath: engine is deeper than project" {
-    // Project: /a/b, Engine: /a/b/c/d
-    // Expected: c/d
-    const result = try computeRelativePath(std.testing.allocator, testPath("/a/b"), testPath("/a/b/c/d"));
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings(testPath("c/d"), result);
 }

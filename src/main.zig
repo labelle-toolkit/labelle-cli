@@ -21,7 +21,6 @@ const std = @import("std");
 const engine_resolver = @import("engine_resolver.zig");
 const project_config = @import("project_config.zig");
 const ios_commands = @import("ios/ios_commands.zig");
-const wasm_commands = @import("wasm/wasm_commands.zig");
 const android_commands = @import("android/android_commands.zig");
 
 // Version from build.zig.zon
@@ -37,7 +36,6 @@ const Command = enum {
     upgrade,
     self_update,
     ios,
-    wasm,
     android,
     targets,
     help,
@@ -66,8 +64,6 @@ const Options = struct {
     upgrade_list: bool = false,
     // iOS options - pass remaining args to ios_commands
     ios_args: []const []const u8 = &.{},
-    // WASM options - pass remaining args to wasm_commands
-    wasm_args: []const []const u8 = &.{},
     // Android options - pass remaining args to android_commands
     android_args: []const []const u8 = &.{},
 };
@@ -80,15 +76,7 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var options = parseArgs(args);
-
-    // Check for LABELLE_ENGINE_PATH environment variable (cross-platform)
-    var env_engine_path: ?[]const u8 = null;
-    if (options.engine_path == null) {
-        env_engine_path = std.process.getEnvVarOwned(allocator, "LABELLE_ENGINE_PATH") catch null;
-        options.engine_path = env_engine_path;
-    }
-    defer if (env_engine_path) |p| allocator.free(p);
+    const options = parseArgs(args);
 
     if (options.show_help) {
         printCommandHelp(options.command);
@@ -104,8 +92,7 @@ pub fn main() !void {
         .upgrade => try runUpgrade(allocator, options),
         .self_update => try runSelfUpdate(allocator),
         .ios => try ios_commands.handleIos(allocator, options.ios_args, options.engine_path),
-        .wasm => try wasm_commands.handleWasm(allocator, options.wasm_args),
-        .android => try android_commands.handleAndroid(allocator, options.android_args),
+        .android => try android_commands.handleAndroid(allocator, options.android_args, options.engine_path),
         .targets => try listTargets(allocator),
         .help => printHelp(),
         .version => printVersion(),
@@ -119,96 +106,132 @@ fn parseArgs(args: []const []const u8) Options {
         return options;
     }
 
-    const cmd_str = args[1];
-    if (std.mem.eql(u8, cmd_str, "init")) {
-        options.command = .init;
-    } else if (std.mem.eql(u8, cmd_str, "generate") or std.mem.eql(u8, cmd_str, "gen")) {
-        options.command = .generate;
-    } else if (std.mem.eql(u8, cmd_str, "build")) {
-        options.command = .build;
-    } else if (std.mem.eql(u8, cmd_str, "run")) {
-        options.command = .run;
-    } else if (std.mem.eql(u8, cmd_str, "targets")) {
-        options.command = .targets;
-    } else if (std.mem.eql(u8, cmd_str, "update")) {
-        options.command = .update;
-    } else if (std.mem.eql(u8, cmd_str, "upgrade")) {
-        options.command = .upgrade;
-    } else if (std.mem.eql(u8, cmd_str, "self-update")) {
-        options.command = .self_update;
-    } else if (std.mem.eql(u8, cmd_str, "ios")) {
-        options.command = .ios;
-        // Pass all remaining args to ios_commands
-        if (args.len > 2) {
-            options.ios_args = args[2..];
-        }
-        return options;
-    } else if (std.mem.eql(u8, cmd_str, "wasm") or std.mem.eql(u8, cmd_str, "web")) {
-        options.command = .wasm;
-        // Pass all remaining args to wasm_commands
-        if (args.len > 2) {
-            options.wasm_args = args[2..];
-        }
-        return options;
-    } else if (std.mem.eql(u8, cmd_str, "android") or std.mem.eql(u8, cmd_str, "apk")) {
-        options.command = .android;
-        // Pass all remaining args to android_commands
-        if (args.len > 2) {
-            options.android_args = args[2..];
-        }
-        return options;
-    } else if (std.mem.eql(u8, cmd_str, "help") or std.mem.eql(u8, cmd_str, "--help") or std.mem.eql(u8, cmd_str, "-h")) {
-        options.command = .help;
-    } else if (std.mem.eql(u8, cmd_str, "version") or std.mem.eql(u8, cmd_str, "--version") or std.mem.eql(u8, cmd_str, "-v")) {
-        options.command = .version;
-    }
-
-    // Parse remaining arguments
-    var i: usize = 2;
+    // First pass: identify command and flags
+    var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            options.show_help = true;
-        } else if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) {
-            options.release = true;
-        } else if (std.mem.eql(u8, arg, "--main-only")) {
-            options.main_only = true;
-        } else if (std.mem.eql(u8, arg, "--no-fetch")) {
-            options.fetch_hashes = false;
-        } else if (std.mem.eql(u8, arg, "--all")) {
-            options.build_all_targets = true;
-        } else if (std.mem.eql(u8, arg, "--check")) {
-            options.upgrade_check_only = true;
-        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
-            options.upgrade_list = true;
-        } else if (std.mem.eql(u8, arg, "--force")) {
-            options.upgrade_force = true;
-        } else if (std.mem.startsWith(u8, arg, "--target=")) {
-            options.target = arg["--target=".len..];
-        } else if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) {
-            // Next arg is the target name
-            if (i + 1 < args.len) {
-                i += 1;
-                options.target = args[i];
+
+        if (std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.eql(u8, arg, "--help")) {
+                options.show_help = true;
+            } else if (std.mem.eql(u8, arg, "--release")) {
+                options.release = true;
+            } else if (std.mem.eql(u8, arg, "--main-only")) {
+                options.main_only = true;
+            } else if (std.mem.eql(u8, arg, "--no-fetch")) {
+                options.fetch_hashes = false;
+            } else if (std.mem.eql(u8, arg, "--all")) {
+                options.build_all_targets = true;
+            } else if (std.mem.eql(u8, arg, "--check")) {
+                options.upgrade_check_only = true;
+            } else if (std.mem.eql(u8, arg, "--list")) {
+                options.upgrade_list = true;
+            } else if (std.mem.eql(u8, arg, "--force")) {
+                options.upgrade_force = true;
+            } else if (std.mem.startsWith(u8, arg, "--target=")) {
+                options.target = arg["--target=".len..];
+            } else if (std.mem.eql(u8, arg, "--target")) {
+                if (i + 1 < args.len) {
+                    i += 1;
+                    options.target = args[i];
+                }
+            } else if (std.mem.startsWith(u8, arg, "--engine=")) {
+                options.engine_version = arg["--engine=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
+                options.engine_path = arg["--engine-path=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--backend=")) {
+                options.backend = arg["--backend=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
+                options.ecs_backend = arg["--ecs=".len..];
+            } else if (std.mem.startsWith(u8, arg, "--version=")) {
+                options.upgrade_version = arg["--version=".len..];
             }
-        } else if (std.mem.startsWith(u8, arg, "--engine=")) {
-            options.engine_version = arg["--engine=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--engine-path=")) {
-            options.engine_path = arg["--engine-path=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--backend=")) {
-            options.backend = arg["--backend=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
-            options.ecs_backend = arg["--ecs=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--version=")) {
-            options.upgrade_version = arg["--version=".len..];
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
-            // Positional argument
-            if (options.command == .init and options.project_name == null) {
-                options.project_name = arg;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            // Short flags
+            for (arg[1..]) |c| {
+                switch (c) {
+                    'h' => options.show_help = true,
+                    'r' => options.release = true,
+                    'l' => options.upgrade_list = true,
+                    'v' => options.command = .version,
+                    't' => {
+                        if (i + 1 < args.len) {
+                            i += 1;
+                            options.target = args[i];
+                        }
+                    },
+                    else => {},
+                }
+            }
+        } else {
+            // Positional argument or command
+            if (options.command == .help) { // No command set yet
+                if (std.mem.eql(u8, arg, "init")) {
+                    options.command = .init;
+                } else if (std.mem.eql(u8, arg, "generate") or std.mem.eql(u8, arg, "gen")) {
+                    options.command = .generate;
+                } else if (std.mem.eql(u8, arg, "build")) {
+                    options.command = .build;
+                } else if (std.mem.eql(u8, arg, "run")) {
+                    options.command = .run;
+                } else if (std.mem.eql(u8, arg, "targets")) {
+                    options.command = .targets;
+                } else if (std.mem.eql(u8, arg, "update")) {
+                    options.command = .update;
+                } else if (std.mem.eql(u8, arg, "upgrade")) {
+                    options.command = .upgrade;
+                } else if (std.mem.eql(u8, arg, "self-update")) {
+                    options.command = .self_update;
+                } else if (std.mem.eql(u8, arg, "ios")) {
+                    options.command = .ios;
+                    options.ios_args = args[i + 1 ..];
+                    // Also check for --engine-path in remaining args
+                    for (options.ios_args) |ios_arg| {
+                        if (std.mem.startsWith(u8, ios_arg, "--engine-path=")) {
+                            options.engine_path = ios_arg["--engine-path=".len..];
+                        }
+                    }
+                    return options;
+                } else if (std.mem.eql(u8, arg, "android") or std.mem.eql(u8, arg, "apk")) {
+                    options.command = .android;
+                    options.android_args = args[i + 1 ..];
+                    // Also check for --engine-path in remaining args
+                    for (options.android_args) |android_arg| {
+                        if (std.mem.startsWith(u8, android_arg, "--engine-path=")) {
+                            options.engine_path = android_arg["--engine-path=".len..];
+                        }
+                    }
+                    return options;
+                } else if (std.mem.eql(u8, arg, "help")) {
+                    options.command = .help;
+                } else if (std.mem.eql(u8, arg, "version")) {
+                    options.command = .version;
+                } else {
+                    // Fallback positional arg
+                    if (options.command == .init and options.project_name == null) {
+                        options.project_name = arg;
+                    } else {
+                        options.project_path = arg;
+                    }
+                }
             } else {
-                options.project_path = arg;
+                // Positional argument
+                if (options.command == .init and options.project_name == null) {
+                    options.project_name = arg;
+                } else {
+                    options.project_path = arg;
+                }
             }
         }
+    }
+
+    // Check for LABELLE_ENGINE_PATH environment variable if not provided via flag
+    if (options.engine_path == null) {
+        if (std.process.getEnvVarOwned(std.heap.page_allocator, "LABELLE_ENGINE_PATH")) |path| {
+            options.engine_path = path;
+            // Note: This leaks in page_allocator but it's a CLI tool exiting soon.
+            // Ideally we'd use the main allocator, but we don't have it easily here.
+        } else |_| {}
     }
 
     return options;
@@ -291,16 +314,6 @@ fn runInit(allocator: std.mem.Allocator, options: Options) !void {
 fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
     std.debug.print("Generating project files...\n", .{});
 
-    // Check if using local engine path
-    if (options.engine_path) |local_path| {
-        // Use local engine path (for development/CI)
-        engine_resolver.runEngineGeneratorWithLocalPath(allocator, local_path) catch |err| {
-            std.debug.print("Error running generator with local path: {}\n", .{err});
-            return;
-        };
-        return;
-    }
-
     // Read project.labelle to get engine version
     const config = project_config.readProjectConfig(allocator, ".") catch |err| {
         std.debug.print("Error reading project.labelle: {}\n", .{err});
@@ -309,24 +322,35 @@ fn runGenerate(allocator: std.mem.Allocator, options: Options) !void {
     };
     defer config.deinit(allocator);
 
-    const engine_version = config.engine_version orelse "latest";
-    const resolved = engine_resolver.resolveVersion(allocator, engine_version, true) catch |err| {
-        if (err == engine_resolver.VersionError.VersionNotFound) {
-            return; // Error already printed
-        }
-        return err;
-    };
-    defer if (resolved.allocated) allocator.free(resolved.version);
+    // Use local engine path if provided, otherwise resolve version
+    if (options.engine_path) |local_path| {
+        std.debug.print("Using local labelle-engine from: {s}\n", .{local_path});
 
-    std.debug.print("Using labelle-engine {s}\n", .{resolved.version});
+        // Run generator from local path
+        engine_resolver.runLocalEngineGenerator(allocator, local_path) catch |err| {
+            std.debug.print("Error running generator from local engine: {}\n", .{err});
+            return;
+        };
+    } else {
+        const engine_version = config.engine_version orelse "latest";
+        const resolved = engine_resolver.resolveVersion(allocator, engine_version, true) catch |err| {
+            if (err == engine_resolver.VersionError.VersionNotFound) {
+                return; // Error already printed
+            }
+            return err;
+        };
+        defer if (resolved.allocated) allocator.free(resolved.version);
 
-    // Fetch engine and run its generator
-    engine_resolver.runEngineGenerator(allocator, resolved.version) catch |err| {
-        if (err == engine_resolver.VersionError.FetchFailed) {
-            return; // Error already printed
-        }
-        return err;
-    };
+        std.debug.print("Using labelle-engine {s}\n", .{resolved.version});
+
+        // Fetch engine and run its generator
+        engine_resolver.runEngineGenerator(allocator, resolved.version) catch |err| {
+            if (err == engine_resolver.VersionError.FetchFailed) {
+                return; // Error already printed
+            }
+            return err;
+        };
+    }
 }
 
 /// Detect available targets by scanning for *_build.zig files in .labelle directory
@@ -348,15 +372,18 @@ fn detectAvailableTargets(allocator: std.mem.Allocator) ![][]const u8 {
 
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != .directory) continue;
 
-        // Look for files matching *_build.zig pattern
-        if (std.mem.endsWith(u8, entry.name, "_build.zig")) {
-            // Extract target name (everything before _build.zig)
-            const target_end = entry.name.len - "_build.zig".len;
-            const target_name = try allocator.dupe(u8, entry.name[0..target_end]);
-            try targets.append(allocator, target_name);
-        }
+        // With the new subfolder structure, each target is a directory containing build.zig
+        // Check if this directory has a build.zig file
+        const build_zig_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{entry.name});
+        defer allocator.free(build_zig_path);
+
+        dir.access(build_zig_path, .{}) catch continue;
+
+        // This is a valid target directory
+        const target_name = try allocator.dupe(u8, entry.name);
+        try targets.append(allocator, target_name);
     }
 
     return targets.toOwnedSlice(allocator);
@@ -463,45 +490,20 @@ fn runBuild(allocator: std.mem.Allocator, options: Options) !void {
 fn buildTarget(allocator: std.mem.Allocator, output_dir: []const u8, target: []const u8, release: bool) !void {
     std.debug.print("Building target: {s}\n", .{target});
 
-    const build_file = try std.fmt.allocPrint(allocator, "{s}_build.zig", .{target});
-    defer allocator.free(build_file);
-
-    const build_zon_file = try std.fmt.allocPrint(allocator, "{s}_build.zig.zon", .{target});
-    defer allocator.free(build_zon_file);
-
-    const install_prefix = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{target});
-    defer allocator.free(install_prefix);
-
-    // Create/update build.zig.zon symlink to point to target-specific .zon
-    // This is required because `zig build --build-file` still looks for build.zig.zon
-    {
-        var dir = try std.fs.cwd().openDir(output_dir, .{});
-        defer dir.close();
-
-        // Remove existing symlink/file if it exists
-        dir.deleteFile("build.zig.zon") catch |err| {
-            if (err != error.FileNotFound) {
-                std.debug.print("Warning: Could not remove existing build.zig.zon: {s}\n", .{@errorName(err)});
-            }
-        };
-
-        // Create new symlink
-        dir.symLink(build_zon_file, "build.zig.zon", .{}) catch |err| {
-            std.debug.print("Warning: Could not create build.zig.zon symlink: {s}\n", .{@errorName(err)});
-            std.debug.print("You may need to manually run: cd {s} && ln -sf {s} build.zig.zon\n", .{ output_dir, build_zon_file });
-        };
-    }
+    // With the new subfolder structure, each target has its own directory
+    const target_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_dir, target });
+    defer allocator.free(target_dir);
 
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try args.appendSlice(allocator, &.{ "zig", "build", "--build-file", build_file, "-p", install_prefix });
+    try args.appendSlice(allocator, &.{ "zig", "build" });
     if (release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
     }
 
     var child = std.process.Child.init(args.items, allocator);
-    child.cwd = output_dir;
+    child.cwd = target_dir;
 
     const result = try child.spawnAndWait();
     if (result != .Exited or result.Exited != 0) {
@@ -544,44 +546,20 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
 
     std.debug.print("Running target: {s}\n", .{target});
 
-    const build_file = try std.fmt.allocPrint(allocator, "{s}_build.zig", .{target});
-    defer allocator.free(build_file);
-
-    const build_zon_file = try std.fmt.allocPrint(allocator, "{s}_build.zig.zon", .{target});
-    defer allocator.free(build_zon_file);
-
-    const install_prefix = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{target});
-    defer allocator.free(install_prefix);
-
-    // Create/update build.zig.zon symlink to point to target-specific .zon
-    {
-        var dir = try std.fs.cwd().openDir(output_dir, .{});
-        defer dir.close();
-
-        // Remove existing symlink/file if it exists
-        dir.deleteFile("build.zig.zon") catch |err| {
-            if (err != error.FileNotFound) {
-                std.debug.print("Warning: Could not remove existing build.zig.zon: {s}\n", .{@errorName(err)});
-            }
-        };
-
-        // Create new symlink
-        dir.symLink(build_zon_file, "build.zig.zon", .{}) catch |err| {
-            std.debug.print("Warning: Could not create build.zig.zon symlink: {s}\n", .{@errorName(err)});
-            std.debug.print("You may need to manually run: cd {s} && ln -sf {s} build.zig.zon\n", .{ output_dir, build_zon_file });
-        };
-    }
+    // With the new subfolder structure, each target has its own directory
+    const target_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_dir, target });
+    defer allocator.free(target_dir);
 
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try args.appendSlice(allocator, &.{ "zig", "build", "--build-file", build_file, "-p", install_prefix, "run" });
+    try args.appendSlice(allocator, &.{ "zig", "build", "run" });
     if (options.release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
     }
 
     var child = std.process.Child.init(args.items, allocator);
-    child.cwd = output_dir;
+    child.cwd = target_dir;
 
     _ = try child.spawnAndWait();
 }
@@ -855,7 +833,6 @@ fn printHelp() void {
         \\  upgrade         Upgrade to a newer labelle-engine version
         \\  self-update     Update the labelle CLI itself
         \\  ios             iOS build and deployment commands
-        \\  wasm            WebAssembly build and serve commands
         \\  android         Android APK build and deployment commands
         \\  help            Show this help
         \\  version         Show CLI version
@@ -864,12 +841,9 @@ fn printHelp() void {
         \\  --target=NAME, -t NAME  Specify build target (e.g., raylib_desktop)
         \\  --all                   Build all available targets
         \\  --engine=VER            Specify labelle-engine version (default: from project.labelle)
-        \\  --engine-path=PATH      Use local engine path instead of fetching from registry
+        \\  --engine-path=PATH      Use local engine path (for development)
         \\  --release, -r           Build in release mode
         \\  --help, -h              Show help for a command
-        \\
-        \\Environment Variables:
-        \\  LABELLE_ENGINE_PATH   Path to local labelle-engine checkout (for development/CI)
         \\
         \\Examples:
         \\  labelle init my-game
@@ -880,17 +854,12 @@ fn printHelp() void {
         \\  labelle build --target raylib_wasm
         \\  labelle build --all
         \\  labelle run --release
+        \\  labelle build --engine-path=../labelle-engine
         \\  labelle upgrade --check
         \\  labelle ios build --simulator
         \\  labelle ios xcode
-        \\  labelle wasm build
-        \\  labelle wasm serve
         \\  labelle android build
         \\  labelle android install
-        \\
-        \\  # Using local engine (for development/CI)
-        \\  labelle build --engine-path=/path/to/labelle-engine
-        \\  LABELLE_ENGINE_PATH=/path/to/engine labelle build
         \\
     , .{cli_version});
 }
@@ -920,10 +889,7 @@ fn printCommandHelp(command: Command) void {
             \\Options:
             \\  --main-only         Only regenerate main.zig
             \\  --no-fetch          Skip fetching dependency hashes
-            \\  --engine-path=PATH  Use local engine instead of fetching from registry
-            \\
-            \\Environment Variables:
-            \\  LABELLE_ENGINE_PATH   Path to local labelle-engine checkout
+            \\  --engine-path=PATH  Use local engine path (for development)
             \\
         , .{}),
         .build => std.debug.print(
@@ -1008,19 +974,6 @@ fn printCommandHelp(command: Command) void {
             \\  run             Build and run on device/simulator
             \\
             \\Run 'labelle ios' for full iOS help.
-            \\
-        , .{}),
-        .wasm => std.debug.print(
-            \\WebAssembly build and serve commands
-            \\
-            \\Usage: labelle wasm <command> [options]
-            \\
-            \\Commands:
-            \\  build           Build for WebAssembly
-            \\  serve           Build and serve locally
-            \\  export          Create optimized production build
-            \\
-            \\Run 'labelle wasm' for full WASM help.
             \\
         , .{}),
         .android => std.debug.print(
