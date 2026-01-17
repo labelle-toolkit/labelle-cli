@@ -57,6 +57,7 @@ This ensures projects always use their pinned engine version.
 | `run` | Generate + run `zig build run` in output directory |
 | `update` | Clear `.labelle/` cache and regenerate |
 | `upgrade` | Check/upgrade engine version |
+| `self-update` | Update the CLI itself from R2 CDN |
 | `ios` | iOS build and deployment commands |
 
 ### iOS Commands
@@ -114,9 +115,15 @@ my-game/
 - Cache directory: `~/.cache/labelle-cli/engines/`
 - Bootstrap directory: `.labelle-bootstrap/` (temporary, can be deleted)
 
-### GitHub API Integration
+### Release Distribution
 
-The CLI fetches version info from:
+**CLI binaries** are distributed via Cloudflare R2 CDN:
+- Latest version: `https://releases.labelle.games/cli/latest.txt`
+- Binaries: `https://releases.labelle.games/cli/v{version}/labelle-{os}-{arch}`
+  - Platforms: `darwin`, `linux`, `windows`
+  - Architectures: `arm64`, `x86_64`
+
+**Engine versions** are fetched from GitHub API:
 - Latest release: `https://api.github.com/repos/labelle-toolkit/labelle-engine/releases/latest`
 - All releases: `https://api.github.com/repos/labelle-toolkit/labelle-engine/releases`
 

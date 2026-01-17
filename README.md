@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://github.com/labelle-toolkit/labelle-cli/actions"><img src="https://github.com/labelle-toolkit/labelle-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/labelle-toolkit/labelle-cli/releases"><img src="https://img.shields.io/github/v/release/labelle-toolkit/labelle-cli" alt="Release"></a>
   <a href="https://github.com/labelle-toolkit/labelle-cli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/labelle-toolkit/labelle-cli" alt="License"></a>
 </p>
 
@@ -27,18 +26,36 @@ A standalone CLI tool that manages [labelle-engine](https://github.com/labelle-t
 
 ## Installation
 
-### From Releases
+### Quick Install (Recommended)
 
-Download the latest binary for your platform from [Releases](https://github.com/labelle-toolkit/labelle-cli/releases).
+Download the latest binary for your platform from the CDN:
 
 ```bash
-# Linux/macOS
-tar -xzf labelle-linux-x86_64.tar.gz
+# macOS ARM64 (Apple Silicon)
+curl -fsSL https://releases.labelle.games/cli/v0.4.2/labelle-darwin-arm64 -o labelle
+chmod +x labelle
+sudo mv labelle /usr/local/bin/
+
+# macOS x86_64 (Intel)
+curl -fsSL https://releases.labelle.games/cli/v0.4.2/labelle-darwin-x86_64 -o labelle
+chmod +x labelle
+sudo mv labelle /usr/local/bin/
+
+# Linux ARM64
+curl -fsSL https://releases.labelle.games/cli/v0.4.2/labelle-linux-arm64 -o labelle
+chmod +x labelle
+sudo mv labelle /usr/local/bin/
+
+# Linux x86_64
+curl -fsSL https://releases.labelle.games/cli/v0.4.2/labelle-linux-x86_64 -o labelle
+chmod +x labelle
 sudo mv labelle /usr/local/bin/
 
 # Verify installation
 labelle version
 ```
+
+**Tip:** After installation, use `labelle self-update` to update to newer versions.
 
 ### From Source
 
@@ -77,6 +94,7 @@ labelle run
 | `labelle run` | Build and run the project |
 | `labelle update` | Clear caches and regenerate |
 | `labelle upgrade` | Upgrade to a newer engine version |
+| `labelle self-update` | Update the CLI itself |
 | `labelle help` | Show help information |
 | `labelle version` | Show CLI version |
 
