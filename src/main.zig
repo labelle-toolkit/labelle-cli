@@ -640,16 +640,17 @@ fn runUpgrade(allocator: std.mem.Allocator, options: Options) !void {
 }
 
 fn runSelfUpdate(allocator: std.mem.Allocator) !void {
-    const github_cli_releases_url = "repos/labelle-toolkit/labelle-cli/releases/latest";
+    const r2_base_url = "https://releases.labelle.games/cli";
 
     std.debug.print("Checking for labelle-cli updates...\n", .{});
     std.debug.print("Current version: {s}\n\n", .{cli_version});
 
-    // Fetch latest version from GitHub using gh api (handles authentication for private repos)
+    // Fetch latest version from R2
     var child = std.process.Child.init(&.{
-        "gh",
-        "api",
-        github_cli_releases_url,
+        "curl",
+        "-s",
+        "-f",
+        r2_base_url ++ "/latest.txt",
     }, allocator);
 
     child.stdout_behavior = .Pipe;
@@ -657,44 +658,30 @@ fn runSelfUpdate(allocator: std.mem.Allocator) !void {
 
     _ = child.spawn() catch |err| {
         std.debug.print("Error: Failed to check for updates: {}\n", .{err});
-        std.debug.print("Make sure GitHub CLI (gh) is installed and you're logged in: gh auth login\n", .{});
+        std.debug.print("Make sure curl is installed and you have network access.\n", .{});
         return;
     };
 
     const stdout = child.stdout orelse return;
-    const response = stdout.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    const response = stdout.readToEndAlloc(allocator, 1024) catch |err| {
         std.debug.print("Error reading response: {}\n", .{err});
         return;
     };
     defer allocator.free(response);
 
-    _ = child.wait() catch |err| {
+    const wait_result = child.wait() catch |err| {
         std.debug.print("Error waiting for curl: {}\n", .{err});
         return;
     };
 
-    // Parse tag_name from response (simple string search)
-    // GitHub API may return JSON with or without spaces: "tag_name":"v0.4.0" or "tag_name": "v0.4.0"
-    const tag_key = "\"tag_name\":";
-    const tag_key_pos = std.mem.indexOf(u8, response, tag_key) orelse {
-        std.debug.print("Error: Could not find latest version. Check GitHub manually.\n", .{});
+    if (wait_result.Exited != 0) {
+        std.debug.print("Error: Could not fetch latest version from R2.\n", .{});
         std.debug.print("URL: https://github.com/labelle-toolkit/labelle-cli/releases\n", .{});
         return;
-    };
+    }
 
-    // Find the opening quote of the value (skip any whitespace)
-    const after_key = tag_key_pos + tag_key.len;
-    const quote_pos = std.mem.indexOfPos(u8, response, after_key, "\"") orelse {
-        std.debug.print("Error: Invalid response from GitHub API.\n", .{});
-        return;
-    };
-    const version_start = quote_pos + 1;
-    const version_end = std.mem.indexOfPos(u8, response, version_start, "\"") orelse {
-        std.debug.print("Error: Invalid response from GitHub API.\n", .{});
-        return;
-    };
-
-    var latest_version = response[version_start..version_end];
+    // Response is just the version string (e.g., "v0.4.2\n")
+    var latest_version = std.mem.trim(u8, response, &std.ascii.whitespace);
     // Strip 'v' prefix if present
     if (std.mem.startsWith(u8, latest_version, "v")) {
         latest_version = latest_version[1..];
@@ -715,89 +702,87 @@ fn runSelfUpdate(allocator: std.mem.Allocator) !void {
 
     std.debug.print("New version available: {s}\n\n", .{latest_version});
 
-    // Check if we're in a git repository (source install)
-    const git_check = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "git", "rev-parse", "--git-dir" },
-    }) catch {
-        // Not in a git repo, show manual instructions
+    // Determine platform for binary download
+    const os_name = switch (@import("builtin").os.tag) {
+        .macos => "darwin",
+        .linux => "linux",
+        .windows => "windows",
+        else => {
+            std.debug.print("Unsupported platform for binary download.\n", .{});
+            printManualUpdateInstructions(latest_version);
+            return;
+        },
+    };
+
+    const arch_name = switch (@import("builtin").cpu.arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "x86_64",
+        else => {
+            std.debug.print("Unsupported architecture for binary download.\n", .{});
+            printManualUpdateInstructions(latest_version);
+            return;
+        },
+    };
+
+    // Construct download URL: https://releases.labelle.games/cli/v0.4.2/labelle-darwin-arm64
+    const download_url = std.fmt.allocPrint(allocator, "{s}/v{s}/labelle-{s}-{s}", .{
+        r2_base_url,
+        latest_version,
+        os_name,
+        arch_name,
+    }) catch return;
+    defer allocator.free(download_url);
+
+    // Create temp file for download
+    const tmp_path = "/tmp/labelle-update";
+    std.debug.print("Downloading from {s}...\n", .{download_url});
+
+    var download_child = std.process.Child.init(&.{
+        "curl",
+        "-s",
+        "-f",
+        "-o",
+        tmp_path,
+        download_url,
+    }, allocator);
+    download_child.stdout_behavior = .Inherit;
+    download_child.stderr_behavior = .Inherit;
+
+    const download_term = download_child.spawnAndWait() catch |err| {
+        std.debug.print("Error downloading: {}\n", .{err});
         printManualUpdateInstructions(latest_version);
         return;
     };
-    defer allocator.free(git_check.stdout);
-    defer allocator.free(git_check.stderr);
 
-    if (git_check.term != .Exited or git_check.term.Exited != 0) {
+    if (download_term != .Exited or download_term.Exited != 0) {
+        std.debug.print("Error: Download failed.\n", .{});
         printManualUpdateInstructions(latest_version);
         return;
     }
 
-    // We're in a git repo - offer to update via git
-    std.debug.print("Detected source installation. Updating via git...\n\n", .{});
-
-    // Git fetch and pull
-    std.debug.print("Running: git fetch origin\n", .{});
-    const fetch_result = std.process.Child.run(.{
+    // Make executable
+    _ = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "git", "fetch", "origin" },
-    }) catch |err| {
-        std.debug.print("Error fetching: {}\n", .{err});
-        return;
-    };
-    defer allocator.free(fetch_result.stdout);
-    defer allocator.free(fetch_result.stderr);
-
-    const version_tag = std.fmt.allocPrint(allocator, "v{s}", .{latest_version}) catch return;
-    defer allocator.free(version_tag);
-
-    std.debug.print("Running: git checkout {s}\n", .{version_tag});
-    const checkout_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "git", "checkout", version_tag },
-    }) catch |err| {
-        std.debug.print("Error checking out version: {}\n", .{err});
-        return;
-    };
-    defer allocator.free(checkout_result.stdout);
-    defer allocator.free(checkout_result.stderr);
-
-    if (checkout_result.term != .Exited or checkout_result.term.Exited != 0) {
-        std.debug.print("Error: Could not checkout v{s}\n", .{latest_version});
-        std.debug.print("{s}\n", .{checkout_result.stderr});
-        return;
-    }
-
-    // Rebuild
-    std.debug.print("Running: zig build -Doptimize=ReleaseSafe\n", .{});
-    var build_child = std.process.Child.init(&.{ "zig", "build", "-Doptimize=ReleaseSafe" }, allocator);
-    build_child.stdin_behavior = .Inherit;
-    build_child.stdout_behavior = .Inherit;
-    build_child.stderr_behavior = .Inherit;
-
-    const build_term = build_child.spawnAndWait() catch |err| {
-        std.debug.print("Error building: {}\n", .{err});
-        return;
-    };
-
-    if (build_term != .Exited or build_term.Exited != 0) {
-        std.debug.print("\nBuild failed. You may need to update manually.\n", .{});
-        return;
-    }
+        .argv = &.{ "chmod", "+x", tmp_path },
+    }) catch {};
 
     std.debug.print("\n", .{});
-    std.debug.print("Successfully updated to v{s}!\n", .{latest_version});
+    std.debug.print("Successfully downloaded v{s}!\n", .{latest_version});
     std.debug.print("\n", .{});
-    std.debug.print("The new binary is at: zig-out/bin/labelle\n", .{});
-    std.debug.print("Copy it to your PATH to complete the update.\n", .{});
+    std.debug.print("The new binary is at: {s}\n", .{tmp_path});
+    std.debug.print("\n", .{});
+    std.debug.print("To complete the update, run:\n", .{});
+    std.debug.print("  sudo mv {s} /usr/local/bin/labelle\n", .{tmp_path});
 }
 
 fn printManualUpdateInstructions(latest_version: []const u8) void {
-    std.debug.print("To update, run:\n\n", .{});
+    std.debug.print("\nTo update manually, download from:\n", .{});
+    std.debug.print("  https://releases.labelle.games/cli/v{s}/\n\n", .{latest_version});
+    std.debug.print("Or build from source:\n", .{});
     std.debug.print("  git clone https://github.com/labelle-toolkit/labelle-cli.git\n", .{});
     std.debug.print("  cd labelle-cli\n", .{});
     std.debug.print("  git checkout v{s}\n", .{latest_version});
     std.debug.print("  zig build -Doptimize=ReleaseSafe\n", .{});
-    std.debug.print("  # Copy zig-out/bin/labelle to your PATH\n", .{});
 }
 
 /// Parse semantic version string into a comparable number.
