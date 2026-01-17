@@ -640,17 +640,15 @@ fn runUpgrade(allocator: std.mem.Allocator, options: Options) !void {
 }
 
 fn runSelfUpdate(allocator: std.mem.Allocator) !void {
-    const github_cli_releases_url = "https://api.github.com/repos/labelle-toolkit/labelle-cli/releases/latest";
+    const github_cli_releases_url = "repos/labelle-toolkit/labelle-cli/releases/latest";
 
     std.debug.print("Checking for labelle-cli updates...\n", .{});
     std.debug.print("Current version: {s}\n\n", .{cli_version});
 
-    // Fetch latest version from GitHub
+    // Fetch latest version from GitHub using gh api (handles authentication for private repos)
     var child = std.process.Child.init(&.{
-        "curl",
-        "-s",
-        "-H",
-        "Accept: application/vnd.github.v3+json",
+        "gh",
+        "api",
         github_cli_releases_url,
     }, allocator);
 
@@ -659,7 +657,7 @@ fn runSelfUpdate(allocator: std.mem.Allocator) !void {
 
     _ = child.spawn() catch |err| {
         std.debug.print("Error: Failed to check for updates: {}\n", .{err});
-        std.debug.print("Make sure curl is installed and you have network access.\n", .{});
+        std.debug.print("Make sure GitHub CLI (gh) is installed and you're logged in: gh auth login\n", .{});
         return;
     };
 
@@ -676,15 +674,21 @@ fn runSelfUpdate(allocator: std.mem.Allocator) !void {
     };
 
     // Parse tag_name from response (simple string search)
-    // GitHub API returns JSON with spaces: "tag_name": "v0.3.2"
-    const tag_prefix = "\"tag_name\": \"";
-    const tag_start = std.mem.indexOf(u8, response, tag_prefix) orelse {
+    // GitHub API may return JSON with or without spaces: "tag_name":"v0.4.0" or "tag_name": "v0.4.0"
+    const tag_key = "\"tag_name\":";
+    const tag_key_pos = std.mem.indexOf(u8, response, tag_key) orelse {
         std.debug.print("Error: Could not find latest version. Check GitHub manually.\n", .{});
         std.debug.print("URL: https://github.com/labelle-toolkit/labelle-cli/releases\n", .{});
         return;
     };
 
-    const version_start = tag_start + tag_prefix.len;
+    // Find the opening quote of the value (skip any whitespace)
+    const after_key = tag_key_pos + tag_key.len;
+    const quote_pos = std.mem.indexOfPos(u8, response, after_key, "\"") orelse {
+        std.debug.print("Error: Invalid response from GitHub API.\n", .{});
+        return;
+    };
+    const version_start = quote_pos + 1;
     const version_end = std.mem.indexOfPos(u8, response, version_start, "\"") orelse {
         std.debug.print("Error: Invalid response from GitHub API.\n", .{});
         return;
