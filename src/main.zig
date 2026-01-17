@@ -487,6 +487,110 @@ fn runBuild(allocator: std.mem.Allocator, options: Options) !void {
     }
 }
 
+/// Setup emsdk sysroot for WASM builds.
+/// Returns the sysroot include path if successful, null otherwise.
+fn setupWasmSysroot(allocator: std.mem.Allocator) ?[]const u8 {
+    // Check if EMSDK environment variable is set
+    const emsdk_path = std.process.getEnvVarOwned(allocator, "EMSDK") catch |err| {
+        if (err == error.EnvironmentVariableNotFound) {
+            // Try to find emcc in PATH
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "which", "emcc" },
+            }) catch {
+                std.debug.print("Warning: emcc not found. Install Emscripten SDK for WASM builds.\n", .{});
+                std.debug.print("  https://emscripten.org/docs/getting_started/downloads.html\n", .{});
+                return null;
+            };
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+
+            if (result.term != .Exited or result.term.Exited != 0) {
+                std.debug.print("Warning: emcc not found. Install Emscripten SDK for WASM builds.\n", .{});
+                return null;
+            }
+
+            // emcc found in PATH, derive EMSDK path from it
+            // emcc is at $EMSDK/upstream/emscripten/emcc
+            const emcc_path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+            // Go up 3 directories: emcc -> emscripten -> upstream -> EMSDK
+            if (std.mem.lastIndexOf(u8, emcc_path, "/upstream/emscripten/")) |idx| {
+                const derived_emsdk = allocator.dupe(u8, emcc_path[0..idx]) catch return null;
+                return setupWasmSysrootWithPath(allocator, derived_emsdk);
+            }
+
+            std.debug.print("Warning: Could not determine EMSDK path from emcc location.\n", .{});
+            return null;
+        }
+        return null;
+    };
+
+    return setupWasmSysrootWithPath(allocator, emsdk_path);
+}
+
+fn setupWasmSysrootWithPath(allocator: std.mem.Allocator, emsdk_path: []const u8) ?[]const u8 {
+    // Sysroot is at $EMSDK/upstream/emscripten/cache/sysroot
+    const sysroot_include = std.fmt.allocPrint(
+        allocator,
+        "{s}/upstream/emscripten/cache/sysroot/include",
+        .{emsdk_path},
+    ) catch return null;
+
+    // Check if sysroot exists
+    std.fs.cwd().access(sysroot_include, .{}) catch {
+        // Sysroot doesn't exist - try to populate it by running emcc
+        std.debug.print("Populating emsdk sysroot...\n", .{});
+
+        const emcc_path = std.fmt.allocPrint(
+            allocator,
+            "{s}/upstream/emscripten/emcc",
+            .{emsdk_path},
+        ) catch return null;
+        defer allocator.free(emcc_path);
+
+        // Create a temp file to compile
+        const tmp_c = "/tmp/labelle_sysroot_check.c";
+        const tmp_js = "/tmp/labelle_sysroot_check.js";
+
+        // Write a minimal C file
+        if (std.fs.cwd().createFile(tmp_c, .{})) |file| {
+            file.writeAll("int main() { return 0; }") catch {};
+            file.close();
+        } else |_| {}
+
+        // Run emcc to populate sysroot
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ emcc_path, tmp_c, "-o", tmp_js },
+        }) catch {
+            allocator.free(sysroot_include);
+            return null;
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        // Clean up temp files
+        std.fs.cwd().deleteFile(tmp_c) catch {};
+        std.fs.cwd().deleteFile(tmp_js) catch {};
+        std.fs.cwd().deleteFile("/tmp/labelle_sysroot_check.wasm") catch {};
+
+        if (result.term != .Exited or result.term.Exited != 0) {
+            std.debug.print("Warning: Failed to populate emsdk sysroot.\n", .{});
+            allocator.free(sysroot_include);
+            return null;
+        }
+
+        // Verify sysroot now exists
+        std.fs.cwd().access(sysroot_include, .{}) catch {
+            std.debug.print("Warning: emsdk sysroot still not found after emcc run.\n", .{});
+            allocator.free(sysroot_include);
+            return null;
+        };
+    };
+
+    return sysroot_include;
+}
+
 fn buildTarget(allocator: std.mem.Allocator, output_dir: []const u8, target: []const u8, release: bool) !void {
     std.debug.print("Building target: {s}\n", .{target});
 
@@ -501,13 +605,30 @@ fn buildTarget(allocator: std.mem.Allocator, output_dir: []const u8, target: []c
     if (release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
     }
-    // Add WASM target flag for wasm builds
-    if (std.mem.indexOf(u8, target, "wasm") != null) {
+
+    // For WASM builds, setup sysroot and set environment
+    const is_wasm = std.mem.indexOf(u8, target, "wasm") != null;
+    var env_map: ?std.process.EnvMap = null;
+    defer if (env_map) |*em| em.deinit();
+
+    if (is_wasm) {
         try args.append(allocator, "-Dtarget=wasm32-emscripten");
+
+        // Setup emsdk sysroot
+        if (setupWasmSysroot(allocator)) |sysroot_include| {
+            defer allocator.free(sysroot_include);
+
+            // Create environment with C_INCLUDE_PATH
+            env_map = try std.process.getEnvMap(allocator);
+            try env_map.?.put("C_INCLUDE_PATH", sysroot_include);
+        }
     }
 
     var child = std.process.Child.init(args.items, allocator);
     child.cwd = target_dir;
+    if (env_map) |*em| {
+        child.env_map = em;
+    }
 
     const result = try child.spawnAndWait();
     if (result != .Exited or result.Exited != 0) {
@@ -561,13 +682,30 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
     if (options.release) {
         try args.append(allocator, "-Doptimize=ReleaseSafe");
     }
-    // Add WASM target flag for wasm builds
-    if (std.mem.indexOf(u8, target, "wasm") != null) {
+
+    // For WASM builds, setup sysroot and set environment
+    const is_wasm = std.mem.indexOf(u8, target, "wasm") != null;
+    var env_map: ?std.process.EnvMap = null;
+    defer if (env_map) |*em| em.deinit();
+
+    if (is_wasm) {
         try args.append(allocator, "-Dtarget=wasm32-emscripten");
+
+        // Setup emsdk sysroot
+        if (setupWasmSysroot(allocator)) |sysroot_include| {
+            defer allocator.free(sysroot_include);
+
+            // Create environment with C_INCLUDE_PATH
+            env_map = try std.process.getEnvMap(allocator);
+            try env_map.?.put("C_INCLUDE_PATH", sysroot_include);
+        }
     }
 
     var child = std.process.Child.init(args.items, allocator);
     child.cwd = target_dir;
+    if (env_map) |*em| {
+        child.env_map = em;
+    }
 
     _ = try child.spawnAndWait();
 }
