@@ -57,6 +57,8 @@ const Options = struct {
     // Target options
     target: ?[]const u8 = null,
     build_all_targets: bool = false,
+    // Update options
+    clear_cache: bool = false,
     // Upgrade options
     upgrade_check_only: bool = false,
     upgrade_version: ?[]const u8 = null,
@@ -122,6 +124,8 @@ fn parseArgs(args: []const []const u8) Options {
                 options.fetch_hashes = false;
             } else if (std.mem.eql(u8, arg, "--all")) {
                 options.build_all_targets = true;
+            } else if (std.mem.eql(u8, arg, "--clear-cache")) {
+                options.clear_cache = true;
             } else if (std.mem.eql(u8, arg, "--check")) {
                 options.upgrade_check_only = true;
             } else if (std.mem.eql(u8, arg, "--list")) {
@@ -710,12 +714,89 @@ fn runRun(allocator: std.mem.Allocator, options: Options) !void {
     _ = try child.spawnAndWait();
 }
 
+/// Clear labelle-related packages from Zig's global cache.
+/// This helps resolve issues with stale or corrupted cached packages.
+fn clearZigCache(allocator: std.mem.Allocator) !void {
+    // Get cache directory path (~/.cache/zig/p/ on Unix, %LOCALAPPDATA%\zig\p\ on Windows)
+    const cache_dir_path = blk: {
+        if (@import("builtin").os.tag == .windows) {
+            const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch |err| {
+                std.debug.print("Warning: Could not get LOCALAPPDATA: {}\n", .{err});
+                return;
+            };
+            defer allocator.free(local_app_data);
+            break :blk try std.fmt.allocPrint(allocator, "{s}\\zig\\p", .{local_app_data});
+        } else {
+            const home = std.posix.getenv("HOME") orelse {
+                std.debug.print("Warning: Could not get HOME directory\n", .{});
+                return;
+            };
+            break :blk try std.fmt.allocPrint(allocator, "{s}/.cache/zig/p", .{home});
+        }
+    };
+    defer allocator.free(cache_dir_path);
+
+    std.debug.print("Cache directory: {s}\n", .{cache_dir_path});
+
+    // Check if cache directory exists
+    var cache_dir = std.fs.openDirAbsolute(cache_dir_path, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("Zig cache directory not found, nothing to clear.\n", .{});
+            return;
+        }
+        std.debug.print("Warning: Could not open Zig cache directory: {}\n", .{err});
+        return;
+    };
+    defer cache_dir.close();
+
+    // Prefixes for labelle-related packages
+    // Note: Add new prefixes here if more labelle packages are created
+    const labelle_prefixes = [_][]const u8{
+        "labelle_engine-",
+        "labelle_gfx-",
+        "labelle_tasks-",
+        "labelle_pathfinding-",
+        "labelle_gui-",
+    };
+
+    var cleared_count: u32 = 0;
+    var iter = cache_dir.iterate();
+    while (try iter.next()) |entry| {
+        // Check if this is a labelle-related package
+        for (labelle_prefixes) |prefix| {
+            if (std.mem.startsWith(u8, entry.name, prefix)) {
+                const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cache_dir_path, entry.name });
+                defer allocator.free(full_path);
+
+                std.fs.deleteTreeAbsolute(full_path) catch |err| {
+                    std.debug.print("Warning: Could not delete {s}: {}\n", .{ entry.name, err });
+                    continue;
+                };
+                cleared_count += 1;
+                break;
+            }
+        }
+    }
+
+    if (cleared_count > 0) {
+        std.debug.print("Cleared {d} labelle package(s) from Zig cache.\n", .{cleared_count});
+    } else {
+        std.debug.print("No labelle packages found in Zig cache.\n", .{});
+    }
+}
+
 fn runUpdate(allocator: std.mem.Allocator, options: Options) !void {
     std.debug.print("Clearing caches and regenerating...\n", .{});
 
     // Clear generated and bootstrap directories
     std.fs.cwd().deleteTree(".labelle") catch {};
     std.fs.cwd().deleteTree(".labelle-bootstrap") catch {};
+
+    // Optionally clear Zig's global cache for labelle packages
+    if (options.clear_cache) {
+        std.debug.print("Clearing Zig global cache for labelle packages...\n", .{});
+        try clearZigCache(allocator);
+    }
 
     // Regenerate
     try runGenerate(allocator, options);
@@ -991,6 +1072,7 @@ fn printHelp() void {
         \\  labelle run --release
         \\  labelle build --engine-path=../labelle-engine
         \\  labelle upgrade --check
+        \\  labelle update --clear-cache
         \\  labelle ios build --simulator
         \\  labelle ios xcode
         \\  labelle android build
@@ -1068,6 +1150,23 @@ fn printCommandHelp(command: Command) void {
             \\
             \\Shows all targets found in .labelle/*_build.zig files.
             \\Targets are generated from the .targets field in project.labelle.
+            \\
+        , .{}),
+        .update => std.debug.print(
+            \\Clear caches and regenerate project files
+            \\
+            \\Usage: labelle update [options]
+            \\
+            \\Options:
+            \\  --clear-cache   Also clear labelle packages from Zig's global cache
+            \\                  (~/.cache/zig/p/ on Unix, %LOCALAPPDATA%\zig\p\ on Windows)
+            \\
+            \\By default, clears only local directories (.labelle/, .labelle-bootstrap/).
+            \\Use --clear-cache when experiencing stale or corrupted package errors.
+            \\
+            \\Examples:
+            \\  labelle update                 (clear local caches only)
+            \\  labelle update --clear-cache   (also clear Zig's global cache)
             \\
         , .{}),
         .upgrade => std.debug.print(
