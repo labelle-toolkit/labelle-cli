@@ -260,9 +260,9 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var backend: []const u8 = "raylib";
     var ecs: []const u8 = "zig_ecs";
     var gui: []const u8 = "none";
-    var core_version: []const u8 = gen.CLI_VERSION;
-    var engine_version: []const u8 = gen.CLI_VERSION;
-    var gfx_version: []const u8 = gen.CLI_VERSION;
+    var core_version: []const u8 = gen.CORE_VERSION;
+    var engine_version: []const u8 = gen.ENGINE_VERSION;
+    var gfx_version: []const u8 = gen.GFX_VERSION;
     var labelle_version: []const u8 = gen.CLI_VERSION;
 
     for (cmd_args) |arg| {
@@ -462,18 +462,24 @@ fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.Pr
 
     var content = try std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024);
 
-    const target_version = gen.CLI_VERSION;
-
     if (cmd_args.len == 0) {
-        // Upgrade all framework versions to CLI's latest compatible set
-        std.debug.print("labelle: upgrading all framework versions to {s}...\n", .{target_version});
-        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, target_version);
-        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, target_version);
-        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, target_version);
-        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, target_version);
+        // Upgrade all framework versions to CLI's latest compatible set from versions.zon
+        std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION });
+        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
+        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
+        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
+        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
     } else {
         const pkg = cmd_args[0];
-        const version = if (cmd_args.len > 1) cmd_args[1] else target_version;
+        const default_version: []const u8 = if (std.mem.eql(u8, pkg, "core"))
+            gen.CORE_VERSION
+        else if (std.mem.eql(u8, pkg, "engine"))
+            gen.ENGINE_VERSION
+        else if (std.mem.eql(u8, pkg, "gfx"))
+            gen.GFX_VERSION
+        else
+            gen.CLI_VERSION;
+        const version = if (cmd_args.len > 1) cmd_args[1] else default_version;
 
         if (std.mem.eql(u8, pkg, "core")) {
             content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, version);
@@ -484,10 +490,10 @@ fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.Pr
         } else if (std.mem.eql(u8, pkg, "labelle") or std.mem.eql(u8, pkg, "cli")) {
             content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, version);
         } else if (std.mem.eql(u8, pkg, "all")) {
-            content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, version);
-            content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, version);
-            content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, version);
-            content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, version);
+            content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
+            content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
+            content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
+            content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
         } else {
             std.debug.print("labelle upgrade: unknown package '{s}'\n", .{pkg});
             std.debug.print("  packages: core, engine, gfx, cli, all\n", .{});

@@ -270,7 +270,7 @@ pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void
 }
 
 /// Fetch CLI-bundled packages (backends, ecs, gui) into the cache.
-/// Tries to clone from the v2 monorepo at the matching tag.
+/// Clones from the labelle-cli repo at the matching tag.
 /// These packages are bundled with the CLI and normally populated from the companion directory.
 /// Remote fetching is a fallback for when the companion directory is not available.
 pub fn fetchCliPackages(allocator: std.mem.Allocator, cli_version: []const u8) !void {
@@ -280,7 +280,7 @@ pub fn fetchCliPackages(allocator: std.mem.Allocator, cli_version: []const u8) !
     const target = try std.fs.path.join(allocator, &.{ packages_dir, "cli", cli_version });
     defer allocator.free(target);
 
-    const git_url = "https://github.com/labelle-toolkit/v2.git";
+    const git_url = "https://github.com/labelle-toolkit/labelle-cli.git";
     const tag = try std.fmt.allocPrint(allocator, "v{s}", .{cli_version});
     defer allocator.free(tag);
 
@@ -303,7 +303,7 @@ pub fn fetchCliPackages(allocator: std.mem.Allocator, cli_version: []const u8) !
 
     const subdirs = [_][]const u8{ "backends", "ecs", "gui" };
     for (subdirs) |subdir| {
-        const src = try std.fs.path.join(allocator, &.{ tmp_dir, "labelle-cli", subdir });
+        const src = try std.fs.path.join(allocator, &.{ tmp_dir, subdir });
         defer allocator.free(src);
         const dst = try std.fs.path.join(allocator, &.{ target, subdir });
         defer allocator.free(dst);

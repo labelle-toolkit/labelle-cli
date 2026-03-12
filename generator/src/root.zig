@@ -20,6 +20,9 @@ pub const LayerDef = config.LayerDef;
 pub const ResourceDef = config.ResourceDef;
 pub const ProjectConfig = config.ProjectConfig;
 pub const CLI_VERSION = config.CLI_VERSION;
+pub const CORE_VERSION = config.CORE_VERSION;
+pub const ENGINE_VERSION = config.ENGINE_VERSION;
+pub const GFX_VERSION = config.GFX_VERSION;
 pub const isLocalVersion = config.isLocalVersion;
 
 pub const generateMainZig = main_zig.generateMainZig;

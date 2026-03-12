@@ -7,11 +7,17 @@ pub fn build(b: *std.Build) void {
     // Single source of truth: version from build.zig.zon
     const version: []const u8 = @import("build.zig.zon").version;
 
+    // Library versions from versions.zon — the tested compatible set for this CLI release
+    const versions = @import("versions.zon");
+
     // ── Generator CLI ───────────────────────────────────────────────
     const gen_dep = b.dependency("generator", .{
         .target = target,
         .optimize = optimize,
         .cli_version = @as([]const u8, version),
+        .core_version = @as([]const u8, versions.core),
+        .engine_version = @as([]const u8, versions.engine),
+        .gfx_version = @as([]const u8, versions.gfx),
     });
     const gen_mod = gen_dep.module("generator");
 
