@@ -252,16 +252,43 @@ fn printTargets() void {
 // ── labelle init ─────────────────────────────────────────────────────
 
 /// Scaffold a new project directory with project.labelle and starter files.
-/// Usage: labelle init <name> [dir]
+/// Usage: labelle init <name> [--backend=X] [--ecs=X] [--gui=X] [dir]
 fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    if (cmd_args.len == 0) {
-        std.debug.print("labelle init: missing project name\n", .{});
-        std.debug.print("usage: labelle init <name> [directory]\n", .{});
-        return error.MissingArgument;
+    // Parse flags and positional args
+    var name: ?[]const u8 = null;
+    var dir_override: ?[]const u8 = null;
+    var backend: []const u8 = "raylib";
+    var ecs: []const u8 = "zig_ecs";
+    var gui: []const u8 = "none";
+
+    for (cmd_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--backend=")) {
+            backend = arg["--backend=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
+            ecs = arg["--ecs=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--gui=")) {
+            gui = arg["--gui=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("labelle init: unknown flag '{s}'\n", .{arg});
+            return error.UnknownFlag;
+        } else if (name == null) {
+            name = arg;
+        } else if (dir_override == null) {
+            dir_override = arg;
+        } else {
+            std.debug.print("labelle init: unexpected argument '{s}'\n", .{arg});
+            std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
+            return error.TooManyArguments;
+        }
     }
 
-    const name = cmd_args[0];
-    const dir = if (cmd_args.len > 1) cmd_args[1] else name;
+    const project_name = name orelse {
+        std.debug.print("labelle init: missing project name\n", .{});
+        std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
+        return error.MissingArgument;
+    };
+
+    const dir = dir_override orelse project_name;
     const cwd = std.fs.cwd();
 
     // Create project directory
@@ -283,9 +310,9 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
             \\    .width = 800,
             \\    .height = 600,
             \\    .target_fps = 60,
-            \\    .backend = .raylib,
-            \\    .ecs = .zig_ecs,
-            \\    .gui = .none,
+            \\    .backend = .{s},
+            \\    .ecs = .{s},
+            \\    .gui = .{s},
             \\    .plugins = .{{}},
             \\    .layers = .{{
             \\        .{{ .name = "background", .order = 0, .space = .screen }},
@@ -298,7 +325,7 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
             \\    .labelle_version = "{s}",
             \\}}
             \\
-        , .{ name, name, gen.CLI_VERSION, gen.CLI_VERSION, gen.CLI_VERSION, gen.CLI_VERSION });
+        , .{ project_name, project_name, backend, ecs, gui, gen.CLI_VERSION, gen.CLI_VERSION, gen.CLI_VERSION, gen.CLI_VERSION });
 
         const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
         defer allocator.free(path);
@@ -345,7 +372,7 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
         }
     }
 
-    std.debug.print("labelle: created project '{s}' in {s}/\n", .{ name, dir });
+    std.debug.print("labelle: created project '{s}' in {s}/\n", .{ project_name, dir });
     std.debug.print("  next: cd {s} && labelle run\n", .{dir});
 }
 
