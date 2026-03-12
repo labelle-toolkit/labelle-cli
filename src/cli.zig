@@ -122,12 +122,14 @@ pub fn main() !void {
     // Read and parse project.labelle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const parsed = readProjectConfig(arena.allocator(), project_dir) catch {
-        std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
-        std.debug.print("  To create a new project:\n", .{});
-        std.debug.print("    labelle init <name>\n\n", .{});
-        std.debug.print("  To see all commands:\n", .{});
-        std.debug.print("    labelle help\n\n", .{});
+    const parsed = readProjectConfig(arena.allocator(), project_dir) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
+            std.debug.print("  To create a new project:\n", .{});
+            std.debug.print("    labelle init <name>\n\n", .{});
+            std.debug.print("  To see all commands:\n", .{});
+            std.debug.print("    labelle help\n\n", .{});
+        }
         return;
     };
 
