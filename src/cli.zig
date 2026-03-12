@@ -273,8 +273,12 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
             return error.UnknownFlag;
         } else if (name == null) {
             name = arg;
-        } else {
+        } else if (dir_override == null) {
             dir_override = arg;
+        } else {
+            std.debug.print("labelle init: unexpected argument '{s}'\n", .{arg});
+            std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
+            return error.TooManyArguments;
         }
     }
 
