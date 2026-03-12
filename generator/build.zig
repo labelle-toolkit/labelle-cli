@@ -4,13 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "dev";
+
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "cli_version", cli_version);
 
     const generator_module = b.addModule("generator", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    generator_module.addOptions("build_options", options);
 
     // ── Tests ───────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run generator tests");
@@ -23,6 +29,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    src_tests.root_module.addOptions("build_options", options);
     test_step.dependOn(&b.addRunArtifact(src_tests).step);
 
     // BDD-style tests from test/
@@ -41,7 +48,6 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zspec", .module = zspec_dep.module("zspec") },
                 },
             }),
-            .test_runner = .{ .path = zspec_dep.path("src/runner.zig"), .mode = .simple },
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }

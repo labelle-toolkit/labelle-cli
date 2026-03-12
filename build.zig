@@ -4,8 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Single source of truth: version from build.zig.zon
+    const version: []const u8 = @import("build.zig.zon").version;
+
     // ── Generator CLI ───────────────────────────────────────────────
-    const gen_dep = b.dependency("generator", .{ .target = target, .optimize = optimize });
+    const gen_dep = b.dependency("generator", .{
+        .target = target,
+        .optimize = optimize,
+        .cli_version = @as([]const u8, version),
+    });
     const gen_mod = gen_dep.module("generator");
 
     const gen_exe = b.addExecutable(.{

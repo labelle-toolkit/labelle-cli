@@ -7,8 +7,8 @@ pub const Platform = enum { desktop, ios, android, wasm };
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 pub const GuiChoice = enum { none, simple, clay, imgui };
 
-/// CLI version constant — the version of labelle-cli and its bundled packages.
-pub const CLI_VERSION = "0.1.0";
+/// CLI version — injected from root build.zig via build options.
+pub const CLI_VERSION = @import("build_options").cli_version;
 
 /// A plugin dependency declared in project.labelle.
 /// Plugins are external packages with a repo URL and version tag.
