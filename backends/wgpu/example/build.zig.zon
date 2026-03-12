@@ -1,0 +1,16 @@
+.{
+    .fingerprint = 0x522707efe6030a65,
+    .name = .wgpu_demo,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .labelle_wgpu = .{
+            .path = "..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

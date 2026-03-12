@@ -1,0 +1,17 @@
+.{
+    .fingerprint = 0x107812f91241acbb,
+    .name = .labelle_clay,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zclay = .{
+            .url = "git+https://github.com/johan0A/clay-zig-bindings#v0.2.2+0.14",
+            .hash = "zclay-0.2.2-Ej1rkJfRAABn4fTSKQ1Rn54ssdmyCsuBT3zjrdhSxTO4",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

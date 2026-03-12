@@ -1,0 +1,21 @@
+.{
+    .fingerprint = 0x9cd73c2cb5d6d1eb,
+    .name = .labelle_bgfx,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zbgfx = .{
+            .url = "https://codeberg.org/cyberegoorg/zbgfx/archive/main.tar.gz",
+            .hash = "zbgfx-0.8.0-Sm4IxLWhugYcCqQ4NdRfeC_HS1ZeekK2eoWFCFOzY94d",
+        },
+        .zglfw = .{
+            .url = "https://github.com/zig-gamedev/zglfw/archive/refs/heads/main.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

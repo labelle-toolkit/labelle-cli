@@ -1,0 +1,36 @@
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+{{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
+    defer window.closeWindow();
+    window.setTargetFPS(target_fps);
+
+    var hooks = GameHooks{};
+    var g = AssembledGame.init(allocator);
+    defer g.deinit();
+
+    g.setHooks(&hooks);
+
+    g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    g.renderer.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
+
+{{setup_code}}
+    while (!window.windowShouldClose()) {
+        const dt: f32 = 0.016;
+{{tick_code}}        g.tick(dt);
+
+        window.beginDrawing();
+        window.clearBackground(30, 30, 35, 255);
+        g.render();
+        g.renderGizmos();
+{{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 180, 180, 180, 255);
+        window.endDrawing();
+    }
+}

@@ -1,0 +1,21 @@
+.{
+    .fingerprint = 0xa1b2c3d4e5f60003,
+    .name = .labelle_wgpu,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .wgpu_native_zig = .{
+            .url = "git+https://github.com/apotema/wgpu_native_zig#fb54d9c8cbefa0b8d0e8224aa8323b7974ae454f",
+            .hash = "1220ec8a938a2b278c3e5f8dc624b98342f610dfd42099f0d8fe85f3aaf3fe8dd1a3",
+        },
+        .zglfw = .{
+            .url = "git+https://github.com/zig-gamedev/zglfw#15bf6ec59a4e1399d0c753455f69b28f09e41791",
+            .hash = "zglfw-0.10.0-dev-zgVDNHO2IQDy_fSdwY5U4z42rHUuKgt7T9f-qmQ3FnuL",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

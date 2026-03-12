@@ -1,0 +1,16 @@
+.{
+    .fingerprint = 0x119af62f2a9c2fc7,
+    .name = .sdl_example,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .sdl_backend = .{
+            .path = "..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

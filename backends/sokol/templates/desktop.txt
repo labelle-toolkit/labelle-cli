@@ -1,0 +1,58 @@
+const BackendGfxType = @import("backend_gfx");
+
+var g: AssembledGame = undefined;
+var hooks: GameHooks = .{};
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+{{module_vars}}
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+fn initInner() !void {
+    const allocator = gpa.allocator();
+{{init_code}}}
+
+export fn init() callconv(.c) void {
+{{hidden_setup}}    window.initGfx();
+    g = AssembledGame.init(gpa.allocator());
+    g.setHooks(&hooks);
+    g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    initInner() catch |err| {
+        std.debug.print("labelle: init failed: {any}\n", .{err});
+    };
+}
+
+fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
+    @import("backend_input").handleEvent(ev);
+}
+
+export fn frame() callconv(.c) void {
+    @import("backend_input").newFrame();
+    BackendGfxType.setScreenSize(window.width(), window.height());
+    const dt: f32 = 0.016;
+{{tick_code}}    g.tick(dt);
+    const pass_action = window.beginFrame();
+    window.beginPass(pass_action);
+    g.render();
+    g.renderGizmos();
+{{gui_draw_code}}    window.endFrame();
+}
+
+export fn cleanup() callconv(.c) void {
+{{cleanup_code}}    g.deinit();
+    window.shutdownGfx();
+    _ = gpa.deinit();
+}
+
+pub fn main() void {
+    window.run(.{
+        .init_cb = &init,
+        .frame_cb = &frame,
+        .cleanup_cb = &cleanup,
+        .event_cb = &sokolEvent,
+        .w = screen_w,
+        .h = screen_h,
+        .title = screen_title,
+    });
+}

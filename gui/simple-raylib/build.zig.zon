@@ -1,0 +1,17 @@
+.{
+    .fingerprint = 0x12e833aa99bd184b,
+    .name = .labelle_simple_gui,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .@"raylib-zig" = .{
+            .url = "https://github.com/raylib-zig/raylib-zig/archive/refs/heads/devel.tar.gz",
+            .hash = "1220be9b99caeccd9be5a29222e6c93db3cb518711853eda4f744d254c88f88aa827",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -1,0 +1,22 @@
+.{
+    .name = "example_raylib",
+    .title = "LaBelle v2 — Raylib",
+    .backend = .raylib,
+    .ecs = .mock,
+    .gui = .none,
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../",
+    .plugins = .{
+        .{ .name = "pathfinding", .repo = "local:../../../labelle-pathfinding", .version = "0.1.0" },
+        .{ .name = "physics", .repo = "local:../../../labelle-physics", .version = "0.1.0" },
+    },
+    .layers = .{
+        .{ .name = "far_background", .order = 0, .space = .screen },
+        .{ .name = "terrain", .order = 1, .space = .world },
+        .{ .name = "characters", .order = 2, .space = .world },
+        .{ .name = "effects", .order = 3, .space = .world },
+        .{ .name = "hud", .order = 4, .space = .screen },
+    },
+}
