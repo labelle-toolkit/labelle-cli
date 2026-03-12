@@ -23,7 +23,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     // Plugin dep/module declarations (for all declared plugins)
     for (cfg.plugins) |plugin| {
         try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
-        try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle-{s}\");\n\n", .{ plugin.name, plugin.name, plugin.name });
+        try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n\n", .{ plugin.name, plugin.name, plugin.name });
     }
 
     // For imgui, the imgui dep provides ALL backend modules + gui — no separate backend dep.
@@ -67,6 +67,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     // Plugin module imports in exe (for all declared plugins)
     for (cfg.plugins) |plugin| {
         try w.print("                .{{ .name = \"labelle-{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+
     }
 
     if (cfg.ecs != .mock) {
