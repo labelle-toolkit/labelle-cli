@@ -42,6 +42,7 @@ pub const fetchFrameworkPackage = cache.fetchFrameworkPackage;
 pub const fetchPlugin = cache.fetchPlugin;
 pub const fetchCliPackages = cache.fetchCliPackages;
 pub const R2_BASE_URL = cache.R2_BASE_URL;
+pub const patchCachedDeps = cache.patchCachedDeps;
 
 /// Generate all assembler files into output_dir/.labelle/{backend}_{platform}/.
 pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []const u8, game_dir: []const u8) !void {

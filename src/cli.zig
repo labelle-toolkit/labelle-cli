@@ -946,6 +946,9 @@ fn ensureCache(allocator: std.mem.Allocator, cfg: gen.ProjectConfig) !void {
         }
     }
 
+    // Patch cached packages: rewrite sibling path deps to point to cached locations
+    try gen.patchCachedDeps(allocator, cfg);
+
     std.debug.print("  cache populated\n", .{});
 }
 

@@ -420,6 +420,99 @@ fn dirExists(path: []const u8) bool {
     return true;
 }
 
+// ── Cache patching ───────────────────────────────────────────────────
+
+/// Patch build.zig.zon files in cached packages to rewrite sibling path deps
+/// (e.g. `../labelle-core`) to point to other cached packages.
+/// Must be called after all framework packages are cached.
+pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !void {
+    // Only patch non-local packages
+    const packages = [_]struct { name: []const u8, version: []const u8 }{
+        .{ .name = "engine", .version = cfg.engine_version },
+        .{ .name = "gfx", .version = cfg.gfx_version },
+    };
+
+    for (packages) |pkg| {
+        if (config.isLocalVersion(pkg.version)) continue;
+
+        const pkg_dir = try resolveFrameworkPackage(allocator, pkg.name, pkg.version, null);
+        defer allocator.free(pkg_dir);
+
+        // Patch the main build.zig.zon
+        try patchZonFile(allocator, pkg_dir, "build.zig.zon", cfg);
+
+        // Patch subpackage build.zig.zon files (scene/, camera/, etc.)
+        var dir = std.fs.cwd().openDir(pkg_dir, .{ .iterate = true }) catch continue;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            const sub_zon = try std.fs.path.join(allocator, &.{ pkg_dir, entry.name, "build.zig.zon" });
+            defer allocator.free(sub_zon);
+            if (std.fs.cwd().access(sub_zon, .{})) |_| {
+                const sub_dir = try std.fs.path.join(allocator, &.{ pkg_dir, entry.name });
+                defer allocator.free(sub_dir);
+                try patchZonFile(allocator, sub_dir, "build.zig.zon", cfg);
+            } else |_| {}
+        }
+    }
+}
+
+/// Patch a single build.zig.zon file, rewriting labelle-core path deps
+/// to point to the cached core package.
+fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, cfg: config.ProjectConfig) !void {
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
+    defer allocator.free(file_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, file_path, 256 * 1024) catch return;
+    defer allocator.free(content);
+
+    // Compute relative path from this dir to the cached core package
+    const core_abs = try resolveFrameworkPackage(allocator, "core", cfg.core_version, null);
+    defer allocator.free(core_abs);
+
+    const dir_abs = std.fs.cwd().realpathAlloc(allocator, dir_path) catch return;
+    defer allocator.free(dir_abs);
+
+    const rel_core = try std.fs.path.relative(allocator, dir_abs, core_abs);
+    defer allocator.free(rel_core);
+
+    // Replace any path that points to a labelle-core sibling
+    // Patterns: "../labelle-core", "../../labelle-core"
+    var result = try allocator.dupe(u8, content);
+    const patterns = [_][]const u8{ "../../labelle-core", "../labelle-core" };
+    for (patterns) |pattern| {
+        const replaced = try replaceAll(allocator, result, pattern, rel_core);
+        allocator.free(result);
+        result = replaced;
+    }
+
+    // Only write if changed
+    if (!std.mem.eql(u8, content, result)) {
+        const file = try std.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+        try file.writeAll(result);
+    }
+    allocator.free(result);
+}
+
+/// Simple string replace-all helper.
+fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    var list = std.ArrayList(u8){};
+    var i: usize = 0;
+    while (i < haystack.len) {
+        if (i + needle.len <= haystack.len and std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
+            try list.appendSlice(allocator, replacement);
+            i += needle.len;
+        } else {
+            try list.append(allocator, haystack[i]);
+            i += 1;
+        }
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// Recursively copy a directory tree.
 pub fn copyDirRecursive(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
     const cwd = std.fs.cwd();
