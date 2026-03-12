@@ -91,7 +91,9 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
 /// If project_dir is provided, joins it with the local path before resolving.
 /// Falls back to CWD if project_dir is null.
 fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) ![]const u8 {
-    const resolve_path = if (project_dir) |pd| blk: {
+    const resolve_path = if (std.fs.path.isAbsolute(local_path))
+        try allocator.dupe(u8, local_path)
+    else if (project_dir) |pd| blk: {
         const joined = try std.fs.path.join(allocator, &.{ pd, local_path });
         break :blk joined;
     } else try allocator.dupe(u8, local_path);
