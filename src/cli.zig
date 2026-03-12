@@ -29,7 +29,12 @@ pub fn main() !void {
     var extra_args: [8][]const u8 = undefined;
     var extra_count: usize = 0;
 
-    if (args.next()) |first| {
+    const first_arg = args.next();
+    if (first_arg == null) {
+        return printHelp();
+    }
+
+    if (first_arg) |first| {
         if (std.mem.eql(u8, first, "generate")) {
             command = .generate;
             project_dir = args.next() orelse ".";
