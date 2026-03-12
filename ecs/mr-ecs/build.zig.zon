@@ -1,0 +1,17 @@
+.{
+    .fingerprint = 0x10d0accc27d4928b,
+    .name = .labelle_mr_ecs,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zcs = .{
+            .url = "https://codeberg.org/Games-by-Mason/mr_ecs/archive/v0.1.1.tar.gz",
+            .hash = "zcs-0.1.1-WhLQ_EVeAwAvYUhbrAM5iqkZ4WLsjRqbANW6vkLao_tf",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

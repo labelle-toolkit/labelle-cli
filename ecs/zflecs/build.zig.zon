@@ -1,0 +1,17 @@
+.{
+    .fingerprint = 0x79fdf8e2cf0e8038,
+    .name = .labelle_zflecs,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zflecs = .{
+            .url = "git+https://github.com/zig-gamedev/zflecs#main",
+            .hash = "zflecs-0.2.0-dev-1PN3ysolPAABJMgsIgYPrs0G278g-f7mCt9kNG9IMq8V",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

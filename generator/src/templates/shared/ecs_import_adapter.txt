@@ -1,0 +1,2 @@
+const EcsAdapter = @import("ecs_backend");
+const EcsBackend = EcsAdapter;

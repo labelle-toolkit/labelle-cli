@@ -1,0 +1,1 @@
+const EcsBackend = engine.MockEcsBackend(u32);

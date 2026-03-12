@@ -1,7 +1,0 @@
-# Build artifacts
-.zig-cache/
-zig-out/
-
-# Generated project files
-test-project/.labelle/
-test-project/main.zig

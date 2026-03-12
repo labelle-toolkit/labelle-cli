@@ -1,0 +1,16 @@
+.{
+    .fingerprint = 0x2e570732cc08bf7c,
+    .name = .bgfx_example,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .labelle_bgfx = .{
+            .path = "..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
