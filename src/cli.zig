@@ -252,7 +252,7 @@ fn printTargets() void {
 // ── labelle init ─────────────────────────────────────────────────────
 
 /// Scaffold a new project directory with project.labelle and starter files.
-/// Usage: labelle init <name> [--backend=X] [--ecs=X] [--gui=X] [dir]
+/// Usage: labelle init <name> [--backend=X] [--ecs=X] [--gui=X] [--core-version=X] [--engine-version=X] [--gfx-version=X] [--labelle-version=X] [dir]
 fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // Parse flags and positional args
     var name: ?[]const u8 = null;
@@ -260,6 +260,10 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var backend: []const u8 = "raylib";
     var ecs: []const u8 = "zig_ecs";
     var gui: []const u8 = "none";
+    var core_version: []const u8 = gen.CLI_VERSION;
+    var engine_version: []const u8 = gen.CLI_VERSION;
+    var gfx_version: []const u8 = gen.CLI_VERSION;
+    var labelle_version: []const u8 = gen.CLI_VERSION;
 
     for (cmd_args) |arg| {
         if (std.mem.startsWith(u8, arg, "--backend=")) {
@@ -268,6 +272,14 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
             ecs = arg["--ecs=".len..];
         } else if (std.mem.startsWith(u8, arg, "--gui=")) {
             gui = arg["--gui=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--core-version=")) {
+            core_version = arg["--core-version=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--engine-version=")) {
+            engine_version = arg["--engine-version=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--gfx-version=")) {
+            gfx_version = arg["--gfx-version=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--labelle-version=")) {
+            labelle_version = arg["--labelle-version=".len..];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle init: unknown flag '{s}'\n", .{arg});
             return error.UnknownFlag;
@@ -325,7 +337,7 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
             \\    .labelle_version = "{s}",
             \\}}
             \\
-        , .{ project_name, project_name, backend, ecs, gui, gen.CLI_VERSION, gen.CLI_VERSION, gen.CLI_VERSION, gen.CLI_VERSION });
+        , .{ project_name, project_name, backend, ecs, gui, core_version, engine_version, gfx_version, labelle_version });
 
         const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
         defer allocator.free(path);
