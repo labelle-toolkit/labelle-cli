@@ -122,7 +122,14 @@ pub fn main() !void {
     // Read and parse project.labelle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const parsed = try readProjectConfig(arena.allocator(), project_dir);
+    const parsed = readProjectConfig(arena.allocator(), project_dir) catch {
+        std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
+        std.debug.print("  To create a new project:\n", .{});
+        std.debug.print("    labelle init <name>\n\n", .{});
+        std.debug.print("  To see all commands:\n", .{});
+        std.debug.print("    labelle help\n\n", .{});
+        return;
+    };
 
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade) {
