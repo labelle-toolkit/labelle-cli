@@ -10,6 +10,12 @@ pub const GuiChoice = enum { none, simple, clay, imgui };
 /// CLI version — injected from root build.zig via build options.
 pub const CLI_VERSION = @import("build_options").cli_version;
 
+/// Library versions — from versions.zon, injected via build options.
+/// These are the tested compatible versions for this CLI release.
+pub const CORE_VERSION = @import("build_options").core_version;
+pub const ENGINE_VERSION = @import("build_options").engine_version;
+pub const GFX_VERSION = @import("build_options").gfx_version;
+
 /// A plugin dependency declared in project.labelle.
 /// Plugins are external packages with a repo URL and version tag.
 /// Use `repo = "local:../../path"` for local development overrides.
@@ -93,10 +99,10 @@ pub const ProjectConfig = struct {
         .{ .name = "ui", .order = 2, .space = .screen },
     },
 
-    // Framework version pinning
-    core_version: []const u8 = CLI_VERSION,
-    engine_version: []const u8 = CLI_VERSION,
-    gfx_version: []const u8 = CLI_VERSION,
+    // Framework version pinning (defaults from versions.zon)
+    core_version: []const u8 = CORE_VERSION,
+    engine_version: []const u8 = ENGINE_VERSION,
+    gfx_version: []const u8 = GFX_VERSION,
     labelle_version: []const u8 = CLI_VERSION,
 
     /// Explicit initial scene name. When set, the generator uses this for the first

@@ -28,3 +28,58 @@ jobs:
 
       - name: Generator tests
         run: cd generator && zig build test
+
+  versions-integration:
+    name: Versions Integration Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout labelle-cli
+        uses: actions/checkout@v4
+        with:
+          path: labelle-cli
+
+      - name: Checkout sibling dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          path: labelle-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          path: labelle-engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          path: labelle-gfx
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev
+
+      - name: Build CLI
+        run: cd labelle-cli && zig build
+
+      - name: Init, generate, and build a project
+        run: |
+          mkdir -p test-projects && cd test-projects
+          ../labelle-cli/zig-out/bin/labelle init test_game --backend=raylib --ecs=zig_ecs \
+            --core-version="local:../../labelle-core" \
+            --engine-version="local:../../labelle-engine" \
+            --gfx-version="local:../../labelle-gfx" \
+            --labelle-version="local:../../labelle-cli"
+          cd test_game
+          ../../labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/raylib_desktop
+          zig build

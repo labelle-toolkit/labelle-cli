@@ -260,9 +260,9 @@ fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var backend: []const u8 = "raylib";
     var ecs: []const u8 = "zig_ecs";
     var gui: []const u8 = "none";
-    var core_version: []const u8 = gen.CLI_VERSION;
-    var engine_version: []const u8 = gen.CLI_VERSION;
-    var gfx_version: []const u8 = gen.CLI_VERSION;
+    var core_version: []const u8 = gen.CORE_VERSION;
+    var engine_version: []const u8 = gen.ENGINE_VERSION;
+    var gfx_version: []const u8 = gen.GFX_VERSION;
     var labelle_version: []const u8 = gen.CLI_VERSION;
 
     for (cmd_args) |arg| {

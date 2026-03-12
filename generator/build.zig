@@ -5,11 +5,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "dev";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse cli_version;
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse cli_version;
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse cli_version;
 
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
 
     const options = b.addOptions();
     options.addOption([]const u8, "cli_version", cli_version);
+    options.addOption([]const u8, "core_version", core_version);
+    options.addOption([]const u8, "engine_version", engine_version);
+    options.addOption([]const u8, "gfx_version", gfx_version);
 
     const generator_module = b.addModule("generator", .{
         .root_source_file = b.path("src/root.zig"),
