@@ -7,21 +7,6 @@
         .generator = .{
             .path = "generator",
         },
-        .labelle_core = .{
-            .path = "../labelle-core",
-        },
-        .labelle_gfx = .{
-            .path = "../labelle-gfx",
-        },
-        .engine = .{
-            .path = "../engine",
-        },
-        .labelle_pathfinding = .{
-            .path = "../labelle-pathfinding",
-        },
-        .labelle_physics = .{
-            .path = "../labelle-physics",
-        },
     },
     .paths = .{
         "build.zig",

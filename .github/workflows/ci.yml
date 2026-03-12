@@ -23,8 +23,8 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build
+      - name: Build CLI
         run: zig build
 
-      - name: Test
-        run: zig build test
+      - name: Generator tests
+        run: cd generator && zig build test
