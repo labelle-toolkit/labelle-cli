@@ -713,32 +713,70 @@ fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     };
 
     // Move downloaded binary to ~/.labelle/bin/
-    const mv_result = if (builtin.os.tag == .windows)
-        runCmd(allocator, &.{ "cmd", "/c", "move", "/Y", tmp_path, bin_path })
-    else
-        runCmd(allocator, &.{ "mv", "-f", tmp_path, bin_path });
+    if (builtin.os.tag == .windows) {
+        // Windows locks the running executable, so we can't overwrite it directly.
+        // Write a batch script that waits for this process to exit, then replaces the binary.
+        const bat_path = try std.fs.path.join(allocator, &.{ bin_dir, "labelle-update.bat" });
+        defer allocator.free(bat_path);
 
-    if (mv_result) |result2| {
-        defer allocator.free(result2.stdout);
-        defer allocator.free(result2.stderr);
-        switch (result2.term) {
-            .Exited => |code| if (code != 0) {
-                std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-                std.debug.print("  downloaded to {s} — move it manually\n", .{tmp_path});
-                return;
-            },
-            else => {
-                std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-                return;
-            },
+        const bat_content = try std.fmt.allocPrint(allocator,
+            \\@echo off
+            \\:wait
+            \\timeout /t 1 /nobreak >nul
+            \\move /Y "{s}" "{s}" >nul 2>&1
+            \\if errorlevel 1 goto wait
+            \\echo Update complete.
+            \\del "%~f0"
+            \\
+        , .{ tmp_path, bin_path });
+        defer allocator.free(bat_content);
+
+        const bat_file = std.fs.cwd().createFile(bat_path, .{}) catch |err| {
+            std.debug.print("labelle: could not create update script: {any}\n", .{err});
+            std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
+            return;
+        };
+        bat_file.writeAll(bat_content) catch {};
+        bat_file.close();
+
+        // Launch the batch script detached
+        var child: std.process.Child = .init(
+            &.{ "cmd.exe", "/c", "start", "/b", bat_path },
+            allocator,
+        );
+        child.spawn() catch |err| {
+            std.debug.print("labelle: could not launch update script: {any}\n", .{err});
+            std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
+            return;
+        };
+
+        std.debug.print("\n  downloaded v{s}\n", .{target_version});
+        std.debug.print("  the binary will be replaced at {s} after this process exits\n\n", .{bin_path});
+    } else {
+        const mv_result = runCmd(allocator, &.{ "mv", "-f", tmp_path, bin_path });
+
+        if (mv_result) |result2| {
+            defer allocator.free(result2.stdout);
+            defer allocator.free(result2.stderr);
+            switch (result2.term) {
+                .Exited => |code| if (code != 0) {
+                    std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
+                    std.debug.print("  downloaded to {s} — move it manually\n", .{tmp_path});
+                    return;
+                },
+                else => {
+                    std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
+                    return;
+                },
+            }
+        } else |_| {
+            std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
+            return;
         }
-    } else |_| {
-        std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-        return;
-    }
 
-    std.debug.print("\n  updated to v{s}\n", .{target_version});
-    std.debug.print("  installed at {s}\n\n", .{bin_path});
+        std.debug.print("\n  updated to v{s}\n", .{target_version});
+        std.debug.print("  installed at {s}\n\n", .{bin_path});
+    }
 
     // Setup PATH if needed (skip with --no-path)
     if (!skip_path) {
@@ -868,8 +906,23 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     const set_cmd = std.fmt.allocPrint(allocator, "[Environment]::SetEnvironmentVariable('Path', '{s};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')", .{escaped_dir}) catch return;
     defer allocator.free(set_cmd);
 
-    _ = runCmd(allocator, &.{ "powershell", "-NoProfile", "-Command", set_cmd }) catch {};
-    std.debug.print("  added {s} to user PATH (restart your terminal to take effect)\n\n", .{bin_dir});
+    if (runCmd(allocator, &.{ "powershell", "-NoProfile", "-Command", set_cmd })) |set_result| {
+        defer allocator.free(set_result.stdout);
+        defer allocator.free(set_result.stderr);
+        switch (set_result.term) {
+            .Exited => |code| if (code == 0) {
+                std.debug.print("  added {s} to user PATH (restart your terminal to take effect)\n\n", .{bin_dir});
+            } else {
+                std.debug.print("  could not update PATH via registry: {s}\n", .{set_result.stderr});
+                std.debug.print("  add {s} to your PATH manually\n\n", .{bin_dir});
+            },
+            else => {
+                std.debug.print("  could not update PATH — add {s} to your PATH manually\n\n", .{bin_dir});
+            },
+        }
+    } else |_| {
+        std.debug.print("  could not run PowerShell — add {s} to your PATH manually\n\n", .{bin_dir});
+    }
 }
 
 /// Case-insensitive path comparison for Windows, normalizing both slash styles.
