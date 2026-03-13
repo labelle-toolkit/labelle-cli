@@ -764,12 +764,13 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     };
     defer allocator.free(home_dir);
 
-    const path_line = "export PATH=\"$HOME/.labelle/bin:$PATH\"";
+    const path_line = std.fmt.allocPrint(allocator, "export PATH=\"{s}:$PATH\"", .{bin_dir}) catch return;
+    defer allocator.free(path_line);
 
     if (std.mem.endsWith(u8, shell_env, "zsh")) {
         const rc_path = std.fs.path.join(allocator, &.{ home_dir, ".zshrc" }) catch return;
         defer allocator.free(rc_path);
-        if (appendToProfile(allocator, rc_path, path_line)) {
+        if (appendToProfile(allocator, rc_path, path_line, bin_dir)) {
             std.debug.print("  added to PATH in ~/.zshrc\n", .{});
             std.debug.print("  run `source ~/.zshrc` or restart your terminal\n\n", .{});
         }
@@ -785,15 +786,28 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         else
             bashrc;
 
-        if (appendToProfile(allocator, target_rc, path_line)) {
+        if (appendToProfile(allocator, target_rc, path_line, bin_dir)) {
             const rc_name = std.fs.path.basename(target_rc);
             std.debug.print("  added to PATH in ~/{s}\n", .{rc_name});
             std.debug.print("  run `source ~/{s}` or restart your terminal\n\n", .{rc_name});
         }
     } else if (std.mem.endsWith(u8, shell_env, "fish")) {
-        // fish uses fish_add_path
-        _ = runCmd(allocator, &.{ "fish", "-c", "fish_add_path ~/.labelle/bin" }) catch {};
-        std.debug.print("  added to PATH via fish_add_path\n\n", .{});
+        const fish_cmd = std.fmt.allocPrint(allocator, "fish_add_path {s}", .{bin_dir}) catch return;
+        defer allocator.free(fish_cmd);
+        if (runCmd(allocator, &.{ "fish", "-c", fish_cmd })) |result| {
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            switch (result.term) {
+                .Exited => |code| if (code == 0) {
+                    std.debug.print("  added to PATH via fish_add_path\n\n", .{});
+                } else {
+                    std.debug.print("  fish_add_path failed — add {s} to your PATH manually\n\n", .{bin_dir});
+                },
+                else => std.debug.print("  fish_add_path failed — add {s} to your PATH manually\n\n", .{bin_dir}),
+            }
+        } else |_| {
+            std.debug.print("  could not run fish — add {s} to your PATH manually\n\n", .{bin_dir});
+        }
     } else {
         std.debug.print("  add {s} to your PATH to use labelle from anywhere\n\n", .{bin_dir});
     }
@@ -823,29 +837,11 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     const current = std.mem.trim(u8, get_result.stdout, &std.ascii.whitespace);
 
     // Check if already present (exact segment match, semicolon-separated)
+    // Windows paths are case-insensitive and use both slash styles
     var iter = std.mem.splitScalar(u8, current, ';');
     while (iter.next()) |segment| {
         const trimmed = std.mem.trim(u8, segment, &std.ascii.whitespace);
-        if (std.mem.eql(u8, trimmed, bin_dir)) return;
-        // Normalize slashes for comparison
-        if (std.mem.indexOf(u8, trimmed, ".labelle") != null) {
-            // Check with both slash styles
-            var has_match = true;
-            if (trimmed.len != bin_dir.len) {
-                has_match = false;
-            } else {
-                for (trimmed, 0..) |c, i| {
-                    const bc = bin_dir[i];
-                    const cn = if (c == '\\') @as(u8, '/') else c;
-                    const bn = if (bc == '\\') @as(u8, '/') else bc;
-                    if (cn != bn) {
-                        has_match = false;
-                        break;
-                    }
-                }
-            }
-            if (has_match) return;
-        }
+        if (windowsPathEql(trimmed, bin_dir)) return;
     }
 
     // Append to user PATH
@@ -856,21 +852,37 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     std.debug.print("  added {s} to user PATH (restart your terminal to take effect)\n\n", .{bin_dir});
 }
 
+/// Case-insensitive path comparison for Windows, normalizing both slash styles.
+/// Also strips a trailing slash/backslash before comparing.
+fn windowsPathEql(a: []const u8, b: []const u8) bool {
+    const a_trimmed = if (a.len > 0 and (a[a.len - 1] == '/' or a[a.len - 1] == '\\')) a[0 .. a.len - 1] else a;
+    const b_trimmed = if (b.len > 0 and (b[b.len - 1] == '/' or b[b.len - 1] == '\\')) b[0 .. b.len - 1] else b;
+    if (a_trimmed.len != b_trimmed.len) return false;
+    for (a_trimmed, 0..) |ac, i| {
+        const bc = b_trimmed[i];
+        const an = if (ac == '\\') @as(u8, '/') else std.ascii.toLower(ac);
+        const bn = if (bc == '\\') @as(u8, '/') else std.ascii.toLower(bc);
+        if (an != bn) return false;
+    }
+    return true;
+}
+
 /// Append a line to a shell profile file if it's not already present.
 /// Returns true if the file was modified, false if it already had the entry.
-fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const u8) bool {
-    // Read existing content and check line-by-line for the PATH export
+/// `bin_dir` is used for robust duplicate detection (matches the actual directory path).
+fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const u8, bin_dir: []const u8) bool {
+    // Read existing content and check line-by-line for an existing PATH entry
     if (std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024)) |content| {
         defer allocator.free(content);
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |file_line| {
             const trimmed = std.mem.trim(u8, file_line, &std.ascii.whitespace);
-            // Match the exact export line (ignoring leading/trailing whitespace)
-            if (std.mem.eql(u8, trimmed, line)) return false;
-            // Also match any uncommented line that sets .labelle/bin in PATH
-            if (!std.mem.startsWith(u8, trimmed, "#") and
-                std.mem.indexOf(u8, trimmed, ".labelle/bin") != null and
+            if (std.mem.startsWith(u8, trimmed, "#")) continue;
+            // Match any uncommented line that references the bin_dir in a PATH context
+            if (std.mem.indexOf(u8, trimmed, bin_dir) != null and
                 std.mem.indexOf(u8, trimmed, "PATH") != null) return false;
+            // Also match the exact export line
+            if (std.mem.eql(u8, trimmed, line)) return false;
         }
     } else |_| {}
 
@@ -1001,7 +1013,7 @@ fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // Scan project.labelle to find additional referenced versions
     var project_arena = std.heap.ArenaAllocator.init(allocator);
     defer project_arena.deinit();
-    if (readProjectConfig(project_arena.allocator(), project_dir)) |cfg| {
+    if (readProjectConfigQuiet(project_arena.allocator(), project_dir)) |cfg| {
         const project_refs = [_]struct { name: []const u8, version: []const u8 }{
             .{ .name = "core", .version = cfg.core_version },
             .{ .name = "engine", .version = cfg.engine_version },
@@ -1082,6 +1094,15 @@ fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !gen
         std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
         return error.ParseError;
     };
+}
+
+/// Same as readProjectConfig but without printing error messages.
+/// Used by commands where a missing project.labelle is expected (e.g. clean).
+fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
+    const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
+    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch return error.FileNotFound;
+    const source = try allocator.dupeZ(u8, source_raw);
+    return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch return error.ParseError;
 }
 
 /// Run a command with inherited stdio (output goes straight to terminal).

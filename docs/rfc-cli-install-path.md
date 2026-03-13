@@ -108,9 +108,10 @@ Old core versions are retained until explicitly pruned with `labelle clean`. Thi
 
 Removes unused package versions from `~/.labelle/packages/`. Behavior:
 
-- Scans all known projects (or the current project with `--project`) for referenced core versions
-- Deletes any versions not referenced by any project
-- Prints a summary of what was removed and how much disk space was freed
+- Always keeps versions matching the current CLI's defaults (core, engine, gfx, cli)
+- Scans `project.labelle` in the current directory (or a directory specified with `--project=<dir>`) for additional referenced versions to keep
+- Deletes any versions not referenced by the CLI defaults or the scanned project
+- Prints a summary of what was removed
 - Supports `--dry-run` to preview without deleting
 
 ## Compatibility & Migration
