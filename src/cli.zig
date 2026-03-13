@@ -781,7 +781,9 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         const bash_profile = std.fs.path.join(allocator, &.{ home_dir, ".bash_profile" }) catch return;
         defer allocator.free(bash_profile);
 
-        const target_rc = if (builtin.os.tag == .macos and !fileExists(bashrc) and fileExists(bash_profile))
+        // macOS Terminal launches login shells which read .bash_profile, not .bashrc.
+        // Prefer .bash_profile on macOS unless .bashrc already exists.
+        const target_rc = if (builtin.os.tag == .macos and !fileExists(bashrc))
             bash_profile
         else
             bashrc;
@@ -830,7 +832,10 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     const get_result = runCmd(allocator, &.{
         "powershell", "-NoProfile", "-Command",
         "[Environment]::GetEnvironmentVariable('Path', 'User')",
-    }) catch return;
+    }) catch {
+        std.debug.print("  could not read current PATH — add {s} to your PATH manually\n\n", .{bin_dir});
+        return;
+    };
     defer allocator.free(get_result.stdout);
     defer allocator.free(get_result.stderr);
 
@@ -844,8 +849,10 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         if (windowsPathEql(trimmed, bin_dir)) return;
     }
 
-    // Append to user PATH
-    const set_cmd = std.fmt.allocPrint(allocator, "[Environment]::SetEnvironmentVariable('Path', '{s};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')", .{bin_dir}) catch return;
+    // Append to user PATH (escape single quotes for PowerShell)
+    const escaped_dir = escapePowerShellString(allocator, bin_dir) catch return;
+    defer allocator.free(escaped_dir);
+    const set_cmd = std.fmt.allocPrint(allocator, "[Environment]::SetEnvironmentVariable('Path', '{s};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')", .{escaped_dir}) catch return;
     defer allocator.free(set_cmd);
 
     _ = runCmd(allocator, &.{ "powershell", "-NoProfile", "-Command", set_cmd }) catch {};
@@ -867,6 +874,28 @@ fn windowsPathEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Escape a string for use inside PowerShell single-quoted strings.
+/// In PowerShell, single quotes inside '...' are escaped by doubling them: ' -> ''
+fn escapePowerShellString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var count: usize = 0;
+    for (input) |c| {
+        if (c == '\'') count += 1;
+    }
+    if (count == 0) return try allocator.dupe(u8, input);
+
+    var result = try allocator.alloc(u8, input.len + count);
+    var j: usize = 0;
+    for (input) |c| {
+        if (c == '\'') {
+            result[j] = '\'';
+            j += 1;
+        }
+        result[j] = c;
+        j += 1;
+    }
+    return result;
+}
+
 /// Append a line to a shell profile file if it's not already present.
 /// Returns true if the file was modified, false if it already had the entry.
 /// `bin_dir` is used for robust duplicate detection (matches the actual directory path).
@@ -878,11 +907,11 @@ fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const
         while (lines.next()) |file_line| {
             const trimmed = std.mem.trim(u8, file_line, &std.ascii.whitespace);
             if (std.mem.startsWith(u8, trimmed, "#")) continue;
-            // Match any uncommented line that references the bin_dir in a PATH context
-            if (std.mem.indexOf(u8, trimmed, bin_dir) != null and
-                std.mem.indexOf(u8, trimmed, "PATH") != null) return false;
-            // Also match the exact export line
+            // Match the exact export line
             if (std.mem.eql(u8, trimmed, line)) return false;
+            // Match any uncommented PATH export that references the bin_dir
+            if ((std.mem.startsWith(u8, trimmed, "export PATH=") or std.mem.startsWith(u8, trimmed, "PATH=")) and
+                std.mem.indexOf(u8, trimmed, bin_dir) != null) return false;
         }
     } else |_| {}
 
@@ -1081,28 +1110,31 @@ fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
 }
 
 fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
-    const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
-
-    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch |err| {
-        std.debug.print("labelle: could not read '{s}': {any}\n", .{ labelle_path, err });
-        return error.FileNotFound;
-    };
-
-    const source = try allocator.dupeZ(u8, source_raw);
-
-    return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
-        std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
-        return error.ParseError;
-    };
+    return readProjectConfigImpl(allocator, project_dir, true);
 }
 
 /// Same as readProjectConfig but without printing error messages.
 /// Used by commands where a missing project.labelle is expected (e.g. clean).
 fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
+    return readProjectConfigImpl(allocator, project_dir, false);
+}
+
+fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, verbose: bool) !gen.ProjectConfig {
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
-    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch return error.FileNotFound;
+    defer allocator.free(labelle_path);
+
+    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch |err| {
+        if (verbose) std.debug.print("labelle: could not read '{s}': {any}\n", .{ labelle_path, err });
+        return error.FileNotFound;
+    };
+    defer allocator.free(source_raw);
+
     const source = try allocator.dupeZ(u8, source_raw);
-    return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch return error.ParseError;
+
+    return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
+        if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
+        return error.ParseError;
+    };
 }
 
 /// Run a command with inherited stdio (output goes straight to terminal).

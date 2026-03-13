@@ -138,5 +138,4 @@ Of the options considered, **the CLI rewrites the dependency path at generation 
 
 ## Open Questions
 
-- Should `labelle-engine` also live in `~/.labelle/packages/` or stay in the Zig package cache?
 - Install script format: shell script for macOS/Linux, MSI or PowerShell for Windows?
