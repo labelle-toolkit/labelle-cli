@@ -41,17 +41,19 @@ The CLI already controls how plugin modules are wired into the build. Instead of
 The generated `build.zig` would look like:
 
 ```zig
-// Shared framework modules (resolved once)
-const core_dep = b.dependency("labelle_core", .{ ... });
+// Shared framework modules (resolved once by the CLI)
+// Dependency key: underscore style ("labelle_core")
+// Module import name: hyphen style ("labelle-core")
+const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
 const core_mod = core_dep.module("labelle-core");
 
 // Plugin — use shared core, not its own
-const plugin_pathfinder_dep = b.dependency("labelle_pathfinder", .{ ... });
+const plugin_pathfinder_dep = b.dependency("labelle_pathfinder", .{ .target = target, .optimize = optimize });
 const plugin_pathfinder_mod = plugin_pathfinder_dep.module("labelle_pathfinder");
-plugin_pathfinder_mod.addImport("labelle-core", core_mod);  // Override
+plugin_pathfinder_mod.addImport("labelle-core", core_mod);  // Override plugin's own resolution
 ```
 
-The key is `addImport` — this overrides the plugin's own `labelle-core` resolution with the shared one, ensuring type compatibility.
+The key is `addImport` — this overrides the plugin's own `labelle-core` resolution with the shared one, ensuring type compatibility. The plugin's `build.zig.zon` still declares `labelle-core` (so `zig build test` works standalone), but at assembly time the CLI substitutes the shared instance.
 
 **Pros**:
 - Single source of truth for framework versions
@@ -65,19 +67,11 @@ The key is `addImport` — this overrides the plugin's own `labelle-core` resolu
 
 ### Option B: Plugins declare framework deps as peer dependencies
 
-Plugins would not declare `labelle-core` in their `build.zig.zon` at all. Instead, their `build.zig` would accept it as an external module:
+**Note**: This option is not viable with Zig's current package system. `b.dependency()` requires a matching key in `build.zig.zon`, so plugins cannot omit the declaration and still resolve the dependency. The only way to receive an externally-provided module is through the host's `addImport` mechanism — which is exactly what Option A does.
 
-```zig
-// Plugin build.zig
-pub fn build(b: *std.Build) void {
-    // labelle-core provided by the host (CLI assembler)
-    const core_mod = b.dependency("labelle-core", .{}).module("labelle-core");
-    // ...
-}
-```
+This option is listed for completeness but is **not recommended**.
 
-**Pros**: Clean separation
-**Cons**: Plugins can't be built/tested standalone without a wrapper
+**Cons**: Not possible without `build.zig.zon` entry; plugins can't be built/tested standalone
 
 ### Option C: Zig package deduplication (future)
 
@@ -96,13 +90,17 @@ Zig may eventually support package deduplication by content hash. This would sol
 
 ## Shared dependencies
 
-The initial set of shared deps to inject:
+Any framework package whose types cross plugin boundaries must be shared. The full set:
 
-| Dependency | Why shared |
-|---|---|
-| `labelle-core` | `Position`, `Color`, and other core types used across all plugins |
+| Dependency key | Module import name | Why shared |
+|---|---|---|
+| `labelle_core` | `labelle-core` | `Position`, `Color`, and other core types used across all plugins |
+| `labelle_gfx` | `labelle-gfx` | `Fade`, `Flash`, and other effect components that may be set by plugins |
+| `zig_utils` | `zig_utils` | `Vector2` and math types used by plugins that depend on zig-utils |
 
-`zig-utils` may also need sharing if plugins use `Vector2` or other types that cross plugin boundaries.
+**Naming convention**: dependency keys in `build.zig.zon` and `b.dependency()` use underscores (`labelle_core`). Module import names used in `@import()` and `addImport()` use hyphens (`labelle-core`). These must be kept consistent across the generated `build.zig`.
+
+Only deps whose types are passed between the game and plugin code need sharing. Internal-only deps (e.g. `zspec` for tests) do not.
 
 ## Implementation plan
 
@@ -110,6 +108,17 @@ The initial set of shared deps to inject:
 2. Add a list of "shared framework deps" to the generator config (initially just `labelle-core`)
 3. Test with both local (`@libs/`) and remote plugins
 4. Update plugin development docs to explain the assembly-time override
+
+## Validation checklist
+
+Before merging, verify:
+
+- [ ] A plugin using `labelle-core` via URL in `build.zig.zon` compiles without type mismatches when assembled by the CLI
+- [ ] `@typeof(plugin_position) == @typeof(game_position)` holds at comptime (same `Position` type)
+- [ ] Plugin still builds standalone with `zig build test` (its own `build.zig.zon` deps are used)
+- [ ] Local plugins (`@libs/foo`) receive the override
+- [ ] Remote plugins (URL-based) receive the override
+- [ ] Removing the local path workaround from `libs/pathfinder/build.zig.zon` (reverting to URL) still compiles
 
 ## Migration
 
