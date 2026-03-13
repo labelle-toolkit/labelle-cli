@@ -23,7 +23,17 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     // Plugin dep/module declarations (for all declared plugins)
     for (cfg.plugins) |plugin| {
         try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
-        try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n\n", .{ plugin.name, plugin.name, plugin.name });
+        try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
+    }
+
+    // Shared framework dep overrides — ensures plugins use the same package
+    // instances as the game, preventing type mismatches (RFC #42).
+    if (cfg.plugins.len > 0) {
+        try w.writeByte('\n');
+        for (cfg.plugins) |plugin| {
+            try w.print("    plugin_{s}_mod.addImport(\"labelle-core\", core_mod);\n", .{plugin.name});
+            try w.print("    plugin_{s}_mod.addImport(\"labelle-gfx\", gfx_mod);\n", .{plugin.name});
+        }
     }
 
     // For imgui, the imgui dep provides ALL backend modules + gui — no separate backend dep.
