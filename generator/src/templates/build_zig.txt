@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "labelle-core", .module = core_mod },
                 .{ .name = "labelle-gfx", .module = gfx_mod },
-                .{ .name = "engine", .module = engine_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
                 .{ .name = "backend_gfx", .module = backend_gfx },
                 .{ .name = "backend_input", .module = backend_input },
                 .{ .name = "backend_audio", .module = backend_audio },
@@ -114,7 +114,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "labelle-core", .module = core_mod },
                 .{ .name = "labelle-gfx", .module = gfx_mod },
-                .{ .name = "engine", .module = engine_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
                 .{ .name = "backend_gfx", .module = backend_gfx },
                 .{ .name = "backend_input", .module = backend_input },
                 .{ .name = "backend_audio", .module = backend_audio },

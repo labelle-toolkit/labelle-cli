@@ -66,7 +66,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
 
     // Plugin module imports in exe (for all declared plugins)
     for (cfg.plugins) |plugin| {
-        try w.print("                .{{ .name = \"labelle-{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
 
     }
 
