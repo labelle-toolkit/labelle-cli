@@ -24,38 +24,23 @@ pub const PluginDep = struct {
     repo: []const u8 = "",
     version: []const u8 = "",
 
-    /// Returns true if this plugin uses a local path override.
+    /// Returns true if this plugin uses a local path.
+    /// Supports `local:../path` (relative to project) and `@libs/path` (inside project).
     pub fn isLocal(self: PluginDep) bool {
-        return std.mem.startsWith(u8, self.repo, "local:");
+        return std.mem.startsWith(u8, self.repo, "local:") or
+            std.mem.startsWith(u8, self.repo, "@");
     }
 
-    /// Returns the local path (after the "local:" prefix).
+    /// Returns the local path portion of the repo string.
+    /// `local:../foo` → `../foo`, `@libs/foo` → `libs/foo`.
     pub fn localPath(self: PluginDep) []const u8 {
-        return self.repo["local:".len..];
+        if (std.mem.startsWith(u8, self.repo, "local:"))
+            return self.repo["local:".len..];
+        if (std.mem.startsWith(u8, self.repo, "@"))
+            return self.repo["@".len..];
+        return self.repo;
     }
 };
-
-/// Components exported by each plugin — auto-registered in ComponentRegistry
-/// when the plugin is declared in project.labelle.
-/// Format: .{ .pascal_name = "Name", .module = "module-path" }.
-pub const PluginComponent = struct {
-    pascal_name: []const u8,
-    module: []const u8,
-};
-
-/// Returns known components for first-party plugins (matched by name).
-/// Third-party plugins declare their own components via their package.
-pub fn pluginComponents(plugin: PluginDep) []const PluginComponent {
-    if (std.mem.eql(u8, plugin.name, "physics")) {
-        return &.{
-            .{ .pascal_name = "RigidBody", .module = "labelle-physics" },
-            .{ .pascal_name = "Velocity", .module = "labelle-physics" },
-            .{ .pascal_name = "Collider", .module = "labelle-physics" },
-            .{ .pascal_name = "Touching", .module = "labelle-physics" },
-        };
-    }
-    return &.{};
-}
 
 pub const LayerSpace = enum { world, screen };
 

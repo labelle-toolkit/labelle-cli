@@ -4,7 +4,6 @@ const tpl = @import("template.zig");
 const config = @import("config.zig");
 
 const ProjectConfig = config.ProjectConfig;
-const PluginComponent = config.PluginComponent;
 const PluginDep = config.PluginDep;
 const LayerDef = config.LayerDef;
 const ResourceDef = config.ResourceDef;
@@ -115,58 +114,36 @@ pub fn generateMainZig(
         try w.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
     }
 
-    // ComponentRegistry (game-local components + auto-registered plugin components)
+    // ComponentRegistry (game-local components + auto-discovered plugin components)
     {
-        // Collect game-local pascal names so plugin components don't duplicate them.
-        // Use a StringHashMap so the number of local components is unbounded.
-        var local_pascal_set = std.StringHashMap(void).init(allocator);
-        defer {
-            var kit = local_pascal_set.keyIterator();
-            while (kit.next()) |key| allocator.free(key.*);
-            local_pascal_set.deinit();
-        }
-        for (component_names) |name| {
-            var pascal_buf: [128]u8 = undefined;
-            const pascal = snakeToPascal(name, &pascal_buf);
-            const owned = try allocator.dupe(u8, pascal);
-            try local_pascal_set.put(owned, {});
+        const has_plugins = cfg.plugins.len > 0;
+
+        if (has_plugins) {
+            try w.writeAll("const Components = engine.ComponentRegistryWithPlugins(.{\n");
+        } else {
+            try w.writeAll("const Components = engine.ComponentRegistry(.{\n");
         }
 
-        try w.writeAll("const Components = engine.ComponentRegistry(.{\n");
-
-        // Game-local components (take precedence)
+        // Game-local components (take precedence over plugin components)
         for (component_names) |name| {
             var pascal_buf: [128]u8 = undefined;
             const pascal = snakeToPascal(name, &pascal_buf);
             try w.print("    .{s} = @import(\"components/{s}.zig\").{s},\n", .{ pascal, name, pascal });
         }
 
-        // Gfx effect components (always available since gfx is always wired)
-        const gfx_components = [_]PluginComponent{
-            .{ .pascal_name = "Fade", .module = "labelle-gfx" },
-            .{ .pascal_name = "TemporalFade", .module = "labelle-gfx" },
-            .{ .pascal_name = "Flash", .module = "labelle-gfx" },
-        };
-        for (&gfx_components) |comp| {
-            if (!local_pascal_set.contains(comp.pascal_name)) {
-                try w.print("    .{s} = @import(\"{s}\").{s},\n", .{ comp.pascal_name, comp.module, comp.pascal_name });
-                const owned = try allocator.dupe(u8, comp.pascal_name);
-                try local_pascal_set.put(owned, {});
+        if (has_plugins) {
+            // Plugin modules — ComponentRegistryWithPlugins auto-discovers
+            // their Components declarations at comptime.
+            try w.writeAll("}, .{\n");
+            // Gfx is always available as a plugin source
+            try w.writeAll("    @import(\"labelle-gfx\"),\n");
+            for (cfg.plugins) |plugin| {
+                try w.print("    @import(\"{s}\"),\n", .{plugin.name});
             }
+            try w.writeAll("});\n\n");
+        } else {
+            try w.writeAll("});\n\n");
         }
-
-        // Plugin components (auto-registered for declared plugins)
-        for (cfg.plugins) |plugin| {
-            for (config.pluginComponents(plugin)) |comp| {
-                if (!local_pascal_set.contains(comp.pascal_name)) {
-                    try w.print("    .{s} = @import(\"{s}\").{s},\n", .{ comp.pascal_name, comp.module, comp.pascal_name });
-                    const owned = try allocator.dupe(u8, comp.pascal_name);
-                    try local_pascal_set.put(owned, {});
-                }
-            }
-        }
-
-        try w.writeAll("});\n\n");
     }
 
     // AllScripts struct — shared by both ScriptRunner (comptime dispatch for game scripts)
