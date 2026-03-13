@@ -136,6 +136,11 @@ Of the options considered, **the CLI rewrites the dependency path at generation 
 - This avoids symlinks (which behave differently on Windows) and environment variables (which add setup burden).
 - The engine's source `build.zig.zon` keeps its relative `../labelle-core` path for monorepo development — only the generated version used by consumers gets the rewritten path.
 
+## Future Work
+
+- **Download verification**: Add checksum or signature verification for downloaded binaries to prevent tampering. The release server could publish SHA256 checksums alongside binaries.
+- **Modular update command**: Extract `cmdUpdate` into a dedicated module with testable helpers for download, PATH setup, and migration detection.
+
 ## Open Questions
 
 - Install script format: shell script for macOS/Linux, MSI or PowerShell for Windows?

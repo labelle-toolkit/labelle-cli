@@ -228,7 +228,7 @@ fn printHelp() void {
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
-        \\  update [ver]         Update the labelle CLI itself
+        \\  update [ver] [--no-path]  Update the labelle CLI itself
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
         \\  help                 Show this help
         \\  version              Show CLI version
@@ -568,6 +568,17 @@ fn replaceVersionField(allocator: std.mem.Allocator, content: []const u8, field_
 fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     const r2_base_url = "https://releases.labelle.games/cli";
 
+    // Parse flags
+    var skip_path = false;
+    var version_arg: ?[]const u8 = null;
+    for (cmd_args) |arg| {
+        if (std.mem.eql(u8, arg, "--no-path")) {
+            skip_path = true;
+        } else {
+            version_arg = arg;
+        }
+    }
+
     std.debug.print("labelle: checking for updates...\n", .{});
     std.debug.print("  current version: {s}\n\n", .{gen.CLI_VERSION});
 
@@ -576,9 +587,9 @@ fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var target_version_owned: ?[]u8 = null;
     defer if (target_version_owned) |v| allocator.free(v);
 
-    if (cmd_args.len > 0) {
+    if (version_arg) |ver| {
         // Explicit version requested
-        target_version = cmd_args[0];
+        target_version = ver;
     } else {
         // Fetch latest version from R2
         const latest_url = r2_base_url ++ "/latest.txt";
@@ -729,8 +740,10 @@ fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     std.debug.print("\n  updated to v{s}\n", .{target_version});
     std.debug.print("  installed at {s}\n\n", .{bin_path});
 
-    // Setup PATH if needed
-    setupPath(allocator, bin_dir);
+    // Setup PATH if needed (skip with --no-path)
+    if (!skip_path) {
+        setupPath(allocator, bin_dir);
+    }
 
     // Check for old binary in system paths and warn
     checkOldBinary(bin_path);
@@ -1010,6 +1023,10 @@ fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
             dry_run = true;
         } else if (std.mem.startsWith(u8, arg, "--project=")) {
             project_dir = arg["--project=".len..];
+        } else {
+            std.debug.print("labelle clean: unknown option '{s}'\n", .{arg});
+            std.debug.print("  usage: labelle clean [--dry-run] [--project=<dir>]\n", .{});
+            return;
         }
     }
 
