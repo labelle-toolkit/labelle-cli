@@ -229,7 +229,7 @@ fn printHelp() void {
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
         \\  update [ver]         Update the labelle CLI itself
-        \\  clean [--dry-run]    Remove unused cached package versions
+        \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
@@ -733,7 +733,7 @@ fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     setupPath(allocator, bin_dir);
 
     // Check for old binary in system paths and warn
-    checkOldBinary(allocator, bin_path);
+    checkOldBinary(bin_path);
 }
 
 /// Detect the user's shell and add ~/.labelle/bin to PATH if not already present.
@@ -745,27 +745,34 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         return;
     }
 
+    // Check if already in PATH (exact segment match)
+    if (std.process.getEnvVarOwned(allocator, "PATH")) |current_path| {
+        defer allocator.free(current_path);
+        if (pathContainsDir(current_path, bin_dir)) return;
+    } else |_| {}
+
     // Detect shell from SHELL env var
-    const shell_env = std.process.getEnvVarOwned(allocator, "SHELL") catch return;
+    const shell_env = std.process.getEnvVarOwned(allocator, "SHELL") catch {
+        std.debug.print("  could not detect shell — add {s} to your PATH manually\n\n", .{bin_dir});
+        return;
+    };
     defer allocator.free(shell_env);
 
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch {
+        std.debug.print("  could not determine home directory — add {s} to your PATH manually\n\n", .{bin_dir});
+        return;
+    };
     defer allocator.free(home_dir);
 
     const path_line = "export PATH=\"$HOME/.labelle/bin:$PATH\"";
 
-    // Check if already in PATH
-    if (std.process.getEnvVarOwned(allocator, "PATH")) |current_path| {
-        defer allocator.free(current_path);
-        if (std.mem.indexOf(u8, current_path, ".labelle/bin") != null) return;
-    } else |_| {}
-
     if (std.mem.endsWith(u8, shell_env, "zsh")) {
         const rc_path = std.fs.path.join(allocator, &.{ home_dir, ".zshrc" }) catch return;
         defer allocator.free(rc_path);
-        appendToProfile(allocator, rc_path, path_line);
-        std.debug.print("  added to PATH in ~/.zshrc\n", .{});
-        std.debug.print("  run `source ~/.zshrc` or restart your terminal\n\n", .{});
+        if (appendToProfile(allocator, rc_path, path_line)) {
+            std.debug.print("  added to PATH in ~/.zshrc\n", .{});
+            std.debug.print("  run `source ~/.zshrc` or restart your terminal\n\n", .{});
+        }
     } else if (std.mem.endsWith(u8, shell_env, "bash")) {
         // On macOS, prefer .bash_profile if .bashrc doesn't exist
         const bashrc = std.fs.path.join(allocator, &.{ home_dir, ".bashrc" }) catch return;
@@ -778,10 +785,11 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         else
             bashrc;
 
-        appendToProfile(allocator, target_rc, path_line);
-        const rc_name = std.fs.path.basename(target_rc);
-        std.debug.print("  added to PATH in ~/{s}\n", .{rc_name});
-        std.debug.print("  run `source ~/{s}` or restart your terminal\n\n", .{rc_name});
+        if (appendToProfile(allocator, target_rc, path_line)) {
+            const rc_name = std.fs.path.basename(target_rc);
+            std.debug.print("  added to PATH in ~/{s}\n", .{rc_name});
+            std.debug.print("  run `source ~/{s}` or restart your terminal\n\n", .{rc_name});
+        }
     } else if (std.mem.endsWith(u8, shell_env, "fish")) {
         // fish uses fish_add_path
         _ = runCmd(allocator, &.{ "fish", "-c", "fish_add_path ~/.labelle/bin" }) catch {};
@@ -789,6 +797,18 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     } else {
         std.debug.print("  add {s} to your PATH to use labelle from anywhere\n\n", .{bin_dir});
     }
+}
+
+/// Check if a PATH string contains a specific directory as an exact segment.
+fn pathContainsDir(path_var: []const u8, dir: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, path_var, ':');
+    while (iter.next()) |segment| {
+        if (std.mem.eql(u8, segment, dir)) return true;
+        // Also match with trailing slash
+        if (segment.len > 0 and segment[segment.len - 1] == '/' and
+            std.mem.eql(u8, segment[0 .. segment.len - 1], dir)) return true;
+    }
+    return false;
 }
 
 fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
@@ -802,9 +822,31 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
 
     const current = std.mem.trim(u8, get_result.stdout, &std.ascii.whitespace);
 
-    // Check if already present
-    if (std.mem.indexOf(u8, current, ".labelle\\bin") != null or
-        std.mem.indexOf(u8, current, ".labelle/bin") != null) return;
+    // Check if already present (exact segment match, semicolon-separated)
+    var iter = std.mem.splitScalar(u8, current, ';');
+    while (iter.next()) |segment| {
+        const trimmed = std.mem.trim(u8, segment, &std.ascii.whitespace);
+        if (std.mem.eql(u8, trimmed, bin_dir)) return;
+        // Normalize slashes for comparison
+        if (std.mem.indexOf(u8, trimmed, ".labelle") != null) {
+            // Check with both slash styles
+            var has_match = true;
+            if (trimmed.len != bin_dir.len) {
+                has_match = false;
+            } else {
+                for (trimmed, 0..) |c, i| {
+                    const bc = bin_dir[i];
+                    const cn = if (c == '\\') @as(u8, '/') else c;
+                    const bn = if (bc == '\\') @as(u8, '/') else bc;
+                    if (cn != bn) {
+                        has_match = false;
+                        break;
+                    }
+                }
+            }
+            if (has_match) return;
+        }
+    }
 
     // Append to user PATH
     const set_cmd = std.fmt.allocPrint(allocator, "[Environment]::SetEnvironmentVariable('Path', '{s};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')", .{bin_dir}) catch return;
@@ -815,26 +857,37 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
 }
 
 /// Append a line to a shell profile file if it's not already present.
-fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const u8) void {
-    // Read existing content to check for duplicates
+/// Returns true if the file was modified, false if it already had the entry.
+fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const u8) bool {
+    // Read existing content and check line-by-line for the PATH export
     if (std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024)) |content| {
         defer allocator.free(content);
-        if (std.mem.indexOf(u8, content, ".labelle/bin") != null) return;
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |file_line| {
+            const trimmed = std.mem.trim(u8, file_line, &std.ascii.whitespace);
+            // Match the exact export line (ignoring leading/trailing whitespace)
+            if (std.mem.eql(u8, trimmed, line)) return false;
+            // Also match any uncommented line that sets .labelle/bin in PATH
+            if (!std.mem.startsWith(u8, trimmed, "#") and
+                std.mem.indexOf(u8, trimmed, ".labelle/bin") != null and
+                std.mem.indexOf(u8, trimmed, "PATH") != null) return false;
+        }
     } else |_| {}
 
     // Append the line
     const file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch
-        std.fs.cwd().createFile(path, .{}) catch return;
+        std.fs.cwd().createFile(path, .{}) catch return false;
     defer file.close();
 
-    file.seekFromEnd(0) catch return;
-    file.writeAll("\n# Added by labelle CLI\n") catch return;
-    file.writeAll(line) catch return;
-    file.writeAll("\n") catch return;
+    file.seekFromEnd(0) catch return false;
+    file.writeAll("\n# Added by labelle CLI\n") catch return false;
+    file.writeAll(line) catch return false;
+    file.writeAll("\n") catch return false;
+    return true;
 }
 
 /// Check if an old labelle binary exists in system paths and warn the user.
-fn checkOldBinary(allocator: std.mem.Allocator, new_path: []const u8) void {
+fn checkOldBinary(new_path: []const u8) void {
     const builtin = @import("builtin");
     if (builtin.os.tag == .windows) return;
 
@@ -845,7 +898,6 @@ fn checkOldBinary(allocator: std.mem.Allocator, new_path: []const u8) void {
             std.debug.print("  warning: found old labelle binary at {s}\n", .{sys_path});
             std.debug.print("  remove it with: sudo rm {s}\n", .{sys_path});
             std.debug.print("  the CLI now runs from {s}\n\n", .{new_path});
-            _ = allocator; // suppress unused warning
             return;
         }
     }
@@ -907,12 +959,17 @@ fn printManualUpdateInstructions(version: []const u8) void {
 // ── labelle clean ────────────────────────────────────────────────────
 
 /// Remove unused cached package versions from ~/.labelle/packages/.
-/// Scans the packages directory and removes versions not currently referenced
-/// by the default CLI versions.
+/// Scans project.labelle in the current directory (or --project dir) to find
+/// referenced versions. Also keeps the CLI's default versions. Removes everything else.
 fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var dry_run = false;
+    var project_dir: []const u8 = ".";
     for (cmd_args) |arg| {
-        if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true;
+        if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.startsWith(u8, arg, "--project=")) {
+            project_dir = arg["--project=".len..];
+        }
     }
 
     const packages_dir = gen.getPackagesDir(allocator) catch {
@@ -923,49 +980,80 @@ fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
 
     std.debug.print("labelle: scanning {s}...\n", .{packages_dir});
 
-    // Known current versions from the CLI build
-    const current_versions = [_]struct { name: []const u8, version: []const u8 }{
-        .{ .name = "core", .version = gen.CORE_VERSION },
-        .{ .name = "engine", .version = gen.ENGINE_VERSION },
-        .{ .name = "gfx", .version = gen.GFX_VERSION },
-        .{ .name = "cli", .version = gen.CLI_VERSION },
-    };
+    // Use an arena for temporary allocations in the scan loop
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Collect all referenced versions per package name.
+    // Always keep the CLI's default versions.
+    var kept = std.StringHashMap(std.StringHashMap(void)).init(arena_alloc);
+
+    const pkg_names = [_][]const u8{ "core", "engine", "gfx", "cli" };
+    const default_versions = [_][]const u8{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION };
+
+    for (pkg_names, 0..) |name, i| {
+        var version_set = std.StringHashMap(void).init(arena_alloc);
+        try version_set.put(default_versions[i], {});
+        try kept.put(name, version_set);
+    }
+
+    // Scan project.labelle to find additional referenced versions
+    var project_arena = std.heap.ArenaAllocator.init(allocator);
+    defer project_arena.deinit();
+    if (readProjectConfig(project_arena.allocator(), project_dir)) |cfg| {
+        const project_refs = [_]struct { name: []const u8, version: []const u8 }{
+            .{ .name = "core", .version = cfg.core_version },
+            .{ .name = "engine", .version = cfg.engine_version },
+            .{ .name = "gfx", .version = cfg.gfx_version },
+            .{ .name = "cli", .version = cfg.labelle_version },
+        };
+        for (project_refs) |ref| {
+            if (gen.isLocalVersion(ref.version)) continue;
+            if (kept.getPtr(ref.name)) |set| {
+                try set.put(ref.version, {});
+            }
+        }
+        std.debug.print("  found project.labelle in '{s}'\n", .{project_dir});
+    } else |_| {
+        std.debug.print("  no project.labelle found — keeping CLI default versions only\n", .{});
+    }
 
     var removed_count: u32 = 0;
 
-    for (current_versions) |pkg| {
-        const pkg_dir_path = std.fs.path.join(allocator, &.{ packages_dir, pkg.name }) catch continue;
-        defer allocator.free(pkg_dir_path);
+    for (pkg_names) |pkg_name| {
+        const pkg_dir_path = std.fs.path.join(arena_alloc, &.{ packages_dir, pkg_name }) catch continue;
 
         var pkg_dir = std.fs.cwd().openDir(pkg_dir_path, .{ .iterate = true }) catch continue;
         defer pkg_dir.close();
+
+        const version_set = kept.get(pkg_name) orelse continue;
 
         var iter = pkg_dir.iterate();
         while (iter.next() catch null) |entry| {
             if (entry.kind != .directory and entry.kind != .sym_link) continue;
 
-            // Keep the current version
-            if (std.mem.eql(u8, entry.name, pkg.version)) continue;
+            // Keep referenced versions
+            if (version_set.contains(entry.name)) continue;
 
             if (dry_run) {
-                std.debug.print("  would remove {s}/{s}\n", .{ pkg.name, entry.name });
+                std.debug.print("  would remove {s}/{s}\n", .{ pkg_name, entry.name });
             } else {
-                const full_path = std.fs.path.join(allocator, &.{ pkg_dir_path, entry.name }) catch continue;
-                defer allocator.free(full_path);
+                const full_path = std.fs.path.join(arena_alloc, &.{ pkg_dir_path, entry.name }) catch continue;
 
                 // Remove symlinks directly, delete trees for directories
                 if (entry.kind == .sym_link) {
                     std.fs.cwd().deleteFile(full_path) catch |err| {
-                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg.name, entry.name, err });
+                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
                         continue;
                     };
                 } else {
                     std.fs.cwd().deleteTree(full_path) catch |err| {
-                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg.name, entry.name, err });
+                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
                         continue;
                     };
                 }
-                std.debug.print("  removed {s}/{s}\n", .{ pkg.name, entry.name });
+                std.debug.print("  removed {s}/{s}\n", .{ pkg_name, entry.name });
             }
             removed_count += 1;
         }
