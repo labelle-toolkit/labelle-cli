@@ -1079,7 +1079,7 @@ fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
         } else {
             std.debug.print("labelle clean: unknown option '{s}'\n", .{arg});
             std.debug.print("  usage: labelle clean [--dry-run] [--project=<dir>]\n", .{});
-            return;
+            return error.InvalidArgument;
         }
     }
 
