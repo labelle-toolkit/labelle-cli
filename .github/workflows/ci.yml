@@ -29,6 +29,57 @@ jobs:
       - name: Generator tests
         run: cd generator && zig build test
 
+      - name: Test CLI commands (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          # help and version should always work
+          ./zig-out/bin/labelle help
+          ./zig-out/bin/labelle version
+
+          # clean --dry-run without project.labelle should succeed gracefully
+          ./zig-out/bin/labelle clean --dry-run
+
+          # clean should reject unknown flags
+          if ./zig-out/bin/labelle clean --bogus 2>&1; then
+            echo "ERROR: clean should have rejected unknown flag"
+            exit 1
+          fi
+
+          # init a project, then clean --dry-run with project context
+          mkdir -p /tmp/test-cli-commands && cd /tmp/test-cli-commands
+          $GITHUB_WORKSPACE/zig-out/bin/labelle init test_project
+          cd test_project
+          $GITHUB_WORKSPACE/zig-out/bin/labelle clean --dry-run
+
+      - name: Test CLI commands (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cli = "$env:GITHUB_WORKSPACE\zig-out\bin\labelle.exe"
+
+          & $cli help
+          & $cli version
+          & $cli clean --dry-run
+
+          # clean should reject unknown flags
+          $output = & $cli clean --bogus 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "clean should have rejected unknown flag"
+            exit 1
+          }
+
+          # init + clean with project context
+          $testDir = "$env:TEMP\test-cli-commands"
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          Push-Location $testDir
+          & $cli init test_project
+          Push-Location test_project
+          & $cli clean --dry-run
+          Pop-Location
+          Pop-Location
+
   versions-integration:
     name: Versions Integration Test
     runs-on: ubuntu-latest
