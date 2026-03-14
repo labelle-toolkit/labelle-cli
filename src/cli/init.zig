@@ -113,7 +113,10 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
                 \\    .entities = .{},
                 \\}
                 \\
-            ) catch {};
+            ) catch |err| {
+                std.debug.print("labelle init: failed to write starter scene: {any}\n", .{err});
+                return err;
+            };
         } else |err| {
             if (err != error.PathAlreadyExists) return err;
         }
@@ -125,7 +128,10 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
         defer allocator.free(path);
         if (cwd.createFile(path, .{ .exclusive = true })) |file| {
             defer file.close();
-            file.writeAll(".labelle/\n") catch {};
+            file.writeAll(".labelle/\n") catch |err| {
+                std.debug.print("labelle init: failed to write .gitignore: {any}\n", .{err});
+                return err;
+            };
         } else |err| {
             if (err != error.PathAlreadyExists) return err;
         }

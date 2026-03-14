@@ -6,6 +6,12 @@ const windows = if (is_windows) struct {
     extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.c) std.os.windows.DWORD;
 } else struct {};
 
+/// Shared state between the main thread and the timeout thread.
+/// Heap-allocated so it outlives the spawning stack frame.
+const TimeoutState = struct {
+    timed_out: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 /// Run a zig command capturing stdout/stderr.
 pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.Child.RunResult {
     return std.process.Child.run(.{
@@ -26,31 +32,38 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     if (!is_windows and timeout_ns != null) child.pgid = 0;
     try child.spawn();
 
-    // Atomic flag set by the timeout thread when it actually fires the kill
-    var timed_out = std.atomic.Value(bool).init(false);
+    // Heap-allocate so the detached thread can safely access it after this function returns
+    var state: ?*TimeoutState = null;
+    defer if (state) |s| allocator.destroy(s);
 
     if (timeout_ns) |ns| {
+        state = try allocator.create(TimeoutState);
+        state.?.* = .{};
+
         if (is_windows) {
             const win_pid = windows.GetProcessId(child.id);
-            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ win_pid, ns, &timed_out });
+            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ allocator, win_pid, ns, state.? });
             thread.detach();
         } else {
-            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns, &timed_out });
+            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns, state.? });
             thread.detach();
         }
     }
 
     const term = try child.wait();
+
+    const did_timeout = if (state) |s| s.timed_out.load(.acquire) else false;
+
     return switch (term) {
         .Exited => |code| blk: {
-            if (timed_out.load(.acquire)) {
+            if (did_timeout) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 break :blk 0;
             }
             break :blk code;
         },
         .Signal => |sig| {
-            if (timed_out.load(.acquire)) {
+            if (did_timeout) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 return 0;
             }
@@ -68,9 +81,9 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     };
 }
 
-fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, timed_out: *std.atomic.Value(bool)) void {
+fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutState) void {
     std.Thread.sleep(timeout_ns);
-    timed_out.store(true, .release);
+    state.timed_out.store(true, .release);
     const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
     std.posix.kill(pgid, std.posix.SIG.TERM) catch |err| {
         if (err != error.ProcessNotFound) {
@@ -79,13 +92,13 @@ fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, timed_out: *std.
     };
 }
 
-fn timeoutKillWindows(pid: std.os.windows.DWORD, timeout_ns: u64, timed_out: *std.atomic.Value(bool)) void {
+fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, timeout_ns: u64, state: *TimeoutState) void {
     std.Thread.sleep(timeout_ns);
-    timed_out.store(true, .release);
+    state.timed_out.store(true, .release);
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
     const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };
-    var kill_child: std.process.Child = .init(&argv, std.heap.page_allocator);
+    var kill_child: std.process.Child = .init(&argv, allocator);
     kill_child.stdin_behavior = .Ignore;
     kill_child.stdout_behavior = .Ignore;
     kill_child.stderr_behavior = .Ignore;

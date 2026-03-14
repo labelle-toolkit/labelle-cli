@@ -41,6 +41,7 @@ pub fn main() !void {
     // Parse command and project dir
     var command: Command = .run;
     var project_dir: []const u8 = ".";
+    var dir_set = false;
     var extra_args: [8][]const u8 = undefined;
     var extra_count: usize = 0;
     var timeout_ns: ?u64 = null;
@@ -84,11 +85,12 @@ pub fn main() !void {
                     std.debug.print("labelle run: unknown flag '{s}'\n", .{arg});
                     return;
                 } else {
-                    if (!std.mem.eql(u8, project_dir, ".")) {
+                    if (dir_set) {
                         std.debug.print("labelle run: unexpected argument '{s}'\n", .{arg});
                         return;
                     }
                     project_dir = arg;
+                    dir_set = true;
                 }
             }
         } else if (std.mem.eql(u8, first, "init")) {
@@ -162,7 +164,36 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, first, "targets")) {
             command = .targets;
         } else {
+            // No command — treat as project dir, default to run
             project_dir = first;
+            dir_set = true;
+            // Parse remaining args (e.g. `labelle mydir --timeout=5s`)
+            while (args.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, "--timeout=")) {
+                    timeout_ns = util.parseDuration(arg["--timeout=".len..]);
+                    if (timeout_ns == null) {
+                        std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
+                        return;
+                    }
+                } else if (std.mem.eql(u8, arg, "--timeout")) {
+                    if (args.next()) |val| {
+                        timeout_ns = util.parseDuration(val);
+                        if (timeout_ns == null) {
+                            std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
+                            return;
+                        }
+                    } else {
+                        std.debug.print("labelle: --timeout requires a value\n", .{});
+                        return;
+                    }
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    std.debug.print("labelle: unknown flag '{s}'\n", .{arg});
+                    return;
+                } else {
+                    std.debug.print("labelle: unexpected argument '{s}'\n", .{arg});
+                    return;
+                }
+            }
         }
     }
 
