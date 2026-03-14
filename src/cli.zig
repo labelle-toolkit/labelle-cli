@@ -1,19 +1,33 @@
 /// labelle-cli — reads project.labelle and generates/builds/runs the assembled game.
 ///
 /// Usage:
-///   labelle generate [dir]       — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s]  — generate + build + run
-///   labelle build [dir]          — generate + build (no run)
-///   labelle [dir]                — alias for `run`
-///   labelle init <name> [dir]    — scaffold a new project
-///   labelle install [pkg] [ver]  — fetch packages into cache
-///   labelle upgrade [dir] [pkg] [ver] — bump versions in project.labelle
-///   labelle update [ver]         — self-update the CLI
-///   labelle clean [--dry-run]    — prune unused package versions
+///   labelle generate [dir]              — generate .labelle/ assembler files
+///   labelle run [dir] [--timeout=30s]   — generate + build + run
+///   labelle build [dir]                 — generate + build (no run)
+///   labelle [dir]                       — alias for `run`
+///   labelle init <name> [dir]           — scaffold a new project
+///   labelle install [pkg] [ver]         — fetch packages into cache
+///   labelle upgrade [dir] [pkg] [ver]   — bump versions in project.labelle
+///   labelle update [ver]                — self-update the CLI
+///   labelle clean [--dry-run]           — prune unused package versions
 const std = @import("std");
 const gen = @import("generator");
 
-const Command = enum { generate, build, run, init, install, upgrade, update, clean, help, version, targets };
+// Submodules
+const help = @import("cli/help.zig");
+const init = @import("cli/init.zig");
+const install = @import("cli/install.zig");
+const upgrade = @import("cli/upgrade.zig");
+const update = @import("cli/update.zig");
+const clean = @import("cli/clean.zig");
+const config = @import("cli/config.zig");
+const compatibility = @import("cli/compatibility.zig");
+const lockfile = @import("cli/lockfile.zig");
+const cache = @import("cli/cache.zig");
+const runner = @import("cli/runner.zig");
+const util = @import("cli/util.zig");
+
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,7 +47,7 @@ pub fn main() !void {
 
     const first_arg = args.next();
     if (first_arg == null) {
-        return printHelp();
+        return help.printHelp();
     }
 
     if (first_arg) |first| {
@@ -48,7 +62,7 @@ pub fn main() !void {
             // Parse optional [dir] and --timeout flag
             while (args.next()) |arg| {
                 if (std.mem.startsWith(u8, arg, "--timeout=")) {
-                    timeout_ns = parseDuration(arg["--timeout=".len..]);
+                    timeout_ns = util.parseDuration(arg["--timeout=".len..]);
                     if (timeout_ns == null) {
                         std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
                         std.debug.print("  expected format: --timeout=30s, --timeout=2m\n", .{});
@@ -56,7 +70,7 @@ pub fn main() !void {
                     }
                 } else if (std.mem.eql(u8, arg, "--timeout")) {
                     if (args.next()) |val| {
-                        timeout_ns = parseDuration(val);
+                        timeout_ns = util.parseDuration(val);
                         if (timeout_ns == null) {
                             std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
                             std.debug.print("  expected format: --timeout 30s, --timeout 2m\n", .{});
@@ -71,8 +85,7 @@ pub fn main() !void {
                 }
             }
         } else if (std.mem.eql(u8, first, "init")) {
-            command = .init;
-            // Collect remaining args for init
+            command = .init_cmd;
             while (args.next()) |arg| {
                 if (extra_count >= extra_args.len) {
                     std.debug.print("labelle: too many arguments\n", .{});
@@ -82,7 +95,7 @@ pub fn main() !void {
                 extra_count += 1;
             }
         } else if (std.mem.eql(u8, first, "install")) {
-            command = .install;
+            command = .install_cmd;
             while (args.next()) |arg| {
                 if (extra_count >= extra_args.len) {
                     std.debug.print("labelle: too many arguments\n", .{});
@@ -92,10 +105,8 @@ pub fn main() !void {
                 extra_count += 1;
             }
         } else if (std.mem.eql(u8, first, "upgrade")) {
-            command = .upgrade;
-            // First non-package arg could be a directory
+            command = .upgrade_cmd;
             if (args.next()) |next_arg| {
-                // If it looks like a package name, treat as extra arg
                 if (std.mem.eql(u8, next_arg, "core") or
                     std.mem.eql(u8, next_arg, "engine") or
                     std.mem.eql(u8, next_arg, "gfx") or
@@ -118,7 +129,7 @@ pub fn main() !void {
                 extra_count += 1;
             }
         } else if (std.mem.eql(u8, first, "update")) {
-            command = .update;
+            command = .update_cmd;
             while (args.next()) |arg| {
                 if (extra_count >= extra_args.len) {
                     std.debug.print("labelle: too many arguments\n", .{});
@@ -128,7 +139,7 @@ pub fn main() !void {
                 extra_count += 1;
             }
         } else if (std.mem.eql(u8, first, "clean")) {
-            command = .clean;
+            command = .clean_cmd;
             while (args.next()) |arg| {
                 if (extra_count >= extra_args.len) {
                     std.debug.print("labelle: too many arguments\n", .{});
@@ -138,33 +149,32 @@ pub fn main() !void {
                 extra_count += 1;
             }
         } else if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
-            command = .help;
+            command = .help_cmd;
         } else if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v")) {
             command = .version;
         } else if (std.mem.eql(u8, first, "targets")) {
             command = .targets;
         } else {
-            // No command — treat as project dir, default to run
             project_dir = first;
         }
     }
 
     // Standalone commands (no project.labelle needed)
     switch (command) {
-        .help => return printHelp(),
-        .version => return printVersion(),
-        .targets => return printTargets(),
-        .init => return cmdInit(allocator, extra_args[0..extra_count]),
-        .install => return cmdInstall(allocator, extra_args[0..extra_count]),
-        .update => return cmdUpdate(allocator, extra_args[0..extra_count]),
-        .clean => return cmdClean(allocator, extra_args[0..extra_count]),
+        .help_cmd => return help.printHelp(),
+        .version => return help.printVersion(),
+        .targets => return help.printTargets(),
+        .init_cmd => return init.cmdInit(allocator, extra_args[0..extra_count]),
+        .install_cmd => return install.cmdInstall(allocator, extra_args[0..extra_count]),
+        .update_cmd => return update.cmdUpdate(allocator, extra_args[0..extra_count]),
+        .clean_cmd => return clean.cmdClean(allocator, extra_args[0..extra_count]),
         else => {},
     }
 
     // Read and parse project.labelle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const parsed = readProjectConfig(arena.allocator(), project_dir) catch |err| {
+    const parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
             std.debug.print("  To create a new project:\n", .{});
@@ -176,15 +186,15 @@ pub fn main() !void {
     };
 
     // Upgrade modifies project.labelle in the project directory
-    if (command == .upgrade) {
-        return cmdUpgrade(allocator, project_dir, parsed, extra_args[0..extra_count]);
+    if (command == .upgrade_cmd) {
+        return upgrade.cmdUpgrade(allocator, project_dir, parsed, extra_args[0..extra_count]);
     }
 
     // Ensure package cache is populated
-    try ensureCache(allocator, parsed);
+    try cache.ensureCache(allocator, parsed);
 
     // Validate version compatibility
-    validateCompatibility(parsed);
+    compatibility.validateCompatibility(parsed);
 
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
@@ -203,15 +213,15 @@ pub fn main() !void {
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
 
-    try fixFingerprint(allocator, target_dir);
-    try writeLockFile(allocator, project_dir, parsed);
+    try runner.fixFingerprint(allocator, target_dir);
+    try lockfile.writeLockFile(allocator, project_dir, parsed);
     std.debug.print("  generated .labelle/{s}/\n", .{target_name});
 
     if (command == .generate) return;
 
     // Build
     std.debug.print("labelle: building...\n", .{});
-    const build_result = try runZig(allocator, target_dir, &.{ "zig", "build" });
+    const build_result = try runner.runZig(allocator, target_dir, &.{ "zig", "build" });
     defer allocator.free(build_result.stdout);
     defer allocator.free(build_result.stderr);
 
@@ -240,1389 +250,8 @@ pub fn main() !void {
     } else {
         std.debug.print("labelle: running...\n\n", .{});
     }
-    const run_result = try runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
+    const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
     if (run_result != 0) {
         std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
-    }
-}
-
-// ── labelle help / version / targets ─────────────────────────────────
-
-fn printHelp() void {
-    std.debug.print(
-        \\Labelle CLI v{s}
-        \\
-        \\Usage: labelle <command> [options]
-        \\
-        \\Commands:
-        \\  init <name> [dir]    Create a new labelle project
-        \\  generate [dir]       Generate .labelle/ assembler files
-        \\  build [dir]          Generate + build the project
-        \\  run [dir] [--timeout=<dur>]  Generate + build + run (default)
-        \\  targets              List available build targets
-        \\  install [pkg] [ver]  Fetch packages into cache
-        \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
-        \\  update [ver] [--no-path]  Update the labelle CLI itself
-        \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
-        \\  help                 Show this help
-        \\  version              Show CLI version
-        \\
-        \\Examples:
-        \\  labelle init my-game
-        \\  labelle generate
-        \\  labelle run
-        \\  labelle run --timeout=30s
-        \\  labelle build ../my-game
-        \\  labelle install 0.2.0
-        \\  labelle upgrade core 0.2.0
-        \\
-    , .{gen.CLI_VERSION});
-}
-
-fn printVersion() void {
-    std.debug.print("labelle v{s}\n", .{gen.CLI_VERSION});
-}
-
-fn printTargets() void {
-    std.debug.print(
-        \\Available backends:
-        \\  raylib     Raylib (desktop, web)
-        \\  sokol      Sokol (desktop, web)
-        \\  sdl        SDL2 (desktop)
-        \\  bgfx       BGFX (desktop)
-        \\  wgpu       WebGPU (desktop, web)
-        \\
-        \\Available ECS adapters:
-        \\  zig_ecs    zig-ecs
-        \\  zflecs     zflecs (Flecs)
-        \\  mr_ecs     mr-ecs
-        \\
-        \\Set backend/ecs in your project.labelle file.
-        \\
-    , .{});
-}
-
-// ── labelle init ─────────────────────────────────────────────────────
-
-/// Scaffold a new project directory with project.labelle and starter files.
-/// Usage: labelle init <name> [--backend=X] [--ecs=X] [--gui=X] [--core-version=X] [--engine-version=X] [--gfx-version=X] [--labelle-version=X] [dir]
-fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    // Parse flags and positional args
-    var name: ?[]const u8 = null;
-    var dir_override: ?[]const u8 = null;
-    var backend: []const u8 = "raylib";
-    var ecs: []const u8 = "zig_ecs";
-    var gui: []const u8 = "none";
-    var core_version: []const u8 = gen.CORE_VERSION;
-    var engine_version: []const u8 = gen.ENGINE_VERSION;
-    var gfx_version: []const u8 = gen.GFX_VERSION;
-    var labelle_version: []const u8 = gen.CLI_VERSION;
-
-    for (cmd_args) |arg| {
-        if (std.mem.startsWith(u8, arg, "--backend=")) {
-            backend = arg["--backend=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--ecs=")) {
-            ecs = arg["--ecs=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--gui=")) {
-            gui = arg["--gui=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--core-version=")) {
-            core_version = arg["--core-version=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--engine-version=")) {
-            engine_version = arg["--engine-version=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--gfx-version=")) {
-            gfx_version = arg["--gfx-version=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--labelle-version=")) {
-            labelle_version = arg["--labelle-version=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            std.debug.print("labelle init: unknown flag '{s}'\n", .{arg});
-            return error.UnknownFlag;
-        } else if (name == null) {
-            name = arg;
-        } else if (dir_override == null) {
-            dir_override = arg;
-        } else {
-            std.debug.print("labelle init: unexpected argument '{s}'\n", .{arg});
-            std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
-            return error.TooManyArguments;
-        }
-    }
-
-    const project_name = name orelse {
-        std.debug.print("labelle init: missing project name\n", .{});
-        std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
-        return error.MissingArgument;
-    };
-
-    const dir = dir_override orelse project_name;
-    const cwd = std.fs.cwd();
-
-    // Create project directory
-    cwd.makePath(dir) catch |err| {
-        std.debug.print("labelle init: could not create '{s}': {any}\n", .{ dir, err });
-        return error.InitFailed;
-    };
-
-    // Write project.labelle
-    {
-        var buf = std.ArrayList(u8){};
-        defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
-
-        try w.print(
-            \\.{{
-            \\    .name = "{s}",
-            \\    .title = "{s}",
-            \\    .width = 800,
-            \\    .height = 600,
-            \\    .target_fps = 60,
-            \\    .backend = .{s},
-            \\    .ecs = .{s},
-            \\    .gui = .{s},
-            \\    .plugins = .{{}},
-            \\    .layers = .{{
-            \\        .{{ .name = "background", .order = 0, .space = .screen }},
-            \\        .{{ .name = "world", .order = 1, .space = .world }},
-            \\        .{{ .name = "ui", .order = 2, .space = .screen }},
-            \\    }},
-            \\    .core_version = "{s}",
-            \\    .engine_version = "{s}",
-            \\    .gfx_version = "{s}",
-            \\    .labelle_version = "{s}",
-            \\}}
-            \\
-        , .{ project_name, project_name, backend, ecs, gui, core_version, engine_version, gfx_version, labelle_version });
-
-        const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
-        defer allocator.free(path);
-        const file = try cwd.createFile(path, .{ .exclusive = true });
-        defer file.close();
-        try file.writeAll(buf.items);
-    }
-
-    // Create starter directories
-    const dirs = [_][]const u8{ "scripts", "scenes", "prefabs", "assets", "components", "hooks" };
-    for (dirs) |subdir| {
-        const path = try std.fs.path.join(allocator, &.{ dir, subdir });
-        defer allocator.free(path);
-        cwd.makePath(path) catch {};
-    }
-
-    // Write a starter scene
-    {
-        const path = try std.fs.path.join(allocator, &.{ dir, "scenes", "main.zon" });
-        defer allocator.free(path);
-        if (cwd.createFile(path, .{ .exclusive = true })) |file| {
-            defer file.close();
-            file.writeAll(
-                \\.{
-                \\    .name = "main",
-                \\    .entities = .{},
-                \\}
-                \\
-            ) catch {};
-        } else |err| {
-            if (err != error.PathAlreadyExists) return err;
-        }
-    }
-
-    // Write .gitignore
-    {
-        const path = try std.fs.path.join(allocator, &.{ dir, ".gitignore" });
-        defer allocator.free(path);
-        if (cwd.createFile(path, .{ .exclusive = true })) |file| {
-            defer file.close();
-            file.writeAll(".labelle/\n") catch {};
-        } else |err| {
-            if (err != error.PathAlreadyExists) return err;
-        }
-    }
-
-    std.debug.print("labelle: created project '{s}' in {s}/\n", .{ project_name, dir });
-    std.debug.print("  next: cd {s} && labelle run\n", .{dir});
-}
-
-// ── labelle install ──────────────────────────────────────────────────
-
-/// Fetch and cache packages without modifying any project.
-/// Usage: labelle install [pkg version | version]
-fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    if (cmd_args.len == 0) {
-        // Install all packages for the current project
-        const parsed = readProjectConfig(allocator, ".") catch {
-            std.debug.print("labelle install: no project.labelle found. Usage:\n", .{});
-            std.debug.print("  labelle install              — install deps for current project\n", .{});
-            std.debug.print("  labelle install <version>    — cache all packages at a version\n", .{});
-            std.debug.print("  labelle install core <ver>   — cache a specific package\n", .{});
-            return error.MissingArgument;
-        };
-        try ensureCache(allocator, parsed);
-        std.debug.print("labelle: all packages cached\n", .{});
-        return;
-    }
-
-    if (cmd_args.len == 1) {
-        // labelle install 0.3.0 — cache all framework packages at this version
-        const version = cmd_args[0];
-        std.debug.print("labelle: caching all packages at version {s}...\n", .{version});
-
-        const packages = [_][]const u8{ "core", "engine", "gfx" };
-        for (packages) |pkg| {
-            if (!try gen.isFrameworkCached(allocator, pkg, version)) {
-                std.debug.print("  fetching {s} {s}...\n", .{ pkg, version });
-                try fetchFrameworkWithFallback(allocator, pkg, version);
-            } else {
-                std.debug.print("  {s} {s} already cached\n", .{ pkg, version });
-            }
-        }
-
-        if (!try gen.isCliCached(allocator, version)) {
-            std.debug.print("  fetching cli {s}...\n", .{version});
-            try fetchCliWithFallback(allocator, version);
-        } else {
-            std.debug.print("  cli {s} already cached\n", .{version});
-        }
-
-        std.debug.print("labelle: done\n", .{});
-        return;
-    }
-
-    // labelle install core 0.2.0
-    const pkg_name = cmd_args[0];
-    const version = cmd_args[1];
-
-    if (std.mem.eql(u8, pkg_name, "core") or std.mem.eql(u8, pkg_name, "engine") or std.mem.eql(u8, pkg_name, "gfx")) {
-        std.debug.print("labelle: fetching {s} {s}...\n", .{ pkg_name, version });
-        try fetchFrameworkWithFallback(allocator, pkg_name, version);
-    } else if (std.mem.eql(u8, pkg_name, "cli")) {
-        std.debug.print("labelle: fetching cli {s}...\n", .{version});
-        try fetchCliWithFallback(allocator, version);
-    } else {
-        std.debug.print("labelle install: unknown package '{s}'\n", .{pkg_name});
-        std.debug.print("  known packages: core, engine, gfx, cli\n", .{});
-        return error.UnknownPackage;
-    }
-
-    std.debug.print("labelle: done\n", .{});
-}
-
-// ── labelle upgrade ──────────────────────────────────────────────────
-
-/// Bump version fields in project.labelle.
-/// Usage: labelle upgrade [dir] [pkg] [version]
-fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig, cmd_args: []const []const u8) !void {
-    const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
-    defer allocator.free(labelle_path);
-
-    var content = try std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024);
-
-    if (cmd_args.len == 0) {
-        // Upgrade all framework versions to CLI's latest compatible set from versions.zon
-        std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION });
-        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
-        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
-        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
-        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
-    } else {
-        const pkg = cmd_args[0];
-        const default_version: []const u8 = if (std.mem.eql(u8, pkg, "core"))
-            gen.CORE_VERSION
-        else if (std.mem.eql(u8, pkg, "engine"))
-            gen.ENGINE_VERSION
-        else if (std.mem.eql(u8, pkg, "gfx"))
-            gen.GFX_VERSION
-        else
-            gen.CLI_VERSION;
-        const version = if (cmd_args.len > 1) cmd_args[1] else default_version;
-
-        if (std.mem.eql(u8, pkg, "core")) {
-            content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, version);
-        } else if (std.mem.eql(u8, pkg, "engine")) {
-            content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, version);
-        } else if (std.mem.eql(u8, pkg, "gfx")) {
-            content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, version);
-        } else if (std.mem.eql(u8, pkg, "labelle") or std.mem.eql(u8, pkg, "cli")) {
-            content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, version);
-        } else if (std.mem.eql(u8, pkg, "all")) {
-            content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
-            content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
-            content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
-            content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
-        } else {
-            std.debug.print("labelle upgrade: unknown package '{s}'\n", .{pkg});
-            std.debug.print("  packages: core, engine, gfx, cli, all\n", .{});
-            allocator.free(content);
-            return error.UnknownPackage;
-        }
-
-        std.debug.print("labelle: upgrading {s} to {s}...\n", .{ pkg, version });
-    }
-
-    // Write back
-    const file = try std.fs.cwd().createFile(labelle_path, .{});
-    defer file.close();
-    try file.writeAll(content);
-    allocator.free(content);
-
-    std.debug.print("labelle: project.labelle updated\n", .{});
-    std.debug.print("  run 'labelle generate' to regenerate build files\n", .{});
-}
-
-/// Replace a version field and free the old content.
-fn replaceAndFree(allocator: std.mem.Allocator, old_content: []u8, field_name: []const u8, old_value: []const u8, new_value: []const u8) ![]u8 {
-    errdefer allocator.free(old_content);
-    const result = try replaceVersionField(allocator, old_content, field_name, old_value, new_value);
-    allocator.free(old_content);
-    return result;
-}
-
-/// Replace a version field value in project.labelle content.
-/// Finds `.field_name = "old_value"` and replaces old_value with new_value.
-fn replaceVersionField(allocator: std.mem.Allocator, content: []const u8, field_name: []const u8, old_value: []const u8, new_value: []const u8) ![]u8 {
-    // Build the search string: .field_name = "old_value"
-    const search = try std.fmt.allocPrint(allocator, ".{s} = \"{s}\"", .{ field_name, old_value });
-    defer allocator.free(search);
-    const replace = try std.fmt.allocPrint(allocator, ".{s} = \"{s}\"", .{ field_name, new_value });
-    defer allocator.free(replace);
-
-    if (std.mem.indexOf(u8, content, search)) |idx| {
-        var result = std.ArrayList(u8){};
-        try result.appendSlice(allocator, content[0..idx]);
-        try result.appendSlice(allocator, replace);
-        try result.appendSlice(allocator, content[idx + search.len ..]);
-        return result.toOwnedSlice(allocator);
-    }
-
-    // Field not found — return a copy
-    return try allocator.dupe(u8, content);
-}
-
-// ── labelle update ───────────────────────────────────────────────────
-
-/// Self-update the CLI binary by downloading from the release server.
-/// Usage: labelle update [version]
-fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    const r2_base_url = "https://releases.labelle.games/cli";
-
-    // Parse flags
-    var skip_path = false;
-    var version_arg: ?[]const u8 = null;
-    for (cmd_args) |arg| {
-        if (std.mem.eql(u8, arg, "--no-path")) {
-            skip_path = true;
-        } else {
-            version_arg = arg;
-        }
-    }
-
-    std.debug.print("labelle: checking for updates...\n", .{});
-    std.debug.print("  current version: {s}\n\n", .{gen.CLI_VERSION});
-
-    // Determine target version
-    var target_version: []const u8 = undefined;
-    var target_version_owned: ?[]u8 = null;
-    defer if (target_version_owned) |v| allocator.free(v);
-
-    if (version_arg) |ver| {
-        // Explicit version requested
-        target_version = ver;
-    } else {
-        // Fetch latest version from R2
-        const latest_url = r2_base_url ++ "/latest.txt";
-        const result = runCmd(allocator, &.{ "curl", "-s", "-f", latest_url }) catch {
-            std.debug.print("labelle: could not check for updates (is curl installed?)\n", .{});
-            printManualUpdateInstructions("latest");
-            return;
-        };
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-
-        switch (result.term) {
-            .Exited => |code| if (code != 0) {
-                std.debug.print("labelle: could not fetch latest version from release server\n", .{});
-                printManualUpdateInstructions("latest");
-                return;
-            },
-            else => {
-                std.debug.print("labelle: curl terminated abnormally\n", .{});
-                return;
-            },
-        }
-
-        var latest = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-        if (std.mem.startsWith(u8, latest, "v")) latest = latest[1..];
-
-        target_version_owned = try allocator.dupe(u8, latest);
-        target_version = target_version_owned.?;
-    }
-
-    // Compare versions
-    const current = parseVersion(gen.CLI_VERSION);
-    const target = parseVersion(target_version);
-
-    if (current >= target) {
-        if (current > target) {
-            std.debug.print("  you are running a newer version ({s}) than {s}\n", .{ gen.CLI_VERSION, target_version });
-        } else {
-            std.debug.print("  already on the latest version ({s})\n", .{gen.CLI_VERSION});
-        }
-        return;
-    }
-
-    std.debug.print("  new version available: {s}\n\n", .{target_version});
-
-    // Determine platform
-    const builtin = @import("builtin");
-    const os_name: []const u8 = switch (builtin.os.tag) {
-        .macos => "darwin",
-        .linux => "linux",
-        .windows => "windows",
-        else => {
-            std.debug.print("labelle: unsupported platform for binary download\n", .{});
-            printManualUpdateInstructions(target_version);
-            return;
-        },
-    };
-    const arch_name: []const u8 = switch (builtin.cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "x86_64",
-        else => {
-            std.debug.print("labelle: unsupported architecture for binary download\n", .{});
-            printManualUpdateInstructions(target_version);
-            return;
-        },
-    };
-
-    // Download
-    const download_url = try std.fmt.allocPrint(allocator, "{s}/v{s}/labelle-{s}-{s}", .{
-        r2_base_url, target_version, os_name, arch_name,
-    });
-    defer allocator.free(download_url);
-
-    const tmp_path = try getTempFilePath(allocator, "labelle-update");
-    defer allocator.free(tmp_path);
-    std.debug.print("  downloading {s}...\n", .{download_url});
-
-    const dl_result = runCmd(allocator, &.{ "curl", "-s", "-f", "-o", tmp_path, download_url }) catch {
-        std.debug.print("labelle: download failed (is curl installed?)\n", .{});
-        printManualUpdateInstructions(target_version);
-        return;
-    };
-    defer allocator.free(dl_result.stdout);
-    defer allocator.free(dl_result.stderr);
-
-    switch (dl_result.term) {
-        .Exited => |code| if (code != 0) {
-            std.debug.print("labelle: download failed (HTTP error)\n", .{});
-            printManualUpdateInstructions(target_version);
-            return;
-        },
-        else => {
-            std.debug.print("labelle: download process terminated abnormally\n", .{});
-            return;
-        },
-    }
-
-    // Make executable (Unix only; builtin already imported above for platform detection)
-    if (builtin.os.tag != .windows) {
-        _ = runCmd(allocator, &.{ "chmod", "+x", tmp_path }) catch {};
-    }
-
-    // Install into ~/.labelle/bin/
-    const cache_root = gen.getCacheRoot(allocator) catch {
-        std.debug.print("labelle: could not determine cache root\n", .{});
-        return;
-    };
-    defer allocator.free(cache_root);
-
-    const bin_dir = try std.fs.path.join(allocator, &.{ cache_root, "bin" });
-    defer allocator.free(bin_dir);
-
-    const bin_name: []const u8 = if (builtin.os.tag == .windows) "labelle.exe" else "labelle";
-    const bin_path = try std.fs.path.join(allocator, &.{ bin_dir, bin_name });
-    defer allocator.free(bin_path);
-
-    // Create bin directory
-    std.fs.cwd().makePath(bin_dir) catch |err| {
-        std.debug.print("labelle: could not create {s}: {any}\n", .{ bin_dir, err });
-        return;
-    };
-
-    // Move downloaded binary to ~/.labelle/bin/
-    if (builtin.os.tag == .windows) {
-        // Windows locks the running executable, so we can't overwrite it directly.
-        // Write a batch script that waits for this process to exit, then replaces the binary.
-        const bat_path = try std.fs.path.join(allocator, &.{ bin_dir, "labelle-update.bat" });
-        defer allocator.free(bat_path);
-
-        const bat_content = try std.fmt.allocPrint(allocator,
-            \\@echo off
-            \\:wait
-            \\timeout /t 1 /nobreak >nul
-            \\move /Y "{s}" "{s}" >nul 2>&1
-            \\if errorlevel 1 goto wait
-            \\echo Update complete.
-            \\del "%~f0"
-            \\
-        , .{ tmp_path, bin_path });
-        defer allocator.free(bat_content);
-
-        const bat_file = std.fs.cwd().createFile(bat_path, .{}) catch |err| {
-            std.debug.print("labelle: could not create update script: {any}\n", .{err});
-            std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
-            return;
-        };
-        bat_file.writeAll(bat_content) catch {};
-        bat_file.close();
-
-        // Launch the batch script detached
-        var child: std.process.Child = .init(
-            &.{ "cmd.exe", "/c", "start", "/b", bat_path },
-            allocator,
-        );
-        child.spawn() catch |err| {
-            std.debug.print("labelle: could not launch update script: {any}\n", .{err});
-            std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
-            return;
-        };
-
-        std.debug.print("\n  downloaded v{s}\n", .{target_version});
-        std.debug.print("  the binary will be replaced at {s} after this process exits\n\n", .{bin_path});
-    } else {
-        const mv_result = runCmd(allocator, &.{ "mv", "-f", tmp_path, bin_path });
-
-        if (mv_result) |result2| {
-            defer allocator.free(result2.stdout);
-            defer allocator.free(result2.stderr);
-            switch (result2.term) {
-                .Exited => |code| if (code != 0) {
-                    std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-                    std.debug.print("  downloaded to {s} — move it manually\n", .{tmp_path});
-                    return;
-                },
-                else => {
-                    std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-                    return;
-                },
-            }
-        } else |_| {
-            std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-            return;
-        }
-
-        std.debug.print("\n  updated to v{s}\n", .{target_version});
-        std.debug.print("  installed at {s}\n\n", .{bin_path});
-    }
-
-    // Setup PATH if needed (skip with --no-path)
-    if (!skip_path) {
-        setupPath(allocator, bin_dir);
-    }
-
-    // Check for old binary in system paths and warn
-    checkOldBinary(bin_path);
-}
-
-/// Detect the user's shell and add ~/.labelle/bin to PATH if not already present.
-fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
-    const builtin = @import("builtin");
-
-    if (builtin.os.tag == .windows) {
-        setupPathWindows(allocator, bin_dir);
-        return;
-    }
-
-    // Check if already in PATH (exact segment match)
-    if (std.process.getEnvVarOwned(allocator, "PATH")) |current_path| {
-        defer allocator.free(current_path);
-        if (pathContainsDir(current_path, bin_dir)) return;
-    } else |_| {}
-
-    // Detect shell from SHELL env var
-    const shell_env = std.process.getEnvVarOwned(allocator, "SHELL") catch {
-        std.debug.print("  could not detect shell — add {s} to your PATH manually\n\n", .{bin_dir});
-        return;
-    };
-    defer allocator.free(shell_env);
-
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch {
-        std.debug.print("  could not determine home directory — add {s} to your PATH manually\n\n", .{bin_dir});
-        return;
-    };
-    defer allocator.free(home_dir);
-
-    const path_line = std.fmt.allocPrint(allocator, "export PATH=\"{s}:$PATH\"", .{bin_dir}) catch return;
-    defer allocator.free(path_line);
-
-    if (std.mem.endsWith(u8, shell_env, "zsh")) {
-        const rc_path = std.fs.path.join(allocator, &.{ home_dir, ".zshrc" }) catch return;
-        defer allocator.free(rc_path);
-        if (appendToProfile(allocator, rc_path, path_line, bin_dir)) {
-            std.debug.print("  added to PATH in ~/.zshrc\n", .{});
-            std.debug.print("  run `source ~/.zshrc` or restart your terminal\n\n", .{});
-        }
-    } else if (std.mem.endsWith(u8, shell_env, "bash")) {
-        // On macOS, prefer .bash_profile if .bashrc doesn't exist
-        const bashrc = std.fs.path.join(allocator, &.{ home_dir, ".bashrc" }) catch return;
-        defer allocator.free(bashrc);
-        const bash_profile = std.fs.path.join(allocator, &.{ home_dir, ".bash_profile" }) catch return;
-        defer allocator.free(bash_profile);
-
-        // macOS Terminal launches login shells which read .bash_profile, not .bashrc.
-        // Prefer .bash_profile on macOS unless .bashrc already exists.
-        const target_rc = if (builtin.os.tag == .macos and !fileExists(bashrc))
-            bash_profile
-        else
-            bashrc;
-
-        if (appendToProfile(allocator, target_rc, path_line, bin_dir)) {
-            const rc_name = std.fs.path.basename(target_rc);
-            std.debug.print("  added to PATH in ~/{s}\n", .{rc_name});
-            std.debug.print("  run `source ~/{s}` or restart your terminal\n\n", .{rc_name});
-        }
-    } else if (std.mem.endsWith(u8, shell_env, "fish")) {
-        const fish_cmd = std.fmt.allocPrint(allocator, "fish_add_path {s}", .{bin_dir}) catch return;
-        defer allocator.free(fish_cmd);
-        if (runCmd(allocator, &.{ "fish", "-c", fish_cmd })) |result| {
-            defer allocator.free(result.stdout);
-            defer allocator.free(result.stderr);
-            switch (result.term) {
-                .Exited => |code| if (code == 0) {
-                    std.debug.print("  added to PATH via fish_add_path\n\n", .{});
-                } else {
-                    std.debug.print("  fish_add_path failed — add {s} to your PATH manually\n\n", .{bin_dir});
-                },
-                else => std.debug.print("  fish_add_path failed — add {s} to your PATH manually\n\n", .{bin_dir}),
-            }
-        } else |_| {
-            std.debug.print("  could not run fish — add {s} to your PATH manually\n\n", .{bin_dir});
-        }
-    } else {
-        std.debug.print("  add {s} to your PATH to use labelle from anywhere\n\n", .{bin_dir});
-    }
-}
-
-/// Check if a PATH string contains a specific directory as an exact segment.
-fn pathContainsDir(path_var: []const u8, dir: []const u8) bool {
-    var iter = std.mem.splitScalar(u8, path_var, ':');
-    while (iter.next()) |segment| {
-        if (std.mem.eql(u8, segment, dir)) return true;
-        // Also match with trailing slash
-        if (segment.len > 0 and segment[segment.len - 1] == '/' and
-            std.mem.eql(u8, segment[0 .. segment.len - 1], dir)) return true;
-    }
-    return false;
-}
-
-fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
-    // Read current user PATH from registry
-    const get_result = runCmd(allocator, &.{
-        "powershell", "-NoProfile", "-Command",
-        "[Environment]::GetEnvironmentVariable('Path', 'User')",
-    }) catch {
-        std.debug.print("  could not read current PATH — add {s} to your PATH manually\n\n", .{bin_dir});
-        return;
-    };
-    defer allocator.free(get_result.stdout);
-    defer allocator.free(get_result.stderr);
-
-    const current = std.mem.trim(u8, get_result.stdout, &std.ascii.whitespace);
-
-    // Check if already present (exact segment match, semicolon-separated)
-    // Windows paths are case-insensitive and use both slash styles
-    var iter = std.mem.splitScalar(u8, current, ';');
-    while (iter.next()) |segment| {
-        const trimmed = std.mem.trim(u8, segment, &std.ascii.whitespace);
-        if (windowsPathEql(trimmed, bin_dir)) return;
-    }
-
-    // Append to user PATH (escape single quotes for PowerShell)
-    const escaped_dir = escapePowerShellString(allocator, bin_dir) catch return;
-    defer allocator.free(escaped_dir);
-    const set_cmd = std.fmt.allocPrint(allocator, "[Environment]::SetEnvironmentVariable('Path', '{s};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')", .{escaped_dir}) catch return;
-    defer allocator.free(set_cmd);
-
-    if (runCmd(allocator, &.{ "powershell", "-NoProfile", "-Command", set_cmd })) |set_result| {
-        defer allocator.free(set_result.stdout);
-        defer allocator.free(set_result.stderr);
-        switch (set_result.term) {
-            .Exited => |code| if (code == 0) {
-                std.debug.print("  added {s} to user PATH (restart your terminal to take effect)\n\n", .{bin_dir});
-            } else {
-                std.debug.print("  could not update PATH via registry: {s}\n", .{set_result.stderr});
-                std.debug.print("  add {s} to your PATH manually\n\n", .{bin_dir});
-            },
-            else => {
-                std.debug.print("  could not update PATH — add {s} to your PATH manually\n\n", .{bin_dir});
-            },
-        }
-    } else |_| {
-        std.debug.print("  could not run PowerShell — add {s} to your PATH manually\n\n", .{bin_dir});
-    }
-}
-
-/// Case-insensitive path comparison for Windows, normalizing both slash styles.
-/// Also strips a trailing slash/backslash before comparing.
-fn windowsPathEql(a: []const u8, b: []const u8) bool {
-    const a_trimmed = if (a.len > 0 and (a[a.len - 1] == '/' or a[a.len - 1] == '\\')) a[0 .. a.len - 1] else a;
-    const b_trimmed = if (b.len > 0 and (b[b.len - 1] == '/' or b[b.len - 1] == '\\')) b[0 .. b.len - 1] else b;
-    if (a_trimmed.len != b_trimmed.len) return false;
-    for (a_trimmed, 0..) |ac, i| {
-        const bc = b_trimmed[i];
-        const an = if (ac == '\\') @as(u8, '/') else std.ascii.toLower(ac);
-        const bn = if (bc == '\\') @as(u8, '/') else std.ascii.toLower(bc);
-        if (an != bn) return false;
-    }
-    return true;
-}
-
-/// Escape a string for use inside PowerShell single-quoted strings.
-/// In PowerShell, single quotes inside '...' are escaped by doubling them: ' -> ''
-fn escapePowerShellString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var count: usize = 0;
-    for (input) |c| {
-        if (c == '\'') count += 1;
-    }
-    if (count == 0) return try allocator.dupe(u8, input);
-
-    var result = try allocator.alloc(u8, input.len + count);
-    var j: usize = 0;
-    for (input) |c| {
-        if (c == '\'') {
-            result[j] = '\'';
-            j += 1;
-        }
-        result[j] = c;
-        j += 1;
-    }
-    return result;
-}
-
-/// Append a line to a shell profile file if it's not already present.
-/// Returns true if the file was modified, false if it already had the entry.
-/// `bin_dir` is used for robust duplicate detection (matches the actual directory path).
-fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const u8, bin_dir: []const u8) bool {
-    // Read existing content and check line-by-line for an existing PATH entry
-    if (std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024)) |content| {
-        defer allocator.free(content);
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |file_line| {
-            const trimmed = std.mem.trim(u8, file_line, &std.ascii.whitespace);
-            if (std.mem.startsWith(u8, trimmed, "#")) continue;
-            // Match the exact export line
-            if (std.mem.eql(u8, trimmed, line)) return false;
-            // Match any uncommented PATH export that references the bin_dir
-            if ((std.mem.startsWith(u8, trimmed, "export PATH=") or std.mem.startsWith(u8, trimmed, "PATH=")) and
-                std.mem.indexOf(u8, trimmed, bin_dir) != null) return false;
-        }
-    } else |_| {}
-
-    // Append the line
-    const file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch
-        std.fs.cwd().createFile(path, .{}) catch return false;
-    defer file.close();
-
-    file.seekFromEnd(0) catch return false;
-    file.writeAll("\n# Added by labelle CLI\n") catch return false;
-    file.writeAll(line) catch return false;
-    file.writeAll("\n") catch return false;
-    return true;
-}
-
-/// Check if an old labelle binary exists in system paths and warn the user.
-fn checkOldBinary(new_path: []const u8) void {
-    const builtin = @import("builtin");
-    if (builtin.os.tag == .windows) return;
-
-    const system_paths = [_][]const u8{ "/usr/local/bin/labelle", "/usr/bin/labelle" };
-    for (system_paths) |sys_path| {
-        if (std.mem.eql(u8, sys_path, new_path)) continue;
-        if (fileExists(sys_path)) {
-            std.debug.print("  warning: found old labelle binary at {s}\n", .{sys_path});
-            std.debug.print("  remove it with: sudo rm {s}\n", .{sys_path});
-            std.debug.print("  the CLI now runs from {s}\n\n", .{new_path});
-            return;
-        }
-    }
-}
-
-fn fileExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
-}
-
-/// Get a platform-aware temporary file path.
-fn getTempFilePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    const builtin = @import("builtin");
-    const tmp_base: []const u8 = if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(allocator, "TEMP") catch
-            std.process.getEnvVarOwned(allocator, "TMP") catch
-            try allocator.dupe(u8, "C:\\Windows\\Temp")
-    else
-        try allocator.dupe(u8, "/tmp");
-    defer allocator.free(tmp_base);
-
-    return try std.fs.path.join(allocator, &.{ tmp_base, name });
-}
-
-fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.Child.RunResult {
-    return std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-    });
-}
-
-/// Parse semantic version string into a comparable number.
-/// "1.2.3" -> 1*1000000 + 2*1000 + 3 = 1002003
-/// Supports components up to 999 each.
-fn parseVersion(version: []const u8) u32 {
-    var parts: [3]u32 = .{ 0, 0, 0 };
-    var part_idx: u8 = 0;
-
-    for (version) |c| {
-        if (c == '.') {
-            part_idx += 1;
-            if (part_idx >= 3) break;
-        } else if (c >= '0' and c <= '9') {
-            parts[part_idx] = parts[part_idx] * 10 + (c - '0');
-        }
-    }
-
-    return parts[0] * 1_000_000 + parts[1] * 1_000 + parts[2];
-}
-
-fn printManualUpdateInstructions(version: []const u8) void {
-    std.debug.print("\n  to update manually, download from:\n", .{});
-    std.debug.print("    https://releases.labelle.games/cli/v{s}/\n\n", .{version});
-    std.debug.print("  or build from source:\n", .{});
-    std.debug.print("    git clone https://github.com/labelle-toolkit/labelle-cli.git\n", .{});
-    std.debug.print("    zig build -Doptimize=ReleaseSafe\n", .{});
-}
-
-// ── labelle clean ────────────────────────────────────────────────────
-
-/// Remove unused cached package versions from ~/.labelle/packages/.
-/// Scans project.labelle in the current directory (or --project dir) to find
-/// referenced versions. Also keeps the CLI's default versions. Removes everything else.
-fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    var dry_run = false;
-    var project_dir: []const u8 = ".";
-    for (cmd_args) |arg| {
-        if (std.mem.eql(u8, arg, "--dry-run")) {
-            dry_run = true;
-        } else if (std.mem.startsWith(u8, arg, "--project=")) {
-            project_dir = arg["--project=".len..];
-        } else {
-            std.debug.print("labelle clean: unknown option '{s}'\n", .{arg});
-            std.debug.print("  usage: labelle clean [--dry-run] [--project=<dir>]\n", .{});
-            return error.InvalidArgument;
-        }
-    }
-
-    const packages_dir = gen.getPackagesDir(allocator) catch {
-        std.debug.print("labelle: could not determine packages directory\n", .{});
-        return;
-    };
-    defer allocator.free(packages_dir);
-
-    std.debug.print("labelle: scanning {s}...\n", .{packages_dir});
-
-    // Use an arena for temporary allocations in the scan loop
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    // Collect all referenced versions per package name.
-    // Always keep the CLI's default versions.
-    var kept = std.StringHashMap(std.StringHashMap(void)).init(arena_alloc);
-
-    const pkg_names = [_][]const u8{ "core", "engine", "gfx", "cli" };
-    const default_versions = [_][]const u8{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION };
-
-    for (pkg_names, 0..) |name, i| {
-        var version_set = std.StringHashMap(void).init(arena_alloc);
-        try version_set.put(default_versions[i], {});
-        try kept.put(name, version_set);
-    }
-
-    // Scan project.labelle to find additional referenced versions
-    var project_arena = std.heap.ArenaAllocator.init(allocator);
-    defer project_arena.deinit();
-    if (readProjectConfigQuiet(project_arena.allocator(), project_dir)) |cfg| {
-        const project_refs = [_]struct { name: []const u8, version: []const u8 }{
-            .{ .name = "core", .version = cfg.core_version },
-            .{ .name = "engine", .version = cfg.engine_version },
-            .{ .name = "gfx", .version = cfg.gfx_version },
-            .{ .name = "cli", .version = cfg.labelle_version },
-        };
-        for (project_refs) |ref| {
-            if (gen.isLocalVersion(ref.version)) continue;
-            if (kept.getPtr(ref.name)) |set| {
-                try set.put(ref.version, {});
-            }
-        }
-        std.debug.print("  found project.labelle in '{s}'\n", .{project_dir});
-    } else |_| {
-        std.debug.print("  no project.labelle found — keeping CLI default versions only\n", .{});
-    }
-
-    var removed_count: u32 = 0;
-
-    for (pkg_names) |pkg_name| {
-        const pkg_dir_path = std.fs.path.join(arena_alloc, &.{ packages_dir, pkg_name }) catch continue;
-
-        var pkg_dir = std.fs.cwd().openDir(pkg_dir_path, .{ .iterate = true }) catch continue;
-        defer pkg_dir.close();
-
-        const version_set = kept.get(pkg_name) orelse continue;
-
-        var iter = pkg_dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .directory and entry.kind != .sym_link) continue;
-
-            // Keep referenced versions
-            if (version_set.contains(entry.name)) continue;
-
-            if (dry_run) {
-                std.debug.print("  would remove {s}/{s}\n", .{ pkg_name, entry.name });
-            } else {
-                const full_path = std.fs.path.join(arena_alloc, &.{ pkg_dir_path, entry.name }) catch continue;
-
-                // Remove symlinks directly, delete trees for directories
-                if (entry.kind == .sym_link) {
-                    std.fs.cwd().deleteFile(full_path) catch |err| {
-                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
-                        continue;
-                    };
-                } else {
-                    std.fs.cwd().deleteTree(full_path) catch |err| {
-                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
-                        continue;
-                    };
-                }
-                std.debug.print("  removed {s}/{s}\n", .{ pkg_name, entry.name });
-            }
-            removed_count += 1;
-        }
-    }
-
-    if (removed_count == 0) {
-        std.debug.print("  nothing to clean\n", .{});
-    } else if (dry_run) {
-        std.debug.print("  {d} version(s) would be removed (use without --dry-run to delete)\n", .{removed_count});
-    } else {
-        std.debug.print("  cleaned {d} old version(s)\n", .{removed_count});
-    }
-}
-
-fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
-    return readProjectConfigImpl(allocator, project_dir, true);
-}
-
-/// Same as readProjectConfig but without printing error messages.
-/// Used by commands where a missing project.labelle is expected (e.g. clean).
-fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
-    return readProjectConfigImpl(allocator, project_dir, false);
-}
-
-fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, verbose: bool) !gen.ProjectConfig {
-    const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
-    defer allocator.free(labelle_path);
-
-    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch |err| {
-        if (verbose) std.debug.print("labelle: could not read '{s}': {any}\n", .{ labelle_path, err });
-        return error.FileNotFound;
-    };
-    defer allocator.free(source_raw);
-
-    const source = try allocator.dupeZ(u8, source_raw);
-
-    return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
-        if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
-        return error.ParseError;
-    };
-}
-
-/// Run a command with inherited stdio (output goes straight to terminal).
-fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, timeout_ns: ?u64) !u8 {
-    var child: std.process.Child = .init(argv, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    if (timeout_ns != null) child.pgid = 0; // new process group so we can kill all children
-    try child.spawn();
-
-    if (timeout_ns) |ns| {
-        // Spawn a thread that sleeps then kills the entire process group
-        const thread = try std.Thread.spawn(.{}, timeoutKill, .{ child.id, ns });
-        thread.detach();
-    }
-
-    const term = try child.wait();
-    return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| {
-            if (timeout_ns != null and sig == std.posix.SIG.TERM) {
-                std.debug.print("\nlabelle: timed out\n", .{});
-                return 0;
-            }
-            std.debug.print("labelle: killed by signal {d}\n", .{sig});
-            return 1;
-        },
-        .Stopped => |sig| {
-            std.debug.print("labelle: stopped by signal {d}\n", .{sig});
-            return 1;
-        },
-        .Unknown => |val| {
-            std.debug.print("labelle: unknown termination {d}\n", .{val});
-            return 1;
-        },
-    };
-}
-
-fn timeoutKill(pid: std.process.Child.Id, timeout_ns: u64) void {
-    std.Thread.sleep(timeout_ns);
-    // Kill the entire process group (negative pid) so child processes (the game binary) also die
-    const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
-    std.posix.kill(pgid, std.posix.SIG.TERM) catch {};
-}
-
-fn parseDuration(input: []const u8) ?u64 {
-    if (input.len == 0) return null;
-
-    const last = input[input.len - 1];
-    const multiplier: u64 = switch (last) {
-        's' => std.time.ns_per_s,
-        'm' => std.time.ns_per_min,
-        else => {
-            // No suffix — treat as seconds
-            const secs = std.fmt.parseInt(u64, input, 10) catch return null;
-            return secs * std.time.ns_per_s;
-        },
-    };
-
-    const num_str = input[0 .. input.len - 1];
-    const val = std.fmt.parseInt(u64, num_str, 10) catch return null;
-    return val * multiplier;
-}
-
-fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.Child.RunResult {
-    return std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .cwd = cwd,
-    });
-}
-
-/// Validate that declared dependency versions are compatible with each other.
-/// Checks major.minor compatibility between framework packages.
-/// Skipped for any package using a `local:` override.
-fn validateCompatibility(cfg: gen.ProjectConfig) void {
-    const is_local = gen.isLocalVersion;
-    var warnings: u8 = 0;
-
-    // Extract major.minor for each non-local framework version
-    const core_mm = if (!is_local(cfg.core_version)) parseMajorMinor(cfg.core_version) else null;
-    const engine_mm = if (!is_local(cfg.engine_version)) parseMajorMinor(cfg.engine_version) else null;
-    const gfx_mm = if (!is_local(cfg.gfx_version)) parseMajorMinor(cfg.gfx_version) else null;
-    const cli_mm = if (!is_local(cfg.labelle_version)) parseMajorMinor(cfg.labelle_version) else null;
-
-    // engine depends on core — major.minor must match
-    if (core_mm != null and engine_mm != null and core_mm.? != engine_mm.?) {
-        std.debug.print("labelle: warning: engine {s} may be incompatible with core {s}\n", .{ cfg.engine_version, cfg.core_version });
-        std.debug.print("  engine depends on core — their major.minor versions should match\n", .{});
-        std.debug.print("  hint: run `labelle upgrade all`\n\n", .{});
-        warnings += 1;
-    }
-
-    // gfx depends on core — major.minor must match
-    if (core_mm != null and gfx_mm != null and core_mm.? != gfx_mm.?) {
-        std.debug.print("labelle: warning: gfx {s} may be incompatible with core {s}\n", .{ cfg.gfx_version, cfg.core_version });
-        std.debug.print("  gfx depends on core — their major.minor versions should match\n", .{});
-        std.debug.print("  hint: run `labelle upgrade gfx` or `labelle upgrade all`\n\n", .{});
-        warnings += 1;
-    }
-
-    // backends (from CLI) depend on core — major.minor must match
-    if (core_mm != null and cli_mm != null and core_mm.? != cli_mm.?) {
-        std.debug.print("labelle: warning: cli {s} backends may be incompatible with core {s}\n", .{ cfg.labelle_version, cfg.core_version });
-        std.debug.print("  backend adapters implement core interfaces — their major.minor versions should match\n", .{});
-        std.debug.print("  hint: run `labelle upgrade cli` or `labelle upgrade all`\n\n", .{});
-        warnings += 1;
-    }
-
-    // plugins depend on core — check each non-local plugin
-    for (cfg.plugins) |plugin| {
-        if (plugin.isLocal()) continue;
-        const plugin_mm = parseMajorMinor(plugin.version);
-        if (core_mm != null and plugin_mm != core_mm.?) {
-            std.debug.print("labelle: warning: plugin {s} {s} may be incompatible with core {s}\n", .{ plugin.name, plugin.version, cfg.core_version });
-            std.debug.print("  plugins depend on core — their major.minor versions should match\n", .{});
-            std.debug.print("  hint: update the plugin version in project.labelle\n\n", .{});
-            warnings += 1;
-        }
-    }
-
-    if (warnings > 0) {
-        std.debug.print("labelle: {d} compatibility warning(s) — proceeding anyway\n\n", .{warnings});
-    }
-}
-
-/// Parse a semver string into a major.minor comparable value.
-/// "0.3.2" -> 0*100 + 3 = 3  (patch is ignored for compatibility)
-fn parseMajorMinor(version: []const u8) u32 {
-    var parts: [3]u32 = .{ 0, 0, 0 };
-    var part_idx: u8 = 0;
-
-    for (version) |c| {
-        if (c == '.') {
-            part_idx += 1;
-            if (part_idx >= 3) break;
-        } else if (c >= '0' and c <= '9') {
-            parts[part_idx] = parts[part_idx] * 10 + (c - '0');
-        }
-    }
-
-    return parts[0] * 100 + parts[1];
-}
-
-/// Write labelle.lock into the project root.
-/// Records resolved versions for reproducibility and diagnostics.
-fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig) !void {
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-
-    try w.writeAll(
-        \\// labelle.lock — resolved dependency versions
-        \\// Generated by labelle-cli. Commit this file to git.
-        \\.{
-        \\
-    );
-
-    try w.print("    .cli_version = \"{s}\",\n", .{gen.CLI_VERSION});
-    try w.print("    .resolved = .{{\n", .{});
-    try w.print("        .core = .{{ .version = \"{s}\" }},\n", .{cfg.core_version});
-    try w.print("        .engine = .{{ .version = \"{s}\" }},\n", .{cfg.engine_version});
-    try w.print("        .gfx = .{{ .version = \"{s}\" }},\n", .{cfg.gfx_version});
-    try w.print("        .labelle = .{{ .version = \"{s}\" }},\n", .{cfg.labelle_version});
-    try w.print("        .backend = .{{ .name = \"{s}\", .platform = \"{s}\" }},\n", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
-
-    if (cfg.ecs != .mock) {
-        try w.print("        .ecs = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.ecs)});
-    }
-    if (cfg.gui != .none) {
-        try w.print("        .gui = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.gui)});
-    }
-
-    try w.writeAll("    },\n");
-
-    // Plugins
-    if (cfg.plugins.len > 0) {
-        try w.writeAll("    .plugins = .{\n");
-        for (cfg.plugins) |plugin| {
-            try w.print("        .{{ .name = \"{s}\", .repo = \"{s}\", .version = \"{s}\" }},\n", .{
-                plugin.name, plugin.repo, plugin.version,
-            });
-        }
-        try w.writeAll("    },\n");
-    }
-
-    try w.writeAll("}\n");
-
-    // Write to project_dir/labelle.lock
-    const lock_path = try std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" });
-    defer allocator.free(lock_path);
-
-    const file = try std.fs.cwd().createFile(lock_path, .{});
-    defer file.close();
-    try file.writeAll(buf.items);
-}
-
-/// Ensure all dependencies declared in the project config are present in the local cache.
-/// Tries monorepo first (for development), falls back to remote fetching.
-fn ensureCache(allocator: std.mem.Allocator, cfg: gen.ProjectConfig) !void {
-    const missing = try gen.validateCache(allocator, cfg);
-    defer {
-        for (missing) |m| allocator.free(m);
-        allocator.free(missing);
-    }
-
-    if (missing.len == 0) return;
-
-    std.debug.print("labelle: populating package cache...\n", .{});
-
-    // Framework packages: core, engine, gfx
-    const framework = [_]struct { name: []const u8, version: []const u8, dir: []const u8 }{
-        .{ .name = "core", .version = cfg.core_version, .dir = "labelle-core" },
-        .{ .name = "engine", .version = cfg.engine_version, .dir = "engine" },
-        .{ .name = "gfx", .version = cfg.gfx_version, .dir = "labelle-gfx" },
-    };
-
-    for (framework) |pkg| {
-        if (!try gen.isFrameworkCached(allocator, pkg.name, pkg.version)) {
-            try fetchFrameworkWithFallback(allocator, pkg.name, pkg.version);
-        }
-    }
-
-    // CLI-bundled packages (backends, ecs, gui)
-    if (!try gen.isCliCached(allocator, cfg.labelle_version)) {
-        try fetchCliWithFallback(allocator, cfg.labelle_version);
-    }
-
-    // Plugins
-    for (cfg.plugins) |plugin| {
-        if (!try gen.isPluginCached(allocator, plugin)) {
-            try fetchPluginWithFallback(allocator, plugin);
-        }
-    }
-
-    // Patch cached packages: rewrite sibling path deps to point to cached locations
-    try gen.patchCachedDeps(allocator, cfg);
-
-    std.debug.print("  cache populated\n", .{});
-}
-
-/// Fetch a framework package: try monorepo first, then remote git clone.
-fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8, version: []const u8) !void {
-    // Try monorepo first
-    if (findRepoRoot(allocator)) |repo_root| {
-        defer allocator.free(repo_root);
-        const dir_name: []const u8 = if (std.mem.eql(u8, name, "core"))
-            "labelle-core"
-        else if (std.mem.eql(u8, name, "engine"))
-            "engine"
-        else if (std.mem.eql(u8, name, "gfx"))
-            "labelle-gfx"
-        else
-            name;
-        const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
-        defer allocator.free(src);
-
-        if (dirExists(src)) {
-            std.debug.print("  caching {s} {s} (local)\n", .{ name, version });
-            try gen.populateFrameworkPackage(allocator, name, version, src);
-            return;
-        }
-    }
-
-    // Fall back to remote fetch
-    std.debug.print("  fetching {s} {s} (remote)...\n", .{ name, version });
-    try gen.fetchFrameworkPackage(allocator, name, version);
-}
-
-/// Fetch CLI-bundled packages: try monorepo first, then remote.
-fn fetchCliWithFallback(allocator: std.mem.Allocator, version: []const u8) !void {
-    // Try monorepo first
-    if (findRepoRoot(allocator)) |repo_root| {
-        defer allocator.free(repo_root);
-        const companion = try std.fs.path.join(allocator, &.{ repo_root, "labelle-cli" });
-        defer allocator.free(companion);
-
-        if (dirExists(companion)) {
-            std.debug.print("  caching cli {s} (local)\n", .{version});
-            try gen.populateCliCache(allocator, version, companion);
-            return;
-        }
-    }
-
-    // Fall back to remote fetch
-    std.debug.print("  fetching cli {s} (remote)...\n", .{version});
-    try gen.fetchCliPackages(allocator, version);
-}
-
-/// Fetch a plugin: try monorepo first, then remote git clone.
-fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: gen.PluginDep) !void {
-    // Try monorepo first
-    if (findRepoRoot(allocator)) |repo_root| {
-        defer allocator.free(repo_root);
-        const plugin_dir = try std.fmt.allocPrint(allocator, "labelle-{s}", .{plugin.name});
-        defer allocator.free(plugin_dir);
-        const src = try std.fs.path.join(allocator, &.{ repo_root, plugin_dir });
-        defer allocator.free(src);
-
-        if (dirExists(src)) {
-            std.debug.print("  caching plugin {s} {s} (local)\n", .{ plugin.name, plugin.version });
-            try gen.populatePlugin(allocator, plugin, src);
-            return;
-        }
-    }
-
-    // Fall back to remote fetch
-    std.debug.print("  fetching plugin {s} {s} (remote)...\n", .{ plugin.name, plugin.version });
-    try gen.fetchPlugin(allocator, plugin);
-}
-
-fn dirExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
-}
-
-/// Try to find the monorepo root by walking up from the CLI executable path.
-/// Returns null if we can't determine it (e.g. installed globally, not in monorepo).
-fn findRepoRoot(allocator: std.mem.Allocator) ?[]const u8 {
-    // Get the CLI executable's directory
-    const exe_path = std.fs.selfExePathAlloc(allocator) catch return null;
-    defer allocator.free(exe_path);
-
-    // Walk up from exe dir looking for a directory that contains labelle-core/
-    // (as a marker that we're in the monorepo)
-    var dir = std.fs.path.dirname(exe_path) orelse return null;
-    var depth: u8 = 0;
-    while (depth < 6) : (depth += 1) {
-        // Check if this directory contains labelle-core/
-        const marker = std.fs.path.join(allocator, &.{ dir, "labelle-core" }) catch return null;
-        defer allocator.free(marker);
-
-        std.fs.cwd().access(marker, .{}) catch {
-            dir = std.fs.path.dirname(dir) orelse return null;
-            continue;
-        };
-
-        return allocator.dupe(u8, dir) catch return null;
-    }
-
-    return null;
-}
-
-/// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
-fn fixFingerprint(allocator: std.mem.Allocator, output_dir: []const u8) !void {
-    const zon_path = try std.fs.path.join(allocator, &.{ output_dir, "build.zig.zon" });
-    defer allocator.free(zon_path);
-
-    const result = try runZig(allocator, output_dir, &.{ "zig", "build" });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    const marker = "use this value: ";
-    if (std.mem.indexOf(u8, result.stderr, marker)) |idx| {
-        const start = idx + marker.len;
-        var end = start;
-        while (end < result.stderr.len and result.stderr[end] != '\n' and result.stderr[end] != ';') {
-            end += 1;
-        }
-        const suggested = result.stderr[start..end];
-
-        const zon_content = try std.fs.cwd().readFileAlloc(allocator, zon_path, 1024 * 1024);
-        defer allocator.free(zon_content);
-
-        const fp_marker = ".fingerprint = ";
-        if (std.mem.indexOf(u8, zon_content, fp_marker)) |fp_idx| {
-            const val_start = fp_idx + fp_marker.len;
-            var val_end = val_start;
-            while (val_end < zon_content.len and zon_content[val_end] != ',') {
-                val_end += 1;
-            }
-
-            var new_content: std.ArrayList(u8) = .{};
-            defer new_content.deinit(allocator);
-            try new_content.appendSlice(allocator, zon_content[0..val_start]);
-            try new_content.appendSlice(allocator, suggested);
-            try new_content.appendSlice(allocator, zon_content[val_end..]);
-
-            const file = try std.fs.cwd().createFile(zon_path, .{});
-            defer file.close();
-            try file.writeAll(new_content.items);
-        }
     }
 }
