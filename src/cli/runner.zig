@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 
 const windows = if (is_windows) struct {
-    extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.C) std.os.windows.DWORD;
+    extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.c) std.os.windows.DWORD;
 } else struct {};
 
 /// Run a zig command capturing stdout/stderr.
