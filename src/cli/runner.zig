@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
 
 /// Run a zig command capturing stdout/stderr.
 pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.Child.RunResult {
@@ -17,19 +19,25 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-    if (timeout_ns != null) child.pgid = 0; // new process group so we can kill all children
+    // On POSIX, create a new process group so we can kill all children on timeout
+    if (!is_windows and timeout_ns != null) child.pgid = 0;
     try child.spawn();
 
     if (timeout_ns) |ns| {
-        const thread = try std.Thread.spawn(.{}, timeoutKill, .{ child.id, ns });
-        thread.detach();
+        if (is_windows) {
+            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ child.id, ns });
+            thread.detach();
+        } else {
+            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns });
+            thread.detach();
+        }
     }
 
     const term = try child.wait();
     return switch (term) {
         .Exited => |code| code,
         .Signal => |sig| {
-            if (timeout_ns != null and sig == std.posix.SIG.TERM) {
+            if (!is_windows and timeout_ns != null and sig == std.posix.SIG.TERM) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 return 0;
             }
@@ -47,10 +55,19 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     };
 }
 
-fn timeoutKill(pid: std.process.Child.Id, timeout_ns: u64) void {
+fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64) void {
     std.Thread.sleep(timeout_ns);
+    // Kill the entire process group so child processes (the game binary) also die
     const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
     std.posix.kill(pgid, std.posix.SIG.TERM) catch {};
+}
+
+fn timeoutKillWindows(pid: std.process.Child.Id, timeout_ns: u64) void {
+    std.Thread.sleep(timeout_ns);
+    // On Windows, use TerminateProcess via the child handle
+    const handle = std.os.windows.OpenProcess(std.os.windows.PROCESS_TERMINATE, false, pid) orelse return;
+    defer std.os.windows.CloseHandle(handle);
+    _ = std.os.windows.TerminateProcess(handle, 1);
 }
 
 /// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
