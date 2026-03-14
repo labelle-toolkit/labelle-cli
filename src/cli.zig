@@ -2,7 +2,7 @@
 ///
 /// Usage:
 ///   labelle generate [dir]       — generate .labelle/ assembler files
-///   labelle run [dir]            — generate + build + run
+///   labelle run [dir] [--timeout=30s]  — generate + build + run
 ///   labelle build [dir]          — generate + build (no run)
 ///   labelle [dir]                — alias for `run`
 ///   labelle init <name> [dir]    — scaffold a new project
@@ -29,6 +29,7 @@ pub fn main() !void {
     var project_dir: []const u8 = ".";
     var extra_args: [8][]const u8 = undefined;
     var extra_count: usize = 0;
+    var timeout_ns: ?u64 = null;
 
     const first_arg = args.next();
     if (first_arg == null) {
@@ -44,7 +45,31 @@ pub fn main() !void {
             project_dir = args.next() orelse ".";
         } else if (std.mem.eql(u8, first, "run")) {
             command = .run;
-            project_dir = args.next() orelse ".";
+            // Parse optional [dir] and --timeout flag
+            while (args.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, "--timeout=")) {
+                    timeout_ns = parseDuration(arg["--timeout=".len..]);
+                    if (timeout_ns == null) {
+                        std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
+                        std.debug.print("  expected format: --timeout=30s, --timeout=2m\n", .{});
+                        return;
+                    }
+                } else if (std.mem.eql(u8, arg, "--timeout")) {
+                    if (args.next()) |val| {
+                        timeout_ns = parseDuration(val);
+                        if (timeout_ns == null) {
+                            std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
+                            std.debug.print("  expected format: --timeout 30s, --timeout 2m\n", .{});
+                            return;
+                        }
+                    } else {
+                        std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
+                        return;
+                    }
+                } else {
+                    project_dir = arg;
+                }
+            }
         } else if (std.mem.eql(u8, first, "init")) {
             command = .init;
             // Collect remaining args for init
@@ -205,8 +230,17 @@ pub fn main() !void {
     if (command == .build) return;
 
     // Run
-    std.debug.print("labelle: running...\n\n", .{});
-    const run_result = try runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" });
+    if (timeout_ns) |t| {
+        const secs = t / std.time.ns_per_s;
+        if (secs >= 60) {
+            std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{secs / 60});
+        } else {
+            std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
+        }
+    } else {
+        std.debug.print("labelle: running...\n\n", .{});
+    }
+    const run_result = try runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
     if (run_result != 0) {
         std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
     }
@@ -224,7 +258,7 @@ fn printHelp() void {
         \\  init <name> [dir]    Create a new labelle project
         \\  generate [dir]       Generate .labelle/ assembler files
         \\  build [dir]          Generate + build the project
-        \\  run [dir]            Generate + build + run (default)
+        \\  run [dir] [--timeout=<dur>]  Generate + build + run (default)
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
@@ -237,6 +271,7 @@ fn printHelp() void {
         \\  labelle init my-game
         \\  labelle generate
         \\  labelle run
+        \\  labelle run --timeout=30s
         \\  labelle build ../my-game
         \\  labelle install 0.2.0
         \\  labelle upgrade core 0.2.0
@@ -1208,17 +1243,28 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
 }
 
 /// Run a command with inherited stdio (output goes straight to terminal).
-fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !u8 {
+fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, timeout_ns: ?u64) !u8 {
     var child: std.process.Child = .init(argv, allocator);
     child.cwd = cwd;
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
     try child.spawn();
+
+    if (timeout_ns) |ns| {
+        // Spawn a thread that sleeps then kills the child
+        const thread = try std.Thread.spawn(.{}, timeoutKill, .{ child.id, ns });
+        thread.detach();
+    }
+
     const term = try child.wait();
     return switch (term) {
         .Exited => |code| code,
         .Signal => |sig| {
+            if (timeout_ns != null and sig == std.posix.SIG.TERM) {
+                std.debug.print("\nlabelle: timed out\n", .{});
+                return 0;
+            }
             std.debug.print("labelle: killed by signal {d}\n", .{sig});
             return 1;
         },
@@ -1231,6 +1277,30 @@ fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []
             return 1;
         },
     };
+}
+
+fn timeoutKill(pid: std.process.Child.Id, timeout_ns: u64) void {
+    std.Thread.sleep(timeout_ns);
+    std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+}
+
+fn parseDuration(input: []const u8) ?u64 {
+    if (input.len == 0) return null;
+
+    const last = input[input.len - 1];
+    const multiplier: u64 = switch (last) {
+        's' => std.time.ns_per_s,
+        'm' => std.time.ns_per_min,
+        else => {
+            // No suffix — treat as seconds
+            const secs = std.fmt.parseInt(u64, input, 10) catch return null;
+            return secs * std.time.ns_per_s;
+        },
+    };
+
+    const num_str = input[0 .. input.len - 1];
+    const val = std.fmt.parseInt(u64, num_str, 10) catch return null;
+    return val * multiplier;
 }
 
 fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.Child.RunResult {
