@@ -64,10 +64,16 @@ fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64) void {
 
 fn timeoutKillWindows(pid: std.process.Child.Id, timeout_ns: u64) void {
     std.Thread.sleep(timeout_ns);
-    // On Windows, use TerminateProcess via the child handle
-    const handle = std.os.windows.OpenProcess(std.os.windows.PROCESS_TERMINATE, false, pid) orelse return;
-    defer std.os.windows.CloseHandle(handle);
-    _ = std.os.windows.TerminateProcess(handle, 1);
+    // On Windows, use taskkill /F /T to kill the process tree
+    var pid_buf: [16]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
+    const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };
+    var kill_child: std.process.Child = .init(&argv, std.heap.page_allocator);
+    kill_child.stdin_behavior = .Ignore;
+    kill_child.stdout_behavior = .Ignore;
+    kill_child.stderr_behavior = .Ignore;
+    kill_child.spawn() catch return;
+    _ = kill_child.wait() catch {};
 }
 
 /// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
