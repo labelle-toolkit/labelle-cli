@@ -1249,10 +1249,11 @@ fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
+    if (timeout_ns != null) child.pgid = 0; // new process group so we can kill all children
     try child.spawn();
 
     if (timeout_ns) |ns| {
-        // Spawn a thread that sleeps then kills the child
+        // Spawn a thread that sleeps then kills the entire process group
         const thread = try std.Thread.spawn(.{}, timeoutKill, .{ child.id, ns });
         thread.detach();
     }
@@ -1281,7 +1282,9 @@ fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []
 
 fn timeoutKill(pid: std.process.Child.Id, timeout_ns: u64) void {
     std.Thread.sleep(timeout_ns);
-    std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+    // Kill the entire process group (negative pid) so child processes (the game binary) also die
+    const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
+    std.posix.kill(pgid, std.posix.SIG.TERM) catch {};
 }
 
 fn parseDuration(input: []const u8) ?u64 {
