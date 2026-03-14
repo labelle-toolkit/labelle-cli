@@ -6,7 +6,9 @@ const cache = @import("cache.zig");
 /// Fetch and cache packages without modifying any project.
 pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     if (cmd_args.len == 0) {
-        const parsed = config.readProjectConfig(allocator, ".") catch {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const parsed = config.readProjectConfig(arena.allocator(), ".") catch {
             std.debug.print("labelle install: no project.labelle found. Usage:\n", .{});
             std.debug.print("  labelle install              — install deps for current project\n", .{});
             std.debug.print("  labelle install <version>    — cache all packages at a version\n", .{});

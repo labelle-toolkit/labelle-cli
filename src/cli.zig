@@ -80,7 +80,14 @@ pub fn main() !void {
                         std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
                         return;
                     }
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    std.debug.print("labelle run: unknown flag '{s}'\n", .{arg});
+                    return;
                 } else {
+                    if (!std.mem.eql(u8, project_dir, ".")) {
+                        std.debug.print("labelle run: unexpected argument '{s}'\n", .{arg});
+                        return;
+                    }
                     project_dir = arg;
                 }
             }
@@ -242,8 +249,12 @@ pub fn main() !void {
     // Run
     if (timeout_ns) |t| {
         const secs = t / std.time.ns_per_s;
-        if (secs >= 60) {
-            std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{secs / 60});
+        const mins = secs / 60;
+        const rem = secs % 60;
+        if (mins > 0 and rem > 0) {
+            std.debug.print("labelle: running (timeout: {d}m{d}s)...\n\n", .{ mins, rem });
+        } else if (mins > 0) {
+            std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{mins});
         } else {
             std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
         }

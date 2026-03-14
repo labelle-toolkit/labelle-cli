@@ -161,7 +161,12 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
             std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
             return;
         };
-        bat_file.writeAll(bat_content) catch {};
+        bat_file.writeAll(bat_content) catch {
+            bat_file.close();
+            std.debug.print("labelle: could not write update script\n", .{});
+            std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
+            return;
+        };
         bat_file.close();
 
         var child: std.process.Child = .init(

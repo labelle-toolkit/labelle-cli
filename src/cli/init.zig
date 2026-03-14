@@ -37,14 +37,14 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
             dir_override = arg;
         } else {
             std.debug.print("labelle init: unexpected argument '{s}'\n", .{arg});
-            std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
+            std.debug.print("usage: labelle init <name> [--backend=X] [--ecs=X] [--gui=X] [--core-version=X] [--engine-version=X] [--gfx-version=X] [dir]\n", .{});
             return error.TooManyArguments;
         }
     }
 
     const project_name = name orelse {
         std.debug.print("labelle init: missing project name\n", .{});
-        std.debug.print("usage: labelle init <name> [--backend=raylib] [--ecs=zig_ecs] [dir]\n", .{});
+        std.debug.print("usage: labelle init <name> [--backend=X] [--ecs=X] [--gui=X] [--core-version=X] [--engine-version=X] [--gfx-version=X] [dir]\n", .{});
         return error.MissingArgument;
     };
 
