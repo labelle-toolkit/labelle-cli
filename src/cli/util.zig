@@ -6,8 +6,8 @@ pub fn fileExists(path: []const u8) bool {
 }
 
 pub fn dirExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
+    const stat = std.fs.cwd().statFile(path) catch return false;
+    return stat.kind == .directory;
 }
 
 /// Get a platform-aware temporary file path.
@@ -130,11 +130,11 @@ pub fn parseDuration(input: []const u8) ?u64 {
         'm' => std.time.ns_per_min,
         else => {
             const secs = std.fmt.parseInt(u64, input, 10) catch return null;
-            return secs * std.time.ns_per_s;
+            return std.math.mul(u64, secs, std.time.ns_per_s) catch return null;
         },
     };
 
     const num_str = input[0 .. input.len - 1];
     const val = std.fmt.parseInt(u64, num_str, 10) catch return null;
-    return val * multiplier;
+    return std.math.mul(u64, val, multiplier) catch return null;
 }

@@ -19,13 +19,14 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-    // On POSIX, create a new process group so we can kill all children on timeout
     if (!is_windows and timeout_ns != null) child.pgid = 0;
     try child.spawn();
 
     if (timeout_ns) |ns| {
         if (is_windows) {
-            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ child.id, ns });
+            // On Windows, child.id is a HANDLE; get the numeric PID for taskkill
+            const win_pid = std.os.windows.kernel32.GetProcessId(child.id);
+            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ win_pid, ns });
             thread.detach();
         } else {
             const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns });
@@ -35,7 +36,13 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
 
     const term = try child.wait();
     return switch (term) {
-        .Exited => |code| code,
+        .Exited => |code| blk: {
+            if (is_windows and timeout_ns != null and code == 1) {
+                std.debug.print("\nlabelle: timed out\n", .{});
+                break :blk 0;
+            }
+            break :blk code;
+        },
         .Signal => |sig| {
             if (!is_windows and timeout_ns != null and sig == std.posix.SIG.TERM) {
                 std.debug.print("\nlabelle: timed out\n", .{});
@@ -57,14 +64,16 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
 
 fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64) void {
     std.Thread.sleep(timeout_ns);
-    // Kill the entire process group so child processes (the game binary) also die
     const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
-    std.posix.kill(pgid, std.posix.SIG.TERM) catch {};
+    std.posix.kill(pgid, std.posix.SIG.TERM) catch |err| {
+        if (err != error.ProcessNotFound) {
+            std.debug.print("labelle: timeout kill failed: {any}\n", .{err});
+        }
+    };
 }
 
-fn timeoutKillWindows(pid: std.process.Child.Id, timeout_ns: u64) void {
+fn timeoutKillWindows(pid: std.os.windows.DWORD, timeout_ns: u64) void {
     std.Thread.sleep(timeout_ns);
-    // On Windows, use taskkill /F /T to kill the process tree
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
     const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };
