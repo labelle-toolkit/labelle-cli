@@ -26,14 +26,16 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     if (!is_windows and timeout_ns != null) child.pgid = 0;
     try child.spawn();
 
+    // Atomic flag set by the timeout thread when it actually fires the kill
+    var timed_out = std.atomic.Value(bool).init(false);
+
     if (timeout_ns) |ns| {
         if (is_windows) {
-            // On Windows, child.id is a HANDLE; get the numeric PID for taskkill
             const win_pid = windows.GetProcessId(child.id);
-            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ win_pid, ns });
+            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ win_pid, ns, &timed_out });
             thread.detach();
         } else {
-            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns });
+            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns, &timed_out });
             thread.detach();
         }
     }
@@ -41,14 +43,14 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     const term = try child.wait();
     return switch (term) {
         .Exited => |code| blk: {
-            if (is_windows and timeout_ns != null and code == 1) {
+            if (timed_out.load(.acquire)) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 break :blk 0;
             }
             break :blk code;
         },
         .Signal => |sig| {
-            if (!is_windows and timeout_ns != null and sig == std.posix.SIG.TERM) {
+            if (timed_out.load(.acquire)) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 return 0;
             }
@@ -66,8 +68,9 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     };
 }
 
-fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64) void {
+fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, timed_out: *std.atomic.Value(bool)) void {
     std.Thread.sleep(timeout_ns);
+    timed_out.store(true, .release);
     const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
     std.posix.kill(pgid, std.posix.SIG.TERM) catch |err| {
         if (err != error.ProcessNotFound) {
@@ -76,8 +79,9 @@ fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64) void {
     };
 }
 
-fn timeoutKillWindows(pid: std.os.windows.DWORD, timeout_ns: u64) void {
+fn timeoutKillWindows(pid: std.os.windows.DWORD, timeout_ns: u64, timed_out: *std.atomic.Value(bool)) void {
     std.Thread.sleep(timeout_ns);
+    timed_out.store(true, .release);
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
     const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };

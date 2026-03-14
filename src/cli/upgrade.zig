@@ -7,7 +7,6 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: ge
     defer allocator.free(labelle_path);
 
     var content = try std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024);
-    errdefer allocator.free(content);
 
     if (cmd_args.len == 0) {
         std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION });

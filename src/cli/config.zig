@@ -22,6 +22,7 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
+    errdefer allocator.free(source);
 
     return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
         if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
