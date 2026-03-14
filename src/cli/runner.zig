@@ -2,6 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 
+const windows = if (is_windows) struct {
+    extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.C) std.os.windows.DWORD;
+} else struct {};
+
 /// Run a zig command capturing stdout/stderr.
 pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.Child.RunResult {
     return std.process.Child.run(.{
@@ -25,7 +29,7 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
     if (timeout_ns) |ns| {
         if (is_windows) {
             // On Windows, child.id is a HANDLE; get the numeric PID for taskkill
-            const win_pid = std.os.windows.kernel32.GetProcessId(child.id);
+            const win_pid = windows.GetProcessId(child.id);
             const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ win_pid, ns });
             thread.detach();
         } else {
