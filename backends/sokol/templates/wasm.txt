@@ -2,20 +2,22 @@ const BackendGfxType = @import("backend_gfx");
 
 var g: AssembledGame = undefined;
 var hooks: GameHooks = .{};
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 {{module_vars}}
 const screen_w: u32 = {{width}};
 const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
 const target_fps: u32 = {{fps}};
 
+// Use page_allocator for Emscripten — GPA is incompatible with wasm32-emscripten
+// (pulls in std.debug which has a broken base_address field on this target).
+const allocator = std.heap.page_allocator;
+
 fn initInner() !void {
-    const allocator = gpa.allocator();
 {{init_code}}}
 
 export fn init() callconv(.c) void {
 {{hidden_setup}}    window.initGfx();
-    g = AssembledGame.init(gpa.allocator());
+    g = AssembledGame.init(allocator);
     g.setHooks(&hooks);
     g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     initInner() catch |err| {
@@ -42,7 +44,6 @@ export fn frame() callconv(.c) void {
 export fn cleanup() callconv(.c) void {
 {{cleanup_code}}    g.deinit();
     window.shutdownGfx();
-    _ = gpa.deinit();
 }
 
 pub fn main() void {
