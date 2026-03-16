@@ -190,7 +190,9 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
             switch (result2.term) {
                 .Exited => |code| if (code != 0) {
                     std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
-                    std.debug.print("  downloaded to {s} — move it manually\n", .{tmp_path});
+                    std.debug.print("\n  downloaded v{s} to {s}\n\n", .{ target_version, tmp_path });
+                    std.debug.print("  to complete the update, run:\n", .{});
+                    std.debug.print("    mv {s} {s}\n\n", .{ tmp_path, bin_path });
                     return;
                 },
                 else => {
