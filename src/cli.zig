@@ -29,6 +29,37 @@ const util = @import("cli/util.zig");
 
 const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
 
+const SceneResult = enum { not_scene, parsed, err };
+
+/// Parse --scene=<name> or --scene <name> from an argument.
+/// Returns .parsed if the flag was consumed (value stored in scene_override),
+/// .not_scene if the arg is not a --scene flag, or .err if the flag is malformed.
+fn parseSceneFlag(
+    arg: []const u8,
+    args: *std.process.ArgIterator,
+    scene_override: *?[]const u8,
+    cmd_name: []const u8,
+) SceneResult {
+    if (std.mem.startsWith(u8, arg, "--scene=")) {
+        const val = arg["--scene=".len..];
+        if (val.len == 0) {
+            std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene=main_menu)\n", .{cmd_name});
+            return .err;
+        }
+        scene_override.* = val;
+        return .parsed;
+    } else if (std.mem.eql(u8, arg, "--scene")) {
+        if (args.next()) |val| {
+            scene_override.* = val;
+            return .parsed;
+        } else {
+            std.debug.print("labelle {s}: --scene requires a value (e.g. --scene main_menu)\n", .{cmd_name});
+            return .err;
+        }
+    }
+    return .not_scene;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -56,16 +87,12 @@ pub fn main() !void {
         if (std.mem.eql(u8, first, "generate")) {
             command = .generate;
             while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--scene=")) {
-                    scene_override = arg["--scene=".len..];
-                } else if (std.mem.eql(u8, arg, "--scene")) {
-                    if (args.next()) |val| {
-                        scene_override = val;
-                    } else {
-                        std.debug.print("labelle generate: --scene requires a value (e.g. --scene main_menu)\n", .{});
-                        return;
-                    }
-                } else if (std.mem.startsWith(u8, arg, "--")) {
+                switch (parseSceneFlag(arg, &args, &scene_override, "generate")) {
+                    .parsed => continue,
+                    .err => return,
+                    .not_scene => {},
+                }
+                if (std.mem.startsWith(u8, arg, "--")) {
                     std.debug.print("labelle generate: unknown flag '{s}'\n", .{arg});
                     return;
                 } else {
@@ -80,16 +107,12 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, first, "build")) {
             command = .build;
             while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--scene=")) {
-                    scene_override = arg["--scene=".len..];
-                } else if (std.mem.eql(u8, arg, "--scene")) {
-                    if (args.next()) |val| {
-                        scene_override = val;
-                    } else {
-                        std.debug.print("labelle build: --scene requires a value (e.g. --scene main_menu)\n", .{});
-                        return;
-                    }
-                } else if (std.mem.startsWith(u8, arg, "--")) {
+                switch (parseSceneFlag(arg, &args, &scene_override, "build")) {
+                    .parsed => continue,
+                    .err => return,
+                    .not_scene => {},
+                }
+                if (std.mem.startsWith(u8, arg, "--")) {
                     std.debug.print("labelle build: unknown flag '{s}'\n", .{arg});
                     return;
                 } else {
@@ -105,16 +128,12 @@ pub fn main() !void {
             command = .run;
             // Parse optional [dir], --timeout, and --scene flags
             while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--scene=")) {
-                    scene_override = arg["--scene=".len..];
-                } else if (std.mem.eql(u8, arg, "--scene")) {
-                    if (args.next()) |val| {
-                        scene_override = val;
-                    } else {
-                        std.debug.print("labelle run: --scene requires a value (e.g. --scene main_menu)\n", .{});
-                        return;
-                    }
-                } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
+                switch (parseSceneFlag(arg, &args, &scene_override, "run")) {
+                    .parsed => continue,
+                    .err => return,
+                    .not_scene => {},
+                }
+                if (std.mem.startsWith(u8, arg, "--timeout=")) {
                     timeout_ns = util.parseDuration(arg["--timeout=".len..]);
                     if (timeout_ns == null) {
                         std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
@@ -221,16 +240,12 @@ pub fn main() !void {
             dir_set = true;
             // Parse remaining args (e.g. `labelle mydir --timeout=5s --scene=intro`)
             while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--scene=")) {
-                    scene_override = arg["--scene=".len..];
-                } else if (std.mem.eql(u8, arg, "--scene")) {
-                    if (args.next()) |val| {
-                        scene_override = val;
-                    } else {
-                        std.debug.print("labelle: --scene requires a value\n", .{});
-                        return;
-                    }
-                } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
+                switch (parseSceneFlag(arg, &args, &scene_override, "run")) {
+                    .parsed => continue,
+                    .err => return,
+                    .not_scene => {},
+                }
+                if (std.mem.startsWith(u8, arg, "--timeout=")) {
                     timeout_ns = util.parseDuration(arg["--timeout=".len..]);
                     if (timeout_ns == null) {
                         std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
