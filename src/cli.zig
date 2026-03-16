@@ -29,39 +29,59 @@ const util = @import("cli/util.zig");
 
 const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
 
-const SceneResult = enum { not_scene, parsed, err };
+const SceneResult = enum { not_scene, parsed, needs_next, err };
 
-/// Parse --scene=<name> or --scene <name> from an argument.
-/// Returns .parsed if the flag was consumed (value stored in scene_override),
-/// .not_scene if the arg is not a --scene flag, or .err if the flag is malformed.
+/// Parse a --scene flag from the current argument string.
+/// Returns .parsed with the value set if --scene=<value> was found,
+/// .needs_next if bare --scene was found (caller must provide next arg),
+/// .not_scene if the arg is unrelated, or .err if the value is empty.
+fn parseSceneArg(arg: []const u8) SceneResult {
+    if (std.mem.startsWith(u8, arg, "--scene=")) {
+        const val = arg["--scene=".len..];
+        if (val.len == 0) return .err;
+        return .parsed;
+    } else if (std.mem.eql(u8, arg, "--scene")) {
+        return .needs_next;
+    }
+    return .not_scene;
+}
+
+/// Extract the scene value from a --scene=<value> argument.
+fn sceneArgValue(arg: []const u8) []const u8 {
+    return arg["--scene=".len..];
+}
+
+/// Parse --scene=<name> or --scene <name> from args, consuming the iterator as needed.
 fn parseSceneFlag(
     arg: []const u8,
     args: *std.process.ArgIterator,
     scene_override: *?[]const u8,
     cmd_name: []const u8,
 ) SceneResult {
-    if (std.mem.startsWith(u8, arg, "--scene=")) {
-        const val = arg["--scene=".len..];
-        if (val.len == 0) {
-            std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene=main_menu)\n", .{cmd_name});
-            return .err;
-        }
-        scene_override.* = val;
-        return .parsed;
-    } else if (std.mem.eql(u8, arg, "--scene")) {
-        if (args.next()) |val| {
-            if (val.len == 0) {
-                std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene main_menu)\n", .{cmd_name});
+    switch (parseSceneArg(arg)) {
+        .parsed => {
+            scene_override.* = sceneArgValue(arg);
+            return .parsed;
+        },
+        .needs_next => {
+            if (args.next()) |val| {
+                if (val.len == 0) {
+                    std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene main_menu)\n", .{cmd_name});
+                    return .err;
+                }
+                scene_override.* = val;
+                return .parsed;
+            } else {
+                std.debug.print("labelle {s}: --scene requires a value (e.g. --scene main_menu)\n", .{cmd_name});
                 return .err;
             }
-            scene_override.* = val;
-            return .parsed;
-        } else {
-            std.debug.print("labelle {s}: --scene requires a value (e.g. --scene main_menu)\n", .{cmd_name});
+        },
+        .err => {
+            std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene=main_menu)\n", .{cmd_name});
             return .err;
-        }
+        },
+        .not_scene => return .not_scene,
     }
-    return .not_scene;
 }
 
 pub fn main() !void {
@@ -381,4 +401,30 @@ pub fn main() !void {
     if (run_result != 0) {
         std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
     }
+}
+
+// --- Tests ---
+
+test "parseSceneArg: --scene=value returns parsed" {
+    try std.testing.expectEqual(SceneResult.parsed, parseSceneArg("--scene=main_menu"));
+    try std.testing.expectEqual(SceneResult.parsed, parseSceneArg("--scene=x"));
+}
+
+test "parseSceneArg: --scene= (empty) returns err" {
+    try std.testing.expectEqual(SceneResult.err, parseSceneArg("--scene="));
+}
+
+test "parseSceneArg: bare --scene returns needs_next" {
+    try std.testing.expectEqual(SceneResult.needs_next, parseSceneArg("--scene"));
+}
+
+test "parseSceneArg: unrelated flags return not_scene" {
+    try std.testing.expectEqual(SceneResult.not_scene, parseSceneArg("--timeout=5s"));
+    try std.testing.expectEqual(SceneResult.not_scene, parseSceneArg("--verbose"));
+    try std.testing.expectEqual(SceneResult.not_scene, parseSceneArg("mydir"));
+}
+
+test "sceneArgValue extracts value from --scene=value" {
+    try std.testing.expectEqualStrings("main_menu", sceneArgValue("--scene=main_menu"));
+    try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
 }

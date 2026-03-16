@@ -40,4 +40,19 @@ pub fn build(b: *std.Build) void {
     }
     const gen_step = b.step("generate", "Generate assembler from project.labelle");
     gen_step.dependOn(&gen_run.step);
+
+    // ── Tests ────────────────────────────────────────────────────────
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "generator", .module = gen_mod },
+            },
+        }),
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const test_step = b.step("test", "Run CLI unit tests");
+    test_step.dependOn(&run_cli_tests.step);
 }
