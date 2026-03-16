@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// Re-export raylib-zig's emsdk helpers so consumers (generated build.zig) can
+/// use emccStep / emrunStep for WASM builds without a direct raylib-zig dep.
+pub const emsdk = @import("raylib-zig").emsdk;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

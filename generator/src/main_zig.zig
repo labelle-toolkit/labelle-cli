@@ -210,8 +210,12 @@ pub fn generateMainZig(
     else
         "";
 
-    if (cfg.backend == .sokol) {
-        const module_vars = "var runner: Runner = undefined;\n";
+    // Callback-based backends (sokol, or WASM): runner lives at module scope
+    // so the frame callback can access it after main() returns.
+    const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm;
+
+    if (use_callback_lifecycle) {
+        const module_vars = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
         const init_code = try buildCallbackInitCode(allocator, cfg, scene_names, gizmo_names);
         defer allocator.free(init_code);
         const cleanup_code = try buildCallbackCleanupCode(allocator, cfg);
@@ -220,7 +224,7 @@ pub fn generateMainZig(
         const platform_comment: []const u8 = switch (cfg.platform) {
             .ios => "iOS: sokol bindings accessed through engine.sokol (no direct sokol import)",
             .android => "Android: sokol handles the app lifecycle via NativeActivity",
-            .wasm => "WASM: sokol uses Emscripten callbacks for the main loop",
+            .wasm => "WASM: Emscripten drives the main loop via callbacks",
             .desktop => "",
         };
         const entry_comment: []const u8 = switch (cfg.platform) {
@@ -230,20 +234,35 @@ pub fn generateMainZig(
             .desktop => "",
         };
 
-        try tpl.render(lifecycle_tmpl, .{
-            .module_vars = module_vars,
-            .width = w_str,
-            .height = h_str,
-            .title = cfg.title,
-            .fps = fps_str,
-            .init_code = init_code,
-            .tick_code = tick_code,
-            .gui_draw_code = gui_draw_code,
-            .cleanup_code = cleanup_code,
-            .platform_comment = platform_comment,
-            .entry_comment = entry_comment,
-            .hidden_setup = hidden_setup,
-        }, w);
+        // Sokol uses module_vars/init_code/cleanup_code; WASM raylib uses setup_code
+        if (cfg.backend == .sokol) {
+            try tpl.render(lifecycle_tmpl, .{
+                .module_vars = module_vars,
+                .width = w_str,
+                .height = h_str,
+                .title = cfg.title,
+                .fps = fps_str,
+                .init_code = init_code,
+                .tick_code = tick_code,
+                .gui_draw_code = gui_draw_code,
+                .cleanup_code = cleanup_code,
+                .platform_comment = platform_comment,
+                .entry_comment = entry_comment,
+                .hidden_setup = hidden_setup,
+            }, w);
+        } else {
+            // WASM raylib: template has module-level runner; use init_code (assignment, not declaration)
+            try tpl.render(lifecycle_tmpl, .{
+                .width = w_str,
+                .height = h_str,
+                .title = cfg.title,
+                .fps = fps_str,
+                .setup_code = init_code,
+                .tick_code = tick_code,
+                .gui_draw_code = gui_draw_code,
+                .hidden_setup = hidden_setup,
+            }, w);
+        }
     } else {
         const setup_code = try buildSetupCode(allocator, cfg, scene_names, gizmo_names);
         defer allocator.free(setup_code);

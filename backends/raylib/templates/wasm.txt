@@ -10,8 +10,9 @@ const target_fps: u32 = {{fps}};
 var g: AssembledGame = undefined;
 var hooks: GameHooks = undefined;
 var g_allocator: std.mem.Allocator = undefined;
+var runner: Runner = undefined;
 
-fn gameFrame() void {
+fn gameFrame() callconv(.c) void {
     const dt: f32 = window.getFrameTime();
 {{tick_code}}    g.tick(dt);
 
@@ -41,5 +42,5 @@ pub fn main() !void {
     g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     g.renderer.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
 
-{{setup_code}}    emscripten.emscripten_set_main_loop(gameFrame, @intCast(target_fps), 1);
+{{setup_code}}    emscripten.emscripten_set_main_loop(gameFrame, @intCast(target_fps), true);
 }
