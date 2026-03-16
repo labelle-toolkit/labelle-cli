@@ -8,7 +8,14 @@ const max_file_size = 64 * 1024 * 1024; // 64 MB
 /// Serve static files from `web_dir` on localhost:`port`, then open the browser.
 pub fn serveAndOpen(allocator: std.mem.Allocator, web_dir: []const u8, port: u16) !void {
     const address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    var server = try address.listen(.{ .reuse_address = true });
+    var server = address.listen(.{ .reuse_address = true }) catch |err| blk: {
+        if (port != 0) {
+            // Preferred port unavailable — fall back to any free port
+            const fallback = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+            break :blk fallback.listen(.{ .reuse_address = true }) catch return err;
+        }
+        return err;
+    };
     defer server.deinit();
 
     const actual_port = server.listen_address.getPort();
@@ -45,6 +52,12 @@ fn handleConnection(allocator: std.mem.Allocator, stream: std.net.Stream, web_di
 
     // Strip leading "/" and resolve against web_dir
     const rel_path = if (file_path.len > 1) file_path[1..] else file_path;
+
+    // Reject absolute paths (e.g. "//etc/passwd" → "/etc/passwd" after strip)
+    if (rel_path.len > 0 and (rel_path[0] == '/' or rel_path[0] == '\\')) {
+        try sendResponse(stream, "400 Bad Request", "text/plain", "Bad Request");
+        return;
+    }
 
     const full_path = std.fs.path.join(allocator, &.{ web_dir, rel_path }) catch {
         try sendResponse(stream, "500 Internal Server Error", "text/plain", "Server Error");
