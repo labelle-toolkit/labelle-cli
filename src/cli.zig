@@ -25,6 +25,7 @@ const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
+const serve = @import("cli/serve.zig");
 const util = @import("cli/util.zig");
 
 const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
@@ -388,23 +389,30 @@ pub fn main() !void {
     if (command == .build) return;
 
     // Run
-    if (timeout_ns) |t| {
-        const secs = t / std.time.ns_per_s;
-        const mins = secs / 60;
-        const rem = secs % 60;
-        if (mins > 0 and rem > 0) {
-            std.debug.print("labelle: running (timeout: {d}m{d}s)...\n\n", .{ mins, rem });
-        } else if (mins > 0) {
-            std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{mins});
-        } else {
-            std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
-        }
+    if (parsed.platform == .wasm) {
+        // WASM: serve via local HTTP server + open browser
+        const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
+        defer allocator.free(web_dir);
+        try serve.serveAndOpen(allocator, web_dir, 8080);
     } else {
-        std.debug.print("labelle: running...\n\n", .{});
-    }
-    const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
-    if (run_result != 0) {
-        std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+        if (timeout_ns) |t| {
+            const secs = t / std.time.ns_per_s;
+            const mins = secs / 60;
+            const rem = secs % 60;
+            if (mins > 0 and rem > 0) {
+                std.debug.print("labelle: running (timeout: {d}m{d}s)...\n\n", .{ mins, rem });
+            } else if (mins > 0) {
+                std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{mins});
+            } else {
+                std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
+            }
+        } else {
+            std.debug.print("labelle: running...\n\n", .{});
+        }
+        const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
+        if (run_result != 0) {
+            std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+        }
     }
 }
 
