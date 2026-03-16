@@ -1,9 +1,9 @@
 /// labelle-cli — reads project.labelle and generates/builds/runs the assembled game.
 ///
 /// Usage:
-///   labelle generate [dir]              — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s]   — generate + build + run
-///   labelle build [dir]                 — generate + build (no run)
+///   labelle generate [dir] [--scene=name] — generate .labelle/ assembler files
+///   labelle run [dir] [--timeout=30s] [--scene=name] — generate + build + run
+///   labelle build [dir] [--scene=name]  — generate + build (no run)
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
@@ -29,6 +29,160 @@ const util = @import("cli/util.zig");
 
 const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
 
+const SceneResult = enum { not_scene, parsed, needs_next, err };
+
+/// Parse a --scene flag from the current argument string.
+/// Returns .parsed with the value set if --scene=<value> was found,
+/// .needs_next if bare --scene was found (caller must provide next arg),
+/// .not_scene if the arg is unrelated, or .err if the value is empty.
+fn parseSceneArg(arg: []const u8) SceneResult {
+    if (std.mem.startsWith(u8, arg, "--scene=")) {
+        const val = arg["--scene=".len..];
+        if (val.len == 0) return .err;
+        return .parsed;
+    } else if (std.mem.eql(u8, arg, "--scene")) {
+        return .needs_next;
+    }
+    return .not_scene;
+}
+
+/// Extract the scene value from a --scene=<value> argument.
+fn sceneArgValue(arg: []const u8) []const u8 {
+    return arg["--scene=".len..];
+}
+
+/// Parse --scene=<name> or --scene <name> from args, consuming the iterator as needed.
+fn parseSceneFlag(
+    arg: []const u8,
+    args: *std.process.ArgIterator,
+    scene_override: *?[]const u8,
+    cmd_name: []const u8,
+) SceneResult {
+    switch (parseSceneArg(arg)) {
+        .parsed => {
+            scene_override.* = sceneArgValue(arg);
+            return .parsed;
+        },
+        .needs_next => {
+            if (args.next()) |val| {
+                if (val.len == 0) {
+                    std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene main_menu)\n", .{cmd_name});
+                    return .err;
+                }
+                scene_override.* = val;
+                return .parsed;
+            } else {
+                std.debug.print("labelle {s}: --scene requires a value (e.g. --scene main_menu)\n", .{cmd_name});
+                return .err;
+            }
+        },
+        .err => {
+            std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene=main_menu)\n", .{cmd_name});
+            return .err;
+        },
+        .not_scene => return .not_scene,
+    }
+}
+
+const ParseError = error{TooManyArguments};
+
+const ParsedArgs = struct {
+    command: Command,
+    project_dir: []const u8 = ".",
+    extra_args: [8][]const u8 = undefined,
+    extra_count: usize = 0,
+    timeout_ns: ?u64 = null,
+    scene_override: ?[]const u8 = null,
+};
+
+/// Parse [dir] and --scene flag for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8 } {
+    var dir: []const u8 = ".";
+    var dir_set = false;
+    var scene: ?[]const u8 = null;
+
+    while (args.next()) |arg| {
+        switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
+            .parsed => continue,
+            .err => return null,
+            .not_scene => {},
+            .needs_next => unreachable,
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
+            return null;
+        } else {
+            if (dir_set) {
+                std.debug.print("labelle {s}: unexpected argument '{s}'\n", .{ cmd_name, arg });
+                return null;
+            }
+            dir = arg;
+            dir_set = true;
+        }
+    }
+    return .{ .dir = dir, .scene = scene };
+}
+
+/// Parse [dir], --scene, and --timeout flags for run command (explicit or implicit).
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64 } {
+    var dir: []const u8 = ".";
+    var dir_set = !allow_dir;
+    var scene: ?[]const u8 = null;
+    var timeout_ns: ?u64 = null;
+
+    while (args.next()) |arg| {
+        switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
+            .parsed => continue,
+            .err => return null,
+            .not_scene => {},
+            .needs_next => unreachable,
+        }
+        if (std.mem.startsWith(u8, arg, "--timeout=")) {
+            timeout_ns = util.parseDuration(arg["--timeout=".len..]);
+            if (timeout_ns == null) {
+                std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
+                std.debug.print("  expected format: --timeout=30s, --timeout=2m\n", .{});
+                return null;
+            }
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            if (args.next()) |val| {
+                timeout_ns = util.parseDuration(val);
+                if (timeout_ns == null) {
+                    std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
+                    std.debug.print("  expected format: --timeout 30s, --timeout 2m\n", .{});
+                    return null;
+                }
+            } else {
+                std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
+                return null;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
+            return null;
+        } else {
+            if (dir_set) {
+                std.debug.print("labelle {s}: unexpected argument '{s}'\n", .{ cmd_name, arg });
+                return null;
+            }
+            dir = arg;
+            dir_set = true;
+        }
+    }
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns };
+}
+
+/// Collect all remaining args into extra_args buffer.
+fn collectExtraArgs(args: *std.process.ArgIterator, extra_args: *[8][]const u8, extra_count: *usize) ParseError!void {
+    while (args.next()) |arg| {
+        if (extra_count.* >= extra_args.len) {
+            std.debug.print("labelle: too many arguments\n", .{});
+            return error.TooManyArguments;
+        }
+        extra_args[extra_count.*] = arg;
+        extra_count.* += 1;
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -38,13 +192,7 @@ pub fn main() !void {
     defer args.deinit();
     _ = args.skip(); // skip program name
 
-    // Parse command and project dir
-    var command: Command = .run;
-    var project_dir: []const u8 = ".";
-    var dir_set = false;
-    var extra_args: [8][]const u8 = undefined;
-    var extra_count: usize = 0;
-    var timeout_ns: ?u64 = null;
+    var parsed_args = ParsedArgs{ .command = .run };
 
     const first_arg = args.next();
     if (first_arg == null) {
@@ -52,69 +200,25 @@ pub fn main() !void {
     }
 
     if (first_arg) |first| {
-        if (std.mem.eql(u8, first, "generate")) {
-            command = .generate;
-            project_dir = args.next() orelse ".";
-        } else if (std.mem.eql(u8, first, "build")) {
-            command = .build;
-            project_dir = args.next() orelse ".";
+        if (std.mem.eql(u8, first, "generate") or std.mem.eql(u8, first, "build")) {
+            parsed_args.command = if (std.mem.eql(u8, first, "generate")) .generate else .build;
+            const result = parseDirAndScene(&args, first) orelse return;
+            parsed_args.project_dir = result.dir;
+            parsed_args.scene_override = result.scene;
         } else if (std.mem.eql(u8, first, "run")) {
-            command = .run;
-            // Parse optional [dir] and --timeout flag
-            while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--timeout=")) {
-                    timeout_ns = util.parseDuration(arg["--timeout=".len..]);
-                    if (timeout_ns == null) {
-                        std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
-                        std.debug.print("  expected format: --timeout=30s, --timeout=2m\n", .{});
-                        return;
-                    }
-                } else if (std.mem.eql(u8, arg, "--timeout")) {
-                    if (args.next()) |val| {
-                        timeout_ns = util.parseDuration(val);
-                        if (timeout_ns == null) {
-                            std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
-                            std.debug.print("  expected format: --timeout 30s, --timeout 2m\n", .{});
-                            return;
-                        }
-                    } else {
-                        std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
-                        return;
-                    }
-                } else if (std.mem.startsWith(u8, arg, "--")) {
-                    std.debug.print("labelle run: unknown flag '{s}'\n", .{arg});
-                    return;
-                } else {
-                    if (dir_set) {
-                        std.debug.print("labelle run: unexpected argument '{s}'\n", .{arg});
-                        return;
-                    }
-                    project_dir = arg;
-                    dir_set = true;
-                }
-            }
+            parsed_args.command = .run;
+            const result = parseRunArgs(&args, "run", true) orelse return;
+            parsed_args.project_dir = result.dir;
+            parsed_args.scene_override = result.scene;
+            parsed_args.timeout_ns = result.timeout_ns;
         } else if (std.mem.eql(u8, first, "init")) {
-            command = .init_cmd;
-            while (args.next()) |arg| {
-                if (extra_count >= extra_args.len) {
-                    std.debug.print("labelle: too many arguments\n", .{});
-                    return error.TooManyArguments;
-                }
-                extra_args[extra_count] = arg;
-                extra_count += 1;
-            }
+            parsed_args.command = .init_cmd;
+            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
         } else if (std.mem.eql(u8, first, "install")) {
-            command = .install_cmd;
-            while (args.next()) |arg| {
-                if (extra_count >= extra_args.len) {
-                    std.debug.print("labelle: too many arguments\n", .{});
-                    return error.TooManyArguments;
-                }
-                extra_args[extra_count] = arg;
-                extra_count += 1;
-            }
+            parsed_args.command = .install_cmd;
+            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
         } else if (std.mem.eql(u8, first, "upgrade")) {
-            command = .upgrade_cmd;
+            parsed_args.command = .upgrade_cmd;
             if (args.next()) |next_arg| {
                 if (std.mem.eql(u8, next_arg, "core") or
                     std.mem.eql(u8, next_arg, "engine") or
@@ -123,96 +227,54 @@ pub fn main() !void {
                     std.mem.eql(u8, next_arg, "labelle") or
                     std.mem.eql(u8, next_arg, "all"))
                 {
-                    extra_args[extra_count] = next_arg;
-                    extra_count += 1;
+                    parsed_args.extra_args[parsed_args.extra_count] = next_arg;
+                    parsed_args.extra_count += 1;
                 } else {
-                    project_dir = next_arg;
+                    parsed_args.project_dir = next_arg;
                 }
             }
-            while (args.next()) |arg| {
-                if (extra_count >= extra_args.len) {
-                    std.debug.print("labelle: too many arguments\n", .{});
-                    return error.TooManyArguments;
-                }
-                extra_args[extra_count] = arg;
-                extra_count += 1;
-            }
+            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
         } else if (std.mem.eql(u8, first, "update")) {
-            command = .update_cmd;
-            while (args.next()) |arg| {
-                if (extra_count >= extra_args.len) {
-                    std.debug.print("labelle: too many arguments\n", .{});
-                    return error.TooManyArguments;
-                }
-                extra_args[extra_count] = arg;
-                extra_count += 1;
-            }
+            parsed_args.command = .update_cmd;
+            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
         } else if (std.mem.eql(u8, first, "clean")) {
-            command = .clean_cmd;
-            while (args.next()) |arg| {
-                if (extra_count >= extra_args.len) {
-                    std.debug.print("labelle: too many arguments\n", .{});
-                    return error.TooManyArguments;
-                }
-                extra_args[extra_count] = arg;
-                extra_count += 1;
-            }
+            parsed_args.command = .clean_cmd;
+            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
         } else if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
-            command = .help_cmd;
+            parsed_args.command = .help_cmd;
         } else if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v")) {
-            command = .version;
+            parsed_args.command = .version;
         } else if (std.mem.eql(u8, first, "targets")) {
-            command = .targets;
+            parsed_args.command = .targets;
         } else {
             // No command — treat as project dir, default to run
-            project_dir = first;
-            dir_set = true;
-            // Parse remaining args (e.g. `labelle mydir --timeout=5s`)
-            while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--timeout=")) {
-                    timeout_ns = util.parseDuration(arg["--timeout=".len..]);
-                    if (timeout_ns == null) {
-                        std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
-                        return;
-                    }
-                } else if (std.mem.eql(u8, arg, "--timeout")) {
-                    if (args.next()) |val| {
-                        timeout_ns = util.parseDuration(val);
-                        if (timeout_ns == null) {
-                            std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
-                            return;
-                        }
-                    } else {
-                        std.debug.print("labelle: --timeout requires a value\n", .{});
-                        return;
-                    }
-                } else if (std.mem.startsWith(u8, arg, "--")) {
-                    std.debug.print("labelle: unknown flag '{s}'\n", .{arg});
-                    return;
-                } else {
-                    std.debug.print("labelle: unexpected argument '{s}'\n", .{arg});
-                    return;
-                }
-            }
+            const result = parseRunArgs(&args, "run", false) orelse return;
+            parsed_args.project_dir = first;
+            parsed_args.scene_override = result.scene;
+            parsed_args.timeout_ns = result.timeout_ns;
         }
     }
+
+    const command = parsed_args.command;
+    const project_dir = parsed_args.project_dir;
+    const timeout_ns = parsed_args.timeout_ns;
 
     // Standalone commands (no project.labelle needed)
     switch (command) {
         .help_cmd => return help.printHelp(),
         .version => return help.printVersion(),
         .targets => return help.printTargets(),
-        .init_cmd => return init.cmdInit(allocator, extra_args[0..extra_count]),
-        .install_cmd => return install.cmdInstall(allocator, extra_args[0..extra_count]),
-        .update_cmd => return update.cmdUpdate(allocator, extra_args[0..extra_count]),
-        .clean_cmd => return clean.cmdClean(allocator, extra_args[0..extra_count]),
+        .init_cmd => return init.cmdInit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .install_cmd => return install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .update_cmd => return update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
 
     // Read and parse project.labelle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
+    var parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
             std.debug.print("  To create a new project:\n", .{});
@@ -223,9 +285,14 @@ pub fn main() !void {
         return;
     };
 
+    // Apply --scene override
+    if (parsed_args.scene_override) |scene| {
+        parsed.initial_scene = scene;
+    }
+
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
-        return upgrade.cmdUpgrade(allocator, project_dir, parsed, extra_args[0..extra_count]);
+        return upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]);
     }
 
     // Ensure package cache is populated
@@ -297,3 +364,59 @@ pub fn main() !void {
         std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
     }
 }
+
+// --- Tests ---
+
+const expect = @import("zspec").expect;
+
+test {
+    @import("zspec").runAll(@This());
+}
+
+pub const ParseSceneArg = struct {
+    pub const with_equals_value = struct {
+        test "returns parsed for --scene=main_menu" {
+            try expect.equal(parseSceneArg("--scene=main_menu"), .parsed);
+        }
+
+        test "returns parsed for --scene=x" {
+            try expect.equal(parseSceneArg("--scene=x"), .parsed);
+        }
+    };
+
+    pub const with_empty_equals = struct {
+        test "returns err for --scene=" {
+            try expect.equal(parseSceneArg("--scene="), .err);
+        }
+    };
+
+    pub const bare_flag = struct {
+        test "returns needs_next for --scene" {
+            try expect.equal(parseSceneArg("--scene"), .needs_next);
+        }
+    };
+
+    pub const unrelated_flags = struct {
+        test "returns not_scene for --timeout=5s" {
+            try expect.equal(parseSceneArg("--timeout=5s"), .not_scene);
+        }
+
+        test "returns not_scene for --verbose" {
+            try expect.equal(parseSceneArg("--verbose"), .not_scene);
+        }
+
+        test "returns not_scene for positional arg" {
+            try expect.equal(parseSceneArg("mydir"), .not_scene);
+        }
+    };
+};
+
+pub const SceneArgValue = struct {
+    test "extracts value from --scene=main_menu" {
+        try std.testing.expectEqualStrings("main_menu", sceneArgValue("--scene=main_menu"));
+    }
+
+    test "extracts value from --scene=intro" {
+        try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
+    }
+};
