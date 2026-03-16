@@ -109,6 +109,8 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     const backend_name = @tagName(cfg.backend);
     const platform_name = if (cfg.backend == .sokol and (cfg.platform == .ios or cfg.platform == .android))
         "mobile"
+    else if (cfg.backend == .sokol and cfg.platform == .wasm)
+        "desktop" // sokol uses a single template for desktop and wasm
     else
         @tagName(cfg.platform);
     const tmpl_filename = try std.fmt.allocPrint(allocator, "{s}.txt", .{platform_name});

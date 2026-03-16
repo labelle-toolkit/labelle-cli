@@ -5,6 +5,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+.header_wasm
+const std = @import("std");
+
+pub fn build(b: *std.Build) !void {
+    var target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+.deps
     const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
     const core_mod = core_dep.module("labelle-core");
 
@@ -29,6 +37,13 @@ pub fn build(b: *std.Build) void {
     const backend_audio = backend_dep.module("audio");
     const backend_window = backend_dep.module("window");
     const sokol_clib = backend_dep.artifact("sokol_clib");
+
+.backend_sokol_wasm
+    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
 
 .backend_sdl
     const backend_dep = b.dependency("labelle_sdl", .{ .target = target, .optimize = optimize });
@@ -82,8 +97,8 @@ pub fn build(b: *std.Build) void {
     const gui_mod = gui_dep.module("gui");
 
 .wasm_target
-    // WASM/Emscripten: override target to wasm32-freestanding for Emscripten linking.
-    const wasm_target = b.resolveTargetQuery(.{
+    // WASM/Emscripten: override target so all dependencies build for wasm32-emscripten.
+    target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .emscripten,
     });
@@ -94,22 +109,6 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "labelle-core", .module = core_mod },
-                .{ .name = "labelle-gfx", .module = gfx_mod },
-                .{ .name = "labelle-engine", .module = engine_mod },
-                .{ .name = "backend_gfx", .module = backend_gfx },
-                .{ .name = "backend_input", .module = backend_input },
-                .{ .name = "backend_audio", .module = backend_audio },
-                .{ .name = "backend_window", .module = backend_window },
-
-.wasm_exe_start
-    const exe = b.addExecutable(.{
-        .name = "game",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = wasm_target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "labelle-core", .module = core_mod },
@@ -134,13 +133,74 @@ pub fn build(b: *std.Build) void {
 .link_raylib
     exe.linkLibrary(raylib_artifact);
 
+.wasm_emsdk_raylib
+    const emsdk = @import("labelle_raylib").emsdk;
+
+.wasm_emsdk_sokol
+    const sokol_em = @import("labelle_sokol");
+    const emsdk_dep = b.dependency("emsdk", .{});
+
+.wasm_exe_start
+    const wasm = b.addLibrary(.{
+        .name = "game",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "labelle-core", .module = core_mod },
+                .{ .name = "labelle-gfx", .module = gfx_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
+                .{ .name = "backend_gfx", .module = backend_gfx },
+                .{ .name = "backend_input", .module = backend_input },
+                .{ .name = "backend_audio", .module = backend_audio },
+                .{ .name = "backend_window", .module = backend_window },
+
+.wasm_exe_ecs_import
+                .{ .name = "ecs_backend", .module = ecs_mod },
+
+.wasm_exe_gui_import
+                .{ .name = "gui_backend", .module = gui_mod },
+
+.wasm_exe_end
+            },
+        }),
+    });
+
 .link_raylib_wasm
-    exe.linkLibrary(raylib_artifact);
-    // Emscripten: link GL and system libraries needed for WASM builds.
-    exe.linkSystemLibrary("GL");
-    exe.linkSystemLibrary("EGL");
-    exe.linkSystemLibrary("glfw");
-    exe.linkSystemLibrary("m");
+    const emcc_flags = emsdk.emccDefaultFlags(b.allocator, .{
+        .optimize = optimize,
+        .asyncify = true,
+    });
+    const emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
+        .optimize = optimize,
+    });
+    const install_dir: std.Build.InstallDir = .{ .custom = "web" };
+    const emcc_step = emsdk.emccStep(b, raylib_artifact, wasm, .{
+        .optimize = optimize,
+        .flags = emcc_flags,
+        .settings = emcc_settings,
+        .install_dir = install_dir,
+    });
+
+.link_sokol_wasm
+    wasm.linkLibrary(backend_dep.artifact("sokol_clib"));
+    const link_step = try sokol_em.emLinkStep(b, .{
+        .target = target,
+        .optimize = optimize,
+        .lib_main = wasm,
+        .emsdk = emsdk_dep,
+        .shell_file_path = null,
+        .use_webgl2 = true,
+        .release_use_closure = false,
+    });
+    const emcc_step = &link_step.step;
+
+.wasm_footer
+    b.getInstallStep().dependOn(emcc_step);
+    const run_step = b.step("run", "Serve WASM build");
+    run_step.dependOn(emcc_step);
+}
 
 .link_sokol
     exe.linkLibrary(sokol_clib);

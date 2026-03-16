@@ -3,6 +3,13 @@ const gen = @import("generator");
 
 /// Validate that declared dependency versions are compatible with each other.
 pub fn validateCompatibility(cfg: gen.ProjectConfig) void {
+    // Validate backend+platform combination
+    if (cfg.platform == .wasm and cfg.backend != .raylib and cfg.backend != .sokol) {
+        std.debug.print("labelle: error: WASM builds are only supported with raylib or sokol backends (got {s})\n", .{@tagName(cfg.backend)});
+        std.debug.print("  hint: set backend = \"raylib\" or backend = \"sokol\" in project.labelle\n\n", .{});
+        std.process.exit(1);
+    }
+
     const is_local = gen.isLocalVersion;
     var warnings: u8 = 0;
 

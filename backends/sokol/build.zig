@@ -1,5 +1,10 @@
 const std = @import("std");
 
+/// Re-export sokol's emscripten linker helpers so consumers (generated build.zig)
+/// can use emLinkStep for WASM builds without a direct sokol dep.
+pub const EmLinkOptions = @import("sokol").EmLinkOptions;
+pub const emLinkStep = @import("sokol").emLinkStep;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

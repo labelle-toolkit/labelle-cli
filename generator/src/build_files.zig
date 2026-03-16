@@ -18,7 +18,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    try tpl.writeSection(build_zig_tmpl, "header", w);
+    if (cfg.platform == .wasm) {
+        try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
+        try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
+    } else {
+        try tpl.writeSection(build_zig_tmpl, "header", w);
+    }
+
+    try tpl.writeSection(build_zig_tmpl, "deps", w);
 
     // Plugin dep/module declarations (for all declared plugins)
     for (cfg.plugins) |plugin| {
@@ -46,7 +53,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     } else {
         switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "backend_sokol", w),
+            .sokol => {
+                if (cfg.platform == .wasm) {
+                    try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
+                } else {
+                    try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
+                }
+            },
             .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
             .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
             .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
@@ -66,52 +79,72 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         .clay => try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_clay" }, w),
     }
 
-    // WASM: emit the wasm target resolution before the exe block
     if (cfg.platform == .wasm) {
-        try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
+        // WASM: import emsdk helpers from backend
+        switch (cfg.backend) {
+            .raylib => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_raylib", w),
+            .sokol => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_sokol", w),
+            else => {},
+        }
+
+        // WASM: build as library, link via emcc
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_start", w);
+
+        for (cfg.plugins) |plugin| {
+            try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+
+        if (cfg.ecs != .mock) {
+            try tpl.writeSection(build_zig_tmpl, "wasm_exe_ecs_import", w);
+        }
+        if (cfg.gui != .none) {
+            try tpl.writeSection(build_zig_tmpl, "wasm_exe_gui_import", w);
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "wasm_exe_end", w);
+
+        switch (cfg.backend) {
+            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
+            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
+            else => {},
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
     } else {
+        // Desktop: build as executable, link natively
         try tpl.writeSection(build_zig_tmpl, "exe_start", w);
-    }
 
-    // Plugin module imports in exe (for all declared plugins)
-    for (cfg.plugins) |plugin| {
-        try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
-
-    }
-
-    if (cfg.ecs != .mock) {
-        try tpl.writeSection(build_zig_tmpl, "exe_ecs_import", w);
-    }
-    if (cfg.gui != .none) {
-        try tpl.writeSection(build_zig_tmpl, "exe_gui_import", w);
-    }
-
-    try tpl.writeSection(build_zig_tmpl, "exe_end", w);
-
-    if (cfg.gui == .imgui) {
-        switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "link_imgui_raylib", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "link_imgui_sokol", w),
-            .sdl, .bgfx, .wgpu => {},
+        for (cfg.plugins) |plugin| {
+            try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
         }
-    } else {
-        switch (cfg.backend) {
-            .raylib => {
-                if (cfg.platform == .wasm) {
-                    try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w);
-                } else {
-                    try tpl.writeSection(build_zig_tmpl, "link_raylib", w);
-                }
-            },
-            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
-            .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
-            .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
-            .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
-        }
-    }
 
-    try tpl.writeSection(build_zig_tmpl, "footer", w);
+        if (cfg.ecs != .mock) {
+            try tpl.writeSection(build_zig_tmpl, "exe_ecs_import", w);
+        }
+        if (cfg.gui != .none) {
+            try tpl.writeSection(build_zig_tmpl, "exe_gui_import", w);
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "exe_end", w);
+
+        if (cfg.gui == .imgui) {
+            switch (cfg.backend) {
+                .raylib => try tpl.writeSection(build_zig_tmpl, "link_imgui_raylib", w),
+                .sokol => try tpl.writeSection(build_zig_tmpl, "link_imgui_sokol", w),
+                .sdl, .bgfx, .wgpu => {},
+            }
+        } else {
+            switch (cfg.backend) {
+                .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
+                .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
+                .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
+                .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
+                .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
+            }
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "footer", w);
+    }
 
     return buf.toOwnedSlice(allocator);
 }
@@ -257,6 +290,11 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
                 .gui_path = gui_path,
             }, w);
         },
+    }
+
+    // WASM: emscripten SDK dependency (required by raylib's emccStep)
+    if (cfg.platform == .wasm) {
+        try tpl.writeSection(build_zig_zon_tmpl, "dep_emsdk", w);
     }
 
     try tpl.writeSection(build_zig_zon_tmpl, "footer", w);

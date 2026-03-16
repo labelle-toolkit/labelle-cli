@@ -25,6 +25,7 @@ const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
+const serve = @import("cli/serve.zig");
 const util = @import("cli/util.zig");
 
 const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
@@ -86,6 +87,8 @@ fn parseSceneFlag(
 
 const ParseError = error{TooManyArguments};
 
+const Platform = gen.Platform;
+
 const ParsedArgs = struct {
     command: Command,
     project_dir: []const u8 = ".",
@@ -93,13 +96,45 @@ const ParsedArgs = struct {
     extra_count: usize = 0,
     timeout_ns: ?u64 = null,
     scene_override: ?[]const u8 = null,
+    platform_override: ?Platform = null,
 };
 
-/// Parse [dir] and --scene flag for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8 } {
+/// Parse a --platform=<value> string into a Platform enum, or null if invalid.
+fn parsePlatformValue(val: []const u8) ?Platform {
+    return std.meta.stringToEnum(Platform, val);
+}
+
+/// Try to parse --platform=<value> from an argument. Returns true if consumed.
+fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8) ?bool {
+    if (!std.mem.startsWith(u8, arg, "--platform=")) return false;
+    const val = arg["--platform=".len..];
+    if (val.len == 0) {
+        std.debug.print("labelle {s}: --platform requires a value (e.g. --platform=wasm)\n", .{cmd_name});
+        return null;
+    }
+    platform.* = parsePlatformValue(val);
+    if (platform.* == null) {
+        const expected = comptime blk: {
+            const fields = @typeInfo(Platform).@"enum".fields;
+            var result: []const u8 = "";
+            for (fields, 0..) |f, i| {
+                if (i > 0) result = result ++ ", ";
+                result = result ++ f.name;
+            }
+            break :blk result;
+        };
+        std.debug.print("labelle {s}: unknown platform '{s}' (expected: {s})\n", .{ cmd_name, val, expected });
+        return null;
+    }
+    return true;
+}
+
+/// Parse [dir], --scene, and --platform flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
+    var platform: ?Platform = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -108,6 +143,7 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             .not_scene => {},
             .needs_next => unreachable,
         }
+        if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -120,15 +156,16 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene };
+    return .{ .dir = dir, .scene = scene, .platform = platform };
 }
 
-/// Parse [dir], --scene, and --timeout flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64 } {
+/// Parse [dir], --scene, --timeout, and --platform flags for run command (explicit or implicit).
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
+    var platform: ?Platform = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -137,6 +174,9 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             .not_scene => {},
             .needs_next => unreachable,
         }
+        if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
+            if (consumed) continue;
+        } else return null;
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_ns = util.parseDuration(arg["--timeout=".len..]);
             if (timeout_ns == null) {
@@ -168,7 +208,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -205,12 +245,14 @@ pub fn main() !void {
             const result = parseDirAndScene(&args, first) orelse return;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
+            parsed_args.platform_override = result.platform;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
+            parsed_args.platform_override = result.platform;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -252,6 +294,7 @@ pub fn main() !void {
             parsed_args.project_dir = first;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
+            parsed_args.platform_override = result.platform;
         }
     }
 
@@ -288,6 +331,11 @@ pub fn main() !void {
     // Apply --scene override
     if (parsed_args.scene_override) |scene| {
         parsed.initial_scene = scene;
+    }
+
+    // Apply --platform override
+    if (parsed_args.platform_override) |platform| {
+        parsed.platform = platform;
     }
 
     // Upgrade modifies project.labelle in the project directory
@@ -345,23 +393,30 @@ pub fn main() !void {
     if (command == .build) return;
 
     // Run
-    if (timeout_ns) |t| {
-        const secs = t / std.time.ns_per_s;
-        const mins = secs / 60;
-        const rem = secs % 60;
-        if (mins > 0 and rem > 0) {
-            std.debug.print("labelle: running (timeout: {d}m{d}s)...\n\n", .{ mins, rem });
-        } else if (mins > 0) {
-            std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{mins});
-        } else {
-            std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
-        }
+    if (parsed.platform == .wasm) {
+        // WASM: serve via local HTTP server + open browser
+        const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
+        defer allocator.free(web_dir);
+        try serve.serveAndOpen(allocator, web_dir, 8080);
     } else {
-        std.debug.print("labelle: running...\n\n", .{});
-    }
-    const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
-    if (run_result != 0) {
-        std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+        if (timeout_ns) |t| {
+            const secs = t / std.time.ns_per_s;
+            const mins = secs / 60;
+            const rem = secs % 60;
+            if (mins > 0 and rem > 0) {
+                std.debug.print("labelle: running (timeout: {d}m{d}s)...\n\n", .{ mins, rem });
+            } else if (mins > 0) {
+                std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{mins});
+            } else {
+                std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
+            }
+        } else {
+            std.debug.print("labelle: running...\n\n", .{});
+        }
+        const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
+        if (run_result != 0) {
+            std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+        }
     }
 }
 
@@ -419,4 +474,30 @@ pub const SceneArgValue = struct {
     test "extracts value from --scene=intro" {
         try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
     }
+};
+
+pub const ParsePlatformValueSpec = struct {
+    pub const valid_platforms = struct {
+        test "parses desktop" {
+            try expect.equal(parsePlatformValue("desktop"), Platform.desktop);
+        }
+        test "parses wasm" {
+            try expect.equal(parsePlatformValue("wasm"), Platform.wasm);
+        }
+        test "parses ios" {
+            try expect.equal(parsePlatformValue("ios"), Platform.ios);
+        }
+        test "parses android" {
+            try expect.equal(parsePlatformValue("android"), Platform.android);
+        }
+    };
+
+    pub const invalid_platforms = struct {
+        test "returns null for empty string" {
+            try expect.equal(parsePlatformValue(""), null);
+        }
+        test "returns null for unknown value" {
+            try expect.equal(parsePlatformValue("windows"), null);
+        }
+    };
 };
