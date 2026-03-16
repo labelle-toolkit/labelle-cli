@@ -9,9 +9,9 @@ pub fn printHelp() void {
         \\
         \\Commands:
         \\  init <name> [dir]    Create a new labelle project
-        \\  generate [dir] [--scene=<name>]  Generate .labelle/ assembler files
-        \\  build [dir] [--scene=<name>]  Generate + build the project
-        \\  run [dir] [--timeout=<dur>] [--scene=<name>]  Generate + build + run (default)
+        \\  generate [dir] [--scene=<name>] [--platform=<p>]  Generate .labelle/ assembler files
+        \\  build [dir] [--scene=<name>] [--platform=<p>]  Generate + build the project
+        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>]  Generate + build + run
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
@@ -26,6 +26,8 @@ pub fn printHelp() void {
         \\  labelle run
         \\  labelle run --timeout=30s
         \\  labelle run --scene=settings_menu
+        \\  labelle generate --platform=wasm
+        \\  labelle build --platform=wasm
         \\  labelle build ../my-game
         \\  labelle install 0.2.0
         \\  labelle upgrade core 0.2.0

@@ -86,6 +86,8 @@ fn parseSceneFlag(
 
 const ParseError = error{TooManyArguments};
 
+const Platform = gen.Platform;
+
 const ParsedArgs = struct {
     command: Command,
     project_dir: []const u8 = ".",
@@ -93,13 +95,39 @@ const ParsedArgs = struct {
     extra_count: usize = 0,
     timeout_ns: ?u64 = null,
     scene_override: ?[]const u8 = null,
+    platform_override: ?Platform = null,
 };
 
-/// Parse [dir] and --scene flag for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8 } {
+/// Parse a --platform=<value> string into a Platform enum, or null if invalid.
+fn parsePlatformValue(val: []const u8) ?Platform {
+    inline for (@typeInfo(Platform).@"enum".fields) |f| {
+        if (std.mem.eql(u8, val, f.name)) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
+/// Try to parse --platform=<value> from an argument. Returns true if consumed.
+fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8) ?bool {
+    if (!std.mem.startsWith(u8, arg, "--platform=")) return false;
+    const val = arg["--platform=".len..];
+    if (val.len == 0) {
+        std.debug.print("labelle {s}: --platform requires a value (e.g. --platform=wasm)\n", .{cmd_name});
+        return null;
+    }
+    platform.* = parsePlatformValue(val);
+    if (platform.* == null) {
+        std.debug.print("labelle {s}: unknown platform '{s}' (expected: desktop, wasm, ios, android)\n", .{ cmd_name, val });
+        return null;
+    }
+    return true;
+}
+
+/// Parse [dir], --scene, and --platform flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
+    var platform: ?Platform = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -108,6 +136,9 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             .not_scene => {},
             .needs_next => unreachable,
         }
+        if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
+            if (consumed) continue;
+        } else return null;
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -120,15 +151,16 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene };
+    return .{ .dir = dir, .scene = scene, .platform = platform };
 }
 
-/// Parse [dir], --scene, and --timeout flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64 } {
+/// Parse [dir], --scene, --timeout, and --platform flags for run command (explicit or implicit).
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
+    var platform: ?Platform = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -137,6 +169,9 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             .not_scene => {},
             .needs_next => unreachable,
         }
+        if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
+            if (consumed) continue;
+        } else return null;
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_ns = util.parseDuration(arg["--timeout=".len..]);
             if (timeout_ns == null) {
@@ -168,7 +203,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -205,12 +240,14 @@ pub fn main() !void {
             const result = parseDirAndScene(&args, first) orelse return;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
+            parsed_args.platform_override = result.platform;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
+            parsed_args.platform_override = result.platform;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -252,6 +289,7 @@ pub fn main() !void {
             parsed_args.project_dir = first;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
+            parsed_args.platform_override = result.platform;
         }
     }
 
@@ -288,6 +326,11 @@ pub fn main() !void {
     // Apply --scene override
     if (parsed_args.scene_override) |scene| {
         parsed.initial_scene = scene;
+    }
+
+    // Apply --platform override
+    if (parsed_args.platform_override) |platform| {
+        parsed.platform = platform;
     }
 
     // Upgrade modifies project.labelle in the project directory
@@ -419,4 +462,30 @@ pub const SceneArgValue = struct {
     test "extracts value from --scene=intro" {
         try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
     }
+};
+
+pub const ParsePlatformValueSpec = struct {
+    pub const valid_platforms = struct {
+        test "parses desktop" {
+            try expect.equal(parsePlatformValue("desktop"), Platform.desktop);
+        }
+        test "parses wasm" {
+            try expect.equal(parsePlatformValue("wasm"), Platform.wasm);
+        }
+        test "parses ios" {
+            try expect.equal(parsePlatformValue("ios"), Platform.ios);
+        }
+        test "parses android" {
+            try expect.equal(parsePlatformValue("android"), Platform.android);
+        }
+    };
+
+    pub const invalid_platforms = struct {
+        test "returns null for empty string" {
+            try expect.equal(parsePlatformValue(""), null);
+        }
+        test "returns null for unknown value" {
+            try expect.equal(parsePlatformValue("windows"), null);
+        }
+    };
 };
