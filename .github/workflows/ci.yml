@@ -26,8 +26,13 @@ jobs:
       - name: Build CLI
         run: zig build
 
+      - name: CLI unit tests
+        run: zig build test
+
       - name: Generator tests
         run: cd generator && zig build test
+        env:
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/generator/.zig-cache
 
       - name: Test CLI commands (Unix)
         if: runner.os != 'Windows'
