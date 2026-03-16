@@ -115,6 +115,7 @@ pub fn main() !void {
                     .parsed => continue,
                     .err => return,
                     .not_scene => {},
+                    .needs_next => unreachable,
                 }
                 if (std.mem.startsWith(u8, arg, "--")) {
                     std.debug.print("labelle generate: unknown flag '{s}'\n", .{arg});
@@ -135,6 +136,7 @@ pub fn main() !void {
                     .parsed => continue,
                     .err => return,
                     .not_scene => {},
+                    .needs_next => unreachable,
                 }
                 if (std.mem.startsWith(u8, arg, "--")) {
                     std.debug.print("labelle build: unknown flag '{s}'\n", .{arg});
@@ -156,6 +158,7 @@ pub fn main() !void {
                     .parsed => continue,
                     .err => return,
                     .not_scene => {},
+                    .needs_next => unreachable,
                 }
                 if (std.mem.startsWith(u8, arg, "--timeout=")) {
                     timeout_ns = util.parseDuration(arg["--timeout=".len..]);
@@ -268,6 +271,7 @@ pub fn main() !void {
                     .parsed => continue,
                     .err => return,
                     .not_scene => {},
+                    .needs_next => unreachable,
                 }
                 if (std.mem.startsWith(u8, arg, "--timeout=")) {
                     timeout_ns = util.parseDuration(arg["--timeout=".len..]);
@@ -405,26 +409,56 @@ pub fn main() !void {
 
 // --- Tests ---
 
-test "parseSceneArg: --scene=value returns parsed" {
-    try std.testing.expectEqual(SceneResult.parsed, parseSceneArg("--scene=main_menu"));
-    try std.testing.expectEqual(SceneResult.parsed, parseSceneArg("--scene=x"));
+const expect = @import("zspec").expect;
+
+test {
+    @import("zspec").runAll(@This());
 }
 
-test "parseSceneArg: --scene= (empty) returns err" {
-    try std.testing.expectEqual(SceneResult.err, parseSceneArg("--scene="));
-}
+pub const ParseSceneArg = struct {
+    pub const with_equals_value = struct {
+        test "returns parsed for --scene=main_menu" {
+            try expect.equal(parseSceneArg("--scene=main_menu"), .parsed);
+        }
 
-test "parseSceneArg: bare --scene returns needs_next" {
-    try std.testing.expectEqual(SceneResult.needs_next, parseSceneArg("--scene"));
-}
+        test "returns parsed for --scene=x" {
+            try expect.equal(parseSceneArg("--scene=x"), .parsed);
+        }
+    };
 
-test "parseSceneArg: unrelated flags return not_scene" {
-    try std.testing.expectEqual(SceneResult.not_scene, parseSceneArg("--timeout=5s"));
-    try std.testing.expectEqual(SceneResult.not_scene, parseSceneArg("--verbose"));
-    try std.testing.expectEqual(SceneResult.not_scene, parseSceneArg("mydir"));
-}
+    pub const with_empty_equals = struct {
+        test "returns err for --scene=" {
+            try expect.equal(parseSceneArg("--scene="), .err);
+        }
+    };
 
-test "sceneArgValue extracts value from --scene=value" {
-    try std.testing.expectEqualStrings("main_menu", sceneArgValue("--scene=main_menu"));
-    try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
-}
+    pub const bare_flag = struct {
+        test "returns needs_next for --scene" {
+            try expect.equal(parseSceneArg("--scene"), .needs_next);
+        }
+    };
+
+    pub const unrelated_flags = struct {
+        test "returns not_scene for --timeout=5s" {
+            try expect.equal(parseSceneArg("--timeout=5s"), .not_scene);
+        }
+
+        test "returns not_scene for --verbose" {
+            try expect.equal(parseSceneArg("--verbose"), .not_scene);
+        }
+
+        test "returns not_scene for positional arg" {
+            try expect.equal(parseSceneArg("mydir"), .not_scene);
+        }
+    };
+};
+
+pub const SceneArgValue = struct {
+    test "extracts value from --scene=main_menu" {
+        try std.testing.expectEqualStrings("main_menu", sceneArgValue("--scene=main_menu"));
+    }
+
+    test "extracts value from --scene=intro" {
+        try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
+    }
+};

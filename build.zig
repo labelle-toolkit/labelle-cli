@@ -42,6 +42,8 @@ pub fn build(b: *std.Build) void {
     gen_step.dependOn(&gen_run.step);
 
     // ── Tests ────────────────────────────────────────────────────────
+    const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
+
     const cli_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
@@ -49,6 +51,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "generator", .module = gen_mod },
+                .{ .name = "zspec", .module = zspec_dep.module("zspec") },
             },
         }),
     });
