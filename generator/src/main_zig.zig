@@ -237,13 +237,14 @@ pub fn generateMainZig(
             const cleanup_code = try buildCallbackCleanupCode(allocator, cfg);
             defer allocator.free(cleanup_code);
 
-            // Desktop: GPA with deinit; WASM: page_allocator (GPA is incompatible with wasm32-emscripten)
+            // Desktop: GPA with deinit; WASM: c_allocator (uses emscripten's malloc/free,
+            // which respects ALLOW_MEMORY_GROWTH — page_allocator conflicts with emscripten)
             const is_wasm = cfg.platform == .wasm;
             const allocator_decl: []const u8 = if (is_wasm)
-                "// Use page_allocator for Emscripten — GPA is incompatible with wasm32-emscripten\n// (pulls in std.debug which has a broken base_address field on this target).\nconst allocator = std.heap.page_allocator;"
+                "// Use c_allocator for Emscripten — delegates to emscripten's malloc/free\n// which respects ALLOW_MEMORY_GROWTH. GPA is incompatible with wasm32-emscripten.\nconst allocator = std.heap.c_allocator;"
             else
                 "var gpa = std.heap.GeneralPurposeAllocator(.{}){};";
-            const allocator_expr: []const u8 = if (is_wasm) "std.heap.page_allocator" else "gpa.allocator()";
+            const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
             const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
 
             try tpl.render(lifecycle_tmpl, .{

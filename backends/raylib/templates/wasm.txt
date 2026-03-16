@@ -27,9 +27,10 @@ fn gameFrame() callconv(.c) void {
 const emscripten = @cImport(@cInclude("emscripten/emscripten.h"));
 
 pub fn main() !void {
-    // Use page_allocator for Emscripten — GPA would be stack-local and invalid
-    // after main() returns, but Emscripten keeps calling gameFrame().
-    const allocator = std.heap.page_allocator;
+    // Use c_allocator for Emscripten — it delegates to emscripten's malloc/free
+    // which respects ALLOW_MEMORY_GROWTH. page_allocator uses wasm memory.grow
+    // directly and conflicts with emscripten's memory management.
+    const allocator = std.heap.c_allocator;
     g_allocator = allocator;
 
 {{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
