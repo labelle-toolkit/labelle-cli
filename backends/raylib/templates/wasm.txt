@@ -19,6 +19,7 @@ fn gameFrame() callconv(.c) void {
     window.beginDrawing();
     window.clearBackground(245, 245, 245, 255);
     g.render();
+    g.renderGizmos();
 {{gui_draw_code}}    window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
     window.endDrawing();
 }
