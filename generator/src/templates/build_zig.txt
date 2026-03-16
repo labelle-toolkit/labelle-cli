@@ -172,9 +172,10 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .asyncify = true,
     });
-    const emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
+    var emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
         .optimize = optimize,
     });
+    emcc_settings.put("ALLOW_MEMORY_GROWTH", "1") catch unreachable;
     const install_dir: std.Build.InstallDir = .{ .custom = "web" };
     const emcc_step = emsdk.emccStep(b, raylib_artifact, wasm, .{
         .optimize = optimize,
