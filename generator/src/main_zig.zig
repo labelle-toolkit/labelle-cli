@@ -218,8 +218,6 @@ pub fn generateMainZig(
         const module_vars = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
         const init_code = try buildCallbackInitCode(allocator, cfg, scene_names, gizmo_names);
         defer allocator.free(init_code);
-        const cleanup_code = try buildCallbackCleanupCode(allocator, cfg);
-        defer allocator.free(cleanup_code);
 
         const platform_comment: []const u8 = switch (cfg.platform) {
             .ios => "iOS: sokol bindings accessed through engine.sokol (no direct sokol import)",
@@ -236,6 +234,8 @@ pub fn generateMainZig(
 
         // Sokol uses module_vars/init_code/cleanup_code; WASM raylib uses setup_code
         if (cfg.backend == .sokol) {
+            const cleanup_code = try buildCallbackCleanupCode(allocator, cfg);
+            defer allocator.free(cleanup_code);
             try tpl.render(lifecycle_tmpl, .{
                 .module_vars = module_vars,
                 .width = w_str,

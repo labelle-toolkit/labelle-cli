@@ -197,6 +197,7 @@ pub fn build(b: *std.Build) !void {
     const emcc_step = &link_step.step;
 
 .wasm_footer
+    b.getInstallStep().dependOn(emcc_step);
     const run_step = b.step("run", "Serve WASM build");
     run_step.dependOn(emcc_step);
 }

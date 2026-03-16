@@ -101,10 +101,7 @@ const ParsedArgs = struct {
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
 fn parsePlatformValue(val: []const u8) ?Platform {
-    inline for (@typeInfo(Platform).@"enum".fields) |f| {
-        if (std.mem.eql(u8, val, f.name)) return @enumFromInt(f.value);
-    }
-    return null;
+    return std.meta.stringToEnum(Platform, val);
 }
 
 /// Try to parse --platform=<value> from an argument. Returns true if consumed.
@@ -117,7 +114,16 @@ fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8
     }
     platform.* = parsePlatformValue(val);
     if (platform.* == null) {
-        std.debug.print("labelle {s}: unknown platform '{s}' (expected: desktop, wasm, ios, android)\n", .{ cmd_name, val });
+        const expected = comptime blk: {
+            const fields = @typeInfo(Platform).@"enum".fields;
+            var result: []const u8 = "";
+            for (fields, 0..) |f, i| {
+                if (i > 0) result = result ++ ", ";
+                result = result ++ f.name;
+            }
+            break :blk result;
+        };
+        std.debug.print("labelle {s}: unknown platform '{s}' (expected: {s})\n", .{ cmd_name, val, expected });
         return null;
     }
     return true;
@@ -137,9 +143,7 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             .not_scene => {},
             .needs_next => unreachable,
         }
-        if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
-            if (consumed) continue;
-        } else return null;
+        if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;

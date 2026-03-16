@@ -11,7 +11,7 @@ pub fn printHelp() void {
         \\  init <name> [dir]    Create a new labelle project
         \\  generate [dir] [--scene=<name>] [--platform=<p>]  Generate .labelle/ assembler files
         \\  build [dir] [--scene=<name>] [--platform=<p>]  Generate + build the project
-        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>]  Generate + build + run
+        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>]  Generate + build + run (default)
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
