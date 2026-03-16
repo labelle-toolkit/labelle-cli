@@ -1,7 +1,7 @@
 /// labelle-cli — reads project.labelle and generates/builds/runs the assembled game.
 ///
 /// Usage:
-///   labelle generate [dir]              — generate .labelle/ assembler files
+///   labelle generate [dir] [--scene=name] — generate .labelle/ assembler files
 ///   labelle run [dir] [--timeout=30s] [--scene=name] — generate + build + run
 ///   labelle build [dir] [--scene=name]  — generate + build (no run)
 ///   labelle [dir]                       — alias for `run`
@@ -50,6 +50,10 @@ fn parseSceneFlag(
         return .parsed;
     } else if (std.mem.eql(u8, arg, "--scene")) {
         if (args.next()) |val| {
+            if (val.len == 0) {
+                std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene main_menu)\n", .{cmd_name});
+                return .err;
+            }
             scene_override.* = val;
             return .parsed;
         } else {
