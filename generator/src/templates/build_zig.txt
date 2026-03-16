@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
 .header_wasm
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     var target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -37,6 +37,13 @@ pub fn build(b: *std.Build) void {
     const backend_audio = backend_dep.module("audio");
     const backend_window = backend_dep.module("window");
     const sokol_clib = backend_dep.artifact("sokol_clib");
+
+.backend_sokol_wasm
+    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
 
 .backend_sdl
     const backend_dep = b.dependency("labelle_sdl", .{ .target = target, .optimize = optimize });
@@ -177,12 +184,15 @@ pub fn build(b: *std.Build) void {
     });
 
 .link_sokol_wasm
+    wasm.linkLibrary(backend_dep.artifact("sokol_clib"));
     const link_step = try sokol_em.emLinkStep(b, .{
         .target = target,
         .optimize = optimize,
         .lib_main = wasm,
         .emsdk = emsdk_dep,
         .shell_file_path = null,
+        .use_webgl2 = true,
+        .release_use_closure = false,
     });
     const emcc_step = &link_step.step;
 

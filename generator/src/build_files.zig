@@ -53,7 +53,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     } else {
         switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "backend_sokol", w),
+            .sokol => {
+                if (cfg.platform == .wasm) {
+                    try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
+                } else {
+                    try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
+                }
+            },
             .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
             .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
             .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
