@@ -2,8 +2,8 @@
 ///
 /// Usage:
 ///   labelle generate [dir]              — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s]   — generate + build + run
-///   labelle build [dir]                 — generate + build (no run)
+///   labelle run [dir] [--timeout=30s] [--scene=name] — generate + build + run
+///   labelle build [dir] [--scene=name]  — generate + build (no run)
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
@@ -45,6 +45,7 @@ pub fn main() !void {
     var extra_args: [8][]const u8 = undefined;
     var extra_count: usize = 0;
     var timeout_ns: ?u64 = null;
+    var scene_override: ?[]const u8 = null;
 
     const first_arg = args.next();
     if (first_arg == null) {
@@ -54,15 +55,66 @@ pub fn main() !void {
     if (first_arg) |first| {
         if (std.mem.eql(u8, first, "generate")) {
             command = .generate;
-            project_dir = args.next() orelse ".";
+            while (args.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, "--scene=")) {
+                    scene_override = arg["--scene=".len..];
+                } else if (std.mem.eql(u8, arg, "--scene")) {
+                    if (args.next()) |val| {
+                        scene_override = val;
+                    } else {
+                        std.debug.print("labelle generate: --scene requires a value (e.g. --scene main_menu)\n", .{});
+                        return;
+                    }
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    std.debug.print("labelle generate: unknown flag '{s}'\n", .{arg});
+                    return;
+                } else {
+                    if (dir_set) {
+                        std.debug.print("labelle generate: unexpected argument '{s}'\n", .{arg});
+                        return;
+                    }
+                    project_dir = arg;
+                    dir_set = true;
+                }
+            }
         } else if (std.mem.eql(u8, first, "build")) {
             command = .build;
-            project_dir = args.next() orelse ".";
+            while (args.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, "--scene=")) {
+                    scene_override = arg["--scene=".len..];
+                } else if (std.mem.eql(u8, arg, "--scene")) {
+                    if (args.next()) |val| {
+                        scene_override = val;
+                    } else {
+                        std.debug.print("labelle build: --scene requires a value (e.g. --scene main_menu)\n", .{});
+                        return;
+                    }
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    std.debug.print("labelle build: unknown flag '{s}'\n", .{arg});
+                    return;
+                } else {
+                    if (dir_set) {
+                        std.debug.print("labelle build: unexpected argument '{s}'\n", .{arg});
+                        return;
+                    }
+                    project_dir = arg;
+                    dir_set = true;
+                }
+            }
         } else if (std.mem.eql(u8, first, "run")) {
             command = .run;
-            // Parse optional [dir] and --timeout flag
+            // Parse optional [dir], --timeout, and --scene flags
             while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--timeout=")) {
+                if (std.mem.startsWith(u8, arg, "--scene=")) {
+                    scene_override = arg["--scene=".len..];
+                } else if (std.mem.eql(u8, arg, "--scene")) {
+                    if (args.next()) |val| {
+                        scene_override = val;
+                    } else {
+                        std.debug.print("labelle run: --scene requires a value (e.g. --scene main_menu)\n", .{});
+                        return;
+                    }
+                } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
                     timeout_ns = util.parseDuration(arg["--timeout=".len..]);
                     if (timeout_ns == null) {
                         std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
@@ -167,9 +219,18 @@ pub fn main() !void {
             // No command — treat as project dir, default to run
             project_dir = first;
             dir_set = true;
-            // Parse remaining args (e.g. `labelle mydir --timeout=5s`)
+            // Parse remaining args (e.g. `labelle mydir --timeout=5s --scene=intro`)
             while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "--timeout=")) {
+                if (std.mem.startsWith(u8, arg, "--scene=")) {
+                    scene_override = arg["--scene=".len..];
+                } else if (std.mem.eql(u8, arg, "--scene")) {
+                    if (args.next()) |val| {
+                        scene_override = val;
+                    } else {
+                        std.debug.print("labelle: --scene requires a value\n", .{});
+                        return;
+                    }
+                } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
                     timeout_ns = util.parseDuration(arg["--timeout=".len..]);
                     if (timeout_ns == null) {
                         std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
@@ -212,7 +273,7 @@ pub fn main() !void {
     // Read and parse project.labelle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
+    var parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
             std.debug.print("  To create a new project:\n", .{});
@@ -222,6 +283,11 @@ pub fn main() !void {
         }
         return;
     };
+
+    // Apply --scene override
+    if (scene_override) |scene| {
+        parsed.initial_scene = scene;
+    }
 
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
