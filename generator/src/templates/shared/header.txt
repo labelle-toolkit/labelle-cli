@@ -5,3 +5,4 @@ const BackendGfx = @import("backend_gfx");
 const BackendInput = @import("backend_input");
 const BackendAudio = @import("backend_audio");
 const window = @import("backend_window");
+const LogSink = engine.core.StderrLogSink;
