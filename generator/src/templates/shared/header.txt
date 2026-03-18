@@ -5,5 +5,5 @@ const BackendGfx = @import("backend_gfx");
 const BackendInput = @import("backend_input");
 const BackendAudio = @import("backend_audio");
 const window = @import("backend_window");
-// Log sink — change to engine.core.StubLogSink to disable, or provide a custom sink.
+// Log sink (default: stderr). Override in project template to disable or customize.
 const LogSink = engine.core.StderrLogSink;
