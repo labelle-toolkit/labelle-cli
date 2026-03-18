@@ -46,11 +46,14 @@ pub fn generateMainZig(
         .simple, .clay, .imgui => try w.writeAll(shared_gui_backend),
     }
 
+    var ident_buf: [256]u8 = undefined;
+
     // Hook imports (hooks/ folder)
     if (hook_names.len > 0) {
         try w.writeAll("\n// --- Hook imports ---\n");
         for (hook_names) |name| {
-            try w.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ ident, name });
         }
     }
 
@@ -58,7 +61,8 @@ pub fn generateMainZig(
     if (enum_names.len > 0) {
         try w.writeAll("\n// --- Enum imports ---\n");
         for (enum_names) |name| {
-            try w.print("const {s} = @import(\"enums/{s}.zig\");\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("const {s} = @import(\"enums/{s}.zig\");\n", .{ ident, name });
         }
     }
 
@@ -66,7 +70,8 @@ pub fn generateMainZig(
     if (scene_names.len > 0) {
         try w.writeAll("\n// --- Scene data ---\n");
         for (scene_names) |name| {
-            try w.print("const {s}_scene = @import(\"scenes/{s}.zon\");\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("const {s}_scene = @import(\"scenes/{s}.zon\");\n", .{ ident, name });
         }
     }
 
@@ -88,15 +93,17 @@ pub fn generateMainZig(
     if (hook_names.len == 0) {
         try w.writeAll("const GameHooks = struct {};\n\n");
     } else if (hook_names.len == 1) {
+        const ident0 = pathToIdent(hook_names[0], &ident_buf);
         var pascal_buf: [128]u8 = undefined;
-        const pascal = snakeToPascal(hook_names[0], &pascal_buf);
-        try w.print("const GameHooks = {s}.{s};\n\n", .{ hook_names[0], pascal });
+        const pascal = snakeToPascal(ident0, &pascal_buf);
+        try w.print("const GameHooks = {s}.{s};\n\n", .{ ident0, pascal });
     } else {
+        var pascal_buf: [128]u8 = undefined;
         try w.writeAll("const GameHooks = engine.MergeHooks(engine.HookPayload(EcsBackend.Entity), .{");
         for (hook_names) |name| {
-            var pascal_buf: [128]u8 = undefined;
-            const pascal = snakeToPascal(name, &pascal_buf);
-            try w.print(" *{s}.{s},", .{ name, pascal });
+            const ident = pathToIdent(name, &ident_buf);
+            const pascal = snakeToPascal(ident, &pascal_buf);
+            try w.print(" *{s}.{s},", .{ ident, pascal });
         }
         try w.writeAll(" });\n\n");
     }
@@ -107,7 +114,8 @@ pub fn generateMainZig(
     if (prefab_names.len > 0) {
         try w.writeAll("const Prefabs = engine.PrefabRegistry(.{\n");
         for (prefab_names) |name| {
-            try w.print("    .{s} = @import(\"prefabs/{s}.zon\"),\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("    .{s} = @import(\"prefabs/{s}.zon\"),\n", .{ ident, name });
         }
         try w.writeAll("});\n\n");
     } else {
@@ -125,9 +133,10 @@ pub fn generateMainZig(
         }
 
         // Game-local components (take precedence over plugin components)
+        var pascal_buf: [128]u8 = undefined;
         for (component_names) |name| {
-            var pascal_buf: [128]u8 = undefined;
-            const pascal = snakeToPascal(name, &pascal_buf);
+            const ident = pathToIdent(name, &ident_buf);
+            const pascal = snakeToPascal(ident, &pascal_buf);
             try w.print("    .{s} = @import(\"components/{s}.zig\").{s},\n", .{ pascal, name, pascal });
         }
 
@@ -151,7 +160,8 @@ pub fn generateMainZig(
     try w.writeAll("const AllScripts = struct {\n");
     for (script_names) |name| {
         if (std.mem.eql(u8, name, "context")) continue;
-        try w.print("    pub const {s} = @import(\"scripts/{s}.zig\");\n", .{ name, name });
+        const ident = pathToIdent(name, &ident_buf);
+        try w.print("    pub const {s} = @import(\"scripts/{s}.zig\");\n", .{ ident, name });
     }
     try w.writeAll("};\n\n");
 
@@ -173,7 +183,8 @@ pub fn generateMainZig(
     if (view_names.len > 0) {
         try w.writeAll("const Views = engine.ViewRegistry(.{\n");
         for (view_names) |name| {
-            try w.print("    .{s} = @import(\"views/{s}.zon\"),\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("    .{s} = @import(\"views/{s}.zon\"),\n", .{ ident, name });
         }
         try w.writeAll("});\n\n");
     } else {
@@ -184,7 +195,8 @@ pub fn generateMainZig(
     if (gizmo_names.len > 0) {
         try w.writeAll("const Gizmos = engine.GizmoRegistry(.{\n");
         for (gizmo_names) |name| {
-            try w.print("    .{s} = @import(\"gizmos/{s}.zon\"),\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("    .{s} = @import(\"gizmos/{s}.zon\"),\n", .{ ident, name });
         }
         try w.writeAll("});\n\n");
     }
@@ -324,8 +336,10 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
         } else {
             try w.writeAll("    const Loader = engine.SceneLoader(AssembledGame, Prefabs, Components, Scripts);\n");
         }
+        var ident_buf: [256]u8 = undefined;
         for (scene_names) |name| {
-            try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, ident });
         }
         const initial = cfg.initial_scene orelse scene_names[0];
         try w.print("    try g.setScene(\"{s}\");\n", .{initial});
@@ -375,8 +389,10 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
         } else {
             try w.writeAll("    const Loader = engine.SceneLoader(AssembledGame, Prefabs, Components, Scripts);\n");
         }
+        var ident_buf: [256]u8 = undefined;
         for (scene_names) |name| {
-            try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, name });
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, ident });
         }
         const initial = cfg.initial_scene orelse scene_names[0];
         try w.print("    try g.setScene(\"{s}\");\n", .{initial});
@@ -399,6 +415,21 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     try w.writeAll("    runner.deinit();\n");
 
     return buf.toOwnedSlice(allocator);
+}
+
+/// Convert a path-style name to a valid Zig identifier: "enemies/goblin" -> "enemies_goblin".
+/// Top-level names (no slashes) pass through unchanged.
+fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
+    if (name.len > buf.len) {
+        std.debug.print("labelle: path too long for identifier (max {d} chars): '{s}'\n", .{ buf.len, name });
+        @panic("path exceeds identifier buffer size");
+    }
+    var i: usize = 0;
+    for (name) |c| {
+        buf[i] = if (c == '/') '_' else c;
+        i += 1;
+    }
+    return buf[0..i];
 }
 
 /// Convert snake_case to PascalCase: "rigid_body" -> "RigidBody", "health" -> "Health".
