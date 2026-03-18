@@ -1,6 +1,6 @@
 const Renderer = gfx.GfxRenderer(BackendGfx, GameLayers, EcsBackend.Entity);
 
-const AssembledGame = engine.GameConfig(
+const AssembledGame = engine.GameConfigWithLog(
     Renderer,
     EcsBackend,
     BackendInput,
