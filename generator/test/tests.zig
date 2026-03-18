@@ -746,3 +746,95 @@ pub const HIDDEN_WINDOW = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.setConfigFlags(.{ .window_hidden = true })") != null);
     }
 };
+
+// ── Subfolder support ────────────────────────────────────────────────
+
+pub const SUBFOLDERS = struct {
+    test "prefab names with slashes use underscore identifiers and slash import paths" {
+        const prefabs = &[_][]const u8{ "enemies/goblin", "enemies/orc", "player" };
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_names, prefabs, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Subfolder prefabs: identifier uses underscore, import path uses slash
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".enemies_goblin = @import(\"prefabs/enemies/goblin.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".enemies_orc = @import(\"prefabs/enemies/orc.zon\")") != null);
+        // Top-level prefab unchanged
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".player = @import(\"prefabs/player.zon\")") != null);
+    }
+
+    test "script names with slashes use underscore identifiers in AllScripts" {
+        const scripts = &[_][]const u8{ "systems/movement", "systems/combat", "camera_control" };
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, scripts, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const systems_movement = @import(\"scripts/systems/movement.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const systems_combat = @import(\"scripts/systems/combat.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const camera_control = @import(\"scripts/camera_control.zig\")") != null);
+    }
+
+    test "scene names with slashes use underscore identifiers and slash import paths" {
+        const scenes = &[_][]const u8{ "levels/forest", "levels/dungeon" };
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_names, empty_names, scenes, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Import uses underscore ident, slash path
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const levels_forest_scene = @import(\"scenes/levels/forest.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const levels_dungeon_scene = @import(\"scenes/levels/dungeon.zon\")") != null);
+        // Registration uses slash name for scene lookup, underscore for variable reference
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerSceneSimple(\"levels/forest\", Loader.sceneLoaderFn(levels_forest_scene))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerSceneSimple(\"levels/dungeon\", Loader.sceneLoaderFn(levels_dungeon_scene))") != null);
+    }
+
+    test "component names with slashes use underscore PascalCase identifiers" {
+        const components = &[_][]const u8{ "physics/rigid_body", "health" };
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_names, empty_names, empty_names, components, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Subfolder component: path with slash, PascalCase from flattened ident
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".PhysicsRigidBody = @import(\"components/physics/rigid_body.zig\").PhysicsRigidBody") != null);
+        // Top-level component unchanged
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".Health = @import(\"components/health.zig\").Health") != null);
+    }
+
+    test "gizmo names with slashes use underscore identifiers" {
+        const gizmos = &[_][]const u8{ "debug/collision", "editor/grid" };
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, gizmos);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".debug_collision = @import(\"gizmos/debug/collision.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".editor_grid = @import(\"gizmos/editor/grid.zon\")") != null);
+    }
+
+    test "view names with slashes use underscore identifiers" {
+        const views = &[_][]const u8{ "panels/inventory", "hud" };
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, views, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".panels_inventory = @import(\"views/panels/inventory.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".hud = @import(\"views/hud.zon\")") != null);
+    }
+};
