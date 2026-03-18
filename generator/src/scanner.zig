@@ -47,7 +47,10 @@ fn copyAndScanRecursive(
     ext: []const u8,
     names: *std.ArrayList([]const u8),
 ) !void {
-    var src_dir = cwd.openDir(src_path, .{ .iterate = true }) catch return;
+    var src_dir = cwd.openDir(src_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
     defer src_dir.close();
 
     try cwd.makePath(dst_path);
