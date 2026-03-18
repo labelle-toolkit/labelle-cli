@@ -7,4 +7,5 @@ const AssembledGame = engine.GameConfig(
     BackendAudio,
     GuiBackend,
     *GameHooks,
+    LogSink,
 );
