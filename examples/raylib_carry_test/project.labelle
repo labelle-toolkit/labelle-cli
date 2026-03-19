@@ -1,0 +1,19 @@
+.{
+    .name = "carry_test",
+    .title = "Carry Test — Parent/Child Position",
+    .width = 800,
+    .height = 400,
+    .target_fps = 60,
+    .backend = .raylib,
+    .ecs = .zig_ecs,
+    .plugins = .{},
+    .layers = .{
+        .{ .name = "background", .order = 0, .space = .screen },
+        .{ .name = "world", .order = 1, .space = .world },
+        .{ .name = "ui", .order = 2, .space = .screen },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../",
+}

@@ -1,0 +1,62 @@
+.{
+    .name = "main",
+    .scripts = .{
+        "carry_demo",
+        "manual_carry",
+    },
+    .entities = .{
+        // === Auto carrier (top row, y=50) ===
+        // Carrier (blue rectangle)
+        .{
+            .components = .{
+                .Position = .{ .x = 50, .y = 50 },
+                .Shape = .{
+                    .shape = .{ .rectangle = .{ .width = 20, .height = 30 } },
+                    .color = .{ .r = 80, .g = 120, .b = 255, .a = 255 },
+                },
+                .Carrier = .{
+                    .pickup_x = 100,
+                    .drop_x = 350,
+                    .speed = 80,
+                },
+            },
+        },
+        // Item for auto carrier (green circle)
+        .{
+            .components = .{
+                .Position = .{ .x = 100, .y = 50 },
+                .Shape = .{
+                    .shape = .{ .circle = .{ .radius = 10 } },
+                    .color = .{ .r = 60, .g = 200, .b = 80, .a = 255 },
+                },
+                .PickupItem = .{},
+            },
+        },
+
+        // === Manual carrier (bottom row, y=150) ===
+        // Carrier (orange rectangle — arrow keys + spacebar)
+        .{
+            .components = .{
+                .Position = .{ .x = 50, .y = 150 },
+                .Shape = .{
+                    .shape = .{ .rectangle = .{ .width = 20, .height = 30 } },
+                    .color = .{ .r = 255, .g = 150, .b = 50, .a = 255 },
+                },
+                .ManualCarrier = .{
+                    .speed = 120,
+                },
+            },
+        },
+        // Item for manual carrier (red circle)
+        .{
+            .components = .{
+                .Position = .{ .x = 200, .y = 150 },
+                .Shape = .{
+                    .shape = .{ .circle = .{ .radius = 10 } },
+                    .color = .{ .r = 220, .g = 50, .b = 50, .a = 255 },
+                },
+                .PickupItem = .{},
+            },
+        },
+    },
+}
