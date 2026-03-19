@@ -1,0 +1,19 @@
+.{
+    .name = .nuklear_raylib_bridge,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .nuklear = .{
+            .path = "../../../../../zig-nuklear",
+        },
+        .@"raylib-zig" = .{
+            .url = "https://github.com/raylib-zig/raylib-zig/archive/refs/heads/devel.tar.gz",
+            .hash = "1220be9b99caeccd9be5a29222e6c93db3cb518711853eda4f744d254c88f88aa827",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -50,15 +50,23 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, p
             // Local bridge path (relative to plugin directory)
             bridge_dir = try std.fs.path.resolve(allocator, &.{ plugin_dir, rel_path });
         }
-    }
 
-    cfg.resolved_gui = .{
-        .name = manifest.name,
-        .rendering = manifest.rendering,
-        .lifecycle = manifest.lifecycle,
-        .plugin_dir = plugin_dir,
-        .bridge_dir = bridge_dir,
-    };
+        cfg.resolved_gui = .{
+            .name = manifest.name,
+            .rendering = manifest.rendering,
+            .lifecycle = manifest.lifecycle,
+            .plugin_dir = plugin_dir,
+            .bridge_dir = bridge_dir,
+            .bridge_artifact = bridge_def.adapter,
+        };
+    } else {
+        cfg.resolved_gui = .{
+            .name = manifest.name,
+            .rendering = manifest.rendering,
+            .lifecycle = manifest.lifecycle,
+            .plugin_dir = plugin_dir,
+        };
+    }
 }
 
 /// Resolve the plugin directory from a GuiPlugin reference.

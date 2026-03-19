@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) !void {
 
 .gui_bridge
     const bridge_dep = b.dependency("gui_bridge", .{ .target = target, .optimize = optimize });
-    const gui_bridge_artifact = bridge_dep.artifact("rlimgui_bridge");
+    const gui_bridge_artifact = bridge_dep.artifact("{{bridge_artifact_name}}");
 
 .wasm_target
     // WASM/Emscripten: override target so all dependencies build for wasm32-emscripten.

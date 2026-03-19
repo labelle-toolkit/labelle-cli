@@ -73,7 +73,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     // Bridge artifact (raw_backend GUIs need a bridge linked into the executable)
     if (cfg.resolved_gui) |gui| {
         if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
-            try tpl.writeSection(build_zig_tmpl, "gui_bridge", w);
+            try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
         }
     }
 

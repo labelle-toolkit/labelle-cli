@@ -98,6 +98,8 @@ pub const ResolvedGui = struct {
     plugin_dir: []const u8,
     /// Absolute path to bridge directory (raw_backend only).
     bridge_dir: ?[]const u8 = null,
+    /// Bridge artifact name (e.g., "rlimgui_bridge", "nuklear_raylib_bridge").
+    bridge_artifact: []const u8 = "",
 };
 
 pub const ProjectConfig = struct {
