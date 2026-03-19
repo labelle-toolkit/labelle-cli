@@ -4,9 +4,9 @@
     .backend = .raylib,
     .ecs = .mock,
     .gui = .{ .path = "../../plugins/imgui" },
-    .core_version = "local:../../../../labelle-core",
-    .engine_version = "local:../../../../engine",
-    .gfx_version = "local:../../../../labelle-gfx",
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
     .labelle_version = "local:../../",
     .layers = .{
         .{ .name = "background", .order = 0, .space = .screen },
