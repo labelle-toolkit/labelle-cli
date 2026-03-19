@@ -25,8 +25,8 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     if (cfg.ecs != .mock) {
         try w.print("        .ecs = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.ecs)});
     }
-    if (cfg.gui != .none) {
-        try w.print("        .gui = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.gui)});
+    if (cfg.resolved_gui) |gui| {
+        try w.print("        .gui = .{{ .name = \"{s}\" }},\n", .{gui.name});
     }
 
     try w.writeAll("    },\n");

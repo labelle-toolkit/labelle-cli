@@ -7,7 +7,7 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     var dir_override: ?[]const u8 = null;
     var backend: []const u8 = "raylib";
     var ecs: []const u8 = "zig_ecs";
-    var gui: []const u8 = "none";
+    var gui: ?[]const u8 = null;
     var core_version: []const u8 = gen.CORE_VERSION;
     var engine_version: []const u8 = gen.ENGINE_VERSION;
     var gfx_version: []const u8 = gen.GFX_VERSION;
@@ -71,7 +71,18 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
             \\    .target_fps = 60,
             \\    .backend = .{s},
             \\    .ecs = .{s},
-            \\    .gui = .{s},
+            \\
+        , .{ project_name, project_name, backend, ecs });
+
+        // GUI plugin reference (null = no GUI, or a plugin ref)
+        if (gui) |gui_path| {
+            try w.print(
+                \\    .gui = .{{ .path = "{s}" }},
+                \\
+            , .{gui_path});
+        }
+
+        try w.print(
             \\    .plugins = .{{}},
             \\    .layers = .{{
             \\        .{{ .name = "background", .order = 0, .space = .screen }},
@@ -84,7 +95,7 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
             \\    .labelle_version = "{s}",
             \\}}
             \\
-        , .{ project_name, project_name, backend, ecs, gui, core_version, engine_version, gfx_version, labelle_version });
+        , .{ core_version, engine_version, gfx_version, labelle_version });
 
         const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
         defer allocator.free(path);

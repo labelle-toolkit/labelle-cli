@@ -3,7 +3,6 @@
     .title = "LaBelle v2 — WebGPU",
     .backend = .wgpu,
     .ecs = .mock,
-    .gui = .none,
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../engine",
     .gfx_version = "local:../../../labelle-gfx",

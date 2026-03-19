@@ -58,6 +58,11 @@
             .path = "{{gui_path}}",
         },
 
+.dep_gui_bridge_path
+        .gui_bridge = .{
+            .path = "{{bridge_path}}",
+        },
+
 .dep_emsdk
         .emsdk = .{
             .url = "git+https://github.com/emscripten-core/emsdk#4.0.9",

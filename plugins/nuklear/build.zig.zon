@@ -1,0 +1,16 @@
+.{
+    .name = .labelle_nuklear,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .nuklear = .{
+            .path = "../../../zig-nuklear",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "gui.labelle",
+    },
+}
