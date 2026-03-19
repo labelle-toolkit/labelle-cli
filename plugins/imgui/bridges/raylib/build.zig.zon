@@ -1,0 +1,16 @@
+.{
+    .name = .rlimgui_bridge,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .rlImGui = .{
+            .url = "https://github.com/raylib-extras/rlImGui/archive/refs/heads/main.tar.gz",
+            .hash = "N-V-__8AAKW_iQAqIz0VKzpwDjcutAHrY1MFFrQFYuTrihyz",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
