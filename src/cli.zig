@@ -351,7 +351,7 @@ pub fn main() !void {
     compatibility.validateCompatibility(parsed);
 
     // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
-    try gui_resolve.resolveGuiPlugin(allocator, &parsed, project_dir);
+    try gui_resolve.resolveGuiPlugin(arena.allocator(), &parsed, project_dir);
 
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });

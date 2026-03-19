@@ -30,7 +30,9 @@ export fn nk_bridge_init() void {
         .mipmaps = 1,
         .format = .uncompressed_r8g8b8a8,
     };
-    font_tex = rl.loadTextureFromImage(rl_img) catch undefined;
+    font_tex = rl.loadTextureFromImage(rl_img) catch {
+        @panic("nuklear bridge: failed to load font atlas texture");
+    };
 
     // Finish atlas — pass the texture ID as a handle
     var null_tex: c.nk_draw_null_texture = undefined;
@@ -65,10 +67,11 @@ export fn nk_bridge_begin() void {
     const scroll = rl.getMouseWheelMoveV();
     c.nk_input_scroll(&ctx, .{ .x = scroll.x, .y = scroll.y });
 
-    // Keyboard — text input
-    const char_pressed = rl.getCharPressed();
-    if (char_pressed > 0) {
-        c.nk_input_unicode(&ctx, @intCast(char_pressed));
+    // Keyboard — text input (drain the queue, multiple chars may be buffered per frame)
+    while (true) {
+        const ch = rl.getCharPressed();
+        if (ch == 0) break;
+        c.nk_input_unicode(&ctx, @intCast(ch));
     }
 
     // Key mappings

@@ -51,6 +51,14 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, p
         if (bridge_def.path) |rel_path| {
             // Local bridge path (relative to plugin directory)
             bridge_dir = try std.fs.path.resolve(allocator, &.{ plugin_dir, rel_path });
+        } else {
+            std.debug.print("labelle: GUI plugin '{s}' bridge for '{s}' has no .path (remote bridge resolution not yet supported)\n", .{ manifest.name, @tagName(cfg.backend) });
+            return error.GuiBridgeResolutionNotSupported;
+        }
+
+        if (bridge_def.adapter.len == 0) {
+            std.debug.print("labelle: GUI plugin '{s}' bridge for '{s}' has empty .adapter name\n", .{ manifest.name, @tagName(cfg.backend) });
+            return error.GuiBridgeMissingAdapter;
         }
 
         cfg.resolved_gui = .{
