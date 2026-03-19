@@ -22,8 +22,8 @@ pub fn build(b: *std.Build) !void {
     const engine_dep = b.dependency("engine", .{ .target = target, .optimize = optimize });
     const engine_mod = engine_dep.module("engine");
 
-    // Deduplicate labelle-core across all packages — ensures a single core module
-    // in the build, preventing diamond dependency issues (see #59).
+    // Deduplicate labelle-core across gfx and engine — ensures a single core
+    // module in the build, preventing diamond dependency version mismatches.
     gfx_mod.addImport("labelle-core", core_mod);
     engine_mod.addImport("labelle-core", core_mod);
     engine_mod.addImport("labelle-gfx", gfx_mod);
