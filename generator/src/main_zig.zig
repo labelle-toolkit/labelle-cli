@@ -90,6 +90,11 @@ pub fn generateMainZig(
         try w.writeByte('\n');
     }
 
+    // HookPayload — the unified hook event type for the game.
+    // MergeHookPayloads is available in engine.core for games that want to
+    // manually merge plugin hook payloads. Auto-merging is planned (#64).
+    try w.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
+
     // GameHooks — merge all hook files from hooks/ folder.
     if (hook_names.len == 0) {
         try w.writeAll("const GameHooks = struct {};\n\n");
@@ -100,7 +105,7 @@ pub fn generateMainZig(
         try w.print("const GameHooks = {s}.{s};\n\n", .{ ident0, pascal });
     } else {
         var pascal_buf: [128]u8 = undefined;
-        try w.writeAll("const GameHooks = engine.MergeHooks(engine.HookPayload(EcsBackend.Entity), .{");
+        try w.writeAll("const GameHooks = engine.MergeHooks(AllHookPayloads, .{");
         for (hook_names) |name| {
             const ident = pathToIdent(name, &ident_buf);
             const pascal = snakeToPascal(ident, &pascal_buf);
