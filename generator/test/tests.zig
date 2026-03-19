@@ -222,6 +222,20 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") != null);
     }
 
+    test "deduplicates labelle-core across gfx and engine" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        // gfx and engine must use the project-level core, not their own resolved version
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "gfx_mod.addImport(\"labelle-core\", core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "engine_mod.addImport(\"labelle-core\", core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "engine_mod.addImport(\"labelle-gfx\", gfx_mod)") != null);
+    }
+
     test "gui=clay wires gui_backend" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
