@@ -156,6 +156,18 @@ pub fn generateMainZig(
         }
     }
 
+    // SystemRegistry — auto-discovers and dispatches plugin systems.
+    // Plugins that export `pub const Systems` get their lifecycle functions
+    // called automatically (setup, tick, postTick, drawGui, deinit).
+    if (cfg.plugins.len > 0) {
+        try w.writeAll("const PluginSystems = engine.SystemRegistry(.{\n");
+        try w.writeAll("    @import(\"labelle-gfx\"),\n");
+        for (cfg.plugins) |plugin| {
+            try w.print("    @import(\"{s}\"),\n", .{plugin.name});
+        }
+        try w.writeAll("});\n\n");
+    }
+
     // AllScripts struct — shared by both ScriptRunner (comptime dispatch for game scripts)
     // and ScriptRegistry (scene scripts with init/update/deinit). Generated once, reused below.
     try w.writeAll("const AllScripts = struct {\n");
@@ -205,7 +217,10 @@ pub fn generateMainZig(
     try w.writeAll(shared_render_gizmos);
 
     // ── Lifecycle (backend-specific, uses {{named}} variables) ─────────
-    const tick_code = "        runner.tick(&g, dt);\n";
+    const tick_code = if (cfg.plugins.len > 0)
+        "        runner.tick(&g, dt);\n        PluginSystems.tick(&g, dt);\n        PluginSystems.postTick(&g, dt);\n"
+    else
+        "        runner.tick(&g, dt);\n";
 
     const gui_draw_code = try buildGuiDrawCode(allocator, cfg, view_names);
     defer allocator.free(gui_draw_code);
@@ -353,6 +368,10 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
 
     try w.writeAll("    runner.setup(&g);\n");
 
+    if (cfg.plugins.len > 0) {
+        try w.writeAll("    PluginSystems.setup(&g);\n");
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -367,6 +386,9 @@ fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names
             try w.writeAll("        g.renderAllViews(Views);\n");
         }
         try w.writeAll("        runner.drawGui(&g);\n");
+        if (cfg.plugins.len > 0) {
+            try w.writeAll("        PluginSystems.drawGui(&g);\n");
+        }
         try w.writeAll("        g.guiEnd();\n");
     }
 
@@ -407,6 +429,10 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
 
     try w.writeAll("    runner.setup(&g);\n");
 
+    if (cfg.plugins.len > 0) {
+        try w.writeAll("    PluginSystems.setup(&g);\n");
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -419,6 +445,10 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
         if (gui.lifecycle.shutdown) {
             try w.writeAll("    GuiBackend.shutdown();\n");
         }
+    }
+
+    if (cfg.plugins.len > 0) {
+        try w.writeAll("    PluginSystems.deinit();\n");
     }
 
     try w.writeAll("    runner.deinit();\n");
