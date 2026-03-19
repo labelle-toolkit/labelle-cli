@@ -87,8 +87,13 @@ const Bridges = struct {
     wgpu: ?BridgeDef = null,
 };
 
+const LibraryDef = struct {
+    package: []const u8 = "",
+};
+
 const GuiLabelle = struct {
     name: []const u8,
+    library: LibraryDef = .{},
     rendering: gen.RenderingMode,
     lifecycle: gen.GuiLifecycle = .{},
     bridges: ?Bridges = null,
