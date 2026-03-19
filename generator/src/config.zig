@@ -5,7 +5,6 @@ const std = @import("std");
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu };
 pub const Platform = enum { desktop, ios, android, wasm };
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
-pub const GuiChoice = enum { none, simple, clay, imgui };
 
 /// CLI version — injected from root build.zig via build options.
 pub const CLI_VERSION = @import("build_options").cli_version;
@@ -66,6 +65,41 @@ pub fn localVersionPath(version: []const u8) []const u8 {
     return version["local:".len..];
 }
 
+// ── GUI Plugin System ────────────────────────────────────────────────
+
+/// GUI plugin reference as declared in project.labelle.
+/// Parsed from ZON: `.gui = .{ .path = "../plugins/imgui" }` or
+/// `.gui = .{ .package = "labelle_imgui", .version = "0.2.0" }`.
+/// When null in ProjectConfig, means no GUI (StubGui).
+pub const GuiPlugin = struct {
+    path: ?[]const u8 = null,
+    package: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    hash: ?[]const u8 = null,
+};
+
+/// How a GUI plugin renders — determines whether a bridge is needed.
+pub const RenderingMode = enum { render_interface, raw_backend };
+
+/// Lifecycle hooks declared by a GUI plugin.
+pub const GuiLifecycle = struct {
+    init: bool = false,
+    shutdown: bool = false,
+};
+
+/// Resolved GUI plugin — populated by the CLI after parsing project.labelle
+/// and reading the plugin's gui.labelle manifest. Generators use this,
+/// not the raw GuiPlugin reference.
+pub const ResolvedGui = struct {
+    name: []const u8,
+    rendering: RenderingMode,
+    lifecycle: GuiLifecycle = .{},
+    plugin_dir: []const u8,
+    /// Absolute path to bridge directory (raw_backend only).
+    bridge_dir: ?[]const u8 = null,
+};
+
 pub const ProjectConfig = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -77,7 +111,9 @@ pub const ProjectConfig = struct {
     backend: Backend = .raylib,
     platform: Platform = .desktop,
     ecs: EcsChoice = .mock,
-    gui: GuiChoice = .none,
+    /// GUI plugin reference — parsed from project.labelle.
+    /// null means no GUI (StubGui injected).
+    gui: ?GuiPlugin = null,
     layers: []const LayerDef = &.{
         .{ .name = "background", .order = 0, .space = .screen },
         .{ .name = "world", .order = 1, .space = .world },
@@ -100,6 +136,10 @@ pub const ProjectConfig = struct {
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
 
+    /// Resolved GUI plugin — populated by the CLI after reading gui.labelle manifest.
+    /// NOT parsed from ZON. Generators check this field, not `gui`.
+    resolved_gui: ?ResolvedGui = null,
+
     /// Check if a plugin is enabled by name.
     pub fn hasPlugin(self: ProjectConfig, name: []const u8) bool {
         for (self.plugins) |p| {
@@ -114,5 +154,10 @@ pub const ProjectConfig = struct {
             if (std.mem.eql(u8, p.name, name)) return p;
         }
         return null;
+    }
+
+    /// Returns true if a GUI plugin is resolved and active.
+    pub fn hasGui(self: ProjectConfig) bool {
+        return self.resolved_gui != null;
     }
 };

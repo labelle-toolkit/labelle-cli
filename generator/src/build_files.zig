@@ -43,27 +43,19 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         }
     }
 
-    // For imgui, the imgui dep provides ALL backend modules + gui — no separate backend dep.
-    if (cfg.gui == .imgui) {
-        switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "backend_imgui_raylib", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "backend_imgui_sokol", w),
-            .sdl, .bgfx, .wgpu => {}, // TODO: imgui integration for these backends
-        }
-    } else {
-        switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
-            .sokol => {
-                if (cfg.platform == .wasm) {
-                    try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
-                } else {
-                    try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
-                }
-            },
-            .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
-            .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
-            .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
-        }
+    // Backend dep — always the standard backend (never a merged GUI+backend package)
+    switch (cfg.backend) {
+        .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
+        .sokol => {
+            if (cfg.platform == .wasm) {
+                try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
+            } else {
+                try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
+            }
+        },
+        .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
+        .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
+        .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
     }
 
     switch (cfg.ecs) {
@@ -73,10 +65,16 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         .mr_ecs => try tpl.renderSection(build_zig_tmpl, "ecs_adapter", .{ .ecs_dep_name = "labelle_mr_ecs" }, w),
     }
 
-    switch (cfg.gui) {
-        .none, .imgui => {}, // imgui gui comes from the backend dep
-        .simple => try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_simple_gui" }, w),
-        .clay => try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_clay" }, w),
+    // GUI plugin dep (manifest-driven — no switch on GUI type)
+    if (cfg.resolved_gui != null) {
+        try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_gui" }, w);
+    }
+
+    // Bridge artifact (raw_backend GUIs need a bridge linked into the executable)
+    if (cfg.resolved_gui) |gui| {
+        if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+            try tpl.writeSection(build_zig_tmpl, "gui_bridge", w);
+        }
     }
 
     if (cfg.platform == .wasm) {
@@ -97,7 +95,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         if (cfg.ecs != .mock) {
             try tpl.writeSection(build_zig_tmpl, "wasm_exe_ecs_import", w);
         }
-        if (cfg.gui != .none) {
+        if (cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "wasm_exe_gui_import", w);
         }
 
@@ -121,25 +119,25 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         if (cfg.ecs != .mock) {
             try tpl.writeSection(build_zig_tmpl, "exe_ecs_import", w);
         }
-        if (cfg.gui != .none) {
+        if (cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "exe_gui_import", w);
         }
 
         try tpl.writeSection(build_zig_tmpl, "exe_end", w);
 
-        if (cfg.gui == .imgui) {
-            switch (cfg.backend) {
-                .raylib => try tpl.writeSection(build_zig_tmpl, "link_imgui_raylib", w),
-                .sokol => try tpl.writeSection(build_zig_tmpl, "link_imgui_sokol", w),
-                .sdl, .bgfx, .wgpu => {},
-            }
-        } else {
-            switch (cfg.backend) {
-                .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
-                .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
-                .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
-                .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
-                .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
+        // Link backend artifact
+        switch (cfg.backend) {
+            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
+            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
+            .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
+            .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
+            .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
+        }
+
+        // Link bridge artifact (raw_backend GUIs)
+        if (cfg.resolved_gui) |gui| {
+            if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                try tpl.writeSection(build_zig_tmpl, "link_gui_bridge", w);
             }
         }
 
@@ -207,25 +205,8 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
         try w.writeAll("        },\n");
     }
 
-    // Backend dep — resolved from CLI cache
-    // For imgui with raylib/sokol, the imgui variant replaces the normal backend dep and provides GUI.
-    const use_imgui_backend = cfg.gui == .imgui and (cfg.backend == .raylib or cfg.backend == .sokol);
-    if (use_imgui_backend) {
-        const gui_dep_name: []const u8 = if (cfg.backend == .raylib) "labelle_raylib_imgui" else "labelle_sokol_imgui";
-        const gui_dir: []const u8 = if (cfg.backend == .raylib) "raylib-imgui" else "sokol-imgui";
-
-        var gui_subpath_buf: [128]u8 = undefined;
-        const gui_subpath = std.fmt.bufPrint(&gui_subpath_buf, "gui/{s}", .{gui_dir}) catch unreachable;
-        const gui_path_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, gui_subpath);
-        defer allocator.free(gui_path_abs);
-        const gui_path = try relativePath(allocator, abs_target, gui_path_abs);
-        defer allocator.free(gui_path);
-
-        try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_path", .{
-            .gui_dep_name = gui_dep_name,
-            .gui_path = gui_path,
-        }, w);
-    } else {
+    // Backend dep — always the standard backend (no merged GUI+backend packages)
+    {
         const backend_name = @tagName(cfg.backend);
         var section_buf: [64]u8 = undefined;
         const section = std.fmt.bufPrint(&section_buf, "dep_{s}_path", .{backend_name}) catch unreachable;
@@ -271,25 +252,25 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
         },
     }
 
-    // GUI dep (non-imgui)
-    switch (cfg.gui) {
-        .none, .imgui => {},
-        .simple, .clay => {
-            const gui_dep_name: []const u8 = if (cfg.gui == .simple) "labelle_simple_gui" else "labelle_clay";
-            const gui_dir: []const u8 = if (cfg.gui == .simple) "simple-raylib" else "clay";
+    // GUI plugin dep (manifest-driven)
+    if (cfg.resolved_gui) |gui| {
+        const gui_path = try relativePath(allocator, abs_target, gui.plugin_dir);
+        defer allocator.free(gui_path);
 
-            var gui_subpath_buf: [128]u8 = undefined;
-            const gui_subpath = std.fmt.bufPrint(&gui_subpath_buf, "gui/{s}", .{gui_dir}) catch unreachable;
-            const gui_path_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, gui_subpath);
-            defer allocator.free(gui_path_abs);
-            const gui_path = try relativePath(allocator, abs_target, gui_path_abs);
-            defer allocator.free(gui_path);
+        try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_path", .{
+            .gui_dep_name = "labelle_gui",
+            .gui_path = gui_path,
+        }, w);
 
-            try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_path", .{
-                .gui_dep_name = gui_dep_name,
-                .gui_path = gui_path,
+        // Bridge dep (raw_backend only)
+        if (gui.bridge_dir) |bd| {
+            const bridge_path = try relativePath(allocator, abs_target, bd);
+            defer allocator.free(bridge_path);
+
+            try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_bridge_path", .{
+                .bridge_path = bridge_path,
             }, w);
-        },
+        }
     }
 
     // WASM: emscripten SDK dependency (required by raylib's emccStep)
