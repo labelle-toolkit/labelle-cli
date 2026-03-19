@@ -32,6 +32,12 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-DNO_FONT_AWESOME"},
     });
 
+    // Bridge wrapper: re-exports rlImGui functions under generic imgui_bridge_* names
+    rlimgui_mod.addCSourceFile(.{
+        .file = b.path("src/bridge.c"),
+        .flags = &.{},
+    });
+
     // Include paths: imgui headers from dcimgui, rlImGui's own headers
     rlimgui_mod.addIncludePath(cimgui_dep.path(cimgui_conf.include_dir));
     rlimgui_mod.addIncludePath(dep_rlimgui.path(""));

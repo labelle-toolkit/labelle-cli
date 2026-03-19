@@ -77,7 +77,7 @@ Each GUI plugin ships a `gui.labelle` manifest that declares its build requireme
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Plugin identifier |
-| `library` | Yes | The GUI library dependency (package name, or url+hash) |
+| `library` | Yes | Dependency object for the GUI library (e.g., `.{ .package = "zclay" }` or `.{ .url = "...", .hash = "..." }`) |
 | `rendering` | Yes | `.render_interface` or `.raw_backend` |
 | `lifecycle` | No | Declares `init`/`shutdown` hooks. Default: none |
 | `bridges` | Only if `raw_backend` | Map of backend → bridge adapter package |
