@@ -19,14 +19,7 @@ pub fn build(b: *std.Build) void {
     });
     gui_mod.addImport("cimgui", cimgui_mod);
 
-    // Re-export cimgui module so consumers (bridges, games) can use it
-    _ = b.addModule("cimgui", .{
-        .root_source_file = cimgui_mod.root_source_file.?,
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Re-export cimgui artifact so bridges can link against it
+    // Re-export cimgui artifact so it can be linked into the final executable
     const cimgui_artifact = dep_cimgui.artifact(cimgui_conf.clib_name);
     b.installArtifact(cimgui_artifact);
 }

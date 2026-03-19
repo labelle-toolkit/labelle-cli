@@ -22,6 +22,12 @@ pub fn build(b: *std.Build) !void {
     const engine_dep = b.dependency("engine", .{ .target = target, .optimize = optimize });
     const engine_mod = engine_dep.module("engine");
 
+    // Deduplicate labelle-core across all packages — ensures a single core module
+    // in the build, preventing diamond dependency issues (see #59).
+    gfx_mod.addImport("labelle-core", core_mod);
+    engine_mod.addImport("labelle-core", core_mod);
+    engine_mod.addImport("labelle-gfx", gfx_mod);
+
 .backend_raylib
     const backend_dep = b.dependency("labelle_raylib", .{ .target = target, .optimize = optimize });
     const backend_gfx = backend_dep.module("gfx");
@@ -202,6 +208,9 @@ pub fn build(b: *std.Build) !void {
 
 .link_gui_bridge
     exe.linkLibrary(gui_bridge_artifact);
+
+.link_gui_bridge_wasm
+    wasm.linkLibrary(gui_bridge_artifact);
 
 .footer
     b.installArtifact(exe);

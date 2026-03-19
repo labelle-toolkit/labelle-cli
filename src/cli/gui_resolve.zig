@@ -23,7 +23,9 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, p
     defer allocator.free(manifest_raw);
 
     const manifest_z = try allocator.dupeZ(u8, manifest_raw);
-    defer allocator.free(manifest_z);
+    // Do NOT defer-free manifest_z — the ZON parser returns string slices
+    // that reference this buffer. It must stay alive as long as resolved_gui.
+    errdefer allocator.free(manifest_z);
 
     const manifest = std.zon.parse.fromSlice(GuiLabelle, allocator, manifest_z, null, .{}) catch |err| {
         std.debug.print("labelle: could not parse GUI manifest '{s}': {any}\n", .{ manifest_path, err });

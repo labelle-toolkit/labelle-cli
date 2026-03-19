@@ -70,13 +70,6 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_gui" }, w);
     }
 
-    // Bridge artifact (raw_backend GUIs need a bridge linked into the executable)
-    if (cfg.resolved_gui) |gui| {
-        if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
-            try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
-        }
-    }
-
     if (cfg.platform == .wasm) {
         // WASM: import emsdk helpers from backend
         switch (cfg.backend) {
@@ -107,6 +100,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
             else => {},
         }
 
+        // Link bridge artifact for WASM (raw_backend GUIs)
+        if (cfg.resolved_gui) |gui| {
+            if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
+                try tpl.writeSection(build_zig_tmpl, "link_gui_bridge_wasm", w);
+            }
+        }
+
         try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
     } else {
         // Desktop: build as executable, link natively
@@ -134,9 +135,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
             .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
         }
 
-        // Link bridge artifact (raw_backend GUIs)
+        // Bridge artifact (raw_backend GUIs) — declare + link
         if (cfg.resolved_gui) |gui| {
             if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
                 try tpl.writeSection(build_zig_tmpl, "link_gui_bridge", w);
             }
         }
