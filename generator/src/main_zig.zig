@@ -41,9 +41,10 @@ pub fn generateMainZig(
         .zig_ecs, .zflecs, .mr_ecs => try w.writeAll(shared_ecs_import_adapter),
     }
 
-    switch (cfg.gui) {
-        .none => try w.writeAll(shared_gui_stub),
-        .simple, .clay, .imgui => try w.writeAll(shared_gui_backend),
+    if (cfg.hasGui()) {
+        try w.writeAll(shared_gui_backend);
+    } else {
+        try w.writeAll(shared_gui_stub);
     }
 
     var ident_buf: [256]u8 = undefined;
@@ -321,9 +322,13 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    if (cfg.gui == .imgui) {
-        try w.writeAll("    GuiBackend.init();\n");
-        try w.writeAll("    defer GuiBackend.shutdown();\n\n");
+    if (cfg.resolved_gui) |gui| {
+        if (gui.lifecycle.init) {
+            try w.writeAll("    GuiBackend.init();\n");
+        }
+        if (gui.lifecycle.shutdown) {
+            try w.writeAll("    defer GuiBackend.shutdown();\n\n");
+        }
     }
 
     // ScriptRunner owns all per-script state + shared context
@@ -356,7 +361,7 @@ fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    if (cfg.gui != .none) {
+    if (cfg.hasGui()) {
         try w.writeAll("        g.guiBegin();\n");
         if (view_names.len > 0) {
             try w.writeAll("        g.renderAllViews(Views);\n");
@@ -377,8 +382,10 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    if (cfg.gui == .imgui) {
-        try w.writeAll("    GuiBackend.init();\n");
+    if (cfg.resolved_gui) |gui| {
+        if (gui.lifecycle.init) {
+            try w.writeAll("    GuiBackend.init();\n");
+        }
     }
 
     try w.writeAll("    runner = Runner.init(allocator, &g.ecs_backend);\n");
@@ -408,8 +415,10 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    if (cfg.gui == .imgui) {
-        try w.writeAll("    GuiBackend.shutdown();\n");
+    if (cfg.resolved_gui) |gui| {
+        if (gui.lifecycle.shutdown) {
+            try w.writeAll("    GuiBackend.shutdown();\n");
+        }
     }
 
     try w.writeAll("    runner.deinit();\n");

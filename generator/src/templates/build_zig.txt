@@ -75,25 +75,6 @@ pub fn build(b: *std.Build) !void {
     const backend_window = backend_dep.module("window");
     const glfw_artifact = backend_dep.artifact("glfw");
 
-.backend_imgui_raylib
-    const backend_dep = b.dependency("labelle_raylib_imgui", .{ .target = target, .optimize = optimize });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const gui_mod = backend_dep.module("gui");
-    const raylib_artifact = backend_dep.artifact("raylib");
-    const rlimgui_clib = backend_dep.artifact("rlimgui_clib");
-
-.backend_imgui_sokol
-    const backend_dep = b.dependency("labelle_sokol_imgui", .{ .target = target, .optimize = optimize });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const gui_mod = backend_dep.module("gui");
-    const sokol_clib = backend_dep.artifact("sokol_clib");
-
 .ecs_adapter
     const ecs_dep = b.dependency("{{ecs_dep_name}}", .{ .target = target, .optimize = optimize });
     const ecs_mod = ecs_dep.module("ecs");
@@ -101,6 +82,10 @@ pub fn build(b: *std.Build) !void {
 .gui_backend
     const gui_dep = b.dependency("{{gui_dep_name}}", .{ .target = target, .optimize = optimize });
     const gui_mod = gui_dep.module("gui");
+
+.gui_bridge
+    const bridge_dep = b.dependency("gui_bridge", .{ .target = target, .optimize = optimize });
+    const gui_bridge_artifact = bridge_dep.artifact("{{bridge_artifact_name}}");
 
 .wasm_target
     // WASM/Emscripten: override target so all dependencies build for wasm32-emscripten.
@@ -212,13 +197,6 @@ pub fn build(b: *std.Build) !void {
 .link_sokol
     exe.linkLibrary(sokol_clib);
 
-.link_imgui_raylib
-    exe.linkLibrary(raylib_artifact);
-    exe.linkLibrary(rlimgui_clib);
-
-.link_imgui_sokol
-    exe.linkLibrary(sokol_clib);
-
 .link_sdl
 
 .link_bgfx
@@ -227,6 +205,12 @@ pub fn build(b: *std.Build) !void {
 
 .link_wgpu
     exe.linkLibrary(glfw_artifact);
+
+.link_gui_bridge
+    exe.linkLibrary(gui_bridge_artifact);
+
+.link_gui_bridge_wasm
+    wasm.linkLibrary(gui_bridge_artifact);
 
 .footer
     b.installArtifact(exe);

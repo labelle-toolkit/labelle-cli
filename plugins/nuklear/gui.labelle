@@ -1,0 +1,9 @@
+.{
+    .name = "nuklear",
+    .library = .{ .package = "nuklear" },
+    .rendering = .raw_backend,
+    .lifecycle = .{ .init = true, .shutdown = true },
+    .bridges = .{
+        .raylib = .{ .adapter = "nuklear_raylib_bridge", .path = "./bridges/raylib" },
+    },
+}

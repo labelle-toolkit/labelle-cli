@@ -23,6 +23,7 @@ const clean = @import("cli/clean.zig");
 const config = @import("cli/config.zig");
 const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
+const gui_resolve = @import("cli/gui_resolve.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const serve = @import("cli/serve.zig");
@@ -349,13 +350,17 @@ pub fn main() !void {
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
 
+    // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
+    try gui_resolve.resolveGuiPlugin(allocator, &parsed, project_dir);
+
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
     defer allocator.free(output_dir);
 
+    const gui_label: []const u8 = if (parsed.resolved_gui) |gui| gui.name else "none";
     std.debug.print("labelle: generating '{s}'...\n", .{parsed.name});
     std.debug.print("  backend: {s}  platform: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
-        @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), @tagName(parsed.gui), parsed.width, parsed.height,
+        @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
     });
 
     try gen.generate(allocator, parsed, output_dir, project_dir);

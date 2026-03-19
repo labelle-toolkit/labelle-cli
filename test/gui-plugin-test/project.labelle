@@ -1,0 +1,16 @@
+.{
+    .name = "gui_plugin_test",
+    .title = "GUI Plugin Test",
+    .backend = .raylib,
+    .ecs = .mock,
+    .gui = .{ .path = "../../plugins/imgui" },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../",
+    .layers = .{
+        .{ .name = "background", .order = 0, .space = .screen },
+        .{ .name = "world", .order = 1, .space = .world },
+        .{ .name = "ui", .order = 2, .space = .screen },
+    },
+}

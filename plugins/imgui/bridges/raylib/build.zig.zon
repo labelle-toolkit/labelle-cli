@@ -1,0 +1,24 @@
+.{
+    .name = .rlimgui_bridge,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .rlImGui = .{
+            .url = "https://github.com/raylib-extras/rlImGui/archive/refs/heads/main.tar.gz",
+            .hash = "N-V-__8AAKW_iQAqIz0VKzpwDjcutAHrY1MFFrQFYuTrihyz",
+        },
+        .cimgui = .{
+            .url = "git+https://github.com/floooh/dcimgui.git#4557d7526fdd977f46ca10c2bbdd63532254f8d6",
+            .hash = "cimgui-0.1.0-44ClkXnYlwBKnil7TfCWL9z1Zo_2YJCJREzrpdFiGvA1",
+        },
+        .@"raylib-zig" = .{
+            .url = "https://github.com/raylib-zig/raylib-zig/archive/refs/heads/devel.tar.gz",
+            .hash = "1220be9b99caeccd9be5a29222e6c93db3cb518711853eda4f744d254c88f88aa827",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

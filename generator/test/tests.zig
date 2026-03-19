@@ -57,6 +57,26 @@ const sokol_lifecycle =
 
 const empty_names: []const []const u8 = &.{};
 
+// Helper: create a ResolvedGui for testing (render_interface, no bridge)
+fn testGuiRenderInterface(name: []const u8) generate.ResolvedGui {
+    return .{
+        .name = name,
+        .rendering = .render_interface,
+        .plugin_dir = "/fake/gui/plugin",
+    };
+}
+
+// Helper: create a ResolvedGui for testing (raw_backend with lifecycle + bridge)
+fn testGuiRawBackend(name: []const u8) generate.ResolvedGui {
+    return .{
+        .name = name,
+        .rendering = .raw_backend,
+        .lifecycle = .{ .init = true, .shutdown = true },
+        .plugin_dir = "/fake/gui/plugin",
+        .bridge_dir = "/fake/gui/bridge",
+    };
+}
+
 // ── build.zig.zon generation ─────────────────────────────────────────
 
 pub const BUILD_ZIG_ZON = struct {
@@ -236,15 +256,38 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "engine_mod.addImport(\"labelle-gfx\", gfx_mod)") != null);
     }
 
-    test "gui=clay wires gui_backend" {
+    test "resolved_gui wires gui_backend" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-            .gui = .clay,
+            .resolved_gui = testGuiRenderInterface("clay"),
         });
         defer std.testing.allocator.free(build_zig);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_mod") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_gui") != null);
+    }
+
+    test "resolved_gui raw_backend wires bridge artifact" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"),
+        });
+        defer std.testing.allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_bridge") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_bridge_artifact") != null);
+    }
+
+    test "no gui omits gui_mod" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        });
+        defer std.testing.allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_mod") == null);
     }
 };
 
@@ -379,12 +422,11 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "My Game") != null);
     }
 
-    test "gui=none uses StubGui" {
+    test "no gui uses StubGui" {
         const main_zig = try generate.generateMainZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-            .gui = .none,
         }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
@@ -392,24 +434,63 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "gui_backend") == null);
     }
 
-    test "gui=clay wires gui_backend in zon and main.zig" {
-        const zon = try generate.generateBuildZigZon(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-            .gui = .clay,
-        }, null, null);
-        defer std.testing.allocator.free(zon);
-        try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_clay") != null);
-
+    test "resolved_gui wires gui_backend in main.zig" {
         const main_zig = try generate.generateMainZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-            .gui = .clay,
+            .resolved_gui = testGuiRenderInterface("clay"),
         }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "gui_backend") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "StubGui") == null);
+    }
+
+    test "resolved_gui with lifecycle generates init/shutdown" {
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"),
+        }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") != null);
+    }
+
+    test "resolved_gui render_interface omits init/shutdown" {
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resolved_gui = testGuiRenderInterface("clay"),
+        }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") == null);
+    }
+
+    test "resolved_gui in zon includes labelle_gui dep" {
+        const zon = try generate.generateBuildZigZon(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resolved_gui = testGuiRenderInterface("clay"),
+        }, null, null);
+        defer std.testing.allocator.free(zon);
+        try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_gui") != null);
+    }
+
+    test "resolved_gui raw_backend in zon includes gui_bridge dep" {
+        const zon = try generate.generateBuildZigZon(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"),
+        }, null, null);
+        defer std.testing.allocator.free(zon);
+        try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_gui") != null);
+        try std.testing.expect(std.mem.indexOf(u8, zon, "gui_bridge") != null);
     }
 
     test "sets renderer screen height" {
@@ -491,6 +572,19 @@ pub const SOKOL = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"main_menu\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") == null);
+    }
+
+    test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {
+        const main_zig = try generate.generateMainZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"),
+        }, sokol_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") != null);
     }
 };
 
@@ -639,7 +733,7 @@ pub const VIEWS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-            .gui = .simple,
+            .resolved_gui = testGuiRenderInterface("clay"),
         }, raylib_lifecycle, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, views, empty_names);
         defer std.testing.allocator.free(main_zig);
 
