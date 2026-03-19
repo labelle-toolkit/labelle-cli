@@ -33,16 +33,6 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
     }
 
-    // Shared framework dep overrides — ensures plugins use the same package
-    // instances as the game, preventing type mismatches (RFC #42).
-    if (cfg.plugins.len > 0) {
-        try w.writeByte('\n');
-        for (cfg.plugins) |plugin| {
-            try w.print("    plugin_{s}_mod.addImport(\"labelle-core\", core_mod);\n", .{plugin.name});
-            try w.print("    plugin_{s}_mod.addImport(\"labelle-gfx\", gfx_mod);\n", .{plugin.name});
-        }
-    }
-
     // Backend dep — always the standard backend (never a merged GUI+backend package)
     switch (cfg.backend) {
         .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
@@ -68,6 +58,34 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     // GUI plugin dep (manifest-driven — no switch on GUI type)
     if (cfg.resolved_gui != null) {
         try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_gui" }, w);
+    }
+
+    // Inject shared modules into plugins — ensures all plugins use the same
+    // package instances and have access to engine subsystems (#42, #61).
+    if (cfg.plugins.len > 0) {
+        try w.writeByte('\n');
+        for (cfg.plugins) |plugin| {
+            // Core + gfx — always available
+            try w.print("    plugin_{s}_mod.addImport(\"labelle-core\", core_mod);\n", .{plugin.name});
+            try w.print("    plugin_{s}_mod.addImport(\"labelle-gfx\", gfx_mod);\n", .{plugin.name});
+            try w.print("    plugin_{s}_mod.addImport(\"labelle-engine\", engine_mod);\n", .{plugin.name});
+
+            // ECS backend — gives plugins Ecs(Backend) access for entity queries
+            if (cfg.ecs != .mock) {
+                try w.print("    plugin_{s}_mod.addImport(\"ecs_backend\", ecs_mod);\n", .{plugin.name});
+            }
+
+            // Backend modules — rendering, input, audio, window
+            try w.print("    plugin_{s}_mod.addImport(\"backend_gfx\", backend_gfx);\n", .{plugin.name});
+            try w.print("    plugin_{s}_mod.addImport(\"backend_input\", backend_input);\n", .{plugin.name});
+            try w.print("    plugin_{s}_mod.addImport(\"backend_audio\", backend_audio);\n", .{plugin.name});
+            try w.print("    plugin_{s}_mod.addImport(\"backend_window\", backend_window);\n", .{plugin.name});
+
+            // GUI backend — if a GUI plugin is active
+            if (cfg.hasGui()) {
+                try w.print("    plugin_{s}_mod.addImport(\"gui_backend\", gui_mod);\n", .{plugin.name});
+            }
+        }
     }
 
     if (cfg.platform == .wasm) {
