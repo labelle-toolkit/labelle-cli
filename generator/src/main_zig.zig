@@ -370,6 +370,7 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
 
     if (cfg.plugins.len > 0) {
         try w.writeAll("    PluginSystems.setup(&g);\n");
+        try w.writeAll("    defer PluginSystems.deinit();\n");
     }
 
     return buf.toOwnedSlice(allocator);
