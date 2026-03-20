@@ -222,12 +222,16 @@ pub fn build(b: *std.Build) !void {
     run_step.dependOn(&run_cmd.step);
 }
 
-/// Override a module import without leaking the old key.
-/// Zig's addImport re-allocates the key even when replacing, causing GPA leaks.
+/// Override a module import without leaking memory.
+/// Zig's addImport always calls b.dupe(name), leaking the old key on replacement
+/// and creating unnecessary allocations for new keys. This function accesses the
+/// import_table directly: reuses existing keys and avoids b.dupe entirely.
 fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
-    if (m.import_table.getPtr(name)) |ptr| {
-        ptr.* = module;
-    } else {
-        m.addImport(name, module);
+    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    if (!gop.found_existing) {
+        // New import — store our key (string literal from generated code, lives forever)
+        gop.key_ptr.* = name;
     }
+    // Replace value (existing or new)
+    gop.value_ptr.* = module;
 }
