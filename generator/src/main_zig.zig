@@ -223,9 +223,9 @@ pub fn generateMainZig(
 
     // ── Lifecycle (backend-specific, uses {{named}} variables) ─────────
     const tick_code = if (cfg.plugins.len > 0)
-        "        runner.tick(&g, dt);\n        PluginSystems.tick(&g, dt);\n        PluginSystems.postTick(&g, dt);\n"
+        "        const scaled_dt = dt * g.time_scale;\n        if (scaled_dt > 0) {\n            runner.tick(&g, scaled_dt);\n            PluginSystems.tick(&g, scaled_dt);\n            PluginSystems.postTick(&g, scaled_dt);\n        }\n"
     else
-        "        runner.tick(&g, dt);\n";
+        "        const scaled_dt = dt * g.time_scale;\n        if (scaled_dt > 0) {\n            runner.tick(&g, scaled_dt);\n        }\n";
 
     const gui_draw_code = try buildGuiDrawCode(allocator, cfg, view_names);
     defer allocator.free(gui_draw_code);
