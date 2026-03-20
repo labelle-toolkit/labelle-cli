@@ -85,7 +85,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_raylib") != null);
@@ -98,7 +98,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .zig_ecs,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_raylib") != null);
@@ -110,7 +110,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_sdl") != null);
@@ -123,7 +123,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .bgfx,
             .ecs = .mock,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_bgfx") != null);
@@ -135,7 +135,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .wgpu,
             .ecs = .mock,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_wgpu") != null);
@@ -148,7 +148,7 @@ pub const BUILD_ZIG_ZON = struct {
             .backend = .raylib,
             .ecs = .mock,
             .version = "1.2.3",
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, ".version = \"1.2.3\"") != null);
@@ -160,7 +160,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, ".version = \"0.1.0\"") != null);
@@ -171,7 +171,7 @@ pub const BUILD_ZIG_ZON = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, ".path =") != null);
@@ -300,7 +300,7 @@ pub const PLUGINS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = &.{},
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_pathfinding") == null);
@@ -336,7 +336,7 @@ pub const PLUGINS = struct {
                 .{ .name = "pathfinding", .repo = "github.com/labelle-toolkit/labelle-pathfinding", .version = "0.1.0" },
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
             },
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_pathfinding") != null);
@@ -442,7 +442,7 @@ pub const PLUGINS = struct {
             .plugins = &.{
                 .{ .name = "pathfinding", .repo = "github.com/labelle-toolkit/labelle-pathfinding", .version = "0.1.0" },
             },
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
 
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_pathfinding") != null);
@@ -549,7 +549,7 @@ pub const MAIN_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_gui") != null);
     }
@@ -560,7 +560,7 @@ pub const MAIN_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRawBackend("imgui"),
-        }, null, null);
+        }, null, null, null);
         defer std.testing.allocator.free(zon);
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_gui") != null);
         try std.testing.expect(std.mem.indexOf(u8, zon, "gui_bridge") != null);

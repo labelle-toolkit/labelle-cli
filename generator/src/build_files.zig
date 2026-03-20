@@ -172,13 +172,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
 // build.zig.zon generator
 // ============================================================
 
-pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, project_dir: ?[]const u8) ![]const u8 {
+pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    // Try to create deps/ hardlinks for short paths
-    const resolved_deps: ?[]const deps_linker.DepEntry = if (target_dir != null and project_dir != null)
-        deps_linker.createDepsLinks(allocator, cfg, target_dir.?, project_dir.?) catch null
+    // Create deps/ hardlinks in .labelle/deps/ (shared across targets)
+    const deps_parent = output_dir orelse target_dir;
+    const resolved_deps: ?[]const deps_linker.DepEntry = if (deps_parent != null and project_dir != null)
+        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?) catch null
     else
         null;
 
@@ -193,10 +194,11 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
 
     if (resolved_deps) |deps| {
         defer allocator.free(deps);
-        // Short deps/ paths via hardlinks (strings in DepEntry are arena-managed)
+        // Deps are at .labelle/deps/, zon is at .labelle/<target>/
+        const prefix = if (output_dir != null and target_dir != null) "../deps" else "deps";
         for (deps) |dep| {
             try w.print("        .{s} = .{{\n", .{dep.zon_name});
-            try w.print("            .path = \"deps/{s}\",\n", .{dep.link_name});
+            try w.print("            .path = \"{s}/{s}\",\n", .{ prefix, dep.link_name });
             try w.writeAll("        },\n");
         }
     } else {

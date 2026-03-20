@@ -92,7 +92,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     try scanner.copyDirRecursive(allocator, game_dir, target_dir, "assets");
 
     // Generate build.zig.zon
-    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, game_dir);
+    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir);
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
 
