@@ -1,0 +1,12 @@
+.{
+    .fingerprint = 0xa47e4b13c1d8fcf2,
+    .name = .labelle_debug,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

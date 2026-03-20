@@ -4,6 +4,9 @@
     .backend = .raylib,
     .ecs = .mock,
     .gui = .{ .path = "../../plugins/nuklear" },
+    .plugins = .{
+        .{ .name = "debug", .repo = "local:../../plugins/debug" },
+    },
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
