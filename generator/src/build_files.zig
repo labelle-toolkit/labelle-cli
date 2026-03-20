@@ -3,6 +3,7 @@ const std = @import("std");
 const tpl = @import("template.zig");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+pub const deps_linker = @import("deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -175,12 +176,11 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    // Resolve target dir to absolute for relative path computation
-    const abs_target: ?[]const u8 = if (target_dir) |td|
-        std.fs.cwd().realpathAlloc(allocator, td) catch null
+    // Try to create deps/ hardlinks for short paths
+    const resolved_deps: ?[]const deps_linker.DepEntry = if (target_dir != null and project_dir != null)
+        deps_linker.createDepsLinks(allocator, cfg, target_dir.?, project_dir.?) catch null
     else
         null;
-    defer if (abs_target) |at| allocator.free(at);
 
     var hash: u64 = 0x517cc1b727220a95;
     for (cfg.name) |c| {
@@ -191,109 +191,19 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
 
     try tpl.renderSection(build_zig_zon_tmpl, "header", .{ .hash = hash_str, .version = cfg.version }, w);
 
-    // Resolve framework package paths via cache, then make relative to target dir
-    const core_path_abs = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
-    defer allocator.free(core_path_abs);
-    const core_path = try relativePath(allocator, abs_target, core_path_abs);
-    defer allocator.free(core_path);
-
-    const gfx_path_abs = try cache.resolveFrameworkPackage(allocator, "gfx", cfg.gfx_version, project_dir);
-    defer allocator.free(gfx_path_abs);
-    const gfx_path = try relativePath(allocator, abs_target, gfx_path_abs);
-    defer allocator.free(gfx_path);
-
-    const engine_path_abs = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, project_dir);
-    defer allocator.free(engine_path_abs);
-    const engine_path = try relativePath(allocator, abs_target, engine_path_abs);
-    defer allocator.free(engine_path);
-
-    try tpl.renderSection(build_zig_zon_tmpl, "dep_core_path", .{
-        .core_path = core_path,
-        .gfx_path = gfx_path,
-        .engine_path = engine_path,
-    }, w);
-
-    // Plugin deps (for all declared plugins)
-    for (cfg.plugins) |plugin| {
-        const plugin_path_abs = try cache.resolvePlugin(allocator, plugin, project_dir);
-        defer allocator.free(plugin_path_abs);
-        const plugin_path = try relativePath(allocator, abs_target, plugin_path_abs);
-        defer allocator.free(plugin_path);
-
-        try w.print("        .labelle_{s} = .{{\n", .{plugin.name});
-        try w.print("            .path = \"{s}\",\n", .{plugin_path});
-        try w.writeAll("        },\n");
-    }
-
-    // Backend dep — always the standard backend (no merged GUI+backend packages)
-    {
-        const backend_name = @tagName(cfg.backend);
-        var section_buf: [64]u8 = undefined;
-        const section = std.fmt.bufPrint(&section_buf, "dep_{s}_path", .{backend_name}) catch unreachable;
-
-        var backend_subpath_buf: [128]u8 = undefined;
-        const backend_subpath = std.fmt.bufPrint(&backend_subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
-        const backend_path_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, backend_subpath);
-        defer allocator.free(backend_path_abs);
-        const backend_path = try relativePath(allocator, abs_target, backend_path_abs);
-        defer allocator.free(backend_path);
-
-        try tpl.renderSection(build_zig_zon_tmpl, section, .{ .backend_path = backend_path }, w);
-    }
-
-    // ECS adapter dep — resolved from CLI cache
-    switch (cfg.ecs) {
-        .mock => {},
-        .zig_ecs, .zflecs, .mr_ecs => {
-            const ecs_dep_name: []const u8 = switch (cfg.ecs) {
-                .zig_ecs => "labelle_zig_ecs",
-                .zflecs => "labelle_zflecs",
-                .mr_ecs => "labelle_mr_ecs",
-                .mock => unreachable,
-            };
-            const ecs_dir: []const u8 = switch (cfg.ecs) {
-                .zig_ecs => "zig-ecs",
-                .zflecs => "zflecs",
-                .mr_ecs => "mr-ecs",
-                .mock => unreachable,
-            };
-
-            var ecs_subpath_buf: [128]u8 = undefined;
-            const ecs_subpath = std.fmt.bufPrint(&ecs_subpath_buf, "ecs/{s}", .{ecs_dir}) catch unreachable;
-            const ecs_path_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, ecs_subpath);
-            defer allocator.free(ecs_path_abs);
-            const ecs_path = try relativePath(allocator, abs_target, ecs_path_abs);
-            defer allocator.free(ecs_path);
-
-            try tpl.renderSection(build_zig_zon_tmpl, "dep_ecs_path", .{
-                .ecs_dep_name = ecs_dep_name,
-                .ecs_path = ecs_path,
-            }, w);
-        },
-    }
-
-    // GUI plugin dep (manifest-driven)
-    if (cfg.resolved_gui) |gui| {
-        const gui_path = try relativePath(allocator, abs_target, gui.plugin_dir);
-        defer allocator.free(gui_path);
-
-        try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_path", .{
-            .gui_dep_name = "labelle_gui",
-            .gui_path = gui_path,
-        }, w);
-
-        // Bridge dep (raw_backend only)
-        if (gui.bridge_dir) |bd| {
-            const bridge_path = try relativePath(allocator, abs_target, bd);
-            defer allocator.free(bridge_path);
-
-            try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_bridge_path", .{
-                .bridge_path = bridge_path,
-            }, w);
+    if (resolved_deps) |deps| {
+        defer allocator.free(deps);
+        // Short deps/ paths via hardlinks (strings in DepEntry are arena-managed)
+        for (deps) |dep| {
+            try w.print("        .{s} = .{{\n", .{dep.zon_name});
+            try w.print("            .path = \"deps/{s}\",\n", .{dep.link_name});
+            try w.writeAll("        },\n");
         }
+    } else {
+        // Fallback: relative paths (for tests without target_dir)
+        try generateZonPathsFallback(allocator, cfg, target_dir, project_dir, w);
     }
 
-    // WASM: emscripten SDK dependency (required by raylib's emccStep)
     if (cfg.platform == .wasm) {
         try tpl.writeSection(build_zig_zon_tmpl, "dep_emsdk", w);
     }
@@ -301,6 +211,77 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     try tpl.writeSection(build_zig_zon_tmpl, "footer", w);
 
     return buf.toOwnedSlice(allocator);
+}
+
+/// Fallback: compute relative paths when deps/ symlinks aren't available.
+fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, project_dir: ?[]const u8, w: anytype) !void {
+    const abs_target: ?[]const u8 = if (target_dir) |td|
+        std.fs.cwd().realpathAlloc(allocator, td) catch null
+    else
+        null;
+    defer if (abs_target) |at| allocator.free(at);
+
+    const core_abs = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
+    defer allocator.free(core_abs);
+    const core_path = try relativePath(allocator, abs_target, core_abs);
+    defer allocator.free(core_path);
+    const gfx_abs = try cache.resolveFrameworkPackage(allocator, "gfx", cfg.gfx_version, project_dir);
+    defer allocator.free(gfx_abs);
+    const gfx_path = try relativePath(allocator, abs_target, gfx_abs);
+    defer allocator.free(gfx_path);
+    const engine_abs = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, project_dir);
+    defer allocator.free(engine_abs);
+    const engine_path = try relativePath(allocator, abs_target, engine_abs);
+    defer allocator.free(engine_path);
+
+    try tpl.renderSection(build_zig_zon_tmpl, "dep_core_path", .{ .core_path = core_path, .gfx_path = gfx_path, .engine_path = engine_path }, w);
+
+    for (cfg.plugins) |plugin| {
+        const p_abs = try cache.resolvePlugin(allocator, plugin, project_dir);
+        defer allocator.free(p_abs);
+        const p = try relativePath(allocator, abs_target, p_abs);
+        defer allocator.free(p);
+        try w.print("        .labelle_{s} = .{{ .path = \"{s}\" }},\n", .{ plugin.name, p });
+    }
+
+    {
+        const bn = @tagName(cfg.backend);
+        var sb: [64]u8 = undefined;
+        const section = std.fmt.bufPrint(&sb, "dep_{s}_path", .{bn}) catch unreachable;
+        var spb: [128]u8 = undefined;
+        const sp = std.fmt.bufPrint(&spb, "backends/{s}", .{bn}) catch unreachable;
+        const bp_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, sp);
+        defer allocator.free(bp_abs);
+        const bp = try relativePath(allocator, abs_target, bp_abs);
+        defer allocator.free(bp);
+        try tpl.renderSection(build_zig_zon_tmpl, section, .{ .backend_path = bp }, w);
+    }
+
+    switch (cfg.ecs) {
+        .mock => {},
+        .zig_ecs, .zflecs, .mr_ecs => {
+            const dn: []const u8 = switch (cfg.ecs) { .zig_ecs => "labelle_zig_ecs", .zflecs => "labelle_zflecs", .mr_ecs => "labelle_mr_ecs", .mock => unreachable };
+            const dd: []const u8 = switch (cfg.ecs) { .zig_ecs => "zig-ecs", .zflecs => "zflecs", .mr_ecs => "mr-ecs", .mock => unreachable };
+            var spb: [128]u8 = undefined;
+            const sp = std.fmt.bufPrint(&spb, "ecs/{s}", .{dd}) catch unreachable;
+            const ep_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, sp);
+            defer allocator.free(ep_abs);
+            const ep = try relativePath(allocator, abs_target, ep_abs);
+            defer allocator.free(ep);
+            try tpl.renderSection(build_zig_zon_tmpl, "dep_ecs_path", .{ .ecs_dep_name = dn, .ecs_path = ep }, w);
+        },
+    }
+
+    if (cfg.resolved_gui) |gui| {
+        const gp = try relativePath(allocator, abs_target, gui.plugin_dir);
+        defer allocator.free(gp);
+        try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_path", .{ .gui_dep_name = "labelle_gui", .gui_path = gp }, w);
+        if (gui.bridge_dir) |bd| {
+            const bp = try relativePath(allocator, abs_target, bd);
+            defer allocator.free(bp);
+            try tpl.renderSection(build_zig_zon_tmpl, "dep_gui_bridge_path", .{ .bridge_path = bp }, w);
+        }
+    }
 }
 
 /// Compute a relative path from `from_dir` to `to_path`.
