@@ -66,25 +66,25 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     if (cfg.plugins.len > 0) {
         try w.writeByte('\n');
         for (cfg.plugins) |plugin| {
-            // Core + gfx — always available
-            try w.print("    plugin_{s}_mod.addImport(\"labelle-core\", core_mod);\n", .{plugin.name});
-            try w.print("    plugin_{s}_mod.addImport(\"labelle-gfx\", gfx_mod);\n", .{plugin.name});
-            try w.print("    plugin_{s}_mod.addImport(\"labelle-engine\", engine_mod);\n", .{plugin.name});
+            // Core + gfx + engine — use overrideImport to avoid GPA leaks
+            try w.print("    overrideImport(plugin_{s}_mod, \"labelle-core\", core_mod);\n", .{plugin.name});
+            try w.print("    overrideImport(plugin_{s}_mod, \"labelle-gfx\", gfx_mod);\n", .{plugin.name});
+            try w.print("    overrideImport(plugin_{s}_mod, \"labelle-engine\", engine_mod);\n", .{plugin.name});
 
-            // ECS backend — gives plugins Ecs(Backend) access for entity queries
+            // ECS backend
             if (cfg.ecs != .mock) {
-                try w.print("    plugin_{s}_mod.addImport(\"ecs_backend\", ecs_mod);\n", .{plugin.name});
+                try w.print("    overrideImport(plugin_{s}_mod, \"ecs_backend\", ecs_mod);\n", .{plugin.name});
             }
 
-            // Backend modules — rendering, input, audio, window
-            try w.print("    plugin_{s}_mod.addImport(\"backend_gfx\", backend_gfx);\n", .{plugin.name});
-            try w.print("    plugin_{s}_mod.addImport(\"backend_input\", backend_input);\n", .{plugin.name});
-            try w.print("    plugin_{s}_mod.addImport(\"backend_audio\", backend_audio);\n", .{plugin.name});
-            try w.print("    plugin_{s}_mod.addImport(\"backend_window\", backend_window);\n", .{plugin.name});
+            // Backend modules
+            try w.print("    overrideImport(plugin_{s}_mod, \"backend_gfx\", backend_gfx);\n", .{plugin.name});
+            try w.print("    overrideImport(plugin_{s}_mod, \"backend_input\", backend_input);\n", .{plugin.name});
+            try w.print("    overrideImport(plugin_{s}_mod, \"backend_audio\", backend_audio);\n", .{plugin.name});
+            try w.print("    overrideImport(plugin_{s}_mod, \"backend_window\", backend_window);\n", .{plugin.name});
 
-            // GUI backend — if a GUI plugin is active
+            // GUI backend
             if (cfg.hasGui()) {
-                try w.print("    plugin_{s}_mod.addImport(\"gui_backend\", gui_mod);\n", .{plugin.name});
+                try w.print("    overrideImport(plugin_{s}_mod, \"gui_backend\", gui_mod);\n", .{plugin.name});
             }
         }
     }
