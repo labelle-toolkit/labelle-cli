@@ -9,4 +9,5 @@ const AssembledGame = engine.GameConfig(
     *GameHooks,
     LogSink,
     Components,
+    DiscoveredGizmoCategories,
 );

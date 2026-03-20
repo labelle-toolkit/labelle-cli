@@ -4,19 +4,141 @@ const std = @import("std");
 const core = @import("labelle-core");
 const Position = core.Position;
 
+var debug_visible: bool = false;
 var show_entities: bool = false;
+var show_perf: bool = true;
 var time_scale_slider: f32 = 1.0;
 var selected_entity: ?u32 = null;
+
+/// Set to false to completely disable the debug inspector (e.g. for shipping builds).
+/// Games can set this in setup: `@import("debug").enabled = false;`
+pub var enabled: bool = true;
+
+/// Key to toggle the debug inspector. Default: F12 (301).
+pub var toggle_key: u32 = 301;
 
 const MAX_COMPONENTS: usize = 32;
 var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 
+// FPS tracking
+const FPS_HISTORY: usize = 120;
+var frame_times: [FPS_HISTORY]f32 = [_]f32{0} ** FPS_HISTORY;
+var frame_index: usize = 0;
+var last_time: ?i64 = null;
+var fps_avg: f32 = 0;
+var fps_min: f32 = 0;
+var fps_max: f32 = 0;
+var frame_ms: f32 = 0;
+
+fn updateFpsTracking() void {
+    const now = std.time.milliTimestamp();
+    if (last_time) |prev| {
+        const delta_ms: f32 = @floatFromInt(now - prev);
+        frame_times[frame_index] = delta_ms;
+        frame_index = (frame_index + 1) % FPS_HISTORY;
+        frame_ms = delta_ms;
+
+        // Compute stats from history
+        var sum: f32 = 0;
+        var min: f32 = 9999;
+        var max: f32 = 0;
+        var count: usize = 0;
+        for (frame_times) |t| {
+            if (t > 0) {
+                sum += t;
+                if (t < min) min = t;
+                if (t > max) max = t;
+                count += 1;
+            }
+        }
+        if (count > 0) {
+            const avg = sum / @as(f32, @floatFromInt(count));
+            fps_avg = if (avg > 0) 1000.0 / avg else 0;
+            fps_min = if (max > 0) 1000.0 / max else 0;
+            fps_max = if (min > 0) 1000.0 / min else 0;
+        }
+    }
+    last_time = now;
+}
+
 pub const Systems = struct {
     pub fn drawGui(game: anytype) void {
+        if (!enabled) return;
+
         const Gui = @TypeOf(game.*).Gui;
         if (!Gui.supportsWidgets()) return;
 
+        // F12 toggles visibility
+        if (game.isKeyPressed(toggle_key)) {
+            debug_visible = !debug_visible;
+        }
+
+        // Always track FPS even when hidden
+        updateFpsTracking();
+
+        if (!debug_visible) return;
+
         if (Gui.beginWindow("Debug Inspector")) {
+            // ── FPS (always visible) ──
+            var fps_buf: [64]u8 = undefined;
+            Gui.label(std.fmt.bufPrintZ(&fps_buf, "FPS: {d:.0} | Frame: {d:.1}ms", .{ fps_avg, frame_ms }) catch "?");
+
+            if (show_perf) {
+                var perf_buf: [64]u8 = undefined;
+                Gui.label(std.fmt.bufPrintZ(&perf_buf, "Min: {d:.0} Avg: {d:.0} Max: {d:.0}", .{ fps_min, fps_avg, fps_max }) catch "?");
+
+                // Mini frame time graph via text bars
+                var graph_buf: [64]u8 = undefined;
+                const bar_len: usize = 40;
+                var bar: [bar_len]u8 = undefined;
+                const max_ms: f32 = 33.3; // 30 FPS = one full bar
+                for (0..bar_len) |i| {
+                    const idx = (frame_index + FPS_HISTORY - bar_len + i) % FPS_HISTORY;
+                    const t = frame_times[idx];
+                    const ratio = @min(t / max_ms, 1.0);
+                    bar[i] = if (ratio > 0.8) '!' else if (ratio > 0.5) '#' else if (ratio > 0.2) '=' else '.';
+                }
+                bar[bar_len - 1] = 0;
+                Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0 .. bar_len - 1 :0]}) catch "?");
+            }
+            // Script profiling (debug builds only)
+            if (game.script_profile_ptr) |ptr| {
+                const ProfileEntry = struct { name: []const u8, tick_ns: u64, draw_gui_ns: u64 };
+                const entries: [*]const ProfileEntry = @ptrCast(@alignCast(ptr));
+                const count = game.script_profile_count;
+
+                Gui.spacing();
+                Gui.label("Scripts:");
+                for (0..count) |i| {
+                    const e = entries[i];
+                    const tick_us = @as(f64, @floatFromInt(e.tick_ns)) / 1000.0;
+                    const gui_us = @as(f64, @floatFromInt(e.draw_gui_ns)) / 1000.0;
+                    var sbuf: [96]u8 = undefined;
+                    Gui.label(std.fmt.bufPrintZ(&sbuf, "  {s}: tick={d:.0}us gui={d:.0}us", .{ e.name, tick_us, gui_us }) catch "?");
+                }
+            }
+
+            if (game.plugin_profile_ptr) |ptr| {
+                const PluginEntry = struct { name: []const u8, tick_ns: u64, post_tick_ns: u64, draw_gui_ns: u64 };
+                const entries: [*]const PluginEntry = @ptrCast(@alignCast(ptr));
+                const count = game.plugin_profile_count;
+
+                Gui.spacing();
+                Gui.label("Plugins:");
+                for (0..count) |i| {
+                    const e = entries[i];
+                    const tick_us = @as(f64, @floatFromInt(e.tick_ns)) / 1000.0;
+                    const post_us = @as(f64, @floatFromInt(e.post_tick_ns)) / 1000.0;
+                    const gui_us = @as(f64, @floatFromInt(e.draw_gui_ns)) / 1000.0;
+                    var sbuf: [128]u8 = undefined;
+                    Gui.label(std.fmt.bufPrintZ(&sbuf, "  {s}: tick={d:.0}us post={d:.0}us gui={d:.0}us", .{ e.name, tick_us, post_us, gui_us }) catch "?");
+                }
+            }
+
+            _ = Gui.checkbox("Show Performance", &show_perf);
+
+            Gui.separator();
+
             // ── Stats ──
             if (Gui.treeNode("Stats")) {
                 var buf: [64]u8 = undefined;
@@ -51,9 +173,30 @@ pub const Systems = struct {
 
             Gui.separator();
 
-            var gizmos_on = game.gizmos_enabled;
-            if (Gui.checkbox("Show Gizmos", &gizmos_on)) {
-                game.gizmos_enabled = gizmos_on;
+            if (Gui.treeNode("Gizmos")) {
+                var gizmos_on = game.gizmos_enabled;
+                if (Gui.checkbox("Master Toggle", &gizmos_on)) {
+                    game.gizmos_enabled = gizmos_on;
+                }
+
+                // Category 0 = uncategorized (always present)
+                var cat0_enabled = game.isGizmoCategoryEnabled(0);
+                if (Gui.checkbox("Uncategorized", &cat0_enabled)) {
+                    game.setGizmoCategory(0, cat0_enabled);
+                }
+
+                // Auto-discovered categories from plugins
+                const categories = @TypeOf(game.*).gizmo_categories;
+                for (categories) |cat| {
+                    var cat_on = game.isGizmoCategoryEnabled(cat.id);
+                    var name_buf: [64]u8 = undefined;
+                    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{cat.name}) catch "?";
+                    if (Gui.checkbox(name_z, &cat_on)) {
+                        game.setGizmoCategory(cat.id, cat_on);
+                    }
+                }
+
+                Gui.treePop();
             }
 
             Gui.separator();
@@ -73,7 +216,6 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
     const comp_names = comptime Reg.names();
 
     if (Gui.beginWindow("Entity Browser")) {
-        // Filters
         Gui.label("Filter:");
         inline for (comp_names, 0..) |name, i| {
             if (i < MAX_COMPONENTS) {
@@ -105,7 +247,6 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
                 const entity = result.entity;
                 const pos: *const Position = result.comp_0;
 
-                // Apply filters
                 var passes = true;
                 inline for (comp_names, 0..) |name, i| {
                     if (i < MAX_COMPONENTS and component_filters[i]) {
@@ -118,17 +259,14 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
 
                 Gui.tableNextRow();
 
-                // ID
                 _ = Gui.tableNextColumn();
                 var id_buf: [16]u8 = undefined;
                 Gui.label(std.fmt.bufPrintZ(&id_buf, "{d}", .{entity}) catch "?");
 
-                // Position
                 _ = Gui.tableNextColumn();
                 var pos_buf: [48]u8 = undefined;
                 Gui.label(std.fmt.bufPrintZ(&pos_buf, "({d:.0}, {d:.0})", .{ pos.x, pos.y }) catch "?");
 
-                // Component tags
                 _ = Gui.tableNextColumn();
                 var tags_buf: [256]u8 = undefined;
                 var tags_len: usize = 0;
@@ -148,7 +286,6 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
                     Gui.label(@ptrCast(tags_buf[0..tags_len :0]));
                 }
 
-                // Select button
                 _ = Gui.tableNextColumn();
                 var sel_buf: [24]u8 = undefined;
                 const sel_label = std.fmt.bufPrintZ(&sel_buf, "Select##{d}", .{entity}) catch "?";
@@ -198,7 +335,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
             }
         }
 
-        // Each registered component (skip if name matches a built-in we already showed)
+        // Each registered component
         inline for (comp_names) |name| {
             const T = Reg.getType(name);
             if (game.ecs_backend.getComponent(entity, T)) |comp| {
@@ -218,7 +355,6 @@ fn showStructFields(comptime Gui: type, ptr: anytype, comptime T: type) void {
     if (info != .@"struct") return;
 
     inline for (info.@"struct".fields) |field| {
-        // Skip internal fields (prefixed with _)
         if (field.name[0] == '_') continue;
 
         var buf: [128]u8 = undefined;
@@ -233,10 +369,8 @@ fn deinitIter(iter: anytype, alloc: anytype) void {
     const DeinitFn = @TypeOf(@TypeOf(iter.*).deinit);
     const params = @typeInfo(DeinitFn).@"fn".params;
     if (params.len == 1) {
-        // Mock ECS: deinit(self) only
         iter.deinit();
     } else {
-        // Real ECS: deinit(self, allocator)
         iter.deinit(alloc);
     }
 }
