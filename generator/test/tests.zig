@@ -691,7 +691,7 @@ pub const SCRIPTS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const Runner = engine.ScriptRunner(AllScripts, GameContext, EcsBackend)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "Runner.init(allocator, &g.ecs_backend)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.setup(&g)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.tick(&g, dt)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.tick(&g, scaled_dt)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.deinit()") != null);
     }
 
