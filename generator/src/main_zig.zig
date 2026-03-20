@@ -171,6 +171,12 @@ pub fn generateMainZig(
             try w.print("    @import(\"{s}\"),\n", .{plugin.name});
         }
         try w.writeAll("});\n\n");
+
+        // Gizmo categories — auto-discovered from plugins via SystemRegistry
+        try w.writeAll("const DiscoveredGizmoCategories = PluginSystems.gizmoCategories();\n\n");
+    } else {
+        try w.writeAll("const GizmoCatEntry = struct { name: []const u8, id: u8 };\n");
+        try w.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");
     }
 
     // AllScripts struct — shared by both ScriptRunner (comptime dispatch for game scripts)
@@ -223,9 +229,30 @@ pub fn generateMainZig(
 
     // ── Lifecycle (backend-specific, uses {{named}} variables) ─────────
     const tick_code = if (cfg.plugins.len > 0)
-        "        const scaled_dt = dt * g.time_scale;\n        if (scaled_dt > 0) {\n            runner.tick(&g, scaled_dt);\n            PluginSystems.tick(&g, scaled_dt);\n            PluginSystems.postTick(&g, scaled_dt);\n        }\n"
+        "        const scaled_dt = dt * g.time_scale;\n" ++
+        "        if (scaled_dt > 0) {\n" ++
+        "            runner.tick(&g, scaled_dt);\n" ++
+        "            PluginSystems.tick(&g, scaled_dt);\n" ++
+        "            PluginSystems.postTick(&g, scaled_dt);\n" ++
+        "        }\n" ++
+        "        // Update profiling pointers (debug only)\n" ++
+        "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
+        "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+        "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
+        "        }\n" ++
+        "        if (comptime PluginSystems.profiling_enabled) {\n" ++
+        "            g.plugin_profile_ptr = @ptrCast(&PluginSystems.plugin_profile);\n" ++
+        "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
+        "        }\n"
     else
-        "        const scaled_dt = dt * g.time_scale;\n        if (scaled_dt > 0) {\n            runner.tick(&g, scaled_dt);\n        }\n";
+        "        const scaled_dt = dt * g.time_scale;\n" ++
+        "        if (scaled_dt > 0) {\n" ++
+        "            runner.tick(&g, scaled_dt);\n" ++
+        "        }\n" ++
+        "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
+        "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+        "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
+        "        }\n";
 
     const gui_draw_code = try buildGuiDrawCode(allocator, cfg, view_names);
     defer allocator.free(gui_draw_code);
