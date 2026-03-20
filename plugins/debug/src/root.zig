@@ -187,7 +187,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
 
         Gui.separator();
 
-        // Position (always show)
+        // Position (always show, not in registry)
         if (game.ecs_backend.getComponent(entity, Position)) |pos| {
             if (Gui.treeNode("Position")) {
                 var buf: [64]u8 = undefined;
@@ -198,7 +198,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
             }
         }
 
-        // Each registered component
+        // Each registered component (skip if name matches a built-in we already showed)
         inline for (comp_names) |name| {
             const T = Reg.getType(name);
             if (game.ecs_backend.getComponent(entity, T)) |comp| {
