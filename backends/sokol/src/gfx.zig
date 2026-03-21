@@ -346,14 +346,16 @@ pub fn getScreenHeight() i32 {
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.offset.x) / camera.zoom + camera.target.x,
-        .y = (pos.y - camera.offset.y) / camera.zoom + camera.target.y,
+        // Y is inverted: screen Y-down, world Y-up
+        .y = camera.target.y - (pos.y - camera.offset.y) / camera.zoom,
     };
 }
 
 pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.target.x) * camera.zoom + camera.offset.x,
-        .y = (pos.y - camera.target.y) * camera.zoom + camera.offset.y,
+        // Y is inverted: world Y-up, screen Y-down
+        .y = -(pos.y - camera.target.y) * camera.zoom + camera.offset.y,
     };
 }
 
