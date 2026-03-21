@@ -24,7 +24,10 @@ export fn init() callconv(.c) void {
 export fn frame() callconv(.c) void {
     frame_count +|= 1;
 
-    BackendGfxType.setScreenSize(window.width(), window.height());
+    const actual_w = window.width();
+    const actual_h = window.height();
+    BackendGfxType.setScreenSize(actual_w, actual_h);
+    g.renderer.setScreenHeight(@floatFromInt(actual_h));
     const dt: f32 = 0.016;
 {{tick_code}}    g.tick(dt);
     const pass_action = window.beginFrame();

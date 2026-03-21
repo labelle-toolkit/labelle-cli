@@ -84,12 +84,17 @@ fn toNdcX(px: f32) f32 {
 }
 
 fn toNdcY(py: f32) f32 {
+    const fh = @as(f32, @floatFromInt(screen_h));
     if (!camera_active) {
-        return 1.0 - (py / @as(f32, @floatFromInt(screen_h))) * 2.0;
+        return 1.0 - (py / fh) * 2.0;
     }
     const cam = active_camera;
-    const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
-    return 1.0 - (screen_y / @as(f32, @floatFromInt(screen_h))) * 2.0;
+    // Positions arrive in screen-space (Y-flipped by renderer.toScreenY).
+    // Undo the flip to get world Y-up, apply camera with inverted Y
+    // (screen Y-down vs world Y-up), then convert to NDC.
+    const world_y = fh - py;
+    const screen_y = -(world_y - cam.target.y) * cam.zoom + cam.offset.y;
+    return 1.0 - (screen_y / fh) * 2.0;
 }
 
 // ── Draw primitives (Backend contract) ─────────────────────────────────
