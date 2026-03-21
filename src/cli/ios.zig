@@ -1,7 +1,7 @@
-/// iOS simulator deployment for labelle-cli.
-/// Assembles a .app bundle and deploys to the iOS Simulator via xcrun simctl.
+/// iOS build, deployment, and Xcode project generation for labelle-cli.
 const std = @import("std");
 const gen = @import("generator");
+const runner = @import("runner.zig");
 
 /// Deploy the built iOS binary to the iOS Simulator.
 /// Expects the binary at `target_dir/zig-out/bin/game`.
@@ -280,6 +280,430 @@ fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_na
         \\</plist>
         \\
     , .{ app_name, bundle_id, app_name, orientations, ios_cfg.minimum_ios });
+}
+
+// ============================================================================
+// labelle ios subcommand
+// ============================================================================
+
+/// Handle `labelle ios <subcommand>` — build, xcode, run for iOS.
+pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, cfg: gen.ProjectConfig, target_dir: []const u8) !void {
+    if (args.len == 0) {
+        printIosHelp();
+        return;
+    }
+
+    const subcmd = args[0];
+    const rest = if (args.len > 1) args[1..] else &[_][]const u8{};
+
+    if (std.mem.eql(u8, subcmd, "build")) {
+        var device = false;
+        var release = false;
+        for (rest) |arg| {
+            if (std.mem.eql(u8, arg, "--device") or std.mem.eql(u8, arg, "-d")) device = true;
+            if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) release = true;
+        }
+        try iosBuild(allocator, target_dir, device, release);
+    } else if (std.mem.eql(u8, subcmd, "xcode")) {
+        var team_id: ?[]const u8 = null;
+        for (rest) |arg| {
+            if (std.mem.startsWith(u8, arg, "--team-id=")) team_id = arg["--team-id=".len..];
+        }
+        try iosXcode(allocator, target_dir, cfg, team_id);
+    } else if (std.mem.eql(u8, subcmd, "run")) {
+        var device = false;
+        for (rest) |arg| {
+            if (std.mem.eql(u8, arg, "--device") or std.mem.eql(u8, arg, "-d")) device = true;
+        }
+        if (device) {
+            std.debug.print("labelle: device deployment requires code signing.\n", .{});
+            std.debug.print("  Run 'labelle ios xcode' first, then deploy via Xcode.\n", .{});
+        } else {
+            try iosBuild(allocator, target_dir, false, false);
+            try deployToSimulator(allocator, target_dir, cfg);
+        }
+    } else if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h")) {
+        printIosHelp();
+    } else {
+        std.debug.print("labelle ios: unknown command '{s}'\n\n", .{subcmd});
+        printIosHelp();
+    }
+}
+
+fn printIosHelp() void {
+    std.debug.print(
+        \\iOS Commands
+        \\
+        \\Usage: labelle ios <command> [options]
+        \\
+        \\Commands:
+        \\  build       Build for iOS (simulator by default)
+        \\  xcode       Generate Xcode project for device deployment
+        \\  run         Build and run on simulator
+        \\
+        \\Build Options:
+        \\  --device            Build for iOS device (arm64)
+        \\  --release           Build release configuration
+        \\
+        \\Xcode Options:
+        \\  --team-id=ID        Apple Developer Team ID for signing
+        \\
+        \\Run Options:
+        \\  --device            Deploy to device (requires Xcode signing)
+        \\
+        \\Examples:
+        \\  labelle ios build                Build for iOS simulator
+        \\  labelle ios build --device       Build for iOS device
+        \\  labelle ios xcode                Generate Xcode project
+        \\  labelle ios run                  Run on simulator
+        \\
+    , .{});
+}
+
+/// Build the iOS target (simulator or device).
+fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, release: bool) !void {
+    const target_label: []const u8 = if (device) "iOS device (arm64)" else "iOS simulator (arm64)";
+    const config_label: []const u8 = if (release) "Release" else "Debug";
+    std.debug.print("labelle: building for {s} ({s})...\n", .{ target_label, config_label });
+
+    var argv_buf: [8][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "zig";
+    argc += 1;
+    argv_buf[argc] = "build";
+    argc += 1;
+    if (device) {
+        argv_buf[argc] = "-Ddevice=true";
+        argc += 1;
+    }
+    if (release) {
+        argv_buf[argc] = "-Doptimize=ReleaseFast";
+        argc += 1;
+    }
+
+    const result = try runner.runZig(allocator, target_dir, argv_buf[0..argc]);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            std.debug.print("labelle: build failed:\n{s}\n", .{result.stderr});
+            return error.BuildFailed;
+        },
+        else => {
+            std.debug.print("labelle: build terminated abnormally\n{s}\n", .{result.stderr});
+            return error.BuildFailed;
+        },
+    }
+    std.debug.print("  build ok\n", .{});
+}
+
+/// Generate Xcode project for device deployment and code signing.
+fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, team_id_override: ?[]const u8) !void {
+    const ios_cfg = cfg.ios orelse gen.IosConfig{};
+    const app_name = if (ios_cfg.app_name.len > 0) ios_cfg.app_name else cfg.title;
+    const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else cfg.name;
+    const minimum_ios = ios_cfg.minimum_ios;
+    const team_id = team_id_override orelse if (ios_cfg.team_id.len > 0) ios_cfg.team_id else null;
+
+    // Build for device first
+    std.debug.print("labelle: step 1 — building for device...\n", .{});
+    try iosBuild(allocator, target_dir, true, false);
+
+    // Create xcode output directory next to .labelle/
+    const xcode_dir = try std.fs.path.join(allocator, &.{ target_dir, "..", "..", "ios-xcode" });
+    defer allocator.free(xcode_dir);
+
+    const sanitized = try sanitizeName(allocator, app_name);
+    defer allocator.free(sanitized);
+
+    // Create directory structure
+    const xcodeproj_dir = try std.fmt.allocPrint(allocator, "{s}/{s}.xcodeproj", .{ xcode_dir, sanitized });
+    defer allocator.free(xcodeproj_dir);
+
+    const app_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ xcode_dir, sanitized });
+    defer allocator.free(app_dir);
+
+    const assets_xcassets = try std.fmt.allocPrint(allocator, "{s}/Assets.xcassets/AppIcon.appiconset", .{app_dir});
+    defer allocator.free(assets_xcassets);
+
+    std.fs.cwd().makePath(xcodeproj_dir) catch {};
+    std.fs.cwd().makePath(assets_xcassets) catch {};
+
+    // Copy device binary
+    const binary_src = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
+    defer allocator.free(binary_src);
+
+    const binary_dst = try std.fmt.allocPrint(allocator, "{s}/game", .{app_dir});
+    defer allocator.free(binary_dst);
+
+    std.fs.cwd().copyFile(binary_src, std.fs.cwd(), binary_dst, .{}) catch |err| {
+        std.debug.print("labelle: could not copy binary: {}\n", .{err});
+        std.debug.print("  source: {s}\n", .{binary_src});
+    };
+
+    // Generate Info.plist
+    const info_content = try generateInfoPlist(allocator, bundle_id, app_name, ios_cfg);
+    defer allocator.free(info_content);
+    const info_path = try std.fmt.allocPrint(allocator, "{s}/Info.plist", .{app_dir});
+    defer allocator.free(info_path);
+    {
+        const f = try std.fs.cwd().createFile(info_path, .{});
+        defer f.close();
+        try f.writeAll(info_content);
+    }
+
+    // Generate LaunchScreen.storyboard
+    const launch_content = try generateLaunchScreen(allocator, app_name);
+    defer allocator.free(launch_content);
+    const launch_path = try std.fmt.allocPrint(allocator, "{s}/LaunchScreen.storyboard", .{app_dir});
+    defer allocator.free(launch_path);
+    {
+        const f = try std.fs.cwd().createFile(launch_path, .{});
+        defer f.close();
+        try f.writeAll(launch_content);
+    }
+
+    // Generate Assets.xcassets
+    const assets_json = try std.fmt.allocPrint(allocator, "{s}/Assets.xcassets/Contents.json", .{app_dir});
+    defer allocator.free(assets_json);
+    {
+        const f = try std.fs.cwd().createFile(assets_json, .{});
+        defer f.close();
+        try f.writeAll("{\n  \"info\" : {\n    \"author\" : \"xcode\",\n    \"version\" : 1\n  }\n}");
+    }
+
+    const icon_json = try std.fmt.allocPrint(allocator, "{s}/Contents.json", .{assets_xcassets});
+    defer allocator.free(icon_json);
+    {
+        const f = try std.fs.cwd().createFile(icon_json, .{});
+        defer f.close();
+        try f.writeAll("{\n  \"images\" : [\n    {\n      \"idiom\" : \"universal\",\n      \"platform\" : \"ios\",\n      \"size\" : \"1024x1024\"\n    }\n  ],\n  \"info\" : {\n    \"author\" : \"xcode\",\n    \"version\" : 1\n  }\n}");
+    }
+
+    // Copy assets
+    const game_assets = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
+    defer allocator.free(game_assets);
+    const xcode_assets = try std.fmt.allocPrint(allocator, "{s}/assets", .{app_dir});
+    defer allocator.free(xcode_assets);
+    copyDirectory(allocator, game_assets, xcode_assets) catch {};
+
+    // Generate project.pbxproj
+    const pbxproj_path = try std.fmt.allocPrint(allocator, "{s}/project.pbxproj", .{xcodeproj_dir});
+    defer allocator.free(pbxproj_path);
+
+    const pbxproj = try generatePbxproj(allocator, sanitized, bundle_id, minimum_ios, team_id);
+    defer allocator.free(pbxproj);
+    {
+        const f = try std.fs.cwd().createFile(pbxproj_path, .{});
+        defer f.close();
+        try f.writeAll(pbxproj);
+    }
+
+    std.debug.print("\nlabelle: Xcode project generated!\n", .{});
+    std.debug.print("  location: ios-xcode/{s}.xcodeproj\n\n", .{sanitized});
+    std.debug.print("Next steps:\n", .{});
+    std.debug.print("  1. open ios-xcode/{s}.xcodeproj\n", .{sanitized});
+    std.debug.print("  2. Select your development team in Signing & Capabilities\n", .{});
+    std.debug.print("  3. Build and run on device\n", .{});
+}
+
+/// Sanitize name for identifiers (replace non-alphanumeric with underscores).
+fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var result = try allocator.alloc(u8, name.len);
+    for (name, 0..) |c, i| {
+        result[i] = if (std.ascii.isAlphanumeric(c) or c == '_') c else '_';
+    }
+    return result;
+}
+
+/// Generate Xcode project.pbxproj.
+fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id: []const u8, minimum_ios: []const u8, team_id: ?[]const u8) ![]const u8 {
+    const team_setting: []const u8 = if (team_id) |tid| tid else "";
+    const team_line: []const u8 = if (team_id != null) "                DEVELOPMENT_TEAM = " else "                // DEVELOPMENT_TEAM not set — configure in Xcode";
+
+    return std.fmt.allocPrint(allocator,
+        \\// !$*UTF8*$!
+        \\{{
+        \\    archiveVersion = 1;
+        \\    classes = {{}};
+        \\    objectVersion = 56;
+        \\    objects = {{
+        \\        /* Begin PBXBuildFile section */
+        \\        A1000001 /* game in CopyFiles */ = {{isa = PBXBuildFile; fileRef = A2000001; }};
+        \\        A1000002 /* LaunchScreen.storyboard in Resources */ = {{isa = PBXBuildFile; fileRef = A2000002; }};
+        \\        A1000003 /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = A2000003; }};
+        \\        /* End PBXBuildFile section */
+        \\        /* Begin PBXCopyFilesBuildPhase section */
+        \\        A3000001 = {{
+        \\            isa = PBXCopyFilesBuildPhase;
+        \\            buildActionMask = 2147483647;
+        \\            dstPath = "";
+        \\            dstSubfolderSpec = 6;
+        \\            files = (A1000001);
+        \\            runOnlyForDeploymentPostprocessing = 0;
+        \\        }};
+        \\        /* End PBXCopyFilesBuildPhase section */
+        \\        /* Begin PBXFileReference section */
+        \\        A4000001 /* {s}.app */ = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "{s}.app"; sourceTree = BUILT_PRODUCTS_DIR; }};
+        \\        A2000001 /* game */ = {{isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = game; sourceTree = "<group>"; }};
+        \\        A2000002 /* LaunchScreen.storyboard */ = {{isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; }};
+        \\        A2000003 /* Assets.xcassets */ = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; }};
+        \\        A2000004 /* Info.plist */ = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; }};
+        \\        /* End PBXFileReference section */
+        \\        /* Begin PBXGroup section */
+        \\        A5000001 = {{
+        \\            isa = PBXGroup;
+        \\            children = (A5000002, A5000003);
+        \\            sourceTree = "<group>";
+        \\        }};
+        \\        A5000002 = {{
+        \\            isa = PBXGroup;
+        \\            children = (A2000001, A2000002, A2000003, A2000004);
+        \\            path = "{s}";
+        \\            sourceTree = "<group>";
+        \\        }};
+        \\        A5000003 = {{
+        \\            isa = PBXGroup;
+        \\            children = (A4000001);
+        \\            name = Products;
+        \\            sourceTree = "<group>";
+        \\        }};
+        \\        /* End PBXGroup section */
+        \\        /* Begin PBXNativeTarget section */
+        \\        A6000001 = {{
+        \\            isa = PBXNativeTarget;
+        \\            buildConfigurationList = A7000003;
+        \\            buildPhases = (A3000001, A3000002);
+        \\            buildRules = ();
+        \\            dependencies = ();
+        \\            name = "{s}";
+        \\            productName = "{s}";
+        \\            productReference = A4000001;
+        \\            productType = "com.apple.product-type.application";
+        \\        }};
+        \\        /* End PBXNativeTarget section */
+        \\        /* Begin PBXProject section */
+        \\        A8000001 = {{
+        \\            isa = PBXProject;
+        \\            attributes = {{BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 1500;}};
+        \\            buildConfigurationList = A7000001;
+        \\            compatibilityVersion = "Xcode 14.0";
+        \\            developmentRegion = en;
+        \\            hasScannedForEncodings = 0;
+        \\            knownRegions = (en, Base);
+        \\            mainGroup = A5000001;
+        \\            productRefGroup = A5000003;
+        \\            projectDirPath = "";
+        \\            projectRoot = "";
+        \\            targets = (A6000001);
+        \\        }};
+        \\        /* End PBXProject section */
+        \\        /* Begin PBXResourcesBuildPhase section */
+        \\        A3000002 = {{
+        \\            isa = PBXResourcesBuildPhase;
+        \\            buildActionMask = 2147483647;
+        \\            files = (A1000002, A1000003);
+        \\            runOnlyForDeploymentPostprocessing = 0;
+        \\        }};
+        \\        /* End PBXResourcesBuildPhase section */
+        \\        /* Begin XCBuildConfiguration section */
+        \\        A7000002 /* Debug */ = {{
+        \\            isa = XCBuildConfiguration;
+        \\            buildSettings = {{
+        \\                ALWAYS_SEARCH_USER_PATHS = NO;
+        \\                IPHONEOS_DEPLOYMENT_TARGET = {s};
+        \\                SDKROOT = iphoneos;
+        \\            }};
+        \\            name = Debug;
+        \\        }};
+        \\        A7000004 /* Debug */ = {{
+        \\            isa = XCBuildConfiguration;
+        \\            buildSettings = {{
+        \\                ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+        \\                CODE_SIGN_STYLE = Automatic;
+        \\                CURRENT_PROJECT_VERSION = 1;
+        \\                GENERATE_INFOPLIST_FILE = YES;
+        \\                INFOPLIST_KEY_CFBundleDisplayName = "{s}";
+        \\                INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
+        \\                INFOPLIST_KEY_MinimumOSVersion = {s};
+        \\                INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+        \\                INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+        \\                INFOPLIST_KEY_UIRequiresFullScreen = YES;
+        \\                INFOPLIST_KEY_UIStatusBarHidden = YES;
+        \\                MARKETING_VERSION = 1.0;
+        \\                PRODUCT_BUNDLE_IDENTIFIER = "{s}";
+        \\                PRODUCT_NAME = "$(TARGET_NAME)";
+        \\                TARGETED_DEVICE_FAMILY = "1,2";
+        \\{s}{s};
+        \\            }};
+        \\            name = Debug;
+        \\        }};
+        \\        A7000005 /* Release */ = {{
+        \\            isa = XCBuildConfiguration;
+        \\            buildSettings = {{
+        \\                ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+        \\                CODE_SIGN_STYLE = Automatic;
+        \\                CURRENT_PROJECT_VERSION = 1;
+        \\                GENERATE_INFOPLIST_FILE = YES;
+        \\                INFOPLIST_KEY_CFBundleDisplayName = "{s}";
+        \\                INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
+        \\                INFOPLIST_KEY_MinimumOSVersion = {s};
+        \\                INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+        \\                INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+        \\                INFOPLIST_KEY_UIRequiresFullScreen = YES;
+        \\                INFOPLIST_KEY_UIStatusBarHidden = YES;
+        \\                MARKETING_VERSION = 1.0;
+        \\                PRODUCT_BUNDLE_IDENTIFIER = "{s}";
+        \\                PRODUCT_NAME = "$(TARGET_NAME)";
+        \\                TARGETED_DEVICE_FAMILY = "1,2";
+        \\{s}{s};
+        \\            }};
+        \\            name = Release;
+        \\        }};
+        \\        /* End XCBuildConfiguration section */
+        \\        /* Begin XCConfigurationList section */
+        \\        A7000001 = {{
+        \\            isa = XCConfigurationList;
+        \\            buildConfigurations = (A7000002);
+        \\            defaultConfigurationIsVisible = 0;
+        \\            defaultConfigurationName = Debug;
+        \\        }};
+        \\        A7000003 = {{
+        \\            isa = XCConfigurationList;
+        \\            buildConfigurations = (A7000004, A7000005);
+        \\            defaultConfigurationIsVisible = 0;
+        \\            defaultConfigurationName = Debug;
+        \\        }};
+        \\        /* End XCConfigurationList section */
+        \\    }};
+        \\    rootObject = A8000001;
+        \\}}
+        \\
+    , .{
+        // PBXFileReference
+        app_name,
+        app_name,
+        // PBXGroup
+        app_name,
+        // PBXNativeTarget
+        app_name,
+        app_name,
+        // XCBuildConfiguration - project level
+        minimum_ios,
+        // Debug target config
+        app_name,
+        minimum_ios,
+        bundle_id,
+        team_line,
+        team_setting,
+        // Release target config
+        app_name,
+        minimum_ios,
+        bundle_id,
+        team_line,
+        team_setting,
+    });
 }
 
 /// Generate LaunchScreen.storyboard with centered app name.

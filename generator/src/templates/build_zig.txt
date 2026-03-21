@@ -245,30 +245,49 @@ fn addExeSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile, sdk_path: []const
     exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
 }
 
+/// Link iOS system frameworks on an executable
+fn linkIosFrameworks(exe: *std.Build.Step.Compile) void {
+    exe.root_module.linkFramework("Foundation", .{});
+    exe.root_module.linkFramework("UIKit", .{});
+    exe.root_module.linkFramework("Metal", .{});
+    exe.root_module.linkFramework("MetalKit", .{});
+    exe.root_module.linkFramework("AudioToolbox", .{});
+    exe.root_module.linkFramework("AVFoundation", .{});
+    exe.root_module.linkFramework("QuartzCore", .{});
+}
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
+    const device_mode = b.option(bool, "device", "Build for iOS device instead of simulator") orelse false;
 
-    const sim_sdk = getIosSdkPath(b, "iphonesimulator") orelse
-        @panic("Could not find iOS simulator SDK. Is Xcode installed?");
+    const sdk_name: []const u8 = if (device_mode) "iphoneos" else "iphonesimulator";
+    const sdk_path = getIosSdkPath(b, sdk_name) orelse
+        @panic("Could not find iOS SDK. Is Xcode installed?");
 
-    const ios_sim_target = b.resolveTargetQuery(.{
-        .cpu_arch = .aarch64,
-        .os_tag = .ios,
-        .abi = .simulator,
-        .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a14 },
-    });
+    const ios_target = if (device_mode)
+        b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+        })
+    else
+        b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+            .abi = .simulator,
+            .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a14 },
+        });
 
 .ios_target_alias
-    const target = ios_sim_target;
+    const target = ios_target;
 
 .ios_deps
-    const core_dep = b.dependency("labelle_core", .{ .target = ios_sim_target, .optimize = optimize });
+    const core_dep = b.dependency("labelle_core", .{ .target = ios_target, .optimize = optimize });
     const core_mod = core_dep.module("labelle-core");
 
-    const gfx_dep = b.dependency("labelle_gfx", .{ .target = ios_sim_target, .optimize = optimize });
+    const gfx_dep = b.dependency("labelle_gfx", .{ .target = ios_target, .optimize = optimize });
     const gfx_mod = gfx_dep.module("labelle-gfx");
 
-    const engine_dep = b.dependency("engine", .{ .target = ios_sim_target, .optimize = optimize });
+    const engine_dep = b.dependency("engine", .{ .target = ios_target, .optimize = optimize });
     const engine_mod = engine_dep.module("engine");
 
     overrideImport(gfx_mod, "labelle-core", core_mod);
@@ -278,7 +297,7 @@ pub fn build(b: *std.Build) void {
 .backend_sokol_ios
     // sokol with dont_link_system_libs — we link iOS frameworks manually
     const backend_dep = b.dependency("labelle_sokol", .{
-        .target = ios_sim_target,
+        .target = ios_target,
         .optimize = optimize,
         .dont_link_system_libs = true,
     });
@@ -289,14 +308,14 @@ pub fn build(b: *std.Build) void {
     const sokol_clib = backend_dep.artifact("sokol_clib");
 
     // Configure SDK paths on sokol_clib for C header compilation
-    configureSdkPaths(b, sokol_clib, sim_sdk);
+    configureSdkPaths(b, sokol_clib, sdk_path);
 
 .ios_exe_start
     const exe = b.addExecutable(.{
         .name = "game",
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
-            .target = ios_sim_target,
+            .target = ios_target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "labelle-core", .module = core_mod },
@@ -321,18 +340,8 @@ pub fn build(b: *std.Build) void {
 .ios_link
     exe.linkLibrary(sokol_clib);
     exe.linkLibC();
-
-    // Add iOS simulator SDK library and framework search paths
-    addExeSdkPaths(b, exe, sim_sdk);
-
-    // Link iOS frameworks
-    exe.root_module.linkFramework("Foundation", .{});
-    exe.root_module.linkFramework("UIKit", .{});
-    exe.root_module.linkFramework("Metal", .{});
-    exe.root_module.linkFramework("MetalKit", .{});
-    exe.root_module.linkFramework("AudioToolbox", .{});
-    exe.root_module.linkFramework("AVFoundation", .{});
-    exe.root_module.linkFramework("QuartzCore", .{});
+    addExeSdkPaths(b, exe, sdk_path);
+    linkIosFrameworks(exe);
 
 .ios_link_gui_bridge
     exe.linkLibrary(gui_bridge_artifact);
@@ -340,7 +349,7 @@ pub fn build(b: *std.Build) void {
 .ios_footer
     b.installArtifact(exe);
 
-    const run_step = b.step("run", "Build for iOS simulator");
+    const run_step = b.step("run", "Build for iOS");
     run_step.dependOn(&exe.step);
 }
 
