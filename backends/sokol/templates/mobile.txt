@@ -1,11 +1,10 @@
 const BackendGfxType = @import("backend_gfx");
 
-var g: AssembledGame = undefined;
+{{module_vars}}var g: AssembledGame = undefined;
 var hooks: GameHooks = .{};
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
 var frame_count: u32 = 0;
-const ci_test = std.posix.getenv("CI_TEST") != null;
 
 const screen_w: u32 = {{width}};
 const screen_h: u32 = {{height}};
@@ -23,12 +22,7 @@ export fn init() callconv(.c) void {
 {{init_code}}}
 
 export fn frame() callconv(.c) void {
-    // CI headless exit
     frame_count +|= 1;
-    if (frame_count > 3 and ci_test) {
-        cleanup();
-        std.posix.exit(0);
-    }
 
     BackendGfxType.setScreenSize(window.width(), window.height());
     const dt: f32 = 0.016;
@@ -47,7 +41,7 @@ export fn cleanup() callconv(.c) void {
 }
 
 // {{entry_comment}}
-export fn sokol_main() callconv(.c) void {
+pub fn main() void {
     window.run(.{
         .init_cb = &init,
         .frame_cb = &frame,

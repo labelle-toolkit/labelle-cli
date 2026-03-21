@@ -41,6 +41,19 @@ pub const PluginDep = struct {
     }
 };
 
+// ── iOS Configuration ──────────────────────────────────────────────
+
+pub const Orientation = enum { portrait, landscape, all };
+
+pub const IosConfig = struct {
+    app_name: []const u8 = "",
+    bundle_id: []const u8 = "",
+    team_id: []const u8 = "",
+    minimum_ios: []const u8 = "15.0",
+    orientation: Orientation = .all,
+    device_family: []const u8 = "1,2",
+};
+
 pub const LayerSpace = enum { world, screen };
 
 pub const LayerDef = struct {
@@ -137,6 +150,10 @@ pub const ProjectConfig = struct {
     hidden: bool = false,
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
+
+    /// iOS configuration — resolved at runtime, NOT parsed from ZON.
+    /// Populated by the CLI from project.labelle or defaults.
+    ios: ?IosConfig = null,
 
     /// Resolved GUI plugin — populated by the CLI after reading gui.labelle manifest.
     /// NOT parsed from ZON. Generators check this field, not `gui`.

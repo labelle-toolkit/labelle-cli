@@ -9,7 +9,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const sokol_dep = b.dependency("sokol", .{ .target = target, .optimize = optimize });
+    // Forward dont_link_system_libs for iOS builds — we link frameworks manually.
+    const dont_link_system_libs = b.option(bool, "dont_link_system_libs", "Don't link system libraries (for iOS cross-compilation)") orelse false;
+
+    const sokol_dep = b.dependency("sokol", .{
+        .target = target,
+        .optimize = optimize,
+        .dont_link_system_libs = dont_link_system_libs,
+    });
     const sokol_mod = sokol_dep.module("sokol");
     const sokol_clib = sokol_dep.artifact("sokol_clib");
 

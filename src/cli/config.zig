@@ -12,6 +12,7 @@ pub fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const
 }
 
 fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, verbose: bool) !gen.ProjectConfig {
+    @setEvalBranchQuota(10000);
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
 

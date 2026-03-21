@@ -213,6 +213,146 @@ pub fn build(b: *std.Build) !void {
 .link_gui_bridge_wasm
     wasm.linkLibrary(gui_bridge_artifact);
 
+.header_ios
+const std = @import("std");
+
+/// Get iOS SDK path using xcrun
+fn getIosSdkPath(b: *std.Build, sdk_name: []const u8) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "xcrun", "--sdk", sdk_name, "--show-sdk-path" },
+    }) catch return null;
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+    if (result.term == .Exited and result.term.Exited == 0) {
+        const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+        if (path.len == 0) return null;
+        return b.allocator.dupe(u8, path) catch null;
+    }
+    return null;
+}
+
+/// Configure SDK paths for a compile artifact (sokol_clib)
+fn configureSdkPaths(b: *std.Build, artifact: *std.Build.Step.Compile, sdk_path: []const u8) void {
+    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
+    artifact.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+    artifact.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/SubFrameworks" }) });
+}
+
+/// Add SDK library and framework paths to an executable
+fn addExeSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile, sdk_path: []const u8) void {
+    exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+    exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+}
+
+pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
+
+    const sim_sdk = getIosSdkPath(b, "iphonesimulator") orelse
+        @panic("Could not find iOS simulator SDK. Is Xcode installed?");
+
+    const ios_sim_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .ios,
+        .abi = .simulator,
+        .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a14 },
+    });
+
+.ios_target_alias
+    const target = ios_sim_target;
+
+.ios_deps
+    const core_dep = b.dependency("labelle_core", .{ .target = ios_sim_target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+
+    const gfx_dep = b.dependency("labelle_gfx", .{ .target = ios_sim_target, .optimize = optimize });
+    const gfx_mod = gfx_dep.module("labelle-gfx");
+
+    const engine_dep = b.dependency("engine", .{ .target = ios_sim_target, .optimize = optimize });
+    const engine_mod = engine_dep.module("engine");
+
+    overrideImport(gfx_mod, "labelle-core", core_mod);
+    overrideImport(engine_mod, "labelle-core", core_mod);
+    overrideImport(engine_mod, "labelle-gfx", gfx_mod);
+
+.backend_sokol_ios
+    // sokol with dont_link_system_libs — we link iOS frameworks manually
+    const backend_dep = b.dependency("labelle_sokol", .{
+        .target = ios_sim_target,
+        .optimize = optimize,
+        .dont_link_system_libs = true,
+    });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const sokol_clib = backend_dep.artifact("sokol_clib");
+
+    // Configure SDK paths on sokol_clib for C header compilation
+    configureSdkPaths(b, sokol_clib, sim_sdk);
+
+.ios_exe_start
+    const exe = b.addExecutable(.{
+        .name = "game",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = ios_sim_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "labelle-core", .module = core_mod },
+                .{ .name = "labelle-gfx", .module = gfx_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
+                .{ .name = "backend_gfx", .module = backend_gfx },
+                .{ .name = "backend_input", .module = backend_input },
+                .{ .name = "backend_audio", .module = backend_audio },
+                .{ .name = "backend_window", .module = backend_window },
+
+.ios_exe_ecs_import
+                .{ .name = "ecs_backend", .module = ecs_mod },
+
+.ios_exe_gui_import
+                .{ .name = "gui_backend", .module = gui_mod },
+
+.ios_exe_end
+            },
+        }),
+    });
+
+.ios_link
+    exe.linkLibrary(sokol_clib);
+    exe.linkLibC();
+
+    // Add iOS simulator SDK library and framework search paths
+    addExeSdkPaths(b, exe, sim_sdk);
+
+    // Link iOS frameworks
+    exe.root_module.linkFramework("Foundation", .{});
+    exe.root_module.linkFramework("UIKit", .{});
+    exe.root_module.linkFramework("Metal", .{});
+    exe.root_module.linkFramework("MetalKit", .{});
+    exe.root_module.linkFramework("AudioToolbox", .{});
+    exe.root_module.linkFramework("AVFoundation", .{});
+    exe.root_module.linkFramework("QuartzCore", .{});
+
+.ios_link_gui_bridge
+    exe.linkLibrary(gui_bridge_artifact);
+
+.ios_footer
+    b.installArtifact(exe);
+
+    const run_step = b.step("run", "Build for iOS simulator");
+    run_step.dependOn(&exe.step);
+}
+
+/// Override a module import without leaking memory.
+fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
+    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    if (!gop.found_existing) {
+        gop.key_ptr.* = name;
+    }
+    gop.value_ptr.* = module;
+}
+
 .footer
     b.installArtifact(exe);
 

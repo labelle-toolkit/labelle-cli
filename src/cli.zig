@@ -27,6 +27,7 @@ const gui_resolve = @import("cli/gui_resolve.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const serve = @import("cli/serve.zig");
+const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
 
 const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
@@ -403,6 +404,18 @@ pub fn main() !void {
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         try serve.serveAndOpen(allocator, web_dir, 8080);
+    } else if (parsed.platform == .ios) {
+        // iOS: deploy to simulator
+        const bundle_id = if (parsed.ios) |ios_cfg|
+            (if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{parsed.name}))
+        else
+            try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{parsed.name});
+        const app_name_str = if (parsed.ios) |ios_cfg|
+            (if (ios_cfg.app_name.len > 0) ios_cfg.app_name else parsed.title)
+        else
+            parsed.title;
+        std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
+        try ios.deployToSimulator(allocator, target_dir, bundle_id, app_name_str);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
