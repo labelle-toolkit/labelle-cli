@@ -39,8 +39,10 @@ export fn frame() callconv(.c) void {
 
 export fn cleanup() callconv(.c) void {
     g.deinit();
-    window.shutdownGfx();
-    _ = gpa.deinit();
+    // On iOS, don't shutdown sokol_gfx here — sokol_app owns the Metal
+    // device and UIWindow lifecycle. Shutting down gfx before sokol_app
+    // deallocates its UIWindow causes a use-after-free crash in objc_msgSend.
+    // sokol_app handles gfx teardown after the window is released.
 }
 
 // {{entry_comment}}
