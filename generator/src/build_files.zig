@@ -22,15 +22,30 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     if (cfg.platform == .wasm) {
         try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
         try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
+    } else if (cfg.platform == .ios) {
+        try tpl.writeSection(build_zig_tmpl, "header_ios", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "header", w);
     }
 
-    try tpl.writeSection(build_zig_tmpl, "deps", w);
+    if (cfg.platform == .ios) {
+        // Emit target alias for ECS adapters, plugins, and GUI that use `target` variable
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
+        }
+        try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+    } else {
+        try tpl.writeSection(build_zig_tmpl, "deps", w);
+    }
 
     // Plugin dep/module declarations (for all declared plugins)
     for (cfg.plugins) |plugin| {
-        try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
+        if (cfg.platform == .ios) {
+            // Pass iOS SDK path to plugins so C dependencies can find system headers
+            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize, .ios_sdk_path = @as(?[]const u8, sdk_path) }});\n", .{ plugin.name, plugin.name });
+        } else {
+            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
+        }
         try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
     }
 
@@ -40,6 +55,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         .sokol => {
             if (cfg.platform == .wasm) {
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
+            } else if (cfg.platform == .ios) {
+                try tpl.writeSection(build_zig_tmpl, "backend_sokol_ios", w);
             } else {
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
             }
@@ -128,6 +145,33 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         }
 
         try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
+    } else if (cfg.platform == .ios) {
+        // iOS: build executable for simulator, link frameworks manually
+        try tpl.writeSection(build_zig_tmpl, "ios_exe_start", w);
+
+        for (cfg.plugins) |plugin| {
+            try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+
+        if (cfg.ecs != .mock) {
+            try tpl.writeSection(build_zig_tmpl, "ios_exe_ecs_import", w);
+        }
+        if (cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "ios_exe_gui_import", w);
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "ios_exe_end", w);
+        try tpl.writeSection(build_zig_tmpl, "ios_link", w);
+
+        // Bridge artifact (raw_backend GUIs)
+        if (cfg.resolved_gui) |gui| {
+            if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
+                try tpl.writeSection(build_zig_tmpl, "ios_link_gui_bridge", w);
+            }
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "ios_footer", w);
     } else {
         // Desktop: build as executable, link natively
         try tpl.writeSection(build_zig_tmpl, "exe_start", w);

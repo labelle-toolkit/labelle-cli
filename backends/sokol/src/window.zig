@@ -40,6 +40,7 @@ pub fn height() i32 {
 }
 
 pub fn beginFrame() sg.PassAction {
+    sgl.defaults();
     var pass_action: sg.PassAction = .{};
     pass_action.colors[0] = .{
         .load_action = .CLEAR,

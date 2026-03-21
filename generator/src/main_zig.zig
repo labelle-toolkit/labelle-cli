@@ -457,7 +457,7 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
             try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, ident });
         }
         const initial = cfg.initial_scene orelse scene_names[0];
-        try w.print("    try g.setScene(\"{s}\");\n", .{initial});
+        try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
     }
 
     try w.writeAll("    runner.setup(&g);\n");

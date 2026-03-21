@@ -27,9 +27,10 @@ const gui_resolve = @import("cli/gui_resolve.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const serve = @import("cli/serve.zig");
+const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, help_cmd, version, targets };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -283,6 +284,23 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, first, "clean")) {
             parsed_args.command = .clean_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+        } else if (std.mem.eql(u8, first, "ios")) {
+            parsed_args.command = .ios_cmd;
+            // First non-flag arg that isn't a subcommand is the project dir
+            while (args.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, "-") or
+                    std.mem.eql(u8, arg, "build") or
+                    std.mem.eql(u8, arg, "xcode") or
+                    std.mem.eql(u8, arg, "run"))
+                {
+                    if (parsed_args.extra_count < parsed_args.extra_args.len) {
+                        parsed_args.extra_args[parsed_args.extra_count] = arg;
+                        parsed_args.extra_count += 1;
+                    }
+                } else {
+                    parsed_args.project_dir = arg;
+                }
+            }
         } else if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
             parsed_args.command = .help_cmd;
         } else if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v")) {
@@ -339,6 +357,12 @@ pub fn main() !void {
         parsed.platform = platform;
     }
 
+    // `labelle ios` always implies sokol + ios platform
+    if (command == .ios_cmd) {
+        parsed.platform = .ios;
+        parsed.backend = .sokol;
+    }
+
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
         return upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]);
@@ -377,6 +401,11 @@ pub fn main() !void {
 
     if (command == .generate) return;
 
+    // `labelle ios` subcommand — handles its own build/xcode/run
+    if (command == .ios_cmd) {
+        return ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
+    }
+
     // Build
     std.debug.print("labelle: building...\n", .{});
     const build_result = try runner.runZig(allocator, target_dir, &.{ "zig", "build" });
@@ -403,6 +432,10 @@ pub fn main() !void {
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         try serve.serveAndOpen(allocator, web_dir, 8080);
+    } else if (parsed.platform == .ios) {
+        // iOS: deploy to simulator
+        std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
+        try ios.deployToSimulator(allocator, target_dir, parsed);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
