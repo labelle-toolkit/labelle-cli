@@ -29,8 +29,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     }
 
     if (cfg.platform == .ios) {
-        // Emit target alias for ECS adapters and plugins that use `target` variable
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock) {
+        // Emit target alias for ECS adapters, plugins, and GUI that use `target` variable
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         try tpl.writeSection(build_zig_tmpl, "ios_deps", w);

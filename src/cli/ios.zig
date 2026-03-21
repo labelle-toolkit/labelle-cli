@@ -662,10 +662,20 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\            name = Release;
         \\        }};
         \\        /* End XCBuildConfiguration section */
+        \\        A7000006 /* Release */ = {{
+        \\            isa = XCBuildConfiguration;
+        \\            buildSettings = {{
+        \\                ALWAYS_SEARCH_USER_PATHS = NO;
+        \\                IPHONEOS_DEPLOYMENT_TARGET = {s};
+        \\                SDKROOT = iphoneos;
+        \\            }};
+        \\            name = Release;
+        \\        }};
+        \\        /* End XCBuildConfiguration section */
         \\        /* Begin XCConfigurationList section */
         \\        A7000001 = {{
         \\            isa = XCConfigurationList;
-        \\            buildConfigurations = (A7000002);
+        \\            buildConfigurations = (A7000002, A7000006);
         \\            defaultConfigurationIsVisible = 0;
         \\            defaultConfigurationName = Debug;
         \\        }};
@@ -689,7 +699,9 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         // PBXNativeTarget
         app_name,
         app_name,
-        // XCBuildConfiguration - project level
+        // XCBuildConfiguration - project level Debug
+        minimum_ios,
+        // XCBuildConfiguration - project level Release
         minimum_ios,
         // Debug target config
         app_name,
