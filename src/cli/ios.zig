@@ -274,12 +274,14 @@ fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_na
         \\    <true/>
         \\    <key>UISupportedInterfaceOrientations</key>
         \\{s}
+        \\    <key>UIDeviceFamily</key>
+        \\{s}
         \\    <key>MinimumOSVersion</key>
         \\    <string>{s}</string>
         \\</dict>
         \\</plist>
         \\
-    , .{ app_name, bundle_id, app_name, orientations, ios_cfg.minimum_ios });
+    , .{ app_name, bundle_id, app_name, orientations, deviceFamilyPlist(ios_cfg.device_family), ios_cfg.minimum_ios });
 }
 
 // ============================================================================
@@ -493,7 +495,7 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     const pbxproj_path = try std.fmt.allocPrint(allocator, "{s}/project.pbxproj", .{xcodeproj_dir});
     defer allocator.free(pbxproj_path);
 
-    const pbxproj = try generatePbxproj(allocator, sanitized, bundle_id, minimum_ios, team_id);
+    const pbxproj = try generatePbxproj(allocator, sanitized, bundle_id, minimum_ios, ios_cfg.device_family, team_id);
     defer allocator.free(pbxproj);
     {
         const f = try std.fs.cwd().createFile(pbxproj_path, .{});
@@ -507,6 +509,15 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     std.debug.print("  1. open ios-xcode/{s}.xcodeproj\n", .{sanitized});
     std.debug.print("  2. Select your development team in Signing & Capabilities\n", .{});
     std.debug.print("  3. Build and run on device\n", .{});
+}
+
+/// Convert device_family string ("1,2") to plist array XML.
+fn deviceFamilyPlist(device_family: []const u8) []const u8 {
+    if (std.mem.eql(u8, device_family, "1"))
+        return "    <array>\n        <integer>1</integer>\n    </array>";
+    if (std.mem.eql(u8, device_family, "2"))
+        return "    <array>\n        <integer>2</integer>\n    </array>";
+    return "    <array>\n        <integer>1</integer>\n        <integer>2</integer>\n    </array>";
 }
 
 /// Generate a default bundle ID from project name (e.g. "my_game" → "com.labelle.my-game").
@@ -524,7 +535,7 @@ fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 /// Generate Xcode project.pbxproj.
-fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id: []const u8, minimum_ios: []const u8, team_id: ?[]const u8) ![]const u8 {
+fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id: []const u8, minimum_ios: []const u8, device_family: []const u8, team_id: ?[]const u8) ![]const u8 {
     const team_setting: []const u8 = if (team_id) |tid| tid else "";
     const team_line: []const u8 = if (team_id != null) "                DEVELOPMENT_TEAM = " else "                // DEVELOPMENT_TEAM not set — configure in Xcode";
 
@@ -638,7 +649,7 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\                ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
         \\                CODE_SIGN_STYLE = Automatic;
         \\                CURRENT_PROJECT_VERSION = 1;
-        \\                GENERATE_INFOPLIST_FILE = YES;
+        \\                INFOPLIST_FILE = Info.plist;
         \\                INFOPLIST_KEY_CFBundleDisplayName = "{s}";
         \\                INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
         \\                INFOPLIST_KEY_MinimumOSVersion = {s};
@@ -649,7 +660,7 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\                MARKETING_VERSION = 1.0;
         \\                PRODUCT_BUNDLE_IDENTIFIER = "{s}";
         \\                PRODUCT_NAME = "$(TARGET_NAME)";
-        \\                TARGETED_DEVICE_FAMILY = "1,2";
+        \\                TARGETED_DEVICE_FAMILY = "{s}";
         \\{s}{s};
         \\            }};
         \\            name = Debug;
@@ -660,7 +671,7 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\                ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
         \\                CODE_SIGN_STYLE = Automatic;
         \\                CURRENT_PROJECT_VERSION = 1;
-        \\                GENERATE_INFOPLIST_FILE = YES;
+        \\                INFOPLIST_FILE = Info.plist;
         \\                INFOPLIST_KEY_CFBundleDisplayName = "{s}";
         \\                INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
         \\                INFOPLIST_KEY_MinimumOSVersion = {s};
@@ -671,7 +682,7 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\                MARKETING_VERSION = 1.0;
         \\                PRODUCT_BUNDLE_IDENTIFIER = "{s}";
         \\                PRODUCT_NAME = "$(TARGET_NAME)";
-        \\                TARGETED_DEVICE_FAMILY = "1,2";
+        \\                TARGETED_DEVICE_FAMILY = "{s}";
         \\{s}{s};
         \\            }};
         \\            name = Release;
@@ -711,12 +722,14 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         app_name,
         minimum_ios,
         bundle_id,
+        device_family,
         team_line,
         team_setting,
         // Release target config
         app_name,
         minimum_ios,
         bundle_id,
+        device_family,
         team_line,
         team_setting,
     });
