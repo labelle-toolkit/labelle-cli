@@ -1,10 +1,15 @@
 /// iOS simulator deployment for labelle-cli.
 /// Assembles a .app bundle and deploys to the iOS Simulator via xcrun simctl.
 const std = @import("std");
+const gen = @import("generator");
 
 /// Deploy the built iOS binary to the iOS Simulator.
 /// Expects the binary at `target_dir/zig-out/bin/game`.
-pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, bundle_id: []const u8, app_name: []const u8) !void {
+pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig) !void {
+    const ios_cfg = cfg.ios orelse gen.IosConfig{};
+    const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else cfg.name;
+    const app_name = if (ios_cfg.app_name.len > 0) ios_cfg.app_name else cfg.title;
+
     // Path to simulator binary
     const binary_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
     defer allocator.free(binary_path);
@@ -19,6 +24,8 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, b
     const app_bundle = try std.fs.path.join(allocator, &.{ target_dir, "game.app" });
     defer allocator.free(app_bundle);
 
+    // Remove old bundle to ensure clean state
+    std.fs.cwd().deleteTree(app_bundle) catch {};
     std.fs.cwd().makePath(app_bundle) catch {};
 
     // Copy binary into .app bundle
@@ -37,12 +44,38 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, b
     const info_plist_path = try std.fs.path.join(allocator, &.{ app_bundle, "Info.plist" });
     defer allocator.free(info_plist_path);
 
-    const info_plist = try generateInfoPlist(allocator, bundle_id, app_name);
+    const info_plist = try generateInfoPlist(allocator, bundle_id, app_name, ios_cfg);
     defer allocator.free(info_plist);
 
-    const info_file = try std.fs.cwd().createFile(info_plist_path, .{});
-    defer info_file.close();
-    try info_file.writeAll(info_plist);
+    {
+        const f = try std.fs.cwd().createFile(info_plist_path, .{});
+        defer f.close();
+        try f.writeAll(info_plist);
+    }
+
+    // Generate LaunchScreen.storyboard
+    const launch_path = try std.fs.path.join(allocator, &.{ app_bundle, "LaunchScreen.storyboard" });
+    defer allocator.free(launch_path);
+
+    const launch_content = try generateLaunchScreen(allocator, app_name);
+    defer allocator.free(launch_content);
+
+    {
+        const f = try std.fs.cwd().createFile(launch_path, .{});
+        defer f.close();
+        try f.writeAll(launch_content);
+    }
+
+    // Copy assets into .app bundle
+    const assets_src = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
+    defer allocator.free(assets_src);
+
+    const assets_dst = try std.fs.path.join(allocator, &.{ app_bundle, "assets" });
+    defer allocator.free(assets_dst);
+
+    copyDirectory(allocator, assets_src, assets_dst) catch {
+        // No assets directory is fine — not all projects have assets
+    };
 
     // Ensure a simulator is booted
     const udid = try ensureSimulatorBooted(allocator);
@@ -135,15 +168,12 @@ fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
             if (std.mem.indexOf(u8, line, "(")) |paren_start| {
                 if (std.mem.indexOfPos(u8, line, paren_start, ")")) |paren_end| {
                     const udid = line[paren_start + 1 .. paren_end];
-                    // Verify it looks like a UDID (36 chars with dashes)
                     if (udid.len == 36 and udid[8] == '-') {
                         std.debug.print("labelle: booting {s}\n", .{std.mem.trim(u8, line, " \t")});
 
-                        // Boot this simulator
                         var boot_child = std.process.Child.init(&.{ "xcrun", "simctl", "boot", udid }, allocator);
                         _ = boot_child.spawnAndWait() catch {};
 
-                        // Wait for boot
                         std.Thread.sleep(2 * std.time.ns_per_s);
 
                         return allocator.dupe(u8, udid);
@@ -153,43 +183,140 @@ fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
         }
     }
 
-    // Fallback — "booted" is understood by simctl
     return allocator.dupe(u8, "booted");
 }
 
-/// Generate minimal Info.plist for simulator .app bundle.
-fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator,
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<plist version="1.0">
-        \\<dict>
-        \\    <key>CFBundleExecutable</key>
-        \\    <string>game</string>
-        \\    <key>CFBundleIdentifier</key>
-        \\    <string>{s}</string>
-        \\    <key>CFBundleName</key>
-        \\    <string>{s}</string>
-        \\    <key>CFBundleVersion</key>
-        \\    <string>1.0</string>
-        \\    <key>CFBundleShortVersionString</key>
-        \\    <string>1.0</string>
-        \\    <key>LSRequiresIPhoneOS</key>
-        \\    <true/>
-        \\    <key>UIRequiredDeviceCapabilities</key>
+/// Copy directory recursively. Silently returns if source doesn't exist.
+fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    var src_dir = try std.fs.cwd().openDir(src, .{ .iterate = true });
+    defer src_dir.close();
+
+    std.fs.cwd().makePath(dst) catch {};
+
+    var iter = src_dir.iterate();
+    while (try iter.next()) |entry| {
+        const src_path = try std.fs.path.join(allocator, &.{ src, entry.name });
+        defer allocator.free(src_path);
+
+        const dst_path = try std.fs.path.join(allocator, &.{ dst, entry.name });
+        defer allocator.free(dst_path);
+
+        switch (entry.kind) {
+            .file => {
+                std.fs.cwd().copyFile(src_path, std.fs.cwd(), dst_path, .{}) catch {};
+            },
+            .directory => {
+                try copyDirectory(allocator, src_path, dst_path);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Generate Info.plist with full iOS metadata.
+fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_name: []const u8, ios_cfg: gen.IosConfig) ![]const u8 {
+    const orientations = switch (ios_cfg.orientation) {
+        .portrait =>
         \\    <array>
-        \\        <string>arm64</string>
+        \\        <string>UIInterfaceOrientationPortrait</string>
         \\    </array>
-        \\    <key>UISupportedInterfaceOrientations</key>
+        ,
+        .landscape =>
+        \\    <array>
+        \\        <string>UIInterfaceOrientationLandscapeLeft</string>
+        \\        <string>UIInterfaceOrientationLandscapeRight</string>
+        \\    </array>
+        ,
+        .all =>
         \\    <array>
         \\        <string>UIInterfaceOrientationPortrait</string>
         \\        <string>UIInterfaceOrientationLandscapeLeft</string>
         \\        <string>UIInterfaceOrientationLandscapeRight</string>
         \\    </array>
-        \\    <key>UILaunchScreen</key>
-        \\    <dict/>
+        ,
+    };
+
+    return std.fmt.allocPrint(allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleDevelopmentRegion</key>
+        \\    <string>en</string>
+        \\    <key>CFBundleDisplayName</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleExecutable</key>
+        \\    <string>game</string>
+        \\    <key>CFBundleIdentifier</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundleInfoDictionaryVersion</key>
+        \\    <string>6.0</string>
+        \\    <key>CFBundleName</key>
+        \\    <string>{s}</string>
+        \\    <key>CFBundlePackageType</key>
+        \\    <string>APPL</string>
+        \\    <key>CFBundleShortVersionString</key>
+        \\    <string>1.0</string>
+        \\    <key>CFBundleVersion</key>
+        \\    <string>1</string>
+        \\    <key>LSRequiresIPhoneOS</key>
+        \\    <true/>
+        \\    <key>UILaunchStoryboardName</key>
+        \\    <string>LaunchScreen</string>
+        \\    <key>UIRequiredDeviceCapabilities</key>
+        \\    <array>
+        \\        <string>arm64</string>
+        \\        <string>metal</string>
+        \\    </array>
+        \\    <key>UIRequiresFullScreen</key>
+        \\    <true/>
+        \\    <key>UIStatusBarHidden</key>
+        \\    <true/>
+        \\    <key>UISupportedInterfaceOrientations</key>
+        \\{s}
+        \\    <key>MinimumOSVersion</key>
+        \\    <string>{s}</string>
         \\</dict>
         \\</plist>
         \\
-    , .{ bundle_id, app_name });
+    , .{ app_name, bundle_id, app_name, orientations, ios_cfg.minimum_ios });
+}
+
+/// Generate LaunchScreen.storyboard with centered app name.
+fn generateLaunchScreen(allocator: std.mem.Allocator, app_name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="21701" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="01J-lp-oVM">
+        \\    <dependencies>
+        \\        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="21679"/>
+        \\        <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+        \\    </dependencies>
+        \\    <scenes>
+        \\        <scene sceneID="EHf-IW-A2E">
+        \\            <objects>
+        \\                <viewController id="01J-lp-oVM" sceneMemberID="viewController">
+        \\                    <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
+        \\                        <rect key="frame" x="0.0" y="0.0" width="393" height="852"/>
+        \\                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+        \\                        <subviews>
+        \\                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="{s}" textAlignment="center" lineBreakMode="tailTruncation" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" translatesAutoresizingMaskIntoConstraints="NO" id="title-label">
+        \\                                <fontDescription key="fontDescription" type="boldSystem" pointSize="32"/>
+        \\                                <color key="textColor" white="1" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>
+        \\                            </label>
+        \\                        </subviews>
+        \\                        <viewLayoutGuide key="safeArea" id="6Tk-OE-BBY"/>
+        \\                        <color key="backgroundColor" red="0.118" green="0.137" blue="0.176" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+        \\                        <constraints>
+        \\                            <constraint firstItem="title-label" firstAttribute="centerX" secondItem="Ze5-6b-2t3" secondAttribute="centerX" id="cx"/>
+        \\                            <constraint firstItem="title-label" firstAttribute="centerY" secondItem="Ze5-6b-2t3" secondAttribute="centerY" id="cy"/>
+        \\                        </constraints>
+        \\                    </view>
+        \\                </viewController>
+        \\                <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>
+        \\            </objects>
+        \\        </scene>
+        \\    </scenes>
+        \\</document>
+        \\
+    , .{app_name});
 }

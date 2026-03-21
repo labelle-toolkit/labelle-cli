@@ -406,16 +406,8 @@ pub fn main() !void {
         try serve.serveAndOpen(allocator, web_dir, 8080);
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
-        const bundle_id = if (parsed.ios) |ios_cfg|
-            (if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{parsed.name}))
-        else
-            try std.fmt.allocPrint(allocator, "com.labelle.{s}", .{parsed.name});
-        const app_name_str = if (parsed.ios) |ios_cfg|
-            (if (ios_cfg.app_name.len > 0) ios_cfg.app_name else parsed.title)
-        else
-            parsed.title;
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
-        try ios.deployToSimulator(allocator, target_dir, bundle_id, app_name_str);
+        try ios.deployToSimulator(allocator, target_dir, parsed);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
