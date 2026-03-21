@@ -39,9 +39,11 @@ export fn frame() callconv(.c) void {
 
 export fn cleanup() callconv(.c) void {
     g.deinit();
-    // Don't call window.shutdownGfx() here — on iOS, sokol_app owns the Metal
-    // device and UIWindow lifecycle. Shutting down gfx before sokol_app
-    // deallocates its UIWindow causes a use-after-free crash in objc_msgSend.
+    // On iOS, don't shutdown sokol_gfx — sokol_app owns the Metal device and
+    // UIWindow lifecycle. On Android, shutdown is safe.
+    if (comptime @import("builtin").target.os.tag != .ios) {
+        window.shutdownGfx();
+    }
     _ = gpa.deinit();
 }
 

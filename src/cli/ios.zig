@@ -7,7 +7,7 @@ const runner = @import("runner.zig");
 /// Expects the binary at `target_dir/zig-out/bin/game`.
 pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig) !void {
     const ios_cfg = cfg.ios orelse gen.IosConfig{};
-    const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else cfg.name;
+    const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else try defaultBundleId(allocator, cfg.name);
     const app_name = if (ios_cfg.app_name.len > 0) ios_cfg.app_name else cfg.title;
 
     // Path to simulator binary
@@ -402,7 +402,7 @@ fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, 
 fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, team_id_override: ?[]const u8) !void {
     const ios_cfg = cfg.ios orelse gen.IosConfig{};
     const app_name = if (ios_cfg.app_name.len > 0) ios_cfg.app_name else cfg.title;
-    const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else cfg.name;
+    const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else try defaultBundleId(allocator, cfg.name);
     const minimum_ios = ios_cfg.minimum_ios;
     const team_id = team_id_override orelse if (ios_cfg.team_id.len > 0) ios_cfg.team_id else null;
 
@@ -440,6 +440,7 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     std.fs.cwd().copyFile(binary_src, std.fs.cwd(), binary_dst, .{}) catch |err| {
         std.debug.print("labelle: could not copy binary: {}\n", .{err});
         std.debug.print("  source: {s}\n", .{binary_src});
+        return err;
     };
 
     // Generate Info.plist
@@ -506,6 +507,11 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     std.debug.print("  1. open ios-xcode/{s}.xcodeproj\n", .{sanitized});
     std.debug.print("  2. Select your development team in Signing & Capabilities\n", .{});
     std.debug.print("  3. Build and run on device\n", .{});
+}
+
+/// Generate a default bundle ID from project name (e.g. "my_game" → "com.labelle.my-game").
+fn defaultBundleId(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "com.labelle.{s}", .{name});
 }
 
 /// Sanitize name for identifiers (replace non-alphanumeric with underscores).
@@ -617,6 +623,15 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\            }};
         \\            name = Debug;
         \\        }};
+        \\        A7000006 /* Release */ = {{
+        \\            isa = XCBuildConfiguration;
+        \\            buildSettings = {{
+        \\                ALWAYS_SEARCH_USER_PATHS = NO;
+        \\                IPHONEOS_DEPLOYMENT_TARGET = {s};
+        \\                SDKROOT = iphoneos;
+        \\            }};
+        \\            name = Release;
+        \\        }};
         \\        A7000004 /* Debug */ = {{
         \\            isa = XCBuildConfiguration;
         \\            buildSettings = {{
@@ -662,16 +677,6 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         \\            name = Release;
         \\        }};
         \\        /* End XCBuildConfiguration section */
-        \\        A7000006 /* Release */ = {{
-        \\            isa = XCBuildConfiguration;
-        \\            buildSettings = {{
-        \\                ALWAYS_SEARCH_USER_PATHS = NO;
-        \\                IPHONEOS_DEPLOYMENT_TARGET = {s};
-        \\                SDKROOT = iphoneos;
-        \\            }};
-        \\            name = Release;
-        \\        }};
-        \\        /* End XCBuildConfiguration section */
         \\        /* Begin XCConfigurationList section */
         \\        A7000001 = {{
         \\            isa = XCConfigurationList;
@@ -699,9 +704,8 @@ fn generatePbxproj(allocator: std.mem.Allocator, app_name: []const u8, bundle_id
         // PBXNativeTarget
         app_name,
         app_name,
-        // XCBuildConfiguration - project level Debug
+        // XCBuildConfiguration - project level (Debug + Release)
         minimum_ios,
-        // XCBuildConfiguration - project level Release
         minimum_ios,
         // Debug target config
         app_name,

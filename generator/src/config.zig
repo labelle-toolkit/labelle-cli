@@ -151,8 +151,8 @@ pub const ProjectConfig = struct {
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
 
-    /// iOS configuration — resolved at runtime, NOT parsed from ZON.
-    /// Populated by the CLI from project.labelle or defaults.
+    /// iOS configuration — parsed from project.labelle `.ios` section.
+    /// Defaults to null (derived from project name/title when absent).
     ios: ?IosConfig = null,
 
     /// Resolved GUI plugin — populated by the CLI after reading gui.labelle manifest.
