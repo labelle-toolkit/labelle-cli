@@ -29,6 +29,9 @@ jobs:
       - name: CLI + Generator tests
         run: zig build test
 
+      - name: Debug plugin tests
+        run: cd plugins/debug && zig build test
+
       - name: Test CLI commands (Unix)
         if: runner.os != 'Windows'
         run: |
