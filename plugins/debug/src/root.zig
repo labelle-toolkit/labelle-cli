@@ -20,6 +20,10 @@ pub var toggle_key: u32 = 301;
 const MAX_COMPONENTS: usize = 32;
 var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 
+// Gizmo state persistence
+const STATE_FILE = "debug_state.ini";
+const MAX_CATEGORIES: usize = 32;
+
 // FPS tracking
 const FPS_HISTORY: usize = 120;
 var frame_times: [FPS_HISTORY]f32 = [_]f32{0} ** FPS_HISTORY;
@@ -62,6 +66,10 @@ fn updateFpsTracking() void {
 }
 
 pub const Systems = struct {
+    pub fn setup(game: anytype) void {
+        loadGizmoState(game);
+    }
+
     pub fn drawGui(game: anytype) void {
         if (!enabled) return;
 
@@ -174,15 +182,19 @@ pub const Systems = struct {
             Gui.separator();
 
             if (Gui.treeNode("Gizmos")) {
+                var dirty = false;
+
                 var gizmos_on = game.gizmos_enabled;
                 if (Gui.checkbox("Master Toggle", &gizmos_on)) {
                     game.gizmos_enabled = gizmos_on;
+                    dirty = true;
                 }
 
                 // Category 0 = uncategorized (always present)
                 var cat0_enabled = game.isGizmoCategoryEnabled(0);
                 if (Gui.checkbox("Uncategorized", &cat0_enabled)) {
                     game.setGizmoCategory(0, cat0_enabled);
+                    dirty = true;
                 }
 
                 // Auto-discovered categories from plugins
@@ -193,8 +205,11 @@ pub const Systems = struct {
                     const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{cat.name}) catch "?";
                     if (Gui.checkbox(name_z, &cat_on)) {
                         game.setGizmoCategory(cat.id, cat_on);
+                        dirty = true;
                     }
                 }
+
+                if (dirty) saveGizmoState(game);
 
                 Gui.treePop();
             }
@@ -373,6 +388,58 @@ fn deinitIter(iter: anytype, alloc: anytype) void {
     } else {
         iter.deinit(alloc);
     }
+}
+
+// ── Gizmo state persistence ──────────────────────────────────────────
+
+fn loadGizmoState(game: anytype) void {
+    const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch return;
+    defer file.close();
+
+    var buf: [1024]u8 = undefined;
+    const len = file.readAll(&buf) catch return;
+    const content = buf[0..len];
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        // Parse "key=value"
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        const val = line[eq + 1 ..];
+
+        if (std.mem.eql(u8, key, "gizmos_enabled")) {
+            game.gizmos_enabled = std.mem.eql(u8, val, "1");
+        } else if (std.mem.startsWith(u8, key, "category_")) {
+            const id_str = key["category_".len..];
+            const id = std.fmt.parseInt(u8, id_str, 10) catch continue;
+            game.setGizmoCategory(id, std.mem.eql(u8, val, "1"));
+        }
+    }
+}
+
+fn saveGizmoState(game: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+
+    // gizmos_enabled
+    const master = std.fmt.bufPrint(buf[pos..], "gizmos_enabled={s}\n", .{if (game.gizmos_enabled) "1" else "0"}) catch return;
+    pos += master.len;
+
+    // Category 0 (uncategorized)
+    const cat0 = std.fmt.bufPrint(buf[pos..], "category_0={s}\n", .{if (game.isGizmoCategoryEnabled(0)) "1" else "0"}) catch return;
+    pos += cat0.len;
+
+    // Discovered categories
+    const categories = @TypeOf(game.*).gizmo_categories;
+    for (categories) |cat| {
+        const line = std.fmt.bufPrint(buf[pos..], "category_{d}={s}\n", .{ cat.id, if (game.isGizmoCategoryEnabled(cat.id)) "1" else "0" }) catch return;
+        pos += line.len;
+    }
+
+    const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch return;
+    defer file.close();
+    file.writeAll(buf[0..pos]) catch return;
 }
 
 fn formatField(buf: []u8, name: []const u8, comptime T: type, value: T) ![:0]u8 {
