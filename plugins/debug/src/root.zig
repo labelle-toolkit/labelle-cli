@@ -20,9 +20,10 @@ pub var toggle_key: u32 = 301;
 const MAX_COMPONENTS: usize = 32;
 var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 
-// Gizmo state persistence
+// State persistence
 const STATE_FILE = "debug_state.ini";
 const MAX_CATEGORIES: usize = 32;
+var state_dirty: bool = false;
 
 // FPS tracking
 const FPS_HISTORY: usize = 120;
@@ -67,7 +68,7 @@ fn updateFpsTracking() void {
 
 pub const Systems = struct {
     pub fn setup(game: anytype) void {
-        loadGizmoState(game);
+        loadDebugState(game);
     }
 
     pub fn drawGui(game: anytype) void {
@@ -76,9 +77,12 @@ pub const Systems = struct {
         const Gui = @TypeOf(game.*).Gui;
         if (!Gui.supportsWidgets()) return;
 
+        var dirty = false;
+
         // F12 toggles visibility
         if (game.isKeyPressed(toggle_key)) {
             debug_visible = !debug_visible;
+            dirty = true;
         }
 
         // Always track FPS even when hidden
@@ -143,7 +147,11 @@ pub const Systems = struct {
                 }
             }
 
-            _ = Gui.checkbox("Show Performance", &show_perf);
+            {
+                const prev = show_perf;
+                _ = Gui.checkbox("Show Performance", &show_perf);
+                if (show_perf != prev) dirty = true;
+            }
 
             Gui.separator();
 
@@ -177,13 +185,12 @@ pub const Systems = struct {
             _ = Gui.sliderFloat("Time Scale", &time_scale_slider, 0, 3);
             if (time_scale_slider != game.getTimeScale()) {
                 game.setTimeScale(time_scale_slider);
+                dirty = true;
             }
 
             Gui.separator();
 
             if (Gui.treeNode("Gizmos")) {
-                var dirty = false;
-
                 var gizmos_on = game.gizmos_enabled;
                 if (Gui.checkbox("Master Toggle", &gizmos_on)) {
                     game.gizmos_enabled = gizmos_on;
@@ -209,15 +216,23 @@ pub const Systems = struct {
                     }
                 }
 
-                if (dirty) saveGizmoState(game);
-
                 Gui.treePop();
             }
 
             Gui.separator();
-            _ = Gui.checkbox("Entity Browser", &show_entities);
+            {
+                const prev = show_entities;
+                _ = Gui.checkbox("Entity Browser", &show_entities);
+                if (show_entities != prev) dirty = true;
+            }
         }
         Gui.endWindow();
+
+        if (dirty) state_dirty = true;
+        if (state_dirty) {
+            saveDebugState(game);
+            state_dirty = false;
+        }
 
         if (show_entities) {
             drawEntityBrowser(game, Gui);
@@ -234,7 +249,9 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
         Gui.label("Filter:");
         inline for (comp_names, 0..) |name, i| {
             if (i < MAX_COMPONENTS) {
+                const prev = component_filters[i];
                 _ = Gui.checkbox(@ptrCast(name), &component_filters[i]);
+                if (component_filters[i] != prev) state_dirty = true;
                 if ((i + 1) % 4 != 0 and i + 1 < comp_names.len) Gui.sameLine();
             }
         }
@@ -392,49 +409,83 @@ fn deinitIter(iter: anytype, alloc: anytype) void {
 
 // ── Gizmo state persistence ──────────────────────────────────────────
 
-fn loadGizmoState(game: anytype) void {
+fn loadDebugState(game: anytype) void {
     const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch return;
     defer file.close();
 
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     const len = file.readAll(&buf) catch return;
     const content = buf[0..len];
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        // Parse "key=value"
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = line[0..eq];
         const val = line[eq + 1 ..];
+        const on = std.mem.eql(u8, val, "1");
 
         if (std.mem.eql(u8, key, "gizmos_enabled")) {
-            game.gizmos_enabled = std.mem.eql(u8, val, "1");
+            game.gizmos_enabled = on;
+        } else if (std.mem.eql(u8, key, "debug_visible")) {
+            debug_visible = on;
+        } else if (std.mem.eql(u8, key, "show_perf")) {
+            show_perf = on;
+        } else if (std.mem.eql(u8, key, "show_entities")) {
+            show_entities = on;
+        } else if (std.mem.eql(u8, key, "time_scale")) {
+            const scale = std.fmt.parseFloat(f32, val) catch continue;
+            game.setTimeScale(scale);
         } else if (std.mem.startsWith(u8, key, "category_")) {
             const id_str = key["category_".len..];
             const id = std.fmt.parseInt(u8, id_str, 10) catch continue;
-            game.setGizmoCategory(id, std.mem.eql(u8, val, "1"));
+            game.setGizmoCategory(id, on);
+        } else if (std.mem.startsWith(u8, key, "filter_")) {
+            const id_str = key["filter_".len..];
+            const id = std.fmt.parseInt(usize, id_str, 10) catch continue;
+            if (id < MAX_COMPONENTS) component_filters[id] = on;
         }
     }
 }
 
-fn saveGizmoState(game: anytype) void {
-    var buf: [1024]u8 = undefined;
+fn saveDebugState(game: anytype) void {
+    var buf: [2048]u8 = undefined;
     var pos: usize = 0;
 
-    // gizmos_enabled
-    const master = std.fmt.bufPrint(buf[pos..], "gizmos_enabled={s}\n", .{if (game.gizmos_enabled) "1" else "0"}) catch return;
-    pos += master.len;
+    const fields = .{
+        .{ "debug_visible", debug_visible },
+        .{ "show_perf", show_perf },
+        .{ "show_entities", show_entities },
+        .{ "gizmos_enabled", game.gizmos_enabled },
+    };
+    inline for (fields) |f| {
+        const line = std.fmt.bufPrint(buf[pos..], "{s}={s}\n", .{ f[0], if (f[1]) "1" else "0" }) catch return;
+        pos += line.len;
+    }
 
-    // Category 0 (uncategorized)
-    const cat0 = std.fmt.bufPrint(buf[pos..], "category_0={s}\n", .{if (game.isGizmoCategoryEnabled(0)) "1" else "0"}) catch return;
-    pos += cat0.len;
+    // Time scale
+    {
+        const line = std.fmt.bufPrint(buf[pos..], "time_scale={d:.2}\n", .{game.getTimeScale()}) catch return;
+        pos += line.len;
+    }
 
-    // Discovered categories
+    // Gizmo categories
+    {
+        const line = std.fmt.bufPrint(buf[pos..], "category_0={s}\n", .{if (game.isGizmoCategoryEnabled(0)) "1" else "0"}) catch return;
+        pos += line.len;
+    }
     const categories = @TypeOf(game.*).gizmo_categories;
     for (categories) |cat| {
         const line = std.fmt.bufPrint(buf[pos..], "category_{d}={s}\n", .{ cat.id, if (game.isGizmoCategoryEnabled(cat.id)) "1" else "0" }) catch return;
         pos += line.len;
+    }
+
+    // Component filters
+    for (0..MAX_COMPONENTS) |i| {
+        if (component_filters[i]) {
+            const line = std.fmt.bufPrint(buf[pos..], "filter_{d}=1\n", .{i}) catch return;
+            pos += line.len;
+        }
     }
 
     const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch return;
