@@ -419,8 +419,11 @@ fn loadDebugState(game: anytype) void {
 
     var buf: [4096]u8 = undefined;
     const len = file.readAll(&buf) catch return;
-    const content = buf[0..len];
+    applyDebugState(game, buf[0..len]);
+}
 
+/// Parse a debug_state.ini string and apply values to game + module state.
+fn applyDebugState(game: anytype, content: []const u8) void {
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -454,6 +457,15 @@ fn loadDebugState(game: anytype) void {
 
 fn saveDebugState(game: anytype) void {
     var buf: [4096]u8 = undefined;
+    const len = serializeDebugState(game, &buf);
+
+    const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch return;
+    defer file.close();
+    file.writeAll(buf[0..len]) catch return;
+}
+
+/// Serialize debug state into a buffer. Returns bytes written.
+fn serializeDebugState(game: anytype, buf: *[4096]u8) usize {
     var pos: usize = 0;
 
     const fields = .{
@@ -463,38 +475,160 @@ fn saveDebugState(game: anytype) void {
         .{ "gizmos_enabled", game.gizmos_enabled },
     };
     inline for (fields) |f| {
-        const line = std.fmt.bufPrint(buf[pos..], "{s}={s}\n", .{ f[0], if (f[1]) "1" else "0" }) catch return;
+        const line = std.fmt.bufPrint(buf[pos..], "{s}={s}\n", .{ f[0], if (f[1]) "1" else "0" }) catch return pos;
         pos += line.len;
     }
 
     // Time scale
     {
-        const line = std.fmt.bufPrint(buf[pos..], "time_scale={d:.2}\n", .{game.getTimeScale()}) catch return;
+        const line = std.fmt.bufPrint(buf[pos..], "time_scale={d:.2}\n", .{game.getTimeScale()}) catch return pos;
         pos += line.len;
     }
 
     // Gizmo categories
     {
-        const line = std.fmt.bufPrint(buf[pos..], "category_0={s}\n", .{if (game.isGizmoCategoryEnabled(0)) "1" else "0"}) catch return;
+        const line = std.fmt.bufPrint(buf[pos..], "category_0={s}\n", .{if (game.isGizmoCategoryEnabled(0)) "1" else "0"}) catch return pos;
         pos += line.len;
     }
     const categories = @TypeOf(game.*).gizmo_categories;
     for (categories) |cat| {
-        const line = std.fmt.bufPrint(buf[pos..], "category_{d}={s}\n", .{ cat.id, if (game.isGizmoCategoryEnabled(cat.id)) "1" else "0" }) catch return;
+        const line = std.fmt.bufPrint(buf[pos..], "category_{d}={s}\n", .{ cat.id, if (game.isGizmoCategoryEnabled(cat.id)) "1" else "0" }) catch return pos;
         pos += line.len;
     }
 
     // Component filters
     for (0..MAX_COMPONENTS) |i| {
         if (component_filters[i]) {
-            const line = std.fmt.bufPrint(buf[pos..], "filter_{d}=1\n", .{i}) catch return;
+            const line = std.fmt.bufPrint(buf[pos..], "filter_{d}=1\n", .{i}) catch return pos;
             pos += line.len;
         }
     }
 
-    const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch return;
-    defer file.close();
-    file.writeAll(buf[0..pos]) catch return;
+    return pos;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+const GizmoCategoryEntry = struct { name: []const u8, id: u8 };
+
+const MockGame = struct {
+    gizmos_enabled: bool = true,
+    time_scale: f32 = 1.0,
+    category_enabled: [32]bool = [_]bool{true} ** 32,
+
+    pub const gizmo_categories = [_]GizmoCategoryEntry{
+        .{ .name = "Workers", .id = 1 },
+        .{ .name = "Navigation", .id = 2 },
+    };
+
+    pub fn setTimeScale(self: *MockGame, scale: f32) void {
+        self.time_scale = scale;
+    }
+    pub fn getTimeScale(self: *const MockGame) f32 {
+        return self.time_scale;
+    }
+    pub fn setGizmoCategory(self: *MockGame, cat: u8, on: bool) void {
+        if (cat < 32) self.category_enabled[cat] = on;
+    }
+    pub fn isGizmoCategoryEnabled(self: *const MockGame, cat: u8) bool {
+        if (cat >= 32) return false;
+        return self.category_enabled[cat];
+    }
+};
+
+fn resetModuleState() void {
+    debug_visible = false;
+    show_perf = true;
+    show_entities = false;
+    component_filters = [_]bool{false} ** MAX_COMPONENTS;
+}
+
+test "roundtrip: save then load restores state" {
+    resetModuleState();
+    var game = MockGame{};
+
+    // Set non-default state
+    debug_visible = true;
+    show_perf = false;
+    show_entities = true;
+    game.gizmos_enabled = false;
+    game.time_scale = 0.5;
+    game.setGizmoCategory(0, false);
+    game.setGizmoCategory(1, false);
+    game.setGizmoCategory(2, true);
+    component_filters[3] = true;
+    component_filters[7] = true;
+
+    // Serialize
+    var buf: [4096]u8 = undefined;
+    const len = serializeDebugState(&game, &buf);
+    const content = buf[0..len];
+
+    // Reset everything
+    resetModuleState();
+    game = MockGame{};
+
+    // Deserialize
+    applyDebugState(&game, content);
+
+    try testing.expect(debug_visible == true);
+    try testing.expect(show_perf == false);
+    try testing.expect(show_entities == true);
+    try testing.expect(game.gizmos_enabled == false);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), game.time_scale, 0.01);
+    try testing.expect(game.category_enabled[0] == false);
+    try testing.expect(game.category_enabled[1] == false);
+    try testing.expect(game.category_enabled[2] == true);
+    try testing.expect(component_filters[3] == true);
+    try testing.expect(component_filters[7] == true);
+    try testing.expect(component_filters[0] == false);
+
+    resetModuleState();
+}
+
+test "CRLF line endings are handled" {
+    resetModuleState();
+    var game = MockGame{};
+
+    const content = "debug_visible=1\r\nshow_perf=0\r\ngizmos_enabled=0\r\ntime_scale=2.00\r\n";
+    applyDebugState(&game, content);
+
+    try testing.expect(debug_visible == true);
+    try testing.expect(show_perf == false);
+    try testing.expect(game.gizmos_enabled == false);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), game.time_scale, 0.01);
+
+    resetModuleState();
+}
+
+test "unknown keys are ignored" {
+    resetModuleState();
+    var game = MockGame{};
+
+    const content = "debug_visible=1\nfoo_bar=1\nunknown=hello\nshow_perf=0\n";
+    applyDebugState(&game, content);
+
+    try testing.expect(debug_visible == true);
+    try testing.expect(show_perf == false);
+    // game state unchanged for unknown keys
+    try testing.expect(game.gizmos_enabled == true);
+
+    resetModuleState();
+}
+
+test "empty content does nothing" {
+    resetModuleState();
+    var game = MockGame{};
+    game.gizmos_enabled = false;
+
+    applyDebugState(&game, "");
+
+    try testing.expect(game.gizmos_enabled == false);
+    try testing.expect(debug_visible == false);
+
+    resetModuleState();
 }
 
 fn formatField(buf: []u8, name: []const u8, comptime T: type, value: T) ![:0]u8 {
