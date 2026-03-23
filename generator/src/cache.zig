@@ -438,6 +438,9 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
         const pkg_dir = try resolveFrameworkPackage(allocator, pkg.name, pkg.version, null);
         defer allocator.free(pkg_dir);
 
+        // Never patch symlinked packages — they point to local repos that must not be mutated.
+        if (isSymlink(pkg_dir)) continue;
+
         // Patch the main build.zig.zon
         try patchZonFile(allocator, pkg_dir, "build.zig.zon", cfg);
 
@@ -511,6 +514,13 @@ fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []cons
         }
     }
     return list.toOwnedSlice(allocator);
+}
+
+/// Check if a path is a symlink.
+fn isSymlink(path: []const u8) bool {
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.fs.readLinkAbsolute(path, &link_buf) catch return false;
+    return true;
 }
 
 /// Recursively copy a directory tree.
