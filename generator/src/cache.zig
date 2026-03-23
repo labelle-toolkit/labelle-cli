@@ -461,7 +461,11 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
 
 /// Patch a single build.zig.zon file, rewriting labelle-core path deps
 /// to point to the cached core package.
+/// Skips directories that are symlinks to avoid mutating local repos.
 fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, cfg: config.ProjectConfig) !void {
+    // Never patch through symlinks — they point to local repos that must not be mutated.
+    if (isSymlink(dir_path)) return;
+
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
     defer allocator.free(file_path);
 
@@ -511,6 +515,13 @@ fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []cons
         }
     }
     return list.toOwnedSlice(allocator);
+}
+
+/// Check if a path is a symlink.
+fn isSymlink(path: []const u8) bool {
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.fs.readLinkAbsolute(path, &link_buf) catch return false;
+    return true;
 }
 
 /// Recursively copy a directory tree.
