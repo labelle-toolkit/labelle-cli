@@ -22,7 +22,6 @@ var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 
 // State persistence
 const STATE_FILE = "debug_state.ini";
-const MAX_CATEGORIES: usize = 32;
 var state_dirty: bool = false;
 
 // FPS tracking
@@ -413,7 +412,7 @@ fn loadDebugState(game: anytype) void {
     const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch return;
     defer file.close();
 
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const len = file.readAll(&buf) catch return;
     const content = buf[0..len];
 
@@ -421,8 +420,8 @@ fn loadDebugState(game: anytype) void {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        const val = line[eq + 1 ..];
+        const key = std.mem.trimRight(u8, line[0..eq], " \t\r");
+        const val = std.mem.trimRight(u8, line[eq + 1 ..], " \t\r");
         const on = std.mem.eql(u8, val, "1");
 
         if (std.mem.eql(u8, key, "gizmos_enabled")) {
@@ -449,7 +448,7 @@ fn loadDebugState(game: anytype) void {
 }
 
 fn saveDebugState(game: anytype) void {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
     const fields = .{
