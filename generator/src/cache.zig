@@ -438,6 +438,9 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
         const pkg_dir = try resolveFrameworkPackage(allocator, pkg.name, pkg.version, null);
         defer allocator.free(pkg_dir);
 
+        // Never patch symlinked packages — they point to local repos that must not be mutated.
+        if (isSymlink(pkg_dir)) continue;
+
         // Patch the main build.zig.zon
         try patchZonFile(allocator, pkg_dir, "build.zig.zon", cfg);
 
@@ -461,11 +464,7 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
 
 /// Patch a single build.zig.zon file, rewriting labelle-core path deps
 /// to point to the cached core package.
-/// Skips directories that are symlinks to avoid mutating local repos.
 fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, cfg: config.ProjectConfig) !void {
-    // Never patch through symlinks — they point to local repos that must not be mutated.
-    if (isSymlink(dir_path)) return;
-
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
     defer allocator.free(file_path);
 
