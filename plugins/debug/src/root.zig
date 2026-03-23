@@ -87,6 +87,11 @@ pub const Systems = struct {
         // Always track FPS even when hidden
         updateFpsTracking();
 
+        // Save before early return so F12-to-hide is persisted
+        if (dirty) {
+            saveDebugState(game);
+        }
+
         if (!debug_visible) return;
 
         if (Gui.beginWindow("Debug Inspector")) {
@@ -172,13 +177,13 @@ pub const Systems = struct {
                 if (Gui.button("Pause")) game.pause();
             }
             Gui.sameLine();
-            if (Gui.button("0.25x")) game.setTimeScale(0.25);
+            if (Gui.button("0.25x")) { game.setTimeScale(0.25); dirty = true; }
             Gui.sameLine();
-            if (Gui.button("0.5x")) game.setTimeScale(0.5);
+            if (Gui.button("0.5x")) { game.setTimeScale(0.5); dirty = true; }
             Gui.sameLine();
-            if (Gui.button("1x")) game.setTimeScale(1.0);
+            if (Gui.button("1x")) { game.setTimeScale(1.0); dirty = true; }
             Gui.sameLine();
-            if (Gui.button("2x")) game.setTimeScale(2.0);
+            if (Gui.button("2x")) { game.setTimeScale(2.0); dirty = true; }
 
             time_scale_slider = game.getTimeScale();
             _ = Gui.sliderFloat("Time Scale", &time_scale_slider, 0, 3);
