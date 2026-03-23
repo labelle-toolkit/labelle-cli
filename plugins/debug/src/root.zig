@@ -412,12 +412,22 @@ fn deinitIter(iter: anytype, alloc: anytype) void {
     }
 }
 
+/// Log a warning through the game's log sink if available, otherwise stderr.
+fn logWarn(game: anytype, comptime fmt: []const u8, args: anytype) void {
+    const Game = @TypeOf(game.*);
+    if (@hasField(Game, "log")) {
+        game.log.warn("[debug] " ++ fmt, args);
+    } else {
+        std.debug.print("debug-plugin: " ++ fmt ++ "\n", args);
+    }
+}
+
 // ── Gizmo state persistence ──────────────────────────────────────────
 
 fn loadDebugState(game: anytype) void {
     const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch |err| {
         if (err != error.FileNotFound) {
-            std.debug.print("debug-plugin: could not open {s}: {any}\n", .{ STATE_FILE, err });
+            logWarn(game, "could not open state file: {any}", .{err});
         }
         return;
     };
@@ -425,7 +435,7 @@ fn loadDebugState(game: anytype) void {
 
     var buf: [4096]u8 = undefined;
     const len = file.readAll(&buf) catch |err| {
-        std.debug.print("debug-plugin: could not read {s}: {any}\n", .{ STATE_FILE, err });
+        logWarn(game, "could not read state file: {any}", .{err});
         return;
     };
     applyDebugState(game, buf[0..len]);
@@ -469,12 +479,12 @@ fn saveDebugState(game: anytype) void {
     const len = serializeDebugState(game, &buf);
 
     const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch |err| {
-        std.debug.print("debug-plugin: could not create {s}: {any}\n", .{ STATE_FILE, err });
+        logWarn(game, "could not create state file: {any}", .{err});
         return;
     };
     defer file.close();
     file.writeAll(buf[0..len]) catch |err| {
-        std.debug.print("debug-plugin: could not write {s}: {any}\n", .{ STATE_FILE, err });
+        logWarn(game, "could not write state file: {any}", .{err});
     };
 }
 
