@@ -88,8 +88,9 @@ pub const Systems = struct {
         updateFpsTracking();
 
         // Save before early return so F12-to-hide is persisted
-        if (dirty) {
+        if (dirty and !debug_visible) {
             saveDebugState(game);
+            return;
         }
 
         if (!debug_visible) return;
@@ -414,11 +415,19 @@ fn deinitIter(iter: anytype, alloc: anytype) void {
 // ── Gizmo state persistence ──────────────────────────────────────────
 
 fn loadDebugState(game: anytype) void {
-    const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch return;
+    const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("debug-plugin: could not open {s}: {any}\n", .{ STATE_FILE, err });
+        }
+        return;
+    };
     defer file.close();
 
     var buf: [4096]u8 = undefined;
-    const len = file.readAll(&buf) catch return;
+    const len = file.readAll(&buf) catch |err| {
+        std.debug.print("debug-plugin: could not read {s}: {any}\n", .{ STATE_FILE, err });
+        return;
+    };
     applyDebugState(game, buf[0..len]);
 }
 
@@ -428,8 +437,8 @@ fn applyDebugState(game: anytype, content: []const u8) void {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = std.mem.trimRight(u8, line[0..eq], " \t\r");
-        const val = std.mem.trimRight(u8, line[eq + 1 ..], " \t\r");
+        const key = std.mem.trim(u8, line[0..eq], " \t\r");
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
         const on = std.mem.eql(u8, val, "1");
 
         if (std.mem.eql(u8, key, "gizmos_enabled")) {
@@ -459,9 +468,14 @@ fn saveDebugState(game: anytype) void {
     var buf: [4096]u8 = undefined;
     const len = serializeDebugState(game, &buf);
 
-    const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch return;
+    const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch |err| {
+        std.debug.print("debug-plugin: could not create {s}: {any}\n", .{ STATE_FILE, err });
+        return;
+    };
     defer file.close();
-    file.writeAll(buf[0..len]) catch return;
+    file.writeAll(buf[0..len]) catch |err| {
+        std.debug.print("debug-plugin: could not write {s}: {any}\n", .{ STATE_FILE, err });
+    };
 }
 
 /// Serialize debug state into a buffer. Returns bytes written.
