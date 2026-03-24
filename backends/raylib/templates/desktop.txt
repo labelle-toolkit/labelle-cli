@@ -18,8 +18,8 @@ pub fn main() !void {
 
     g.setHooks(&hooks);
 
-    g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
-    g.renderer.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
 
 {{setup_code}}
     while (!window.windowShouldClose()) {

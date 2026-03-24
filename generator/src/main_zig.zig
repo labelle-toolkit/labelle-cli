@@ -379,7 +379,7 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
     }
 
     // ScriptRunner owns all per-script state + shared context
-    try w.writeAll("    var runner = Runner.init(allocator, &g.ecs_backend);\n");
+    try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
 
     if (scene_names.len > 0) {
@@ -443,7 +443,7 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
         }
     }
 
-    try w.writeAll("    runner = Runner.init(allocator, &g.ecs_backend);\n");
+    try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
     if (scene_names.len > 0) {
         if (gizmo_names.len > 0) {

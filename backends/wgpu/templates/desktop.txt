@@ -18,7 +18,7 @@ pub fn main() !void {
 
     g.setHooks(&hooks);
 
-    g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
 {{setup_code}}
     while (!window.windowShouldClose()) {

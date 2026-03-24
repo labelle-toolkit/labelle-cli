@@ -163,7 +163,7 @@ pub const Systems = struct {
             // ── Stats ──
             if (Gui.treeNode("Stats")) {
                 var buf: [64]u8 = undefined;
-                Gui.label(std.fmt.bufPrintZ(&buf, "Entities: {d}", .{game.ecs_backend.entityCount()}) catch "?");
+                Gui.label(std.fmt.bufPrintZ(&buf, "Entities: {d}", .{game.active_world.ecs_backend.entityCount()}) catch "?");
                 var frame_buf: [64]u8 = undefined;
                 Gui.label(std.fmt.bufPrintZ(&frame_buf, "Frame: {d}", .{game.frame_number}) catch "?");
                 Gui.treePop();
@@ -274,7 +274,7 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
             _ = Gui.tableNextColumn();
             Gui.label("");
 
-            var iter = game.ecs_backend.query(.{Position});
+            var iter = game.active_world.ecs_backend.query(.{Position});
             defer deinitIter(&iter, game.allocator);
 
             var count: usize = 0;
@@ -287,7 +287,7 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
                 var passes = true;
                 inline for (comp_names, 0..) |name, i| {
                     if (i < MAX_COMPONENTS and component_filters[i]) {
-                        if (!Reg.entityHasNamed(&game.ecs_backend, entity, name)) {
+                        if (!Reg.entityHasNamed(&game.active_world.ecs_backend, entity, name)) {
                             passes = false;
                         }
                     }
@@ -309,7 +309,7 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
                 var tags_len: usize = 0;
 
                 inline for (comp_names) |name| {
-                    if (Reg.entityHasNamed(&game.ecs_backend, entity, name)) {
+                    if (Reg.entityHasNamed(&game.active_world.ecs_backend, entity, name)) {
                         if (tags_len + name.len + 1 < tags_buf.len) {
                             @memcpy(tags_buf[tags_len .. tags_len + name.len], name);
                             tags_len += name.len;
@@ -336,7 +336,7 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
         }
 
         var total_buf: [48]u8 = undefined;
-        Gui.label(std.fmt.bufPrintZ(&total_buf, "Total: {d}", .{game.ecs_backend.entityCount()}) catch "?");
+        Gui.label(std.fmt.bufPrintZ(&total_buf, "Total: {d}", .{game.active_world.ecs_backend.entityCount()}) catch "?");
     }
     Gui.endWindow();
 }
@@ -346,7 +346,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
     const Reg = @TypeOf(game.*).ComponentRegistry;
     const comp_names = comptime Reg.names();
 
-    if (!game.ecs_backend.entityExists(entity)) {
+    if (!game.active_world.ecs_backend.entityExists(entity)) {
         selected_entity = null;
         return;
     }
@@ -362,7 +362,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
         Gui.separator();
 
         // Position (always show, not in registry)
-        if (game.ecs_backend.getComponent(entity, Position)) |pos| {
+        if (game.active_world.ecs_backend.getComponent(entity, Position)) |pos| {
             if (Gui.treeNode("Position")) {
                 var buf: [64]u8 = undefined;
                 Gui.label(std.fmt.bufPrintZ(&buf, "x: {d:.2}", .{pos.x}) catch "?");
@@ -375,7 +375,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
         // Each registered component
         inline for (comp_names) |name| {
             const T = Reg.getType(name);
-            if (game.ecs_backend.getComponent(entity, T)) |comp| {
+            if (game.active_world.ecs_backend.getComponent(entity, T)) |comp| {
                 if (Gui.treeNode(@ptrCast(name))) {
                     showStructFields(Gui, comp, T);
                     Gui.treePop();

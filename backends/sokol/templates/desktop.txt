@@ -17,7 +17,7 @@ export fn init() callconv(.c) void {
 {{hidden_setup}}    window.initGfx();
     g = AssembledGame.init({{allocator_expr}});
     g.setHooks(&hooks);
-    g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     initInner() catch |err| {
         std.debug.print("labelle: init failed: {any}\n", .{err});
     };
