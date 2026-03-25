@@ -129,6 +129,12 @@ Runtime Scene (entities + components ready for ECS)
 
 Entity references (`{ "ref": { "entity": "player" } }`) work the same way — resolved in Phase 2 after all entities are created. The parsed `Value` tree preserves the reference structure, so no special parser work is needed. Resolution logic belongs in the ECS bridge during engine integration.
 
+**Bidirectional parent/child references**: Children already track their parent via `parent_index`. Parents also track their children via `children_indices` — a slice of indices into the flattened entity list. This means both directions are available after scene loading:
+- **Child → Parent**: `entity.parent_index` (index into `scene.entities`)
+- **Parent → Children**: `entity.children_indices` (slice of indices into `scene.entities`)
+
+Both are set during the flattening phase when the entity tree is linearized into `scene.entities`. This enables traversal in either direction without walking the tree.
+
 ### Error Handling
 
 Runtime parsing means runtime errors are possible (typos, missing components, type mismatches). The system should:

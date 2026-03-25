@@ -47,6 +47,7 @@ pub const Entity = struct {
     components: []const ComponentData,
     children: []const Entity,
     parent_index: ?usize, // index into scene.entities of parent, set during flattening
+    children_indices: []const usize, // indices into scene.entities of children, set during flattening
 
     pub const ComponentData = struct {
         name: []const u8,
@@ -339,7 +340,53 @@ fn loadEntity(allocator: Allocator, entity_val: Value, prefab_cache: *PrefabCach
         .components = try merged.toOwnedSlice(allocator),
         .children = try children.toOwnedSlice(allocator),
         .parent_index = null,
+        .children_indices = &.{},
     };
+}
+
+/// Flatten the entity tree into a linear list with bidirectional parent/child indices.
+/// Top-level entities come first, then their children depth-first.
+/// Sets `parent_index` and `children_indices` on each entity.
+pub fn flattenEntities(allocator: Allocator, tree_entities: []const Entity) ![]Entity {
+    var flat: std.ArrayList(Entity) = .{};
+
+    // First pass: add all top-level entities to get their indices
+    for (tree_entities) |entity| {
+        try flattenRecursive(allocator, &flat, entity, null);
+    }
+
+    var result = try flat.toOwnedSlice(allocator);
+
+    // Second pass: set children_indices for each entity that has children
+    for (result, 0..) |*entity, i| {
+        if (entity.children.len > 0) {
+            var indices: std.ArrayList(usize) = .{};
+            for (result[i + 1 ..], i + 1..) |other, j| {
+                if (other.parent_index) |pi| {
+                    if (pi == i) try indices.append(allocator, j);
+                }
+            }
+            entity.children_indices = try indices.toOwnedSlice(allocator);
+        }
+    }
+
+    return result;
+}
+
+fn flattenRecursive(
+    allocator: Allocator,
+    flat: *std.ArrayList(Entity),
+    entity: Entity,
+    parent_idx: ?usize,
+) !void {
+    const my_index = flat.items.len;
+    var e = entity;
+    e.parent_index = parent_idx;
+    try flat.append(allocator, e);
+
+    for (entity.children) |child| {
+        try flattenRecursive(allocator, flat, child, my_index);
+    }
 }
 
 // ======================== Tests ========================
@@ -789,4 +836,96 @@ test "load scene from real file" {
         try std.testing.expect(w.hasComponent("ClosestMovementNode"));
         try std.testing.expect(w.hasComponent("NeedsClosestNode"));
     }
+}
+
+// === Flatten with bidirectional parent/child indices ===
+
+test "flattenEntities — parent refs children, children ref parent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Simple tree: parent with 2 children
+    var cache = PrefabCache.init(alloc, "nonexistent");
+
+    var prefab_p = parser.Parser.init(alloc,
+        \\.{
+        \\    .components = .{ .Room = .{} },
+        \\    .children = .{
+        \\        .{ .components = .{ .Wall = .{}, .Position = .{ .x = 10, .y = 0 } } },
+        \\        .{ .components = .{ .Door = .{}, .Position = .{ .x = 50, .y = 0 } } },
+        \\    },
+        \\}
+    );
+    const parent_entity = try loadEntity(alloc, try prefab_p.parse(), &cache);
+    try std.testing.expectEqual(@as(usize, 2), parent_entity.children.len);
+
+    const flat = try flattenEntities(alloc, &.{parent_entity});
+
+    // Flat: parent(0), wall(1), door(2)
+    try std.testing.expectEqual(@as(usize, 3), flat.len);
+
+    // Parent has no parent_index
+    try std.testing.expect(flat[0].parent_index == null);
+    // Parent's children_indices point to wall and door
+    try std.testing.expectEqual(@as(usize, 2), flat[0].children_indices.len);
+    try std.testing.expectEqual(@as(usize, 1), flat[0].children_indices[0]);
+    try std.testing.expectEqual(@as(usize, 2), flat[0].children_indices[1]);
+
+    // Wall (index 1) points back to parent
+    try std.testing.expectEqual(@as(usize, 0), flat[1].parent_index.?);
+    try std.testing.expect(flat[1].hasComponent("Wall"));
+    try std.testing.expectEqual(@as(usize, 0), flat[1].children_indices.len);
+
+    // Door (index 2) points back to parent
+    try std.testing.expectEqual(@as(usize, 0), flat[2].parent_index.?);
+    try std.testing.expect(flat[2].hasComponent("Door"));
+    try std.testing.expectEqual(@as(usize, 0), flat[2].children_indices.len);
+}
+
+test "flattenEntities — nested grandchildren" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var cache = PrefabCache.init(alloc, "nonexistent");
+
+    // Grandparent -> Parent -> Child
+    var child_p = parser.Parser.init(alloc,
+        \\.{ .components = .{ .Leaf = .{} } }
+    );
+    try cache.put("leaf", try child_p.parse());
+
+    var parent_p = parser.Parser.init(alloc,
+        \\.{ .components = .{ .Branch = .{} }, .children = .{ .{ .prefab = "leaf", .components = .{} } } }
+    );
+    try cache.put("branch", try parent_p.parse());
+
+    var root_p = parser.Parser.init(alloc,
+        \\.{
+        \\    .components = .{ .Root = .{} },
+        \\    .children = .{
+        \\        .{ .prefab = "branch", .components = .{} },
+        \\    },
+        \\}
+    );
+    const root = try loadEntity(alloc, try root_p.parse(), &cache);
+    const flat = try flattenEntities(alloc, &.{root});
+
+    // Flat: root(0), branch(1), leaf(2)
+    try std.testing.expectEqual(@as(usize, 3), flat.len);
+
+    // Root -> [branch]
+    try std.testing.expect(flat[0].parent_index == null);
+    try std.testing.expectEqual(@as(usize, 1), flat[0].children_indices.len);
+    try std.testing.expectEqual(@as(usize, 1), flat[0].children_indices[0]);
+
+    // Branch -> [leaf], parent = root
+    try std.testing.expectEqual(@as(usize, 0), flat[1].parent_index.?);
+    try std.testing.expectEqual(@as(usize, 1), flat[1].children_indices.len);
+    try std.testing.expectEqual(@as(usize, 2), flat[1].children_indices[0]);
+
+    // Leaf, parent = branch, no children
+    try std.testing.expectEqual(@as(usize, 1), flat[2].parent_index.?);
+    try std.testing.expectEqual(@as(usize, 0), flat[2].children_indices.len);
 }
