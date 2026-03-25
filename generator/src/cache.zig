@@ -463,11 +463,11 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
     }
 }
 
-/// Patch a single build.zig.zon file, rewriting labelle-core path deps
-/// to point to the sibling core package in the deps directory.
-/// After deps_linker runs, engine and core are siblings under .labelle/deps/,
-/// so core is always at "../labelle-core" relative to the engine package root
-/// (or "../../labelle-core" from a subpackage like scene/).
+/// Patch a single build.zig.zon file in the global cache, rewriting
+/// labelle-core path deps to work after deps_linker hardlinks the package
+/// into .labelle/deps/ alongside core. In the deps layout, packages are
+/// siblings, so core is at "../labelle-core" from a root package or
+/// "../../labelle-core" from a subpackage (scene/, camera/).
 fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, is_subpackage: bool) !void {
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
     defer allocator.free(file_path);
