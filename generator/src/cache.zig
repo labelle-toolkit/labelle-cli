@@ -441,10 +441,11 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
         // Never patch symlinked packages — they point to local repos that must not be mutated.
         if (isSymlink(pkg_dir)) continue;
 
-        // Patch the main build.zig.zon
-        try patchZonFile(allocator, pkg_dir, "build.zig.zon", cfg);
+        // Patch the main build.zig.zon (root: core is sibling → "../labelle-core")
+        try patchZonFile(allocator, pkg_dir, "build.zig.zon", false);
 
         // Patch subpackage build.zig.zon files (scene/, camera/, etc.)
+        // Subpackages are one level deeper → "../../labelle-core"
         var dir = std.fs.cwd().openDir(pkg_dir, .{ .iterate = true }) catch continue;
         defer dir.close();
 
@@ -456,40 +457,39 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
             if (std.fs.cwd().access(sub_zon, .{})) |_| {
                 const sub_dir = try std.fs.path.join(allocator, &.{ pkg_dir, entry.name });
                 defer allocator.free(sub_dir);
-                try patchZonFile(allocator, sub_dir, "build.zig.zon", cfg);
+                try patchZonFile(allocator, sub_dir, "build.zig.zon", true);
             } else |_| {}
         }
     }
 }
 
-/// Patch a single build.zig.zon file, rewriting labelle-core path deps
-/// to point to the cached core package.
-fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, cfg: config.ProjectConfig) !void {
+/// Patch a single build.zig.zon file in the global cache, rewriting
+/// labelle-core path deps to work after deps_linker hardlinks the package
+/// into .labelle/deps/ alongside core. In the deps layout, packages are
+/// siblings, so core is at "../labelle-core" from a root package or
+/// "../../labelle-core" from a subpackage (scene/, camera/).
+fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []const u8, is_subpackage: bool) !void {
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
     defer allocator.free(file_path);
 
     const content = std.fs.cwd().readFileAlloc(allocator, file_path, 256 * 1024) catch return;
     defer allocator.free(content);
 
-    // Compute relative path from this dir to the cached core package
-    const core_abs = try resolveFrameworkPackage(allocator, "core", cfg.core_version, null);
-    defer allocator.free(core_abs);
+    // After deps_linker, all packages are siblings under .labelle/deps/.
+    // Root build.zig.zon: core is at "../labelle-core"
+    // Subpackage build.zig.zon (scene/, camera/): core is at "../../labelle-core"
+    const target = if (is_subpackage) "../../labelle-core" else "../labelle-core";
 
-    const dir_abs = std.fs.cwd().realpathAlloc(allocator, dir_path) catch return;
-    defer allocator.free(dir_abs);
-
-    const rel_core = try std.fs.path.relative(allocator, dir_abs, core_abs);
-    defer allocator.free(rel_core);
-
-    // Replace any path that points to a labelle-core sibling
-    // Patterns: "../labelle-core", "../../labelle-core"
+    // Normalize all core path variants to the correct target for this depth.
+    // Use a placeholder to avoid "../labelle-core" matching inside "../../labelle-core".
     var result = try allocator.dupe(u8, content);
-    const patterns = [_][]const u8{ "../../labelle-core", "../labelle-core" };
-    for (patterns) |pattern| {
-        const replaced = try replaceAll(allocator, result, pattern, rel_core);
-        allocator.free(result);
-        result = replaced;
-    }
+    const step1 = try replaceAll(allocator, result, "../../labelle-core", "\x00CORE_REF\x00");
+    allocator.free(result);
+    const step2 = try replaceAll(allocator, step1, "../labelle-core", "\x00CORE_REF\x00");
+    allocator.free(step1);
+    const step3 = try replaceAll(allocator, step2, "\x00CORE_REF\x00", target);
+    allocator.free(step2);
+    result = step3;
 
     // Only write if changed
     if (!std.mem.eql(u8, content, result)) {
