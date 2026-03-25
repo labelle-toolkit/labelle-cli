@@ -51,6 +51,11 @@ pub const HotReloader = struct {
     }
 
     pub fn deinit(self: *HotReloader) void {
+        // Free all duped key strings in watched_files
+        var iter = self.watched_files.keyIterator();
+        while (iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
         self.scene_arena.deinit();
         self.watched_files.deinit();
     }
@@ -91,6 +96,9 @@ pub const HotReloader = struct {
             if (self.on_before_reload) |cb| cb(scene);
         }
 
+        // Clear before arena reset to avoid dangling pointer on load failure
+        self.current_scene = null;
+
         // Reset the arena — frees all memory from previous scene load
         _ = self.scene_arena.reset(.retain_capacity);
 
@@ -115,6 +123,11 @@ pub const HotReloader = struct {
     }
 
     fn snapshotFileTimes(self: *HotReloader) !void {
+        // Free all previously duped key strings before clearing the map
+        var iter = self.watched_files.keyIterator();
+        while (iter.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
         self.watched_files.clearRetainingCapacity();
 
         // Watch the scene file
@@ -124,10 +137,11 @@ pub const HotReloader = struct {
         var dir = std.fs.cwd().openDir(self.prefab_dir, .{ .iterate = true }) catch return;
         defer dir.close();
 
-        var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zon")) {
                 const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.prefab_dir, entry.name });
+                defer self.allocator.free(full_path);
                 try self.watchFile(full_path);
             }
         }
@@ -179,6 +193,11 @@ pub const SimulatedGame = struct {
     }
 
     pub fn deinit(self: *SimulatedGame) void {
+        // Free duped scene_name strings from reload log
+        for (self.reload_log.items) |event| {
+            self.reloader.allocator.free(event.scene_name);
+        }
+        self.reload_log.deinit(self.reloader.allocator);
         self.reloader.deinit();
     }
 
@@ -204,10 +223,12 @@ pub const SimulatedGame = struct {
 
     fn logReload(self: *SimulatedGame) !void {
         if (self.reloader.current_scene) |scene| {
+            // Dupe scene_name onto the parent allocator so it survives arena resets
+            const owned_name = try self.reloader.allocator.dupe(u8, scene.name);
             try self.reload_log.append(self.reloader.allocator, .{
                 .frame = self.frame_count,
                 .entity_count = scene.entities.len,
-                .scene_name = scene.name,
+                .scene_name = owned_name,
                 .reload_time_ns = self.reloader.last_reload_time_ns,
             });
         }
