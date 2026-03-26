@@ -151,6 +151,11 @@ pub const ProjectConfig = struct {
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
 
+    /// Game states for the state machine. Scripts in `scripts/<state>/` only run
+    /// when that state is active. First element is the initial state.
+    /// Defaults to a single "running" state when omitted.
+    states: []const []const u8 = &.{"running"},
+
     /// iOS configuration — parsed from project.labelle `.ios` section.
     /// Defaults to null (derived from project name/title when absent).
     ios: ?IosConfig = null,
