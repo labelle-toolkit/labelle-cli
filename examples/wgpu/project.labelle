@@ -11,6 +11,7 @@
         .{ .name = "pathfinding", .repo = "local:../../../labelle-pathfinding", .version = "0.1.0" },
         .{ .name = "physics", .repo = "local:../../../labelle-physics", .version = "0.1.0" },
     },
+    .states = .{ "playing" },
     .layers = .{
         .{ .name = "far_background", .order = 0, .space = .screen },
         .{ .name = "terrain", .order = 1, .space = .world },

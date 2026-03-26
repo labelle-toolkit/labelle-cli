@@ -1,0 +1,34 @@
+{
+    // Main scene — example game
+    "name": "main",
+    "scripts": [
+        "camera_control"
+    ],
+    "entities": [
+        // Player entity
+        {
+            "name": "player",
+            "components": {
+                "Position": { "x": 400, "y": 300 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 32, "height": 32 } },
+                    "color": { "r": 60, "g": 120, "b": 220, "a": 255 },
+                    "layer": "world",
+                    "z_index": 5
+                },
+                "Velocity": { "x": 0, "y": 0 }
+            }
+        },
+        // Title label
+        {
+            "components": {
+                "Position": { "x": 400, "y": 50 },
+                "Text": {
+                    "text": "LaBelle Example",
+                    "size": 24,
+                    "color": { "r": 255, "g": 255, "b": 255, "a": 255 }
+                }
+            }
+        }
+    ]
+}
