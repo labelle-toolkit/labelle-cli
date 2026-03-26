@@ -68,11 +68,11 @@ pub const ScriptScanner = struct {
                 try self.addEntry(name_copy, null, &.{});
             } else if (entry.kind == .directory) {
                 // First-level directory — parse for state binding
-                const dir_states = self.parseDirStates(entry.name) catch return;
+                const dir_states = try self.parseDirStates(entry.name);
                 if (dir_states.len == 0) continue;
 
-                const subdir_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ scripts_dir, entry.name }) catch return;
-                const subdir_name = self.allocator.dupe(u8, entry.name) catch return;
+                const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ scripts_dir, entry.name });
+                const subdir_name = try self.allocator.dupe(u8, entry.name);
                 // Recursively scan — deeper subdirs are organizational only
                 try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states);
             }
@@ -135,7 +135,7 @@ pub const ScriptScanner = struct {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
                 try self.addEntry(name_copy, state_dir_name, states);
             } else if (entry.kind == .directory) {
-                const sub_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch return;
+                const sub_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
                 try self.scanZigFilesRecursive(sub_path, state_dir_name, states);
             }
         }
