@@ -70,6 +70,12 @@ fn validateStates(states: []const []const u8) void {
             std.debug.print("labelle: error: state name cannot be empty\n", .{});
             std.process.exit(1);
         }
+        // First character must be [a-z_] — digits would produce invalid Zig identifiers in codegen
+        if (name[0] >= '0' and name[0] <= '9') {
+            std.debug.print("labelle: error: state name \"{s}\" cannot start with a digit\n", .{name});
+            std.debug.print("  hint: prefix with a letter (e.g., \"level_1\" not \"1_level\")\n\n", .{});
+            std.process.exit(1);
+        }
         for (name) |c| {
             if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_')) {
                 std.debug.print("labelle: error: invalid state name \"{s}\" — must be lowercase alphanumeric with underscores [a-z0-9_]\n", .{name});
