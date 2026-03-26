@@ -77,8 +77,22 @@ pub fn generateMainZig(
         }
     }
 
-    // Note: JSONC scenes are loaded at runtime, not imported at comptime.
-    // They are registered in the setup/init code via g.registerJsoncScene().
+    // JSONC scene bridge + loader wrappers (runtime-loaded scenes)
+    if (jsonc_scene_names.len > 0) {
+        try w.writeAll("\n// --- JSONC scene loaders (runtime) ---\n");
+        try w.writeAll("const JsoncBridge = engine.JsoncSceneBridge(AssembledGame, Components);\n");
+        for (jsonc_scene_names) |name| {
+            const ident = pathToIdent(name, &ident_buf);
+            try w.print(
+                \\const jsonc_{s}_loader = struct {{
+                \\    fn load(game: *AssembledGame) anyerror!void {{
+                \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
+                \\    }}
+                \\}}.load;
+                \\
+            , .{ ident, name });
+        }
+    }
 
     try w.writeByte('\n');
 
@@ -401,11 +415,13 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
         }
     }
 
-    // Register runtime JSONC scenes (loaded from disk at runtime)
+    // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
         try w.writeAll("\n    // Runtime JSONC scenes\n");
+        var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
-            try w.print("    g.registerJsoncScene(\"{s}\", \"scenes/{s}.jsonc\", \"prefabs\");\n", .{ name, name });
+            const ident = pathToIdent(name, &jsonc_ident_buf);
+            try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
     }
 
@@ -478,11 +494,13 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
         }
     }
 
-    // Register runtime JSONC scenes (loaded from disk at runtime)
+    // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
         try w.writeAll("\n    // Runtime JSONC scenes\n");
+        var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
-            try w.print("    g.registerJsoncScene(\"{s}\", \"scenes/{s}.jsonc\", \"prefabs\");\n", .{ name, name });
+            const ident = pathToIdent(name, &jsonc_ident_buf);
+            try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
     }
 
