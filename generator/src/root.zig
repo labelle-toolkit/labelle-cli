@@ -7,6 +7,7 @@ const config = @import("config.zig");
 const cache = @import("cache.zig");
 const scanner = @import("scanner.zig");
 const main_zig = @import("main_zig.zig");
+pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
