@@ -80,7 +80,11 @@ pub fn generateMainZig(
     // JSONC scene bridge + loader wrappers (runtime-loaded scenes)
     if (jsonc_scene_names.len > 0) {
         try w.writeAll("\n// --- JSONC scene loaders (runtime) ---\n");
-        try w.writeAll("const JsoncBridge = engine.JsoncSceneBridge(AssembledGame, Components);\n");
+        if (gizmo_names.len > 0) {
+            try w.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");
+        } else {
+            try w.writeAll("const JsoncBridge = engine.JsoncSceneBridge(AssembledGame, Components);\n");
+        }
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &ident_buf);
             try w.print(
