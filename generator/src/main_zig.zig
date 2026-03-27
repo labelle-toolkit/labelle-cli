@@ -219,11 +219,12 @@ pub fn generateMainZig(
                 try w.print("            \"{s}\",\n", .{state});
             }
             try w.writeAll("        };\n");
-            // Re-export all public declarations from the inner module
-            try w.writeAll("        pub const init = if (@hasDecl(_inner, \"init\")) _inner.init else null;\n");
-            try w.writeAll("        pub const update = if (@hasDecl(_inner, \"update\")) _inner.update else null;\n");
-            try w.writeAll("        pub const deinit = if (@hasDecl(_inner, \"deinit\")) _inner.deinit else null;\n");
-            try w.writeAll("        pub const drawGui = if (@hasDecl(_inner, \"drawGui\")) _inner.drawGui else null;\n");
+            // Re-export all lifecycle decls from the inner module.
+            // We check each one individually since not all scripts export all decls.
+            const decl_names = [_][]const u8{ "tick", "setup", "drawGui", "State" };
+            for (decl_names) |decl| {
+                try w.print("        pub const {s} = if (@hasDecl(_inner, \"{s}\")) _inner.{s} else {{}};\n", .{ decl, decl, decl });
+            }
             try w.writeAll("    };\n");
         }
     }
