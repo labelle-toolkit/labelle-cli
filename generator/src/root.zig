@@ -34,6 +34,7 @@ pub const isLocalVersion = config.isLocalVersion;
 pub const generateMainZig = main_zig.generateMainZig;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
+pub const deps_linker = build_files.deps_linker;
 
 pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;

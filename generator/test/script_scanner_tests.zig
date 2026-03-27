@@ -435,3 +435,59 @@ pub const DuplicateValidation = struct {
         try std.testing.expectError(error.DuplicateSortOrder, scanner.scanDir(scripts_path));
     }
 };
+
+// Regression tests for memory leaks (issue #78).
+// These use std.testing.allocator directly (not arena) so the GPA
+// detects any leaked allocations and fails the test.
+pub const MemoryLeaks = struct {
+    test "scanDir with state dirs does not leak (regression #78)" {
+        const alloc = std.testing.allocator;
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/global.zig", .data = "" });
+        try tmp_dir.dir.makeDir("scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_movement.zig", .data = "" });
+        try tmp_dir.dir.makeDir("scripts/playing/sub");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/sub/02_ai.zig", .data = "" });
+        try tmp_dir.dir.makeDir("scripts/menu");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/menu/ui.zig", .data = "" });
+        try tmp_dir.dir.makeDir("scripts/playing+menu");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing+menu/camera.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        defer alloc.free(scripts_path);
+
+        const states_list = [_][]const u8{ "playing", "menu" };
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        defer scanner.deinit();
+        try scanner.scanDir(scripts_path);
+
+        // Verify scan worked
+        try expect.equal(scanner.getEntries().len, @as(usize, 5));
+        // If deinit doesn't free everything, std.testing.allocator will fail this test
+    }
+
+    test "scanDir with no state dirs does not leak" {
+        const alloc = std.testing.allocator;
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/bar.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        defer alloc.free(scripts_path);
+
+        const states_list = [_][]const u8{"playing"};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        defer scanner.deinit();
+        try scanner.scanDir(scripts_path);
+
+        try expect.equal(scanner.getEntries().len, @as(usize, 2));
+    }
+};
