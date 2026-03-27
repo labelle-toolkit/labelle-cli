@@ -278,9 +278,9 @@ pub const BUILD_ZIG = struct {
         defer std.testing.allocator.free(build_zig);
 
         // gfx and engine must use the project-level core, not their own resolved version
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "gfx_mod.overrideImport(\"labelle-core\", core_mod)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "engine_mod.overrideImport(\"labelle-core\", core_mod)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "engine_mod.overrideImport(\"labelle-gfx\", gfx_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(gfx_mod, \"labelle-core\", core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(engine_mod, \"labelle-core\", core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(engine_mod, \"labelle-gfx\", gfx_mod)") != null);
     }
 
     test "resolved_gui wires gui_backend" {
@@ -400,18 +400,18 @@ pub const PLUGINS = struct {
         defer std.testing.allocator.free(build_zig);
 
         // Core + gfx + engine (always injected)
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"labelle-core\", core_mod)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"labelle-gfx\", gfx_mod)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"labelle-engine\", engine_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"labelle-core\", core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"labelle-gfx\", gfx_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"labelle-engine\", engine_mod)") != null);
 
         // ECS backend (injected when ecs != mock)
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"ecs_backend\", ecs_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"ecs_backend\", ecs_mod)") != null);
 
         // Backend modules (always injected)
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"backend_gfx\", backend_gfx)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"backend_input\", backend_input)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"backend_audio\", backend_audio)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"backend_window\", backend_window)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"backend_gfx\", backend_gfx)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"backend_input\", backend_input)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"backend_audio\", backend_audio)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"backend_window\", backend_window)") != null);
     }
 
     test "plugins with mock ecs omit ecs_backend import" {
@@ -428,8 +428,8 @@ pub const PLUGINS = struct {
         // Should NOT have ecs_backend when using mock
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(\"ecs_backend\"") == null);
         // But should still have core, gfx, engine
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"labelle-core\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"labelle-engine\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"labelle-core\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"labelle-engine\"") != null);
     }
 
     test "plugins receive gui_backend when gui is active" {
@@ -444,7 +444,7 @@ pub const PLUGINS = struct {
         });
         defer std.testing.allocator.free(build_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "plugin_physics_mod.overrideImport(\"gui_backend\", gui_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"gui_backend\", gui_mod)") != null);
     }
 
     test "plugins omit gui_backend when no gui" {

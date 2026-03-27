@@ -206,7 +206,7 @@ pub fn generateMainZig(
     try w.writeAll("const AllScripts = struct {\n");
     for (script_entries) |entry| {
         if (std.mem.eql(u8, entry.name, "context")) continue;
-        const ident = pathToIdent(entry.rel_path, &ident_buf);
+        const ident = entry.name;
         if (entry.states.len == 0) {
             // Global script — import directly, no wrapper needed
             try w.print("    pub const {s} = @import(\"scripts/{s}\");\n", .{ ident, entry.rel_path });
