@@ -76,8 +76,16 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     const jsonc_scene_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "scenes", ".jsonc");
     defer scanner.freeNames(allocator, jsonc_scene_names);
 
-    const script_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "scripts", ".zig");
-    defer scanner.freeNames(allocator, script_names);
+    // Copy all script files (including subdirectories) into target dir.
+    // Then use ScriptScanner to parse directory-based state binding.
+    const script_names_unused = try scanner.copyAndScan(allocator, game_dir, target_dir, "scripts", ".zig");
+    scanner.freeNames(allocator, script_names_unused);
+
+    const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
+    defer allocator.free(scripts_target);
+    var script_scan = script_scanner.ScriptScanner.init(allocator, cfg.states);
+    try script_scan.scanDir(scripts_target);
+    const script_entries = script_scan.getEntries();
 
     const component_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "components", ".zig");
     defer scanner.freeNames(allocator, component_names);
@@ -108,7 +116,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
     // Generate main.zig — uses ScriptRunner for comptime dispatch
-    const main_zig_content = try main_zig.generateMainZig(allocator, cfg, backend_tmpl, script_names, prefab_names, scene_names, jsonc_scene_names, component_names, hook_names, enum_names, view_names, gizmo_names);
+    const main_zig_content = try main_zig.generateMainZig(allocator, cfg, backend_tmpl, script_entries, prefab_names, scene_names, jsonc_scene_names, component_names, hook_names, enum_names, view_names, gizmo_names);
     defer allocator.free(main_zig_content);
     try scanner.writeFile(target_dir, "main.zig", main_zig_content);
 }

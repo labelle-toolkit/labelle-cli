@@ -37,6 +37,9 @@ pub const ScriptScanner = struct {
         sort_order: ?u32,
         /// State directory it was found in (null = root/global).
         subdir: ?[]const u8,
+        /// Relative path from the scripts/ root (e.g., "playing/navigation/02_movement.zig").
+        /// For root-level scripts, same as filename.
+        rel_path: []const u8,
     };
 
     pub const ScanError = error{
@@ -65,7 +68,7 @@ pub const ScriptScanner = struct {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 // Root-level script — runs in all states
                 const name_copy = try self.allocator.dupe(u8, entry.name);
-                try self.addEntry(name_copy, null, &.{});
+                try self.addEntryWithPath(name_copy, null, &.{}, name_copy);
             } else if (entry.kind == .directory) {
                 // First-level directory — parse for state binding
                 const dir_states = try self.parseDirStates(entry.name);
@@ -74,7 +77,7 @@ pub const ScriptScanner = struct {
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ scripts_dir, entry.name });
                 const subdir_name = try self.allocator.dupe(u8, entry.name);
                 // Recursively scan — deeper subdirs are organizational only
-                try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states);
+                try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states, subdir_name);
             }
         }
 
@@ -96,6 +99,22 @@ pub const ScriptScanner = struct {
             .states = states,
             .sort_order = sort_order,
             .subdir = subdir,
+            .rel_path = filename,
+        });
+    }
+
+    /// Add an entry with a full relative path (used by filesystem scanning).
+    pub fn addEntryWithPath(self: *ScriptScanner, filename: []const u8, subdir: ?[]const u8, states: []const []const u8, rel_path: []const u8) !void {
+        const name = stripPrefixAndExtension(filename);
+        const sort_order = extractSortOrder(filename);
+
+        try self.entries.append(self.allocator, .{
+            .name = name,
+            .filename = filename,
+            .states = states,
+            .sort_order = sort_order,
+            .subdir = subdir,
+            .rel_path = rel_path,
         });
     }
 
@@ -125,7 +144,7 @@ pub const ScriptScanner = struct {
 
     /// Recursively scan a directory for .zig files. Subdirectories within
     /// a state folder are purely organizational — they don't affect state binding.
-    fn scanZigFilesRecursive(self: *ScriptScanner, dir_path: []const u8, state_dir_name: ?[]const u8, states: []const []const u8) ScanError!void {
+    fn scanZigFilesRecursive(self: *ScriptScanner, dir_path: []const u8, state_dir_name: ?[]const u8, states: []const []const u8, rel_prefix: []const u8) ScanError!void {
         var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close();
 
@@ -133,10 +152,12 @@ pub const ScriptScanner = struct {
         while (iter.next() catch return) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
-                try self.addEntry(name_copy, state_dir_name, states);
+                const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                try self.addEntryWithPath(name_copy, state_dir_name, states, rel_path);
             } else if (entry.kind == .directory) {
                 const sub_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
-                try self.scanZigFilesRecursive(sub_path, state_dir_name, states);
+                const sub_rel = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                try self.scanZigFilesRecursive(sub_path, state_dir_name, states, sub_rel);
             }
         }
     }

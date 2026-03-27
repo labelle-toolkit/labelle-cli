@@ -2,11 +2,13 @@
 const std = @import("std");
 const tpl = @import("template.zig");
 const config = @import("config.zig");
+const script_scanner = @import("script_scanner.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
 const LayerDef = config.LayerDef;
 const ResourceDef = config.ResourceDef;
+const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 
 // ── Shared templates (embedded at comptime — backend-independent) ──────────
 const shared_header = @embedFile("templates/shared/header.txt");
@@ -21,7 +23,7 @@ pub fn generateMainZig(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
     lifecycle_tmpl: []const u8,
-    script_names: []const []const u8,
+    script_entries: []const ScriptEntry,
     prefab_names: []const []const u8,
     scene_names: []const []const u8,
     jsonc_scene_names: []const []const u8,
@@ -203,11 +205,37 @@ pub fn generateMainZig(
 
     // AllScripts struct — shared by both ScriptRunner (comptime dispatch for game scripts)
     // and ScriptRegistry (scene scripts with init/update/deinit). Generated once, reused below.
+    //
+    // Directory convention determines state binding:
+    //   scripts/*.zig              → global (no game_states decl)
+    //   scripts/<state>/*.zig      → runs only in that state
+    //   scripts/<s1>+<s2>/*.zig    → runs in multiple states
+    //   scripts/<state>/sub/*.zig  → organizational, same state as parent
+    //
+    // State-scoped scripts get a wrapper module that injects `pub const game_states`.
     try w.writeAll("const AllScripts = struct {\n");
-    for (script_names) |name| {
-        if (std.mem.eql(u8, name, "context")) continue;
-        const ident = pathToIdent(name, &ident_buf);
-        try w.print("    pub const {s} = @import(\"scripts/{s}.zig\");\n", .{ ident, name });
+    for (script_entries) |entry| {
+        if (std.mem.eql(u8, entry.name, "context")) continue;
+        const ident = pathToIdent(entry.name, &ident_buf);
+        if (entry.states.len == 0) {
+            // Global script — import directly, no wrapper needed
+            try w.print("    pub const {s} = @import(\"scripts/{s}\");\n", .{ ident, entry.rel_path });
+        } else {
+            // State-scoped script — generate a wrapper that adds game_states
+            try w.print("    pub const {s} = struct {{\n", .{ident});
+            try w.print("        const _inner = @import(\"scripts/{s}\");\n", .{entry.rel_path});
+            try w.writeAll("        pub const game_states = .{\n");
+            for (entry.states) |state| {
+                try w.print("            \"{s}\",\n", .{state});
+            }
+            try w.writeAll("        };\n");
+            // Re-export all public declarations from the inner module
+            try w.writeAll("        pub const init = if (@hasDecl(_inner, \"init\")) _inner.init else null;\n");
+            try w.writeAll("        pub const update = if (@hasDecl(_inner, \"update\")) _inner.update else null;\n");
+            try w.writeAll("        pub const deinit = if (@hasDecl(_inner, \"deinit\")) _inner.deinit else null;\n");
+            try w.writeAll("        pub const drawGui = if (@hasDecl(_inner, \"drawGui\")) _inner.drawGui else null;\n");
+            try w.writeAll("    };\n");
+        }
     }
     try w.writeAll("};\n\n");
 
@@ -215,7 +243,7 @@ pub fn generateMainZig(
     try w.writeAll("const Scripts = engine.ScriptRegistry(AllScripts);\n\n");
 
     // GameContext — shared state across scripts (optional context.zig)
-    const has_context = hasName(script_names, "context");
+    const has_context = hasContextEntry(script_entries);
     if (has_context) {
         try w.writeAll("const GameContext = @import(\"scripts/context.zig\").GameContext(EcsBackend);\n");
     } else {
@@ -382,6 +410,14 @@ pub fn generateMainZig(
 fn hasName(names: []const []const u8, target: []const u8) bool {
     for (names) |name| {
         if (std.mem.eql(u8, name, target)) return true;
+    }
+    return false;
+}
+
+/// Check if a script entry with the given name exists.
+fn hasContextEntry(entries: []const ScriptEntry) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, "context")) return true;
     }
     return false;
 }
