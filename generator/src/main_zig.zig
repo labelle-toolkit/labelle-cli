@@ -25,7 +25,6 @@ pub fn generateMainZig(
     lifecycle_tmpl: []const u8,
     script_entries: []const ScriptEntry,
     prefab_names: []const []const u8,
-    scene_names: []const []const u8,
     jsonc_scene_names: []const []const u8,
     component_names: []const []const u8,
     hook_names: []const []const u8,
@@ -67,15 +66,6 @@ pub fn generateMainZig(
         for (enum_names) |name| {
             const ident = pathToIdent(name, &ident_buf);
             try w.print("const {s} = @import(\"enums/{s}.zig\");\n", .{ ident, name });
-        }
-    }
-
-    // Scene imports (comptime .zon scenes)
-    if (scene_names.len > 0) {
-        try w.writeAll("\n// --- Scene data (comptime) ---\n");
-        for (scene_names) |name| {
-            const ident = pathToIdent(name, &ident_buf);
-            try w.print("const {s}_scene = @import(\"scenes/{s}.zon\");\n", .{ ident, name });
         }
     }
 
@@ -326,7 +316,7 @@ pub fn generateMainZig(
 
     if (use_callback_lifecycle) {
         const module_vars = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
-        const init_code = try buildCallbackInitCode(allocator, cfg, scene_names, jsonc_scene_names, gizmo_names);
+        const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names);
         defer allocator.free(init_code);
 
         const platform_comment: []const u8 = switch (cfg.platform) {
@@ -388,7 +378,7 @@ pub fn generateMainZig(
             }, w);
         }
     } else {
-        const setup_code = try buildSetupCode(allocator, cfg, scene_names, jsonc_scene_names, gizmo_names);
+        const setup_code = try buildSetupCode(allocator, cfg, jsonc_scene_names);
         defer allocator.free(setup_code);
 
         try tpl.render(lifecycle_tmpl, .{
@@ -423,7 +413,7 @@ fn hasContextEntry(entries: []const ScriptEntry) bool {
 }
 
 /// Build the setup code block for {{setup_code}} (loop-based backends).
-fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names: []const []const u8, jsonc_scene_names: []const []const u8, gizmo_names: []const []const u8) ![]const u8 {
+fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -440,21 +430,6 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
 
-    const has_any_scenes = scene_names.len > 0 or jsonc_scene_names.len > 0;
-
-    if (scene_names.len > 0) {
-        if (gizmo_names.len > 0) {
-            try w.writeAll("    const Loader = engine.SceneLoaderWithGizmos(AssembledGame, Prefabs, Components, Scripts, Gizmos);\n");
-        } else {
-            try w.writeAll("    const Loader = engine.SceneLoader(AssembledGame, Prefabs, Components, Scripts);\n");
-        }
-        var ident_buf: [256]u8 = undefined;
-        for (scene_names) |name| {
-            const ident = pathToIdent(name, &ident_buf);
-            try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, ident });
-        }
-    }
-
     // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
         try w.writeAll("\n    // Runtime JSONC scenes\n");
@@ -463,11 +438,8 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names:
             const ident = pathToIdent(name, &jsonc_ident_buf);
             try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
-    }
 
-    if (has_any_scenes) {
-        // Determine initial scene: config override > first comptime > first jsonc
-        const initial = cfg.initial_scene orelse (if (scene_names.len > 0) scene_names[0] else jsonc_scene_names[0]);
+        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    try g.setScene(\"{s}\");\n", .{initial});
         try w.writeByte('\n');
     }
@@ -507,7 +479,7 @@ fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names
 // ============================================================
 
 /// Init code for callback-based backends (inside a `!void` helper, can use try).
-fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene_names: []const []const u8, jsonc_scene_names: []const []const u8, gizmo_names: []const []const u8) ![]const u8 {
+fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -519,21 +491,6 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
-    const has_any_scenes = scene_names.len > 0 or jsonc_scene_names.len > 0;
-
-    if (scene_names.len > 0) {
-        if (gizmo_names.len > 0) {
-            try w.writeAll("    const Loader = engine.SceneLoaderWithGizmos(AssembledGame, Prefabs, Components, Scripts, Gizmos);\n");
-        } else {
-            try w.writeAll("    const Loader = engine.SceneLoader(AssembledGame, Prefabs, Components, Scripts);\n");
-        }
-        var ident_buf: [256]u8 = undefined;
-        for (scene_names) |name| {
-            const ident = pathToIdent(name, &ident_buf);
-            try w.print("    g.registerSceneSimple(\"{s}\", Loader.sceneLoaderFn({s}_scene));\n", .{ name, ident });
-        }
-    }
-
     // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
         try w.writeAll("\n    // Runtime JSONC scenes\n");
@@ -542,10 +499,8 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, scene
             const ident = pathToIdent(name, &jsonc_ident_buf);
             try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
-    }
 
-    if (has_any_scenes) {
-        const initial = cfg.initial_scene orelse (if (scene_names.len > 0) scene_names[0] else jsonc_scene_names[0]);
+        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
     }
 
