@@ -22,6 +22,9 @@ pub const PluginDep = struct {
     name: []const u8,
     repo: []const u8 = "",
     version: []const u8 = "",
+    /// Game states this plugin runs in. Empty = all states (plugin default).
+    /// Overrides the plugin's own `Systems.game_states` if set.
+    states: []const []const u8 = &.{},
 
     /// Returns true if this plugin uses a local path.
     /// Supports `local:../path` (relative to project) and `@libs/path` (inside project).
