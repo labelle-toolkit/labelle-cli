@@ -25,13 +25,13 @@ pub fn createDepsLinks(
     var deps = std.ArrayList(DepEntry){};
 
     const core_path = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
-    try deps.append(allocator, .{ .zon_name = "labelle_core", .link_name = "labelle-core", .abs_path = core_path });
+    try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_core"), .link_name = try allocator.dupe(u8, "labelle-core"), .abs_path = core_path });
 
     const gfx_path = try cache.resolveFrameworkPackage(allocator, "gfx", cfg.gfx_version, project_dir);
-    try deps.append(allocator, .{ .zon_name = "labelle_gfx", .link_name = "labelle-gfx", .abs_path = gfx_path });
+    try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_gfx"), .link_name = try allocator.dupe(u8, "labelle-gfx"), .abs_path = gfx_path });
 
     const engine_path = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, project_dir);
-    try deps.append(allocator, .{ .zon_name = "engine", .link_name = "labelle-engine", .abs_path = engine_path });
+    try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "engine"), .link_name = try allocator.dupe(u8, "labelle-engine"), .abs_path = engine_path });
 
     for (cfg.plugins) |plugin| {
         const plugin_path = try cache.resolvePlugin(allocator, plugin, project_dir);
@@ -79,9 +79,9 @@ pub fn createDepsLinks(
     }
 
     if (cfg.resolved_gui) |gui| {
-        try deps.append(allocator, .{ .zon_name = "labelle_gui", .link_name = "labelle-gui", .abs_path = try allocator.dupe(u8, gui.plugin_dir) });
+        try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_gui"), .link_name = try allocator.dupe(u8, "labelle-gui"), .abs_path = try allocator.dupe(u8, gui.plugin_dir) });
         if (gui.bridge_dir) |bd| {
-            try deps.append(allocator, .{ .zon_name = "gui_bridge", .link_name = "gui-bridge", .abs_path = try allocator.dupe(u8, bd) });
+            try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "gui_bridge"), .link_name = try allocator.dupe(u8, "gui-bridge"), .abs_path = try allocator.dupe(u8, bd) });
         }
     }
 
@@ -104,6 +104,16 @@ pub fn createDepsLinks(
     }
 
     return deps.toOwnedSlice(allocator);
+}
+
+/// Free all DepEntry fields and the slice itself.
+pub fn freeDepEntries(allocator: std.mem.Allocator, deps: []const DepEntry) void {
+    for (deps) |dep| {
+        allocator.free(dep.zon_name);
+        allocator.free(dep.link_name);
+        allocator.free(dep.abs_path);
+    }
+    allocator.free(deps);
 }
 
 /// Recursively hardlink a directory tree. Creates directories, hardlinks files.

@@ -237,7 +237,7 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     try tpl.renderSection(build_zig_zon_tmpl, "header", .{ .hash = hash_str, .version = cfg.version }, w);
 
     if (resolved_deps) |deps| {
-        defer allocator.free(deps);
+        defer deps_linker.freeDepEntries(allocator, deps);
         // Deps are at .labelle/deps/, zon is at .labelle/<target>/
         const prefix = if (output_dir != null and target_dir != null) "../deps" else "deps";
         for (deps) |dep| {

@@ -25,6 +25,9 @@ pub const ScriptScanner = struct {
     allocator: Allocator,
     entries: std.ArrayList(ScriptEntry),
     valid_states: []const []const u8,
+    // Track shared allocations for proper cleanup (one per state dir)
+    shared_subdirs: std.ArrayList([]const u8) = .{},
+    shared_states: std.ArrayList([]const []const u8) = .{},
 
     pub const ScriptEntry = struct {
         /// Script name (prefix stripped, .zig stripped).
@@ -55,6 +58,29 @@ pub const ScriptScanner = struct {
         };
     }
 
+    pub fn deinit(self: *ScriptScanner) void {
+        // Free per-entry allocations
+        for (self.entries.items) |entry| {
+            // rel_path is either same pointer as filename (root scripts) or separately allocated
+            if (entry.rel_path.ptr != entry.filename.ptr) {
+                self.allocator.free(entry.rel_path);
+            }
+            self.allocator.free(entry.filename);
+        }
+        self.entries.deinit(self.allocator);
+
+        // Free shared subdir names (one per state directory)
+        for (self.shared_subdirs.items) |s| self.allocator.free(s);
+        self.shared_subdirs.deinit(self.allocator);
+
+        // Free shared state slices (one per state directory, each containing duped state strings)
+        for (self.shared_states.items) |states| {
+            for (states) |s| self.allocator.free(s);
+            self.allocator.free(states);
+        }
+        self.shared_states.deinit(self.allocator);
+    }
+
     /// Scan a scripts directory on disk.
     /// Root-level .zig files are global (all states).
     /// First-level subdirectories define state binding.
@@ -75,7 +101,11 @@ pub const ScriptScanner = struct {
                 if (dir_states.len == 0) continue;
 
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ scripts_dir, entry.name });
+                defer self.allocator.free(subdir_path);
                 const subdir_name = try self.allocator.dupe(u8, entry.name);
+                // Track shared allocations for cleanup in deinit
+                try self.shared_subdirs.append(self.allocator, subdir_name);
+                try self.shared_states.append(self.allocator, dir_states);
                 // Recursively scan — deeper subdirs are organizational only
                 try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states, subdir_name);
             }
@@ -156,7 +186,9 @@ pub const ScriptScanner = struct {
                 try self.addEntryWithPath(name_copy, state_dir_name, states, rel_path);
             } else if (entry.kind == .directory) {
                 const sub_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
+                defer self.allocator.free(sub_path);
                 const sub_rel = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                defer self.allocator.free(sub_rel);
                 try self.scanZigFilesRecursive(sub_path, state_dir_name, states, sub_rel);
             }
         }

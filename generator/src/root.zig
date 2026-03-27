@@ -81,6 +81,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
     defer allocator.free(scripts_target);
     var script_scan = script_scanner.ScriptScanner.init(allocator, cfg.states);
+    defer script_scan.deinit();
     try script_scan.scanDir(scripts_target);
     const script_entries = script_scan.getEntries();
 
