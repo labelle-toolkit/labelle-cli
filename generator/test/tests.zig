@@ -721,8 +721,8 @@ pub const SCRIPTS = struct {
 
         // Global script: direct import, no wrapper
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const movement = @import(\"scripts/movement.zig\")") != null);
-        // State-scoped script: wrapper with game_states
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const pathfinder = struct {") != null);
+        // State-scoped script: wrapper with game_states (identifier derived from rel_path)
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_01_pathfinder = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_inner = @import(\"scripts/playing/01_pathfinder.zig\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const game_states = .{") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"playing\",") != null);
@@ -740,7 +740,7 @@ pub const SCRIPTS = struct {
         }, raylib_lifecycle, entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const camera = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_paused_camera = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"playing\",") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"paused\",") != null);
     }
@@ -970,7 +970,7 @@ pub const SUBFOLDERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".player = @import(\"prefabs/player.zon\")") != null);
     }
 
-    test "scripts in organizational subdirs use filename-based identifiers" {
+    test "scripts in organizational subdirs use path-based identifiers" {
         const playing_states: []const []const u8 = &.{"playing"};
         const entries: []const ScriptEntry = &.{
             .{ .name = "movement", .filename = "movement.zig", .states = playing_states, .sort_order = null, .subdir = "playing", .rel_path = "playing/systems/movement.zig" },
@@ -984,10 +984,10 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // State-scoped scripts get wrappers with the correct import path
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const movement = struct {") != null);
+        // State-scoped scripts: identifier derived from rel_path, import uses full path
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_systems_movement = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/playing/systems/movement.zig\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const combat = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_systems_combat = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/playing/systems/combat.zig\")") != null);
         // Global script: direct import
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const camera_control = @import(\"scripts/camera_control.zig\")") != null);
