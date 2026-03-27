@@ -4,8 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Single source of truth: version from build.zig.zon
-    const version: []const u8 = @import("build.zig.zon").version;
+    // Version from build.zig.zon, overridable via -Dversion (used by CI release)
+    const version: []const u8 = b.option([]const u8, "version", "Override version string (e.g. from git tag)") orelse @import("build.zig.zon").version;
 
     // Library versions from versions.zon — the tested compatible set for this CLI release
     const versions = @import("versions.zon");
