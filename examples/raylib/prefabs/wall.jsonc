@@ -1,0 +1,9 @@
+{
+    "components": {
+        "Shape": {
+            "shape": { "rectangle": { "width": 64, "height": 64 } },
+            "color": { "r": 180, "g": 60, "b": 60, "a": 255 }
+        },
+        "Wall": {}
+    }
+}

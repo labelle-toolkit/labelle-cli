@@ -1,0 +1,9 @@
+.{
+    .match = .{"Coin"},
+    .entity = .{
+        .Shape = .{
+            .shape = .{ .circle = .{ .radius = 12 } },
+            .color = .{ .r = 255, .g = 255, .b = 100, .a = 120 },
+        },
+    },
+}

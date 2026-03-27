@@ -1,0 +1,11 @@
+{
+    // Scene fragment — included by main.jsonc.
+    // Edit this file and press F5 to hot-reload obstacles without restarting.
+    "entities": [
+        // Walls — red rectangles
+        { "prefab": "wall", "components": { "Position": { "x": 100, "y": 100 } } },
+        { "prefab": "wall", "components": { "Position": { "x": 500, "y": 400 } } },
+        { "prefab": "wall", "components": { "Position": { "x": 300, "y": 250 } } },
+        { "prefab": "wall", "components": { "Position": { "x": 700, "y": 100 } } }
+    ]
+}

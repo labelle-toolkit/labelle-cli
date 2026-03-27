@@ -206,7 +206,7 @@ pub fn generateMainZig(
     try w.writeAll("const AllScripts = struct {\n");
     for (script_entries) |entry| {
         if (std.mem.eql(u8, entry.name, "context")) continue;
-        const ident = pathToIdent(entry.name, &ident_buf);
+        const ident = pathToIdent(entry.rel_path, &ident_buf);
         if (entry.states.len == 0) {
             // Global script — import directly, no wrapper needed
             try w.print("    pub const {s} = @import(\"scripts/{s}\");\n", .{ ident, entry.rel_path });
@@ -534,15 +534,17 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
 }
 
 /// Convert a path-style name to a valid Zig identifier: "enemies/goblin" -> "enemies_goblin".
-/// Top-level names (no slashes) pass through unchanged.
+/// Replaces `/` and `+` with `_`, strips `.zig` extension.
 fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     if (name.len > buf.len) {
         std.debug.print("labelle: path too long for identifier (max {d} chars): '{s}'\n", .{ buf.len, name });
         @panic("path exceeds identifier buffer size");
     }
+    // Strip .zig extension
+    const end = if (std.mem.endsWith(u8, name, ".zig")) name.len - 4 else name.len;
     var i: usize = 0;
-    for (name) |c| {
-        buf[i] = if (c == '/') '_' else c;
+    for (name[0..end]) |c| {
+        buf[i] = if (c == '/' or c == '+') '_' else c;
         i += 1;
     }
     return buf[0..i];
