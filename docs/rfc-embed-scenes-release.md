@@ -157,6 +157,131 @@ invocation, so the extra flexibility of Option 2 is not needed.
 
 ---
 
+## Precompiling the engine and core
+
+### The question
+
+Can we compile `labelle-core` and `labelle-engine` once, cache them as `.a`
+(static library) files, and link them into game builds without recompiling?
+This would make game script changes compile in seconds instead of rebuilding
+the entire dependency tree.
+
+### How it works today
+
+The generated `build.zig` consumes everything as **Zig source modules**:
+
+```zig
+const engine_dep = b.dependency("engine", .{ .target = target, .optimize = optimize });
+const engine_mod = engine_dep.module("engine");
+// → engine source is recompiled from scratch on every build
+```
+
+Zig's `.zig-cache/` provides incremental caching — so the second build is
+faster than the first. But the build system still walks the full dependency
+graph every time to determine staleness, and any change to game code that
+touches engine generics triggers re-monomorphization.
+
+### The comptime problem
+
+The engine makes heavy use of comptime generics:
+
+```zig
+pub fn JsoncSceneBridge(comptime GameType: type, comptime Components: type) type { ... }
+pub fn Mixin(comptime Game: type) type { ... }
+pub fn Game(comptime Components: type, comptime Scripts: type, ...) type { ... }
+```
+
+These types are **monomorphized at compile time** based on each game's concrete
+component/script types. A precompiled `.a` file cannot contain this generic
+code — the compiler needs the game's types to instantiate it.
+
+This means the engine **cannot be fully precompiled** as a static library
+without changing its architecture.
+
+### What CAN be precompiled
+
+Not all engine code is generic. The dependency tree has layers:
+
+| Layer | Generic? | Precompilable? |
+|---|---|---|
+| `labelle-core` (math, Position, types) | No | **Yes** |
+| `labelle-gfx` (sprite/shape types) | No | **Yes** |
+| JSONC parser (`jsonc/`) | No | **Yes** |
+| Backend C libs (raylib, sokol) | No | **Yes** (already `.a` via Zig) |
+| ECS adapter | Partially | Partially |
+| Engine game loop, scene bridge, mixins | **Heavily generic** | No |
+
+The non-generic parts — core, gfx, JSONC parser, C backends — could be
+precompiled into static libraries and linked directly. This skips their
+compilation entirely when only game scripts change.
+
+### Proposed approach: hybrid source + precompiled
+
+Split the generated `build.zig` into two layers:
+
+1. **Precompiled layer** — core, gfx, JSONC parser, backend C libs compiled
+   once into `.a` files cached in `.labelle/cache/libs/`. Only rebuilt when
+   the engine version changes or the target/optimize options change.
+
+2. **Source layer** — engine (generic), game scripts, generated `main.zig`
+   compiled from source every time. Links against the precompiled `.a` files.
+
+```
+.labelle/
+  cache/
+    libs/
+      labelle-core-aarch64-macos-debug.a      ← compiled once
+      labelle-gfx-aarch64-macos-debug.a       ← compiled once
+      jsonc-aarch64-macos-debug.a             ← compiled once
+      raylib-aarch64-macos-debug.a            ← compiled once (already works this way)
+  raylib_desktop/
+    main.zig                                   ← compiled from source (game-specific)
+    build.zig                                  ← links precompiled .a + compiles engine+game
+```
+
+The cache key would be: `{package_version}-{target}-{optimize}`. When any of
+those change, the `.a` is rebuilt.
+
+### Implementation
+
+The generated `build.zig` would:
+
+1. Check if a cached `.a` exists for core/gfx/jsonc at the right version+target
+2. If yes: `exe.addObjectFile(.{ .cwd_relative = "cache/libs/labelle-core-....a" })`
+3. If no: build from source as today, then cache the result
+
+This requires the non-generic packages to expose a `build.zig` that can
+produce a static library artifact, not just a module. Core and gfx may already
+do this or can be trivially extended.
+
+### Impact
+
+| Scenario | Today | With precompiled cache |
+|---|---|---|
+| First build (cold cache) | ~same | ~same (builds + caches) |
+| Game script change | Rebuilds everything | **Engine/core skipped, only game code compiles** |
+| Engine version bump | Rebuilds everything | Rebuilds + re-caches engine |
+| Target change (e.g. WASM) | Rebuilds everything | Rebuilds + re-caches for new target |
+
+The biggest win is the **game script change** case — the most common dev loop.
+Instead of recompiling core + gfx + jsonc + engine + game, you only compile
+engine (generic parts) + game.
+
+### Limitations
+
+- The engine's generic code (`Game`, `Mixin`, `JsoncSceneBridge`) cannot be
+  precompiled. This is the largest chunk of engine code and is the main
+  bottleneck. A longer-term solution would be to reduce comptime generics in
+  favor of runtime polymorphism (vtables / type-erased interfaces), but that
+  is a major architectural change outside this RFC's scope.
+- Zig's build system doesn't natively support "output a .a from a dependency
+  and cache it externally." This would require custom build logic in the CLI
+  or a wrapper build step.
+- Cross-target builds (e.g. building for WASM and desktop) need separate
+  cached artifacts per target.
+
+---
+
 ## Scope
 
 ### In scope
@@ -170,6 +295,7 @@ invocation, so the extra flexibility of Option 2 is not needed.
 - Binary mtime check to skip compilation when no `.zig` source changed
 - Merge the two `zig build` invocations into a single `zig build run`
 - Incremental scene/asset sync (copy only changed files)
+- Precompiled `.a` caching for non-generic packages (core, gfx, jsonc, backends)
 
 ### Out of scope
 
@@ -179,6 +305,8 @@ invocation, so the extra flexibility of Option 2 is not needed.
 - Obfuscation or encryption of embedded data
 - File watching / daemon mode (e.g., `labelle watch` that stays running and
   re-launches on changes) — future enhancement
+- Reducing engine comptime generics in favor of runtime polymorphism —
+  major architectural change, separate effort
 
 ---
 
@@ -436,3 +564,8 @@ paths produce a working build.
    mtime). In practice, mtime is sufficient for a dev workflow.
 5. Should the fingerprint file (`.labelle/.gen_fingerprint`) be gitignored?
    It is machine-local state and should not be committed.
+6. For precompiled libraries, should the CLI manage the cache, or should this
+   be done via Zig's build system (custom build steps that produce and
+   consume `.a` artifacts)? Zig's `.zig-cache` already caches compilation
+   units, but it's opaque and tied to the build graph — an explicit
+   `.labelle/cache/libs/` is more controllable and survives regeneration.
