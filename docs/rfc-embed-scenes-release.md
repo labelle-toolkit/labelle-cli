@@ -210,6 +210,14 @@ Not all engine code is generic. The dependency tree has layers:
 | Backend C libs (raylib, sokol) | No | **Yes** (already `.a` via Zig) |
 | ECS adapter | Partially | Partially |
 | Engine game loop, scene bridge, mixins | **Heavily generic** | No |
+| **Plugins** (debug, imgui, nuklear) | **Heavily generic** | **No** |
+
+Plugins use `game: anytype` and comptime introspection throughout — they
+iterate over the game's component registry at compile time, access game-specific
+types, and use `inline for` over component names. For example, the debug plugin
+calls `@TypeOf(game.*).ComponentRegistry`, `Reg.names()`, and `Reg.getType(name)`
+to render the entity browser. This means plugins must be compiled together with
+the game, same as the generic engine code.
 
 The non-generic parts — core, gfx, JSONC parser, C backends — could be
 precompiled into static libraries and linked directly. This skips their
