@@ -862,6 +862,37 @@ paths produce a working build.
 
 ---
 
+## Related RFCs and issues
+
+- **#106 / `docs/rfc-auto-zig-toolchain.md`** (branch `feat/auto-zig-toolchain`):
+  Auto-download and manage the Zig toolchain. The CLI downloads Zig on first
+  use — no separate install. Also adds `labelle install-deps` for Linux system
+  libraries. This simplifies every deployment scenario in this RFC:
+  - Cloud IDE devcontainers only need `labelle` pre-installed, not Zig
+  - The build server runs `labelle build` and Zig is auto-managed
+  - Local developers install one binary
+
+- **#77**: Chrome extension editor with local native messaging. The extension
+  provides a visual scene editor and WASM preview in the browser, calling the
+  local `labelle` CLI for compilation via Chrome Native Messaging. This is the
+  local counterpart to the cloud editor described in this RFC:
+  - Scene/prefab edits are client-side (same as the online editor)
+  - Script compilation uses the local CLI (instead of a build server)
+  - Combined with #106, setup is: `labelle install` + Chrome extension
+
+Together, these define three tiers of the same editing experience:
+
+| Tier | Compilation | Editor | Install required |
+|---|---|---|---|
+| **Local CLI** | Local `zig build` | Terminal / text editor | `labelle` only (#106 auto-downloads Zig) |
+| **Chrome extension** (#77) | Local `zig build` via native messaging | Visual editor in browser | `labelle install` + Chrome extension |
+| **Online editor** (this RFC) | Server-side `zig build` or none (JSONC only) | Web app | Nothing (browser only) |
+
+All three share the same engine, the same JSONC scene/prefab format, and the
+same compile/content boundary. The only difference is where compilation runs.
+
+---
+
 ## Open questions
 
 1. Should `labelle build` (without `--release`) also embed scenes, or only
