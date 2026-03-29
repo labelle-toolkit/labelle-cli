@@ -231,6 +231,7 @@ pub fn generateMainZigFromTemplate(
             }
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("hook_imports_block", block);
     }
@@ -247,6 +248,7 @@ pub fn generateMainZigFromTemplate(
             }
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("enum_imports_block", block);
     }
@@ -275,6 +277,7 @@ pub fn generateMainZigFromTemplate(
             }
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("jsonc_scene_block", block);
     }
@@ -285,6 +288,7 @@ pub fn generateMainZigFromTemplate(
         const bw = buf.writer(allocator);
         try generateGameLayers(cfg.layers, bw);
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("game_layers_block", block);
     }
@@ -298,6 +302,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("const Resources = ResourceRegistry;\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("resource_registry_block", block);
     }
@@ -324,6 +329,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll(" });\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("game_hooks_block", block);
     }
@@ -343,6 +349,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("prefab_registry_block", block);
     }
@@ -374,6 +381,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("});\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("component_registry_block", block);
     }
@@ -395,6 +403,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("system_registry_block", block);
     }
@@ -426,6 +435,7 @@ pub fn generateMainZigFromTemplate(
         }
         try bw.writeAll("};\n\n");
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("all_scripts_block", block);
     }
@@ -445,6 +455,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("const Views = engine.EmptyViewRegistry;\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("view_registry_block", block);
     }
@@ -462,6 +473,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("});\n\n");
         }
         const block = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(block);
         try allocs.append(allocator, block);
         try data.scalars.put("gizmo_registry_block", block);
     }

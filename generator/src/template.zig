@@ -111,7 +111,7 @@ fn isIdentChar(c: u8) bool {
 
 // ── Dynamic template engine ───────────────────────────────────────────
 // Supports runtime string maps, {{#if}}/{{#else}}/{{/if}},
-// {{#each list}}/{{/each}}, and nested blocks (max depth 4).
+// {{#each list}}/{{/each}}, and nested blocks.
 
 pub const ListItem = struct {
     fields: std.StringHashMap([]const u8),
