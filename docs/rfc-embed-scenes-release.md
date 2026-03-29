@@ -270,10 +270,12 @@ engine (generic parts) + game.
 ### Limitations
 
 - The engine's generic code (`Game`, `Mixin`, `JsoncSceneBridge`) cannot be
-  precompiled. This is the largest chunk of engine code and is the main
-  bottleneck. A longer-term solution would be to reduce comptime generics in
-  favor of runtime polymorphism (vtables / type-erased interfaces), but that
-  is a major architectural change outside this RFC's scope.
+  precompiled. This is the largest chunk of engine code. Replacing comptime
+  generics with runtime polymorphism (vtables) is **not desirable** — the
+  comptime approach lets Zig inline across the engine/game boundary and
+  eliminate dynamic dispatch. For a game engine running thousands of entities
+  per frame, that performance matters. We accept that generic engine code
+  recompiles with the game.
 - Zig's build system doesn't natively support "output a .a from a dependency
   and cache it externally." This would require custom build logic in the CLI
   or a wrapper build step.
@@ -305,8 +307,9 @@ engine (generic parts) + game.
 - Obfuscation or encryption of embedded data
 - File watching / daemon mode (e.g., `labelle watch` that stays running and
   re-launches on changes) — future enhancement
-- Reducing engine comptime generics in favor of runtime polymorphism —
-  major architectural change, separate effort
+- Reducing engine comptime generics — the generics exist for performance
+  (inlining, zero-cost dispatch); replacing them with vtables would hurt
+  runtime performance for the sake of compile times
 
 ---
 
