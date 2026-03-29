@@ -271,6 +271,37 @@ Same CLI binary, different generated code.
 
 ## Design decisions
 
+### Why not a separate assembler/builder repo?
+
+It's tempting to extract the codegen into its own `labelle-assembler` repo.
+But this makes the coupling **worse**, not better:
+
+| Option | Repos to update on engine API change | Coupling |
+|---|---|---|
+| Templates in engine | 1 (engine) | API + template in same commit |
+| Templates in CLI (today) | 2 (engine + CLI) | CLI must track engine changes |
+| Templates in new assembler repo | 3 (engine + assembler + CLI) | Three-way lockstep |
+
+A separate repo means the engine author changes an API in `labelle-engine`,
+then must open a second PR in `labelle-assembler` to update the templates,
+and the CLI must know which assembler version matches which engine version.
+That's strictly more fragmentation and coordination for zero benefit.
+
+**The right answer is: templates live in `labelle-engine/codegen/`.** No new
+repos. The engine author changes an API and updates the template in the same
+commit, same PR, same review. The CLI doesn't need to know or care.
+
+```
+labelle-engine/          ← existing repo, no new repos
+  src/                   ← engine source (existing)
+  codegen/               ← NEW: templates for the CLI generator
+    manifest.zon
+    main.zig.template
+    build.zig.template
+  jsonc/                 ← JSONC parser (existing)
+  scene/                 ← scene module (existing)
+```
+
 ### Why not versioned codegen in the CLI?
 
 Alternative: the CLI contains multiple codegen backends, one per engine
