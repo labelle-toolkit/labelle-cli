@@ -32,7 +32,7 @@ pub const ENGINE_VERSION = config.ENGINE_VERSION;
 pub const GFX_VERSION = config.GFX_VERSION;
 pub const isLocalVersion = config.isLocalVersion;
 
-pub const generateMainZig = main_zig.generateMainZig;
+pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
