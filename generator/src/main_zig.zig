@@ -572,6 +572,433 @@ fn snakeToPascal(name: []const u8, pascal_buf: *[128]u8) []const u8 {
     return pascal_buf[0..i];
 }
 
+// ── Template-based generation (engine provides main.zig.template) ────────
+
+/// Generate main.zig using the engine's codegen template.
+/// The template uses {{variable}} interpolation and {{#if}}/{{#each}} blocks.
+/// All complex sections are pre-computed into scalar blocks by this function.
+pub fn generateMainZigFromTemplate(
+    allocator: std.mem.Allocator,
+    engine_template: []const u8,
+    cfg: ProjectConfig,
+    lifecycle_tmpl: []const u8,
+    script_entries: []const ScriptEntry,
+    prefab_names: []const []const u8,
+    jsonc_scene_names: []const []const u8,
+    component_names: []const []const u8,
+    hook_names: []const []const u8,
+    enum_names: []const []const u8,
+    view_names: []const []const u8,
+    gizmo_names: []const []const u8,
+) ![]const u8 {
+    var data = tpl.TemplateData{
+        .scalars = std.StringHashMap([]const u8).init(allocator),
+        .lists = std.StringHashMap([]const tpl.ListItem).init(allocator),
+    };
+    defer data.scalars.deinit();
+    defer data.lists.deinit();
+
+    // Track allocations for cleanup
+    var allocs = std.ArrayList([]const u8).init(allocator);
+    defer {
+        for (allocs.items) |s| allocator.free(s);
+        allocs.deinit();
+    }
+
+    // ── Boolean flags ──
+    try data.scalars.put("ecs_mode_mock", if (cfg.ecs == .mock) "1" else "");
+    try data.scalars.put("has_gui", if (cfg.hasGui()) "1" else "");
+    try data.scalars.put("has_context", if (hasContextEntry(script_entries)) "1" else "");
+
+    // ── Pre-computed blocks ──
+    var ident_buf: [256]u8 = undefined;
+
+    // Hook imports block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (hook_names.len > 0) {
+            try bw.writeAll("\n// --- Hook imports ---\n");
+            for (hook_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ ident, name });
+            }
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("hook_imports_block", block);
+    }
+
+    // Enum imports block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (enum_names.len > 0) {
+            try bw.writeAll("\n// --- Enum imports ---\n");
+            for (enum_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("const {s} = @import(\"enums/{s}.zig\");\n", .{ ident, name });
+            }
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("enum_imports_block", block);
+    }
+
+    // JSONC scene block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (jsonc_scene_names.len > 0) {
+            try bw.writeAll("\n// --- JSONC scene loaders (runtime) ---\n");
+            if (gizmo_names.len > 0) {
+                try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");
+            } else {
+                try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridge(AssembledGame, Components);\n");
+            }
+            for (jsonc_scene_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print(
+                    \\const jsonc_{s}_loader = struct {{
+                    \\    fn load(game: *AssembledGame) anyerror!void {{
+                    \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
+                    \\    }}
+                    \\}}.load;
+                    \\
+                , .{ ident, name });
+            }
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("jsonc_scene_block", block);
+    }
+
+    // Game layers block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        try generateGameLayers(cfg.layers, bw);
+        try bw.writeByte('\n');
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("game_layers_block", block);
+    }
+
+    // Resource registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (cfg.resources.len > 0) {
+            try generateResourceRegistry(cfg.resources, bw);
+            try bw.writeAll("const Resources = ResourceRegistry;\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("resource_registry_block", block);
+    }
+
+    // Game hooks block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (hook_names.len == 0) {
+            try bw.writeAll("const GameHooks = struct {};\n\n");
+        } else if (hook_names.len == 1) {
+            const ident0 = pathToIdent(hook_names[0], &ident_buf);
+            var pascal_buf: [128]u8 = undefined;
+            const pascal = snakeToPascal(ident0, &pascal_buf);
+            try bw.print("const GameHooks = {s}.{s};\n\n", .{ ident0, pascal });
+        } else {
+            var pascal_buf: [128]u8 = undefined;
+            try bw.writeAll("const GameHooks = engine.MergeHooks(AllHookPayloads, .{");
+            for (hook_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                const pascal = snakeToPascal(ident, &pascal_buf);
+                try bw.print(" *{s}.{s},", .{ ident, pascal });
+            }
+            try bw.writeAll(" });\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("game_hooks_block", block);
+    }
+
+    // Assembled game block
+    {
+        try data.scalars.put("assembled_game_block", shared_assembled_game);
+    }
+
+    // Prefab registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (prefab_names.len > 0) {
+            try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{\n");
+            for (prefab_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("    .{s} = @import(\"prefabs/{s}.zon\"),\n", .{ ident, name });
+            }
+            try bw.writeAll("});\n\n");
+        } else {
+            try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("prefab_registry_block", block);
+    }
+
+    // Component registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        const has_plugins = cfg.plugins.len > 0;
+        if (has_plugins) {
+            try bw.writeAll("const Components = engine.ComponentRegistryWithPlugins(.{\n");
+        } else {
+            try bw.writeAll("const Components = engine.ComponentRegistry(.{\n");
+        }
+        var pascal_buf: [128]u8 = undefined;
+        for (component_names) |name| {
+            const ident = pathToIdent(name, &ident_buf);
+            const pascal = snakeToPascal(ident, &pascal_buf);
+            try bw.print("    .{s} = @import(\"components/{s}.zig\").{s},\n", .{ pascal, name, pascal });
+        }
+        if (has_plugins) {
+            try bw.writeAll("}, .{\n");
+            try bw.writeAll("    @import(\"labelle-gfx\"),\n");
+            for (cfg.plugins) |plugin| {
+                try bw.print("    @import(\"{s}\"),\n", .{plugin.name});
+            }
+            try bw.writeAll("});\n\n");
+        } else {
+            try bw.writeAll("});\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("component_registry_block", block);
+    }
+
+    // System registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (cfg.plugins.len > 0) {
+            try bw.writeAll("const PluginSystems = engine.SystemRegistry(.{\n");
+            try bw.writeAll("    @import(\"labelle-gfx\"),\n");
+            for (cfg.plugins) |plugin| {
+                try bw.print("    @import(\"{s}\"),\n", .{plugin.name});
+            }
+            try bw.writeAll("});\n\n");
+            try bw.writeAll("const DiscoveredGizmoCategories = PluginSystems.gizmoCategories();\n\n");
+        } else {
+            try bw.writeAll("const GizmoCatEntry = struct { name: []const u8, id: u8 };\n");
+            try bw.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("system_registry_block", block);
+    }
+
+    // All scripts block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        try bw.writeAll("const AllScripts = struct {\n");
+        for (script_entries) |entry| {
+            if (std.mem.eql(u8, entry.name, "context")) continue;
+            const ident = pathToIdent(entry.rel_path, &ident_buf);
+            if (entry.states.len == 0) {
+                try bw.print("    pub const {s} = @import(\"scripts/{s}\");\n", .{ ident, entry.rel_path });
+            } else {
+                try bw.print("    pub const {s} = struct {{\n", .{ident});
+                try bw.print("        const _inner = @import(\"scripts/{s}\");\n", .{entry.rel_path});
+                try bw.writeAll("        pub const game_states = .{\n");
+                for (entry.states) |state| {
+                    try bw.print("            \"{s}\",\n", .{state});
+                }
+                try bw.writeAll("        };\n");
+                const decl_names = [_][]const u8{ "tick", "setup", "drawGui", "State" };
+                for (decl_names) |decl| {
+                    try bw.print("        pub const {s} = if (@hasDecl(_inner, \"{s}\")) _inner.{s} else {{}};\n", .{ decl, decl, decl });
+                }
+                try bw.writeAll("    };\n");
+            }
+        }
+        try bw.writeAll("};\n\n");
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("all_scripts_block", block);
+    }
+
+    // View registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (view_names.len > 0) {
+            try bw.writeAll("const Views = engine.ViewRegistry(.{\n");
+            for (view_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("    .{s} = @import(\"views/{s}.zon\"),\n", .{ ident, name });
+            }
+            try bw.writeAll("});\n\n");
+        } else {
+            try bw.writeAll("const Views = engine.EmptyViewRegistry;\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("view_registry_block", block);
+    }
+
+    // Gizmo registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (gizmo_names.len > 0) {
+            try bw.writeAll("const Gizmos = engine.GizmoRegistry(.{\n");
+            for (gizmo_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("    .{s} = @import(\"gizmos/{s}.zon\"),\n", .{ ident, name });
+            }
+            try bw.writeAll("});\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(block);
+        try data.scalars.put("gizmo_registry_block", block);
+    }
+
+    // ── Lifecycle section (rendered from backend template, same as procedural path) ──
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+
+        const tick_code = if (cfg.plugins.len > 0)
+            "        const scaled_dt = dt * g.time_scale;\n" ++
+            "        if (scaled_dt > 0) {\n" ++
+            "            runner.tick(&g, scaled_dt);\n" ++
+            "            PluginSystems.tick(&g, scaled_dt);\n" ++
+            "            PluginSystems.postTick(&g, scaled_dt);\n" ++
+            "        }\n" ++
+            "        // Update profiling pointers (debug only)\n" ++
+            "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
+            "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+            "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
+            "        }\n" ++
+            "        if (comptime PluginSystems.profiling_enabled) {\n" ++
+            "            g.plugin_profile_ptr = @ptrCast(&PluginSystems.plugin_profile);\n" ++
+            "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
+            "        }\n"
+        else
+            "        const scaled_dt = dt * g.time_scale;\n" ++
+            "        if (scaled_dt > 0) {\n" ++
+            "            runner.tick(&g, scaled_dt);\n" ++
+            "        }\n" ++
+            "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
+            "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+            "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
+            "        }\n";
+
+        const gui_draw_code = try buildGuiDrawCode(allocator, cfg, view_names);
+        defer allocator.free(gui_draw_code);
+
+        var w_buf: [16]u8 = undefined;
+        var h_buf: [16]u8 = undefined;
+        var fps_buf: [16]u8 = undefined;
+        const w_str = std.fmt.bufPrint(&w_buf, "{d}", .{cfg.width}) catch unreachable;
+        const h_str = std.fmt.bufPrint(&h_buf, "{d}", .{cfg.height}) catch unreachable;
+        const fps_str = std.fmt.bufPrint(&fps_buf, "{d}", .{cfg.target_fps}) catch unreachable;
+
+        const hidden_setup: []const u8 = if (cfg.hidden)
+            "    window.setConfigFlags(.{ .window_hidden = true });\n"
+        else
+            "";
+
+        const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm;
+
+        if (use_callback_lifecycle) {
+            const module_vars = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
+            const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names);
+            defer allocator.free(init_code);
+
+            const platform_comment: []const u8 = switch (cfg.platform) {
+                .ios => "iOS: sokol bindings accessed through engine.sokol (no direct sokol import)",
+                .android => "Android: sokol handles the app lifecycle via NativeActivity",
+                .wasm => "WASM: Emscripten drives the main loop via callbacks",
+                .desktop => "",
+            };
+            const entry_comment: []const u8 = switch (cfg.platform) {
+                .ios => "iOS entry — no main(), sokol handles the app lifecycle",
+                .android => "Android entry — no main(), sokol handles the NativeActivity lifecycle",
+                .wasm => "WASM entry — Emscripten drives the main loop via callbacks",
+                .desktop => "",
+            };
+
+            if (cfg.backend == .sokol) {
+                const cleanup_code = try buildCallbackCleanupCode(allocator, cfg);
+                defer allocator.free(cleanup_code);
+                const is_wasm = cfg.platform == .wasm;
+                const allocator_decl: []const u8 = if (is_wasm)
+                    "// Use c_allocator for Emscripten — delegates to emscripten's malloc/free\n// which respects ALLOW_MEMORY_GROWTH. GPA is incompatible with wasm32-emscripten.\nconst allocator = std.heap.c_allocator;"
+                else
+                    "var gpa = std.heap.GeneralPurposeAllocator(.{}){};";
+                const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
+                const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
+
+                try tpl.render(lifecycle_tmpl, .{
+                    .module_vars = module_vars,
+                    .width = w_str,
+                    .height = h_str,
+                    .title = cfg.title,
+                    .fps = fps_str,
+                    .init_code = init_code,
+                    .tick_code = tick_code,
+                    .gui_draw_code = gui_draw_code,
+                    .cleanup_code = cleanup_code,
+                    .platform_comment = platform_comment,
+                    .entry_comment = entry_comment,
+                    .hidden_setup = hidden_setup,
+                    .allocator_decl = allocator_decl,
+                    .allocator_expr = allocator_expr,
+                    .allocator_cleanup = allocator_cleanup,
+                }, bw);
+            } else {
+                try tpl.render(lifecycle_tmpl, .{
+                    .width = w_str,
+                    .height = h_str,
+                    .title = cfg.title,
+                    .fps = fps_str,
+                    .setup_code = init_code,
+                    .tick_code = tick_code,
+                    .gui_draw_code = gui_draw_code,
+                    .hidden_setup = hidden_setup,
+                }, bw);
+            }
+        } else {
+            const setup_code = try buildSetupCode(allocator, cfg, jsonc_scene_names);
+            defer allocator.free(setup_code);
+
+            try tpl.render(lifecycle_tmpl, .{
+                .width = w_str,
+                .height = h_str,
+                .title = cfg.title,
+                .fps = fps_str,
+                .setup_code = setup_code,
+                .tick_code = tick_code,
+                .gui_draw_code = gui_draw_code,
+                .hidden_setup = hidden_setup,
+            }, bw);
+        }
+
+        const lifecycle = try buf.toOwnedSlice(allocator);
+        try allocs.append(lifecycle);
+        try data.scalars.put("lifecycle", lifecycle);
+    }
+
+    // ── Render the engine template ──
+    var output = std.ArrayList(u8){};
+    try tpl.renderDynamic(engine_template, data, output.writer(allocator));
+    return output.toOwnedSlice(allocator);
+}
+
 /// Generate the GameLayers enum from project.labelle layer definitions.
 fn generateGameLayers(layers: []const LayerDef, w: anytype) !void {
     try w.writeAll("const GameLayers = enum(u8) {\n");

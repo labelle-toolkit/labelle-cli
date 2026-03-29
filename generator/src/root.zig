@@ -115,10 +115,26 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
-    // Generate main.zig — uses ScriptRunner for comptime dispatch
-    const main_zig_content = try main_zig.generateMainZig(allocator, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, component_names, hook_names, enum_names, view_names, gizmo_names);
+    // Generate main.zig — load engine template from codegen/ directory
+    const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
+    defer allocator.free(engine_template);
+    const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, component_names, hook_names, enum_names, view_names, gizmo_names);
     defer allocator.free(main_zig_content);
     try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+}
+
+/// Load the engine's main.zig template from the codegen/ directory.
+fn loadEngineTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig) ![]const u8 {
+    const engine_path = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, game_dir);
+    defer allocator.free(engine_path);
+
+    const tmpl_path = try std.fs.path.join(allocator, &.{ engine_path, "codegen", "main.zig.template" });
+    defer allocator.free(tmpl_path);
+
+    return std.fs.cwd().readFileAlloc(allocator, tmpl_path, 256 * 1024) catch |err| {
+        std.debug.print("labelle: could not read engine template '{s}': {any}\n", .{ tmpl_path, err });
+        return error.EngineTemplateNotFound;
+    };
 }
 
 /// Load the backend+platform lifecycle template from the CLI cache.
