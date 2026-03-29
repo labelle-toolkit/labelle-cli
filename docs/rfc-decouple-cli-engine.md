@@ -6,6 +6,12 @@ Tracking issue: #107
 
 Draft — open for discussion.
 
+> **INVARIANT**: The engine MUST NEVER contain knowledge of specific platforms
+> (iOS, Android, WASM, desktop) or specific backends (raylib, sokol, sdl, bgfx,
+> wgpu). Platform and backend specifics are the sole responsibility of the CLI
+> and the backend packages. This boundary is non-negotiable — violating it
+> reintroduces the tight coupling this RFC exists to eliminate.
+
 ---
 
 ## Background
