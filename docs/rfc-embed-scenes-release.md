@@ -102,14 +102,53 @@ depending on the build mode, avoiding the need for Zig build options entirely.
 the JSONC files are small. A packed blob can be added later if binary size
 becomes a concern.
 
-### Prefab handling
+### Prefab handling — move to runtime JSONC in dev mode
 
-Prefabs are currently `.zon` files `@import`'d at comptime. This already
-embeds them. However, there is a broader initiative to move prefabs to `.jsonc`
-as well (for consistency with scenes and to enable hot reload of prefabs).
+Prefabs are currently `.zon` files `@import`'d at comptime in the generated
+`main.zig`:
 
-If/when prefabs become `.jsonc`, they would follow the same embed strategy as
-scenes. This RFC's design accommodates that path.
+```zig
+const Prefabs = engine.PrefabRegistry(.{
+    .player = @import("prefabs/player.zon"),
+    .goblin = @import("prefabs/goblin.zon"),
+});
+```
+
+This means **any prefab edit triggers a full recompile**, same as game scripts.
+But the runtime infrastructure to load prefabs from disk already exists — the
+`PrefabCache` inside `jsonc_scene_bridge.zig` loads `.jsonc` prefab files at
+runtime when a scene references them via `"prefab": "player"`.
+
+In fact, `Prefabs` / `PrefabRegistry` is now dead code in the JSONC scene path.
+After the comptime scene removal (RFC-remove-comptime-scenes.md), nothing in the
+generated code actually uses `Prefabs` — it is declared but never referenced.
+The JSONC bridge's `PrefabCache` has fully replaced it.
+
+**Proposal**: remove the comptime `PrefabRegistry` from codegen entirely and
+move prefabs to `.jsonc` format (or keep `.zon` but load them from disk via
+`PrefabCache`). This gives prefabs the same dev/release treatment as scenes:
+
+- **Dev mode** (`labelle run`): prefabs loaded from disk via `PrefabCache`.
+  Editing a prefab requires no recompilation — the hot reloader detects the
+  change and the scene bridge re-parses.
+- **Release mode** (`labelle build`): prefab files embedded via `@embedFile`,
+  `PrefabCache` reads from memory instead of disk.
+
+The `PrefabCache.get()` method already tries `.jsonc` first (line 95 of
+`jsonc_scene_bridge.zig`). To also support `.zon` files at runtime, we would
+need a small `.zon` parser or simply require prefabs to be `.jsonc` going
+forward. Since scenes are already JSONC, standardizing on one format is
+cleaner.
+
+#### Migration path
+
+1. Remove `PrefabRegistry` generation from `main_zig.zig` (lines 133–143)
+2. Remove `PrefabRegistry` type from engine (or keep for backwards compat)
+3. Convert existing `.zon` prefab files to `.jsonc`
+4. `PrefabCache` becomes the single prefab loading mechanism for both dev
+   and release
+5. Generator stops `@import`'ing prefab `.zon` files — prefabs no longer
+   trigger recompilation in dev mode
 
 ### Build mode detection
 
@@ -135,7 +174,9 @@ invocation, so the extra flexibility of Option 2 is not needed.
 - `@embedFile` embedding of `.jsonc` scene files in release builds
 - `loadSceneFromMemory` engine entry point
 - Generator-time dev/release code path split
-- Prefab embedding if prefabs are `.jsonc` at that point
+- Migrate prefabs from comptime `.zon` to runtime `.jsonc`
+- Remove `PrefabRegistry` from codegen (dead code in JSONC scene path)
+- Prefab embedding via `@embedFile` in release builds
 - Codegen fingerprinting to skip regeneration when inputs are unchanged
 - Binary mtime check to skip compilation when no `.zig` source changed
 - Merge the two `zig build` invocations into a single `zig build run`
@@ -210,9 +251,13 @@ The generator copies and scans these directories:
 | `enums/` | `.zig` | Yes | Yes |
 | `views/` | `.zon` | Yes | Yes (comptime import) |
 | `gizmos/` | `.zon` | Yes | Yes (comptime import) |
-| `prefabs/` | `.zon` | Yes | Yes (comptime import) |
+| `prefabs/` | `.zon` → `.jsonc` | ~~Yes~~ Copy only | ~~Yes~~ **No** (after migration to runtime) |
 | `scenes/` | `.jsonc` | Copy only | **No** (runtime loaded) |
 | `assets/` | `*` | Copy only | **No** (runtime loaded) |
+
+Note: prefabs currently trigger recompilation because they are `.zon` files
+`@import`'d at comptime. After the migration proposed in this RFC, they
+become runtime-loaded `.jsonc` files — same as scenes.
 | `project.labelle` | — | Yes | Yes |
 
 **Strategy**: compute a lightweight fingerprint (concatenation of mtime + size
@@ -264,7 +309,7 @@ halves the build-system overhead.
 | Scenario | Before | After |
 |---|---|---|
 | No changes | regen + 2x zig build + run | **just launch** |
-| Scene/asset change only | regen + 2x zig build + run | **copy scene + launch** |
+| Scene/prefab/asset change | regen + 2x zig build + run | **copy changed files + launch** |
 | Script/component change | regen + 2x zig build + run | regen + 1x zig build run |
 | project.labelle change | regen + 2x zig build + run | regen + 1x zig build run |
 
@@ -393,8 +438,9 @@ paths produce a working build.
 2. Should the hot reloader be compiled out entirely in release mode, or just
    disabled? Compiling it out saves binary size; keeping it allows runtime
    toggling for debugging shipped builds.
-3. When prefabs move to `.jsonc`, should they follow this same RFC or get a
-   separate one?
+3. Should the prefab `.zon` → `.jsonc` migration be a breaking change (remove
+   `.zon` support) or should `PrefabCache` support both formats during a
+   transition period?
 4. For the binary-up-to-date check, should we rely on mtime comparison alone
    or also hash file contents? Mtime is fast but can miss changes (e.g.,
    `touch` without actual edits) or give false positives (copy that preserves
