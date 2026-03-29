@@ -536,47 +536,217 @@ Cons: requires a C-ABI export wrapper in the engine.
 existing engine code. Option B is cleaner long-term and aligns with the
 `loadSceneFromMemory()` work already planned for release builds.
 
+### Two tiers of users
+
+The online editor serves two distinct user profiles with different needs:
+
+**Content creators** (level designers, modders, game jam participants):
+- Edit scenes and prefabs only (JSONC)
+- Zero compilation — changes are instant in the browser
+- No toolchain install required
+- This is the majority of users in a collaborative or modding context
+
+**Game developers** (programmers writing game logic):
+- Edit Zig scripts, components, hooks, enums
+- Requires compilation — Zig source must be built into WASM
+- Today this means installing the CLI and Zig locally
+
+The question is: can game developers also work from the browser, without
+installing anything?
+
+### Server-side builds for script changes
+
+Yes — if the server has Zig + `labelle` installed. When a developer changes
+a script in the browser editor, the server runs the build:
+
+```
+┌─────────────┐                    ┌────────────────────────┐
+│ Browser      │  scene edit ──────▶│  No build needed       │
+│              │  (JSONC)           │  Instant preview       │
+│              │                    └────────────────────────┘
+│              │
+│              │  script edit ─────▶┌────────────────────────┐
+│              │  (.zig)            │  Build server           │
+│              │                    │                        │
+│              │                    │  1. Receive .zig diff  │
+│              │◀── new .wasm ──────│  2. labelle build      │
+│              │    (~seconds)      │     --platform=wasm    │
+│              │                    │  3. Return .wasm       │
+└─────────────┘                    └────────────────────────┘
+```
+
+The build server would:
+
+1. Maintain a project workspace per user/project
+2. Keep the `.zig-cache` warm (incremental builds)
+3. Keep precompiled `.a` files for core/gfx/jsonc (from the caching strategy
+   described earlier in this RFC)
+4. On script change: apply the diff, run `labelle build --platform=wasm`,
+   return the new `.wasm` to the browser
+5. Cache the `.wasm` output — if the same user edits only scenes next, serve
+   the cached binary
+
+With precompiled non-generic packages cached on the server, the build only
+needs to compile the generic engine + game scripts — the fastest possible
+incremental build.
+
+### Cloud IDE: full development environment in the browser
+
+For the full game developer experience, a cloud IDE approach provides
+everything without local installation:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Browser                                                      │
+│                                                                │
+│  ┌─────────────────────┐  ┌────────────────────────────────┐  │
+│  │ Code Editor          │  │ Game Preview                    │  │
+│  │                     │  │                                │  │
+│  │ • scripts/*.zig     │  │ WASM build rendered in canvas  │  │
+│  │ • components/*.zig  │  │                                │  │
+│  │ • scenes/*.jsonc    │  │ Live reload for scene edits    │  │
+│  │ • prefabs/*.jsonc   │  │ Rebuild on script edits        │  │
+│  │ • project.labelle   │  │                                │  │
+│  └─────────────────────┘  └────────────────────────────────┘  │
+│                                                                │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │ Terminal (optional)                                      │  │
+│  │ $ labelle run --platform=wasm                           │  │
+│  │ $ labelle build --release                               │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────┴──────────┐
+                    │ Cloud workspace     │
+                    │                    │
+                    │ • Zig 0.15.2       │
+                    │ • labelle CLI      │
+                    │ • Project files    │
+                    │ • .zig-cache       │
+                    │ • Precompiled .a   │
+                    │   cache            │
+                    └────────────────────┘
+```
+
+#### Implementation options
+
+**Option 1: Custom cloud IDE**
+
+Build a purpose-built web IDE for labelle:
+- Monaco editor (VS Code's editor component) for Zig and JSONC
+- Custom scene editor panel with visual entity placement
+- WebSocket connection to a per-user container running `labelle`
+- WASM preview panel that hot-reloads on scene changes and rebuilds on
+  script changes
+
+Pros: tailored UX, integrated scene editor, full control.
+Cons: significant frontend engineering, must maintain the IDE.
+
+**Option 2: Gitpod / GitHub Codespaces with labelle pre-installed**
+
+Use an existing cloud IDE platform with a devcontainer that has Zig +
+labelle pre-installed:
+
+```dockerfile
+# .devcontainer/Dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+    libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+    libwayland-dev libxkbcommon-dev libasound2-dev
+# Install Zig
+RUN curl -L https://ziglang.org/download/0.15.2/... | tar xJ -C /usr/local
+# Install labelle CLI
+RUN curl -L https://labelle-releases.example.com/cli/latest/labelle-linux-x86_64 \
+    -o /usr/local/bin/labelle && chmod +x /usr/local/bin/labelle
+```
+
+Developers open the repo in Codespaces, everything is pre-configured.
+The WASM build can be previewed via port forwarding or a simple HTTP
+server.
+
+Pros: zero custom IDE work, familiar VS Code interface, Git integration.
+Cons: no custom scene editor (just text editing), depends on third-party
+platform, cost per workspace.
+
+**Option 3: Hybrid — Codespaces for scripts + custom scene editor**
+
+Use Codespaces/Gitpod as the compilation backend, but overlay a custom
+scene/prefab editor that talks to the same workspace:
+
+- Content creators use the visual scene editor (no Codespaces needed —
+  pure client-side JSONC editing)
+- Game developers open Codespaces for script work, get full terminal +
+  IDE
+- Both share the same project repo and see each other's changes
+
+This separates the "needs a compiler" and "doesn't need a compiler"
+workflows cleanly.
+
+**Recommendation**: start with Option 2 (Codespaces/Gitpod) — it's the
+fastest path to "zero local install" for developers. Add a custom scene
+editor frontend later for the content-creator tier. Option 3 is the
+eventual goal.
+
 ### Server architecture
 
-For a hosted editor service:
-
 ```
-┌─────────────┐     ┌──────────────────────────────────┐
-│ User browser │────▶│ CDN / Static hosting              │
-│              │     │  - Pre-compiled .wasm per project │
-│              │     │  - JS loader / editor app         │
-│              │     │  - User's scene/prefab JSONC      │
-│              │     │  - Asset files (images, audio)    │
-└─────────────┘     └──────────────────────────────────┘
-                                    │
-                    ┌───────────────┴───────────────┐
-                    │ Build server (only on Zig      │
-                    │ source changes)                │
-                    │                                │
-                    │ labelle build --platform=wasm  │
-                    │ → outputs .wasm + .js + .html  │
-                    │ → cached until scripts change  │
-                    └────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                        CDN / Edge                            │
+│  Static assets: editor app, cached .wasm binaries, assets   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+            ▼              ▼              ▼
+   ┌──────────────┐ ┌───────────┐ ┌──────────────┐
+   │ Scene editor  │ │ Code      │ │ Build        │
+   │ (static SPA)  │ │ editor    │ │ service      │
+   │               │ │ (Cloud    │ │              │
+   │ JSONC editing │ │  IDE or   │ │ Receives     │
+   │ No backend    │ │  custom)  │ │ .zig diffs   │
+   │ needed        │ │           │ │ Returns .wasm│
+   └──────────────┘ └─────┬─────┘ └──────┬───────┘
+                          │               │
+                          ▼               ▼
+                    ┌─────────────────────────┐
+                    │ Project storage          │
+                    │                         │
+                    │ • Git repo (scripts,    │
+                    │   components, scenes)   │
+                    │ • Asset storage (S3/R2) │
+                    │ • WASM cache per commit │
+                    └─────────────────────────┘
 ```
 
-Scene and prefab edits are **purely client-side** — saved to a database or
-object store, served as static files. The build server is only invoked when
-a game developer changes scripts or components.
+Key design points:
 
-For a game jam or modding scenario, the WASM binary is compiled once by the
-game author, and all participants edit scenes/prefabs without any compilation
-infrastructure.
+- **WASM binaries are cached per Git commit hash** of the Zig source files.
+  If only scenes changed, the cached WASM is reused.
+- **Scene/prefab JSONC files are stored separately** from the WASM binary —
+  they're loaded at runtime, so they can change independently.
+- **The build service is stateless** — it pulls the project from storage,
+  builds, caches the output, returns it. Can scale horizontally.
+- **Precompiled `.a` cache is shared** across projects using the same engine
+  version — a build server that has already compiled core/gfx/jsonc for
+  `wasm32-emscripten-debug` can reuse those artifacts for any project.
 
 ### What this enables
 
 - **Online level editor** — drag entities, edit components, see changes
   instantly in the WASM preview. No install, no compiler.
+- **Online game development** — edit Zig scripts in a cloud IDE, server
+  compiles and returns the WASM binary. No local toolchain needed.
 - **Modding support** — ship the WASM binary, let players create custom
   scenes and prefabs.
 - **Collaborative editing** — multiple users edit scenes via a shared
   backend, each seeing live updates in their browser.
 - **Game jam template** — precompile a starter project, participants only
-  touch JSONC files to build levels.
+  touch JSONC files to build levels. Developers can also edit scripts via
+  the cloud IDE if needed.
+- **Education** — students start building games in the browser immediately,
+  no environment setup. The cloud IDE handles compilation; the scene editor
+  lets them see results instantly.
 
 ---
 
