@@ -9,6 +9,7 @@ const scanner = @import("scanner.zig");
 const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
+pub const template = @import("template.zig");
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
 pub const Backend = config.Backend;
