@@ -1,4 +1,4 @@
-# RFC: Embed JSONC Scenes and Prefabs in Release Builds
+# RFC: Build Pipeline — Embed Scenes in Release, Skip Recompilation in Dev
 
 Tracking issue: #105
 
@@ -136,6 +136,10 @@ invocation, so the extra flexibility of Option 2 is not needed.
 - `loadSceneFromMemory` engine entry point
 - Generator-time dev/release code path split
 - Prefab embedding if prefabs are `.jsonc` at that point
+- Codegen fingerprinting to skip regeneration when inputs are unchanged
+- Binary mtime check to skip compilation when no `.zig` source changed
+- Merge the two `zig build` invocations into a single `zig build run`
+- Incremental scene/asset sync (copy only changed files)
 
 ### Out of scope
 
@@ -143,6 +147,8 @@ invocation, so the extra flexibility of Option 2 is not needed.
   backend/renderer
 - Compression or binary packing — future optimization
 - Obfuscation or encryption of embedded data
+- File watching / daemon mode (e.g., `labelle watch` that stays running and
+  re-launches on changes) — future enhancement
 
 ---
 
@@ -151,6 +157,119 @@ invocation, so the extra flexibility of Option 2 is not needed.
 No breaking changes. The default behavior (`labelle run`) remains unchanged.
 `labelle build` gains embedded scenes automatically. Game authors do not need
 to modify their projects.
+
+---
+
+## Dev mode: skip unnecessary work on `labelle run`
+
+### The problem today
+
+Every `labelle run` unconditionally executes three expensive steps, even when
+nothing has changed (`src/cli.zig` lines 390–454):
+
+```
+1. Regenerate   — copy ALL files (scripts, scenes, components, prefabs, assets)
+                  + generate build.zig and main.zig                    [I/O heavy]
+2. zig build    — invoke the Zig build system                          [redundant]
+3. zig build run — invoke the Zig build system AGAIN, then launch      [builds twice]
+```
+
+Even if the developer only changed a `.jsonc` scene file (which is loaded at
+runtime and never compiled), the CLI still copies every file, regenerates all
+build files, and invokes `zig build` twice.
+
+Step 2 (`zig build` on line 411) and step 3 (`zig build run` on line 454) both
+invoke the Zig build system. The separate `zig build` exists for error
+reporting — if it fails, the CLI prints the error and stops. But this means
+every successful run pays for two full build-system invocations.
+
+### What should happen
+
+```
+labelle run
+  ├─ Has project.labelle or codegen inputs changed?
+  │    NO  → skip regeneration
+  │    YES → regenerate
+  ├─ Has any .zig source changed since last successful build?
+  │    NO  → skip compilation, launch existing binary
+  │    YES → zig build run (single invocation — builds + runs)
+  └─ launch
+```
+
+### Proposed changes
+
+#### 1. Skip regeneration when codegen inputs are unchanged
+
+The generator copies and scans these directories:
+
+| Directory | Extension | Triggers codegen? | Triggers recompilation? |
+|---|---|---|---|
+| `scripts/` | `.zig` | Yes | Yes |
+| `components/` | `.zig` | Yes | Yes |
+| `hooks/` | `.zig` | Yes | Yes |
+| `enums/` | `.zig` | Yes | Yes |
+| `views/` | `.zon` | Yes | Yes (comptime import) |
+| `gizmos/` | `.zon` | Yes | Yes (comptime import) |
+| `prefabs/` | `.zon` | Yes | Yes (comptime import) |
+| `scenes/` | `.jsonc` | Copy only | **No** (runtime loaded) |
+| `assets/` | `*` | Copy only | **No** (runtime loaded) |
+| `project.labelle` | — | Yes | Yes |
+
+**Strategy**: compute a lightweight fingerprint (concatenation of mtime + size
+for all codegen-triggering files). Store it in `.labelle/.gen_fingerprint`.
+On the next run, if the fingerprint matches, skip regeneration entirely.
+
+For scenes and assets (runtime-only files), they still need to be copied to
+`.labelle/<target>/` so the binary can find them at runtime. But this can be
+a fast incremental sync (only copy changed files) rather than a full directory
+copy every time.
+
+#### 2. Skip compilation when no Zig source changed
+
+After regeneration (or skip), check whether any `.zig` file in
+`.labelle/<target>/` is newer than the output binary. If not, the binary is
+up to date — skip straight to launch.
+
+```zig
+fn binaryIsUpToDate(target_dir: []const u8) bool {
+    const binary_mtime = getMtime(target_dir ++ "/zig-out/bin/<name>");
+    // Walk .zig files in target_dir, return false if any is newer
+    ...
+}
+```
+
+This avoids invoking `zig build` at all when only scene/asset files changed.
+The hot reloader in the engine handles those changes at runtime.
+
+#### 3. Merge the two `zig build` invocations
+
+Currently:
+```zig
+// line 411 — build only, capture output for error reporting
+const build_result = try runner.runZig(allocator, target_dir, &.{ "zig", "build" });
+// line 454 — build + run, inherits stdio
+const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
+```
+
+Replace with a single `zig build run` that inherits stdio. If it fails during
+the build phase, Zig already prints the errors to stderr — the separate
+`zig build` call is not needed.
+
+If we want to distinguish build errors from runtime errors (different exit
+behavior), we can check the exit code or parse stderr, but a single invocation
+halves the build-system overhead.
+
+### Expected result
+
+| Scenario | Before | After |
+|---|---|---|
+| No changes | regen + 2x zig build + run | **just launch** |
+| Scene/asset change only | regen + 2x zig build + run | **copy scene + launch** |
+| Script/component change | regen + 2x zig build + run | regen + 1x zig build run |
+| project.labelle change | regen + 2x zig build + run | regen + 1x zig build run |
+
+The common dev loop (edit scene → test) goes from ~seconds of unnecessary
+build overhead to near-instant launch.
 
 ---
 
@@ -276,3 +395,9 @@ paths produce a working build.
    toggling for debugging shipped builds.
 3. When prefabs move to `.jsonc`, should they follow this same RFC or get a
    separate one?
+4. For the binary-up-to-date check, should we rely on mtime comparison alone
+   or also hash file contents? Mtime is fast but can miss changes (e.g.,
+   `touch` without actual edits) or give false positives (copy that preserves
+   mtime). In practice, mtime is sufficient for a dev workflow.
+5. Should the fingerprint file (`.labelle/.gen_fingerprint`) be gitignored?
+   It is machine-local state and should not be committed.
