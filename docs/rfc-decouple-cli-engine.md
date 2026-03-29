@@ -123,7 +123,6 @@ a generic orchestrator that reads templates from the engine.
 labelle-engine/
   codegen/
     main.zig.template      ← how to generate main.zig for this engine version
-    build.zig.template      ← how to generate build.zig for this engine version
     manifest.zon            ← declares capabilities, required inputs, API version
 ```
 
@@ -294,13 +293,16 @@ commit, same PR, same review. The CLI doesn't need to know or care.
 ```
 labelle-engine/          ← existing repo, no new repos
   src/                   ← engine source (existing)
-  codegen/               ← NEW: templates for the CLI generator
+  codegen/               ← NEW: main.zig template for the CLI generator
     manifest.zon
-    main.zig.template
-    build.zig.template
+    main.zig.template    ← engine API knowledge (GameConfig, ScriptRunner, etc.)
   jsonc/                 ← JSONC parser (existing)
   scene/                 ← scene module (existing)
 ```
+
+Note: `build.zig` generation stays in the CLI — it contains platform and
+backend knowledge (iOS SDK, Emscripten, linking) that the engine should
+not know about.
 
 ### Why not versioned codegen in the CLI?
 
@@ -323,10 +325,44 @@ development.
 The template approach gives the engine full freedom to change its API
 while maintaining CLI compatibility.
 
+### Template ownership: engine owns `main.zig`, CLI owns `build.zig`
+
+Not all generated code depends on the engine API. The two main outputs
+have very different coupling:
+
+**`main.zig`** — engine-coupled. References `GameConfig(...)`,
+`ScriptRunner(...)`, `SystemRegistry(...)`, `JsoncSceneBridge(...)`,
+lifecycle ordering (`setup` → `tick` → `drawGui`), profiling hooks, etc.
+This is the code that breaks when engine APIs change. **This template
+moves to the engine.**
+
+**`build.zig`** — platform/backend-coupled. Contains iOS SDK path
+resolution, Emscripten linking, backend artifact wiring (`raylib`,
+`sokol`, `sdl`, `bgfx`, `wgpu`), ECS adapter dependencies, plugin
+module injection, GUI bridge linking. The engine knows nothing about
+platforms or backends. **This template stays in the CLI.**
+
+```
+labelle-engine/codegen/              ← engine ships these
+  manifest.zon                        ← capabilities, codegen_api version
+  main.zig.template                   ← how to assemble the game (engine API)
+
+labelle-cli/generator/src/templates/ ← CLI keeps these
+  build_zig.txt                       ← how to build (platforms, backends, linking)
+  build_zig_zon.txt                   ← dependency declarations
+```
+
+This split is clean because:
+- The engine author changes an API → updates `main.zig.template` in the
+  same commit
+- The CLI author adds a new backend or platform → updates `build_zig.txt`
+  without touching the engine
+- Neither needs to know about the other's concerns
+
 ### Why templates in the engine, not in the project?
 
-The templates belong to the engine because they encode engine API
-knowledge. If they were in the project, every project would need to
+The `main.zig` template belongs to the engine because it encodes engine
+API knowledge. If it were in the project, every project would need to
 update templates on engine upgrade — that's just moving the coupling.
 
 The engine author updates templates alongside API changes. Projects
@@ -408,9 +444,8 @@ engine version.
    per backend (raylib, sokol, sdl), or one template with backend
    conditionals? Currently the CLI has separate template sections per
    backend.
-4. **Who owns `build.zig` templates?**: `build.zig` references backend
-   packages, ECS adapters, and GUI plugins — not just the engine. Should
-   the build file template come from the CLI (which knows all packages)
-   while `main.zig` comes from the engine?
+4. ~~**Who owns `build.zig` templates?**~~ Resolved: `build.zig` stays in the
+   CLI (platform/backend knowledge), `main.zig` moves to the engine (API
+   knowledge). See "Template ownership" section above.
 5. **Transition period**: how long should the CLI maintain built-in fallback
    templates for engines without `codegen/`? One major version cycle?
