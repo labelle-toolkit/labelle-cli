@@ -397,6 +397,33 @@ the work is maintaining correct package names across distros.
 
 ---
 
+## Related RFCs and issues
+
+- **#105 / `docs/rfc-embed-scenes-release.md`** (branch `feat/embed-scenes-release`):
+  Build pipeline RFC — embed scenes in release, skip recompilation in dev,
+  precompile non-generic packages, online WASM editor. The auto-Zig
+  toolchain makes the server-side build service simpler (the build server
+  just needs `labelle`, not a separate Zig install). The `install-deps`
+  command solves the Linux system library problem for both local dev and
+  cloud IDE containers.
+
+- **#77**: Chrome extension editor with local native messaging. The extension
+  calls the local `labelle` CLI for compilation via Chrome Native Messaging.
+  Auto-Zig download means users only install `labelle` + the Chrome extension
+  — no separate Zig setup. `labelle install` can register the native messaging
+  host manifest as part of the same setup flow.
+
+Together, these three efforts define the full developer experience:
+
+| Scenario | What's needed |
+|---|---|
+| Local CLI dev | `labelle` (auto-downloads Zig) + `sudo labelle install-deps` on Linux |
+| Chrome extension editor | `labelle install` (Zig + native host) + Chrome extension |
+| Cloud IDE (Codespaces) | Devcontainer with `labelle` pre-installed (#105) |
+| Online editor (no install) | Server runs `labelle build`, users edit JSONC in browser (#105) |
+
+---
+
 ## Open questions
 
 1. Should the CLI auto-download without asking, or prompt first?
