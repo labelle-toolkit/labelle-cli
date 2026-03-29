@@ -595,6 +595,7 @@ pub fn generateMainZigFromTemplate(
 
     // ── Render the engine template ──
     var output = std.ArrayList(u8){};
+    errdefer output.deinit(allocator);
     try tpl.renderDynamic(engine_template, data, output.writer(allocator));
     return output.toOwnedSlice(allocator);
 }
