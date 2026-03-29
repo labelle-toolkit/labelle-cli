@@ -29,7 +29,7 @@ pub const SimpleVariableInterpolation = struct {
 
         const result = try render("Hello, {{name}}!", data);
         defer a.free(result);
-        try expect.equalStrings("Hello, Alice!", result);
+        try std.testing.expectEqualStrings("Hello, Alice!", result);
     }
 
     test "replaces multiple variables" {
@@ -41,7 +41,7 @@ pub const SimpleVariableInterpolation = struct {
 
         const result = try render("{{first}} {{last}}", data);
         defer a.free(result);
-        try expect.equalStrings("Jane Doe", result);
+        try std.testing.expectEqualStrings("Jane Doe", result);
     }
 
     test "handles variables with spaces in braces" {
@@ -52,7 +52,7 @@ pub const SimpleVariableInterpolation = struct {
 
         const result = try render("{{ x }}", data);
         defer a.free(result);
-        try expect.equalStrings("42", result);
+        try std.testing.expectEqualStrings("42", result);
     }
 };
 
@@ -64,7 +64,7 @@ pub const MissingVariables = struct {
 
         const result = try render("a{{missing}}b", data);
         defer a.free(result);
-        try expect.equalStrings("ab", result);
+        try std.testing.expectEqualStrings("ab", result);
     }
 };
 
@@ -77,7 +77,7 @@ pub const ConditionalBlocks = struct {
 
         const result = try render("{{#if show}}visible{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("visible", result);
+        try std.testing.expectEqualStrings("visible", result);
     }
 
     test "falsy if skips body" {
@@ -87,7 +87,7 @@ pub const ConditionalBlocks = struct {
 
         const result = try render("{{#if show}}hidden{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("", result);
+        try std.testing.expectEqualStrings("", result);
     }
 
     test "empty string is falsy" {
@@ -98,7 +98,7 @@ pub const ConditionalBlocks = struct {
 
         const result = try render("{{#if val}}yes{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("", result);
+        try std.testing.expectEqualStrings("", result);
     }
 
     test "else branch when falsy" {
@@ -108,7 +108,7 @@ pub const ConditionalBlocks = struct {
 
         const result = try render("{{#if x}}A{{#else}}B{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("B", result);
+        try std.testing.expectEqualStrings("B", result);
     }
 
     test "else branch skipped when truthy" {
@@ -119,7 +119,7 @@ pub const ConditionalBlocks = struct {
 
         const result = try render("{{#if x}}A{{#else}}B{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("A", result);
+        try std.testing.expectEqualStrings("A", result);
     }
 };
 
@@ -133,7 +133,7 @@ pub const NestedIfBlocks = struct {
 
         const result = try render("{{#if a}}A{{#if b}}B{{/if}}{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("AB", result);
+        try std.testing.expectEqualStrings("AB", result);
     }
 
     test "nested if falsy inner" {
@@ -144,7 +144,7 @@ pub const NestedIfBlocks = struct {
 
         const result = try render("{{#if a}}A{{#if b}}B{{/if}}C{{/if}}", data);
         defer a.free(result);
-        try expect.equalStrings("AC", result);
+        try std.testing.expectEqualStrings("AC", result);
     }
 };
 
@@ -171,7 +171,7 @@ pub const EachLoops = struct {
 
         const result = try render("{{#each people}}[{{name}}]{{/each}}", data);
         defer a.free(result);
-        try expect.equalStrings("[Alice][Bob]", result);
+        try std.testing.expectEqualStrings("[Alice][Bob]", result);
     }
 
     test "empty list produces no output" {
@@ -185,7 +185,7 @@ pub const EachLoops = struct {
 
         const result = try render("{{#each things}}X{{/each}}", data);
         defer a.free(result);
-        try expect.equalStrings("", result);
+        try std.testing.expectEqualStrings("", result);
     }
 
     test "missing list produces no output" {
@@ -195,7 +195,7 @@ pub const EachLoops = struct {
 
         const result = try render("{{#each nope}}X{{/each}}", data);
         defer a.free(result);
-        try expect.equalStrings("", result);
+        try std.testing.expectEqualStrings("", result);
     }
 };
 
@@ -217,7 +217,7 @@ pub const FallbackToParentScalars = struct {
 
         const result = try render("{{#each files}}{{project}}/{{file}}{{/each}}", data);
         defer a.free(result);
-        try expect.equalStrings("labelle/main.zig", result);
+        try std.testing.expectEqualStrings("labelle/main.zig", result);
     }
 
     test "item field shadows parent scalar" {
@@ -237,7 +237,7 @@ pub const FallbackToParentScalars = struct {
 
         const result = try render("{{#each entries}}{{name}}{{/each}}", data);
         defer a.free(result);
-        try expect.equalStrings("child", result);
+        try std.testing.expectEqualStrings("child", result);
     }
 };
 
@@ -267,7 +267,7 @@ pub const NestedIfInsideEach = struct {
             data,
         );
         defer a.free(result);
-        try expect.equalStrings("Alice* Bob ", result);
+        try std.testing.expectEqualStrings("Alice* Bob ", result);
     }
 
     test "if-else inside each" {
@@ -293,6 +293,6 @@ pub const NestedIfInsideEach = struct {
             data,
         );
         defer a.free(result);
-        try expect.equalStrings("ON\nOFF\n", result);
+        try std.testing.expectEqualStrings("ON\nOFF\n", result);
     }
 };
