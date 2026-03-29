@@ -447,6 +447,139 @@ build overhead to near-instant launch.
 
 ---
 
+## Online editor: WASM builds with user-editable scenes
+
+### The opportunity
+
+With scenes and prefabs as runtime JSONC, an online game editor becomes
+viable with **zero server-side compilation** for content changes:
+
+1. **Server precompiles one WASM binary** per game project (scripts +
+   components + engine). This is the expensive step — but it only happens
+   when Zig source changes.
+2. **Users edit scenes and prefabs** through a web GUI (visual editor or
+   JSONC text editor).
+3. **Browser loads the precompiled WASM + the user's JSONC files** — no
+   server round-trip needed for content iteration.
+
+The compile/content boundary maps perfectly to the dev/release split:
+
+| Layer | Changes by | Requires compilation? | Handled by |
+|---|---|---|---|
+| Engine + plugins | Framework devs | Yes | Precompiled, cached |
+| Game scripts + components | Game developer | Yes | Server-side `zig build` on change |
+| Scenes + prefabs (JSONC) | **Anyone (level designer, player)** | **No** | Client-side, immediate |
+| Assets (images, audio) | Artist | No | Uploaded, served as static files |
+
+### How it would work
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Online Editor (browser)                            │
+│                                                     │
+│  ┌──────────────┐  ┌─────────────────────────────┐  │
+│  │ Scene Editor  │  │ Game Preview (WASM)         │  │
+│  │              │  │                             │  │
+│  │ Edit JSONC   │──│ Reload scene from memory    │  │
+│  │ prefabs,     │  │ via loadSceneFromMemory()   │  │
+│  │ entities,    │  │                             │  │
+│  │ positions    │  │ Pre-compiled .wasm binary   │  │
+│  └──────────────┘  └─────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+                           │
+                     No server call
+                     for scene edits
+```
+
+### WASM filesystem challenge
+
+The engine currently loads scenes via `std.fs.cwd().openFile()`. In
+Emscripten, this maps to a virtual filesystem (MEMFS/IDBFS). There are
+several ways to feed JSONC data to the WASM binary:
+
+**Option A: Emscripten virtual filesystem**
+
+Pre-populate Emscripten's MEMFS with scene/prefab files before the game
+starts. The JavaScript loader writes files into the virtual FS, and the
+engine's `openFile()` calls work unchanged.
+
+```javascript
+// JS loader — write scene data into Emscripten's virtual FS
+FS.writeFile('/scenes/main.jsonc', sceneJsoncString);
+FS.writeFile('/prefabs/worker.jsonc', prefabJsoncString);
+// Then start the WASM module — engine reads files normally
+Module.callMain();
+```
+
+Pros: zero engine changes, `openFile()` works as-is.
+Cons: requires Emscripten FS setup in the JS loader.
+
+**Option B: `loadSceneFromMemory()` via JS bridge**
+
+The `loadSceneFromMemory()` entry point (proposed for release builds)
+can also serve the online editor. JavaScript passes scene data directly
+into WASM memory, bypassing the filesystem entirely.
+
+```javascript
+// JS calls into WASM with scene data as a byte buffer
+const sceneBytes = new TextEncoder().encode(sceneJsoncString);
+const ptr = Module._malloc(sceneBytes.length);
+Module.HEAPU8.set(sceneBytes, ptr);
+Module._loadSceneFromMemory(ptr, sceneBytes.length);
+Module._free(ptr);
+```
+
+Pros: no filesystem dependency, works with any WASM runtime.
+Cons: requires a C-ABI export wrapper in the engine.
+
+**Recommendation**: Option A for the initial version — it works with the
+existing engine code. Option B is cleaner long-term and aligns with the
+`loadSceneFromMemory()` work already planned for release builds.
+
+### Server architecture
+
+For a hosted editor service:
+
+```
+┌─────────────┐     ┌──────────────────────────────────┐
+│ User browser │────▶│ CDN / Static hosting              │
+│              │     │  - Pre-compiled .wasm per project │
+│              │     │  - JS loader / editor app         │
+│              │     │  - User's scene/prefab JSONC      │
+│              │     │  - Asset files (images, audio)    │
+└─────────────┘     └──────────────────────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    │ Build server (only on Zig      │
+                    │ source changes)                │
+                    │                                │
+                    │ labelle build --platform=wasm  │
+                    │ → outputs .wasm + .js + .html  │
+                    │ → cached until scripts change  │
+                    └────────────────────────────────┘
+```
+
+Scene and prefab edits are **purely client-side** — saved to a database or
+object store, served as static files. The build server is only invoked when
+a game developer changes scripts or components.
+
+For a game jam or modding scenario, the WASM binary is compiled once by the
+game author, and all participants edit scenes/prefabs without any compilation
+infrastructure.
+
+### What this enables
+
+- **Online level editor** — drag entities, edit components, see changes
+  instantly in the WASM preview. No install, no compiler.
+- **Modding support** — ship the WASM binary, let players create custom
+  scenes and prefabs.
+- **Collaborative editing** — multiple users edit scenes via a shared
+  backend, each seeing live updates in their browser.
+- **Game jam template** — precompile a starter project, participants only
+  touch JSONC files to build levels.
+
+---
+
 ## CI: keeping release builds honest
 
 The current CI (`ci.yml`) tests the dev path end-to-end: init a project,
