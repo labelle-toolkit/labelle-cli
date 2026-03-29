@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         "test/tests.zig",
         "test/script_scanner_tests.zig",
         "test/deps_linker_tests.zig",
+        "test/template_dynamic_test.zig",
     };
 
     for (test_files) |test_file| {

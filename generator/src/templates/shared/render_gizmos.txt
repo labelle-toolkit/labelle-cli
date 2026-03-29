@@ -1,2 +1,0 @@
-// Gizmo rendering is now handled by g.renderGizmos() — no generated code needed.
-// The engine delegates to the renderer's renderGizmoDraws() method.
