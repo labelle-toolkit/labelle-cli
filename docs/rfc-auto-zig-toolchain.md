@@ -278,6 +278,103 @@ successful download.
 
 ---
 
+## Linux system dependencies: `labelle install-deps`
+
+macOS and Windows ship with the system libraries that backends like raylib
+and sokol need (OpenGL, audio, window management). Linux does not — users
+must install development packages manually.
+
+The CLI already knows exactly which packages are needed per backend (the
+same list is in the CI workflow). A `labelle install-deps` command can
+automate this:
+
+```
+$ sudo labelle install-deps
+labelle: detected Ubuntu 24.04 (apt)
+labelle: installing system dependencies for backend 'raylib'...
+  running: apt-get install -y libgl1-mesa-dev libx11-dev libxcursor-dev \
+    libxrandr-dev libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+    libwayland-dev libxkbcommon-dev libasound2-dev
+  ✓ all dependencies installed
+```
+
+### Package lists per backend and distro
+
+The CLI detects the Linux distribution and uses the appropriate package
+manager:
+
+| Distro | Package manager | Detection |
+|---|---|---|
+| Ubuntu / Debian | `apt-get` | `/etc/debian_version` or `apt-get --version` |
+| Fedora / RHEL | `dnf` | `/etc/redhat-release` or `dnf --version` |
+| Arch | `pacman` | `/etc/arch-release` or `pacman --version` |
+| Alpine | `apk` | `/etc/alpine-release` |
+
+Package names per backend:
+
+**raylib:**
+
+| apt (Ubuntu/Debian) | dnf (Fedora) | pacman (Arch) |
+|---|---|---|
+| `libgl1-mesa-dev` | `mesa-libGL-devel` | `mesa` |
+| `libx11-dev` | `libX11-devel` | `libx11` |
+| `libxcursor-dev` | `libXcursor-devel` | `libxcursor` |
+| `libxrandr-dev` | `libXrandr-devel` | `libxrandr` |
+| `libxinerama-dev` | `libXinerama-devel` | `libxinerama` |
+| `libxi-dev` | `libXi-devel` | `libxi` |
+| `libxext-dev` | `libXext-devel` | `libxext` |
+| `libxfixes-dev` | `libXfixes-devel` | `libxfixes` |
+| `libwayland-dev` | `wayland-devel` | `wayland` |
+| `libxkbcommon-dev` | `libxkbcommon-devel` | `libxkbcommon` |
+| `libasound2-dev` | `alsa-lib-devel` | `alsa-lib` |
+
+**sokol:**
+
+Same graphics/window/input packages as raylib, plus potentially
+`libgles2-mesa-dev` for GLES backends.
+
+### Behavior
+
+- **Requires sudo**: the command must be run as root (or with sudo) since
+  it installs system packages. If not root, print a clear message:
+  ```
+  labelle: install-deps requires root privileges
+    run: sudo labelle install-deps
+  ```
+- **Reads `project.labelle`**: if run inside a project, uses the configured
+  backend to determine the package list. If run outside a project, installs
+  packages for all backends (or accepts `--backend=raylib`).
+- **Idempotent**: running it twice is safe — package managers handle
+  already-installed packages gracefully.
+- **Dry run**: `labelle install-deps --dry-run` prints the command without
+  executing it, for users who want to review first.
+- **macOS/Windows**: prints "no system dependencies needed" and exits.
+
+### Implementation
+
+The package lists are static data embedded in the CLI:
+
+```zig
+const linux_deps = struct {
+    const apt = struct {
+        const raylib = &.{
+            "libgl1-mesa-dev", "libx11-dev", "libxcursor-dev",
+            "libxrandr-dev", "libxinerama-dev", "libxi-dev",
+            "libxext-dev", "libxfixes-dev", "libwayland-dev",
+            "libxkbcommon-dev", "libasound2-dev",
+        };
+        // sokol, sdl, bgfx, wgpu...
+    };
+    const dnf = struct { ... };
+    const pacman = struct { ... };
+};
+```
+
+The distro detection + package install is ~100 lines of code. The bulk of
+the work is maintaining correct package names across distros.
+
+---
+
 ## Scope
 
 ### In scope
@@ -290,12 +387,10 @@ successful download.
 - Pure Zig `.tar.xz` / `.zip` extraction (no system dependency)
 - `LABELLE_ZIG_PATH` override
 
+- `labelle install-deps` command for Linux system library installation
+
 ### Out of scope
 
-- Managing system library dependencies (libgl, libx11, etc.) — these are
-  OS-level packages needed by raylib/sokol and can't be bundled easily.
-  Linux users still need `apt-get install` for these. macOS and Windows
-  have them built-in.
 - Emscripten SDK management — could be a follow-up RFC using the same
   pattern
 - Multiple Zig versions simultaneously — only the pinned version is managed
