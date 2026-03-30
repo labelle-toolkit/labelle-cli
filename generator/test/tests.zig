@@ -720,6 +720,38 @@ pub const SOKOL = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") == null);
     }
 
+    test "embed_scenes generates @embedFile loaders" {
+        const jsonc_scenes = &[_][]const u8{ "intro", "gameplay" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .embed_scenes = true,
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scenes/intro.jsonc\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scenes/gameplay.jsonc\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSceneFromSource") != null);
+        // Should NOT have runtime loadScene
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadScene(game") == null);
+    }
+
+    test "default embed_scenes=false generates runtime loaders" {
+        const jsonc_scenes = &[_][]const u8{"intro"};
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadScene(game") != null);
+        // Should NOT have @embedFile
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSceneFromSource") == null);
+    }
+
     test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",

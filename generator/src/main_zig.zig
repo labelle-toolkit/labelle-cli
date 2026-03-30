@@ -256,7 +256,11 @@ pub fn generateMainZigFromTemplate(
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
         if (jsonc_scene_names.len > 0) {
-            try bw.writeAll("\n// --- JSONC scene loaders (runtime) ---\n");
+            if (cfg.embed_scenes) {
+                try bw.writeAll("\n// --- JSONC scene loaders (embedded) ---\n");
+            } else {
+                try bw.writeAll("\n// --- JSONC scene loaders (runtime) ---\n");
+            }
             if (gizmo_names.len > 0) {
                 try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");
             } else {
@@ -264,14 +268,26 @@ pub fn generateMainZigFromTemplate(
             }
             for (jsonc_scene_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
-                try bw.print(
-                    \\const jsonc_{s}_loader = struct {{
-                    \\    fn load(game: *AssembledGame) anyerror!void {{
-                    \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
-                    \\    }}
-                    \\}}.load;
-                    \\
-                , .{ ident, name });
+                if (cfg.embed_scenes) {
+                    try bw.print(
+                        \\const jsonc_{s}_loader = struct {{
+                        \\    const embedded_source = @embedFile("scenes/{s}.jsonc");
+                        \\    fn load(game: *AssembledGame) anyerror!void {{
+                        \\        return JsoncBridge.loadSceneFromSource(game, embedded_source, "prefabs");
+                        \\    }}
+                        \\}}.load;
+                        \\
+                    , .{ ident, name });
+                } else {
+                    try bw.print(
+                        \\const jsonc_{s}_loader = struct {{
+                        \\    fn load(game: *AssembledGame) anyerror!void {{
+                        \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
+                        \\    }}
+                        \\}}.load;
+                        \\
+                    , .{ ident, name });
+                }
             }
         }
         const block = try buf.toOwnedSlice(allocator);
