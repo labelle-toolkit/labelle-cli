@@ -26,6 +26,7 @@ const lockfile = @import("cli/lockfile.zig");
 const gui_resolve = @import("cli/gui_resolve.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
+const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
@@ -99,6 +100,7 @@ const ParsedArgs = struct {
     timeout_ns: ?u64 = null,
     scene_override: ?[]const u8 = null,
     platform_override: ?Platform = null,
+    docker: bool = false,
 };
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -131,12 +133,13 @@ fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8
     return true;
 }
 
-/// Parse [dir], --scene, and --platform flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform } {
+/// Parse [dir], --scene, --platform, and --docker flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, docker_build: bool } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
     var platform: ?Platform = null;
+    var docker_build = false;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -146,6 +149,10 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             .needs_next => unreachable,
         }
         if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
+        if (std.mem.eql(u8, arg, "--docker")) {
+            docker_build = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -158,16 +165,17 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .docker_build = docker_build };
 }
 
-/// Parse [dir], --scene, --timeout, and --platform flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform } {
+/// Parse [dir], --scene, --timeout, --platform, and --docker flags for run command (explicit or implicit).
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, docker_build: bool } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
     var platform: ?Platform = null;
+    var docker_build = false;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -179,6 +187,10 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
         if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
             if (consumed) continue;
         } else return null;
+        if (std.mem.eql(u8, arg, "--docker")) {
+            docker_build = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_ns = util.parseDuration(arg["--timeout=".len..]);
             if (timeout_ns == null) {
@@ -210,7 +222,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .docker_build = docker_build };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -248,6 +260,7 @@ pub fn main() !void {
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.platform_override = result.platform;
+            parsed_args.docker = result.docker_build;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
@@ -255,6 +268,7 @@ pub fn main() !void {
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
+            parsed_args.docker = result.docker_build;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -314,6 +328,7 @@ pub fn main() !void {
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
+            parsed_args.docker = result.docker_build;
         }
     }
 
@@ -395,7 +410,9 @@ pub fn main() !void {
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
 
-    try runner.fixFingerprint(allocator, target_dir);
+    // fixFingerprint runs `zig build` locally to discover the correct hash.
+    // Skip it for docker builds since the local Zig toolchain may be broken.
+    if (!parsed_args.docker) try runner.fixFingerprint(allocator, target_dir);
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     std.debug.print("  generated .labelle/{s}/\n", .{target_name});
 
@@ -407,20 +424,29 @@ pub fn main() !void {
     }
 
     // Build
-    std.debug.print("labelle: building...\n", .{});
-    const build_result = try runner.runZig(allocator, target_dir, &.{ "zig", "build" });
-    defer allocator.free(build_result.stdout);
-    defer allocator.free(build_result.stderr);
+    if (parsed_args.docker) {
+        std.debug.print("labelle: building via docker...\n", .{});
+        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform);
+        if (docker_exit != 0) {
+            std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
+            return error.BuildFailed;
+        }
+    } else {
+        std.debug.print("labelle: building...\n", .{});
+        const build_result = try runner.runZig(allocator, target_dir, &.{ "zig", "build" });
+        defer allocator.free(build_result.stdout);
+        defer allocator.free(build_result.stderr);
 
-    switch (build_result.term) {
-        .Exited => |code| if (code != 0) {
-            std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
-            return error.BuildFailed;
-        },
-        else => {
-            std.debug.print("labelle: build process terminated abnormally\n{s}\n", .{build_result.stderr});
-            return error.BuildFailed;
-        },
+        switch (build_result.term) {
+            .Exited => |code| if (code != 0) {
+                std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
+                return error.BuildFailed;
+            },
+            else => {
+                std.debug.print("labelle: build process terminated abnormally\n{s}\n", .{build_result.stderr});
+                return error.BuildFailed;
+            },
+        }
     }
     std.debug.print("  build ok\n", .{});
 
