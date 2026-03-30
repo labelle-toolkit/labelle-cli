@@ -494,6 +494,11 @@ pub fn main() !void {
         return ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
     }
 
+    // Warn if --target is used without --docker (it has no effect otherwise)
+    if (parsed_args.docker_target != null and !parsed_args.docker) {
+        std.debug.print("labelle: warning: --target has no effect without --docker\n", .{});
+    }
+
     // Build — default to ReleaseSafe for WASM (Debug exceeds browser local variable limits)
     const optimize_flag: ?[]const u8 = if (effective_optimize) |opt|
         try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{opt})
@@ -508,7 +513,7 @@ pub fn main() !void {
 
     if (parsed_args.docker) {
         std.debug.print("labelle: building via docker...\n", .{});
-        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target);
+        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target, effective_optimize);
         if (docker_exit != 0) {
             std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
             return error.BuildFailed;

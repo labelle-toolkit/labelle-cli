@@ -12,14 +12,12 @@ const host_arch = switch (builtin.cpu.arch) {
 
 const host_target = host_arch ++ "-" ++ @tagName(builtin.os.tag);
 
-// Fix #4: Let stderr through so install failures are visible to the user.
 const install_zig = "apt-get update -qq > /dev/null && " ++
     "apt-get install -y -qq python3-pip > /dev/null && " ++
     "pip3 install ziglang==" ++ ZIG_VERSION ++ " --break-system-packages > /dev/null";
 
 // Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
 // to add framework/include/lib search paths for macOS cross-compilation.
-// Fix #5: Match any linkLibrary call, not just raylib_artifact.
 const setup_xcode_frameworks =
     "XCODE_PKG=$(find /root/.cache/zig/p/ -maxdepth 2 -name 'AppKit.framework' -path '*/Frameworks/*' 2>/dev/null | head -1 | sed 's|/Frameworks/AppKit.framework||') && " ++
     "if [ -z \"$XCODE_PKG\" ]; then " ++
@@ -31,12 +29,6 @@ const setup_xcode_frameworks =
     "sed -i \"/exe.linkLibrary/i\\\\    exe.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\" build.zig && " ++
     "sed -i \"/exe.linkLibrary/i\\\\    exe.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\" build.zig && " ++
     "sed -i \"/exe.linkLibrary/i\\\\    exe.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
-
-// Fix #6: Use head -1 to handle multiple fingerprint mismatches, and | as sed delimiter.
-const fix_fingerprint_script =
-    "BUILD_OUT=$({s} 2>&1 || true) && " ++
-    "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | head -1 | sed 's/.*use this value: //') && " ++
-    "if [ -n \"$FP\" ]; then sed -i \"s|.fingerprint = .*,|.fingerprint = $FP,|\" build.zig.zon; fi";
 
 fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
     if (std.process.getEnvVarOwned(allocator, "ZIG_GLOBAL_CACHE_DIR")) |dir| {
@@ -51,11 +43,24 @@ fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
     return error.NoCacheDir;
 }
 
+/// Sanitize a user-supplied target triple to prevent shell injection.
+/// Only allows [A-Za-z0-9_.-]; replaces any other byte with '_'.
+fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
+    var sanitized = try allocator.alloc(u8, target.len);
+    for (target, 0..) |c, i| {
+        sanitized[i] = switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => c,
+            else => '_',
+        };
+    }
+    return sanitized;
+}
+
 /// Run `zig build` inside a Docker container with inherited stdio.
 /// For macOS targets, shares the Zig cache and injects xcode-frameworks paths.
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
-pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8) !u8 {
+pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
     const abs_target = try std.fs.realpathAlloc(allocator, target_dir);
     defer allocator.free(abs_target);
 
@@ -65,37 +70,48 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     const labelle_vol = try std.fmt.allocPrint(allocator, "{s}:/labelle", .{parent});
     defer allocator.free(labelle_vol);
 
-    // Determine the build command:
-    // - WASM: no -Dtarget (build.zig handles it)
-    // - --target=<triple>: use the explicit override
-    // - Default: cross-compile back to the host OS
-    const zig_build_cmd_alloc = if (target_override) |t|
-        try std.fmt.allocPrint(allocator, "python3 -m ziglang build -Dtarget={s}", .{t})
+    // Build the zig command with optional -Dtarget and -Doptimize flags.
+    // Sanitize target_override to prevent shell injection.
+    const sanitized_target = if (target_override) |t| try sanitizeTarget(allocator, t) else null;
+    defer if (sanitized_target) |s| allocator.free(s);
+
+    const effective_target: []const u8 = sanitized_target orelse if (platform == .wasm)
+        ""
+    else
+        host_target;
+
+    const optimize_part = if (optimize) |opt|
+        try std.fmt.allocPrint(allocator, " -Doptimize={s}", .{opt})
     else
         null;
-    defer if (zig_build_cmd_alloc) |cmd| allocator.free(cmd);
+    defer if (optimize_part) |o| allocator.free(o);
 
-    const effective_cmd: []const u8 = zig_build_cmd_alloc orelse if (platform == .wasm)
-        "python3 -m ziglang build"
+    const effective_cmd = if (effective_target.len == 0)
+        try std.fmt.allocPrint(allocator, "python3 -m ziglang build{s}", .{optimize_part orelse ""})
     else
-        "python3 -m ziglang build -Dtarget=" ++ host_target;
+        try std.fmt.allocPrint(allocator, "python3 -m ziglang build -Dtarget={s}{s}", .{ effective_target, optimize_part orelse "" });
+    defer allocator.free(effective_cmd);
 
-    // Fix #1: Only set up xcode-frameworks when actually targeting macOS,
-    // not for all desktop builds (e.g. Linux user building for Linux).
-    const is_macos_target = if (target_override) |t|
+    // Only set up xcode-frameworks when the effective target is macOS.
+    const is_macos_target = if (sanitized_target) |t|
         std.mem.indexOf(u8, t, "macos") != null
+    else if (platform == .wasm)
+        false
     else
-        // No explicit target — default is host_target, so check host OS
-        builtin.os.tag == .macos and platform == .desktop;
+        std.mem.indexOf(u8, host_target, "macos") != null;
 
     const macos_setup: []const u8 = if (is_macos_target)
         setup_xcode_frameworks ++ " && "
     else
         "";
 
+    // Fix fingerprint: run build once to get the error, patch if needed, then build for real.
+    // Only re-runs the build if a fingerprint was actually found and patched.
     const script = try std.fmt.allocPrint(allocator,
         "{s} && cd /labelle/{s} && " ++
-            fix_fingerprint_script ++ " && " ++
+            "BUILD_OUT=$({s} 2>&1 || true) && " ++
+            "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | head -1 | sed 's/.*use this value: //') && " ++
+            "if [ -n \"$FP\" ]; then sed -i \"s|.fingerprint = .*,|.fingerprint = $FP,|\" build.zig.zon; fi && " ++
             "{s}" ++
             "{s}",
         .{ install_zig, subdir, effective_cmd, macos_setup, effective_cmd },
@@ -104,7 +120,6 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
 
     // For non-WASM builds, share the host Zig cache for pre-fetched packages.
     // WASM builds need their own cache since emscripten binaries are platform-specific.
-    // Fix #2: Skip cache mount if cache dir can't be resolved, instead of mounting /dev/null.
     if (platform != .wasm) {
         if (zigCacheDir(allocator)) |cache_dir| {
             defer allocator.free(cache_dir);
