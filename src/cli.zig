@@ -26,6 +26,7 @@ const lockfile = @import("cli/lockfile.zig");
 const gui_resolve = @import("cli/gui_resolve.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
+const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
@@ -100,6 +101,8 @@ const ParsedArgs = struct {
     scene_override: ?[]const u8 = null,
     platform_override: ?Platform = null,
     optimize_override: ?[]const u8 = null,
+    docker: bool = false,
+    docker_target: ?[]const u8 = null,
 };
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -161,13 +164,15 @@ fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const 
     return null;
 }
 
-/// Parse [dir], --scene, --platform, and --optimize flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8 } {
+/// Parse [dir], --scene, --platform, --optimize, --docker, and --target flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
     var platform: ?Platform = null;
     var optimize: ?[]const u8 = null;
+    var docker_build = false;
+    var docker_target: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -178,6 +183,19 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
         }
         if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
         if (parseOptimizeFlag(arg, &optimize, cmd_name) orelse return null) continue;
+        if (std.mem.eql(u8, arg, "--docker")) {
+            docker_build = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--target=")) {
+            const val = arg["--target=".len..];
+            if (val.len == 0) {
+                std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
+                return null;
+            }
+            docker_target = val;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -190,17 +208,19 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target };
 }
 
-/// Parse [dir], --scene, --timeout, and --platform flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8 } {
+/// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
     var platform: ?Platform = null;
     var optimize: ?[]const u8 = null;
+    var docker_build = false;
+    var docker_target: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -215,6 +235,19 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
         if (parseOptimizeFlag(arg, &optimize, cmd_name)) |consumed| {
             if (consumed) continue;
         } else return null;
+        if (std.mem.eql(u8, arg, "--docker")) {
+            docker_build = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--target=")) {
+            const val = arg["--target=".len..];
+            if (val.len == 0) {
+                std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
+                return null;
+            }
+            docker_target = val;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_ns = util.parseDuration(arg["--timeout=".len..]);
             if (timeout_ns == null) {
@@ -246,7 +279,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -285,6 +318,8 @@ pub fn main() !void {
             parsed_args.scene_override = result.scene;
             parsed_args.platform_override = result.platform;
             parsed_args.optimize_override = result.optimize;
+            parsed_args.docker = result.docker_build;
+            parsed_args.docker_target = result.docker_target;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
@@ -293,6 +328,8 @@ pub fn main() !void {
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
             parsed_args.optimize_override = result.optimize;
+            parsed_args.docker = result.docker_build;
+            parsed_args.docker_target = result.docker_target;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -353,6 +390,8 @@ pub fn main() !void {
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
             parsed_args.optimize_override = result.optimize;
+            parsed_args.docker = result.docker_build;
+            parsed_args.docker_target = result.docker_target;
         }
     }
 
@@ -442,7 +481,9 @@ pub fn main() !void {
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
 
-    try runner.fixFingerprint(allocator, target_dir);
+    // fixFingerprint runs `zig build` locally to discover the correct hash.
+    // Skip it for docker builds since the local Zig toolchain may be broken.
+    if (!parsed_args.docker) try runner.fixFingerprint(allocator, target_dir);
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     std.debug.print("  generated .labelle/{s}/\n", .{target_name});
 
@@ -451,6 +492,11 @@ pub fn main() !void {
     // `labelle ios` subcommand — handles its own build/xcode/run
     if (command == .ios_cmd) {
         return ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
+    }
+
+    // Warn if --target is used without --docker (it has no effect otherwise)
+    if (parsed_args.docker_target != null and !parsed_args.docker) {
+        std.debug.print("labelle: warning: --target has no effect without --docker\n", .{});
     }
 
     // Build — default to ReleaseSafe for WASM (Debug exceeds browser local variable limits)
@@ -465,20 +511,29 @@ pub fn main() !void {
     try zig_args.appendSlice(allocator, &.{ "zig", "build" });
     if (optimize_flag) |flag| try zig_args.append(allocator, flag);
 
-    std.debug.print("labelle: building...\n", .{});
-    const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
-    defer allocator.free(build_result.stdout);
-    defer allocator.free(build_result.stderr);
+    if (parsed_args.docker) {
+        std.debug.print("labelle: building via docker...\n", .{});
+        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target, effective_optimize);
+        if (docker_exit != 0) {
+            std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
+            return error.BuildFailed;
+        }
+    } else {
+        std.debug.print("labelle: building...\n", .{});
+        const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
+        defer allocator.free(build_result.stdout);
+        defer allocator.free(build_result.stderr);
 
-    switch (build_result.term) {
-        .Exited => |code| if (code != 0) {
-            std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
-            return error.BuildFailed;
-        },
-        else => {
-            std.debug.print("labelle: build process terminated abnormally\n{s}\n", .{build_result.stderr});
-            return error.BuildFailed;
-        },
+        switch (build_result.term) {
+            .Exited => |code| if (code != 0) {
+                std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
+                return error.BuildFailed;
+            },
+            else => {
+                std.debug.print("labelle: build process terminated abnormally\n{s}\n", .{build_result.stderr});
+                return error.BuildFailed;
+            },
+        }
     }
     std.debug.print("  build ok\n", .{});
 
@@ -509,10 +564,27 @@ pub fn main() !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        try zig_args.append(allocator, "run");
-        const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
-        if (run_result != 0) {
-            std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+        // When --docker was used, run the built binary directly instead of
+        // calling `zig build run` (local Zig may be broken).
+        if (parsed_args.docker) {
+            // Cross-compiled binaries can't be run on the host
+            if (parsed_args.docker_target) |t| {
+                std.debug.print("labelle: cannot run cross-compiled binary (target: {s})\n", .{t});
+                std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
+                return;
+            }
+            const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
+            defer allocator.free(bin_path);
+            const run_result = try runner.runZigInherit(allocator, project_dir, &.{bin_path}, timeout_ns);
+            if (run_result != 0) {
+                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+            }
+        } else {
+            try zig_args.append(allocator, "run");
+            const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
+            if (run_result != 0) {
+                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+            }
         }
     }
 }
