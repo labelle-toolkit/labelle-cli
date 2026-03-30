@@ -86,6 +86,54 @@ jobs:
           Pop-Location
           Pop-Location
 
+  docker-build:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout labelle-cli
+        uses: actions/checkout@v4
+        with:
+          path: labelle-cli
+
+      - name: Checkout sibling dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          path: labelle-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          path: labelle-engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          path: labelle-gfx
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build CLI
+        run: cd labelle-cli && zig build
+
+      - name: Test --docker build (Linux target)
+        run: |
+          mkdir -p test-docker && cd test-docker
+          ../labelle-cli/zig-out/bin/labelle init docker_test \
+            --backend=raylib --ecs=zig_ecs \
+            --core-version="local:../../labelle-core" \
+            --engine-version="local:../../labelle-engine" \
+            --gfx-version="local:../../labelle-gfx" \
+            --labelle-version="local:../../labelle-cli"
+          cd docker_test
+          ../../labelle-cli/zig-out/bin/labelle build --docker --target=x86_64-linux
+          file .labelle/raylib_desktop/zig-out/bin/game | grep -q "ELF 64-bit"
+          echo "Docker build produced valid Linux binary"
+
   versions-integration:
     name: Versions Integration Test
     runs-on: ubuntu-latest
