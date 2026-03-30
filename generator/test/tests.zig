@@ -720,6 +720,23 @@ pub const SOKOL = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") == null);
     }
 
+    test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"),
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") != null);
+    }
+};
+
+// ── Embed scenes ────────────────────────────────────────────────────
+
+pub const EMBED_SCENES = struct {
     test "embed_scenes generates @embedFile loaders" {
         const jsonc_scenes = &[_][]const u8{ "intro", "gameplay" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
@@ -750,19 +767,6 @@ pub const SOKOL = struct {
         // Should NOT have @embedFile
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSceneFromSource") == null);
-    }
-
-    test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
-            .name = "test-game",
-            .backend = .sokol,
-            .ecs = .mock,
-            .resolved_gui = testGuiRawBackend("imgui"),
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
-        defer std.testing.allocator.free(main_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") != null);
     }
 };
 

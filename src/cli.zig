@@ -429,9 +429,10 @@ pub fn main() !void {
     // Embed scenes in release builds (any non-Debug optimize mode)
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
-    if (effective_optimize) |opt| {
-        parsed.embed_scenes = !std.mem.eql(u8, opt, "Debug");
-    }
+    parsed.embed_scenes = if (effective_optimize) |opt|
+        !std.mem.eql(u8, opt, "Debug")
+    else
+        false;
 
     try gen.generate(allocator, parsed, output_dir, project_dir);
 
