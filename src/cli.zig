@@ -451,10 +451,10 @@ pub fn main() !void {
         null;
     defer if (optimize_flag) |f| allocator.free(f);
 
-    var zig_args = std.ArrayList([]const u8).init(allocator);
-    defer zig_args.deinit();
-    try zig_args.appendSlice(&.{ "zig", "build" });
-    if (optimize_flag) |flag| try zig_args.append(flag);
+    var zig_args: std.ArrayList([]const u8) = .{};
+    defer zig_args.deinit(allocator);
+    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+    if (optimize_flag) |flag| try zig_args.append(allocator, flag);
 
     std.debug.print("labelle: building...\n", .{});
     const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
@@ -500,7 +500,7 @@ pub fn main() !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        try zig_args.append("run");
+        try zig_args.append(allocator, "run");
         const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
         if (run_result != 0) {
             std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
