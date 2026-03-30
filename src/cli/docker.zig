@@ -16,6 +16,24 @@ const install_zig = "apt-get update -qq > /dev/null 2>&1 && " ++
     "apt-get install -y -qq python3-pip > /dev/null 2>&1 && " ++
     "pip3 install ziglang==" ++ ZIG_VERSION ++ " --break-system-packages > /dev/null 2>&1";
 
+// Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
+// to add framework/include/lib search paths for macOS cross-compilation.
+const setup_xcode_frameworks =
+    // Find xcode-frameworks in the Zig cache by looking for AppKit.framework
+    "XCODE_PKG=$(find /root/.cache/zig/p/ -maxdepth 2 -name 'AppKit.framework' -path '*/Frameworks/*' 2>/dev/null | head -1 | sed 's|/Frameworks/AppKit.framework||') && " ++
+    // If not cached, clone from Corendos/xcode-frameworks (open-source macOS framework stubs)
+    "if [ -z \"$XCODE_PKG\" ]; then " ++
+    "apt-get install -y -qq git > /dev/null 2>&1 && " ++
+    "git clone --depth 1 -b main https://github.com/Corendos/xcode-frameworks.git /tmp/xcode-fw > /dev/null 2>&1 && " ++
+    "XCODE_PKG=/tmp/xcode-fw; fi && " ++
+    // Patch build.zig to inject framework search paths before exe.linkLibrary(raylib_artifact)
+    "if [ -n \"$XCODE_PKG\" ] && grep -q 'linkLibrary(raylib_artifact)' build.zig; then " ++
+    "sed -i \"s|exe.linkLibrary(raylib_artifact);|" ++
+    "exe.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\\n" ++
+    "    exe.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\\n" ++
+    "    exe.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\\n" ++
+    "    exe.linkLibrary(raylib_artifact);|\" build.zig; fi";
+
 fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
     if (std.process.getEnvVarOwned(allocator, "ZIG_GLOBAL_CACHE_DIR")) |dir| {
         return dir;
@@ -30,7 +48,8 @@ fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 /// Run `zig build` inside a Docker container with inherited stdio.
-/// For desktop platforms, cross-compiles back to the host OS and shares the Zig cache.
+/// For desktop platforms, cross-compiles back to the host OS, shares the Zig cache,
+/// and injects macOS framework paths from xcode-frameworks for linking.
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
 pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform) !u8 {
@@ -48,15 +67,25 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     else
         "python3 -m ziglang build -Dtarget=" ++ host_target;
 
-    // The script first runs `zig build` to get the fingerprint error, patches build.zig.zon,
-    // then runs the real build. This mirrors fixFingerprint but works inside the container.
+    // For macOS desktop builds, set up xcode-frameworks before building.
+    const macos_setup: []const u8 = if (platform == .desktop)
+        setup_xcode_frameworks ++ " && "
+    else
+        "";
+
+    // The script:
+    // 1. Installs Zig via pip
+    // 2. Fixes the build.zig.zon fingerprint (mirrors fixFingerprint on the host)
+    // 3. For macOS desktop: locates/fetches xcode-frameworks and patches build.zig
+    // 4. Runs zig build
     const script = try std.fmt.allocPrint(allocator,
         "{s} && cd /labelle/{s} && " ++
             "BUILD_OUT=$({s} 2>&1 || true) && " ++
             "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | sed 's/.*use this value: //') && " ++
             "if [ -n \"$FP\" ]; then sed -i \"s/.fingerprint = .*,/.fingerprint = $FP,/\" build.zig.zon; fi && " ++
+            "{s}" ++
             "{s}",
-        .{ install_zig, subdir, zig_build_cmd, zig_build_cmd },
+        .{ install_zig, subdir, zig_build_cmd, macos_setup, zig_build_cmd },
     );
     defer allocator.free(script);
 
