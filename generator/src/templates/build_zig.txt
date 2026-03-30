@@ -82,7 +82,7 @@ pub fn build(b: *std.Build) !void {
 
 .gui_backend
     const gui_dep = b.dependency("{{gui_dep_name}}", .{ .target = target, .optimize = optimize });
-    const gui_mod = gui_dep.module("gui");
+    const gui_mod = gui_dep.module("{{gui_mod_name}}");
 
 .gui_bridge
     const bridge_dep = b.dependency("gui_bridge", .{ .target = target, .optimize = optimize });

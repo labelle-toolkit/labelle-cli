@@ -74,8 +74,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
     }
 
     // GUI plugin dep (manifest-driven — no switch on GUI type)
-    if (cfg.resolved_gui != null) {
-        try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_gui" }, w);
+    if (cfg.resolved_gui) |gui| {
+        const gui_mod_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{gui.name});
+        defer allocator.free(gui_mod_name);
+        try tpl.renderSection(build_zig_tmpl, "gui_backend", .{ .gui_dep_name = "labelle_gui", .gui_mod_name = gui_mod_name }, w);
     }
 
     // Inject shared modules into plugins — ensures all plugins use the same

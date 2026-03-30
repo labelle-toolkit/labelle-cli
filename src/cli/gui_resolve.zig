@@ -9,7 +9,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, p
     const gui_ref = cfg.gui orelse return; // null = no GUI
 
     // Resolve plugin directory
-    const plugin_dir = try resolvePluginDir(allocator, gui_ref, project_dir);
+    const plugin_dir = try resolvePluginDir(allocator, gui_ref, cfg.*, project_dir);
 
     // Read and parse gui.labelle manifest
     const manifest_path = try std.fs.path.join(allocator, &.{ plugin_dir, "gui.labelle" });
@@ -80,13 +80,23 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, p
 }
 
 /// Resolve the plugin directory from a GuiPlugin reference.
-fn resolvePluginDir(allocator: std.mem.Allocator, ref: gen.GuiPlugin, project_dir: []const u8) ![]const u8 {
+fn resolvePluginDir(allocator: std.mem.Allocator, ref: gen.GuiPlugin, cfg: gen.ProjectConfig, project_dir: []const u8) ![]const u8 {
     if (ref.path) |rel_path| {
         // Local path — resolve relative to project directory
         return std.fs.path.resolve(allocator, &.{ project_dir, rel_path });
     }
+    if (ref.plugin) |name| {
+        // Reference a declared plugin by name — resolve from the plugin cache
+        for (cfg.plugins) |plugin| {
+            if (std.mem.eql(u8, plugin.name, name)) {
+                return gen.resolvePlugin(allocator, plugin, project_dir);
+            }
+        }
+        std.debug.print("labelle: GUI references plugin '{s}', but no plugin with that name is declared in .plugins\n", .{name});
+        return error.GuiPluginNotFound;
+    }
     // TODO: support .package + .version (cache lookup) and .url + .hash (fetch)
-    std.debug.print("labelle: GUI plugin reference must include .path (remote plugins not yet supported)\n", .{});
+    std.debug.print("labelle: GUI plugin reference must include .path or .plugin\n", .{});
     return error.GuiPluginResolutionNotSupported;
 }
 

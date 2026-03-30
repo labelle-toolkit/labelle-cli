@@ -86,9 +86,12 @@ pub fn localVersionPath(version: []const u8) []const u8 {
 /// GUI plugin reference as declared in project.labelle.
 /// Parsed from ZON: `.gui = .{ .path = "../plugins/imgui" }` or
 /// `.gui = .{ .package = "labelle_imgui", .version = "0.2.0" }`.
+/// `.gui = .{ .plugin = "imgui" }` — references a declared plugin by name.
 /// When null in ProjectConfig, means no GUI (StubGui).
 pub const GuiPlugin = struct {
     path: ?[]const u8 = null,
+    /// Reference a declared plugin by name (from .plugins list).
+    plugin: ?[]const u8 = null,
     package: ?[]const u8 = null,
     version: ?[]const u8 = null,
     url: ?[]const u8 = null,
