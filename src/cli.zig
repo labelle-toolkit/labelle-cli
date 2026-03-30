@@ -426,6 +426,14 @@ pub fn main() !void {
         @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
     });
 
+    // Embed scenes in release builds (any non-Debug optimize mode)
+    const effective_optimize = parsed_args.optimize_override orelse
+        if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
+    parsed.embed_scenes = if (effective_optimize) |opt|
+        !std.mem.eql(u8, opt, "Debug")
+    else
+        false;
+
     try gen.generate(allocator, parsed, output_dir, project_dir);
 
     // Target subdir: .labelle/raylib_desktop/, etc.
@@ -446,9 +454,7 @@ pub fn main() !void {
     }
 
     // Build — default to ReleaseSafe for WASM (Debug exceeds browser local variable limits)
-    const optimize = parsed_args.optimize_override orelse
-        if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
-    const optimize_flag: ?[]const u8 = if (optimize) |opt|
+    const optimize_flag: ?[]const u8 = if (effective_optimize) |opt|
         try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{opt})
     else
         null;
