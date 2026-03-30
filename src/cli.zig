@@ -101,6 +101,7 @@ const ParsedArgs = struct {
     scene_override: ?[]const u8 = null,
     platform_override: ?Platform = null,
     docker: bool = false,
+    docker_target: ?[]const u8 = null,
 };
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -133,13 +134,14 @@ fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8
     return true;
 }
 
-/// Parse [dir], --scene, --platform, and --docker flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, docker_build: bool } {
+/// Parse [dir], --scene, --platform, --docker, and --target flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, docker_build: bool, docker_target: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
     var platform: ?Platform = null;
     var docker_build = false;
+    var docker_target: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -151,6 +153,15 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
         if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
         if (std.mem.eql(u8, arg, "--docker")) {
             docker_build = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--target=")) {
+            const val = arg["--target=".len..];
+            if (val.len == 0) {
+                std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
+                return null;
+            }
+            docker_target = val;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -165,17 +176,18 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform, .docker_build = docker_build };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .docker_build = docker_build, .docker_target = docker_target };
 }
 
-/// Parse [dir], --scene, --timeout, --platform, and --docker flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, docker_build: bool } {
+/// Parse [dir], --scene, --timeout, --platform, --docker, and --target flags for run command (explicit or implicit).
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, docker_build: bool, docker_target: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
     var platform: ?Platform = null;
     var docker_build = false;
+    var docker_target: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -189,6 +201,15 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
         } else return null;
         if (std.mem.eql(u8, arg, "--docker")) {
             docker_build = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--target=")) {
+            const val = arg["--target=".len..];
+            if (val.len == 0) {
+                std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
+                return null;
+            }
+            docker_target = val;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
@@ -222,7 +243,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .docker_build = docker_build };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .docker_build = docker_build, .docker_target = docker_target };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -261,6 +282,7 @@ pub fn main() !void {
             parsed_args.scene_override = result.scene;
             parsed_args.platform_override = result.platform;
             parsed_args.docker = result.docker_build;
+            parsed_args.docker_target = result.docker_target;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
@@ -269,6 +291,7 @@ pub fn main() !void {
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
             parsed_args.docker = result.docker_build;
+            parsed_args.docker_target = result.docker_target;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -329,6 +352,7 @@ pub fn main() !void {
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
             parsed_args.docker = result.docker_build;
+            parsed_args.docker_target = result.docker_target;
         }
     }
 
@@ -426,7 +450,7 @@ pub fn main() !void {
     // Build
     if (parsed_args.docker) {
         std.debug.print("labelle: building via docker...\n", .{});
-        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform);
+        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target);
         if (docker_exit != 0) {
             std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
             return error.BuildFailed;

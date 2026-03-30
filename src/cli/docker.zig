@@ -52,7 +52,7 @@ fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
 /// and injects macOS framework paths from xcode-frameworks for linking.
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
-pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform) !u8 {
+pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8) !u8 {
     const abs_target = try std.fs.realpathAlloc(allocator, target_dir);
     defer allocator.free(abs_target);
 
@@ -62,13 +62,29 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     const labelle_vol = try std.fmt.allocPrint(allocator, "{s}:/labelle", .{parent});
     defer allocator.free(labelle_vol);
 
-    const zig_build_cmd: []const u8 = if (platform == .wasm)
+    // Determine the build command:
+    // - WASM: no -Dtarget (build.zig handles it)
+    // - --target=<triple>: use the explicit override
+    // - Default: cross-compile back to the host OS
+    const zig_build_cmd_alloc = if (target_override) |t|
+        try std.fmt.allocPrint(allocator, "python3 -m ziglang build -Dtarget={s}", .{t})
+    else
+        null;
+    defer if (zig_build_cmd_alloc) |cmd| allocator.free(cmd);
+
+    const effective_cmd: []const u8 = zig_build_cmd_alloc orelse if (platform == .wasm)
         "python3 -m ziglang build"
     else
         "python3 -m ziglang build -Dtarget=" ++ host_target;
 
-    // For macOS desktop builds, set up xcode-frameworks before building.
-    const macos_setup: []const u8 = if (platform == .desktop)
+    // Determine if this is a macOS target (needs xcode-frameworks)
+    const is_macos_target = if (target_override) |t|
+        std.mem.indexOf(u8, t, "macos") != null
+    else
+        platform == .desktop;
+
+    // For macOS targets, set up xcode-frameworks before building.
+    const macos_setup: []const u8 = if (is_macos_target)
         setup_xcode_frameworks ++ " && "
     else
         "";
@@ -85,7 +101,7 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
             "if [ -n \"$FP\" ]; then sed -i \"s/.fingerprint = .*,/.fingerprint = $FP,/\" build.zig.zon; fi && " ++
             "{s}" ++
             "{s}",
-        .{ install_zig, subdir, zig_build_cmd, macos_setup, zig_build_cmd },
+        .{ install_zig, subdir, effective_cmd, macos_setup, effective_cmd },
     );
     defer allocator.free(script);
 

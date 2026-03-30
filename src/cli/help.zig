@@ -10,8 +10,8 @@ pub fn printHelp() void {
         \\Commands:
         \\  init <name> [dir]    Create a new labelle project
         \\  generate [dir] [--scene=<name>] [--platform=<p>]  Generate .labelle/ assembler files
-        \\  build [dir] [--scene=<name>] [--platform=<p>] [--docker]  Generate + build the project
-        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--docker]  Generate + build + run (default)
+        \\  build [dir] [--scene=<name>] [--platform=<p>] [--docker] [--target=<t>]  Generate + build the project
+        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--docker] [--target=<t>]  Generate + build + run (default)
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
@@ -30,6 +30,7 @@ pub fn printHelp() void {
         \\  labelle build --platform=wasm
         \\  labelle build ../my-game
         \\  labelle build --docker
+        \\  labelle build --docker --target=x86_64-windows
         \\  labelle run --docker
         \\  labelle install 0.2.0
         \\  labelle upgrade core 0.2.0
