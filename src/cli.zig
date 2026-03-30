@@ -559,10 +559,22 @@ pub fn main() !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        try zig_args.append(allocator, "run");
-        const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
-        if (run_result != 0) {
-            std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+        // Fix #3: When --docker was used, the binary was already built by Docker.
+        // Run it directly instead of calling `zig build run` which would use the
+        // (potentially broken) local Zig toolchain.
+        if (parsed_args.docker) {
+            const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
+            defer allocator.free(bin_path);
+            const run_result = try runner.runZigInherit(allocator, ".", &.{bin_path}, timeout_ns);
+            if (run_result != 0) {
+                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+            }
+        } else {
+            try zig_args.append(allocator, "run");
+            const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
+            if (run_result != 0) {
+                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+            }
         }
     }
 }

@@ -12,27 +12,31 @@ const host_arch = switch (builtin.cpu.arch) {
 
 const host_target = host_arch ++ "-" ++ @tagName(builtin.os.tag);
 
-const install_zig = "apt-get update -qq > /dev/null 2>&1 && " ++
-    "apt-get install -y -qq python3-pip > /dev/null 2>&1 && " ++
-    "pip3 install ziglang==" ++ ZIG_VERSION ++ " --break-system-packages > /dev/null 2>&1";
+// Fix #4: Let stderr through so install failures are visible to the user.
+const install_zig = "apt-get update -qq > /dev/null && " ++
+    "apt-get install -y -qq python3-pip > /dev/null && " ++
+    "pip3 install ziglang==" ++ ZIG_VERSION ++ " --break-system-packages > /dev/null";
 
 // Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
 // to add framework/include/lib search paths for macOS cross-compilation.
+// Fix #5: Match any linkLibrary call, not just raylib_artifact.
 const setup_xcode_frameworks =
-    // Find xcode-frameworks in the Zig cache by looking for AppKit.framework
     "XCODE_PKG=$(find /root/.cache/zig/p/ -maxdepth 2 -name 'AppKit.framework' -path '*/Frameworks/*' 2>/dev/null | head -1 | sed 's|/Frameworks/AppKit.framework||') && " ++
-    // If not cached, clone from Corendos/xcode-frameworks (open-source macOS framework stubs)
     "if [ -z \"$XCODE_PKG\" ]; then " ++
-    "apt-get install -y -qq git > /dev/null 2>&1 && " ++
+    "apt-get install -y -qq git > /dev/null && " ++
     "git clone --depth 1 -b main https://github.com/Corendos/xcode-frameworks.git /tmp/xcode-fw > /dev/null 2>&1 && " ++
     "XCODE_PKG=/tmp/xcode-fw; fi && " ++
-    // Patch build.zig to inject framework search paths before exe.linkLibrary(raylib_artifact)
-    "if [ -n \"$XCODE_PKG\" ] && grep -q 'linkLibrary(raylib_artifact)' build.zig; then " ++
-    "sed -i \"s|exe.linkLibrary(raylib_artifact);|" ++
-    "exe.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\\n" ++
-    "    exe.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\\n" ++
-    "    exe.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\\n" ++
-    "    exe.linkLibrary(raylib_artifact);|\" build.zig; fi";
+    "if [ -n \"$XCODE_PKG\" ] && grep -q 'exe.linkLibrary' build.zig; then " ++
+    "sed -i \"1s|^|// xcode-frameworks injected by labelle --docker\\n|\" build.zig && " ++
+    "sed -i \"/exe.linkLibrary/i\\\\    exe.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\" build.zig && " ++
+    "sed -i \"/exe.linkLibrary/i\\\\    exe.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\" build.zig && " ++
+    "sed -i \"/exe.linkLibrary/i\\\\    exe.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
+
+// Fix #6: Use head -1 to handle multiple fingerprint mismatches, and | as sed delimiter.
+const fix_fingerprint_script =
+    "BUILD_OUT=$({s} 2>&1 || true) && " ++
+    "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | head -1 | sed 's/.*use this value: //') && " ++
+    "if [ -n \"$FP\" ]; then sed -i \"s|.fingerprint = .*,|.fingerprint = $FP,|\" build.zig.zon; fi";
 
 fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
     if (std.process.getEnvVarOwned(allocator, "ZIG_GLOBAL_CACHE_DIR")) |dir| {
@@ -48,8 +52,7 @@ fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 /// Run `zig build` inside a Docker container with inherited stdio.
-/// For desktop platforms, cross-compiles back to the host OS, shares the Zig cache,
-/// and injects macOS framework paths from xcode-frameworks for linking.
+/// For macOS targets, shares the Zig cache and injects xcode-frameworks paths.
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
 pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8) !u8 {
@@ -77,28 +80,22 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     else
         "python3 -m ziglang build -Dtarget=" ++ host_target;
 
-    // Determine if this is a macOS target (needs xcode-frameworks)
+    // Fix #1: Only set up xcode-frameworks when actually targeting macOS,
+    // not for all desktop builds (e.g. Linux user building for Linux).
     const is_macos_target = if (target_override) |t|
         std.mem.indexOf(u8, t, "macos") != null
     else
-        platform == .desktop;
+        // No explicit target — default is host_target, so check host OS
+        builtin.os.tag == .macos and platform == .desktop;
 
-    // For macOS targets, set up xcode-frameworks before building.
     const macos_setup: []const u8 = if (is_macos_target)
         setup_xcode_frameworks ++ " && "
     else
         "";
 
-    // The script:
-    // 1. Installs Zig via pip
-    // 2. Fixes the build.zig.zon fingerprint (mirrors fixFingerprint on the host)
-    // 3. For macOS desktop: locates/fetches xcode-frameworks and patches build.zig
-    // 4. Runs zig build
     const script = try std.fmt.allocPrint(allocator,
         "{s} && cd /labelle/{s} && " ++
-            "BUILD_OUT=$({s} 2>&1 || true) && " ++
-            "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | sed 's/.*use this value: //') && " ++
-            "if [ -n \"$FP\" ]; then sed -i \"s/.fingerprint = .*,/.fingerprint = $FP,/\" build.zig.zon; fi && " ++
+            fix_fingerprint_script ++ " && " ++
             "{s}" ++
             "{s}",
         .{ install_zig, subdir, effective_cmd, macos_setup, effective_cmd },
@@ -107,13 +104,15 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
 
     // For non-WASM builds, share the host Zig cache for pre-fetched packages.
     // WASM builds need their own cache since emscripten binaries are platform-specific.
+    // Fix #2: Skip cache mount if cache dir can't be resolved, instead of mounting /dev/null.
     if (platform != .wasm) {
-        const cache_dir = zigCacheDir(allocator) catch "/dev/null";
-        defer if (!std.mem.eql(u8, cache_dir, "/dev/null")) allocator.free(cache_dir);
-        const cache_vol = try std.fmt.allocPrint(allocator, "{s}:/root/.cache/zig", .{cache_dir});
-        defer allocator.free(cache_vol);
+        if (zigCacheDir(allocator)) |cache_dir| {
+            defer allocator.free(cache_dir);
+            const cache_vol = try std.fmt.allocPrint(allocator, "{s}:/root/.cache/zig", .{cache_dir});
+            defer allocator.free(cache_vol);
 
-        return spawnAndWait(allocator, &.{ "docker", "run", "--rm", "-v", labelle_vol, "-v", cache_vol, "ubuntu:24.04", "bash", "-c", script });
+            return spawnAndWait(allocator, &.{ "docker", "run", "--rm", "-v", labelle_vol, "-v", cache_vol, "ubuntu:24.04", "bash", "-c", script });
+        } else |_| {}
     }
 
     return spawnAndWait(allocator, &.{ "docker", "run", "--rm", "-v", labelle_vol, "ubuntu:24.04", "bash", "-c", script });
