@@ -1,9 +1,9 @@
 /// labelle-cli — reads project.labelle and generates/builds/runs the assembled game.
 ///
 /// Usage:
-///   labelle generate [dir] [--scene=name] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] — generate + build + run
-///   labelle build [dir] [--scene=name]  — generate + build (no run)
+///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] — generate + build + run
+///   labelle build [dir] [--scene=name] [--optimize=MODE] — generate + build (no run)
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
@@ -99,6 +99,7 @@ const ParsedArgs = struct {
     timeout_ns: ?u64 = null,
     scene_override: ?[]const u8 = null,
     platform_override: ?Platform = null,
+    optimize_override: ?[]const u8 = null,
 };
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -131,12 +132,42 @@ fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8
     return true;
 }
 
-/// Parse [dir], --scene, and --platform flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform } {
+const valid_optimize_modes = [_][]const u8{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" };
+
+/// Try to parse --optimize=<value> from an argument. Returns true if consumed,
+/// false if this is not an --optimize= flag, and null on error.
+fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const u8) ?bool {
+    if (!std.mem.startsWith(u8, arg, "--optimize=")) return false;
+    const val = arg["--optimize=".len..];
+    if (val.len == 0) {
+        std.debug.print("labelle {s}: --optimize requires a value (e.g. --optimize=ReleaseSafe)\n", .{cmd_name});
+        return null;
+    }
+    for (valid_optimize_modes) |mode| {
+        if (std.mem.eql(u8, val, mode)) {
+            optimize.* = val;
+            return true;
+        }
+    }
+    const expected = comptime blk: {
+        var result: []const u8 = "";
+        for (valid_optimize_modes, 0..) |mode, i| {
+            if (i > 0) result = result ++ ", ";
+            result = result ++ mode;
+        }
+        break :blk result;
+    };
+    std.debug.print("labelle {s}: unknown optimize mode '{s}' (expected: {s})\n", .{ cmd_name, val, expected });
+    return null;
+}
+
+/// Parse [dir], --scene, --platform, and --optimize flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
     var platform: ?Platform = null;
+    var optimize: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -146,6 +177,7 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             .needs_next => unreachable,
         }
         if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
+        if (parseOptimizeFlag(arg, &optimize, cmd_name) orelse return null) continue;
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -158,16 +190,17 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize };
 }
 
 /// Parse [dir], --scene, --timeout, and --platform flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform } {
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
     var platform: ?Platform = null;
+    var optimize: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -177,6 +210,9 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             .needs_next => unreachable,
         }
         if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
+            if (consumed) continue;
+        } else return null;
+        if (parseOptimizeFlag(arg, &optimize, cmd_name)) |consumed| {
             if (consumed) continue;
         } else return null;
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
@@ -210,7 +246,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -248,6 +284,7 @@ pub fn main() !void {
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.platform_override = result.platform;
+            parsed_args.optimize_override = result.optimize;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
@@ -255,6 +292,7 @@ pub fn main() !void {
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
+            parsed_args.optimize_override = result.optimize;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -314,6 +352,7 @@ pub fn main() !void {
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
             parsed_args.platform_override = result.platform;
+            parsed_args.optimize_override = result.optimize;
         }
     }
 
@@ -406,9 +445,22 @@ pub fn main() !void {
         return ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
     }
 
-    // Build
+    // Build — default to ReleaseSafe for WASM (Debug exceeds browser local variable limits)
+    const optimize = parsed_args.optimize_override orelse
+        if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
+    const optimize_flag: ?[]const u8 = if (optimize) |opt|
+        try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{opt})
+    else
+        null;
+    defer if (optimize_flag) |f| allocator.free(f);
+
+    var zig_args: std.ArrayList([]const u8) = .{};
+    defer zig_args.deinit(allocator);
+    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+    if (optimize_flag) |flag| try zig_args.append(allocator, flag);
+
     std.debug.print("labelle: building...\n", .{});
-    const build_result = try runner.runZig(allocator, target_dir, &.{ "zig", "build" });
+    const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
     defer allocator.free(build_result.stdout);
     defer allocator.free(build_result.stderr);
 
@@ -451,7 +503,8 @@ pub fn main() !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        const run_result = try runner.runZigInherit(allocator, target_dir, &.{ "zig", "build", "run" }, timeout_ns);
+        try zig_args.append(allocator, "run");
+        const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
         if (run_result != 0) {
             std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
         }
@@ -512,6 +565,41 @@ pub const SceneArgValue = struct {
     test "extracts value from --scene=intro" {
         try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
     }
+};
+
+pub const ParseOptimizeFlagSpec = struct {
+    pub const valid_modes = struct {
+        test "parses all valid modes" {
+            inline for (valid_optimize_modes) |mode| {
+                var opt: ?[]const u8 = null;
+                const arg = "--optimize=" ++ mode;
+                try expect.equal(parseOptimizeFlag(arg, &opt, "build"), true);
+                try std.testing.expectEqualStrings(mode, opt.?);
+            }
+        }
+    };
+
+    pub const invalid_modes = struct {
+        test "returns null for empty value" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=", &opt, "build"), null);
+        }
+        test "returns null for unknown mode" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=Fast", &opt, "build"), null);
+        }
+    };
+
+    pub const not_optimize = struct {
+        test "returns false for unrelated flag" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--platform=wasm", &opt, "build"), false);
+        }
+        test "returns false for positional arg" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("my-game", &opt, "build"), false);
+        }
+    };
 };
 
 pub const ParsePlatformValueSpec = struct {
