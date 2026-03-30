@@ -564,13 +564,18 @@ pub fn main() !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        // Fix #3: When --docker was used, the binary was already built by Docker.
-        // Run it directly instead of calling `zig build run` which would use the
-        // (potentially broken) local Zig toolchain.
+        // When --docker was used, run the built binary directly instead of
+        // calling `zig build run` (local Zig may be broken).
         if (parsed_args.docker) {
+            // Cross-compiled binaries can't be run on the host
+            if (parsed_args.docker_target) |t| {
+                std.debug.print("labelle: cannot run cross-compiled binary (target: {s})\n", .{t});
+                std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
+                return;
+            }
             const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
             defer allocator.free(bin_path);
-            const run_result = try runner.runZigInherit(allocator, ".", &.{bin_path}, timeout_ns);
+            const run_result = try runner.runZigInherit(allocator, project_dir, &.{bin_path}, timeout_ns);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }

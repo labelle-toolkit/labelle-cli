@@ -22,7 +22,8 @@ const setup_xcode_frameworks =
     "XCODE_PKG=$(find /root/.cache/zig/p/ -maxdepth 2 -name 'AppKit.framework' -path '*/Frameworks/*' 2>/dev/null | head -1 | sed 's|/Frameworks/AppKit.framework||') && " ++
     "if [ -z \"$XCODE_PKG\" ]; then " ++
     "apt-get install -y -qq git > /dev/null && " ++
-    "git clone --depth 1 -b main https://github.com/Corendos/xcode-frameworks.git /tmp/xcode-fw > /dev/null 2>&1 && " ++
+    "git clone --depth 1 https://github.com/Corendos/xcode-frameworks.git /tmp/xcode-fw > /dev/null 2>&1 && " ++
+    "cd /tmp/xcode-fw && git fetch --depth 1 origin 9a45f3ac977fd25dff77e58c6de1870b6808c4a7 > /dev/null 2>&1 && git checkout FETCH_HEAD > /dev/null 2>&1 && cd - > /dev/null && " ++
     "XCODE_PKG=/tmp/xcode-fw; fi && " ++
     "if [ -n \"$XCODE_PKG\" ] && grep -q 'exe.linkLibrary' build.zig; then " ++
     "sed -i \"1s|^|// xcode-frameworks injected by labelle --docker\\n|\" build.zig && " ++
@@ -72,13 +73,17 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
 
     // Build the zig command with optional -Dtarget and -Doptimize flags.
     // Sanitize target_override to prevent shell injection.
-    const sanitized_target = if (target_override) |t| try sanitizeTarget(allocator, t) else null;
+    // Ignore --target for WASM builds (build.zig handles the wasm32-emscripten target).
+    const sanitized_target = if (platform != .wasm and target_override != null)
+        try sanitizeTarget(allocator, target_override.?)
+    else
+        null;
     defer if (sanitized_target) |s| allocator.free(s);
 
-    const effective_target: []const u8 = sanitized_target orelse if (platform == .wasm)
+    const effective_target: []const u8 = if (platform == .wasm)
         ""
     else
-        host_target;
+        sanitized_target orelse host_target;
 
     const optimize_part = if (optimize) |opt|
         try std.fmt.allocPrint(allocator, " -Doptimize={s}", .{opt})
