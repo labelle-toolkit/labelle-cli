@@ -134,7 +134,8 @@ fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8
 
 const valid_optimize_modes = [_][]const u8{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" };
 
-/// Try to parse --optimize=<value> from an argument. Returns true if consumed, null on error.
+/// Try to parse --optimize=<value> from an argument. Returns true if consumed,
+/// false if this is not an --optimize= flag, and null on error.
 fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const u8) ?bool {
     if (!std.mem.startsWith(u8, arg, "--optimize=")) return false;
     const val = arg["--optimize=".len..];
@@ -160,7 +161,7 @@ fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const 
     return null;
 }
 
-/// Parse [dir], --scene, and --platform flags for generate/build commands.
+/// Parse [dir], --scene, --platform, and --optimize flags for generate/build commands.
 fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8 } {
     var dir: []const u8 = ".";
     var dir_set = false;
@@ -562,6 +563,53 @@ pub const SceneArgValue = struct {
     test "extracts value from --scene=intro" {
         try std.testing.expectEqualStrings("intro", sceneArgValue("--scene=intro"));
     }
+};
+
+pub const ParseOptimizeFlagSpec = struct {
+    pub const valid_modes = struct {
+        test "parses Debug" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=Debug", &opt, "build"), true);
+            try std.testing.expectEqualStrings("Debug", opt.?);
+        }
+        test "parses ReleaseSafe" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=ReleaseSafe", &opt, "build"), true);
+            try std.testing.expectEqualStrings("ReleaseSafe", opt.?);
+        }
+        test "parses ReleaseFast" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=ReleaseFast", &opt, "build"), true);
+            try std.testing.expectEqualStrings("ReleaseFast", opt.?);
+        }
+        test "parses ReleaseSmall" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=ReleaseSmall", &opt, "build"), true);
+            try std.testing.expectEqualStrings("ReleaseSmall", opt.?);
+        }
+    };
+
+    pub const invalid_modes = struct {
+        test "returns null for empty value" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=", &opt, "build"), null);
+        }
+        test "returns null for unknown mode" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--optimize=Fast", &opt, "build"), null);
+        }
+    };
+
+    pub const not_optimize = struct {
+        test "returns false for unrelated flag" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("--platform=wasm", &opt, "build"), false);
+        }
+        test "returns false for positional arg" {
+            var opt: ?[]const u8 = null;
+            try expect.equal(parseOptimizeFlag("my-game", &opt, "build"), false);
+        }
+    };
 };
 
 pub const ParsePlatformValueSpec = struct {
