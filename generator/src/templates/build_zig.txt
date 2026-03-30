@@ -195,6 +195,15 @@ pub fn build(b: *std.Build) !void {
     run_step.dependOn(emcc_step);
 }
 
+/// Override a module import without leaking memory.
+fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
+    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    if (!gop.found_existing) {
+        gop.key_ptr.* = name;
+    }
+    gop.value_ptr.* = module;
+}
+
 .link_sokol
     exe.linkLibrary(sokol_clib);
 
