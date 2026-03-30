@@ -212,7 +212,9 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
         if (parsePlatformFlag(arg, &platform, cmd_name)) |consumed| {
             if (consumed) continue;
         } else return null;
-        if (parseOptimizeFlag(arg, &optimize, cmd_name) orelse return null) continue;
+        if (parseOptimizeFlag(arg, &optimize, cmd_name)) |consumed| {
+            if (consumed) continue;
+        } else return null;
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_ns = util.parseDuration(arg["--timeout=".len..]);
             if (timeout_ns == null) {
@@ -567,25 +569,13 @@ pub const SceneArgValue = struct {
 
 pub const ParseOptimizeFlagSpec = struct {
     pub const valid_modes = struct {
-        test "parses Debug" {
-            var opt: ?[]const u8 = null;
-            try expect.equal(parseOptimizeFlag("--optimize=Debug", &opt, "build"), true);
-            try std.testing.expectEqualStrings("Debug", opt.?);
-        }
-        test "parses ReleaseSafe" {
-            var opt: ?[]const u8 = null;
-            try expect.equal(parseOptimizeFlag("--optimize=ReleaseSafe", &opt, "build"), true);
-            try std.testing.expectEqualStrings("ReleaseSafe", opt.?);
-        }
-        test "parses ReleaseFast" {
-            var opt: ?[]const u8 = null;
-            try expect.equal(parseOptimizeFlag("--optimize=ReleaseFast", &opt, "build"), true);
-            try std.testing.expectEqualStrings("ReleaseFast", opt.?);
-        }
-        test "parses ReleaseSmall" {
-            var opt: ?[]const u8 = null;
-            try expect.equal(parseOptimizeFlag("--optimize=ReleaseSmall", &opt, "build"), true);
-            try std.testing.expectEqualStrings("ReleaseSmall", opt.?);
+        test "parses all valid modes" {
+            inline for (valid_optimize_modes) |mode| {
+                var opt: ?[]const u8 = null;
+                const arg = "--optimize=" ++ mode;
+                try expect.equal(parseOptimizeFlag(arg, &opt, "build"), true);
+                try std.testing.expectEqualStrings(mode, opt.?);
+            }
         }
     };
 
