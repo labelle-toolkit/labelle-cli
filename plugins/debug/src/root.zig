@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const core = @import("labelle-core");
+const engine = @import("labelle-engine");
 const Position = core.Position;
 
 var debug_visible: bool = false;
@@ -14,8 +15,8 @@ var selected_entity: ?u32 = null;
 /// Games can set this in setup: `@import("debug").enabled = false;`
 pub var enabled: bool = true;
 
-/// Key to toggle the debug inspector. Default: F12 (301).
-pub var toggle_key: u32 = 301;
+/// Key to toggle the debug inspector. Default: F12.
+pub var toggle_key: engine.KeyboardKey = .f12;
 
 const MAX_COMPONENTS: usize = 32;
 var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
