@@ -501,6 +501,11 @@ pub fn main() !void {
         null;
     defer if (optimize_flag) |f| allocator.free(f);
 
+    var zig_args: std.ArrayList([]const u8) = .{};
+    defer zig_args.deinit(allocator);
+    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+    if (optimize_flag) |flag| try zig_args.append(allocator, flag);
+
     if (parsed_args.docker) {
         std.debug.print("labelle: building via docker...\n", .{});
         const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target);
@@ -509,11 +514,6 @@ pub fn main() !void {
             return error.BuildFailed;
         }
     } else {
-        var zig_args: std.ArrayList([]const u8) = .{};
-        defer zig_args.deinit(allocator);
-        try zig_args.appendSlice(allocator, &.{ "zig", "build" });
-        if (optimize_flag) |flag| try zig_args.append(allocator, flag);
-
         std.debug.print("labelle: building...\n", .{});
         const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
         defer allocator.free(build_result.stdout);
