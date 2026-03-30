@@ -263,25 +263,28 @@ pub fn generateMainZigFromTemplate(
             } else {
                 try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridge(AssembledGame, Components);\n");
             }
-            const loader_tmpl = if (cfg.embed_scenes)
-                \\const jsonc_{s}_loader = struct {{
-                \\    const embedded_source = @embedFile("scenes/{s}.jsonc");
-                \\    fn load(game: *AssembledGame) anyerror!void {{
-                \\        return JsoncBridge.loadSceneFromSource(game, embedded_source, "prefabs");
-                \\    }}
-                \\}}.load;
-                \\
-            else
-                \\const jsonc_{s}_loader = struct {{
-                \\    fn load(game: *AssembledGame) anyerror!void {{
-                \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
-                \\    }}
-                \\}}.load;
-                \\
-            ;
             for (jsonc_scene_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
-                try bw.print(loader_tmpl, .{ ident, name });
+                if (cfg.embed_scenes) {
+                    try bw.print(
+                        \\const jsonc_{s}_loader = struct {{
+                        \\    const embedded_source = @embedFile("scenes/{s}.jsonc");
+                        \\    fn load(game: *AssembledGame) anyerror!void {{
+                        \\        return JsoncBridge.loadSceneFromSource(game, embedded_source, "prefabs");
+                        \\    }}
+                        \\}}.load;
+                        \\
+                    , .{ ident, name });
+                } else {
+                    try bw.print(
+                        \\const jsonc_{s}_loader = struct {{
+                        \\    fn load(game: *AssembledGame) anyerror!void {{
+                        \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
+                        \\    }}
+                        \\}}.load;
+                        \\
+                    , .{ ident, name });
+                }
             }
         }
         const block = try buf.toOwnedSlice(allocator);
