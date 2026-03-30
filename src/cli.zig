@@ -148,7 +148,15 @@ fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const 
             return true;
         }
     }
-    std.debug.print("labelle {s}: unknown optimize mode '{s}' (expected: Debug, ReleaseSafe, ReleaseFast, ReleaseSmall)\n", .{ cmd_name, val });
+    const expected = comptime blk: {
+        var result: []const u8 = "";
+        for (valid_optimize_modes, 0..) |mode, i| {
+            if (i > 0) result = result ++ ", ";
+            result = result ++ mode;
+        }
+        break :blk result;
+    };
+    std.debug.print("labelle {s}: unknown optimize mode '{s}' (expected: {s})\n", .{ cmd_name, val, expected });
     return null;
 }
 
@@ -443,12 +451,13 @@ pub fn main() !void {
         null;
     defer if (optimize_flag) |f| allocator.free(f);
 
+    var zig_args = std.ArrayList([]const u8).init(allocator);
+    defer zig_args.deinit();
+    try zig_args.appendSlice(&.{ "zig", "build" });
+    if (optimize_flag) |flag| try zig_args.append(flag);
+
     std.debug.print("labelle: building...\n", .{});
-    const build_args: []const []const u8 = if (optimize_flag) |flag|
-        &.{ "zig", "build", flag }
-    else
-        &.{ "zig", "build" };
-    const build_result = try runner.runZig(allocator, target_dir, build_args);
+    const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
     defer allocator.free(build_result.stdout);
     defer allocator.free(build_result.stderr);
 
@@ -491,11 +500,8 @@ pub fn main() !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        const run_args: []const []const u8 = if (optimize_flag) |flag|
-            &.{ "zig", "build", flag, "run" }
-        else
-            &.{ "zig", "build", "run" };
-        const run_result = try runner.runZigInherit(allocator, target_dir, run_args, timeout_ns);
+        try zig_args.append("run");
+        const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
         if (run_result != 0) {
             std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
         }
