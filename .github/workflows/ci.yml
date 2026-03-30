@@ -120,7 +120,7 @@ jobs:
       - name: Build CLI
         run: cd labelle-cli && zig build
 
-      - name: Test --docker build (Linux target)
+      - name: Test --docker WASM build
         run: |
           mkdir -p test-docker && cd test-docker
           ../labelle-cli/zig-out/bin/labelle init docker_test \
@@ -130,9 +130,9 @@ jobs:
             --gfx-version="local:../../labelle-gfx" \
             --labelle-version="local:../../labelle-cli"
           cd docker_test
-          ../../labelle-cli/zig-out/bin/labelle build --docker --target=x86_64-linux
-          file .labelle/raylib_desktop/zig-out/bin/game | grep -q "ELF 64-bit"
-          echo "Docker build produced valid Linux binary"
+          ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm
+          test -f .labelle/raylib_wasm/zig-out/web/game.wasm
+          echo "Docker WASM build produced game.wasm"
 
   versions-integration:
     name: Versions Integration Test
