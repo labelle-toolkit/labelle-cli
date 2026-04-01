@@ -1,8 +1,9 @@
 {
     "components": {
-        "Shape": {
-            "shape": { "rectangle": { "width": 24, "height": 24 } },
-            "color": { "r": 60, "g": 120, "b": 220, "a": 255 }
+        "Sprite": {
+            "sprite_name": "player.png",
+            "pivot": "center",
+            "layer": "world"
         },
         "Velocity": { "x": 0, "y": 0 },
         "Player": {},

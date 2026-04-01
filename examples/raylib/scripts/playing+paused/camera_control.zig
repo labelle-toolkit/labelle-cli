@@ -3,7 +3,7 @@
 
 pub fn tick(game: anytype, _: f32) void {
     // Camera follows player in both playing and paused states
-    const Player = @import("components/player.zig").Player;
+    const Player = @import("../../components/player.zig").Player;
     var view = game.ecs_backend.view(.{Player}, .{});
     defer view.deinit();
 

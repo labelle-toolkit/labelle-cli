@@ -1,8 +1,11 @@
 {
     "components": {
-        "Shape": {
-            "shape": { "rectangle": { "width": 64, "height": 64 } },
-            "color": { "r": 180, "g": 60, "b": 60, "a": 255 }
+        "Sprite": {
+            "sprite_name": "wall.png",
+            "pivot": "center",
+            "layer": "world",
+            "scale_x": 2.0,
+            "scale_y": 2.0
         },
         "Wall": {}
     }

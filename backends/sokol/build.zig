@@ -25,8 +25,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/gfx.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     gfx_mod.addImport("sokol", sokol_mod);
+    gfx_mod.addIncludePath(b.path("src"));
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
 
     // ── Input backend module ────────────────────────────────────────
     const input_mod = b.addModule("input", .{

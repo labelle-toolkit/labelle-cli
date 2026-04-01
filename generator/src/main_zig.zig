@@ -37,9 +37,18 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
 
+    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
+        for (cfg.resources) |res| {
+            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
+        }
+        try w.writeByte('\n');
+    }
+
     // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
-        try w.writeAll("\n    // Runtime JSONC scenes\n");
+        try w.writeAll("    // Runtime JSONC scenes\n");
         var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
@@ -102,9 +111,18 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
+    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
+        for (cfg.resources) |res| {
+            try w.print("    g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas\");\n", .{ res.name, res.json, res.texture });
+        }
+        try w.writeByte('\n');
+    }
+
     // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
-        try w.writeAll("\n    // Runtime JSONC scenes\n");
+        try w.writeAll("    // Runtime JSONC scenes\n");
         var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
@@ -303,14 +321,11 @@ pub fn generateMainZigFromTemplate(
     }
 
     // Resource registry block
+    // Resource registry block — resources are now loaded at runtime via
+    // @embedFile + loadAtlasFromMemory, so the comptime registry is empty.
+    // The block is kept as an empty string for template compatibility.
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
-        if (cfg.resources.len > 0) {
-            try generateResourceRegistry(cfg.resources, bw);
-            try bw.writeAll("const Resources = ResourceRegistry;\n\n");
-        }
-        const block = try buf.toOwnedSlice(allocator);
+        const block = try allocator.dupe(u8, "");
         try allocs.append(allocator, block);
         try data.scalars.put("resource_registry_block", block);
     }

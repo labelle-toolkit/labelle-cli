@@ -1,8 +1,9 @@
 {
     "components": {
-        "Shape": {
-            "shape": { "circle": { "radius": 8 } },
-            "color": { "r": 255, "g": 220, "b": 50, "a": 255 }
+        "Sprite": {
+            "sprite_name": "coin.png",
+            "pivot": "center",
+            "layer": "world"
         },
         "Coin": {}
     }

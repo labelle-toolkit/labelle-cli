@@ -5,7 +5,7 @@ pub fn tick(game: anytype, dt: f32) void {
     const speed: f32 = 200.0;
 
     // Find player entity and move it
-    const Player = @import("components/player.zig").Player;
+    const Player = @import("../../components/player.zig").Player;
     var view = game.ecs_backend.view(.{Player}, .{});
     defer view.deinit();
 

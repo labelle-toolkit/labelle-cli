@@ -960,28 +960,28 @@ pub const LAYERS = struct {
 };
 
 pub const RESOURCES = struct {
-    test "generates ResourceRegistry from resource config" {
+    test "generates embedded atlas loading from resource config" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
             .resources = &.{
-                .{ .name = "characters", .json = "assets/characters_frames.zon", .texture = "assets/characters.png" },
-                .{ .name = "tiles", .json = "assets/tiles_frames.zon", .texture = "assets/tiles.png" },
+                .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png" },
+                .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" },
             },
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const ResourceRegistry = struct {") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const characters = engine.ComptimeAtlas(@import(\"assets/characters_frames.zon\"))") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const tiles = engine.ComptimeAtlas(@import(\"assets/tiles_frames.zon\"))") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".characters = \"assets/characters.png\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".tiles = \"assets/tiles.png\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const names: [2][]const u8") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const Resources = ResourceRegistry;") != null);
+        // Resources are embedded via @embedFile + loadAtlasFromMemory
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"characters\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"assets/characters.json\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"assets/characters.png\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"tiles\"") != null);
+        // No comptime ResourceRegistry
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "ResourceRegistry") == null);
     }
 
-    test "omits ResourceRegistry when no resources" {
+    test "omits atlas loading when no resources" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
@@ -989,7 +989,7 @@ pub const RESOURCES = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "ResourceRegistry") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory") == null);
     }
 };
 
