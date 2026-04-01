@@ -108,6 +108,14 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     return .{ .id = @intCast(tex.id), .width = tex.width, .height = tex.height };
 }
 
+pub fn loadTextureFromMemory(file_type: [:0]const u8, data: []const u8) !Texture {
+    const image = rl.loadImageFromMemory(file_type, data) catch return error.LoadFailed;
+    defer rl.unloadImage(image);
+    const tex = rl.loadTextureFromImage(image) catch return error.LoadFailed;
+    if (tex.id == 0) return error.LoadFailed;
+    return .{ .id = @intCast(tex.id), .width = tex.width, .height = tex.height };
+}
+
 pub fn unloadTexture(texture: Texture) void {
     rl.unloadTexture(.{
         .id = @intCast(texture.id),

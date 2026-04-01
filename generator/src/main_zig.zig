@@ -59,7 +59,7 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases\n");
         for (cfg.resources) |res| {
-            try w.print("    try g.loadAtlas(\"{s}\", \"{s}\", \"{s}\");\n", .{ res.name, res.json, res.texture });
+            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
         }
         try w.writeByte('\n');
     }
@@ -128,7 +128,7 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases\n");
         for (cfg.resources) |res| {
-            try w.print("    try g.loadAtlas(\"{s}\", \"{s}\", \"{s}\");\n", .{ res.name, res.json, res.texture });
+            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
         }
         try w.writeByte('\n');
     }
