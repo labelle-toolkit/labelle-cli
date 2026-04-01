@@ -411,7 +411,7 @@ fn createTextureFromRgba(pixels: []const u8, width: i32, height: i32) !Texture {
     };
 }
 
-// TGA and BMP loaders removed — stb_image handles all formats.
+// TGA and BMP loaders removed — stb_image handles PNG (compiled with STBI_ONLY_PNG).
 
 // ── Embedded bitmap font atlas ──────────────────────────────────────────
 

@@ -321,14 +321,11 @@ pub fn generateMainZigFromTemplate(
     }
 
     // Resource registry block
+    // Resource registry block — resources are now loaded at runtime via
+    // @embedFile + loadAtlasFromMemory, so the comptime registry is empty.
+    // The block is kept as an empty string for template compatibility.
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
-        if (cfg.resources.len > 0) {
-            try generateResourceRegistry(cfg.resources, bw);
-            try bw.writeAll("const Resources = ResourceRegistry;\n\n");
-        }
-        const block = try buf.toOwnedSlice(allocator);
+        const block = try allocator.dupe(u8, "");
         try allocs.append(allocator, block);
         try data.scalars.put("resource_registry_block", block);
     }
