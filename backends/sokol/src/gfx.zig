@@ -278,8 +278,12 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
     sgl.disableTexture();
 }
 
+const stbi = @cImport({
+    @cInclude("stb_image.h");
+});
+
 pub fn loadTexture(path: [:0]const u8) !Texture {
-    // Read the file from disk
+    // Read the file from disk, then decode from memory
     const file = std.fs.cwd().openFileZ(path, .{}) catch return error.LoadFailed;
     defer file.close();
 
@@ -290,28 +294,30 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     const data = file.readToEndAlloc(std.heap.page_allocator, @intCast(file_size)) catch return error.LoadFailed;
     defer std.heap.page_allocator.free(data);
 
-    // Parse as a simple uncompressed format. We support:
-    // - Raw RGBA data is not self-describing, so we support TGA (uncompressed) and BMP
-    // - For production use, integrate stb_image or zigimg
-    // Try TGA first (common in game dev), then BMP
-    if (tryLoadTga(data)) |result| {
-        return result;
-    }
-    if (tryLoadBmp(data)) |result| {
-        return result;
-    }
+    return loadTextureFromMemoryData(data);
+}
 
-    // If nothing worked, try treating it as raw RGBA if the size is a perfect square
-    const pixel_count = data.len / 4;
-    if (data.len % 4 == 0 and pixel_count > 0) {
-        const side_f = std.math.sqrt(@as(f32, @floatFromInt(pixel_count)));
-        const side: usize = @intFromFloat(side_f);
-        if (side * side == pixel_count) {
-            return createTextureFromRgba(data, @intCast(side), @intCast(side));
-        }
-    }
+pub fn loadTextureFromMemory(_: [:0]const u8, data: []const u8) !Texture {
+    return loadTextureFromMemoryData(data);
+}
 
-    return error.LoadFailed;
+fn loadTextureFromMemoryData(data: []const u8) !Texture {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const pixels = stbi.stbi_load_from_memory(
+        @ptrCast(data.ptr),
+        @intCast(data.len),
+        &width,
+        &height,
+        &channels,
+        4, // force RGBA
+    );
+    if (pixels == null) return error.LoadFailed;
+    defer stbi.stbi_image_free(pixels);
+
+    const pixel_data: []const u8 = @as([*]const u8, @ptrCast(pixels))[0..@intCast(width * height * 4)];
+    return createTextureFromRgba(pixel_data, width, height);
 }
 
 pub fn unloadTexture(texture: Texture) void {
