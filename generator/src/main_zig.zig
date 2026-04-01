@@ -55,6 +55,15 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         try w.writeByte('\n');
     }
 
+    // Load atlas resources declared in project.labelle
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    // Load sprite atlases\n");
+        for (cfg.resources) |res| {
+            try w.print("    try g.loadAtlas(\"{s}\", \"{s}\", \"{s}\");\n", .{ res.name, res.json, res.texture });
+        }
+        try w.writeByte('\n');
+    }
+
     try w.writeAll("    runner.setup(&g);\n");
 
     if (cfg.plugins.len > 0) {
@@ -113,6 +122,15 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
+    }
+
+    // Load atlas resources declared in project.labelle
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    // Load sprite atlases\n");
+        for (cfg.resources) |res| {
+            try w.print("    try g.loadAtlas(\"{s}\", \"{s}\", \"{s}\");\n", .{ res.name, res.json, res.texture });
+        }
+        try w.writeByte('\n');
     }
 
     try w.writeAll("    runner.setup(&g);\n");
