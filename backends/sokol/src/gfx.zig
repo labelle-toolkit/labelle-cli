@@ -316,7 +316,8 @@ fn loadTextureFromMemoryData(data: []const u8) !Texture {
     if (pixels == null) return error.LoadFailed;
     defer stbi.stbi_image_free(pixels);
 
-    const pixel_data: []const u8 = @as([*]const u8, @ptrCast(pixels))[0..@intCast(width * height * 4)];
+    const size: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    const pixel_data: []const u8 = @as([*]const u8, @ptrCast(pixels))[0..size];
     return createTextureFromRgba(pixel_data, width, height);
 }
 
@@ -410,106 +411,7 @@ fn createTextureFromRgba(pixels: []const u8, width: i32, height: i32) !Texture {
     };
 }
 
-// ── TGA loader (uncompressed, 32-bit RGBA) ──────────────────────────────
-
-fn tryLoadTga(data: []const u8) ?Texture {
-    // Minimal TGA header is 18 bytes
-    if (data.len < 18) return null;
-
-    const image_type = data[2];
-    // Only support uncompressed true-color (type 2)
-    if (image_type != 2) return null;
-
-    const width: i32 = @as(i32, @intCast(data[12])) | (@as(i32, @intCast(data[13])) << 8);
-    const height: i32 = @as(i32, @intCast(data[14])) | (@as(i32, @intCast(data[15])) << 8);
-    const bpp = data[16];
-    if (bpp != 32 and bpp != 24) return null;
-
-    const id_length: usize = data[0];
-    const color_map_length: usize = @as(usize, @intCast(data[5])) | (@as(usize, @intCast(data[6])) << 8);
-    const entry_size: usize = if (data[7] != 0) @as(usize, data[7]) else 0;
-    const pixel_offset = 18 + id_length + color_map_length * (entry_size / 8);
-    const bytes_per_pixel: usize = @as(usize, bpp) / 8;
-    const w: usize = @intCast(width);
-    const h: usize = @intCast(height);
-    const pixel_data_size = std.math.mul(usize, std.math.mul(usize, w, h) catch return null, bytes_per_pixel) catch return null;
-
-    if (data.len < pixel_offset + pixel_data_size) return null;
-
-    // Convert BGR(A) to RGBA and flip vertically (TGA is bottom-up by default)
-    const rgba_size = std.math.mul(usize, std.math.mul(usize, w, h) catch return null, 4) catch return null;
-    const rgba = std.heap.page_allocator.alloc(u8, rgba_size) catch return null;
-
-    const descriptor = data[17];
-    const top_to_bottom = (descriptor & 0x20) != 0;
-
-    for (0..h) |row| {
-        const src_row = if (top_to_bottom) row else (h - 1 - row);
-        for (0..w) |col| {
-            const src_idx = pixel_offset + (src_row * w + col) * bytes_per_pixel;
-            const dst_idx = (row * w + col) * 4;
-            // TGA stores as BGRA
-            rgba[dst_idx + 0] = data[src_idx + 2]; // R
-            rgba[dst_idx + 1] = data[src_idx + 1]; // G
-            rgba[dst_idx + 2] = data[src_idx + 0]; // B
-            rgba[dst_idx + 3] = if (bpp == 32) data[src_idx + 3] else 255; // A
-        }
-    }
-
-    defer std.heap.page_allocator.free(rgba);
-    return createTextureFromRgba(rgba, width, height) catch null;
-}
-
-// ── BMP loader (uncompressed, 24/32-bit) ────────────────────────────────
-
-fn tryLoadBmp(data: []const u8) ?Texture {
-    // Check BMP signature
-    if (data.len < 54) return null;
-    if (data[0] != 'B' or data[1] != 'M') return null;
-
-    const pixel_offset: usize = @as(usize, @intCast(std.mem.readInt(u32, data[10..14], .little)));
-    const width: i32 = @bitCast(std.mem.readInt(u32, data[18..22], .little));
-    const height_raw: i32 = @bitCast(std.mem.readInt(u32, data[22..26], .little));
-    const bpp: u16 = std.mem.readInt(u16, data[28..30], .little);
-    const compression: u32 = std.mem.readInt(u32, data[30..34], .little);
-
-    // Only support uncompressed (BI_RGB = 0); reject BI_BITFIELDS since we don't read the masks
-    if (compression != 0) return null;
-    if (bpp != 24 and bpp != 32) return null;
-    if (width <= 0) return null;
-
-    const bottom_up = height_raw > 0;
-    const height: i32 = if (height_raw == std.math.minInt(i32)) return null else if (height_raw < 0) -height_raw else height_raw;
-
-    const w: usize = @intCast(width);
-    const h: usize = @intCast(height);
-    const bytes_per_pixel: usize = @as(usize, bpp) / 8;
-    // BMP rows are padded to 4-byte boundaries
-    const row_size = std.math.mul(usize, w, bytes_per_pixel) catch return null;
-    const row_stride = (row_size + 3) & ~@as(usize, 3);
-
-    const total_pixel_data = std.math.mul(usize, row_stride, h) catch return null;
-    if (data.len < pixel_offset + total_pixel_data) return null;
-
-    const rgba_size = std.math.mul(usize, std.math.mul(usize, w, h) catch return null, 4) catch return null;
-    const rgba = std.heap.page_allocator.alloc(u8, rgba_size) catch return null;
-
-    for (0..h) |row| {
-        const src_row = if (bottom_up) (h - 1 - row) else row;
-        for (0..w) |col| {
-            const src_idx = pixel_offset + src_row * row_stride + col * bytes_per_pixel;
-            const dst_idx = (row * w + col) * 4;
-            // BMP stores as BGR(A)
-            rgba[dst_idx + 0] = data[src_idx + 2]; // R
-            rgba[dst_idx + 1] = data[src_idx + 1]; // G
-            rgba[dst_idx + 2] = data[src_idx + 0]; // B
-            rgba[dst_idx + 3] = if (bpp == 32) data[src_idx + 3] else 255; // A
-        }
-    }
-
-    defer std.heap.page_allocator.free(rgba);
-    return createTextureFromRgba(rgba, width, height) catch null;
-}
+// TGA and BMP loaders removed — stb_image handles all formats.
 
 // ── Embedded bitmap font atlas ──────────────────────────────────────────
 

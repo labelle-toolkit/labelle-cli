@@ -37,9 +37,18 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
 
+    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
+        for (cfg.resources) |res| {
+            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
+        }
+        try w.writeByte('\n');
+    }
+
     // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
-        try w.writeAll("\n    // Runtime JSONC scenes\n");
+        try w.writeAll("    // Runtime JSONC scenes\n");
         var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
@@ -51,15 +60,6 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         // Set initial game state (first declared state in project.labelle)
         if (cfg.states.len > 0) {
             try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
-        }
-        try w.writeByte('\n');
-    }
-
-    // Load atlas resources declared in project.labelle
-    if (cfg.resources.len > 0) {
-        try w.writeAll("    // Load sprite atlases\n");
-        for (cfg.resources) |res| {
-            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
         }
         try w.writeByte('\n');
     }
@@ -111,9 +111,18 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
+    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    if (cfg.resources.len > 0) {
+        try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
+        for (cfg.resources) |res| {
+            try w.print("    g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas\");\n", .{ res.name, res.json, res.texture });
+        }
+        try w.writeByte('\n');
+    }
+
     // Register runtime JSONC scenes
     if (jsonc_scene_names.len > 0) {
-        try w.writeAll("\n    // Runtime JSONC scenes\n");
+        try w.writeAll("    // Runtime JSONC scenes\n");
         var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
@@ -122,15 +131,6 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
-    }
-
-    // Load atlas resources declared in project.labelle
-    if (cfg.resources.len > 0) {
-        try w.writeAll("    // Load sprite atlases\n");
-        for (cfg.resources) |res| {
-            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
-        }
-        try w.writeByte('\n');
     }
 
     try w.writeAll("    runner.setup(&g);\n");
