@@ -8,6 +8,9 @@
     .ecs = .zig_ecs,
     .initial_scene = "main",
     .states = .{ "menu", "playing", "paused" },
+    .resources = .{
+        .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
+    },
     .layers = .{
         .{ .name = "background", .order = 0, .space = .screen },
         .{ .name = "world", .order = 1, .space = .world },

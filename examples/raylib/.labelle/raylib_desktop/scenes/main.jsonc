@@ -1,0 +1,21 @@
+{
+    // Main gameplay scene — demonstrates scene composition via include.
+    // Obstacles are loaded from a separate fragment file.
+    "name": "main",
+    "include": ["scenes/obstacles.jsonc"],
+    "entities": [
+        // Player — blue square, controlled by arrow keys (playing state)
+        {
+            "prefab": "player",
+            "components": {
+                "Position": { "x": 400, "y": 300 }
+            }
+        },
+        // Collectible coins — yellow circles
+        { "prefab": "coin", "components": { "Position": { "x": 200, "y": 150 } } },
+        { "prefab": "coin", "components": { "Position": { "x": 600, "y": 200 } } },
+        { "prefab": "coin", "components": { "Position": { "x": 350, "y": 450 } } },
+        { "prefab": "coin", "components": { "Position": { "x": 150, "y": 400 } } },
+        { "prefab": "coin", "components": { "Position": { "x": 650, "y": 350 } } }
+    ]
+}

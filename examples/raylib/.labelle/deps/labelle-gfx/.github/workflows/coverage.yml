@@ -1,0 +1,93 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout labelle-core (sibling dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          path: labelle-core-tmp
+
+      - name: Move labelle-core to sibling directory
+        run: mv labelle-core-tmp ../labelle-core
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.15.2'
+
+      - name: Install raylib and sokol dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxrender-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libasound2-dev \
+            git-lfs
+
+      - name: Setup Git LFS
+        run: git lfs install
+
+      - name: Cache Zig dependencies
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-coverage-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-cache-coverage-${{ runner.os }}-
+
+      - name: Run root tests
+        run: |
+          echo "Running root tests..."
+          zig build test --summary all
+
+      - name: Run spatial_grid tests
+        working-directory: spatial_grid
+        run: |
+          echo "Running spatial_grid tests..."
+          zig build test --summary all
+
+      - name: Run tilemap tests
+        working-directory: tilemap
+        run: |
+          echo "Running tilemap tests..."
+          zig build test --summary all
+
+      - name: Run camera tests
+        working-directory: camera
+        run: |
+          echo "Running camera tests..."
+          zig build test --summary all
+
+      - name: Create coverage badge
+        if: github.ref == 'refs/heads/main'
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: coverage.json
+          label: coverage
+          message: N/A
+          color: lightgrey

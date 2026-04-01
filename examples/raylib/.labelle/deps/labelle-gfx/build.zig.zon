@@ -1,0 +1,28 @@
+.{
+    .fingerprint = 0x348f3b533c42ca9c,
+    .name = .labelle_gfx,
+    .version = "1.2.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .labelle_core = .{
+            .path = "../labelle-core",
+        },
+        .spatial_grid = .{
+            .path = "spatial_grid",
+        },
+        .tilemap = .{
+            .path = "tilemap",
+        },
+        .camera = .{
+            .path = "camera",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "spatial_grid",
+        "tilemap",
+        "camera",
+    },
+}

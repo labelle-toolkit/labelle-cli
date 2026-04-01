@@ -1,0 +1,48 @@
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+// --- WASM/Emscripten main loop ---
+// Raylib's web target requires emscripten_set_main_loop instead of a while loop.
+// The game tick + render is driven by a per-frame callback.
+
+var g: AssembledGame = undefined;
+var hooks: GameHooks = undefined;
+var g_allocator: std.mem.Allocator = undefined;
+var runner: Runner = undefined;
+
+fn gameFrame() callconv(.c) void {
+    const dt: f32 = window.getFrameTime();
+{{tick_code}}    g.tick(dt);
+
+    window.beginDrawing();
+    window.clearBackground(245, 245, 245, 255);
+    g.render();
+    g.renderGizmos();
+{{gui_draw_code}}    window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
+    window.endDrawing();
+}
+
+const emscripten = @cImport(@cInclude("emscripten/emscripten.h"));
+
+pub fn main() !void {
+    // Use c_allocator for Emscripten — it delegates to emscripten's malloc/free
+    // which respects ALLOW_MEMORY_GROWTH. page_allocator uses wasm memory.grow
+    // directly and conflicts with emscripten's memory management.
+    const allocator = std.heap.c_allocator;
+    g_allocator = allocator;
+
+{{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
+    // Note: no defer closeWindow — Emscripten keeps running after main returns.
+
+    hooks = GameHooks{};
+    g = AssembledGame.init(allocator);
+
+    g.setHooks(&hooks);
+
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
+
+{{setup_code}}    emscripten.emscripten_set_main_loop(gameFrame, @intCast(target_fps), true);
+}
