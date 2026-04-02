@@ -70,7 +70,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
-    const prefab_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "prefabs", ".zon");
+    const prefab_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "prefabs", ".jsonc");
     defer scanner.freeNames(allocator, prefab_names);
 
     const jsonc_scene_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "scenes", ".jsonc");
