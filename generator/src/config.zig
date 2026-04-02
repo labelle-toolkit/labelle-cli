@@ -155,7 +155,6 @@ pub const ProjectConfig = struct {
     /// When true, the window is created hidden (no visible window). Useful for headless testing in CI.
     hidden: bool = false,
     /// When true, embed scene files into the binary via @embedFile (for release builds).
-    embed_scenes: bool = true,
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
 

@@ -291,7 +291,7 @@ pub fn generateMainZigFromTemplate(
     {
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
-        if (jsonc_scene_names.len > 0) {
+        if (jsonc_scene_names.len > 0 or prefab_names.len > 0) {
             try bw.writeAll("\n// --- JSONC scene loaders (embedded) ---\n");
             if (gizmo_names.len > 0) {
                 try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");
