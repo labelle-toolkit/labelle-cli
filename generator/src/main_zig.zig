@@ -20,7 +20,7 @@ fn hasContextEntry(entries: []const ScriptEntry) bool {
 }
 
 /// Build the setup code block for {{setup_code}} (loop-based backends).
-fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8) ![]const u8 {
+fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -46,9 +46,18 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         try w.writeByte('\n');
     }
 
-    // Register runtime JSONC scenes
+    // Pre-load embedded prefabs (must happen before scene loading)
+    if (prefab_names.len > 0) {
+        try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
+        for (prefab_names) |name| {
+            try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ name, name });
+        }
+        try w.writeByte('\n');
+    }
+
+    // Register JSONC scenes
     if (jsonc_scene_names.len > 0) {
-        try w.writeAll("    // Runtime JSONC scenes\n");
+        try w.writeAll("    // JSONC scenes\n");
         var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
@@ -99,7 +108,7 @@ fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names
 // ============================================================
 
 /// Init code for callback-based backends (inside a `!void` helper, can use try).
-fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8) ![]const u8 {
+fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -120,9 +129,18 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
         try w.writeByte('\n');
     }
 
-    // Register runtime JSONC scenes
+    // Pre-load embedded prefabs
+    if (prefab_names.len > 0) {
+        try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
+        for (prefab_names) |name| {
+            try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\") catch @panic(\"failed to load prefab\");\n", .{ name, name });
+        }
+        try w.writeByte('\n');
+    }
+
+    // Register JSONC scenes
     if (jsonc_scene_names.len > 0) {
-        try w.writeAll("    // Runtime JSONC scenes\n");
+        try w.writeAll("    // JSONC scenes\n");
         var jsonc_ident_buf: [256]u8 = undefined;
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
@@ -273,9 +291,8 @@ pub fn generateMainZigFromTemplate(
     {
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
-        if (jsonc_scene_names.len > 0) {
-            const loader_type = if (cfg.embed_scenes) "embedded" else "runtime";
-            try bw.print("\n// --- JSONC scene loaders ({s}) ---\n", .{loader_type});
+        if (jsonc_scene_names.len > 0 or prefab_names.len > 0) {
+            try bw.writeAll("\n// --- JSONC scene loaders (embedded) ---\n");
             if (gizmo_names.len > 0) {
                 try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");
             } else {
@@ -283,26 +300,15 @@ pub fn generateMainZigFromTemplate(
             }
             for (jsonc_scene_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
-                if (cfg.embed_scenes) {
-                    try bw.print(
-                        \\const jsonc_{s}_loader = struct {{
-                        \\    const embedded_source = @embedFile("scenes/{s}.jsonc");
-                        \\    fn load(game: *AssembledGame) anyerror!void {{
-                        \\        return JsoncBridge.loadSceneFromSource(game, embedded_source, "prefabs");
-                        \\    }}
-                        \\}}.load;
-                        \\
+                try bw.print(
+                    \\const jsonc_{s}_loader = struct {{
+                    \\    const embedded_source = @embedFile("scenes/{s}.jsonc");
+                    \\    fn load(game: *AssembledGame) anyerror!void {{
+                    \\        return JsoncBridge.loadSceneFromSource(game, embedded_source, "prefabs");
+                    \\    }}
+                    \\}}.load;
+                    \\
                     , .{ ident, name });
-                } else {
-                    try bw.print(
-                        \\const jsonc_{s}_loader = struct {{
-                        \\    fn load(game: *AssembledGame) anyerror!void {{
-                        \\        return JsoncBridge.loadScene(game, "scenes/{s}.jsonc", "prefabs");
-                        \\    }}
-                        \\}}.load;
-                        \\
-                    , .{ ident, name });
-                }
             }
         }
         const block = try buf.toOwnedSlice(allocator);
@@ -356,20 +362,12 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("game_hooks_block", block);
     }
 
-    // Prefab registry block
+    // Prefab registry block — JSONC prefabs are loaded at runtime via
+    // addEmbeddedPrefab, so the comptime registry is always empty.
     {
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
-        if (prefab_names.len > 0) {
-            try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{\n");
-            for (prefab_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print("    .{s} = @import(\"prefabs/{s}.zon\"),\n", .{ ident, name });
-            }
-            try bw.writeAll("});\n\n");
-        } else {
-            try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
-        }
+        try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("prefab_registry_block", block);
@@ -544,7 +542,7 @@ pub fn generateMainZigFromTemplate(
 
         if (use_callback_lifecycle) {
             const module_vars = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
-            const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names);
+            const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names, prefab_names);
             defer allocator.free(init_code);
 
             const platform_comment: []const u8 = switch (cfg.platform) {
@@ -601,7 +599,7 @@ pub fn generateMainZigFromTemplate(
                 }, bw);
             }
         } else {
-            const setup_code = try buildSetupCode(allocator, cfg, jsonc_scene_names);
+            const setup_code = try buildSetupCode(allocator, cfg, jsonc_scene_names, prefab_names);
             defer allocator.free(setup_code);
 
             try tpl.render(lifecycle_tmpl, .{

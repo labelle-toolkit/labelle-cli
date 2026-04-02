@@ -737,36 +737,20 @@ pub const SOKOL = struct {
 // ── Embed scenes ────────────────────────────────────────────────────
 
 pub const EMBED_SCENES = struct {
-    test "embed_scenes generates @embedFile loaders" {
+    test "scenes are always embedded via @embedFile" {
         const jsonc_scenes = &[_][]const u8{ "intro", "gameplay" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-            .embed_scenes = true,
         }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scenes/intro.jsonc\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scenes/gameplay.jsonc\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSceneFromSource") != null);
-        // Should NOT have runtime loadScene
+        // No file-based loadScene
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadScene(game") == null);
-    }
-
-    test "default embed_scenes=false generates runtime loaders" {
-        const jsonc_scenes = &[_][]const u8{"intro"};
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_names, empty_names, empty_names, empty_names, empty_names);
-        defer std.testing.allocator.free(main_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadScene(game") != null);
-        // Should NOT have @embedFile
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSceneFromSource") == null);
     }
 };
 
@@ -872,7 +856,7 @@ pub const SCRIPTS = struct {
 // ── Prefabs & Scenes ─────────────────────────────────────────────────
 
 pub const PREFABS_AND_SCENES = struct {
-    test "builds PrefabRegistry from scanned prefabs" {
+    test "embeds prefabs via addEmbeddedPrefab" {
         const prefabs = &[_][]const u8{ "enemy", "player" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
@@ -881,9 +865,12 @@ pub const PREFABS_AND_SCENES = struct {
         }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PrefabRegistry") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".player = @import(\"prefabs/player.zon\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".enemy = @import(\"prefabs/enemy.zon\")") != null);
+        // Prefabs are embedded at runtime, not compiled via PrefabRegistry
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedPrefab") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/player.jsonc\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/enemy.jsonc\")") != null);
+        // Empty comptime PrefabRegistry
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PrefabRegistry(.{})") != null);
     }
 
 };
@@ -1036,7 +1023,7 @@ pub const HIDDEN_WINDOW = struct {
 // ── Subfolder support ────────────────────────────────────────────────
 
 pub const SUBFOLDERS = struct {
-    test "prefab names with slashes use underscore identifiers and slash import paths" {
+    test "prefab names with slashes use slash paths in embedFile" {
         const prefabs = &[_][]const u8{ "enemies/goblin", "enemies/orc", "player" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
@@ -1045,11 +1032,10 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Subfolder prefabs: identifier uses underscore, import path uses slash
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".enemies_goblin = @import(\"prefabs/enemies/goblin.zon\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".enemies_orc = @import(\"prefabs/enemies/orc.zon\")") != null);
-        // Top-level prefab unchanged
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".player = @import(\"prefabs/player.zon\")") != null);
+        // Subfolder prefabs embedded with slash paths
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/enemies/goblin.jsonc\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/enemies/orc.jsonc\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/player.jsonc\")") != null);
     }
 
     test "scripts in organizational subdirs use path-based identifiers" {

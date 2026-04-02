@@ -465,13 +465,9 @@ pub fn main() !void {
         @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
     });
 
-    // Embed scenes in release builds (any non-Debug optimize mode)
+    // Scenes and prefabs are always embedded via @embedFile
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
-    parsed.embed_scenes = if (effective_optimize) |opt|
-        !std.mem.eql(u8, opt, "Debug")
-    else
-        false;
 
     try gen.generate(allocator, parsed, output_dir, project_dir);
 
