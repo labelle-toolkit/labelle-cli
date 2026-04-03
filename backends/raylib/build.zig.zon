@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .@"raylib-zig" = .{
-            .url = "git+https://github.com/raylib-zig/raylib-zig?ref=devel#cd71c85bba906e2f128f5ddd1f6e7d23df51d5e2",
-            .hash = "raylib_zig-5.6.0-dev-KE8REOdOBQB10f0TgBk02dc9Nx_4RJeHzBUVF7mSWhG-",
+            .url = "https://github.com/raylib-zig/raylib-zig/archive/cd71c85d571027ac8033357f83b124ee051825b3.tar.gz",
+            .hash = "raylib_zig-5.6.0-dev-KE8REENOBQC-m5nK7M2b5aKSIubJPbPLUYcRhT7aT3RN",
         },
     },
     .paths = .{
