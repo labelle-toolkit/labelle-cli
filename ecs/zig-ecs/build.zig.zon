@@ -6,7 +6,7 @@
     .dependencies = .{
         .zig_ecs = .{
             .url = "git+https://github.com/prime31/zig-ecs#dcfaddf1011f4a543127e67df89c314d98387d8f",
-            .hash = "entt-1.0.0-qJPtbNLVAgDPXaUbyRSsBTK75Cr1WujUA92kToJugWry",
+            .hash = "entt-1.0.0-qJPtbL7vAgBQJsEfw-QB-C5WSHXZ7dStpwj6cGwfDCc0",
         },
     },
     .paths = .{
