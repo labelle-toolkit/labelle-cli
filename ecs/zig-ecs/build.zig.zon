@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zig_ecs = .{
-            .url = "git+https://github.com/prime31/zig-ecs#dcfaddf1011f4a543127e67df89c314d98387d8f",
-            .hash = "entt-1.0.0-qJPtbL7vAgBQJsEfw-QB-C5WSHXZ7dStpwj6cGwfDCc0",
+            .url = "git+https://github.com/prime31/zig-ecs#dbf3647c2cc4f327fe87067e40f8436c7f87f209",
+            .hash = "entt-1.0.0-qJPtbNLVAgDPXaUbyRSsBTK75Cr1WujUA92kToJugWry",
         },
     },
     .paths = .{

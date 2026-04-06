@@ -1,6 +1,7 @@
 /// zig-ecs adapter — satisfies the labelle-core Ecs(Impl) contract.
 /// Wraps prime31/zig-ecs (EnTT port) with the required interface.
 const std = @import("std");
+const builtin = @import("builtin");
 const zig_ecs = @import("zig-ecs");
 
 /// External entity type — plain u32 for engine compatibility.
@@ -48,14 +49,19 @@ pub fn createEntity(self: *Self) Entity {
 
 pub fn destroyEntity(self: *Self, entity: Entity) void {
     const ie = toInternal(entity);
-    if (self.inner.valid(ie)) {
-        self.inner.destroy(ie);
-        self.entity_count -= 1;
-        for (self.alive_entities.items, 0..) |e, idx| {
-            if (e == entity) {
-                _ = self.alive_entities.swapRemove(idx);
-                break;
-            }
+    if (!self.inner.valid(ie)) {
+        if (builtin.mode == .Debug) {
+            std.debug.print("destroyEntity on invalid entity {d}\n", .{entity});
+            @panic("destroyEntity on invalid entity");
+        }
+        return;
+    }
+    self.inner.destroy(ie);
+    self.entity_count -= 1;
+    for (self.alive_entities.items, 0..) |e, idx| {
+        if (e == entity) {
+            _ = self.alive_entities.swapRemove(idx);
+            break;
         }
     }
 }
@@ -69,6 +75,12 @@ pub fn entityCount(self: *Self) usize {
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
+    if (builtin.mode == .Debug) {
+        if (!self.inner.valid(toInternal(entity))) {
+            std.debug.print("addComponent({s}) on invalid entity {d}\n", .{ @typeName(@TypeOf(component)), entity });
+            @panic("addComponent on invalid entity");
+        }
+    }
     self.inner.addOrReplace(toInternal(entity), component);
 }
 
@@ -81,6 +93,12 @@ pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
+    if (builtin.mode == .Debug) {
+        if (!self.inner.valid(toInternal(entity))) {
+            std.debug.print("removeComponent({s}) on invalid entity {d}\n", .{ @typeName(T), entity });
+            @panic("removeComponent on invalid entity");
+        }
+    }
     self.inner.remove(T, toInternal(entity));
 }
 
