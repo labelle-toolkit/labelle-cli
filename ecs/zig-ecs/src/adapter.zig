@@ -4,6 +4,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zig_ecs = @import("zig-ecs");
 
+const is_safe = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+
 /// External entity type — plain u32 for engine compatibility.
 pub const Entity = u32;
 
@@ -50,7 +52,7 @@ pub fn createEntity(self: *Self) Entity {
 pub fn destroyEntity(self: *Self, entity: Entity) void {
     const ie = toInternal(entity);
     if (!self.inner.valid(ie)) {
-        if (builtin.mode == .Debug) {
+        if (comptime is_safe) {
             std.debug.print("destroyEntity on invalid entity {d}\n", .{entity});
             @panic("destroyEntity on invalid entity");
         }
@@ -75,13 +77,14 @@ pub fn entityCount(self: *Self) usize {
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
-    if (builtin.mode == .Debug) {
-        if (!self.inner.valid(toInternal(entity))) {
+    const ie = toInternal(entity);
+    if (comptime is_safe) {
+        if (!self.inner.valid(ie)) {
             std.debug.print("addComponent({s}) on invalid entity {d}\n", .{ @typeName(@TypeOf(component)), entity });
             @panic("addComponent on invalid entity");
         }
     }
-    self.inner.addOrReplace(toInternal(entity), component);
+    self.inner.addOrReplace(ie, component);
 }
 
 pub fn getComponent(self: *Self, entity: Entity, comptime T: type) ?*T {
@@ -93,13 +96,14 @@ pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
-    if (builtin.mode == .Debug) {
-        if (!self.inner.valid(toInternal(entity))) {
+    const ie = toInternal(entity);
+    if (comptime is_safe) {
+        if (!self.inner.valid(ie)) {
             std.debug.print("removeComponent({s}) on invalid entity {d}\n", .{ @typeName(T), entity });
             @panic("removeComponent on invalid entity");
         }
     }
-    self.inner.remove(T, toInternal(entity));
+    self.inner.remove(T, ie);
 }
 
 /// View type — iterates matching entities, converting to external Entity.
