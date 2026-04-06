@@ -4,7 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zig_ecs = @import("zig-ecs");
 
-const is_safe = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+const is_debug = builtin.mode == .Debug;
 
 /// External entity type — plain u32 for engine compatibility.
 pub const Entity = u32;
@@ -13,6 +13,18 @@ pub const Entity = u32;
 const InternalEntity = zig_ecs.Entity;
 
 const Self = @This();
+
+/// Debug-only: panic with a clear message when an invalid entity
+/// is passed to a mutating ECS method. In release builds this is
+/// a no-op — the underlying zig-ecs asserts are stripped anyway.
+fn assertValid(self: *Self, entity: Entity, comptime operation: []const u8) void {
+    if (comptime is_debug) {
+        if (!self.inner.valid(toInternal(entity))) {
+            std.debug.print("{s} on invalid entity {d}\n", .{ operation, entity });
+            @panic(operation ++ " on invalid entity");
+        }
+    }
+}
 
 inner: zig_ecs.Registry,
 entity_count: usize,
@@ -52,10 +64,7 @@ pub fn createEntity(self: *Self) Entity {
 pub fn destroyEntity(self: *Self, entity: Entity) void {
     const ie = toInternal(entity);
     if (!self.inner.valid(ie)) {
-        if (comptime is_safe) {
-            std.debug.print("destroyEntity on invalid entity {d}\n", .{entity});
-            @panic("destroyEntity on invalid entity");
-        }
+        self.assertValid(entity, "destroyEntity");
         return;
     }
     self.inner.destroy(ie);
@@ -77,14 +86,8 @@ pub fn entityCount(self: *Self) usize {
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
-    const ie = toInternal(entity);
-    if (comptime is_safe) {
-        if (!self.inner.valid(ie)) {
-            std.debug.print("addComponent({s}) on invalid entity {d}\n", .{ @typeName(@TypeOf(component)), entity });
-            @panic("addComponent on invalid entity");
-        }
-    }
-    self.inner.addOrReplace(ie, component);
+    self.assertValid(entity, "addComponent");
+    self.inner.addOrReplace(toInternal(entity), component);
 }
 
 pub fn getComponent(self: *Self, entity: Entity, comptime T: type) ?*T {
@@ -96,14 +99,8 @@ pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
-    const ie = toInternal(entity);
-    if (comptime is_safe) {
-        if (!self.inner.valid(ie)) {
-            std.debug.print("removeComponent({s}) on invalid entity {d}\n", .{ @typeName(T), entity });
-            @panic("removeComponent on invalid entity");
-        }
-    }
-    self.inner.remove(T, ie);
+    self.assertValid(entity, "removeComponent");
+    self.inner.remove(T, toInternal(entity));
 }
 
 /// View type — iterates matching entities, converting to external Entity.
