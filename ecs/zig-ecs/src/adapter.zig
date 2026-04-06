@@ -1,7 +1,10 @@
 /// zig-ecs adapter — satisfies the labelle-core Ecs(Impl) contract.
 /// Wraps prime31/zig-ecs (EnTT port) with the required interface.
 const std = @import("std");
+const builtin = @import("builtin");
 const zig_ecs = @import("zig-ecs");
+
+const is_debug = builtin.mode == .Debug;
 
 /// External entity type — plain u32 for engine compatibility.
 pub const Entity = u32;
@@ -10,6 +13,18 @@ pub const Entity = u32;
 const InternalEntity = zig_ecs.Entity;
 
 const Self = @This();
+
+/// Debug-only: panic with a clear message when an invalid entity
+/// is passed to a mutating ECS method. In release builds this is
+/// a no-op — the underlying zig-ecs asserts are stripped anyway.
+fn assertValid(self: *Self, entity: Entity, comptime operation: []const u8) void {
+    if (comptime is_debug) {
+        if (!self.inner.valid(toInternal(entity))) {
+            std.debug.print("{s} on invalid entity {d}\n", .{ operation, entity });
+            @panic(operation ++ " on invalid entity");
+        }
+    }
+}
 
 inner: zig_ecs.Registry,
 entity_count: usize,
@@ -47,15 +62,15 @@ pub fn createEntity(self: *Self) Entity {
 }
 
 pub fn destroyEntity(self: *Self, entity: Entity) void {
+    self.assertValid(entity, "destroyEntity");
     const ie = toInternal(entity);
-    if (self.inner.valid(ie)) {
-        self.inner.destroy(ie);
-        self.entity_count -= 1;
-        for (self.alive_entities.items, 0..) |e, idx| {
-            if (e == entity) {
-                _ = self.alive_entities.swapRemove(idx);
-                break;
-            }
+    if (!self.inner.valid(ie)) return;
+    self.inner.destroy(ie);
+    self.entity_count -= 1;
+    for (self.alive_entities.items, 0..) |e, idx| {
+        if (e == entity) {
+            _ = self.alive_entities.swapRemove(idx);
+            break;
         }
     }
 }
@@ -69,6 +84,7 @@ pub fn entityCount(self: *Self) usize {
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
+    self.assertValid(entity, "addComponent(" ++ @typeName(@TypeOf(component)) ++ ")");
     self.inner.addOrReplace(toInternal(entity), component);
 }
 
@@ -81,6 +97,7 @@ pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
+    self.assertValid(entity, "removeComponent(" ++ @typeName(T) ++ ")");
     self.inner.remove(T, toInternal(entity));
 }
 
@@ -230,3 +247,4 @@ pub fn query(self: *Self, comptime components: anytype) QueryIterator(components
         .index = 0,
     };
 }
+

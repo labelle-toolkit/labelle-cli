@@ -13,4 +13,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     adapter_mod.addImport("zig-ecs", ecs_mod);
+
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/adapter_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs", .module = adapter_mod },
+            },
+        }),
+    });
+    const test_step = b.step("test", "Run adapter tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }
