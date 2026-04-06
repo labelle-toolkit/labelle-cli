@@ -86,7 +86,7 @@ pub fn entityCount(self: *Self) usize {
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
-    self.assertValid(entity, "addComponent");
+    self.assertValid(entity, "addComponent(" ++ @typeName(@TypeOf(component)) ++ ")");
     self.inner.addOrReplace(toInternal(entity), component);
 }
 
@@ -99,7 +99,7 @@ pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
-    self.assertValid(entity, "removeComponent");
+    self.assertValid(entity, "removeComponent(" ++ @typeName(T) ++ ")");
     self.inner.remove(T, toInternal(entity));
 }
 
@@ -265,7 +265,7 @@ test "createEntity and entityExists" {
 
     const e = ecs.createEntity();
     try testing.expect(ecs.entityExists(e));
-    try testing.expectEqual(1, ecs.entityCount());
+    try testing.expectEqual(@as(usize, 1), ecs.entityCount());
 }
 
 test "destroyEntity removes entity" {
@@ -275,7 +275,7 @@ test "destroyEntity removes entity" {
     const e = ecs.createEntity();
     ecs.destroyEntity(e);
     try testing.expect(!ecs.entityExists(e));
-    try testing.expectEqual(0, ecs.entityCount());
+    try testing.expectEqual(@as(usize, 0), ecs.entityCount());
 }
 
 test "addComponent and getComponent" {
@@ -287,8 +287,8 @@ test "addComponent and getComponent" {
 
     const pos = ecs.getComponent(e, Position);
     try testing.expect(pos != null);
-    try testing.expectEqual(10, pos.?.x);
-    try testing.expectEqual(20, pos.?.y);
+    try testing.expectEqual(@as(f32, 10), pos.?.x);
+    try testing.expectEqual(@as(f32, 20), pos.?.y);
 }
 
 test "removeComponent removes component" {
@@ -334,7 +334,7 @@ test "view returns only alive entities" {
         try testing.expect(ecs.entityExists(entity));
         count += 1;
     }
-    try testing.expectEqual(2, count);
+    try testing.expectEqual(@as(usize, 2), count);
 }
 
 test "destroyEntity then create reuses entity slots" {
@@ -348,7 +348,7 @@ test "destroyEntity then create reuses entity slots" {
     // New entity should be alive, old should not
     try testing.expect(ecs.entityExists(e2));
     try testing.expect(!ecs.entityExists(e1));
-    try testing.expectEqual(1, ecs.entityCount());
+    try testing.expectEqual(@as(usize, 1), ecs.entityCount());
 }
 
 test "multiple components on same entity" {
@@ -398,7 +398,7 @@ test "view after destroyEntity returns clean results" {
         try testing.expect(tag.label % 2 == 0);
         count += 1;
     }
-    try testing.expectEqual(5, count);
+    try testing.expectEqual(@as(usize, 5), count);
 }
 
 test "double destroyEntity is safe in release mode" {
@@ -415,7 +415,7 @@ test "double destroyEntity is safe in release mode" {
     // Second destroy should not corrupt state (silent return in non-debug)
     ecs.destroyEntity(e);
 
-    try testing.expectEqual(0, ecs.entityCount());
+    try testing.expectEqual(@as(usize, 0), ecs.entityCount());
     try testing.expect(!ecs.entityExists(e));
 }
 
@@ -438,10 +438,10 @@ test "addComponent replaces existing component" {
 
     const e = ecs.createEntity();
     ecs.addComponent(e, Tag{ .label = 1 });
-    try testing.expectEqual(1, ecs.getComponent(e, Tag).?.label);
+    try testing.expectEqual(@as(u32, 1), ecs.getComponent(e, Tag).?.label);
 
     ecs.addComponent(e, Tag{ .label = 99 });
-    try testing.expectEqual(99, ecs.getComponent(e, Tag).?.label);
+    try testing.expectEqual(@as(u32, 99), ecs.getComponent(e, Tag).?.label);
 }
 
 test "query excludes destroyed entities" {
@@ -460,10 +460,10 @@ test "query excludes destroyed entities" {
     var count: usize = 0;
     while (q.next()) |result| {
         try testing.expect(ecs.entityExists(result.entity));
-        try testing.expectEqual(2, result.comp_0.label);
+        try testing.expectEqual(@as(u32, 2), result.comp_0.label);
         count += 1;
     }
-    try testing.expectEqual(1, count);
+    try testing.expectEqual(@as(usize, 1), count);
 }
 
 test "destroy and recreate cycle preserves integrity" {
@@ -478,7 +478,7 @@ test "destroy and recreate cycle preserves integrity" {
         ecs.destroyEntity(e);
     }
 
-    try testing.expectEqual(0, ecs.entityCount());
+    try testing.expectEqual(@as(usize, 0), ecs.entityCount());
 
     // Create fresh entities — should all work
     for (0..10) |i| {
@@ -487,5 +487,5 @@ test "destroy and recreate cycle preserves integrity" {
         try testing.expect(ecs.entityExists(e));
         try testing.expectEqual(@as(u32, @intCast(i + 100)), ecs.getComponent(e, Tag).?.label);
     }
-    try testing.expectEqual(10, ecs.entityCount());
+    try testing.expectEqual(@as(usize, 10), ecs.entityCount());
 }
