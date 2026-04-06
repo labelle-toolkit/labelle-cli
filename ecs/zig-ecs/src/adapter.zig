@@ -400,3 +400,92 @@ test "view after destroyEntity returns clean results" {
     }
     try testing.expectEqual(5, count);
 }
+
+test "double destroyEntity is safe in release mode" {
+    // In Debug mode this panics (by design — catches use-after-destroy).
+    // This test verifies the silent early-return path in non-debug modes.
+    if (comptime is_debug) return;
+    var ecs = Self.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    ecs.addComponent(e, Tag{ .label = 1 });
+    ecs.destroyEntity(e);
+
+    // Second destroy should not corrupt state (silent return in non-debug)
+    ecs.destroyEntity(e);
+
+    try testing.expectEqual(0, ecs.entityCount());
+    try testing.expect(!ecs.entityExists(e));
+}
+
+test "hasComponent returns false for destroyed entity" {
+    var ecs = Self.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    ecs.addComponent(e, Tag{ .label = 1 });
+    ecs.addComponent(e, Position{ .x = 5, .y = 10 });
+    ecs.destroyEntity(e);
+
+    try testing.expect(!ecs.hasComponent(e, Tag));
+    try testing.expect(!ecs.hasComponent(e, Position));
+}
+
+test "addComponent replaces existing component" {
+    var ecs = Self.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    ecs.addComponent(e, Tag{ .label = 1 });
+    try testing.expectEqual(1, ecs.getComponent(e, Tag).?.label);
+
+    ecs.addComponent(e, Tag{ .label = 99 });
+    try testing.expectEqual(99, ecs.getComponent(e, Tag).?.label);
+}
+
+test "query excludes destroyed entities" {
+    var ecs = Self.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e1 = ecs.createEntity();
+    ecs.addComponent(e1, Tag{ .label = 1 });
+    const e2 = ecs.createEntity();
+    ecs.addComponent(e2, Tag{ .label = 2 });
+
+    ecs.destroyEntity(e1);
+
+    var q = ecs.query(.{Tag});
+    defer q.deinit(testing.allocator);
+    var count: usize = 0;
+    while (q.next()) |result| {
+        try testing.expect(ecs.entityExists(result.entity));
+        try testing.expectEqual(2, result.comp_0.label);
+        count += 1;
+    }
+    try testing.expectEqual(1, count);
+}
+
+test "destroy and recreate cycle preserves integrity" {
+    var ecs = Self.init(testing.allocator);
+    defer ecs.deinit();
+
+    // Create-destroy-create cycle 50 times
+    for (0..50) |i| {
+        const e = ecs.createEntity();
+        ecs.addComponent(e, Tag{ .label = @intCast(i) });
+        ecs.addComponent(e, Position{ .x = @floatFromInt(i), .y = 0 });
+        ecs.destroyEntity(e);
+    }
+
+    try testing.expectEqual(0, ecs.entityCount());
+
+    // Create fresh entities — should all work
+    for (0..10) |i| {
+        const e = ecs.createEntity();
+        ecs.addComponent(e, Tag{ .label = @intCast(i + 100) });
+        try testing.expect(ecs.entityExists(e));
+        try testing.expectEqual(@as(u32, @intCast(i + 100)), ecs.getComponent(e, Tag).?.label);
+    }
+    try testing.expectEqual(10, ecs.entityCount());
+}
