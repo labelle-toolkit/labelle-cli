@@ -62,11 +62,9 @@ pub fn createEntity(self: *Self) Entity {
 }
 
 pub fn destroyEntity(self: *Self, entity: Entity) void {
+    self.assertValid(entity, "destroyEntity");
     const ie = toInternal(entity);
-    if (!self.inner.valid(ie)) {
-        self.assertValid(entity, "destroyEntity");
-        return;
-    }
+    if (!self.inner.valid(ie)) return;
     self.inner.destroy(ie);
     self.entity_count -= 1;
     for (self.alive_entities.items, 0..) |e, idx| {

@@ -85,7 +85,7 @@ test "view returns only alive entities" {
     try testing.expectEqual(@as(usize, 2), count);
 }
 
-test "destroyEntity then create reuses entity slots" {
+test "destroyEntity then create leaves only new entity alive" {
     var ecs = Adapter.init(testing.allocator);
     defer ecs.deinit();
 
