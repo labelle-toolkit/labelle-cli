@@ -539,10 +539,10 @@ pub fn generateMainZigFromTemplate(
             "        const scaled_dt = dt * g.time_scale;\n" ++
             "        if (scaled_dt > 0) {\n" ++
             "            runner.tick(&g, scaled_dt);\n" ++
-            "            runner.dispatchEvents(&g);\n" ++
             "            PluginSystems.tick(&g, scaled_dt);\n" ++
             "            PluginSystems.postTick(&g, scaled_dt);\n" ++
             "        }\n" ++
+            "        runner.dispatchEvents(&g);\n" ++
             "        // Update profiling pointers (debug only)\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
             "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
@@ -556,8 +556,8 @@ pub fn generateMainZigFromTemplate(
             "        const scaled_dt = dt * g.time_scale;\n" ++
             "        if (scaled_dt > 0) {\n" ++
             "            runner.tick(&g, scaled_dt);\n" ++
-            "            runner.dispatchEvents(&g);\n" ++
             "        }\n" ++
+            "        runner.dispatchEvents(&g);\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
             "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
