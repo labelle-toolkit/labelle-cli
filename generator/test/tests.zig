@@ -674,7 +674,7 @@ pub const SOKOL = struct {
             .height = 600,
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "setScreenHeight") != null);
@@ -685,7 +685,7 @@ pub const SOKOL = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn init() callconv(.c)") != null);
@@ -698,7 +698,7 @@ pub const SOKOL = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
@@ -713,7 +713,7 @@ pub const SOKOL = struct {
             .backend = .sokol,
             .ecs = .mock,
             .initial_scene = "main_menu",
-        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"main_menu\")") != null);
@@ -726,7 +726,7 @@ pub const SOKOL = struct {
             .backend = .sokol,
             .ecs = .mock,
             .resolved_gui = testGuiRawBackend("imgui"),
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
@@ -1013,7 +1013,7 @@ pub const HIDDEN_WINDOW = struct {
             .backend = .sokol,
             .ecs = .mock,
             .hidden = true,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.setConfigFlags(.{ .window_hidden = true })") != null);
