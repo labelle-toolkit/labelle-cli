@@ -1,7 +1,7 @@
 const BackendGfxType = @import("backend_gfx");
 
 var g: AssembledGame = undefined;
-var hooks: GameHooks = .{};
+{{hooks_init_block}}
 {{allocator_decl}}
 {{module_vars}}
 const screen_w: u32 = {{width}};

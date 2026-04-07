@@ -1,7 +1,7 @@
 const BackendGfxType = @import("backend_gfx");
 
 {{module_vars}}var g: AssembledGame = undefined;
-var hooks: GameHooks = .{};
+{{hooks_init_block}}
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
 var frame_count: u32 = 0;

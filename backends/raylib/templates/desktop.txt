@@ -12,7 +12,7 @@ pub fn main() !void {
     defer window.closeWindow();
     window.setTargetFPS(target_fps);
 
-    var hooks = GameHooks{};
+{{hooks_init_block}}
     var g = AssembledGame.init(allocator);
     defer g.deinit();
 

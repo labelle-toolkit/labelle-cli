@@ -229,6 +229,7 @@ pub fn generateMainZigFromTemplate(
     jsonc_scene_names: []const []const u8,
     component_names: []const []const u8,
     hook_names: []const []const u8,
+    event_names: []const []const u8,
     enum_names: []const []const u8,
     view_names: []const []const u8,
     gizmo_names: []const []const u8,
@@ -269,6 +270,22 @@ pub fn generateMainZigFromTemplate(
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("hook_imports_block", block);
+    }
+
+    // Event imports block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (event_names.len > 0) {
+            try bw.writeAll("\n// --- Event imports ---\n");
+            for (event_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
+            }
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("event_imports_block", block);
     }
 
     // Enum imports block
@@ -336,17 +353,26 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("resource_registry_block", block);
     }
 
+    // AllHookPayloads block — merge engine payloads with game events if present
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (event_names.len == 0) {
+            try bw.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
+        } else {
+            try bw.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents });\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("all_hook_payloads_block", block);
+    }
+
     // Game hooks block
     {
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
         if (hook_names.len == 0) {
             try bw.writeAll("const GameHooks = struct {};\n\n");
-        } else if (hook_names.len == 1) {
-            const ident0 = pathToIdent(hook_names[0], &ident_buf);
-            var pascal_buf: [128]u8 = undefined;
-            const pascal = snakeToPascal(ident0, &pascal_buf);
-            try bw.print("const GameHooks = {s}.{s};\n\n", .{ ident0, pascal });
         } else {
             var pascal_buf: [128]u8 = undefined;
             try bw.writeAll("const GameHooks = engine.MergeHooks(AllHookPayloads, .{");
@@ -360,6 +386,52 @@ pub fn generateMainZigFromTemplate(
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("game_hooks_block", block);
+    }
+
+    // Hooks init block — instantiate individual hooks and wire into GameHooks
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (hook_names.len == 0) {
+            try bw.writeAll("    var hooks = GameHooks{};\n");
+        } else {
+            var pascal_buf: [128]u8 = undefined;
+            for (hook_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                const pascal = snakeToPascal(ident, &pascal_buf);
+                try bw.print("    var {s}_inst = {s}.{s}{{}};\n", .{ ident, ident, pascal });
+            }
+            try bw.writeAll("    var hooks = GameHooks{ .receivers = .{");
+            for (hook_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print(" &{s}_inst,", .{ident});
+            }
+            try bw.writeAll(" } };\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("hooks_init_block", block);
+    }
+
+    // Game events block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (event_names.len == 0) {
+            try bw.writeAll("const GameEvents = void;\n\n");
+        } else {
+            try bw.writeAll("const GameEvents = union(enum) {\n");
+            var pascal_buf: [128]u8 = undefined;
+            for (event_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                const pascal = snakeToPascal(ident, &pascal_buf);
+                try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
+            }
+            try bw.writeAll("};\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("game_events_block", block);
     }
 
     // Prefab registry block — JSONC prefabs are loaded at runtime via
@@ -504,6 +576,7 @@ pub fn generateMainZigFromTemplate(
             "            PluginSystems.tick(&g, scaled_dt);\n" ++
             "            PluginSystems.postTick(&g, scaled_dt);\n" ++
             "        }\n" ++
+            "        g.dispatchEvents();\n" ++
             "        // Update profiling pointers (debug only)\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
             "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
@@ -518,6 +591,7 @@ pub fn generateMainZigFromTemplate(
             "        if (scaled_dt > 0) {\n" ++
             "            runner.tick(&g, scaled_dt);\n" ++
             "        }\n" ++
+            "        g.dispatchEvents();\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
             "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
@@ -537,6 +611,8 @@ pub fn generateMainZigFromTemplate(
             "    window.setConfigFlags(.{ .window_hidden = true });\n"
         else
             "";
+
+        const hooks_init = data.scalars.get("hooks_init_block") orelse "    var hooks = GameHooks{};\n";
 
         const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm;
 
@@ -582,6 +658,7 @@ pub fn generateMainZigFromTemplate(
                     .platform_comment = platform_comment,
                     .entry_comment = entry_comment,
                     .hidden_setup = hidden_setup,
+                    .hooks_init_block = hooks_init,
                     .allocator_decl = allocator_decl,
                     .allocator_expr = allocator_expr,
                     .allocator_cleanup = allocator_cleanup,
@@ -596,6 +673,7 @@ pub fn generateMainZigFromTemplate(
                     .tick_code = tick_code,
                     .gui_draw_code = gui_draw_code,
                     .hidden_setup = hidden_setup,
+                    .hooks_init_block = hooks_init,
                 }, bw);
             }
         } else {
@@ -611,6 +689,7 @@ pub fn generateMainZigFromTemplate(
                 .tick_code = tick_code,
                 .gui_draw_code = gui_draw_code,
                 .hidden_setup = hidden_setup,
+                .hooks_init_block = hooks_init,
             }, bw);
         }
 
