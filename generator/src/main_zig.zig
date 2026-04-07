@@ -229,6 +229,7 @@ pub fn generateMainZigFromTemplate(
     jsonc_scene_names: []const []const u8,
     component_names: []const []const u8,
     hook_names: []const []const u8,
+    event_names: []const []const u8,
     enum_names: []const []const u8,
     view_names: []const []const u8,
     gizmo_names: []const []const u8,
@@ -269,6 +270,22 @@ pub fn generateMainZigFromTemplate(
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("hook_imports_block", block);
+    }
+
+    // Event imports block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (event_names.len > 0) {
+            try bw.writeAll("\n// --- Event imports ---\n");
+            for (event_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                try bw.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
+            }
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("event_imports_block", block);
     }
 
     // Enum imports block
@@ -362,6 +379,27 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("game_hooks_block", block);
     }
 
+    // Game events block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (event_names.len == 0) {
+            try bw.writeAll("const GameEvents = void;\n\n");
+        } else {
+            try bw.writeAll("const GameEvents = union(enum) {\n");
+            var pascal_buf: [128]u8 = undefined;
+            for (event_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                const pascal = snakeToPascal(ident, &pascal_buf);
+                try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
+            }
+            try bw.writeAll("};\n\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("game_events_block", block);
+    }
+
     // Prefab registry block — JSONC prefabs are loaded at runtime via
     // addEmbeddedPrefab, so the comptime registry is always empty.
     {
@@ -443,7 +481,7 @@ pub fn generateMainZigFromTemplate(
                     try bw.print("            \"{s}\",\n", .{state});
                 }
                 try bw.writeAll("        };\n");
-                const decl_names = [_][]const u8{ "tick", "setup", "drawGui", "State" };
+                const decl_names = [_][]const u8{ "tick", "setup", "drawGui", "onEvent", "State" };
                 for (decl_names) |decl| {
                     try bw.print("        pub const {s} = if (@hasDecl(_inner, \"{s}\")) _inner.{s} else {{}};\n", .{ decl, decl, decl });
                 }
@@ -501,6 +539,7 @@ pub fn generateMainZigFromTemplate(
             "        const scaled_dt = dt * g.time_scale;\n" ++
             "        if (scaled_dt > 0) {\n" ++
             "            runner.tick(&g, scaled_dt);\n" ++
+            "            runner.dispatchEvents(&g);\n" ++
             "            PluginSystems.tick(&g, scaled_dt);\n" ++
             "            PluginSystems.postTick(&g, scaled_dt);\n" ++
             "        }\n" ++
@@ -517,6 +556,7 @@ pub fn generateMainZigFromTemplate(
             "        const scaled_dt = dt * g.time_scale;\n" ++
             "        if (scaled_dt > 0) {\n" ++
             "            runner.tick(&g, scaled_dt);\n" ++
+            "            runner.dispatchEvents(&g);\n" ++
             "        }\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
             "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
