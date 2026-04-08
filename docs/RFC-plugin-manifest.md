@@ -84,20 +84,19 @@ Each `convention_dirs` entry:
 | Field         | Type        | Required | Description                                                                 |
 |---------------|-------------|----------|-----------------------------------------------------------------------------|
 | `name`        | `[]const u8`| yes      | Directory name, relative to the game project root (e.g., `"state_machines"`). |
-| `extension`   | `[]const u8`| yes      | File extension to scan (e.g., `".zig"`, `".jsonc"`).                        |
+| `extension`   | `[]const u8`| yes      | File extension to scan (e.g., `".zig"`, `".jsonc"`). Ignored when `mode = .copy_only`. |
 | `mode`        | enum        | yes      | `.copy_and_scan` (copies files + returns name list) or `.copy_only` (copies files, no name list — like `assets/`). |
-| `optional`    | `bool`      | no       | Default `false`. If `true`, the directory not existing in the game is not an error. |
 
 ### Mode semantics
 
 - **`.copy_and_scan`** — mirrors the existing `scanner.copyAndScan` path. Every file matching `extension` under `<game_dir>/<name>/` is copied to `<target_dir>/<name>/`, and the file stems are returned as a name list. This is what `components/`, `hooks/`, `events/`, etc. already do. For v1 the name list is computed and stored but *not* exposed for codegen — that's future work (NG3).
 - **`.copy_only`** — mirrors `scanner.copyDirRecursive` used today for `assets/`. Files are copied, no scanning, no name list.
 
-### Optionality
+### Missing directories are silently tolerated
 
-A plugin that requires its directory to exist (no fallback) should set `optional = false` (default). A plugin that works with or without content in the directory should set `optional = true`.
+If a game project doesn't have a directory a plugin declares, it is **not an error**. This matches existing CLI behavior: `scanner.copyAndScan` and `scanner.copyDirRecursive` both silently no-op on `error.FileNotFound` today, so a game that doesn't have `components/`, `hooks/`, or `assets/` builds fine.
 
-For labelle-fsm: `state_machines/` should be **optional** — a game that depends on labelle-fsm but hasn't created any state machines yet should not fail to build.
+A plugin that needs its directory to be non-empty for runtime correctness should perform that check in its own initialization code, not at generate time.
 
 ## Integration in the generator
 
@@ -115,24 +114,20 @@ for (cfg.plugins) |plugin| {
         for (m.convention_dirs) |dir| {
             switch (dir.mode) {
                 .copy_and_scan => {
-                    const names = scanner.copyAndScan(
+                    const names = try scanner.copyAndScan(
                         allocator,
                         game_dir,
                         target_dir,
                         dir.name,
                         dir.extension,
-                    ) catch |err| {
-                        if (err == error.FileNotFound and dir.optional) continue;
-                        return err;
-                    };
+                    );
                     defer scanner.freeNames(allocator, names);
                     // v1: names computed but not exposed to codegen (NG3)
+                    // Missing source dirs silently no-op via copyAndScan.
                 },
                 .copy_only => {
-                    scanner.copyDirRecursive(allocator, game_dir, target_dir, dir.name) catch |err| {
-                        if (err == error.FileNotFound and dir.optional) continue;
-                        return err;
-                    };
+                    try scanner.copyDirRecursive(allocator, game_dir, target_dir, dir.name);
+                    // Missing source dirs silently no-op via copyDirRecursive.
                 },
             }
         }
@@ -202,12 +197,14 @@ labelle: two plugins want the same convention directory 'state_machines':
   each plugin must use a unique directory name
 ```
 
-### E4. Directory missing (non-optional)
+### E4. Reserved directory name
 
 ```
-labelle: plugin 'fsm' declares convention_dir 'state_machines' (required)
-  but the directory does not exist in the game project at /path/to/game/state_machines
-  either create the directory or mark the plugin's convention_dir as optional
+labelle: plugin 'fsm' tried to declare convention_dir 'components'
+  but 'components' is reserved for first-class engine concepts.
+  reserved names: assets, components, enums, events, gizmos, hooks,
+                  prefabs, scenes, scripts, views
+  pick a different directory name for this plugin.
 ```
 
 ### E5. Manifest version unknown
@@ -247,11 +244,11 @@ v1 copies and scans. The name list returned by `copyAndScan` is computed but not
 
 If a plugin needs both `.zig` and `.zon` files in the same directory, it declares two `convention_dirs` entries with the same `name` and different extensions. Two entries is clearer than a `extensions: []const []const u8` field.
 
-### Q4. `optional` default — **`false` (required by default).**
+### Q4. `optional` field — **Dropped entirely.**
 
-Plugin authors opt into optionality explicitly. Most plugin-introduced directories are load-bearing, and "does this directory have to exist?" is a real decision that should not have a silent default.
+Originally proposed as a per-entry bool to control whether a missing source directory should error. Discovered during implementation that the existing CLI silently no-ops on missing convention directories: `scanner.copyAndScan` and `scanner.copyDirRecursive` both swallow `error.FileNotFound` (`generator/src/scanner.zig:50, 152`). A game today can omit `components/`, `hooks/`, `assets/` entirely and the CLI doesn't complain.
 
-`labelle-fsm` will set `optional = true` in its own manifest because games depending on labelle-fsm don't necessarily have any state machines yet. That's an explicit choice by the plugin author, not a paper-over of a default.
+The `optional` field would introduce a stricter behavior than the rest of the CLI uses, which is inconsistent and surprising. Dropped to match existing convention. A plugin that genuinely needs a non-empty directory at runtime can validate that itself, in its own initialization code, not at generate time.
 
 ### Q5. Interaction with `plugin.states` — **Manifest processed regardless of `states`.**
 

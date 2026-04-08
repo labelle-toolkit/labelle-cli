@@ -10,6 +10,13 @@ const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
 pub const template = @import("template.zig");
+pub const plugin_manifest = @import("plugin_manifest.zig");
+
+// Force test discovery for files that aren't transitively reached by
+// any compiled function path during `addTest` runs.
+test {
+    _ = @import("plugin_manifest.zig");
+}
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
 pub const Backend = config.Backend;
@@ -108,6 +115,51 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
 
     // Copy-only folders (no scanning needed)
     try scanner.copyDirRecursive(allocator, game_dir, target_dir, "assets");
+
+    // ── Plugin-declared convention directories ────────────────────────
+    // Each plugin in cfg.plugins may ship a `plugin.labelle` manifest at
+    // its root that declares additional directories the CLI should copy
+    // and/or scan from the game project. See
+    // `docs/RFC-plugin-manifest.md` for the design.
+    //
+    // The manifest is read regardless of `plugin.states` (game-state
+    // gating affects runtime, not generate-time layout). Missing source
+    // directories are silently tolerated, matching the behavior of the
+    // hardcoded scans above.
+    for (cfg.plugins) |plugin| {
+        var manifest = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse continue;
+        defer manifest.deinit();
+
+        for (manifest.convention_dirs) |dir| {
+            switch (dir.mode) {
+                .copy_and_scan => {
+                    // copy_and_scan requires extension. Default to .zig
+                    // if a manifest forgets it — matches the most common
+                    // case (every existing convention dir uses .zig).
+                    const ext = dir.extension orelse ".zig";
+                    const names = try scanner.copyAndScan(
+                        allocator,
+                        game_dir,
+                        target_dir,
+                        dir.name,
+                        ext,
+                    );
+                    // v1: name list is computed but not exposed to codegen.
+                    // Future RFC will decide how plugins drive main.zig
+                    // generation from these names.
+                    scanner.freeNames(allocator, names);
+                },
+                .copy_only => {
+                    try scanner.copyDirRecursive(
+                        allocator,
+                        game_dir,
+                        target_dir,
+                        dir.name,
+                    );
+                },
+            }
+        }
+    }
 
     // Generate build.zig.zon
     const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir);
