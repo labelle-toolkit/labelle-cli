@@ -25,6 +25,7 @@ const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
+const assembler = @import("cli/assembler.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
@@ -468,7 +469,24 @@ pub fn main() !void {
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
 
-    try gen.generate(allocator, parsed, output_dir, project_dir);
+    // Phase 2 of RFC #122: optionally route through the standalone
+    // labelle-assembler binary instead of the in-process generator.
+    // Opt-in via the LABELLE_ASSEMBLER env var pointing at a binary path.
+    // When unset, the existing in-process call path is used unchanged.
+    if (try assembler.lookupOverride(allocator)) |asm_path| {
+        defer allocator.free(asm_path);
+        std.debug.print("  using out-of-process assembler: {s}\n", .{asm_path});
+        try assembler.spawnGenerate(
+            allocator,
+            asm_path,
+            project_dir,
+            parsed_args.scene_override,
+            parsed.platform,
+            parsed.backend,
+        );
+    } else {
+        try gen.generate(allocator, parsed, output_dir, project_dir);
+    }
 
     // Target subdir: .labelle/raylib_desktop/, etc.
     const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), @tagName(parsed.platform) });
