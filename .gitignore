@@ -1,2 +1,8 @@
 .zig-cache/
 zig-out/
+
+# Fixture build artifacts — test/*-test/ directories are minimal game
+# projects run by the system-test CI steps. The generator produces
+# .labelle/ and labelle.lock inside them; neither should be committed.
+test/*/.labelle/
+test/*/labelle.lock

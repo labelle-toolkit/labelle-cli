@@ -10,6 +10,13 @@ const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
 pub const template = @import("template.zig");
+pub const plugin_manifest = @import("plugin_manifest.zig");
+
+// Force test discovery for files that aren't transitively reached by
+// any compiled function path during `addTest` runs.
+test {
+    _ = @import("plugin_manifest.zig");
+}
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
 pub const Backend = config.Backend;
@@ -108,6 +115,100 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
 
     // Copy-only folders (no scanning needed)
     try scanner.copyDirRecursive(allocator, game_dir, target_dir, "assets");
+
+    // ── Plugin-declared convention directories ────────────────────────
+    // Each plugin in cfg.plugins may ship a `plugin.labelle` manifest at
+    // its root that declares additional directories the CLI should copy
+    // and/or scan from the game project. See
+    // `docs/RFC-plugin-manifest.md` for the design.
+    //
+    // The manifest is read regardless of `plugin.states` (game-state
+    // gating affects runtime, not generate-time layout). Missing source
+    // directories are silently tolerated, matching the behavior of the
+    // hardcoded scans above.
+    //
+    // Duplicate directory declarations across plugins are a hard error
+    // (RFC E3). A single name can be claimed by exactly one plugin to
+    // keep the "who owns this directory" story unambiguous and prevent
+    // conflicting copy passes.
+    //
+    // All manifests are loaded first and kept alive until every copy
+    // pass has run, so the duplicate-detection hash map (which stores
+    // slices into parsed manifest memory) stays valid across plugins.
+    //
+    // Pre-reserve capacity up front so the per-plugin append cannot
+    // fail. If we used a fallible append, a successful loadOptional
+    // followed by an OOM-on-resize would leak the parsed manifest
+    // (it wouldn't have made it into the cleanup list).
+    var loaded_manifests = std.ArrayListUnmanaged(plugin_manifest.PluginManifest){};
+    defer {
+        for (loaded_manifests.items) |*m| m.deinit();
+        loaded_manifests.deinit(allocator);
+    }
+    try loaded_manifests.ensureTotalCapacity(allocator, cfg.plugins.len);
+
+    var owner_of_dir = std.StringHashMapUnmanaged([]const u8){};
+    defer owner_of_dir.deinit(allocator);
+
+    for (cfg.plugins) |plugin| {
+        const maybe_manifest = try plugin_manifest.loadOptional(allocator, plugin, game_dir);
+        const manifest = maybe_manifest orelse continue;
+        // Capacity was reserved above — this cannot fail, so there's
+        // no window where `manifest` is owned but outside the cleanup
+        // list's reach.
+        loaded_manifests.appendAssumeCapacity(manifest);
+
+        for (manifest.convention_dirs) |dir| {
+            // Duplicate detection is *cross-plugin only*. A single plugin
+            // is allowed to declare the same directory name in multiple
+            // convention_dirs entries with different extensions — that's
+            // the RFC Q3 multi-extension pattern (e.g. a plugin wanting
+            // both .zig and .zon files under state_machines/). Only error
+            // when a different plugin already claimed the name.
+            if (owner_of_dir.get(dir.name)) |prev_owner| {
+                if (!std.mem.eql(u8, prev_owner, plugin.name)) {
+                    std.debug.print(
+                        "labelle: two plugins want the same convention directory '{s}':\n  - plugin '{s}' already declared it\n  - plugin '{s}' is trying to declare it again\n  each plugin must use a unique directory name\n",
+                        .{ dir.name, prev_owner, plugin.name },
+                    );
+                    return error.PluginManifestDuplicateDir;
+                }
+                // Same plugin re-declaring the name (multi-extension) —
+                // don't overwrite the claim, just keep going and let the
+                // copy pass below handle it.
+            } else {
+                try owner_of_dir.put(allocator, dir.name, plugin.name);
+            }
+
+            switch (dir.mode) {
+                .copy_and_scan => {
+                    // `extension` is required for copy_and_scan and is
+                    // validated by plugin_manifest.loadFromDir at load
+                    // time, so .? here is safe.
+                    const ext = dir.extension.?;
+                    const names = try scanner.copyAndScan(
+                        allocator,
+                        game_dir,
+                        target_dir,
+                        dir.name,
+                        ext,
+                    );
+                    // v1: name list is computed but not exposed to codegen.
+                    // Future RFC will decide how plugins drive main.zig
+                    // generation from these names.
+                    scanner.freeNames(allocator, names);
+                },
+                .copy_only => {
+                    try scanner.copyDirRecursive(
+                        allocator,
+                        game_dir,
+                        target_dir,
+                        dir.name,
+                    );
+                },
+            }
+        }
+    }
 
     // Generate build.zig.zon
     const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir);

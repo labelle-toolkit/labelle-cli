@@ -1,0 +1,25 @@
+.{
+    .name = "plugin_manifest_test",
+    .title = "Plugin Manifest Test",
+    .backend = .raylib,
+    .ecs = .mock,
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../",
+    .plugins = .{
+        .{ .name = "fsm_test", .repo = "local:fake-fsm-plugin" },
+        // fake-other-plugin ships no plugin.labelle by default — it's a
+        // no-op manifest-less plugin (same shape as labelle-pathfinder).
+        // The CI duplicate-detection case temporarily writes a
+        // plugin.labelle into this directory to exercise the error path,
+        // then deletes it on cleanup.
+        .{ .name = "other_plugin", .repo = "local:fake-other-plugin" },
+    },
+    .states = .{"playing"},
+    .layers = .{
+        .{ .name = "background", .order = 0, .space = .screen },
+        .{ .name = "world", .order = 1, .space = .world },
+        .{ .name = "ui", .order = 2, .space = .screen },
+    },
+}
