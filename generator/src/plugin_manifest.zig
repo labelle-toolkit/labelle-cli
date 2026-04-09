@@ -83,14 +83,15 @@ pub const PluginManifest = struct {
 // ── Errors ─────────────────────────────────────────────────────────
 //
 // loadOptional uses an inferred error set so it composes cleanly with
-// std.fs and std.zon error unions across Zig versions. The four
-// validation errors below are the manifest-specific ones the caller
-// might want to match on:
+// std.fs and std.zon error unions across Zig versions. The manifest-
+// specific validation errors the caller might want to match on are:
 //
-//   error.PluginManifestParseError       — ZON parser rejected the file
-//   error.PluginManifestNameMismatch     — plugin.labelle name != .plugins entry name
-//   error.PluginManifestReservedDirName  — plugin tried to claim a reserved name
-//   error.PluginManifestUnknownVersion   — manifest_version > what we support
+//   error.PluginManifestParseError         — ZON parser rejected the file
+//   error.PluginManifestNameMismatch       — plugin.labelle name != .plugins entry name
+//   error.PluginManifestReservedDirName    — plugin tried to claim a reserved name
+//   error.PluginManifestUnsafeDirName      — convention_dir name is not a safe relative segment
+//   error.PluginManifestMissingExtension   — copy_and_scan entry omitted its required extension
+//   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
 
 /// Read and parse `plugin.labelle` for the given plugin if it exists.
 ///
@@ -117,6 +118,15 @@ pub fn loadOptional(
 ///
 /// `expected_name` is what `project.labelle`'s `.plugins` entry calls
 /// the plugin — the manifest's `name` field must match.
+///
+/// Returns `null` if the plugin has no `plugin.labelle` (legal — many
+/// plugins like labelle-pathfinder don't need one). Errors on:
+///   - ZON parse failure                  → PluginManifestParseError
+///   - name mismatch                      → PluginManifestNameMismatch
+///   - unsupported manifest_version       → PluginManifestUnknownVersion
+///   - reserved convention_dir name       → PluginManifestReservedDirName
+///   - unsafe convention_dir name         → PluginManifestUnsafeDirName
+///   - missing extension on copy_and_scan → PluginManifestMissingExtension
 ///
 /// The returned manifest owns its strings as deep heap copies made by
 /// the ZON parser; the source buffer is freed before returning. Call
@@ -179,9 +189,13 @@ pub fn loadFromDir(
     }
 
     // ── Validate manifest_version ──
-    if (parsed.manifest_version > SUPPORTED_MANIFEST_VERSION) {
+    // Valid versions: 1 <= v <= SUPPORTED_MANIFEST_VERSION. Version 0 is
+    // not a real schema version — probably a plugin author who forgot to
+    // set the field or typed 0 by accident — and should be flagged the
+    // same way as an unknown future version.
+    if (parsed.manifest_version < 1 or parsed.manifest_version > SUPPORTED_MANIFEST_VERSION) {
         std.debug.print(
-            "labelle: plugin '{s}' requires manifest_version {d}\n  but this labelle-cli release supports up to manifest_version {d}\n  upgrade labelle-cli or downgrade the plugin\n",
+            "labelle: plugin '{s}' has manifest_version {d}\n  but this labelle-cli release supports manifest_version 1..{d}\n  fix the plugin.labelle manifest or upgrade/downgrade labelle-cli\n",
             .{ expected_name, parsed.manifest_version, SUPPORTED_MANIFEST_VERSION },
         );
         return error.PluginManifestUnknownVersion;
@@ -464,6 +478,27 @@ test "loadFromDir: errors on manifest_version higher than supported" {
         \\.{
         \\    .name = "fsm",
         \\    .manifest_version = 99,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "fsm");
+    try testing.expectError(error.PluginManifestUnknownVersion, result);
+}
+
+test "loadFromDir: errors on manifest_version zero" {
+    // manifest_version = 0 is not a real schema version — catch the
+    // "plugin author forgot to set it / typed 0 by accident" case with
+    // the same error as an unknown future version.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "fsm",
+        \\    .manifest_version = 0,
         \\}
     );
 

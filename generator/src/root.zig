@@ -135,18 +135,28 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     // All manifests are loaded first and kept alive until every copy
     // pass has run, so the duplicate-detection hash map (which stores
     // slices into parsed manifest memory) stays valid across plugins.
+    //
+    // Pre-reserve capacity up front so the per-plugin append cannot
+    // fail. If we used a fallible append, a successful loadOptional
+    // followed by an OOM-on-resize would leak the parsed manifest
+    // (it wouldn't have made it into the cleanup list).
     var loaded_manifests = std.ArrayListUnmanaged(plugin_manifest.PluginManifest){};
     defer {
         for (loaded_manifests.items) |*m| m.deinit();
         loaded_manifests.deinit(allocator);
     }
+    try loaded_manifests.ensureTotalCapacity(allocator, cfg.plugins.len);
+
     var owner_of_dir = std.StringHashMapUnmanaged([]const u8){};
     defer owner_of_dir.deinit(allocator);
 
     for (cfg.plugins) |plugin| {
         const maybe_manifest = try plugin_manifest.loadOptional(allocator, plugin, game_dir);
         const manifest = maybe_manifest orelse continue;
-        try loaded_manifests.append(allocator, manifest);
+        // Capacity was reserved above — this cannot fail, so there's
+        // no window where `manifest` is owned but outside the cleanup
+        // list's reach.
+        loaded_manifests.appendAssumeCapacity(manifest);
 
         for (manifest.convention_dirs) |dir| {
             // Duplicate detection is *cross-plugin only*. A single plugin

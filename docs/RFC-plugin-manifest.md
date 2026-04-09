@@ -81,11 +81,11 @@ A plugin that wants to extend project layout ships a `plugin.labelle` file at it
 
 Each `convention_dirs` entry:
 
-| Field         | Type        | Required | Description                                                                 |
-|---------------|-------------|----------|-----------------------------------------------------------------------------|
-| `name`        | `[]const u8`| yes      | Directory name, relative to the game project root (e.g., `"state_machines"`). |
-| `extension`   | `[]const u8`| yes      | File extension to scan (e.g., `".zig"`, `".jsonc"`). Ignored when `mode = .copy_only`. |
-| `mode`        | enum        | yes      | `.copy_and_scan` (copies files + returns name list) or `.copy_only` (copies files, no name list — like `assets/`). |
+| Field         | Type           | Required                         | Description                                                                 |
+|---------------|----------------|----------------------------------|-----------------------------------------------------------------------------|
+| `name`        | `[]const u8`   | yes                              | Directory name, relative to the game project root (e.g., `"state_machines"`). Must be a safe single segment — no `..`, no path separators, no absolute paths. |
+| `extension`   | `?[]const u8`  | only when `mode = .copy_and_scan`| File extension to scan (e.g., `".zig"`, `".jsonc"`). `.copy_only` entries omit this field. `loadFromDir` errors with `PluginManifestMissingExtension` if a `copy_and_scan` entry is missing its extension. |
+| `mode`        | enum           | yes                              | `.copy_and_scan` (copies files + returns name list) or `.copy_only` (copies files recursively, no scanning — like `assets/`). |
 
 ### Mode semantics
 
@@ -228,7 +228,7 @@ If in the future we want to unify the two, we can introduce a `plugin.labelle` w
 
 The `manifest_version` field is a `u8` that:
 
-- **v1** = this RFC. Supports `name`, `convention_dirs`, optionality.
+- **v1** = this RFC. Supports `name` and `convention_dirs` (each with `name`, `extension`, `mode`).
 - Future versions may add fields. The CLI refuses to load a manifest with a version higher than it knows about (E5), so plugins using new features fail cleanly against old CLIs instead of being silently partially-loaded.
 - Dropping a field or changing semantics bumps the version.
 - Adding a new optional field does not bump the version (forward-compatible within a major version).

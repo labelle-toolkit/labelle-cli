@@ -54,7 +54,7 @@ Because `labelle generate` loads the engine template, this fixture depends on `l
 
 ## Why not a Zig unit test
 
-A unit test in `generator/src/plugin_manifest.zig` (there are 18 of them) covers the manifest parser and validation logic. This fixture exists to catch regressions in the *integration glue*:
+The unit tests in `generator/src/plugin_manifest.zig` cover the manifest parser and validation logic. This fixture exists to catch regressions in the *integration glue*:
 
 - Does `cache.resolvePlugin` correctly resolve `local:fake-fsm-plugin` relative to `project_dir`?
 - Does the generator's plugin loop actually hand control to the manifest reader?
