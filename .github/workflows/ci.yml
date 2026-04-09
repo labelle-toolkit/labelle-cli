@@ -191,3 +191,106 @@ jobs:
           ../../labelle-cli/zig-out/bin/labelle generate
           cd .labelle/raylib_desktop
           zig build
+
+      - name: Plugin manifest system test
+        run: |
+          set -e
+          cd labelle-cli/test/plugin-manifest-test
+          CLI="$GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle"
+          ORIG=$(cat fake-fsm-plugin/plugin.labelle)
+
+          cleanup() {
+            echo "$ORIG" > fake-fsm-plugin/plugin.labelle
+            rm -rf .labelle labelle.lock
+          }
+          trap cleanup EXIT
+
+          # --- Happy path: plugin.labelle is read and state_machines/
+          # is copied into the generated build target ---
+          "$CLI" generate
+          test -f .labelle/raylib_desktop/state_machines/probe_machine.zig
+          echo "OK: happy path copied state_machines/probe_machine.zig"
+          rm -rf .labelle labelle.lock
+
+          # --- Missing extension on copy_and_scan must fail ---
+          cat > fake-fsm-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "fsm_test",
+              .manifest_version = 1,
+              .convention_dirs = .{
+                  .{ .name = "state_machines", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: missing extension should have errored"
+            exit 1
+          fi
+          echo "OK: missing extension rejected"
+
+          # --- Reserved dir name must fail ---
+          cat > fake-fsm-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "fsm_test",
+              .manifest_version = 1,
+              .convention_dirs = .{
+                  .{ .name = "components", .extension = ".zig", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: reserved dir name should have errored"
+            exit 1
+          fi
+          echo "OK: reserved dir name rejected"
+
+          # --- Path traversal must fail ---
+          cat > fake-fsm-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "fsm_test",
+              .manifest_version = 1,
+              .convention_dirs = .{
+                  .{ .name = "../../etc", .extension = ".zig", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: path traversal should have errored"
+            exit 1
+          fi
+          echo "OK: path traversal rejected"
+
+          # --- Unknown manifest_version must fail ---
+          cat > fake-fsm-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "fsm_test",
+              .manifest_version = 99,
+              .convention_dirs = .{
+                  .{ .name = "state_machines", .extension = ".zig", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: unknown manifest_version should have errored"
+            exit 1
+          fi
+          echo "OK: unknown manifest_version rejected"
+
+          # --- Name mismatch must fail ---
+          cat > fake-fsm-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "wrong_name",
+              .manifest_version = 1,
+              .convention_dirs = .{
+                  .{ .name = "state_machines", .extension = ".zig", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: name mismatch should have errored"
+            exit 1
+          fi
+          echo "OK: name mismatch rejected"
+
+          # trap cleanup restores the original manifest and wipes artifacts
+          echo "plugin-manifest system test: all cases passed"

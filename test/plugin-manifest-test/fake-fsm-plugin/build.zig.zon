@@ -1,0 +1,13 @@
+.{
+    .name = .fsm_test,
+    .version = "0.0.0",
+    .fingerprint = 0xbe3d0d47ab92f401,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "plugin.labelle",
+        "src",
+    },
+}

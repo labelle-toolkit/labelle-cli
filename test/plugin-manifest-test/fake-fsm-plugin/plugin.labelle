@@ -1,0 +1,17 @@
+// Fake plugin manifest for the plugin-manifest system test.
+//
+// Declares `state_machines/` as a convention directory so `labelle
+// generate` knows to copy state_machines/*.zig from the game project
+// into the generated build target. Used by ../project.labelle's
+// .plugins list.
+.{
+    .name = "fsm_test",
+    .manifest_version = 1,
+    .convention_dirs = .{
+        .{
+            .name = "state_machines",
+            .extension = ".zig",
+            .mode = .copy_and_scan,
+        },
+    },
+}
