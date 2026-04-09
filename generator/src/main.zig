@@ -128,6 +128,14 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
 
     if (scene_override) |s| cfg.initial_scene = s;
 
+    // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
+    // and populates cfg.resolved_gui. Must run before gen.generate so the
+    // generated build.zig/zon and main.zig include the GUI module wiring.
+    gen.resolveGuiPlugin(arena_alloc, &cfg, root) catch |err| {
+        std.debug.print("labelle-assembler: failed to resolve GUI plugin: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
     const output_dir = try std.fs.path.join(allocator, &.{ root, ".labelle" });
     defer allocator.free(output_dir);
 
@@ -139,6 +147,15 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
     defer allocator.free(target_name);
     std.debug.print("labelle-assembler: generated .labelle/{s}/\n", .{target_name});
+
+    // NOTE: build.zig.zon's `.fingerprint` field is left at the placeholder
+    // value emitted by the generator template. The CLI patches it via a
+    // post-generate `runner.fixFingerprint` pass that runs `zig build`,
+    // parses Zig's "use this value: 0x..." error from stderr, and rewrites
+    // the field. Until Phase 2 wires the launcher to do that post-step
+    // around the subprocess invocation, callers of this binary must run
+    // an equivalent fixFingerprint pass before `zig build` will succeed
+    // against the generated tree. Tracked for follow-up.
 }
 
 /// Inline copy of `cli/config.zig:readProjectConfig`. Lives here so the
