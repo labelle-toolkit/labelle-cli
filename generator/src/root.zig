@@ -126,17 +126,44 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     // gating affects runtime, not generate-time layout). Missing source
     // directories are silently tolerated, matching the behavior of the
     // hardcoded scans above.
+    //
+    // Duplicate directory declarations across plugins are a hard error
+    // (RFC E3). A single name can be claimed by exactly one plugin to
+    // keep the "who owns this directory" story unambiguous and prevent
+    // conflicting copy passes.
+    //
+    // All manifests are loaded first and kept alive until every copy
+    // pass has run, so the duplicate-detection hash map (which stores
+    // slices into parsed manifest memory) stays valid across plugins.
+    var loaded_manifests = std.ArrayListUnmanaged(plugin_manifest.PluginManifest){};
+    defer {
+        for (loaded_manifests.items) |*m| m.deinit();
+        loaded_manifests.deinit(allocator);
+    }
+    var owner_of_dir = std.StringHashMapUnmanaged([]const u8){};
+    defer owner_of_dir.deinit(allocator);
+
     for (cfg.plugins) |plugin| {
-        var manifest = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse continue;
-        defer manifest.deinit();
+        const maybe_manifest = try plugin_manifest.loadOptional(allocator, plugin, game_dir);
+        const manifest = maybe_manifest orelse continue;
+        try loaded_manifests.append(allocator, manifest);
 
         for (manifest.convention_dirs) |dir| {
+            if (owner_of_dir.get(dir.name)) |prev_owner| {
+                std.debug.print(
+                    "labelle: two plugins want the same convention directory '{s}':\n  - plugin '{s}' already declared it\n  - plugin '{s}' is trying to declare it again\n  each plugin must use a unique directory name\n",
+                    .{ dir.name, prev_owner, plugin.name },
+                );
+                return error.PluginManifestDuplicateDir;
+            }
+            try owner_of_dir.put(allocator, dir.name, plugin.name);
+
             switch (dir.mode) {
                 .copy_and_scan => {
-                    // copy_and_scan requires extension. Default to .zig
-                    // if a manifest forgets it — matches the most common
-                    // case (every existing convention dir uses .zig).
-                    const ext = dir.extension orelse ".zig";
+                    // `extension` is required for copy_and_scan and is
+                    // validated by plugin_manifest.loadFromDir at load
+                    // time, so .? here is safe.
+                    const ext = dir.extension.?;
                     const names = try scanner.copyAndScan(
                         allocator,
                         game_dir,

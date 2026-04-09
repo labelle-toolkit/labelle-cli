@@ -2,7 +2,7 @@
 
 **Status:** Ready for implementation
 **Scope:** `labelle-cli` generator — add a general-purpose `plugin.labelle` manifest
-**Prerequisite for:** `labelle-fsm` (see `/home/alexandre/prj/labelle/labelle-fsm/RFC.md`) and any future plugin that introduces its own convention directory
+**Prerequisite for:** `labelle-fsm` and any future plugin that introduces its own convention directory
 
 ---
 
@@ -142,17 +142,20 @@ pub const ConventionDirMode = enum { copy_and_scan, copy_only };
 
 pub const ConventionDir = struct {
     name: []const u8,
-    extension: []const u8,
+    /// Required when `mode == .copy_and_scan`, null when `.copy_only`.
+    /// Enforced by `loadFromDir` — missing extension on a copy_and_scan
+    /// entry returns `error.PluginManifestMissingExtension`.
+    extension: ?[]const u8 = null,
     mode: ConventionDirMode,
-    optional: bool = false,
 };
 
 pub const PluginManifest = struct {
     name: []const u8,
     manifest_version: u8,
     convention_dirs: []const ConventionDir = &.{},
+    allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *PluginManifest, allocator: std.mem.Allocator) void { ... }
+    pub fn deinit(self: *PluginManifest) void { ... }
 };
 
 /// Returns null if the plugin has no plugin.labelle file. Errors on parse failure.
@@ -273,7 +276,7 @@ Same approach as `ProjectConfig` parsing today (`labelle-cli/src/cli/`). Forward
 
 1. **Add `plugin_manifest.zig`** to `generator/src/` with `PluginManifest`, `loadOptional`, `validate`, and the error messages listed above.
 2. **Extend `root.zig`** with the plugin-manifest scan loop after the hardcoded scans.
-3. **Tests** — unit tests for parse success, parse failure, name mismatch, duplicate dir, reserved dir, optional missing dir, unknown version.
+3. **Tests** — unit tests for parse success, parse failure, name mismatch, duplicate dir across plugins, reserved dir, unsafe dir name (path traversal), missing extension on copy_and_scan, unknown manifest version, forward-compat `ignore_unknown_fields`.
 4. **Integration test** — a fake plugin with a manifest declaring `state_machines/`, a fake game project with and without the directory, verify copy/scan behavior.
 5. **Documentation** — add a "Plugin Manifest" section to the CLI README explaining the schema and the reserved-name list.
 6. **Ship** as a CLI minor version bump (e.g., 0.5.0 → 0.6.0). No backwards incompatibility — plugins without a manifest continue to work.

@@ -50,9 +50,15 @@ pub const ConventionDir = struct {
     mode: ConventionDirMode,
 };
 
-/// Parsed and validated `plugin.labelle` manifest. All string fields
-/// (name, convention_dirs entries' name/extension) are heap-allocated
-/// by the ZON parser. Call `deinit` to release them.
+/// Parsed and validated `plugin.labelle` manifest.
+///
+/// Ownership: every string field (`name`, each `ConventionDir.name`
+/// and `ConventionDir.extension`) is a heap allocation made by the
+/// ZON parser via `parseString → toOwnedSlice`. Strings are deep
+/// copies, *not* references into the source buffer — the source
+/// buffer is freed immediately after parsing in `loadFromDir`.
+/// Call `deinit` to release all heap allocations owned by the
+/// manifest.
 pub const PluginManifest = struct {
     name: []const u8,
     manifest_version: u8,
@@ -64,11 +70,11 @@ pub const PluginManifest = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PluginManifest) void {
-        // The ZON parser allocates fresh string copies via
-        // parseString → toOwnedSlice (see std/zon/parse.zig). Free
-        // every heap-allocated field individually — std.zon.parse.free
-        // walks slices and structs recursively, so passing the
-        // top-level slice frees its elements' nested strings too.
+        // Free every heap-allocated field individually.
+        // std.zon.parse.free walks slices and structs recursively,
+        // so passing `self.convention_dirs` frees each element's
+        // nested `name` and `extension` strings in addition to the
+        // outer slice.
         std.zon.parse.free(self.allocator, self.name);
         std.zon.parse.free(self.allocator, self.convention_dirs);
     }
@@ -112,6 +118,10 @@ pub fn loadOptional(
 /// `expected_name` is what `project.labelle`'s `.plugins` entry calls
 /// the plugin — the manifest's `name` field must match.
 ///
+/// The returned manifest owns its strings as deep heap copies made by
+/// the ZON parser; the source buffer is freed before returning. Call
+/// `PluginManifest.deinit` to release them.
+///
 /// Exposed publicly so tests and tooling can exercise the manifest
 /// machinery without needing the full plugin-cache resolution path.
 pub fn loadFromDir(
@@ -136,9 +146,17 @@ pub fn loadFromDir(
     defer allocator.free(raw_z);
 
     // Parse with the typed ZON struct (matches gui_resolve.zig pattern).
-    // The parser allocates fresh string copies, so raw_z can be freed
-    // immediately after parsing succeeds.
-    const parsed = std.zon.parse.fromSlice(ZonManifest, allocator, raw_z, null, .{}) catch |err| {
+    // The parser allocates fresh string copies via parseString →
+    // toOwnedSlice, so raw_z can be freed immediately after parsing
+    // succeeds — the returned slices are independent heap allocations.
+    //
+    // ignore_unknown_fields = true is intentional forward-compat: a
+    // manifest from a future plugin that adds a new optional field
+    // should still load in an older CLI. Hard-incompat changes bump
+    // manifest_version (checked below) rather than adding fields.
+    const parsed = std.zon.parse.fromSlice(ZonManifest, allocator, raw_z, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
         std.debug.print(
             "labelle: failed to parse plugin.labelle for plugin '{s}' at {s}\n  parser error: {any}\n  see docs/RFC-plugin-manifest.md for the manifest schema\n",
             .{ expected_name, manifest_path, err },
@@ -169,8 +187,9 @@ pub fn loadFromDir(
         return error.PluginManifestUnknownVersion;
     }
 
-    // ── Validate convention_dirs against reserved names ──
+    // ── Validate every convention_dir entry ──
     for (parsed.convention_dirs) |dir| {
+        // Reserved names — mustn't shadow a hardcoded convention dir.
         if (isReservedDirName(dir.name)) {
             std.debug.print(
                 "labelle: plugin '{s}' tried to declare convention_dir '{s}'\n  but '{s}' is reserved for first-class engine concepts.\n  reserved names: ",
@@ -182,6 +201,33 @@ pub fn loadFromDir(
             }
             std.debug.print("\n  pick a different directory name for this plugin.\n", .{});
             return error.PluginManifestReservedDirName;
+        }
+
+        // Path-traversal guard. `dir.name` is concatenated into a path
+        // passed to copyAndScan / copyDirRecursive, so a malicious or
+        // buggy plugin declaring "../../etc" or "/abs/path" could
+        // read/write outside the game root. Require a plain relative
+        // segment: non-empty, no path separators, no `..` or `.`,
+        // no leading `/` or `\`, no null bytes.
+        if (!isSafeDirName(dir.name)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declared convention_dir name '{s}' that is not a safe relative directory name\n  directory names must be plain single segments (no '/', '\\', '..', '.', absolute paths, or NUL)\n",
+                .{ expected_name, dir.name },
+            );
+            return error.PluginManifestUnsafeDirName;
+        }
+
+        // copy_and_scan mode requires an explicit extension. root.zig
+        // used to silently default to ".zig", which hid typos and
+        // surprised plugin authors scanning .jsonc or .zon files. The
+        // RFC marks extension as required for this mode — enforce it
+        // here at load time with a clear diagnostic.
+        if (dir.mode == .copy_and_scan and dir.extension == null) {
+            std.debug.print(
+                "labelle: plugin '{s}' declared convention_dir '{s}' with mode .copy_and_scan\n  but 'extension' is missing. copy_and_scan mode requires a file extension to scan (e.g. \".zig\").\n  use mode .copy_only if you want to copy every file regardless of extension.\n",
+                .{ expected_name, dir.name },
+            );
+            return error.PluginManifestMissingExtension;
         }
     }
 
@@ -200,6 +246,29 @@ pub fn isReservedDirName(name: []const u8) bool {
     return false;
 }
 
+/// Returns true iff `name` is a plain, safe relative directory segment
+/// suitable for concatenating into a path under the game root.
+///
+/// Rejects anything that could escape the game directory or otherwise
+/// surprise the copy/scan routines:
+///   - empty string
+///   - contains a path separator (`/` or `\`)
+///   - `.` or `..` exactly
+///   - contains a NUL byte
+///
+/// Subdirectory paths (e.g. `"nested/dir"`) are intentionally rejected
+/// too — plugins should declare one `convention_dirs` entry per
+/// top-level directory, not walk into subfolders at declaration time.
+pub fn isSafeDirName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.eql(u8, name, ".")) return false;
+    if (std.mem.eql(u8, name, "..")) return false;
+    for (name) |c| {
+        if (c == '/' or c == '\\' or c == 0) return false;
+    }
+    return true;
+}
+
 // ── ZON-parseable manifest type ───────────────────────────────────
 //
 // Mirrors the public-facing PluginManifest but without the lifetime
@@ -215,12 +284,6 @@ const ZonManifest = struct {
 // ============================================================================
 
 const testing = std.testing;
-
-fn writeTempManifest(tmp: std.testing.TmpDir, body: []const u8) !void {
-    var f = try tmp.dir.createFile("plugin.labelle", .{});
-    defer f.close();
-    try f.writeAll(body);
-}
 
 test "isReservedDirName: matches every hardcoded name" {
     inline for (.{
@@ -479,4 +542,126 @@ test "loadFromDir: parses copy_only mode end-to-end" {
 
     try testing.expectEqual(ConventionDirMode.copy_only, manifest.convention_dirs[0].mode);
     try testing.expectEqualStrings("fsm_extras", manifest.convention_dirs[0].name);
+}
+
+test "isSafeDirName: accepts plain segments, rejects escape attempts" {
+    try testing.expect(isSafeDirName("state_machines"));
+    try testing.expect(isSafeDirName("fsm_extras"));
+    try testing.expect(isSafeDirName("a"));
+    try testing.expect(isSafeDirName("with.dots.ok"));
+
+    try testing.expect(!isSafeDirName(""));
+    try testing.expect(!isSafeDirName("."));
+    try testing.expect(!isSafeDirName(".."));
+    try testing.expect(!isSafeDirName("../escape"));
+    try testing.expect(!isSafeDirName("foo/bar"));
+    try testing.expect(!isSafeDirName("foo\\bar"));
+    try testing.expect(!isSafeDirName("/absolute"));
+    try testing.expect(!isSafeDirName("has\x00null"));
+}
+
+test "loadFromDir: rejects path traversal in convention_dir name" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "evil",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "../../etc",
+        \\            .extension = ".zig",
+        \\            .mode = .copy_and_scan,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "evil");
+    try testing.expectError(error.PluginManifestUnsafeDirName, result);
+}
+
+test "loadFromDir: rejects absolute path in convention_dir name" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "evil",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "/tmp/absolute",
+        \\            .extension = ".zig",
+        \\            .mode = .copy_and_scan,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "evil");
+    try testing.expectError(error.PluginManifestUnsafeDirName, result);
+}
+
+test "loadFromDir: rejects copy_and_scan without extension" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "fsm",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "state_machines",
+        \\            .mode = .copy_and_scan,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "fsm");
+    try testing.expectError(error.PluginManifestMissingExtension, result);
+}
+
+test "loadFromDir: ignore_unknown_fields allows forward-compat manifests" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A future v1-compatible manifest that adds a hypothetical `author`
+    // field. An older CLI should silently ignore the unknown field and
+    // still load the rest of the manifest.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "fsm",
+        \\    .manifest_version = 1,
+        \\    .author = "future-you",
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "state_machines",
+        \\            .extension = ".zig",
+        \\            .mode = .copy_and_scan,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "fsm")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqualStrings("fsm", manifest.name);
+    try testing.expectEqual(@as(usize, 1), manifest.convention_dirs.len);
 }
