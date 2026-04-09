@@ -201,15 +201,58 @@ jobs:
 
           cleanup() {
             echo "$ORIG" > fake-fsm-plugin/plugin.labelle
+            rm -f fake-other-plugin/plugin.labelle
             rm -rf .labelle labelle.lock
           }
           trap cleanup EXIT
 
           # --- Happy path: plugin.labelle is read and state_machines/
-          # is copied into the generated build target ---
+          # is copied into the generated build target. Second plugin
+          # (fake-other-plugin) has no manifest — exercises the
+          # manifest-less plugin path too. ---
           "$CLI" generate
           test -f .labelle/raylib_desktop/state_machines/probe_machine.zig
           echo "OK: happy path copied state_machines/probe_machine.zig"
+          rm -rf .labelle labelle.lock
+
+          # --- Same plugin declaring same name with two extensions is
+          # allowed (RFC Q3 multi-extension pattern) ---
+          cat > fake-fsm-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "fsm_test",
+              .manifest_version = 1,
+              .convention_dirs = .{
+                  .{ .name = "state_machines", .extension = ".zig", .mode = .copy_and_scan },
+                  .{ .name = "state_machines", .extension = ".zon", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if ! "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: multi-extension same-plugin pattern should have succeeded"
+            exit 1
+          fi
+          test -f .labelle/raylib_desktop/state_machines/probe_machine.zig
+          echo "OK: multi-extension same-plugin pattern accepted"
+          echo "$ORIG" > fake-fsm-plugin/plugin.labelle
+          rm -rf .labelle labelle.lock
+
+          # --- Cross-plugin duplicate: fake-other-plugin claims the
+          # same directory name — must fail ---
+          cat > fake-other-plugin/plugin.labelle << 'EOF'
+          .{
+              .name = "other_plugin",
+              .manifest_version = 1,
+              .convention_dirs = .{
+                  .{ .name = "state_machines", .extension = ".zig", .mode = .copy_and_scan },
+              },
+          }
+          EOF
+          if "$CLI" generate > /dev/null 2>&1; then
+            echo "FAIL: cross-plugin duplicate should have errored"
+            exit 1
+          fi
+          echo "OK: cross-plugin duplicate rejected"
+          rm -f fake-other-plugin/plugin.labelle
           rm -rf .labelle labelle.lock
 
           # --- Missing extension on copy_and_scan must fail ---
@@ -292,5 +335,6 @@ jobs:
           fi
           echo "OK: name mismatch rejected"
 
-          # trap cleanup restores the original manifest and wipes artifacts
+          # trap cleanup restores the original manifest, deletes the
+          # temporary fake-other-plugin/plugin.labelle, and wipes artifacts
           echo "plugin-manifest system test: all cases passed"

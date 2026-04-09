@@ -1,0 +1,12 @@
+.{
+    .name = .other_plugin,
+    .version = "0.0.0",
+    .fingerprint = 0x7c91e82a43d5b609,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

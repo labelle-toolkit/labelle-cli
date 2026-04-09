@@ -149,14 +149,26 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
         try loaded_manifests.append(allocator, manifest);
 
         for (manifest.convention_dirs) |dir| {
+            // Duplicate detection is *cross-plugin only*. A single plugin
+            // is allowed to declare the same directory name in multiple
+            // convention_dirs entries with different extensions — that's
+            // the RFC Q3 multi-extension pattern (e.g. a plugin wanting
+            // both .zig and .zon files under state_machines/). Only error
+            // when a different plugin already claimed the name.
             if (owner_of_dir.get(dir.name)) |prev_owner| {
-                std.debug.print(
-                    "labelle: two plugins want the same convention directory '{s}':\n  - plugin '{s}' already declared it\n  - plugin '{s}' is trying to declare it again\n  each plugin must use a unique directory name\n",
-                    .{ dir.name, prev_owner, plugin.name },
-                );
-                return error.PluginManifestDuplicateDir;
+                if (!std.mem.eql(u8, prev_owner, plugin.name)) {
+                    std.debug.print(
+                        "labelle: two plugins want the same convention directory '{s}':\n  - plugin '{s}' already declared it\n  - plugin '{s}' is trying to declare it again\n  each plugin must use a unique directory name\n",
+                        .{ dir.name, prev_owner, plugin.name },
+                    );
+                    return error.PluginManifestDuplicateDir;
+                }
+                // Same plugin re-declaring the name (multi-extension) —
+                // don't overwrite the claim, just keep going and let the
+                // copy pass below handle it.
+            } else {
+                try owner_of_dir.put(allocator, dir.name, plugin.name);
             }
-            try owner_of_dir.put(allocator, dir.name, plugin.name);
 
             switch (dir.mode) {
                 .copy_and_scan => {

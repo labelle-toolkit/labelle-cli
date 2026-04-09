@@ -9,6 +9,12 @@
     .labelle_version = "local:../../",
     .plugins = .{
         .{ .name = "fsm_test", .repo = "local:fake-fsm-plugin" },
+        // fake-other-plugin ships no plugin.labelle by default — it's a
+        // no-op manifest-less plugin (same shape as labelle-pathfinder).
+        // The CI duplicate-detection case temporarily writes a
+        // plugin.labelle into this directory to exercise the error path,
+        // then deletes it on cleanup.
+        .{ .name = "other_plugin", .repo = "local:fake-other-plugin" },
     },
     .states = .{"playing"},
     .layers = .{
