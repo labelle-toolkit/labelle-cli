@@ -1,5 +1,6 @@
 const std = @import("std");
 const gen = @import("generator");
+const assembler = @import("assembler.zig");
 
 /// Scaffold a new project directory with project.labelle and starter files.
 pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -12,6 +13,7 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     var engine_version: []const u8 = gen.ENGINE_VERSION;
     var gfx_version: []const u8 = gen.GFX_VERSION;
     var labelle_version: []const u8 = gen.CLI_VERSION;
+    var assembler_version: []const u8 = assembler.DEFAULT_ASSEMBLER_VERSION;
 
     for (cmd_args) |arg| {
         if (std.mem.startsWith(u8, arg, "--backend=")) {
@@ -28,6 +30,8 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
             gfx_version = arg["--gfx-version=".len..];
         } else if (std.mem.startsWith(u8, arg, "--labelle-version=")) {
             labelle_version = arg["--labelle-version=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--assembler-version=")) {
+            assembler_version = arg["--assembler-version=".len..];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle init: unknown flag '{s}'\n", .{arg});
             return error.UnknownFlag;
@@ -93,9 +97,10 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
             \\    .engine_version = "{s}",
             \\    .gfx_version = "{s}",
             \\    .labelle_version = "{s}",
+            \\    .assembler_version = "{s}",
             \\}}
             \\
-        , .{ core_version, engine_version, gfx_version, labelle_version });
+        , .{ core_version, engine_version, gfx_version, labelle_version, assembler_version });
 
         const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
         defer allocator.free(path);
