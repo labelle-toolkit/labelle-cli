@@ -303,6 +303,7 @@ fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
     }
     std.debug.print("labelle assembler: unknown subcommand '{s}'\n", .{cmd_args[0]});
     std.debug.print("  usage: labelle assembler list\n", .{});
+    return error.UnknownSubcommand;
 }
 
 pub fn main() !void {

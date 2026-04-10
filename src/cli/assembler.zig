@@ -28,20 +28,26 @@ pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 /// Platform/arch names used in the release URL.
-fn osName() []const u8 {
+fn osName() error{UnsupportedPlatform}![]const u8 {
     return switch (builtin.os.tag) {
         .macos => "macos",
         .linux => "linux",
         .windows => "windows",
-        else => "unknown",
+        else => {
+            std.debug.print("labelle: unsupported OS for assembler download: {s}\n", .{@tagName(builtin.os.tag)});
+            return error.UnsupportedPlatform;
+        },
     };
 }
 
-fn archName() []const u8 {
+fn archName() error{UnsupportedPlatform}![]const u8 {
     return switch (builtin.cpu.arch) {
         .aarch64 => "aarch64",
         .x86_64 => "x86_64",
-        else => "unknown",
+        else => {
+            std.debug.print("labelle: unsupported architecture for assembler download: {s}\n", .{@tagName(builtin.cpu.arch)});
+            return error.UnsupportedPlatform;
+        },
     };
 }
 
@@ -58,8 +64,8 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
     const url = try std.fmt.allocPrint(allocator, "{s}/v{s}/labelle-assembler-{s}-{s}", .{
         ASSEMBLER_RELEASE_BASE,
         version,
-        osName(),
-        archName(),
+        try osName(),
+        try archName(),
     });
     defer allocator.free(url);
 
@@ -67,7 +73,7 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
     std.debug.print("  url: {s}\n", .{url});
 
     // Ensure the parent directory exists.
-    if (std.fs.path.dirnamePosix(dest_path) orelse std.fs.path.dirnameWindows(dest_path)) |dir| {
+    if (std.fs.path.dirname(dest_path)) |dir| {
         std.fs.cwd().makePath(dir) catch |err| {
             std.debug.print("labelle: could not create directory {s}: {any}\n", .{ dir, err });
             return error.AssemblerDownloadFailed;
@@ -102,7 +108,14 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
 
     // Make executable on Unix.
     if (builtin.os.tag != .windows) {
-        _ = util.runCmd(allocator, &.{ "chmod", "+x", dest_path }) catch {};
+        const file = std.fs.cwd().openFile(dest_path, .{}) catch |err| {
+            std.debug.print("labelle: could not open {s} for chmod: {any}\n", .{ dest_path, err });
+            return;
+        };
+        defer file.close();
+        file.chmod(0o755) catch |err| {
+            std.debug.print("labelle: chmod failed for {s}: {any}\n", .{ dest_path, err });
+        };
     }
 
     std.debug.print("  cached at {s}\n", .{dest_path});
@@ -132,21 +145,27 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
 
     // Verify the binary exists; if not, auto-download it.
-    std.fs.cwd().access(asm_path, .{}) catch {
-        // Phase 4: auto-download instead of just erroring.
-        std.debug.print("labelle: assembler v{s} not cached, downloading...\n", .{pinned_version});
-        downloadAssembler(allocator, pinned_version, asm_path) catch {
-            // Download failed — fall back to the manual install message.
-            std.debug.print(
-                \\
-                \\labelle: assembler version {s} not found in cache.
-                \\  expected: {s}
-                \\  run: labelle install assembler {s}
-                \\
-            , .{ pinned_version, asm_path, pinned_version });
+    std.fs.cwd().access(asm_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Phase 4: auto-download instead of just erroring.
+            std.debug.print("labelle: assembler v{s} not cached, downloading...\n", .{pinned_version});
+            downloadAssembler(allocator, pinned_version, asm_path) catch {
+                // Download failed — fall back to the manual install message.
+                std.debug.print(
+                    \\
+                    \\labelle: assembler version {s} not found in cache.
+                    \\  expected: {s}
+                    \\  run: labelle install assembler {s}
+                    \\
+                , .{ pinned_version, asm_path, pinned_version });
+                allocator.free(asm_path);
+                return error.AssemblerNotCached;
+            };
+        },
+        else => {
             allocator.free(asm_path);
-            return error.AssemblerNotCached;
-        };
+            return err;
+        },
     };
 
     return asm_path;
