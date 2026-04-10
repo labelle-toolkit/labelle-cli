@@ -2,9 +2,21 @@ const std = @import("std");
 const gen = @import("generator");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const assembler = @import("assembler.zig");
 
 /// Fetch and cache packages without modifying any project.
 pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
+    // Handle `labelle install assembler <version>` and `labelle install assembler`
+    if (cmd_args.len >= 1 and std.mem.eql(u8, cmd_args[0], "assembler")) {
+        if (cmd_args.len < 2) {
+            std.debug.print("labelle install assembler: missing version argument\n", .{});
+            std.debug.print("  usage: labelle install assembler <version>\n", .{});
+            std.debug.print("  example: labelle install assembler 1.0.0\n", .{});
+            return error.MissingArgument;
+        }
+        return assembler.cmdInstallAssembler(allocator, cmd_args[1]);
+    }
+
     if (cmd_args.len == 0) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();

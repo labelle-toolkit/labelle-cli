@@ -7,6 +7,8 @@
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
+///   labelle install assembler <ver>    — download and cache an assembler binary
+///   labelle assembler list             — list cached assembler versions
 ///   labelle upgrade [dir] [pkg] [ver]   — bump versions in project.labelle
 ///   labelle update [ver]                — self-update the CLI
 ///   labelle clean [--dry-run]           — prune unused package versions
@@ -31,7 +33,7 @@ const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, help_cmd, version, targets };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, help_cmd, version, targets, assembler_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -294,6 +296,15 @@ fn collectExtraArgs(args: *std.process.ArgIterator, extra_args: *[8][]const u8, 
     }
 }
 
+/// Handle `labelle assembler <subcommand>`.
+fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
+    if (cmd_args.len == 0 or std.mem.eql(u8, cmd_args[0], "list")) {
+        return assembler.cmdListAssemblers(allocator);
+    }
+    std.debug.print("labelle assembler: unknown subcommand '{s}'\n", .{cmd_args[0]});
+    std.debug.print("  usage: labelle assembler list\n", .{});
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -376,6 +387,9 @@ pub fn main() !void {
                     parsed_args.project_dir = arg;
                 }
             }
+        } else if (std.mem.eql(u8, first, "assembler")) {
+            parsed_args.command = .assembler_cmd;
+            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
         } else if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
             parsed_args.command = .help_cmd;
         } else if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v")) {
@@ -408,6 +422,7 @@ pub fn main() !void {
         .install_cmd => return install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .update_cmd => return update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
 

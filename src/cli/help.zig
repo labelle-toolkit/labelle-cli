@@ -14,6 +14,8 @@ pub fn printHelp() void {
         \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build + run (default)
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
+        \\  install assembler <ver>  Download and cache an assembler binary
+        \\  assembler list       List cached assembler versions
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
         \\  update [ver] [--no-path]  Update the labelle CLI itself
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
