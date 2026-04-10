@@ -1,18 +1,21 @@
 /// Subprocess wrapper for the standalone labelle-assembler binary.
 ///
-/// Phase 2-3 of the assembler split (RFC #122). Resolves the external
+/// Phase 2-4 of the assembler split (RFC #122). Resolves the external
 /// assembler binary via three-tier priority:
 ///
 ///   1. `LABELLE_ASSEMBLER` env var — local dev override (always wins)
 ///   2. `assembler_version` in project.labelle — pinned version resolved
 ///      from the cache at `~/.labelle/assembler/<version>/labelle-assembler`
+///      If not cached, auto-downloads from GitHub releases (Phase 4).
 ///   3. Absent — fall back to the bundled in-process generator
-///
-/// When an `assembler_version` is pinned but the cached binary is missing,
-/// the CLI prints an actionable error and returns `error.AssemblerNotCached`.
 const std = @import("std");
+const builtin = @import("builtin");
 const gen = @import("generator");
 const launcher_manifest = @import("launcher_manifest.zig");
+const util = @import("util.zig");
+
+/// GitHub release URL template for assembler binaries.
+const ASSEMBLER_RELEASE_BASE = "https://github.com/labelle-toolkit/labelle-assembler/releases/download";
 
 /// Look up the override path. Returns null if `LABELLE_ASSEMBLER` is
 /// unset, in which case the CLI should use the in-process generator.
@@ -24,9 +27,104 @@ pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
     };
 }
 
+/// Platform/arch names used in the release URL.
+fn osName() error{UnsupportedPlatform}![]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "macos",
+        .linux => "linux",
+        .windows => "windows",
+        else => {
+            std.debug.print("labelle: unsupported OS for assembler download: {s}\n", .{@tagName(builtin.os.tag)});
+            return error.UnsupportedPlatform;
+        },
+    };
+}
+
+fn archName() error{UnsupportedPlatform}![]const u8 {
+    return switch (builtin.cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => {
+            std.debug.print("labelle: unsupported architecture for assembler download: {s}\n", .{@tagName(builtin.cpu.arch)});
+            return error.UnsupportedPlatform;
+        },
+    };
+}
+
+const exe_suffix = if (builtin.os.tag == .windows) ".exe" else "";
+const exe_name = "labelle-assembler" ++ exe_suffix;
+
+/// Download an assembler binary from GitHub releases and cache it.
+///
+/// URL pattern: https://github.com/labelle-toolkit/labelle-assembler/releases/download/v<version>/labelle-assembler-<os>-<arch>
+///
+/// The binary is saved to `~/.labelle/assembler/<version>/labelle-assembler`
+/// and made executable on Unix.
+pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest_path: []const u8) !void {
+    const url = try std.fmt.allocPrint(allocator, "{s}/v{s}/labelle-assembler-{s}-{s}", .{
+        ASSEMBLER_RELEASE_BASE,
+        version,
+        try osName(),
+        try archName(),
+    });
+    defer allocator.free(url);
+
+    std.debug.print("labelle: downloading assembler v{s}...\n", .{version});
+    std.debug.print("  url: {s}\n", .{url});
+
+    // Ensure the parent directory exists.
+    if (std.fs.path.dirname(dest_path)) |dir| {
+        std.fs.cwd().makePath(dir) catch |err| {
+            std.debug.print("labelle: could not create directory {s}: {any}\n", .{ dir, err });
+            return error.AssemblerDownloadFailed;
+        };
+    }
+
+    // Use curl with -L to follow redirects (GitHub releases redirect to S3).
+    const result = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", dest_path, url }) catch {
+        std.debug.print("labelle: download failed (is curl installed?)\n", .{});
+        std.debug.print("  url: {s}\n", .{url});
+        std.debug.print("  you can download manually and place it at: {s}\n", .{dest_path});
+        return error.AssemblerDownloadFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            std.debug.print("labelle: download failed (HTTP error, exit code {d})\n", .{code});
+            std.debug.print("  url: {s}\n", .{url});
+            std.debug.print("  you can download manually and place it at: {s}\n", .{dest_path});
+            // Clean up partial download
+            std.fs.cwd().deleteFile(dest_path) catch {};
+            return error.AssemblerDownloadFailed;
+        },
+        else => {
+            std.debug.print("labelle: download process terminated abnormally\n", .{});
+            std.fs.cwd().deleteFile(dest_path) catch {};
+            return error.AssemblerDownloadFailed;
+        },
+    }
+
+    // Make executable on Unix.
+    if (builtin.os.tag != .windows) {
+        const file = std.fs.cwd().openFile(dest_path, .{}) catch |err| {
+            std.debug.print("labelle: could not open {s} for chmod: {any}\n", .{ dest_path, err });
+            return;
+        };
+        defer file.close();
+        file.chmod(0o755) catch |err| {
+            std.debug.print("labelle: chmod failed for {s}: {any}\n", .{ dest_path, err });
+        };
+    }
+
+    std.debug.print("  cached at {s}\n", .{dest_path});
+}
+
 /// Resolve the assembler binary path using three-tier priority:
 ///   1. LABELLE_ASSEMBLER env var (local dev override)
 ///   2. assembler_version from project.labelle (pinned, resolved from cache)
+///      If not cached, auto-downloads from GitHub releases.
 ///   3. null (use in-process generator)
 ///
 /// Caller owns the returned slice and must free it.
@@ -44,22 +142,97 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     const cache_root = try gen.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
-    const exe_name = "labelle-assembler" ++ if (comptime @import("builtin").os.tag == .windows) ".exe" else "";
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
 
-    // Verify the binary exists.
-    std.fs.cwd().access(asm_path, .{}) catch {
-        std.debug.print(
-            \\labelle: assembler version {s} not found in cache.
-            \\  expected: {s}
-            \\  run: labelle install assembler {s}
-            \\
-        , .{ pinned_version, asm_path, pinned_version });
-        allocator.free(asm_path);
-        return error.AssemblerNotCached;
+    // Verify the binary exists; if not, auto-download it.
+    std.fs.cwd().access(asm_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Phase 4: auto-download instead of just erroring.
+            std.debug.print("labelle: assembler v{s} not cached, downloading...\n", .{pinned_version});
+            downloadAssembler(allocator, pinned_version, asm_path) catch {
+                // Download failed — fall back to the manual install message.
+                std.debug.print(
+                    \\
+                    \\labelle: assembler version {s} not found in cache.
+                    \\  expected: {s}
+                    \\  run: labelle install assembler {s}
+                    \\
+                , .{ pinned_version, asm_path, pinned_version });
+                allocator.free(asm_path);
+                return error.AssemblerNotCached;
+            };
+        },
+        else => {
+            allocator.free(asm_path);
+            return err;
+        },
     };
 
     return asm_path;
+}
+
+/// Explicitly install (download + cache) an assembler version.
+/// Called by `labelle install assembler <version>`.
+pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !void {
+    const cache_root = try gen.getCacheRoot(allocator);
+    defer allocator.free(cache_root);
+
+    const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", version, exe_name });
+    defer allocator.free(asm_path);
+
+    // Check if already cached.
+    std.fs.cwd().access(asm_path, .{}) catch {
+        // Not cached — download it.
+        try downloadAssembler(allocator, version, asm_path);
+        std.debug.print("labelle: assembler v{s} installed\n", .{version});
+        return;
+    };
+
+    std.debug.print("labelle: assembler v{s} already cached at {s}\n", .{ version, asm_path });
+}
+
+/// List cached assembler versions by scanning ~/.labelle/assembler/.
+pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
+    const cache_root = try gen.getCacheRoot(allocator);
+    defer allocator.free(cache_root);
+
+    const asm_dir = try std.fs.path.join(allocator, &.{ cache_root, "assembler" });
+    defer allocator.free(asm_dir);
+
+    var dir = std.fs.cwd().openDir(asm_dir, .{ .iterate = true }) catch {
+        std.debug.print("labelle: no cached assembler versions found\n", .{});
+        std.debug.print("  cache directory: {s}\n", .{asm_dir});
+        return;
+    };
+    defer dir.close();
+
+    var count: usize = 0;
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .directory) {
+            if (count == 0) {
+                std.debug.print("Cached assembler versions:\n", .{});
+            }
+            // Verify the binary actually exists inside the version directory.
+            const bin_path = try std.fs.path.join(allocator, &.{ asm_dir, entry.name, exe_name });
+            defer allocator.free(bin_path);
+            const exists = blk: {
+                std.fs.cwd().access(bin_path, .{}) catch break :blk false;
+                break :blk true;
+            };
+            if (exists) {
+                std.debug.print("  {s}\n", .{entry.name});
+            } else {
+                std.debug.print("  {s} (incomplete — binary missing)\n", .{entry.name});
+            }
+            count += 1;
+        }
+    }
+
+    if (count == 0) {
+        std.debug.print("labelle: no cached assembler versions found\n", .{});
+        std.debug.print("  cache directory: {s}\n", .{asm_dir});
+    }
 }
 
 /// Spawn `labelle-assembler generate` against the given project and
