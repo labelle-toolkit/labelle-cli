@@ -39,6 +39,8 @@ const usage =
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
     \\  --scene <name>          Override initial scene from project.labelle
+    \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
+    \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
     \\
     \\Notes:
     \\  This binary assumes the package cache is already populated. The
@@ -90,6 +92,8 @@ pub fn main() !void {
 fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var project_root: ?[]const u8 = null;
     var scene_override: ?[]const u8 = null;
+    var platform_override: ?gen.Platform = null;
+    var backend_override: ?gen.Backend = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--project-root")) {
@@ -106,6 +110,22 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
             };
         } else if (std.mem.startsWith(u8, arg, "--scene=")) {
             scene_override = arg["--scene=".len..];
+        } else if (std.mem.eql(u8, arg, "--platform")) {
+            const val = args.next() orelse {
+                std.debug.print("labelle-assembler: --platform requires a value\n", .{});
+                std.process.exit(2);
+            };
+            platform_override = parsePlatform(val) orelse std.process.exit(2);
+        } else if (std.mem.startsWith(u8, arg, "--platform=")) {
+            platform_override = parsePlatform(arg["--platform=".len..]) orelse std.process.exit(2);
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            const val = args.next() orelse {
+                std.debug.print("labelle-assembler: --backend requires a value\n", .{});
+                std.process.exit(2);
+            };
+            backend_override = parseBackend(val) orelse std.process.exit(2);
+        } else if (std.mem.startsWith(u8, arg, "--backend=")) {
+            backend_override = parseBackend(arg["--backend=".len..]) orelse std.process.exit(2);
         } else {
             std.debug.print("labelle-assembler generate: unknown flag '{s}'\n", .{arg});
             std.process.exit(2);
@@ -127,6 +147,8 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     };
 
     if (scene_override) |s| cfg.initial_scene = s;
+    if (platform_override) |p| cfg.platform = p;
+    if (backend_override) |b| cfg.backend = b;
 
     // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
     // and populates cfg.resolved_gui. Must run before gen.generate so the
@@ -156,6 +178,34 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     // around the subprocess invocation, callers of this binary must run
     // an equivalent fixFingerprint pass before `zig build` will succeed
     // against the generated tree. Tracked for follow-up.
+}
+
+/// Parse a --platform value into the Platform enum, or print an error
+/// listing accepted values and return null. Caller is expected to exit
+/// with code 2 on null.
+fn parsePlatform(val: []const u8) ?gen.Platform {
+    if (std.meta.stringToEnum(gen.Platform, val)) |p| return p;
+    std.debug.print("labelle-assembler: unknown platform '{s}'\n", .{val});
+    std.debug.print("  expected one of:", .{});
+    inline for (@typeInfo(gen.Platform).@"enum".fields) |f| {
+        std.debug.print(" {s}", .{f.name});
+    }
+    std.debug.print("\n", .{});
+    return null;
+}
+
+/// Parse a --backend value into the Backend enum, or print an error
+/// listing accepted values and return null. Caller is expected to exit
+/// with code 2 on null.
+fn parseBackend(val: []const u8) ?gen.Backend {
+    if (std.meta.stringToEnum(gen.Backend, val)) |b| return b;
+    std.debug.print("labelle-assembler: unknown backend '{s}'\n", .{val});
+    std.debug.print("  expected one of:", .{});
+    inline for (@typeInfo(gen.Backend).@"enum".fields) |f| {
+        std.debug.print(" {s}", .{f.name});
+    }
+    std.debug.print("\n", .{});
+    return null;
 }
 
 /// Inline copy of `cli/config.zig:readProjectConfig`. Lives here so the
