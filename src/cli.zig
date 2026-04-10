@@ -356,6 +356,7 @@ pub fn main() !void {
                     std.mem.eql(u8, next_arg, "gfx") or
                     std.mem.eql(u8, next_arg, "cli") or
                     std.mem.eql(u8, next_arg, "labelle") or
+                    std.mem.eql(u8, next_arg, "assembler") or
                     std.mem.eql(u8, next_arg, "all"))
                 {
                     parsed_args.extra_args[parsed_args.extra_count] = next_arg;
@@ -501,6 +502,7 @@ pub fn main() !void {
             parsed.backend,
         );
     } else {
+        std.debug.print("labelle: note: no assembler_version in project.labelle — using bundled generator. Pin a version for reproducible builds.\n", .{});
         try gen.generate(allocator, parsed, output_dir, project_dir);
     }
 

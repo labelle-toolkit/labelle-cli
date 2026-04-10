@@ -1,5 +1,6 @@
 const std = @import("std");
 const gen = @import("generator");
+const assembler = @import("assembler.zig");
 
 /// Bump version fields in project.labelle.
 pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig, cmd_args: []const []const u8) !void {
@@ -22,6 +23,8 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: ge
             gen.ENGINE_VERSION
         else if (std.mem.eql(u8, pkg, "gfx"))
             gen.GFX_VERSION
+        else if (std.mem.eql(u8, pkg, "assembler"))
+            assembler.DEFAULT_ASSEMBLER_VERSION
         else
             gen.CLI_VERSION;
         const version = if (cmd_args.len > 1) cmd_args[1] else default_version;
@@ -34,14 +37,30 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: ge
             content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, version);
         } else if (std.mem.eql(u8, pkg, "labelle") or std.mem.eql(u8, pkg, "cli")) {
             content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, version);
+        } else if (std.mem.eql(u8, pkg, "assembler")) {
+            // If assembler_version already exists, replace it; otherwise append it before the closing `}`
+            if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
+                const old_asm = cfg.assembler_version orelse "0.0.0";
+                content = try replaceAndFree(allocator, content, "assembler_version", old_asm, version);
+            } else {
+                // Insert assembler_version before the final closing brace
+                content = try insertBeforeClosingBrace(allocator, content, "assembler_version", version);
+            }
         } else if (std.mem.eql(u8, pkg, "all")) {
             content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
             content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
             content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
             content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
+            // Also upgrade assembler if it exists (or add it)
+            if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
+                const old_asm = cfg.assembler_version orelse "0.0.0";
+                content = try replaceAndFree(allocator, content, "assembler_version", old_asm, assembler.DEFAULT_ASSEMBLER_VERSION);
+            } else {
+                content = try insertBeforeClosingBrace(allocator, content, "assembler_version", assembler.DEFAULT_ASSEMBLER_VERSION);
+            }
         } else {
             std.debug.print("labelle upgrade: unknown package '{s}'\n", .{pkg});
-            std.debug.print("  packages: core, engine, gfx, cli, all\n", .{});
+            std.debug.print("  packages: core, engine, gfx, cli, assembler, all\n", .{});
             allocator.free(content);
             return error.UnknownPackage;
         }
@@ -80,4 +99,27 @@ fn replaceVersionField(allocator: std.mem.Allocator, content: []const u8, field_
     }
 
     return try allocator.dupe(u8, content);
+}
+
+/// Insert a new `.field = "value"` line before the final closing `}` in a ZON file.
+/// Used when adding assembler_version to a project.labelle that doesn't have one yet.
+fn insertBeforeClosingBrace(allocator: std.mem.Allocator, old_content: []u8, field_name: []const u8, value: []const u8) ![]u8 {
+    errdefer allocator.free(old_content);
+
+    const line = try std.fmt.allocPrint(allocator, "    .{s} = \"{s}\",\n", .{ field_name, value });
+    defer allocator.free(line);
+
+    // Find the last `}` in the content.
+    if (std.mem.lastIndexOfScalar(u8, old_content, '}')) |idx| {
+        var result = std.ArrayList(u8){};
+        try result.appendSlice(allocator, old_content[0..idx]);
+        try result.appendSlice(allocator, line);
+        try result.appendSlice(allocator, old_content[idx..]);
+        const owned = try result.toOwnedSlice(allocator);
+        allocator.free(old_content);
+        return owned;
+    }
+
+    // No closing brace found — return content unchanged.
+    return old_content;
 }

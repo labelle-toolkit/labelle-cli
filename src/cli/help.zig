@@ -16,7 +16,7 @@ pub fn printHelp() void {
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  install assembler <ver>  Download and cache an assembler binary
         \\  assembler list       List cached assembler versions
-        \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle
+        \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all)
         \\  update [ver] [--no-path]  Update the labelle CLI itself
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
         \\  help                 Show this help
