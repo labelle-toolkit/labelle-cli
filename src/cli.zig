@@ -469,13 +469,13 @@ pub fn main() !void {
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
 
-    // Phase 2 of RFC #122: optionally route through the standalone
+    // Phase 2-3 of RFC #122: optionally route through the standalone
     // labelle-assembler binary instead of the in-process generator.
-    // Opt-in via the LABELLE_ASSEMBLER env var pointing at a binary path.
-    // When unset, the existing in-process call path is used unchanged.
-    if (try assembler.lookupOverride(allocator)) |asm_path| {
+    // Resolution order: LABELLE_ASSEMBLER env var > assembler_version
+    // in project.labelle > in-process fallback.
+    if (try assembler.resolveAssembler(allocator, project_dir)) |asm_path| {
         defer allocator.free(asm_path);
-        std.debug.print("  using out-of-process assembler: {s}\n", .{asm_path});
+        std.debug.print("  using assembler: {s}\n", .{asm_path});
         try assembler.spawnGenerate(
             allocator,
             asm_path,

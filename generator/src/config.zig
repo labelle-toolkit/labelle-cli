@@ -167,6 +167,12 @@ pub const ProjectConfig = struct {
     /// Defaults to null (derived from project name/title when absent).
     ios: ?IosConfig = null,
 
+    /// Pinned assembler version (Phase 3 of RFC #122).
+    /// When set, the CLI resolves the assembler binary from the cache at
+    /// `~/.labelle/assembler/<version>/labelle-assembler` instead of using
+    /// the in-process generator. The LABELLE_ASSEMBLER env var overrides this.
+    assembler_version: ?[]const u8 = null,
+
     /// Resolved GUI plugin — populated by the CLI after reading gui.labelle manifest.
     /// NOT parsed from ZON. Generators check this field, not `gui`.
     resolved_gui: ?ResolvedGui = null,
