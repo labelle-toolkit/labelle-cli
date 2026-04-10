@@ -60,13 +60,13 @@ pub fn main() !void {
 
     const first = args.next() orelse {
         std.debug.print("{s}", .{usage});
-        std.process.exit(1);
+        std.process.exit(2);
     };
 
     if (std.mem.eql(u8, first, "--protocol-version")) {
         // Protocol version goes to stdout so callers can capture it via
         // a normal pipe. Everything else goes to stderr.
-        const stdout = std.fs.File.stdout();
+        const stdout = std.io.getStdOut();
         var buf: [16]u8 = undefined;
         const msg = try std.fmt.bufPrint(&buf, "{d}\n", .{PROTOCOL_VERSION});
         try stdout.writeAll(msg);
