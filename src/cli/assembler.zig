@@ -1,16 +1,18 @@
 /// Subprocess wrapper for the standalone labelle-assembler binary.
 ///
-/// Phase 2 of the assembler split (RFC #122). Lets the CLI optionally
-/// invoke an out-of-process assembler binary instead of importing the
-/// generator module in-process. Selection is opt-in via the
-/// `LABELLE_ASSEMBLER` environment variable — when unset, the CLI keeps
-/// using the existing in-process call path with no behaviour change.
+/// Phase 2-3 of the assembler split (RFC #122). Resolves the external
+/// assembler binary via three-tier priority:
 ///
-/// In Phase 3 this resolution will move from "env var" to "version pin
-/// in project.labelle" via the launcher manifest parser, and the env
-/// var will become the local-development override.
+///   1. `LABELLE_ASSEMBLER` env var — local dev override (always wins)
+///   2. `assembler_version` in project.labelle — pinned version resolved
+///      from the cache at `~/.labelle/assembler/<version>/labelle-assembler`
+///   3. Absent — fall back to the bundled in-process generator
+///
+/// When an `assembler_version` is pinned but the cached binary is missing,
+/// the CLI prints an actionable error and returns `error.AssemblerNotCached`.
 const std = @import("std");
 const gen = @import("generator");
+const launcher_manifest = @import("launcher_manifest.zig");
 
 /// Look up the override path. Returns null if `LABELLE_ASSEMBLER` is
 /// unset, in which case the CLI should use the in-process generator.
@@ -20,6 +22,44 @@ pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };
+}
+
+/// Resolve the assembler binary path using three-tier priority:
+///   1. LABELLE_ASSEMBLER env var (local dev override)
+///   2. assembler_version from project.labelle (pinned, resolved from cache)
+///   3. null (use in-process generator)
+///
+/// Caller owns the returned slice and must free it.
+pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !?[]u8 {
+    // 1. Env var override always takes priority.
+    if (try lookupOverride(allocator)) |path| return path;
+
+    // 2. Check project.labelle for assembler_version.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const manifest = try launcher_manifest.readLauncherManifest(arena.allocator(), project_dir) orelse return null;
+    const pinned_version = manifest.assembler_version orelse return null;
+
+    // Resolve from cache: ~/.labelle/assembler/<version>/labelle-assembler
+    const cache_root = try gen.getCacheRoot(allocator);
+    defer allocator.free(cache_root);
+
+    const exe_name = "labelle-assembler" ++ if (comptime @import("builtin").os.tag == .windows) ".exe" else "";
+    const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
+
+    // Verify the binary exists.
+    std.fs.cwd().access(asm_path, .{}) catch {
+        std.debug.print(
+            \\labelle: assembler version {s} not found in cache.
+            \\  expected: {s}
+            \\  run: labelle install assembler {s}
+            \\
+        , .{ pinned_version, asm_path, pinned_version });
+        allocator.free(asm_path);
+        return error.AssemblerNotCached;
+    };
+
+    return asm_path;
 }
 
 /// Spawn `labelle-assembler generate` against the given project and
