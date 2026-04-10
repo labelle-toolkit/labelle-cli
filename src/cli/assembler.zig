@@ -35,14 +35,17 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     if (try lookupOverride(allocator)) |path| return path;
 
     // 2. Check project.labelle for assembler_version.
-    const manifest = try launcher_manifest.readLauncherManifest(allocator, project_dir) orelse return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const manifest = try launcher_manifest.readLauncherManifest(arena.allocator(), project_dir) orelse return null;
     const pinned_version = manifest.assembler_version orelse return null;
 
     // Resolve from cache: ~/.labelle/assembler/<version>/labelle-assembler
     const cache_root = try gen.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
-    const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, "labelle-assembler" });
+    const exe_name = "labelle-assembler" ++ if (comptime @import("builtin").os.tag == .windows) ".exe" else "";
+    const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
 
     // Verify the binary exists.
     std.fs.cwd().access(asm_path, .{}) catch {
