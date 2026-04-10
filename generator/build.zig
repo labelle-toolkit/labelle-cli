@@ -24,6 +24,27 @@ pub fn build(b: *std.Build) void {
     });
     generator_module.addOptions("build_options", options);
 
+    // ── Standalone assembler binary (Phase 1 of RFC #122) ───────────────
+    // Coexists with the in-process module above. The `labelle` CLI still
+    // imports the module directly today; this binary exposes the same
+    // generator behind a subprocess protocol so future CLI versions can
+    // invoke an out-of-process assembler pinned by `project.labelle`.
+    const assembler_exe = b.addExecutable(.{
+        .name = "labelle-assembler",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    assembler_exe.root_module.addOptions("build_options", options);
+    b.installArtifact(assembler_exe);
+
+    const assembler_run = b.addRunArtifact(assembler_exe);
+    if (b.args) |args| assembler_run.addArgs(args);
+    const assembler_run_step = b.step("run-assembler", "Run the standalone labelle-assembler binary");
+    assembler_run_step.dependOn(&assembler_run.step);
+
     // ── Tests ───────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run generator tests");
 

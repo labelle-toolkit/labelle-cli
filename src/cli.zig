@@ -23,7 +23,6 @@ const clean = @import("cli/clean.zig");
 const config = @import("cli/config.zig");
 const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
-const gui_resolve = @import("cli/gui_resolve.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const docker = @import("cli/docker.zig");
@@ -453,7 +452,7 @@ pub fn main() !void {
     compatibility.validateCompatibility(parsed);
 
     // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
-    try gui_resolve.resolveGuiPlugin(arena.allocator(), &parsed, project_dir);
+    try gen.resolveGuiPlugin(arena.allocator(), &parsed, project_dir);
 
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });

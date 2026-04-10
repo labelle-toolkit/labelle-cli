@@ -1,11 +1,17 @@
 /// GUI plugin resolver — reads gui.labelle manifest and populates resolved_gui on ProjectConfig.
+///
+/// Lives in the generator package because the fields it produces
+/// (`resolved_gui`) are consumed by the generator's `generate()` function.
+/// Both the in-process CLI import path and the standalone
+/// `labelle-assembler` binary call this through `root.zig`'s re-export.
 const std = @import("std");
-const gen = @import("generator");
+const config = @import("config.zig");
+const cache = @import("cache.zig");
 
 /// Resolve the GUI plugin reference in the config.
 /// Reads gui.labelle from the plugin directory, validates the bridge for
 /// the selected backend, and populates cfg.resolved_gui.
-pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, project_dir: []const u8) !void {
+pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig, project_dir: []const u8) !void {
     const gui_ref = cfg.gui orelse return; // null = no GUI
 
     // Resolve plugin directory
@@ -80,7 +86,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *gen.ProjectConfig, p
 }
 
 /// Resolve the plugin directory from a GuiPlugin reference.
-fn resolvePluginDir(allocator: std.mem.Allocator, ref: gen.GuiPlugin, cfg: gen.ProjectConfig, project_dir: []const u8) ![]const u8 {
+fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: config.ProjectConfig, project_dir: []const u8) ![]const u8 {
     if (ref.path) |rel_path| {
         // Local path — resolve relative to project directory
         return std.fs.path.resolve(allocator, &.{ project_dir, rel_path });
@@ -89,7 +95,7 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: gen.GuiPlugin, cfg: gen.P
         // Reference a declared plugin by name — resolve from the plugin cache
         for (cfg.plugins) |plugin| {
             if (std.mem.eql(u8, plugin.name, name)) {
-                return gen.resolvePlugin(allocator, plugin, project_dir);
+                return cache.resolvePlugin(allocator, plugin, project_dir);
             }
         }
         std.debug.print("labelle: GUI references plugin '{s}', but no plugin with that name is declared in .plugins\n", .{name});
@@ -122,12 +128,12 @@ const LibraryDef = struct {
 const GuiLabelle = struct {
     name: []const u8,
     library: LibraryDef = .{},
-    rendering: gen.RenderingMode,
-    lifecycle: gen.GuiLifecycle = .{},
+    rendering: config.RenderingMode,
+    lifecycle: config.GuiLifecycle = .{},
     bridges: ?Bridges = null,
 };
 
-fn getBridgeForBackend(bridges: Bridges, backend: gen.Backend) ?BridgeDef {
+fn getBridgeForBackend(bridges: Bridges, backend: config.Backend) ?BridgeDef {
     return switch (backend) {
         .raylib => bridges.raylib,
         .sokol => bridges.sokol,

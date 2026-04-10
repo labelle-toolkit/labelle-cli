@@ -11,6 +11,7 @@ pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
+const gui_resolve = @import("gui_resolve.zig");
 
 // Force test discovery for files that aren't transitively reached by
 // any compiled function path during `addTest` runs.
@@ -38,6 +39,8 @@ pub const CORE_VERSION = config.CORE_VERSION;
 pub const ENGINE_VERSION = config.ENGINE_VERSION;
 pub const GFX_VERSION = config.GFX_VERSION;
 pub const isLocalVersion = config.isLocalVersion;
+
+pub const resolveGuiPlugin = gui_resolve.resolveGuiPlugin;
 
 pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
 pub const generateBuildZig = build_files.generateBuildZig;
