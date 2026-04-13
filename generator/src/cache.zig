@@ -74,6 +74,38 @@ pub fn resolveCliPackage(allocator: std.mem.Allocator, cli_version: []const u8, 
     return try std.fs.path.join(allocator, &.{ packages_dir, "cli", cli_version, subpath });
 }
 
+/// Resolve an assembler-bundled package (backend, ecs adapter, gui) to its cached path.
+/// Returns an absolute path like: ~/.labelle/packages/assembler/0.3.0/backends/raylib
+/// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
+pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: []const u8, project_dir: ?[]const u8, subpath: []const u8) ![]const u8 {
+    if (config.isLocalVersion(assembler_version)) {
+        const local_path = config.localVersionPath(assembler_version);
+        const joined = try std.fs.path.join(allocator, &.{ local_path, subpath });
+        defer allocator.free(joined);
+        return resolveLocalPath(allocator, joined, project_dir);
+    }
+
+    const packages_dir = try getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    return try std.fs.path.join(allocator, &.{ packages_dir, "assembler", assembler_version, subpath });
+}
+
+/// Try to resolve a bundled package (backend/ecs/gui) from the assembler cache slot,
+/// falling back to the CLI cache slot if the subpath is not present in the assembler slot.
+/// Used during the staged migration of backends out of labelle-cli into labelle-assembler.
+///
+/// `cli_version` and `assembler_version` may point at different `local:` paths during
+/// monorepo dev, so each slot is resolved against its own version. When
+/// `assembler_version` is null, `cli_version` is used for both slots — in production
+/// both versions ship together.
+pub fn resolveBundledPackage(allocator: std.mem.Allocator, cli_version: []const u8, assembler_version: ?[]const u8, project_dir: ?[]const u8, subpath: []const u8) ![]const u8 {
+    const asm_ver = assembler_version orelse cli_version;
+    const asm_path = try resolveAssemblerPackage(allocator, asm_ver, project_dir, subpath);
+    if (dirExists(asm_path)) return asm_path;
+    allocator.free(asm_path);
+    return resolveCliPackage(allocator, cli_version, project_dir, subpath);
+}
+
 /// Resolve a plugin to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/plugins/github.com/labelle-toolkit/labelle-physics/0.3.0
 /// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
@@ -125,6 +157,17 @@ pub fn isCliCached(allocator: std.mem.Allocator, cli_version: []const u8) !bool 
     return dirExists(path);
 }
 
+/// Check if an assembler package version is cached.
+pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []const u8) !bool {
+    if (config.isLocalVersion(assembler_version)) return true;
+
+    const packages_dir = try getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    const path = try std.fs.path.join(allocator, &.{ packages_dir, "assembler", assembler_version });
+    defer allocator.free(path);
+    return dirExists(path);
+}
+
 /// Check if a plugin version is cached.
 pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !bool {
     if (plugin.isLocal()) return true;
@@ -167,6 +210,42 @@ pub fn populateCliCache(allocator: std.mem.Allocator, cli_version: []const u8, c
     }
 }
 
+/// Populate the assembler cache from the assembler source directory.
+/// `companion_dir` points at the labelle-assembler repo root (for dev) or
+/// an install-time bundled directory. Symlinks `backends/` into
+/// ~/.labelle/packages/assembler/{version}/. Missing subdirectories are
+/// skipped silently so the same function works through the staged migration.
+pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: []const u8, companion_dir: []const u8) !void {
+    const packages_dir = try getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+
+    const target = try std.fs.path.join(allocator, &.{ packages_dir, "assembler", assembler_version });
+    defer allocator.free(target);
+
+    const cwd = std.fs.cwd();
+
+    cwd.makePath(target) catch |err| {
+        std.debug.print("labelle: could not create cache directory '{s}': {any}\n", .{ target, err });
+        return error.CachePopulationFailed;
+    };
+
+    const subdirs = [_][]const u8{ "backends", "ecs", "gui" };
+    for (subdirs) |subdir| {
+        const src_path = try std.fs.path.join(allocator, &.{ companion_dir, subdir });
+        defer allocator.free(src_path);
+
+        if (!dirExists(src_path)) continue;
+
+        const dst_path = try std.fs.path.join(allocator, &.{ target, subdir });
+        defer allocator.free(dst_path);
+
+        symlinkToCache(allocator, src_path, dst_path) catch |err| {
+            std.debug.print("labelle: could not link '{s}' to cache: {any}\n", .{ src_path, err });
+            return error.CachePopulationFailed;
+        };
+    }
+}
+
 /// Validate that all dependencies in a project config are cached.
 /// Returns a list of missing packages, or empty if all are cached.
 pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![]const []const u8 {
@@ -188,6 +267,11 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
     // CLI-bundled packages
     if (!try isCliCached(allocator, cfg.labelle_version)) {
         try missing.append(allocator, try std.fmt.allocPrint(allocator, "cli {s}", .{cfg.labelle_version}));
+    }
+
+    // Assembler-bundled packages (backends, ecs, gui — migrating from CLI)
+    if (!try isAssemblerCached(allocator, cfg.labelle_version)) {
+        try missing.append(allocator, try std.fmt.allocPrint(allocator, "assembler {s}", .{cfg.labelle_version}));
     }
 
     // Plugins
@@ -269,6 +353,51 @@ pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void
     defer allocator.free(tag);
 
     try gitCloneShallow(allocator, git_url, tag, target);
+}
+
+/// Fetch assembler-bundled packages (backends, ecs, gui) into the cache.
+/// Clones from the labelle-assembler repo at the matching tag.
+pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: []const u8) !void {
+    const packages_dir = try getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+
+    const target = try std.fs.path.join(allocator, &.{ packages_dir, "assembler", assembler_version });
+    defer allocator.free(target);
+
+    const git_url = "https://github.com/labelle-toolkit/labelle-assembler.git";
+    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{assembler_version});
+    defer allocator.free(tag);
+
+    const tmp_dir = try getTempPath(allocator, "labelle-assembler-fetch", assembler_version);
+    defer allocator.free(tmp_dir);
+
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    gitCloneShallow(allocator, git_url, tag, tmp_dir) catch {
+        std.debug.print("labelle: could not fetch assembler packages at v{s}\n", .{assembler_version});
+        std.debug.print("  assembler-bundled packages (backends, ecs, gui) ship with the assembler binary.\n", .{});
+        return error.FetchFailed;
+    };
+
+    const cwd = std.fs.cwd();
+    cwd.makePath(target) catch {};
+
+    const subdirs = [_][]const u8{ "backends", "ecs", "gui" };
+    for (subdirs) |subdir| {
+        const src = try std.fs.path.join(allocator, &.{ tmp_dir, subdir });
+        defer allocator.free(src);
+
+        if (!dirExists(src)) continue;
+
+        const dst = try std.fs.path.join(allocator, &.{ target, subdir });
+        defer allocator.free(dst);
+
+        copyDirRecursive(allocator, src, dst) catch |err| {
+            std.debug.print("labelle: warning: could not copy {s}: {any}\n", .{ subdir, err });
+        };
+    }
+
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
 }
 
 /// Fetch CLI-bundled packages (backends, ecs, gui) into the cache.

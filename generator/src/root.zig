@@ -52,17 +52,23 @@ pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;
 pub const getPackagesDir = cache.getPackagesDir;
 pub const populateCliCache = cache.populateCliCache;
+pub const populateAssemblerCache = cache.populateAssemblerCache;
 pub const populateFrameworkPackage = cache.populateFrameworkPackage;
 pub const populatePlugin = cache.populatePlugin;
 pub const isFrameworkCached = cache.isFrameworkCached;
 pub const isCliCached = cache.isCliCached;
+pub const isAssemblerCached = cache.isAssemblerCached;
 pub const isPluginCached = cache.isPluginCached;
 pub const fetchFrameworkPackage = cache.fetchFrameworkPackage;
 pub const fetchPlugin = cache.fetchPlugin;
 pub const fetchCliPackages = cache.fetchCliPackages;
+pub const fetchAssemblerPackages = cache.fetchAssemblerPackages;
 pub const R2_BASE_URL = cache.R2_BASE_URL;
 pub const patchCachedDeps = cache.patchCachedDeps;
 pub const resolvePlugin = cache.resolvePlugin;
+pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
+pub const resolveCliPackage = cache.resolveCliPackage;
+pub const resolveBundledPackage = cache.resolveBundledPackage;
 
 /// Generate all assembler files into output_dir/.labelle/{backend}_{platform}/.
 pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []const u8, game_dir: []const u8) !void {
@@ -258,10 +264,10 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     const tmpl_filename = try std.fmt.allocPrint(allocator, "{s}.txt", .{platform_name});
     defer allocator.free(tmpl_filename);
 
-    // Resolve backend path from CLI cache
+    // Resolve backend path — prefer assembler cache (migrating), fall back to CLI cache
     var backend_subpath_buf: [128]u8 = undefined;
     const backend_subpath = std.fmt.bufPrint(&backend_subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
-    const backend_path = try cache.resolveCliPackage(allocator, cfg.labelle_version, game_dir, backend_subpath);
+    const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_subpath);
     defer allocator.free(backend_path);
 
     const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, "templates", tmpl_filename });
