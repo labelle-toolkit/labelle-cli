@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .generator = .{
-            .path = "generator",
+            .path = "../labelle-assembler",
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.7.0.tar.gz",
