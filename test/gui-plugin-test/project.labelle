@@ -3,7 +3,7 @@
     .title = "GUI Plugin Test",
     .backend = .raylib,
     .ecs = .mock,
-    .gui = .{ .path = "../../plugins/imgui" },
+    .gui = .{ .path = "../../../labelle-assembler/plugins/imgui" },
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
