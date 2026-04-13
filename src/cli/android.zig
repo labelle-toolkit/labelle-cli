@@ -81,7 +81,11 @@ fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: 
 /// Package APK and deploy to device/emulator via ADB.
 pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, emulator: bool) !void {
     const android_cfg = cfg.android orelse gen.AndroidConfig{};
+    // package_name may be heap-allocated (defaultPackageName) or a slice into
+    // android_cfg (no allocation).  Track whether we own it so we can free it.
+    const package_name_owned = android_cfg.package_name.len == 0;
     const package_name = if (android_cfg.package_name.len > 0) android_cfg.package_name else try defaultPackageName(allocator, cfg.name);
+    defer if (package_name_owned) allocator.free(package_name);
     const app_name = if (android_cfg.app_name.len > 0) android_cfg.app_name else cfg.title;
 
     // Locate the built .so
@@ -105,8 +109,11 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     // Intentionally ignoring errors: the staging directory may not exist on first run.
     std.fs.cwd().deleteTree(staging_dir) catch {};
 
-    // Stage .so into lib/<abi>/
-    const abi_dir = if (emulator) "x86_64" else "arm64-v8a";
+    // Stage .so into lib/<abi>/.
+    // On Apple Silicon, the Android emulator runs ARM64 images; on Intel Macs
+    // it runs x86_64.  Physical device builds always target arm64-v8a.
+    const builtin = @import("builtin");
+    const abi_dir = if (emulator and builtin.cpu.arch != .aarch64) "x86_64" else "arm64-v8a";
     const lib_dir = try std.fs.path.join(allocator, &.{ staging_dir, "lib", abi_dir });
     defer allocator.free(lib_dir);
     try std.fs.cwd().makePath(lib_dir);
@@ -220,10 +227,25 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     const aligned_apk = try std.fmt.allocPrint(allocator, "{s}.aligned", .{apk_path});
     defer allocator.free(aligned_apk);
 
-    // Package with aapt
+    // Package with aapt.
+    // Pass -A for assets and -M for the manifest but do NOT pass the full
+    // staging_dir as a positional argument — aapt would scan it, find another
+    // AndroidManifest.xml, and report "Duplicate file".
     std.debug.print("labelle: packaging APK...\n", .{});
+    const assets_dir = try std.fs.path.join(allocator, &.{ staging_dir, "assets" });
+    defer allocator.free(assets_dir);
     {
-        const result = util.runCmd(allocator, &.{ aapt, "package", "-f", "-M", manifest_path, "-I", android_jar, "-F", unsigned_apk, staging_dir }) catch |err| {
+        const aapt_args: []const []const u8 = blk: {
+            const base = &[_][]const u8{ aapt, "package", "-f", "-M", manifest_path, "-I", android_jar, "-F", unsigned_apk };
+            // Only pass -A if the assets directory actually exists.
+            if (std.fs.cwd().access(assets_dir, .{})) |_| {
+                break :blk try std.mem.concat(allocator, []const u8, &.{ base, &.{ "-A", assets_dir } });
+            } else |_| {
+                break :blk try allocator.dupe([]const u8, base);
+            }
+        };
+        defer allocator.free(aapt_args);
+        const result = util.runCmd(allocator, aapt_args) catch |err| {
             std.debug.print("labelle: aapt package failed: {}\n", .{err});
             return err;
         };
@@ -232,6 +254,31 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         switch (result.term) {
             .Exited => |code| if (code != 0) {
                 std.debug.print("labelle: aapt package failed: {s}\n", .{result.stderr});
+                return error.PackageFailed;
+            },
+            else => return error.PackageFailed,
+        }
+    }
+
+    // Add native libs to the APK with zip (aapt does not handle .so files).
+    // Run zip from inside staging_dir so the archive path is lib/<abi>/libgame.so.
+    // Resolve both paths to absolute so they survive the CWD change.
+    {
+        const staging_abs = try std.fs.cwd().realpathAlloc(allocator, staging_dir);
+        defer allocator.free(staging_abs);
+        const unsigned_abs = try std.fs.cwd().realpathAlloc(allocator, unsigned_apk);
+        defer allocator.free(unsigned_abs);
+
+        var child = std.process.Child.init(&.{ "zip", "-r", unsigned_abs, "lib" }, allocator);
+        child.cwd = staging_abs;
+        child.stdin_behavior = .Close;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        const term = try child.wait();
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                std.debug.print("labelle: zip native lib failed (exit {d})\n", .{code});
                 return error.PackageFailed;
             },
             else => return error.PackageFailed,
