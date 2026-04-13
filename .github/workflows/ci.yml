@@ -112,11 +112,9 @@ jobs:
           repository: labelle-toolkit/labelle-gfx
           path: labelle-gfx
 
-      # TODO(#147): revert to main after labelle-assembler#7 merges.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
-          ref: feat/absorb-backends
           path: labelle-assembler
 
       - name: Setup Zig
@@ -175,11 +173,9 @@ jobs:
           repository: labelle-toolkit/labelle-gfx
           path: labelle-gfx
 
-      # TODO(#147): revert to main after labelle-assembler#7 merges.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
-          ref: feat/absorb-backends
           path: labelle-assembler
 
       - name: Setup Zig
