@@ -112,6 +112,13 @@ jobs:
           repository: labelle-toolkit/labelle-gfx
           path: labelle-gfx
 
+      # TODO(#147): revert to main after labelle-assembler#7 merges.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-assembler
+          ref: feat/absorb-backends
+          path: labelle-assembler
+
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -120,7 +127,12 @@ jobs:
       - name: Build CLI
         run: cd labelle-cli && zig build
 
+      - name: Build assembler
+        run: cd labelle-assembler && zig build
+
       - name: Test --docker WASM build
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
         run: |
           mkdir -p test-docker && cd test-docker
           ../labelle-cli/zig-out/bin/labelle init docker_test \
@@ -128,7 +140,8 @@ jobs:
             --core-version="local:../../labelle-core" \
             --engine-version="local:../../labelle-engine" \
             --gfx-version="local:../../labelle-gfx" \
-            --labelle-version="local:../../labelle-cli"
+            --labelle-version="local:../../labelle-cli" \
+            --assembler-version="local:../../labelle-assembler"
           cd docker_test
           ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm
           test -f .labelle/raylib_wasm/zig-out/web/game.wasm
@@ -137,6 +150,8 @@ jobs:
   versions-integration:
     name: Versions Integration Test
     runs-on: ubuntu-latest
+    env:
+      LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
 
     steps:
       - name: Checkout labelle-cli
@@ -160,6 +175,13 @@ jobs:
           repository: labelle-toolkit/labelle-gfx
           path: labelle-gfx
 
+      # TODO(#147): revert to main after labelle-assembler#7 merges.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-assembler
+          ref: feat/absorb-backends
+          path: labelle-assembler
+
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -176,6 +198,9 @@ jobs:
       - name: Build CLI
         run: cd labelle-cli && zig build
 
+      - name: Build assembler
+        run: cd labelle-assembler && zig build
+
       - name: Init, generate, and build a project
         run: |
           mkdir -p test-projects && cd test-projects
@@ -183,7 +208,8 @@ jobs:
             --core-version="local:../../labelle-core" \
             --engine-version="local:../../labelle-engine" \
             --gfx-version="local:../../labelle-gfx" \
-            --labelle-version="local:../../labelle-cli"
+            --labelle-version="local:../../labelle-cli" \
+            --assembler-version="local:../../labelle-assembler"
           cd test_game
           ../../labelle-cli/zig-out/bin/labelle generate
           cd .labelle/raylib_desktop

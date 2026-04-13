@@ -11,6 +11,7 @@
     .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
     .labelle_version = "local:../../",
+    .assembler_version = "local:../../../labelle-assembler",
     .states = .{ "playing" },
     .layers = .{
         .{ .name = "background", .order = 0, .space = .screen },
