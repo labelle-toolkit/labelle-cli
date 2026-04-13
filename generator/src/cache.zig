@@ -98,12 +98,43 @@ pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: 
 /// monorepo dev, so each slot is resolved against its own version. When
 /// `assembler_version` is null, `cli_version` is used for both slots — in production
 /// both versions ship together.
+///
+/// The assembler-slot probe is silent — misses during the staged migration are
+/// expected, so we don't want resolveLocalPath's "path does not exist" warning
+/// firing for every un-migrated backend.
 pub fn resolveBundledPackage(allocator: std.mem.Allocator, cli_version: []const u8, assembler_version: ?[]const u8, project_dir: ?[]const u8, subpath: []const u8) ![]const u8 {
     const asm_ver = assembler_version orelse cli_version;
-    const asm_path = try resolveAssemblerPackage(allocator, asm_ver, project_dir, subpath);
-    if (dirExists(asm_path)) return asm_path;
-    allocator.free(asm_path);
+    if (try probeBundledSlot(allocator, asm_ver, project_dir, subpath, "assembler")) |p| return p;
     return resolveCliPackage(allocator, cli_version, project_dir, subpath);
+}
+
+/// Silent probe of a cache slot. Returns the resolved absolute path if the
+/// directory exists, null otherwise.
+fn probeBundledSlot(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    project_dir: ?[]const u8,
+    subpath: []const u8,
+    slot: []const u8,
+) !?[]const u8 {
+    const candidate = blk: {
+        if (config.isLocalVersion(version)) {
+            const local_path = config.localVersionPath(version);
+            const joined = try std.fs.path.join(allocator, &.{ local_path, subpath });
+            defer allocator.free(joined);
+
+            if (std.fs.path.isAbsolute(joined)) break :blk try allocator.dupe(u8, joined);
+            if (project_dir) |pd| break :blk try std.fs.path.join(allocator, &.{ pd, joined });
+            break :blk try allocator.dupe(u8, joined);
+        }
+        const packages_dir = try getPackagesDir(allocator);
+        defer allocator.free(packages_dir);
+        break :blk try std.fs.path.join(allocator, &.{ packages_dir, slot, version, subpath });
+    };
+    defer allocator.free(candidate);
+
+    if (!dirExists(candidate)) return null;
+    return std.fs.cwd().realpathAlloc(allocator, candidate) catch try allocator.dupe(u8, candidate);
 }
 
 /// Resolve a plugin to its cached path.

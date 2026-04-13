@@ -4,13 +4,10 @@
     .backend = .bgfx,
     .ecs = .mock,
     .core_version = "local:../../../labelle-core",
-    .engine_version = "local:../../../engine",
+    .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
     .labelle_version = "local:../../",
-    .plugins = .{
-        .{ .name = "pathfinding", .repo = "local:../../../labelle-pathfinding", .version = "0.1.0" },
-        .{ .name = "physics", .repo = "local:../../../labelle-physics", .version = "0.1.0" },
-    },
+    .assembler_version = "local:../../../labelle-assembler",
     .states = .{ "playing" },
     .layers = .{
         .{ .name = "far_background", .order = 0, .space = .screen },
