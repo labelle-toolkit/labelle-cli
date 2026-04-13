@@ -30,6 +30,9 @@ fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
 export fn frame() callconv(.c) void {
     @import("backend_input").newFrame();
     BackendGfxType.setScreenSize(window.width(), window.height());
+    // Keep design coords fixed so screen-space NDC mapping uses the design resolution
+    // rather than the physical framebuffer size (which differs on HiDPI displays).
+    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
     const dt: f32 = 1.0 / @as(f32, @floatFromInt(target_fps));
 {{tick_code}}    g.tick(dt);
     const pass_action = window.beginFrame();

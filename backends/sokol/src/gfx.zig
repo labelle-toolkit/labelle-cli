@@ -216,10 +216,11 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     const segments = 32;
     const cx = toNdcX(center_x);
     const cy = toNdcY(center_y);
-    // Convert radius to NDC scale
-    const fw: f32 = @floatFromInt(screen_w);
-    const rx = (radius / fw) * 2.0;
-    const ry = (radius / @as(f32, @floatFromInt(screen_h))) * 2.0;
+    // Convert radius to NDC scale — use design dims in screen-space to match toNdcX/Y.
+    const rw: f32 = @floatFromInt(if (!camera_active) design_w else screen_w);
+    const rh: f32 = @floatFromInt(if (!camera_active) design_h else screen_h);
+    const rx = (radius / rw) * 2.0;
+    const ry = (radius / rh) * 2.0;
 
     sgl.beginTriangleStrip();
     sgl.c4b(tint.r, tint.g, tint.b, tint.a);
