@@ -260,7 +260,7 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     const tmpl_filename = try std.fmt.allocPrint(allocator, "{s}.txt", .{platform_name});
     defer allocator.free(tmpl_filename);
 
-    // Resolve backend path — prefer assembler cache (migrating), fall back to CLI cache
+    // Resolve backend path from the assembler cache slot.
     var backend_subpath_buf: [128]u8 = undefined;
     const backend_subpath = std.fmt.bufPrint(&backend_subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
     const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_subpath);

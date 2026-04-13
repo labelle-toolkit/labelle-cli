@@ -199,9 +199,13 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
         }
     }
 
-    // Assembler-bundled packages (backends, ecs, gui)
-    if (!try isAssemblerCached(allocator, cfg.labelle_version)) {
-        try missing.append(allocator, try std.fmt.allocPrint(allocator, "assembler {s}", .{cfg.labelle_version}));
+    // Assembler-bundled packages (backends, ecs, gui).
+    // Mirrors ensureCache: asm_ver = assembler_version orelse labelle_version.
+    // When the two differ (e.g. pinned assembler version), we must probe the
+    // slot keyed by asm_ver, not labelle_version.
+    const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+    if (!try isAssemblerCached(allocator, asm_ver)) {
+        try missing.append(allocator, try std.fmt.allocPrint(allocator, "assembler {s}", .{asm_ver}));
     }
 
     // Plugins
