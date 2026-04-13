@@ -29,6 +29,7 @@ pub const RenderingMode = config.RenderingMode;
 pub const GuiLifecycle = config.GuiLifecycle;
 pub const PluginDep = config.PluginDep;
 pub const IosConfig = config.IosConfig;
+pub const AndroidConfig = config.AndroidConfig;
 pub const Orientation = config.Orientation;
 pub const LayerSpace = config.LayerSpace;
 pub const LayerDef = config.LayerDef;
