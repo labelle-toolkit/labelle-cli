@@ -35,9 +35,6 @@ jobs:
       - name: Debug plugin tests
         run: cd plugins/debug && zig build test
 
-      - name: zig-ecs adapter tests
-        run: cd ecs/zig-ecs && zig build test
-
       - name: Test CLI commands (Unix)
         if: runner.os != 'Windows'
         run: |

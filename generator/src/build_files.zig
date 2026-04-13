@@ -312,7 +312,7 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
             const dd: []const u8 = switch (cfg.ecs) { .zig_ecs => "zig-ecs", .zflecs => "zflecs", .mr_ecs => "mr-ecs", .mock => unreachable };
             var spb: [128]u8 = undefined;
             const sp = std.fmt.bufPrint(&spb, "ecs/{s}", .{dd}) catch unreachable;
-            const ep_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, sp);
+            const ep_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, sp);
             defer allocator.free(ep_abs);
             const ep = try relativePath(allocator, abs_target, ep_abs);
             defer allocator.free(ep);

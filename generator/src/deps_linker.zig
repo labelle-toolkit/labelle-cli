@@ -67,7 +67,7 @@ pub fn createDepsLinks(
             };
             var subpath_buf: [128]u8 = undefined;
             const subpath = std.fmt.bufPrint(&subpath_buf, "ecs/{s}", .{ecs_dir}) catch unreachable;
-            const ecs_path = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, subpath);
+            const ecs_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, subpath);
             const ecs_link_name: []const u8 = switch (cfg.ecs) {
                 .zig_ecs => "labelle-zig-ecs",
                 .zflecs => "labelle-zflecs",
