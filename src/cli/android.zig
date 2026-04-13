@@ -83,7 +83,6 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     const android_cfg = cfg.android orelse gen.AndroidConfig{};
     const package_name = if (android_cfg.package_name.len > 0) android_cfg.package_name else try defaultPackageName(allocator, cfg.name);
     const app_name = if (android_cfg.app_name.len > 0) android_cfg.app_name else cfg.title;
-    _ = app_name;
 
     // Locate the built .so
     const lib_name = if (emulator) "x86_64-linux-android" else "aarch64-linux-android";
@@ -103,6 +102,7 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     // Create APK staging directory
     const staging_dir = try std.fs.path.join(allocator, &.{ target_dir, "apk-staging" });
     defer allocator.free(staging_dir);
+    // Intentionally ignoring errors: the staging directory may not exist on first run.
     std.fs.cwd().deleteTree(staging_dir) catch {};
 
     // Stage .so into lib/<abi>/
@@ -118,7 +118,7 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     // Generate AndroidManifest.xml
     const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, "AndroidManifest.xml" });
     defer allocator.free(manifest_path);
-    const manifest = try generateAndroidManifest(allocator, package_name, android_cfg);
+    const manifest = try generateAndroidManifest(allocator, package_name, app_name, android_cfg);
     defer allocator.free(manifest);
     {
         const f = try std.fs.cwd().createFile(manifest_path, .{});
@@ -131,7 +131,7 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     defer allocator.free(assets_src);
     const assets_dst = try std.fs.path.join(allocator, &.{ staging_dir, "assets" });
     defer allocator.free(assets_dst);
-    copyDirectory(allocator, assets_src, assets_dst) catch {};
+    try copyDirectory(allocator, assets_src, assets_dst);
 
     // Build APK
     const apk_path = try std.fs.path.join(allocator, &.{ target_dir, "game.apk" });
@@ -289,7 +289,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
 }
 
 /// Generate AndroidManifest.xml for NativeActivity.
-fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u8, cfg: gen.AndroidConfig) ![]u8 {
+fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u8, app_name: []const u8, cfg: gen.AndroidConfig) ![]u8 {
     const orientation = switch (cfg.orientation) {
         .portrait => "portrait",
         .landscape => "landscape",
@@ -320,7 +320,7 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         \\    </application>
         \\</manifest>
         \\
-    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, package_name, orientation });
+    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, orientation });
 }
 
 /// Find adb in ANDROID_HOME/platform-tools/ or PATH.
@@ -341,9 +341,7 @@ fn findAdb(allocator: std.mem.Allocator) ![]u8 {
         return error.AdbNotFound;
     };
     defer allocator.free(result.stderr);
-    defer {
-        if (result.stdout.len == 0) allocator.free(result.stdout);
-    }
+    defer allocator.free(result.stdout);
     if (result.term == .Exited and result.term.Exited == 0 and result.stdout.len > 0) {
         const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
         return allocator.dupe(u8, path);
@@ -379,8 +377,16 @@ fn findBuildTools(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 {
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind == .directory) {
-            if (latest) |prev| allocator.free(prev);
-            latest = try allocator.dupe(u8, entry.name);
+            if (latest) |prev| {
+                // Pick the highest version by lexicographic comparison
+                // (works for dotted semver like "33.0.0" vs "34.0.0")
+                if (std.mem.order(u8, entry.name, prev) == .gt) {
+                    allocator.free(prev);
+                    latest = try allocator.dupe(u8, entry.name);
+                }
+            } else {
+                latest = try allocator.dupe(u8, entry.name);
+            }
         }
     }
 
@@ -420,6 +426,19 @@ fn ensureDebugKeystore(allocator: std.mem.Allocator) ![]u8 {
         };
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
+
+        switch (result.term) {
+            .Exited => |code| if (code != 0) {
+                std.debug.print("labelle: keytool failed (exit code {d}): {s}\n", .{ code, result.stderr });
+                allocator.free(keystore);
+                return error.KeystoreFailed;
+            },
+            else => {
+                std.debug.print("labelle: keytool terminated abnormally\n", .{});
+                allocator.free(keystore);
+                return error.KeystoreFailed;
+            },
+        }
     };
 
     return keystore;
