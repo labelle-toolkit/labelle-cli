@@ -486,25 +486,21 @@ pub fn main() !void {
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
 
-    // Phase 2-3 of RFC #122: optionally route through the standalone
-    // labelle-assembler binary instead of the in-process generator.
+    // Route through the standalone labelle-assembler binary.
     // Resolution order: LABELLE_ASSEMBLER env var > assembler_version
-    // in project.labelle > in-process fallback.
-    if (try assembler.resolveAssembler(allocator, project_dir)) |asm_path| {
-        defer allocator.free(asm_path);
-        std.debug.print("  using assembler: {s}\n", .{asm_path});
-        try assembler.spawnGenerate(
-            allocator,
-            asm_path,
-            project_dir,
-            parsed_args.scene_override,
-            parsed.platform,
-            parsed.backend,
-        );
-    } else {
-        std.debug.print("labelle: note: no assembler_version in project.labelle — using bundled generator. Pin a version for reproducible builds.\n", .{});
-        try gen.generate(allocator, parsed, output_dir, project_dir);
-    }
+    // in project.labelle. If neither is set, auto-downloads the default version.
+    const asm_path = try assembler.resolveAssembler(allocator, project_dir) orelse
+        try assembler.resolveDefault(allocator);
+    defer allocator.free(asm_path);
+    std.debug.print("  using assembler: {s}\n", .{asm_path});
+    try assembler.spawnGenerate(
+        allocator,
+        asm_path,
+        project_dir,
+        parsed_args.scene_override,
+        parsed.platform,
+        parsed.backend,
+    );
 
     // Target subdir: .labelle/raylib_desktop/, etc.
     const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), @tagName(parsed.platform) });

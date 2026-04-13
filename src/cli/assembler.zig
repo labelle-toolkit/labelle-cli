@@ -125,11 +125,44 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
     std.debug.print("  cached at {s}\n", .{dest_path});
 }
 
-/// Resolve the assembler binary path using three-tier priority:
+/// Resolve the default assembler version. Downloads it if not cached.
+/// Used when no assembler_version is configured in project.labelle.
+/// Caller owns the returned slice and must free it.
+pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
+    const cache_root = try gen.getCacheRoot(allocator);
+    defer allocator.free(cache_root);
+
+    const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", DEFAULT_ASSEMBLER_VERSION, exe_name });
+
+    std.fs.cwd().access(asm_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("labelle: no assembler_version in project.labelle — downloading default v{s}...\n", .{DEFAULT_ASSEMBLER_VERSION});
+            downloadAssembler(allocator, DEFAULT_ASSEMBLER_VERSION, asm_path) catch {
+                std.debug.print(
+                    \\
+                    \\labelle: could not download assembler v{s}.
+                    \\  Add assembler_version to project.labelle or set LABELLE_ASSEMBLER env var.
+                    \\  run: labelle install assembler {s}
+                    \\
+                , .{ DEFAULT_ASSEMBLER_VERSION, DEFAULT_ASSEMBLER_VERSION });
+                allocator.free(asm_path);
+                return error.AssemblerNotCached;
+            };
+        },
+        else => {
+            allocator.free(asm_path);
+            return err;
+        },
+    };
+
+    return asm_path;
+}
+
+/// Resolve the assembler binary path using priority:
 ///   1. LABELLE_ASSEMBLER env var (local dev override)
 ///   2. assembler_version from project.labelle (pinned, resolved from cache)
 ///      If not cached, auto-downloads from GitHub releases.
-///   3. null (use in-process generator)
+///   3. null — caller should use resolveDefault() as fallback
 ///
 /// Caller owns the returned slice and must free it.
 pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !?[]u8 {
