@@ -31,9 +31,10 @@ const assembler = @import("cli/assembler.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
+const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, help_cmd, version, targets, assembler_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, help_cmd, version, targets, assembler_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -389,6 +390,22 @@ pub fn main() !void {
                     parsed_args.project_dir = arg;
                 }
             }
+        } else if (std.mem.eql(u8, first, "android")) {
+            parsed_args.command = .android_cmd;
+            while (args.next()) |arg| {
+                if (std.mem.startsWith(u8, arg, "-") or
+                    std.mem.eql(u8, arg, "build") or
+                    std.mem.eql(u8, arg, "run") or
+                    std.mem.eql(u8, arg, "help"))
+                {
+                    if (parsed_args.extra_count < parsed_args.extra_args.len) {
+                        parsed_args.extra_args[parsed_args.extra_count] = arg;
+                        parsed_args.extra_count += 1;
+                    }
+                } else {
+                    parsed_args.project_dir = arg;
+                }
+            }
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
             try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
@@ -458,6 +475,12 @@ pub fn main() !void {
         parsed.backend = .sokol;
     }
 
+    // `labelle android` always implies sokol + android platform
+    if (command == .android_cmd) {
+        parsed.platform = .android;
+        parsed.backend = .sokol;
+    }
+
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
         return upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]);
@@ -521,6 +544,11 @@ pub fn main() !void {
         return ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
     }
 
+    // `labelle android` subcommand — handles its own build/run
+    if (command == .android_cmd) {
+        return android.handleAndroid(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
+    }
+
     // Warn if --target is used without --docker (it has no effect otherwise)
     if (parsed_args.docker_target != null and !parsed_args.docker) {
         std.debug.print("labelle: warning: --target has no effect without --docker\n", .{});
@@ -576,6 +604,10 @@ pub fn main() !void {
         // iOS: deploy to simulator
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
         try ios.deployToSimulator(allocator, target_dir, parsed);
+    } else if (parsed.platform == .android) {
+        // Android: deploy to device/emulator
+        std.debug.print("labelle: deploying to Android...\n", .{});
+        try android.deployToDevice(allocator, target_dir, parsed, false);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
