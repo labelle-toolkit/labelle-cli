@@ -48,8 +48,14 @@ export fn cleanup() callconv(.c) void {
 }
 
 // {{entry_comment}}
-pub fn main() void {
-    window.run(.{
+// sokol's C runtime provides the OS entry point (ANativeActivity_onCreate on
+// Android, main() on iOS) and calls sokol_main() to configure the app.
+// sokol_main must RETURN sapp_desc — it must NOT call sapp_run() itself.
+// Zig's own pub fn main() is not used for shared-library / UIKit targets.
+export fn sokol_main(argc: c_int, argv: [*][*:0]u8) window.Desc {
+    _ = argc;
+    _ = argv;
+    return window.makeDesc(.{
         .init_cb = &init,
         .frame_cb = &frame,
         .cleanup_cb = &cleanup,
