@@ -12,7 +12,7 @@ const std = @import("std");
 
 /// Default assembler version pinned in newly scaffolded projects.
 /// Bump this when a new assembler release ships.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.5.0";
+pub const DEFAULT_ASSEMBLER_VERSION = "0.5.1";
 const builtin = @import("builtin");
 const gen = @import("generator");
 const launcher_manifest = @import("launcher_manifest.zig");
