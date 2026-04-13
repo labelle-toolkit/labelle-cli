@@ -137,7 +137,7 @@ pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
     std.fs.cwd().access(asm_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("labelle: no assembler_version in project.labelle — downloading default v{s}...\n", .{DEFAULT_ASSEMBLER_VERSION});
-            downloadAssembler(allocator, DEFAULT_ASSEMBLER_VERSION, asm_path) catch {
+            downloadAssembler(allocator, DEFAULT_ASSEMBLER_VERSION, asm_path) catch |dl_err| {
                 std.debug.print(
                     \\
                     \\labelle: could not download assembler v{s}.
@@ -146,7 +146,7 @@ pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
                     \\
                 , .{ DEFAULT_ASSEMBLER_VERSION, DEFAULT_ASSEMBLER_VERSION });
                 allocator.free(asm_path);
-                return error.AssemblerNotCached;
+                return dl_err;
             };
         },
         else => {
