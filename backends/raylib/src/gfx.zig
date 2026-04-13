@@ -142,6 +142,9 @@ pub fn getScreenHeight() i32 {
     return rl.getScreenHeight();
 }
 
+/// No-op: raylib handles DPI mapping internally; design size is implicit.
+pub fn setDesignSize(_: i32, _: i32) void {}
+
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
     const result = rl.getScreenToWorld2D(pos.toRl(), camera.toRl());
     return .{ .x = result.x, .y = result.y };

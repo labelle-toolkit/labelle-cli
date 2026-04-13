@@ -27,8 +27,21 @@ export fn frame() callconv(.c) void {
     const actual_w = window.width();
     const actual_h = window.height();
     BackendGfxType.setScreenSize(actual_w, actual_h);
+    // Tell the gfx backend the design canvas size so screen-space sprites
+    // (background, UI) map design coords (0..screen_w, 0..screen_h) to the
+    // full physical screen NDC range. Must be called after setScreenSize.
+    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
-    const dt: f32 = 0.016;
+    // On the first frame, scale camera zoom so the design height fills the physical
+    // screen height exactly. With high_dpi=true, actual_h is the framebuffer height.
+    // zoom = actual_h / design_h maps one design pixel to (actual_h/design_h) physical
+    // pixels, giving sharp high-DPI rendering without layout changes to game code.
+    if (frame_count == 1) {
+        const zoom = @as(f32, @floatFromInt(actual_h)) / @as(f32, @floatFromInt(screen_h));
+        g.getCamera().setZoom(zoom);
+    }
+    // Cap dt at 4 frames to prevent physics explosions after backgrounding.
+    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(target_fps)));
 {{tick_code}}    g.tick(dt);
     const pass_action = window.beginFrame();
     window.beginPass(pass_action);

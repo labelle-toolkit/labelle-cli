@@ -60,9 +60,32 @@ pub fn color(r: u8, g: u8, b: u8, a: u8) Color {
 var screen_w: i32 = 800;
 var screen_h: i32 = 600;
 
+/// Design dimensions — the virtual canvas size in design pixels.
+/// Screen-space (no-camera) NDC is computed relative to these, so a
+/// design-sized quad always fills exactly NDC (-1,-1)→(1,1) regardless
+/// of the physical framebuffer size. Defaults to match screen_w/screen_h
+/// so desktop (high_dpi=false) behaviour is unchanged; override via
+/// setDesignSize() when the physical resolution differs from the design
+/// resolution (e.g. Android with high_dpi=true).
+var design_w: i32 = 800;
+var design_h: i32 = 600;
+
 pub fn setScreenSize(w: i32, h: i32) void {
     screen_w = w;
     screen_h = h;
+    // Keep design dimensions in sync unless explicitly overridden via
+    // setDesignSize(). This preserves backward-compatible behaviour for
+    // desktop and high_dpi=false targets where physical == design.
+    design_w = w;
+    design_h = h;
+}
+
+/// Override the design canvas dimensions used for screen-space NDC mapping.
+/// Call this after setScreenSize() when the physical framebuffer is larger
+/// than the design resolution (e.g. Android with high_dpi=true).
+pub fn setDesignSize(w: i32, h: i32) void {
+    design_w = w;
+    design_h = h;
 }
 
 // ── Camera state ────────────────────────────────────────────────────
@@ -76,7 +99,9 @@ var camera_active: bool = false;
 /// When a camera is active, applies forward transform: (world - target) * zoom + offset.
 fn toNdcX(px: f32) f32 {
     if (!camera_active) {
-        return (px / @as(f32, @floatFromInt(screen_w))) * 2.0 - 1.0;
+        // Screen-space: map design coords directly to NDC so a design-width
+        // quad fills exactly NDC -1..1 regardless of physical screen width.
+        return (px / @as(f32, @floatFromInt(design_w))) * 2.0 - 1.0;
     }
     const cam = active_camera;
     const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x;
@@ -84,16 +109,17 @@ fn toNdcX(px: f32) f32 {
 }
 
 fn toNdcY(py: f32) f32 {
-    const fh = @as(f32, @floatFromInt(screen_h));
     if (!camera_active) {
-        return 1.0 - (py / fh) * 2.0;
+        // Screen-space: map design coords directly to NDC so a design-height
+        // quad fills exactly NDC -1..1 regardless of physical screen height.
+        return 1.0 - (py / @as(f32, @floatFromInt(design_h))) * 2.0;
     }
     const cam = active_camera;
     // Positions arrive in screen-space Y-down (Y-flipped by renderer.toScreenY).
     // Apply the camera in the same screen-Y-down convention as the raylib backend:
     // screen_final = (py - target.y) * zoom + offset.y
     const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
-    return 1.0 - (screen_y / fh) * 2.0;
+    return 1.0 - (screen_y / @as(f32, @floatFromInt(screen_h))) * 2.0;
 }
 
 // ── Draw primitives (Backend contract) ─────────────────────────────────

@@ -40,6 +40,12 @@ pub fn height() i32 {
     return sapp.height();
 }
 
+/// Duration of the last frame in seconds.
+/// Use this for dt in the frame callback instead of a hardcoded value.
+pub fn frameDuration() f64 {
+    return sapp.frameDuration();
+}
+
 pub fn beginFrame() sg.PassAction {
     sgl.defaults();
     var pass_action: sg.PassAction = .{};
@@ -89,6 +95,7 @@ pub fn makeDesc(desc: struct {
         .height = desc.h,
         .window_title = desc.title,
         .gl = if (is_android) .{ .major_version = 3, .minor_version = 0 } else .{},
+        .high_dpi = true,
         .logger = .{ .func = slog.func },
     };
 }
