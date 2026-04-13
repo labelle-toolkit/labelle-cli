@@ -46,11 +46,11 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
             }
         }
 
-        if (!try gen.isCliCached(allocator, version)) {
-            std.debug.print("  fetching cli {s}...\n", .{version});
-            try cache.fetchCliWithFallback(allocator, version);
+        if (!try gen.isAssemblerCached(allocator, version)) {
+            std.debug.print("  fetching assembler {s}...\n", .{version});
+            try cache.fetchAssemblerWithFallback(allocator, version);
         } else {
-            std.debug.print("  cli {s} already cached\n", .{version});
+            std.debug.print("  assembler {s} already cached\n", .{version});
         }
 
         std.debug.print("labelle: done\n", .{});
@@ -63,12 +63,12 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
     if (std.mem.eql(u8, pkg_name, "core") or std.mem.eql(u8, pkg_name, "engine") or std.mem.eql(u8, pkg_name, "gfx")) {
         std.debug.print("labelle: fetching {s} {s}...\n", .{ pkg_name, version });
         try cache.fetchFrameworkWithFallback(allocator, pkg_name, version);
-    } else if (std.mem.eql(u8, pkg_name, "cli")) {
-        std.debug.print("labelle: fetching cli {s}...\n", .{version});
-        try cache.fetchCliWithFallback(allocator, version);
+    } else if (std.mem.eql(u8, pkg_name, "assembler")) {
+        std.debug.print("labelle: fetching assembler {s}...\n", .{version});
+        try cache.fetchAssemblerWithFallback(allocator, version);
     } else {
         std.debug.print("labelle install: unknown package '{s}'\n", .{pkg_name});
-        std.debug.print("  known packages: core, engine, gfx, cli\n", .{});
+        std.debug.print("  known packages: core, engine, gfx, assembler\n", .{});
         return error.UnknownPackage;
     }
 

@@ -26,10 +26,6 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: gen.ProjectConfig) !void {
         }
     }
 
-    if (!try gen.isCliCached(allocator, cfg.labelle_version)) {
-        try fetchCliWithFallback(allocator, cfg.labelle_version);
-    }
-
     const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
     if (!try gen.isAssemblerCached(allocator, asm_ver)) {
         try fetchAssemblerWithFallback(allocator, asm_ver);
@@ -72,28 +68,8 @@ pub fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8
     try gen.fetchFrameworkPackage(allocator, name, version);
 }
 
-/// Fetch CLI-bundled packages: try monorepo first, then remote.
-pub fn fetchCliWithFallback(allocator: std.mem.Allocator, version: []const u8) !void {
-    if (findRepoRoot(allocator)) |repo_root| {
-        defer allocator.free(repo_root);
-        const companion = try std.fs.path.join(allocator, &.{ repo_root, "labelle-cli" });
-        defer allocator.free(companion);
-
-        if (util.dirExists(companion)) {
-            std.debug.print("  caching cli {s} (local)\n", .{version});
-            try gen.populateCliCache(allocator, version, companion);
-            return;
-        }
-    }
-
-    std.debug.print("  fetching cli {s} (remote)...\n", .{version});
-    try gen.fetchCliPackages(allocator, version);
-}
-
-/// Fetch assembler-bundled packages: try monorepo first, then remote.
-/// Backends are migrating from labelle-cli into labelle-assembler; the
-/// assembler cache slot holds the migrated ones, the CLI cache slot holds
-/// the rest, and the resolver falls back between them during the migration.
+/// Fetch assembler-bundled packages (backends, ecs, gui): try monorepo
+/// first, then remote. The CLI no longer bundles any of these — see #147.
 pub fn fetchAssemblerWithFallback(allocator: std.mem.Allocator, version: []const u8) !void {
     if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);

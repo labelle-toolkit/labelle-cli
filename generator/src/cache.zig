@@ -58,22 +58,6 @@ pub fn resolveFrameworkPackage(allocator: std.mem.Allocator, package: []const u8
     return try std.fs.path.join(allocator, &.{ packages_dir, package, version });
 }
 
-/// Resolve a CLI-bundled package (backend, ecs adapter) to its cached path.
-/// Returns an absolute path like: ~/.labelle/packages/cli/0.3.0/backends/raylib
-/// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
-pub fn resolveCliPackage(allocator: std.mem.Allocator, cli_version: []const u8, project_dir: ?[]const u8, subpath: []const u8) ![]const u8 {
-    if (config.isLocalVersion(cli_version)) {
-        const local_path = config.localVersionPath(cli_version);
-        const joined = try std.fs.path.join(allocator, &.{ local_path, subpath });
-        defer allocator.free(joined);
-        return resolveLocalPath(allocator, joined, project_dir);
-    }
-
-    const packages_dir = try getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-    return try std.fs.path.join(allocator, &.{ packages_dir, "cli", cli_version, subpath });
-}
-
 /// Resolve an assembler-bundled package (backend, ecs adapter, gui) to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/assembler/0.3.0/backends/raylib
 /// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
@@ -141,17 +125,6 @@ pub fn isFrameworkCached(allocator: std.mem.Allocator, package: []const u8, vers
     return dirExists(path);
 }
 
-/// Check if a CLI package version is cached.
-pub fn isCliCached(allocator: std.mem.Allocator, cli_version: []const u8) !bool {
-    if (config.isLocalVersion(cli_version)) return true;
-
-    const packages_dir = try getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-    const path = try std.fs.path.join(allocator, &.{ packages_dir, "cli", cli_version });
-    defer allocator.free(path);
-    return dirExists(path);
-}
-
 /// Check if an assembler package version is cached.
 pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []const u8) !bool {
     if (config.isLocalVersion(assembler_version)) return true;
@@ -170,42 +143,6 @@ pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !b
     const path = try resolvePlugin(allocator, plugin, null);
     defer allocator.free(path);
     return dirExists(path);
-}
-
-/// Populate the CLI cache from the companion directory.
-/// The companion directory is expected to be a sibling of the CLI binary: ../packages/
-/// Copies backends/ and ecs/ into ~/.labelle/packages/cli/{version}/
-pub fn populateCliCache(allocator: std.mem.Allocator, cli_version: []const u8, companion_dir: []const u8) !void {
-    const packages_dir = try getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-
-    const target = try std.fs.path.join(allocator, &.{ packages_dir, "cli", cli_version });
-    defer allocator.free(target);
-
-    const cwd = std.fs.cwd();
-
-    // Create target directory
-    cwd.makePath(target) catch |err| {
-        std.debug.print("labelle: could not create cache directory '{s}': {any}\n", .{ target, err });
-        return error.CachePopulationFailed;
-    };
-
-    // Symlink companion subdirectories
-    const subdirs = [_][]const u8{ "ecs", "gui" };
-    for (subdirs) |subdir| {
-        const src_path = try std.fs.path.join(allocator, &.{ companion_dir, subdir });
-        defer allocator.free(src_path);
-
-        if (!dirExists(src_path)) continue;
-
-        const dst_path = try std.fs.path.join(allocator, &.{ target, subdir });
-        defer allocator.free(dst_path);
-
-        symlinkToCache(allocator, src_path, dst_path) catch |err| {
-            std.debug.print("labelle: could not link '{s}' to cache: {any}\n", .{ src_path, err });
-            return error.CachePopulationFailed;
-        };
-    }
 }
 
 /// Populate the assembler cache from the assembler source directory.
@@ -262,12 +199,7 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
         }
     }
 
-    // CLI-bundled packages
-    if (!try isCliCached(allocator, cfg.labelle_version)) {
-        try missing.append(allocator, try std.fmt.allocPrint(allocator, "cli {s}", .{cfg.labelle_version}));
-    }
-
-    // Assembler-bundled packages (backends, ecs, gui — migrating from CLI)
+    // Assembler-bundled packages (backends, ecs, gui)
     if (!try isAssemblerCached(allocator, cfg.labelle_version)) {
         try missing.append(allocator, try std.fmt.allocPrint(allocator, "assembler {s}", .{cfg.labelle_version}));
     }
@@ -395,59 +327,6 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
         };
     }
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-}
-
-/// Fetch CLI-bundled packages (ecs, gui) into the cache.
-/// Clones from the labelle-cli repo at the matching tag.
-/// These packages ship with the CLI and are normally populated from the
-/// companion directory; remote fetching is the fallback.
-///
-/// Backends used to live here too but moved to labelle-assembler — see
-/// fetchAssemblerPackages.
-pub fn fetchCliPackages(allocator: std.mem.Allocator, cli_version: []const u8) !void {
-    const packages_dir = try getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-
-    const target = try std.fs.path.join(allocator, &.{ packages_dir, "cli", cli_version });
-    defer allocator.free(target);
-
-    const git_url = "https://github.com/labelle-toolkit/labelle-cli.git";
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{cli_version});
-    defer allocator.free(tag);
-
-    const tmp_dir = try getTempPath(allocator, "labelle-cli-fetch", cli_version);
-    defer allocator.free(tmp_dir);
-
-    // Clean up any previous attempt
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-    gitCloneShallow(allocator, git_url, tag, tmp_dir) catch {
-        std.debug.print("labelle: could not fetch cli packages at v{s}\n", .{cli_version});
-        std.debug.print("  cli-bundled packages (ecs, gui) ship with the CLI binary.\n", .{});
-        std.debug.print("  run 'labelle update' to get the latest CLI with bundled packages.\n", .{});
-        return error.FetchFailed;
-    };
-
-    const cwd = std.fs.cwd();
-    cwd.makePath(target) catch {};
-
-    const subdirs = [_][]const u8{ "ecs", "gui" };
-    for (subdirs) |subdir| {
-        const src = try std.fs.path.join(allocator, &.{ tmp_dir, subdir });
-        defer allocator.free(src);
-
-        if (!dirExists(src)) continue;
-
-        const dst = try std.fs.path.join(allocator, &.{ target, subdir });
-        defer allocator.free(dst);
-
-        copyDirRecursive(allocator, src, dst) catch |err| {
-            std.debug.print("labelle: warning: could not copy {s}: {any}\n", .{ subdir, err });
-        };
-    }
-
-    // Clean up temp clone
     std.fs.cwd().deleteTree(tmp_dir) catch {};
 }
 

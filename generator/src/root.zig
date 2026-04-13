@@ -51,23 +51,19 @@ pub const deps_linker = build_files.deps_linker;
 pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;
 pub const getPackagesDir = cache.getPackagesDir;
-pub const populateCliCache = cache.populateCliCache;
 pub const populateAssemblerCache = cache.populateAssemblerCache;
 pub const populateFrameworkPackage = cache.populateFrameworkPackage;
 pub const populatePlugin = cache.populatePlugin;
 pub const isFrameworkCached = cache.isFrameworkCached;
-pub const isCliCached = cache.isCliCached;
 pub const isAssemblerCached = cache.isAssemblerCached;
 pub const isPluginCached = cache.isPluginCached;
 pub const fetchFrameworkPackage = cache.fetchFrameworkPackage;
 pub const fetchPlugin = cache.fetchPlugin;
-pub const fetchCliPackages = cache.fetchCliPackages;
 pub const fetchAssemblerPackages = cache.fetchAssemblerPackages;
 pub const R2_BASE_URL = cache.R2_BASE_URL;
 pub const patchCachedDeps = cache.patchCachedDeps;
 pub const resolvePlugin = cache.resolvePlugin;
 pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
-pub const resolveCliPackage = cache.resolveCliPackage;
 pub const resolveBundledPackage = cache.resolveBundledPackage;
 
 /// Generate all assembler files into output_dir/.labelle/{backend}_{platform}/.
