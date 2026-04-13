@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
 
     // Re-export sokol backend modules (using the same sokol dep with imgui)
     // This avoids module conflicts when the demo needs both sokol backends and imgui.
-    const backend_root = "../../../backends/sokol/src";
+    const backend_root = "../../../labelle-assembler/backends/sokol/src";
 
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path(backend_root ++ "/gfx.zig"),

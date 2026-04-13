@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
 
     // Re-export raylib backend modules (using the same raylib dep)
     // to avoid module conflicts when the demo needs both raylib backends and imgui.
-    const backend_root = "../../../backends/raylib/src";
+    const backend_root = "../../../labelle-assembler/backends/raylib/src";
 
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path(backend_root ++ "/gfx.zig"),
