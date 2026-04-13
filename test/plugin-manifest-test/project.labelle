@@ -7,6 +7,7 @@
     .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
     .labelle_version = "local:../../",
+    .assembler_version = "local:../../../labelle-assembler",
     .plugins = .{
         .{ .name = "fsm_test", .repo = "local:fake-fsm-plugin" },
         // fake-other-plugin ships no plugin.labelle by default — it's a

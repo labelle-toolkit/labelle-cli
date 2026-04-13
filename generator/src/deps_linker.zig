@@ -44,7 +44,7 @@ pub fn createDepsLinks(
         const backend_name = @tagName(cfg.backend);
         var subpath_buf: [128]u8 = undefined;
         const subpath = std.fmt.bufPrint(&subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
-        const backend_path = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, subpath);
+        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, subpath);
         const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{backend_name});
         const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{backend_name});
         try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = backend_path });
@@ -67,7 +67,7 @@ pub fn createDepsLinks(
             };
             var subpath_buf: [128]u8 = undefined;
             const subpath = std.fmt.bufPrint(&subpath_buf, "ecs/{s}", .{ecs_dir}) catch unreachable;
-            const ecs_path = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, subpath);
+            const ecs_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, subpath);
             const ecs_link_name: []const u8 = switch (cfg.ecs) {
                 .zig_ecs => "labelle-zig-ecs",
                 .zflecs => "labelle-zflecs",
