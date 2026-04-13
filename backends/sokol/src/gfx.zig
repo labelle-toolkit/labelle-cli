@@ -89,11 +89,10 @@ fn toNdcY(py: f32) f32 {
         return 1.0 - (py / fh) * 2.0;
     }
     const cam = active_camera;
-    // Positions arrive in screen-space (Y-flipped by renderer.toScreenY).
-    // Undo the flip to get world Y-up, apply camera with inverted Y
-    // (screen Y-down vs world Y-up), then convert to NDC.
-    const world_y = fh - py;
-    const screen_y = -(world_y - cam.target.y) * cam.zoom + cam.offset.y;
+    // Positions arrive in screen-space Y-down (Y-flipped by renderer.toScreenY).
+    // Apply the camera in the same screen-Y-down convention as the raylib backend:
+    // screen_final = (py - target.y) * zoom + offset.y
+    const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
     return 1.0 - (screen_y / fh) * 2.0;
 }
 
@@ -353,16 +352,16 @@ pub fn getScreenHeight() i32 {
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.offset.x) / camera.zoom + camera.target.x,
-        // Y is inverted: screen Y-down, world Y-up
-        .y = camera.target.y - (pos.y - camera.offset.y) / camera.zoom,
+        // Screen Y-down convention, same as raylib backend
+        .y = (pos.y - camera.offset.y) / camera.zoom + camera.target.y,
     };
 }
 
 pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.target.x) * camera.zoom + camera.offset.x,
-        // Y is inverted: world Y-up, screen Y-down
-        .y = -(pos.y - camera.target.y) * camera.zoom + camera.offset.y,
+        // Screen Y-down convention, same as raylib backend
+        .y = (pos.y - camera.target.y) * camera.zoom + camera.offset.y,
     };
 }
 

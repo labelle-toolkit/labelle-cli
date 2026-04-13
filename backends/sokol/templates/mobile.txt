@@ -27,7 +27,7 @@ export fn frame() callconv(.c) void {
     const actual_w = window.width();
     const actual_h = window.height();
     BackendGfxType.setScreenSize(actual_w, actual_h);
-    g.setScreenHeight(@floatFromInt(actual_h));
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     const dt: f32 = 0.016;
 {{tick_code}}    g.tick(dt);
     const pass_action = window.beginFrame();
