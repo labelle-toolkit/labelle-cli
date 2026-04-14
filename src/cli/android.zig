@@ -3,6 +3,7 @@ const std = @import("std");
 const gen = @import("generator");
 const runner = @import("runner.zig");
 const util = @import("util.zig");
+const android_sdk = @import("android_sdk.zig");
 
 /// Handle `labelle android <subcommand>` dispatch.
 pub fn handleAndroid(
@@ -38,11 +39,77 @@ pub fn handleAndroid(
     } else if (std.mem.eql(u8, cmd, "run")) {
         try androidBuild(allocator, target_dir, emulator, release);
         try deployToDevice(allocator, target_dir, cfg, emulator);
+    } else if (std.mem.eql(u8, cmd, "doctor")) {
+        try runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {
         printHelp();
     } else {
         std.debug.print("labelle android: unknown subcommand '{s}'\n", .{cmd});
         printHelp();
+    }
+}
+
+/// Run the SDK / NDK environment probe and print a pass/fail report.
+/// Used via `labelle android doctor`. Exits the process with code 1
+/// when any required tool is missing so CI scripts can gate on it.
+///
+/// Takes an optional `android_cfg` purely to pick up the project's
+/// `target_sdk_version`. When called without a project (via the
+/// standalone dispatch in cli.zig for `labelle android doctor` in a
+/// random directory), pass `null` to use the defaults.
+pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) !void {
+    // Every probe allocates path strings and the checks list; they all
+    // live until the report is printed at the end of this function. An
+    // arena matches that lifetime exactly and avoids tracking every
+    // individual allocation through optional / catch-null branches.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const resolved = android_cfg orelse gen.AndroidConfig{};
+    const info = try android_sdk.detect(arena_alloc, .{
+        .target_sdk_version = resolved.target_sdk_version,
+        // In doctor mode the NDK miss is still a hard failure — builds
+        // will fail without it — but we surface every check first so
+        // the user sees the full picture.
+        .ndk_required = true,
+    });
+
+    std.debug.print(
+        \\
+        \\labelle android doctor
+        \\======================
+        \\  target SDK: {d}
+        \\
+    , .{info.target_sdk_version});
+
+    var failures: u32 = 0;
+    var optional_misses: u32 = 0;
+    for (info.checks) |check| {
+        if (check.path) |p| {
+            std.debug.print("  [  OK  ] {s}\n           {s}\n", .{ check.name, p });
+        } else if (check.required) {
+            failures += 1;
+            std.debug.print("  [ FAIL ] {s}\n", .{check.name});
+            if (check.hint) |h| std.debug.print("           → {s}\n", .{h});
+        } else {
+            optional_misses += 1;
+            std.debug.print("  [ WARN ] {s}\n", .{check.name});
+            if (check.hint) |h| std.debug.print("           → {s}\n", .{h});
+        }
+    }
+
+    std.debug.print("\n", .{});
+    if (failures == 0) {
+        std.debug.print("  All required Android tools are present.\n", .{});
+        if (optional_misses > 0) {
+            std.debug.print("  ({d} optional tool(s) missing — see WARN lines above.)\n", .{optional_misses});
+        }
+        std.debug.print("\n", .{});
+    } else {
+        std.debug.print("  {d} required tool(s) missing — see FAIL lines above.\n", .{failures});
+        std.debug.print("  Install instructions: https://developer.android.com/tools\n\n", .{});
+        return error.AndroidToolsMissing;
     }
 }
 
@@ -519,7 +586,7 @@ fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8)
     }
 }
 
-fn printHelp() void {
+pub fn printHelp() void {
     std.debug.print(
         \\
         \\Usage: labelle android <command> [options]
@@ -527,6 +594,8 @@ fn printHelp() void {
         \\Commands:
         \\  build      Build for Android device (arm64)
         \\  run        Build and deploy to device/emulator
+        \\  doctor     Probe the Android SDK/NDK environment and report
+        \\             the status of every required tool
         \\  help       Show this help
         \\
         \\Options:
