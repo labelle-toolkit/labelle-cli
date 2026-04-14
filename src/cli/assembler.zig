@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const gen = @import("generator");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
+const runner = @import("runner.zig");
 
 /// GitHub release URL template for assembler binaries.
 const ASSEMBLER_RELEASE_BASE = "https://github.com/labelle-toolkit/labelle-assembler/releases/download";
@@ -48,7 +49,7 @@ fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, pro
     defer allocator.free(real_source);
 
     std.debug.print("labelle: building local assembler at {s}...\n", .{real_source});
-    const build_result = util.runCmdInDir(allocator, &.{ "zig", "build" }, real_source) catch |err| {
+    const build_result = runner.runZig(allocator, real_source, &.{ "zig", "build" }) catch |err| {
         std.debug.print("labelle: failed to run 'zig build' in {s}: {any}\n", .{ real_source, err });
         return error.AssemblerNotCached;
     };
@@ -59,7 +60,10 @@ fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, pro
             std.debug.print("labelle: local assembler build failed (exit {d})\n{s}", .{ code, build_result.stderr });
             return error.AssemblerNotCached;
         },
-        else => return error.AssemblerNotCached,
+        else => {
+            std.debug.print("labelle: local assembler build terminated abnormally\n", .{});
+            return error.AssemblerNotCached;
+        },
     }
 
     const bin_path = try std.fs.path.join(allocator, &.{ real_source, "zig-out", "bin", exe_name });
