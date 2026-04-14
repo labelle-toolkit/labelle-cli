@@ -150,7 +150,13 @@ pub fn handleAndroid(
 
     if (std.mem.eql(u8, cmd, "build")) {
         if (all_abis) {
-            _ = try buildAllAbis(allocator, target_dir, release_mode);
+            // Arena contains every path string + the StagedAbi slice
+            // returned by buildAllAbis. For `build` we only care that
+            // the .so files landed on disk; the staged paths are
+            // discarded so the arena is all we need.
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            _ = try buildAllAbis(arena.allocator(), target_dir, release_mode);
         } else {
             try androidBuild(allocator, target_dir, emulator, release_mode);
         }
@@ -258,9 +264,15 @@ pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) 
 
 /// Build every ABI the fat APK needs, stashing each `libgame.so` at
 /// a per-arch path so back-to-back `zig build` invocations don't
-/// clobber each other. Returns a slice of `StagedAbi` entries (owned
-/// by `allocator`, typically an arena) that `deployToDeviceWithAbis`
-/// can stage into `apk-staging/lib/<abi>/`.
+/// clobber each other. Returns a slice of `StagedAbi` entries —
+/// every `so_path` field and the slice itself are owned by
+/// `allocator`.
+///
+/// Callers pass an ArenaAllocator so transient intermediate strings
+/// (stash_root, per-iter dst_dir) plus the returned slice are
+/// released together; manual defers are still used for correctness
+/// under a non-arena allocator (the `errdefer` that walks the list
+/// on failure, and the per-iter `dst_dir` free).
 ///
 /// Relies on the generated build.zig accepting
 /// `-Dandroid_arch=arm64|x86_64`, which landed in labelle-assembler's
@@ -269,10 +281,19 @@ pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) 
 /// regenerate build.zig.
 fn buildAllAbis(allocator: std.mem.Allocator, target_dir: []const u8, release_mode: ReleaseMode) ![]const StagedAbi {
     const stash_root = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "android-multi" });
-    std.fs.cwd().makePath(stash_root) catch {};
+    defer allocator.free(stash_root);
+    // Wipe any stale per-arch binaries from a previous `--all-abis`
+    // run — we want each invocation to start from a clean slate so
+    // aborted builds don't leave half-a-fat-APK lying around. Missing
+    // is fine; permission errors will surface on makePath below.
+    std.fs.cwd().deleteTree(stash_root) catch {};
+    try std.fs.cwd().makePath(stash_root);
 
     var staged: std.ArrayList(StagedAbi) = .{};
-    errdefer staged.deinit(allocator);
+    errdefer {
+        for (staged.items) |item| allocator.free(item.so_path);
+        staged.deinit(allocator);
+    }
 
     for (all_abi_archs) |abi| {
         try androidBuildArch(allocator, target_dir, abi, release_mode);
@@ -285,8 +306,11 @@ fn buildAllAbis(allocator: std.mem.Allocator, target_dir: []const u8, release_mo
         };
 
         const dst_dir = try std.fs.path.join(allocator, &.{ stash_root, abi.libDir() });
+        defer allocator.free(dst_dir);
         try std.fs.cwd().makePath(dst_dir);
+
         const dst = try std.fs.path.join(allocator, &.{ dst_dir, "libgame.so" });
+        errdefer allocator.free(dst);
         try std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{});
 
         try staged.append(allocator, .{ .abi_dir = abi.libDir(), .so_path = dst });
