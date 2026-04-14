@@ -10,7 +10,14 @@
         // below to pick up new assembler types; the old mirror
         // approach made every assembler change a double-edit (#151).
         .labelle_assembler = .{
-            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/a610afd51a9c967edec3919a138aac9a67ca58c2.tar.gz",
+            // Pinned to the v0.6.0 release commit (2026-04-14).
+            // Zig's package hash is content-hashed over
+            // \`paths = {build.zig, build.zig.zon, src}\`, so this
+            // hash happens to match the earlier a610afd pin — the
+            // plugins/examples absorbs didn't touch src/. The URL
+            // is still bumped to point at the release tag's commit
+            // for clarity.
+            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/295021cd5d12fc28d2ea5014b44cd45b48e71d48.tar.gz",
             .hash = "labelle_assembler-0.1.0-pG4XEN5xAwAnum-kDc9yodAT3RzwkiOQPUg3W7N-IX9L",
         },
         .zspec = .{
