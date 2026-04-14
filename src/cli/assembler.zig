@@ -31,6 +31,46 @@ pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
     };
 }
 
+/// Resolve `assembler_version = "local:<path>"`: build the sibling
+/// labelle-assembler checkout and return the path to its binary.
+/// `rel_path` is relative to `project_dir` (or absolute).
+fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, project_dir: []const u8) ![]u8 {
+    const source_dir = if (std.fs.path.isAbsolute(rel_path))
+        try allocator.dupe(u8, rel_path)
+    else
+        try std.fs.path.join(allocator, &.{ project_dir, rel_path });
+    defer allocator.free(source_dir);
+
+    const real_source = std.fs.cwd().realpathAlloc(allocator, source_dir) catch |err| {
+        std.debug.print("labelle: local assembler path '{s}' does not exist: {any}\n", .{ source_dir, err });
+        return error.AssemblerNotCached;
+    };
+    defer allocator.free(real_source);
+
+    std.debug.print("labelle: building local assembler at {s}...\n", .{real_source});
+    const build_result = util.runCmdInDir(allocator, &.{ "zig", "build" }, real_source) catch |err| {
+        std.debug.print("labelle: failed to run 'zig build' in {s}: {any}\n", .{ real_source, err });
+        return error.AssemblerNotCached;
+    };
+    defer allocator.free(build_result.stdout);
+    defer allocator.free(build_result.stderr);
+    switch (build_result.term) {
+        .Exited => |code| if (code != 0) {
+            std.debug.print("labelle: local assembler build failed (exit {d})\n{s}", .{ code, build_result.stderr });
+            return error.AssemblerNotCached;
+        },
+        else => return error.AssemblerNotCached,
+    }
+
+    const bin_path = try std.fs.path.join(allocator, &.{ real_source, "zig-out", "bin", exe_name });
+    std.fs.cwd().access(bin_path, .{}) catch |err| {
+        std.debug.print("labelle: local assembler binary not found at {s}: {any}\n", .{ bin_path, err });
+        allocator.free(bin_path);
+        return error.AssemblerNotCached;
+    };
+    return bin_path;
+}
+
 /// Platform/arch names used in the release URL.
 fn osName() error{UnsupportedPlatform}![]const u8 {
     return switch (builtin.os.tag) {
@@ -174,6 +214,14 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     defer arena.deinit();
     const manifest = try launcher_manifest.readLauncherManifest(arena.allocator(), project_dir) orelse return null;
     const pinned_version = manifest.assembler_version orelse return null;
+
+    // 2a. `local:<path>` — dev-mode pointer at a sibling labelle-assembler
+    // checkout. Build it on demand (idempotent when up to date) and run
+    // the binary out of its zig-out/bin/. Avoids the URL/hash cache path
+    // entirely so monorepo-style edits round-trip without a release.
+    if (std.mem.startsWith(u8, pinned_version, "local:")) {
+        return try resolveLocalAssembler(allocator, pinned_version["local:".len..], project_dir);
+    }
 
     // Resolve from cache: ~/.labelle/assembler/<version>/labelle-assembler
     const cache_root = try gen.getCacheRoot(allocator);

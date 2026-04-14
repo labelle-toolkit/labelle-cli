@@ -31,6 +31,17 @@ pub fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) !std.proce
     });
 }
 
+/// Run a command with `cwd` set to a specific directory. Used when the
+/// command (e.g. `zig build`) must execute inside a sibling source tree
+/// rather than the project directory.
+pub fn runCmdInDir(allocator: std.mem.Allocator, argv: []const []const u8, cwd: []const u8) !std.process.Child.RunResult {
+    return std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .cwd = cwd,
+    });
+}
+
 /// Parse semantic version string into a comparable number.
 /// "1.2.3" -> 1*1000000 + 2*1000 + 3 = 1002003
 pub fn parseVersion(version: []const u8) u32 {
