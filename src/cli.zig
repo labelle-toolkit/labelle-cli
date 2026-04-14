@@ -98,7 +98,12 @@ const Platform = gen.Platform;
 const ParsedArgs = struct {
     command: Command,
     project_dir: []const u8 = ".",
-    extra_args: [8][]const u8 = undefined,
+    // Sized for the longest realistic android invocation:
+    //   android run --all-abis --release --keystore k --keystore-pass p
+    //               --key-alias a --key-pass kp
+    // That's 11 tokens — 16 gives headroom for future flags without
+    // risking silent truncation (flagged by the PR #171 review).
+    extra_args: [16][]const u8 = undefined,
     extra_count: usize = 0,
     timeout_ns: ?u64 = null,
     scene_override: ?[]const u8 = null,
@@ -286,15 +291,22 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
 }
 
 /// Collect all remaining args into extra_args buffer.
-fn collectExtraArgs(args: *std.process.ArgIterator, extra_args: *[8][]const u8, extra_count: *usize) ParseError!void {
+fn collectExtraArgs(args: *std.process.ArgIterator, parsed_args: *ParsedArgs) ParseError!void {
     while (args.next()) |arg| {
-        if (extra_count.* >= extra_args.len) {
-            std.debug.print("labelle: too many arguments\n", .{});
-            return error.TooManyArguments;
-        }
-        extra_args[extra_count.*] = arg;
-        extra_count.* += 1;
+        try appendExtraArg(parsed_args, arg);
     }
+}
+
+/// Append one token to `ParsedArgs.extra_args`, surfacing overflow as
+/// an error instead of silently dropping it (which would let the
+/// subcommand fall through to `project_dir`).
+fn appendExtraArg(parsed_args: *ParsedArgs, arg: []const u8) ParseError!void {
+    if (parsed_args.extra_count >= parsed_args.extra_args.len) {
+        std.debug.print("labelle: too many arguments\n", .{});
+        return error.TooManyArguments;
+    }
+    parsed_args.extra_args[parsed_args.extra_count] = arg;
+    parsed_args.extra_count += 1;
 }
 
 /// Handle `labelle assembler <subcommand>`.
@@ -345,10 +357,10 @@ pub fn main() !void {
             parsed_args.docker_target = result.docker_target;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
-            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "install")) {
             parsed_args.command = .install_cmd;
-            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "upgrade")) {
             parsed_args.command = .upgrade_cmd;
             if (args.next()) |next_arg| {
@@ -360,19 +372,18 @@ pub fn main() !void {
                     std.mem.eql(u8, next_arg, "assembler") or
                     std.mem.eql(u8, next_arg, "all"))
                 {
-                    parsed_args.extra_args[parsed_args.extra_count] = next_arg;
-                    parsed_args.extra_count += 1;
+                    try appendExtraArg(&parsed_args, next_arg);
                 } else {
                     parsed_args.project_dir = next_arg;
                 }
             }
-            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "update")) {
             parsed_args.command = .update_cmd;
-            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "clean")) {
             parsed_args.command = .clean_cmd;
-            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "ios")) {
             parsed_args.command = .ios_cmd;
             // First non-flag arg that isn't a subcommand is the project dir
@@ -382,10 +393,7 @@ pub fn main() !void {
                     std.mem.eql(u8, arg, "xcode") or
                     std.mem.eql(u8, arg, "run"))
                 {
-                    if (parsed_args.extra_count < parsed_args.extra_args.len) {
-                        parsed_args.extra_args[parsed_args.extra_count] = arg;
-                        parsed_args.extra_count += 1;
-                    }
+                    try appendExtraArg(&parsed_args, arg);
                 } else {
                     parsed_args.project_dir = arg;
                 }
@@ -397,10 +405,7 @@ pub fn main() !void {
             var expect_value = false;
             while (args.next()) |arg| {
                 if (expect_value) {
-                    if (parsed_args.extra_count < parsed_args.extra_args.len) {
-                        parsed_args.extra_args[parsed_args.extra_count] = arg;
-                        parsed_args.extra_count += 1;
-                    }
+                    try appendExtraArg(&parsed_args, arg);
                     expect_value = false;
                     continue;
                 }
@@ -410,10 +415,7 @@ pub fn main() !void {
                     std.mem.eql(u8, arg, "doctor") or
                     std.mem.eql(u8, arg, "help"))
                 {
-                    if (parsed_args.extra_count < parsed_args.extra_args.len) {
-                        parsed_args.extra_args[parsed_args.extra_count] = arg;
-                        parsed_args.extra_count += 1;
-                    }
+                    try appendExtraArg(&parsed_args, arg);
                     if (std.mem.eql(u8, arg, "--keystore") or
                         std.mem.eql(u8, arg, "--keystore-pass") or
                         std.mem.eql(u8, arg, "--key-alias") or
@@ -427,7 +429,7 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
-            try collectExtraArgs(&args, &parsed_args.extra_args, &parsed_args.extra_count);
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
             parsed_args.command = .help_cmd;
         } else if (std.mem.eql(u8, first, "version") or std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v")) {

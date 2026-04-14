@@ -70,21 +70,13 @@ pub fn handleAndroid(
         } else if (std.mem.eql(u8, arg, "--release-small")) {
             release_mode = .small;
         } else if (std.mem.eql(u8, arg, "--keystore")) {
-            i += 1;
-            if (i >= extra_args.len) return missingValue(arg);
-            signing.keystore = extra_args[i];
+            signing.keystore = try takeValue(extra_args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--keystore-pass")) {
-            i += 1;
-            if (i >= extra_args.len) return missingValue(arg);
-            signing.keystore_pass = extra_args[i];
+            signing.keystore_pass = try takeValue(extra_args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--key-alias")) {
-            i += 1;
-            if (i >= extra_args.len) return missingValue(arg);
-            signing.key_alias = extra_args[i];
+            signing.key_alias = try takeValue(extra_args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--key-pass")) {
-            i += 1;
-            if (i >= extra_args.len) return missingValue(arg);
-            signing.key_pass = extra_args[i];
+            signing.key_pass = try takeValue(extra_args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -95,6 +87,15 @@ pub fn handleAndroid(
 
     if (signing.keystore != null and signing.keystore_pass == null) {
         std.debug.print("labelle android: --keystore requires --keystore-pass\n", .{});
+        return error.InvalidArgs;
+    }
+    if (signing.keystore == null and
+        (signing.keystore_pass != null or signing.key_alias != null or signing.key_pass != null))
+    {
+        std.debug.print(
+            "labelle android: --keystore-pass, --key-alias and --key-pass require --keystore\n",
+            .{},
+        );
         return error.InvalidArgs;
     }
 
@@ -121,6 +122,19 @@ pub fn handleAndroid(
 fn missingValue(flag: []const u8) error{InvalidArgs} {
     std.debug.print("labelle android: {s} requires a value\n", .{flag});
     return error.InvalidArgs;
+}
+
+/// Pull the next token as the value of a value-bearing flag. Rejects
+/// both the end-of-args case and tokens that look like another flag
+/// (start with `-`), so `--keystore --keystore-pass p` surfaces a
+/// clear "--keystore requires a value" instead of silently eating
+/// `--keystore-pass`.
+fn takeValue(extra_args: []const []const u8, i: *usize, flag: []const u8) error{InvalidArgs}![]const u8 {
+    i.* += 1;
+    if (i.* >= extra_args.len) return missingValue(flag);
+    const v = extra_args[i.*];
+    if (std.mem.startsWith(u8, v, "-")) return missingValue(flag);
+    return v;
 }
 
 /// Run the SDK / NDK environment probe and print a pass/fail report.
@@ -459,12 +473,23 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     var debug_keystore_buf: ?[]u8 = null;
     defer if (debug_keystore_buf) |b| allocator.free(b);
 
-    const resolved: ResolvedSigning = if (signing.keystore) |ks| .{
-        .keystore = ks,
-        .keystore_pass = signing.keystore_pass.?, // validated in handleAndroid
-        .key_alias = signing.key_alias,
-        .key_pass = signing.key_pass,
-        .is_debug = false,
+    // Re-validate here rather than trust `handleAndroid`'s check — the
+    // public `deployToDevice` is callable from other code paths (e.g.
+    // `labelle run` dispatching to Android without the android.zig
+    // arg parser), and we don't want a `SigningConfig` with a
+    // keystore but no pass to hit a panicking `.?` unwrap.
+    const resolved: ResolvedSigning = if (signing.keystore) |ks| blk: {
+        const kp = signing.keystore_pass orelse {
+            std.debug.print("labelle: signing keystore requires keystore_pass\n", .{});
+            return error.InvalidArgs;
+        };
+        break :blk .{
+            .keystore = ks,
+            .keystore_pass = kp,
+            .key_alias = signing.key_alias,
+            .key_pass = signing.key_pass,
+            .is_debug = false,
+        };
     } else blk: {
         const kp = try ensureDebugKeystore(allocator);
         debug_keystore_buf = kp;
