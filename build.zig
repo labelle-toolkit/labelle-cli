@@ -10,8 +10,12 @@ pub fn build(b: *std.Build) void {
     // Library versions from versions.zon — the tested compatible set for this CLI release
     const versions = @import("versions.zon");
 
-    // ── Generator CLI ───────────────────────────────────────────────
-    const gen_dep = b.dependency("generator", .{
+    // ── Generator module from labelle-assembler ─────────────────────
+    // Pulled via the labelle_assembler Zig package dep declared in
+    // build.zig.zon. The module exposes the same types/functions the
+    // CLI used to read from a hand-synced mirror at ./generator (see
+    // #151 and #132 for the history).
+    const gen_dep = b.dependency("labelle_assembler", .{
         .target = target,
         .optimize = optimize,
         .cli_version = @as([]const u8, version),
