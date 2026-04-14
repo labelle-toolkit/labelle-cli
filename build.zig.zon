@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xa3d95bf7b905a401,
     .name = .labelle_cli,
-    .version = "1.32.0",
+    .version = "1.32.1",
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         // Pulls the generator module from labelle-assembler (types,
@@ -16,7 +16,10 @@
             // (game.quit + isKeyPressed timing), RunDesc compile fix,
             // event forwarding to GUI bridge, and the sokol+imgui
             // example. See labelle-assembler v0.7.0 release notes.
-            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/a5486b7.tar.gz",
+            // Use the full 40-char SHA — abbreviated SHAs in archive
+            // URLs can become ambiguous as upstream gains commits and
+            // GitHub will return 404 in that case.
+            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/a5486b767aa51b4de880b8820c395b6e3038fab5.tar.gz",
             .hash = "labelle_assembler-0.1.0-pG4XEKZ1AwCUOL9nZUSr6vKXRr9F0SMgGCnIg2WFEGG0",
         },
         .zspec = .{

@@ -11,8 +11,10 @@
 const std = @import("std");
 
 /// Default assembler version pinned in newly scaffolded projects.
-/// Bump this when a new assembler release ships.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.6.0";
+/// Bump this in lockstep with the labelle_assembler dep in build.zig.zon —
+/// a stale value here would auto-download a binary whose ABI doesn't match
+/// the bundled generator module the CLI is compiled against.
+pub const DEFAULT_ASSEMBLER_VERSION = "0.7.0";
 const builtin = @import("builtin");
 const gen = @import("generator");
 const launcher_manifest = @import("launcher_manifest.zig");
