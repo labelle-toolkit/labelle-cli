@@ -3,9 +3,9 @@
     .title = "Nuklear Plugin Test",
     .backend = .raylib,
     .ecs = .mock,
-    .gui = .{ .path = "../../plugins/nuklear" },
+    .gui = .{ .path = "../../../labelle-assembler/plugins/nuklear" },
     .plugins = .{
-        .{ .name = "debug", .repo = "local:../../plugins/debug" },
+        .{ .name = "debug", .repo = "local:../../../labelle-assembler/plugins/debug" },
     },
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",
