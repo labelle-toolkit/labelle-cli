@@ -48,6 +48,43 @@ const ResolvedSigning = struct {
     is_debug: bool,
 };
 
+/// One built .so ready to be staged into `lib/<abi_dir>/libgame.so`.
+/// `deployToDevice` takes a slice of these so the single-arch and
+/// multi-arch (`--all-abis` fat APK) paths share the same staging /
+/// packaging / signing / install pipeline.
+pub const StagedAbi = struct {
+    /// APK `lib/` subdirectory (e.g. `arm64-v8a`, `x86_64`).
+    abi_dir: []const u8,
+    /// Absolute or target-dir-relative path to the built `libgame.so`.
+    so_path: []const u8,
+};
+
+/// The two arches `--all-abis` produces, in the order they're built.
+/// arm64 first so the faster device build runs before the slower
+/// x86_64 cross-build.
+const all_abi_archs = [_]AbiArch{ .arm64, .x86_64 };
+
+/// Android target arch selector. Mirrors the `-Dandroid_arch` option
+/// in the generated build.zig template.
+pub const AbiArch = enum {
+    arm64,
+    x86_64,
+
+    pub fn optionValue(self: AbiArch) []const u8 {
+        return switch (self) {
+            .arm64 => "arm64",
+            .x86_64 => "x86_64",
+        };
+    }
+
+    pub fn libDir(self: AbiArch) []const u8 {
+        return switch (self) {
+            .arm64 => "arm64-v8a",
+            .x86_64 => "x86_64",
+        };
+    }
+};
+
 /// Handle `labelle android <subcommand>` dispatch.
 pub fn handleAndroid(
     allocator: std.mem.Allocator,
@@ -57,6 +94,7 @@ pub fn handleAndroid(
 ) !void {
     var subcmd: ?[]const u8 = null;
     var emulator = false;
+    var all_abis = false;
     var release_mode: ReleaseMode = .debug;
     var signing = SigningConfig{};
 
@@ -65,6 +103,8 @@ pub fn handleAndroid(
         const arg = extra_args[i];
         if (std.mem.eql(u8, arg, "--emulator")) {
             emulator = true;
+        } else if (std.mem.eql(u8, arg, "--all-abis")) {
+            all_abis = true;
         } else if (std.mem.eql(u8, arg, "--release")) {
             release_mode = .fast;
         } else if (std.mem.eql(u8, arg, "--release-small")) {
@@ -98,6 +138,10 @@ pub fn handleAndroid(
         );
         return error.InvalidArgs;
     }
+    if (all_abis and emulator) {
+        std.debug.print("labelle android: --all-abis and --emulator are mutually exclusive\n", .{});
+        return error.InvalidArgs;
+    }
 
     const cmd = subcmd orelse {
         printHelp();
@@ -105,10 +149,21 @@ pub fn handleAndroid(
     };
 
     if (std.mem.eql(u8, cmd, "build")) {
-        try androidBuild(allocator, target_dir, emulator, release_mode);
+        if (all_abis) {
+            _ = try buildAllAbis(allocator, target_dir, release_mode);
+        } else {
+            try androidBuild(allocator, target_dir, emulator, release_mode);
+        }
     } else if (std.mem.eql(u8, cmd, "run")) {
-        try androidBuild(allocator, target_dir, emulator, release_mode);
-        try deployToDevice(allocator, target_dir, cfg, emulator, signing);
+        if (all_abis) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
+            try deployToDeviceWithAbis(allocator, target_dir, cfg, abis, signing);
+        } else {
+            try androidBuild(allocator, target_dir, emulator, release_mode);
+            try deployToDevice(allocator, target_dir, cfg, emulator, signing);
+        }
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         try runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -201,6 +256,86 @@ pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) 
     }
 }
 
+/// Build every ABI the fat APK needs, stashing each `libgame.so` at
+/// a per-arch path so back-to-back `zig build` invocations don't
+/// clobber each other. Returns a slice of `StagedAbi` entries (owned
+/// by `allocator`, typically an arena) that `deployToDeviceWithAbis`
+/// can stage into `apk-staging/lib/<abi>/`.
+///
+/// Relies on the generated build.zig accepting
+/// `-Dandroid_arch=arm64|x86_64`, which landed in labelle-assembler's
+/// Android template. Projects generated before that template change
+/// will fail with "unknown option 'android_arch'" — users need to
+/// regenerate build.zig.
+fn buildAllAbis(allocator: std.mem.Allocator, target_dir: []const u8, release_mode: ReleaseMode) ![]const StagedAbi {
+    const stash_root = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "android-multi" });
+    std.fs.cwd().makePath(stash_root) catch {};
+
+    var staged: std.ArrayList(StagedAbi) = .{};
+    errdefer staged.deinit(allocator);
+
+    for (all_abi_archs) |abi| {
+        try androidBuildArch(allocator, target_dir, abi, release_mode);
+
+        const src = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
+        defer allocator.free(src);
+        std.fs.cwd().access(src, .{}) catch {
+            std.debug.print("labelle: build for {s} did not produce {s}\n", .{ abi.optionValue(), src });
+            return error.BinaryNotFound;
+        };
+
+        const dst_dir = try std.fs.path.join(allocator, &.{ stash_root, abi.libDir() });
+        try std.fs.cwd().makePath(dst_dir);
+        const dst = try std.fs.path.join(allocator, &.{ dst_dir, "libgame.so" });
+        try std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{});
+
+        try staged.append(allocator, .{ .abi_dir = abi.libDir(), .so_path = dst });
+    }
+
+    return staged.toOwnedSlice(allocator);
+}
+
+/// Run `zig build -Dandroid_arch=<abi>` for a single target arch.
+/// Unlike `androidBuild`, this never passes `-Demulator` — the arch
+/// is selected explicitly so back-to-back builds are reproducible
+/// regardless of host CPU.
+fn androidBuildArch(allocator: std.mem.Allocator, target_dir: []const u8, abi: AbiArch, release_mode: ReleaseMode) !void {
+    const mode_label = switch (release_mode) {
+        .debug => "",
+        .fast => " [ReleaseFast]",
+        .small => " [ReleaseSmall]",
+    };
+    std.debug.print("labelle: building for Android ({s}){s}...\n", .{ abi.libDir(), mode_label });
+
+    var zig_args: std.ArrayList([]const u8) = .{};
+    defer zig_args.deinit(allocator);
+    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+
+    const arch_flag = try std.fmt.allocPrint(allocator, "-Dandroid_arch={s}", .{abi.optionValue()});
+    defer allocator.free(arch_flag);
+    try zig_args.append(allocator, arch_flag);
+
+    if (release_mode.optimizeFlag()) |flag| {
+        try zig_args.append(allocator, flag);
+    }
+
+    const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
+    defer allocator.free(build_result.stdout);
+    defer allocator.free(build_result.stderr);
+
+    switch (build_result.term) {
+        .Exited => |code| if (code != 0) {
+            std.debug.print("labelle: Android build failed ({s}):\n{s}\n", .{ abi.libDir(), build_result.stderr });
+            return error.BuildFailed;
+        },
+        else => {
+            std.debug.print("labelle: Android build ({s}) terminated abnormally\n{s}\n", .{ abi.libDir(), build_result.stderr });
+            return error.BuildFailed;
+        },
+    }
+    std.debug.print("  {s} build ok\n", .{abi.libDir()});
+}
+
 /// Build the Android shared library via `zig build`.
 fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: bool, release_mode: ReleaseMode) !void {
     const mode_label = switch (release_mode) {
@@ -241,8 +376,35 @@ fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: 
     std.debug.print("  build ok\n", .{});
 }
 
-/// Package APK and deploy to device/emulator via ADB.
+/// Package APK and deploy to device/emulator via ADB. Single-arch
+/// entry point — picks the ABI from `emulator` + host arch, then
+/// delegates to `deployToDeviceWithAbis`.
 pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
+    const builtin = @import("builtin");
+    // On Apple Silicon, the Android emulator runs ARM64 images; on
+    // Intel Macs it runs x86_64. Physical device builds always
+    // target arm64-v8a.
+    const abi_dir: []const u8 = if (emulator and builtin.cpu.arch != .aarch64) "x86_64" else "arm64-v8a";
+    const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
+    defer allocator.free(so_path);
+
+    const abis = [_]StagedAbi{.{ .abi_dir = abi_dir, .so_path = so_path }};
+    try deployToDeviceWithAbis(allocator, target_dir, cfg, abis[0..], signing);
+}
+
+/// Shared staging / packaging / install / launch pipeline used by
+/// both the single-arch and `--all-abis` paths. `abis` is the list of
+/// `(abi_dir, libgame.so path)` pairs that get fanned out into
+/// `apk-staging/lib/<abi_dir>/libgame.so` before `buildApk` runs.
+pub fn deployToDeviceWithAbis(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    cfg: gen.ProjectConfig,
+    abis: []const StagedAbi,
+    signing: SigningConfig,
+) !void {
+    if (abis.len == 0) return error.NoAbisProvided;
+
     const android_cfg = cfg.android orelse gen.AndroidConfig{};
     // package_name may be heap-allocated (defaultPackageName) or a slice into
     // android_cfg (no allocation).  Track whether we own it so we can free it.
@@ -251,16 +413,13 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     defer if (package_name_owned) allocator.free(package_name);
     const app_name = if (android_cfg.app_name.len > 0) android_cfg.app_name else cfg.title;
 
-    // Locate the built .so
-    const lib_name = if (emulator) "x86_64-linux-android" else "aarch64-linux-android";
-    _ = lib_name;
-    const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
-    defer allocator.free(so_path);
-
-    std.fs.cwd().access(so_path, .{}) catch {
-        std.debug.print("labelle: Android .so not found at {s}\n", .{so_path});
-        return error.BinaryNotFound;
-    };
+    // Validate every .so exists before we touch the staging dir.
+    for (abis) |abi| {
+        std.fs.cwd().access(abi.so_path, .{}) catch {
+            std.debug.print("labelle: Android .so not found at {s}\n", .{abi.so_path});
+            return error.BinaryNotFound;
+        };
+    }
 
     // Find ADB
     const adb = try findAdb(allocator);
@@ -272,18 +431,18 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     // Intentionally ignoring errors: the staging directory may not exist on first run.
     std.fs.cwd().deleteTree(staging_dir) catch {};
 
-    // Stage .so into lib/<abi>/.
-    // On Apple Silicon, the Android emulator runs ARM64 images; on Intel Macs
-    // it runs x86_64.  Physical device builds always target arm64-v8a.
-    const builtin = @import("builtin");
-    const abi_dir = if (emulator and builtin.cpu.arch != .aarch64) "x86_64" else "arm64-v8a";
-    const lib_dir = try std.fs.path.join(allocator, &.{ staging_dir, "lib", abi_dir });
-    defer allocator.free(lib_dir);
-    try std.fs.cwd().makePath(lib_dir);
+    // Fan out every staged .so into `lib/<abi>/libgame.so`. The fat
+    // APK case produces multiple directories under `lib/`; apksigner
+    // and Android's package installer pick the right one per device.
+    for (abis) |abi| {
+        const lib_dir = try std.fs.path.join(allocator, &.{ staging_dir, "lib", abi.abi_dir });
+        defer allocator.free(lib_dir);
+        try std.fs.cwd().makePath(lib_dir);
 
-    const staged_so = try std.fs.path.join(allocator, &.{ lib_dir, "libgame.so" });
-    defer allocator.free(staged_so);
-    try std.fs.cwd().copyFile(so_path, std.fs.cwd(), staged_so, .{});
+        const staged_so = try std.fs.path.join(allocator, &.{ lib_dir, "libgame.so" });
+        defer allocator.free(staged_so);
+        try std.fs.cwd().copyFile(abi.so_path, std.fs.cwd(), staged_so, .{});
+    }
 
     // Generate AndroidManifest.xml
     const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, "AndroidManifest.xml" });
@@ -740,6 +899,9 @@ pub fn printHelp() void {
         \\
         \\Options:
         \\  --emulator         Target x86_64 emulator instead of arm64 device
+        \\  --all-abis         Build both arm64-v8a and x86_64 into a fat APK
+        \\                     (mutually exclusive with --emulator; requires
+        \\                      an assembler release with -Dandroid_arch)
         \\  --release          Build with ReleaseFast optimization
         \\  --release-small    Build with ReleaseSmall optimization
         \\
