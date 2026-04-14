@@ -396,6 +396,7 @@ pub fn main() !void {
                 if (std.mem.startsWith(u8, arg, "-") or
                     std.mem.eql(u8, arg, "build") or
                     std.mem.eql(u8, arg, "run") or
+                    std.mem.eql(u8, arg, "doctor") or
                     std.mem.eql(u8, arg, "help"))
                 {
                     if (parsed_args.extra_count < parsed_args.extra_args.len) {
@@ -443,6 +444,39 @@ pub fn main() !void {
         .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
+    }
+
+    // `labelle android doctor` and `labelle android help` are
+    // standalone — they don't need a project.labelle. Intercept here
+    // so running them from any directory works without the "No
+    // project.labelle found" bail below.
+    //
+    // Doctor still *uses* the project's android config when available
+    // so the probe targets the right `target_sdk_version`. The read
+    // is quiet: if there's no project (or it fails to parse), we fall
+    // through to the defaults instead of erroring out.
+    //
+    // `AndroidToolsMissing` is caught and turned into `exit(1)` so
+    // the Zig error-return trace stays out of the user's terminal —
+    // the report was already printed.
+    if (command == .android_cmd and parsed_args.extra_count > 0) {
+        const first = parsed_args.extra_args[0];
+        if (std.mem.eql(u8, first, "doctor")) {
+            var doctor_arena = std.heap.ArenaAllocator.init(allocator);
+            defer doctor_arena.deinit();
+            const project_cfg: ?gen.AndroidConfig = blk: {
+                const parsed_cfg = config.readProjectConfigQuiet(doctor_arena.allocator(), project_dir) catch break :blk null;
+                break :blk parsed_cfg.android;
+            };
+            android.runDoctor(allocator, project_cfg) catch |err| {
+                if (err == error.AndroidToolsMissing) std.process.exit(1);
+                return err;
+            };
+            return;
+        }
+        if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
+            return android.printHelp();
+        }
     }
 
     // Read and parse project.labelle
