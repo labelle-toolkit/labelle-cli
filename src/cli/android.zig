@@ -5,6 +5,49 @@ const runner = @import("runner.zig");
 const util = @import("util.zig");
 const android_sdk = @import("android_sdk.zig");
 
+/// Optimisation mode selected from the CLI flags.
+/// `debug` is the default (stack-safe), `fast` is `ReleaseFast`,
+/// `small` is `ReleaseSmall`. Maps directly to the `-Doptimize=` arg
+/// we pass to `zig build`.
+pub const ReleaseMode = enum {
+    debug,
+    fast,
+    small,
+
+    pub fn optimizeFlag(self: ReleaseMode) ?[]const u8 {
+        return switch (self) {
+            .debug => null,
+            .fast => "-Doptimize=ReleaseFast",
+            .small => "-Doptimize=ReleaseSmall",
+        };
+    }
+};
+
+/// APK signing configuration. Every field is optional — unset means
+/// "use the debug keystore with the well-known `android` passwords".
+/// When `keystore` is set, `keystore_pass` is required too; the rest
+/// fall back to sensible defaults (`--key-pass` defaults to the
+/// keystore pass, `--key-alias` defaults to the only alias in the
+/// keystore when apksigner can find one).
+pub const SigningConfig = struct {
+    keystore: ?[]const u8 = null,
+    keystore_pass: ?[]const u8 = null,
+    key_alias: ?[]const u8 = null,
+    key_pass: ?[]const u8 = null,
+};
+
+/// Post-validation signing values passed into apksigner. Unlike
+/// `SigningConfig`, every required field is non-optional — the
+/// resolver picks debug defaults when the user didn't supply a
+/// keystore.
+const ResolvedSigning = struct {
+    keystore: []const u8,
+    keystore_pass: []const u8,
+    key_alias: ?[]const u8,
+    key_pass: ?[]const u8,
+    is_debug: bool,
+};
+
 /// Handle `labelle android <subcommand>` dispatch.
 pub fn handleAndroid(
     allocator: std.mem.Allocator,
@@ -14,13 +57,34 @@ pub fn handleAndroid(
 ) !void {
     var subcmd: ?[]const u8 = null;
     var emulator = false;
-    var release = false;
+    var release_mode: ReleaseMode = .debug;
+    var signing = SigningConfig{};
 
-    for (extra_args) |arg| {
+    var i: usize = 0;
+    while (i < extra_args.len) : (i += 1) {
+        const arg = extra_args[i];
         if (std.mem.eql(u8, arg, "--emulator")) {
             emulator = true;
         } else if (std.mem.eql(u8, arg, "--release")) {
-            release = true;
+            release_mode = .fast;
+        } else if (std.mem.eql(u8, arg, "--release-small")) {
+            release_mode = .small;
+        } else if (std.mem.eql(u8, arg, "--keystore")) {
+            i += 1;
+            if (i >= extra_args.len) return missingValue(arg);
+            signing.keystore = extra_args[i];
+        } else if (std.mem.eql(u8, arg, "--keystore-pass")) {
+            i += 1;
+            if (i >= extra_args.len) return missingValue(arg);
+            signing.keystore_pass = extra_args[i];
+        } else if (std.mem.eql(u8, arg, "--key-alias")) {
+            i += 1;
+            if (i >= extra_args.len) return missingValue(arg);
+            signing.key_alias = extra_args[i];
+        } else if (std.mem.eql(u8, arg, "--key-pass")) {
+            i += 1;
+            if (i >= extra_args.len) return missingValue(arg);
+            signing.key_pass = extra_args[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -29,16 +93,21 @@ pub fn handleAndroid(
         }
     }
 
+    if (signing.keystore != null and signing.keystore_pass == null) {
+        std.debug.print("labelle android: --keystore requires --keystore-pass\n", .{});
+        return error.InvalidArgs;
+    }
+
     const cmd = subcmd orelse {
         printHelp();
         return;
     };
 
     if (std.mem.eql(u8, cmd, "build")) {
-        try androidBuild(allocator, target_dir, emulator, release);
+        try androidBuild(allocator, target_dir, emulator, release_mode);
     } else if (std.mem.eql(u8, cmd, "run")) {
-        try androidBuild(allocator, target_dir, emulator, release);
-        try deployToDevice(allocator, target_dir, cfg, emulator);
+        try androidBuild(allocator, target_dir, emulator, release_mode);
+        try deployToDevice(allocator, target_dir, cfg, emulator, signing);
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         try runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -47,6 +116,11 @@ pub fn handleAndroid(
         std.debug.print("labelle android: unknown subcommand '{s}'\n", .{cmd});
         printHelp();
     }
+}
+
+fn missingValue(flag: []const u8) error{InvalidArgs} {
+    std.debug.print("labelle android: {s} requires a value\n", .{flag});
+    return error.InvalidArgs;
 }
 
 /// Run the SDK / NDK environment probe and print a pass/fail report.
@@ -114,8 +188,16 @@ pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) 
 }
 
 /// Build the Android shared library via `zig build`.
-fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: bool, release: bool) !void {
-    std.debug.print("labelle: building for Android{s}...\n", .{if (emulator) " (emulator)" else ""});
+fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: bool, release_mode: ReleaseMode) !void {
+    const mode_label = switch (release_mode) {
+        .debug => "",
+        .fast => " [ReleaseFast]",
+        .small => " [ReleaseSmall]",
+    };
+    std.debug.print("labelle: building for Android{s}{s}...\n", .{
+        if (emulator) " (emulator)" else "",
+        mode_label,
+    });
 
     var zig_args: std.ArrayList([]const u8) = .{};
     defer zig_args.deinit(allocator);
@@ -124,8 +206,8 @@ fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: 
     if (emulator) {
         try zig_args.append(allocator, "-Demulator=true");
     }
-    if (release) {
-        try zig_args.append(allocator, "-Doptimize=ReleaseFast");
+    if (release_mode.optimizeFlag()) |flag| {
+        try zig_args.append(allocator, flag);
     }
 
     const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
@@ -146,7 +228,7 @@ fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: 
 }
 
 /// Package APK and deploy to device/emulator via ADB.
-pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, emulator: bool) !void {
+pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
     const android_cfg = cfg.android orelse gen.AndroidConfig{};
     // package_name may be heap-allocated (defaultPackageName) or a slice into
     // android_cfg (no allocation).  Track whether we own it so we can free it.
@@ -210,7 +292,7 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
     // Build APK
     const apk_path = try std.fs.path.join(allocator, &.{ target_dir, "game.apk" });
     defer allocator.free(apk_path);
-    try buildApk(allocator, staging_dir, apk_path, android_cfg);
+    try buildApk(allocator, staging_dir, apk_path, android_cfg, signing);
 
     // Install via ADB
     std.debug.print("labelle: installing on device...\n", .{});
@@ -256,7 +338,7 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
 }
 
 /// Build APK from staging directory using Android SDK tools.
-fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []const u8, android_cfg: gen.AndroidConfig) !void {
+fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []const u8, android_cfg: gen.AndroidConfig, signing: SigningConfig) !void {
     const sdk_home = try findAndroidSdk(allocator);
     defer allocator.free(sdk_home);
 
@@ -369,18 +451,51 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         }
     }
 
-    // Sign with debug keystore
-    const keystore = try ensureDebugKeystore(allocator);
-    defer allocator.free(keystore);
+    // ── Sign ────────────────────────────────────────────────────────
+    // `signing` wins when the user passed `--keystore` — otherwise we
+    // generate / reuse the debug keystore at ~/.labelle/. Both paths
+    // end up invoking apksigner with an argv built from the same
+    // builder so the two code paths stay in sync.
+    var debug_keystore_buf: ?[]u8 = null;
+    defer if (debug_keystore_buf) |b| allocator.free(b);
+
+    const resolved: ResolvedSigning = if (signing.keystore) |ks| .{
+        .keystore = ks,
+        .keystore_pass = signing.keystore_pass.?, // validated in handleAndroid
+        .key_alias = signing.key_alias,
+        .key_pass = signing.key_pass,
+        .is_debug = false,
+    } else blk: {
+        const kp = try ensureDebugKeystore(allocator);
+        debug_keystore_buf = kp;
+        break :blk .{
+            .keystore = kp,
+            .keystore_pass = "pass:android",
+            .key_alias = "androiddebugkey",
+            .key_pass = "pass:android",
+            .is_debug = true,
+        };
+    };
+
+    if (resolved.is_debug) {
+        std.debug.print("labelle: signing APK with debug keystore\n", .{});
+    } else {
+        std.debug.print("labelle: signing APK with {s}\n", .{resolved.keystore});
+    }
 
     {
-        const result = util.runCmd(allocator, &.{
+        var args: std.ArrayList([]const u8) = .{};
+        defer args.deinit(allocator);
+        try args.appendSlice(allocator, &.{
             apksigner, "sign",
-            "--ks",     keystore,
-            "--ks-pass", "pass:android",
-            "--out",    apk_path,
-            aligned_apk,
-        }) catch |err| {
+            "--ks",     resolved.keystore,
+            "--ks-pass", resolved.keystore_pass,
+        });
+        if (resolved.key_alias) |a| try args.appendSlice(allocator, &.{ "--ks-key-alias", a });
+        if (resolved.key_pass) |p| try args.appendSlice(allocator, &.{ "--key-pass", p });
+        try args.appendSlice(allocator, &.{ "--out", apk_path, aligned_apk });
+
+        const result = util.runCmd(allocator, args.items) catch |err| {
             std.debug.print("labelle: apksigner failed: {}\n", .{err});
             return err;
         };
@@ -599,8 +714,15 @@ pub fn printHelp() void {
         \\  help       Show this help
         \\
         \\Options:
-        \\  --emulator   Target x86_64 emulator instead of arm64 device
-        \\  --release    Build with ReleaseFast optimization
+        \\  --emulator         Target x86_64 emulator instead of arm64 device
+        \\  --release          Build with ReleaseFast optimization
+        \\  --release-small    Build with ReleaseSmall optimization
+        \\
+        \\Signing (release):
+        \\  --keystore <path>       Path to JKS keystore (default: debug keystore)
+        \\  --keystore-pass <pass>  apksigner --ks-pass (e.g. pass:xxx, env:VAR, file:/p)
+        \\  --key-alias <name>      Key alias inside the keystore
+        \\  --key-pass <pass>       apksigner --key-pass (defaults to keystore pass)
         \\
     , .{});
 }

@@ -392,7 +392,18 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, first, "android")) {
             parsed_args.command = .android_cmd;
+            // Android value-bearing flags: the NEXT token after one of
+            // these is the flag's value, not the project directory.
+            var expect_value = false;
             while (args.next()) |arg| {
+                if (expect_value) {
+                    if (parsed_args.extra_count < parsed_args.extra_args.len) {
+                        parsed_args.extra_args[parsed_args.extra_count] = arg;
+                        parsed_args.extra_count += 1;
+                    }
+                    expect_value = false;
+                    continue;
+                }
                 if (std.mem.startsWith(u8, arg, "-") or
                     std.mem.eql(u8, arg, "build") or
                     std.mem.eql(u8, arg, "run") or
@@ -402,6 +413,13 @@ pub fn main() !void {
                     if (parsed_args.extra_count < parsed_args.extra_args.len) {
                         parsed_args.extra_args[parsed_args.extra_count] = arg;
                         parsed_args.extra_count += 1;
+                    }
+                    if (std.mem.eql(u8, arg, "--keystore") or
+                        std.mem.eql(u8, arg, "--keystore-pass") or
+                        std.mem.eql(u8, arg, "--key-alias") or
+                        std.mem.eql(u8, arg, "--key-pass"))
+                    {
+                        expect_value = true;
                     }
                 } else {
                     parsed_args.project_dir = arg;
@@ -641,7 +659,7 @@ pub fn main() !void {
     } else if (parsed.platform == .android) {
         // Android: deploy to device/emulator
         std.debug.print("labelle: deploying to Android...\n", .{});
-        try android.deployToDevice(allocator, target_dir, parsed, false);
+        try android.deployToDevice(allocator, target_dir, parsed, false, .{});
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
