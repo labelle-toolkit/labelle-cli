@@ -13,8 +13,9 @@
 #
 # ── Required repository secrets ────────────────────────────────────
 #
-#   ANDROID_KEYSTORE_BASE64   base64-encoded JKS/PKCS12 keystore
-#                             (`base64 -i release.jks | pbcopy`)
+#   ANDROID_KEYSTORE_BASE64   single-line base64 of the JKS/PKCS12 keystore.
+#                             macOS:  base64 -i release.jks | tr -d '\n' | pbcopy
+#                             Linux:  base64 -w0 release.jks | xclip -selection clipboard
 #   ANDROID_KEYSTORE_PASS     password for the keystore
 #   ANDROID_KEY_ALIAS         alias of the signing key inside the keystore
 #   ANDROID_KEY_PASS          password for the key (often same as keystore)
@@ -44,6 +45,10 @@ permissions:
 
 env:
   ZIG_VERSION: "0.15.2"
+  # Pin labelle-cli to a specific tag or commit SHA so your CI is
+  # reproducible. `main` is accepted but will drift as upstream
+  # changes land — use it only for local iteration, never for
+  # a shipping release workflow.
   LABELLE_REF: "main"
 
 jobs:
@@ -98,18 +103,26 @@ jobs:
         run: labelle android doctor
 
       - name: Restore release keystore
+        # Secret is read via `env:` + `printf` rather than textual
+        # `${{ secrets.* }}` interpolation so a shell metacharacter in
+        # the base64 blob can't break the script or execute code.
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" \
-            | base64 --decode > "$RUNNER_TEMP/release.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
 
       - name: Build signed fat APK
         working-directory: game
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
         run: |
           labelle android build --all-abis --release \
             --keystore "$RUNNER_TEMP/release.jks" \
-            --keystore-pass "pass:${{ secrets.ANDROID_KEYSTORE_PASS }}" \
-            --key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
-            --key-pass "pass:${{ secrets.ANDROID_KEY_PASS }}"
+            --keystore-pass "pass:$KEYSTORE_PASS" \
+            --key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASS"
 
       - name: Rename APK with version
         working-directory: game
