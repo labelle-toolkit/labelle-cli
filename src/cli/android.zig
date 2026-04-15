@@ -150,15 +150,21 @@ pub fn handleAndroid(
 
     if (std.mem.eql(u8, cmd, "build")) {
         if (all_abis) {
-            // Arena contains every path string + the StagedAbi slice
-            // returned by buildAllAbis. For `build` we only care that
-            // the .so files landed on disk; the staged paths are
-            // discarded so the arena is all we need.
+            // Arena contains every intermediate path string and the
+            // StagedAbi slice returned by buildAllAbis — they all
+            // live for the duration of the package step and get
+            // released together when the arena drops.
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            _ = try buildAllAbis(arena.allocator(), target_dir, release_mode);
+            const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
+            const apk_path = try packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
+            defer allocator.free(apk_path);
+            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
         } else {
             try androidBuild(allocator, target_dir, emulator, release_mode);
+            const apk_path = try packageApk(allocator, target_dir, cfg, emulator, signing);
+            defer allocator.free(apk_path);
+            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
         }
     } else if (std.mem.eql(u8, cmd, "run")) {
         if (all_abis) {
@@ -404,11 +410,7 @@ fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulator: 
 /// entry point — picks the ABI from `emulator` + host arch, then
 /// delegates to `deployToDeviceWithAbis`.
 pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
-    const builtin = @import("builtin");
-    // On Apple Silicon, the Android emulator runs ARM64 images; on
-    // Intel Macs it runs x86_64. Physical device builds always
-    // target arm64-v8a.
-    const abi_dir: []const u8 = if (emulator and builtin.cpu.arch != .aarch64) "x86_64" else "arm64-v8a";
+    const abi_dir = hostAbiDir(emulator);
     const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_path);
 
@@ -417,9 +419,10 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
 }
 
 /// Shared staging / packaging / install / launch pipeline used by
-/// both the single-arch and `--all-abis` paths. `abis` is the list of
-/// `(abi_dir, libgame.so path)` pairs that get fanned out into
-/// `apk-staging/lib/<abi_dir>/libgame.so` before `buildApk` runs.
+/// both the single-arch and `--all-abis` run paths. Stages every
+/// entry in `abis` into `apk-staging/lib/<abi_dir>/libgame.so`,
+/// signs an APK via `packageApkWithAbis`, then pushes it to the
+/// connected device with ADB and launches the NativeActivity.
 pub fn deployToDeviceWithAbis(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
@@ -427,6 +430,52 @@ pub fn deployToDeviceWithAbis(
     abis: []const StagedAbi,
     signing: SigningConfig,
 ) !void {
+    const apk_path = try packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
+    defer allocator.free(apk_path);
+
+    const package_name = try resolvePackageName(allocator, cfg);
+    defer allocator.free(package_name);
+
+    try installAndLaunch(allocator, apk_path, package_name);
+}
+
+/// Single-arch wrapper around `packageApkWithAbis` that mirrors
+/// `deployToDevice`: picks the ABI from `emulator` + host arch,
+/// compiles a one-element `StagedAbi` slice, and returns the path to
+/// the signed APK (caller owns it).
+///
+/// Used by `labelle android build` when `--all-abis` is not set.
+pub fn packageApk(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    cfg: gen.ProjectConfig,
+    emulator: bool,
+    signing: SigningConfig,
+) ![]u8 {
+    const abi_dir = hostAbiDir(emulator);
+    const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
+    defer allocator.free(so_path);
+    const abis = [_]StagedAbi{.{ .abi_dir = abi_dir, .so_path = so_path }};
+    return packageApkWithAbis(allocator, target_dir, cfg, abis[0..], signing);
+}
+
+/// Package a signed APK from one or more built `libgame.so` entries.
+/// Does NOT touch ADB — this is the path that `labelle android build`
+/// and CI pipelines use to produce an installable artifact without
+/// requiring a connected device. Returns the owned path to the APK
+/// (typically `<target_dir>/game.apk`).
+///
+/// `abis` is the list of `(abi_dir, libgame.so path)` pairs that get
+/// fanned out into `apk-staging/lib/<abi_dir>/libgame.so` before
+/// `buildApk` runs. A single-element slice produces a single-arch
+/// APK; multi-element slices produce a fat APK.
+pub fn packageApkWithAbis(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    cfg: gen.ProjectConfig,
+    abis: []const StagedAbi,
+    signing: SigningConfig,
+) ![]u8 {
     if (abis.len == 0) return error.NoAbisProvided;
 
     const android_cfg = cfg.android orelse gen.AndroidConfig{};
@@ -444,10 +493,6 @@ pub fn deployToDeviceWithAbis(
             return error.BinaryNotFound;
         };
     }
-
-    // Find ADB
-    const adb = try findAdb(allocator);
-    defer allocator.free(adb);
 
     // Create APK staging directory
     const staging_dir = try std.fs.path.join(allocator, &.{ target_dir, "apk-staging" });
@@ -488,8 +533,18 @@ pub fn deployToDeviceWithAbis(
 
     // Build APK
     const apk_path = try std.fs.path.join(allocator, &.{ target_dir, "game.apk" });
-    defer allocator.free(apk_path);
+    errdefer allocator.free(apk_path);
     try buildApk(allocator, staging_dir, apk_path, android_cfg, signing);
+    return apk_path;
+}
+
+/// Push a previously-built APK to the connected device via `adb
+/// install -r` and launch the NativeActivity. Split out of
+/// `deployToDeviceWithAbis` so the `build` subcommand and CI
+/// pipelines can use the packaging half without touching ADB.
+fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_name: []const u8) !void {
+    const adb = try findAdb(allocator);
+    defer allocator.free(adb);
 
     // Install via ADB
     std.debug.print("labelle: installing on device...\n", .{});
@@ -532,6 +587,23 @@ pub fn deployToDeviceWithAbis(
     }
 
     std.debug.print("labelle: app launched on device\n", .{});
+}
+
+/// Pick the ABI directory for a single-arch build. On Apple Silicon
+/// the Android emulator runs ARM64 images; on Intel Macs it runs
+/// x86_64. Physical device builds always target arm64-v8a.
+fn hostAbiDir(emulator: bool) []const u8 {
+    const builtin = @import("builtin");
+    return if (emulator and builtin.cpu.arch != .aarch64) "x86_64" else "arm64-v8a";
+}
+
+/// Resolve the Android package name from `cfg`, defaulting to
+/// `com.labelle.<project>` when the project doesn't set one. Caller
+/// owns the returned slice.
+fn resolvePackageName(allocator: std.mem.Allocator, cfg: gen.ProjectConfig) ![]const u8 {
+    const android_cfg = cfg.android orelse gen.AndroidConfig{};
+    if (android_cfg.package_name.len > 0) return allocator.dupe(u8, android_cfg.package_name);
+    return defaultPackageName(allocator, cfg.name);
 }
 
 /// Build APK from staging directory using Android SDK tools.

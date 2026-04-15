@@ -1,0 +1,139 @@
+# Reference GitHub Actions workflow for a labelle-based Android game.
+#
+# Copy this file into your game repository as
+# `.github/workflows/android-release.yml`. On every `v*` tag push it will:
+#
+#   1. Install Zig + the Android SDK / NDK / build-tools.
+#   2. Check out and build the `labelle` CLI from source.
+#   3. Restore a release keystore from repository secrets.
+#   4. Run `labelle android build --all-abis --release` to produce a
+#      signed fat APK (arm64-v8a + x86_64).
+#   5. Attach the APK to a GitHub Release so Obtainium
+#      (https://github.com/ImranR98/Obtainium) can pick it up.
+#
+# ── Required repository secrets ────────────────────────────────────
+#
+#   ANDROID_KEYSTORE_BASE64   single-line base64 of the JKS/PKCS12 keystore.
+#                             macOS:  base64 -i release.jks | tr -d '\n' | pbcopy
+#                             Linux:  base64 -w0 release.jks | xclip -selection clipboard
+#   ANDROID_KEYSTORE_PASS     password for the keystore
+#   ANDROID_KEY_ALIAS         alias of the signing key inside the keystore
+#   ANDROID_KEY_PASS          password for the key (often same as keystore)
+#
+# Generate a keystore once with:
+#   keytool -genkey -v -keystore release.jks -alias labelle-release \
+#     -keyalg RSA -keysize 2048 -validity 10000
+#
+# ── Things you may want to change ──────────────────────────────────
+#
+#   - `LABELLE_REF` below: pin a specific labelle-cli tag or commit
+#     instead of tracking `main`, so your CI is reproducible.
+#   - The APK path in the "Upload APK to Release" step assumes the
+#     sokol backend (`.labelle/sokol_android/game.apk`). If you use a
+#     different backend, adjust the path.
+#   - `ZIG_VERSION`: bump when labelle-cli's minimum_zig_version moves.
+
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # needed to create the GitHub Release
+
+env:
+  ZIG_VERSION: "0.15.2"
+  # Pin labelle-cli to a specific tag or commit SHA so your CI is
+  # reproducible. `main` is accepted but will drift as upstream
+  # changes land — use it only for local iteration, never for
+  # a shipping release workflow.
+  LABELLE_REF: "main"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out game repository
+        uses: actions/checkout@v4
+        with:
+          path: game
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Set up JDK (for keytool + apksigner)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build-tools + NDK
+        run: |
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;27.0.12077973"
+          # android-actions/setup-android exports ANDROID_SDK_ROOT; the
+          # labelle CLI reads ANDROID_HOME so re-export it here for
+          # compatibility with every android_sdk probe path.
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Check out labelle-cli
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: ${{ env.LABELLE_REF }}
+          path: labelle-cli
+
+      - name: Build labelle CLI
+        working-directory: labelle-cli
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          echo "$PWD/zig-out/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Android toolchain
+        working-directory: game
+        run: labelle android doctor
+
+      - name: Restore release keystore
+        # Secret is read via `env:` + `printf` rather than textual
+        # `${{ secrets.* }}` interpolation so a shell metacharacter in
+        # the base64 blob can't break the script or execute code.
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+
+      - name: Build signed fat APK
+        working-directory: game
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: |
+          labelle android build --all-abis --release \
+            --keystore "$RUNNER_TEMP/release.jks" \
+            --keystore-pass "pass:$KEYSTORE_PASS" \
+            --key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASS"
+
+      - name: Rename APK with version
+        working-directory: game
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          # sokol backend landing pad — change this if you use a
+          # different backend.
+          cp .labelle/sokol_android/game.apk "game-${VERSION}.apk"
+
+      - name: Publish GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          files: game/game-*.apk
+          generate_release_notes: true
