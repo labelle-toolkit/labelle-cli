@@ -464,6 +464,7 @@ pub fn main() !void {
             parsed_args.optimize_override = result.optimize;
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
+            parsed_args.bake = result.bake;
         }
     }
 

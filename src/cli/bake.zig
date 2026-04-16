@@ -32,7 +32,12 @@ pub fn run(
 
     for (resources) |res| {
         if (res.texture.len == 0) continue;
-        if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
+        // Case-insensitive so `.PNG` / `.Png` (common when art comes
+        // from asset pipelines that preserve uploader casing) still
+        // match. Skipped silently when the extension isn't a PNG.
+        if (res.texture.len < 4) continue;
+        const ext = res.texture[res.texture.len - 4 ..];
+        if (!std.ascii.eqlIgnoreCase(ext, ".png")) continue;
 
         const png_path = try std.fs.path.join(allocator, &.{ project_dir, res.texture });
         defer allocator.free(png_path);
@@ -74,7 +79,11 @@ fn isFresh(rgba_path: []const u8, png_path: []const u8) !bool {
 fn bakeOne(allocator: std.mem.Allocator, png_path: []const u8, rgba_path: []const u8) !void {
     const png_file = try std.fs.cwd().openFile(png_path, .{});
     defer png_file.close();
-    const png_bytes = try png_file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    // Read exactly `stat.size` — local build input is trusted, so no
+    // need for a hardcoded cap that would reject legitimate large 4K+
+    // atlases.
+    const png_stat = try png_file.stat();
+    const png_bytes = try png_file.readToEndAlloc(allocator, png_stat.size);
     defer allocator.free(png_bytes);
 
     var w: c_int = 0;
@@ -92,9 +101,18 @@ fn bakeOne(allocator: std.mem.Allocator, png_path: []const u8, rgba_path: []cons
     defer stbi.stbi_image_free(raw);
     if (w <= 0 or h <= 0) return error.DecodeFailed;
 
-    const pixels_len: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    // Checked multiplication — `w * h * 4` could overflow `usize` on
+    // 32-bit targets or on adversarial inputs (stb_image permits up to
+    // 2^24 per axis by default).
+    const wh = std.math.mul(usize, @as(usize, @intCast(w)), @as(usize, @intCast(h))) catch return error.DecodeFailed;
+    const pixels_len = std.math.mul(usize, wh, 4) catch return error.DecodeFailed;
 
+    // Delete the partial .rgba on any error from here on. Without this
+    // `errdefer`, a crash/OOM/disk-full mid-write leaves a truncated
+    // file that `isFresh` would mistake for a valid cached bake on the
+    // next run (mtime >= PNG).
     var out = try std.fs.cwd().createFile(rgba_path, .{ .truncate = true });
+    errdefer std.fs.cwd().deleteFile(rgba_path) catch {};
     defer out.close();
 
     var header: [header_len]u8 = undefined;
