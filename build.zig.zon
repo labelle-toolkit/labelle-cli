@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xa3d95bf7b905a401,
     .name = .labelle_cli,
-    .version = "1.32.1",
+    .version = "1.33.0",
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         // Pulls the generator module from labelle-assembler (types,
@@ -10,16 +10,14 @@
         // below to pick up new assembler types; the old mirror
         // approach made every assembler change a double-edit (#151).
         .labelle_assembler = .{
-            // Pinned to the post-v0.7.0 tip that carries the
-            // `-Dandroid_arch=arm64|x86_64` option in the Android
-            // build.zig template (labelle-assembler#43). `labelle
-            // android --all-abis` relies on that option to produce a
-            // fat APK from a single host.
+            // Pinned to labelle-assembler v0.8.0 — the asset-streaming
+            // codegen + lazy resources + scene asset manifests + sokol
+            // backend updates that landed in the RFC #437 work.
             // Use the full 40-char SHA — abbreviated SHAs in archive
             // URLs can become ambiguous as upstream gains commits and
             // GitHub will return 404 in that case.
-            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/4e60304d6dee5cef81a363a4770964b3c0839562.tar.gz",
-            .hash = "labelle_assembler-0.1.0-pG4XEBN5AwD7bXG3IZlRpVJoK5HwM05C9jMer7ngzejJ",
+            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/1c24f303586cbfcf9238a85c8c3d9906af1ff32b.tar.gz",
+            .hash = "labelle_assembler-0.8.0-pG4XEOZJBACiCUdlxNpfp_v7gB1ZbTobMOd587m3cwKt",
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.7.0.tar.gz",
