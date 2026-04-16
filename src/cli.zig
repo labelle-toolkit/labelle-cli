@@ -28,6 +28,7 @@ const lockfile = @import("cli/lockfile.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const assembler = @import("cli/assembler.zig");
+const bake_mod = @import("cli/bake.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
@@ -111,6 +112,7 @@ const ParsedArgs = struct {
     optimize_override: ?[]const u8 = null,
     docker: bool = false,
     docker_target: ?[]const u8 = null,
+    bake: bool = false,
 };
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -173,7 +175,7 @@ fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const 
 }
 
 /// Parse [dir], --scene, --platform, --optimize, --docker, and --target flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8 } {
+fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
@@ -181,6 +183,7 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
     var optimize: ?[]const u8 = null;
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
+    var bake = false;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -193,6 +196,10 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
         if (parseOptimizeFlag(arg, &optimize, cmd_name) orelse return null) continue;
         if (std.mem.eql(u8, arg, "--docker")) {
             docker_build = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--bake")) {
+            bake = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--target=")) {
@@ -216,11 +223,11 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake };
 }
 
 /// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8 } {
+fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
@@ -229,6 +236,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
     var optimize: ?[]const u8 = null;
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
+    var bake = false;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -245,6 +253,10 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
         } else return null;
         if (std.mem.eql(u8, arg, "--docker")) {
             docker_build = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--bake")) {
+            bake = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--target=")) {
@@ -287,7 +299,7 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target };
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -345,6 +357,7 @@ pub fn main() !void {
             parsed_args.optimize_override = result.optimize;
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
+            parsed_args.bake = result.bake;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true) orelse return;
@@ -355,6 +368,7 @@ pub fn main() !void {
             parsed_args.optimize_override = result.optimize;
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
+            parsed_args.bake = result.bake;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -566,6 +580,19 @@ pub fn main() !void {
     // Scenes and prefabs are always embedded via @embedFile
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
+
+    // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
+    // @embedFile path picks up the fresh `.rgba` files. Skipped unless
+    // `--bake` is passed: raw RGBA expands heavily-transparent atlases
+    // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
+    // APK size sane. Use for projects whose atlases are nearly opaque
+    // and PNG decode dominates cold start.
+    if (parsed_args.bake) {
+        bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
+            std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+    }
 
     // Route through the standalone labelle-assembler binary.
     // Resolution order: LABELLE_ASSEMBLER env var > assembler_version

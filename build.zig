@@ -36,6 +36,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // stb_image for the pre-bake step (PNG → LRGBA). Header-only .h
+    // paired with an implementation .c that instantiates the symbols.
+    gen_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/cli/stb_image_impl.c"),
+        .flags = &.{"-std=c99"},
+    });
+    gen_exe.root_module.addIncludePath(b.path("src/cli"));
+    gen_exe.root_module.link_libc = true;
     b.installArtifact(gen_exe);
 
     const gen_run = b.addRunArtifact(gen_exe);
