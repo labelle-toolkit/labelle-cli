@@ -97,6 +97,10 @@ pub fn handleAndroid(
     var all_abis = false;
     var release_mode: ReleaseMode = .debug;
     var signing = SigningConfig{};
+    // Deploy-only flags (ignored by other subcommands).
+    var deploy_tag: ?[]const u8 = null;
+    var deploy_channel: []const u8 = "stable";
+    var deploy_notes_file: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < extra_args.len) : (i += 1) {
@@ -117,6 +121,18 @@ pub fn handleAndroid(
             signing.key_alias = try takeValue(extra_args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--key-pass")) {
             signing.key_pass = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--tag")) {
+            deploy_tag = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--tag=")) {
+            deploy_tag = arg["--tag=".len..];
+        } else if (std.mem.eql(u8, arg, "--channel")) {
+            deploy_channel = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--channel=")) {
+            deploy_channel = arg["--channel=".len..];
+        } else if (std.mem.eql(u8, arg, "--notes-file")) {
+            deploy_notes_file = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--notes-file=")) {
+            deploy_notes_file = arg["--notes-file=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -149,23 +165,9 @@ pub fn handleAndroid(
     };
 
     if (std.mem.eql(u8, cmd, "build")) {
-        if (all_abis) {
-            // Arena contains every intermediate path string and the
-            // StagedAbi slice returned by buildAllAbis — they all
-            // live for the duration of the package step and get
-            // released together when the arena drops.
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-            const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
-            const apk_path = try packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
-            defer allocator.free(apk_path);
-            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
-        } else {
-            try androidBuild(allocator, target_dir, emulator, release_mode);
-            const apk_path = try packageApk(allocator, target_dir, cfg, emulator, signing);
-            defer allocator.free(apk_path);
-            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
-        }
+        const apk_path = try buildAndPackage(allocator, target_dir, cfg, release_mode, all_abis, emulator, signing);
+        defer allocator.free(apk_path);
+        std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
     } else if (std.mem.eql(u8, cmd, "run")) {
         if (all_abis) {
             var arena = std.heap.ArenaAllocator.init(allocator);
@@ -176,6 +178,16 @@ pub fn handleAndroid(
             try androidBuild(allocator, target_dir, emulator, release_mode);
             try deployToDevice(allocator, target_dir, cfg, emulator, signing);
         }
+    } else if (std.mem.eql(u8, cmd, "deploy")) {
+        try cmdDeploy(allocator, target_dir, cfg, .{
+            .tag = deploy_tag,
+            .channel = deploy_channel,
+            .notes_file = deploy_notes_file,
+            .release_mode = if (release_mode == .debug) .fast else release_mode,
+            .all_abis = all_abis,
+            .emulator = emulator,
+            .signing = signing,
+        });
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         try runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -953,6 +965,173 @@ fn ensureDebugKeystore(allocator: std.mem.Allocator) ![]u8 {
     return keystore;
 }
 
+/// Build the shared library and package the APK in one go. Returns the
+/// caller-owned APK path on disk. Shared by the `android build` entry
+/// point and `deploy android` (#141) — the build half of the deploy
+/// command is identical to a regular build.
+fn buildAndPackage(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    cfg: gen.ProjectConfig,
+    release_mode: ReleaseMode,
+    all_abis: bool,
+    emulator: bool,
+    signing: SigningConfig,
+) ![]const u8 {
+    if (all_abis) {
+        // Arena contains every intermediate path string and the
+        // StagedAbi slice returned by buildAllAbis — they all live
+        // for the duration of the package step and get released
+        // together when the arena drops.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
+        return packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
+    } else {
+        try androidBuild(allocator, target_dir, emulator, release_mode);
+        return packageApk(allocator, target_dir, cfg, emulator, signing);
+    }
+}
+
+/// Parameters for `labelle android deploy` (#141). Kept as a struct
+/// so the call site in `handleAndroid` stays readable and so adding
+/// future deploy-only flags doesn't ripple into every reader of the
+/// function signature.
+const DeployOpts = struct {
+    tag: ?[]const u8,
+    channel: []const u8, // "stable" | "staging" (others treated as stable for now)
+    notes_file: ?[]const u8,
+    release_mode: ReleaseMode,
+    all_abis: bool,
+    emulator: bool,
+    signing: SigningConfig,
+};
+
+/// Build + package an APK, then upload it as a GitHub Release via the
+/// `gh` CLI. v1 of the labelle.games OTA story (#141): zero server
+/// infrastructure, testers subscribe to the game's GitHub repo URL in
+/// Obtainium, the release flows to their device on next poll.
+fn cmdDeploy(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    cfg: gen.ProjectConfig,
+    opts: DeployOpts,
+) !void {
+    const tag = opts.tag orelse {
+        std.debug.print(
+            \\labelle android deploy: --tag is required.
+            \\  Example: labelle android deploy --tag v0.3.0
+            \\  (use the release tag you want on GitHub — usually vMAJOR.MINOR.PATCH)
+            \\
+        , .{});
+        return error.InvalidArgs;
+    };
+
+    const channel_is_prerelease = std.mem.eql(u8, opts.channel, "staging") or
+        std.mem.eql(u8, opts.channel, "preview") or
+        std.mem.eql(u8, opts.channel, "internal");
+
+    // `gh` presence + auth is cheap to check up front. Failing here
+    // is a much better UX than building a multi-MB APK and then
+    // discovering the uploader isn't installed.
+    try ensureGhAvailable(allocator);
+
+    std.debug.print(
+        "labelle android deploy: building APK (channel={s}, tag={s})...\n",
+        .{ opts.channel, tag },
+    );
+
+    const apk_path = try buildAndPackage(
+        allocator,
+        target_dir,
+        cfg,
+        opts.release_mode,
+        opts.all_abis,
+        opts.emulator,
+        opts.signing,
+    );
+    defer allocator.free(apk_path);
+
+    std.debug.print("labelle android deploy: uploading {s} to GitHub Releases as {s}...\n", .{ apk_path, tag });
+
+    const release_title = try std.fmt.allocPrint(
+        allocator,
+        "{s} {s}",
+        .{ if (cfg.title.len > 0) cfg.title else cfg.name, tag },
+    );
+    defer allocator.free(release_title);
+
+    var argv: std.ArrayList([]const u8) = .{};
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        "gh",          "release", "create",
+        tag,           apk_path,  "--title",
+        release_title,
+    });
+    if (channel_is_prerelease) try argv.append(allocator, "--prerelease");
+    if (opts.notes_file) |f| {
+        try argv.append(allocator, "--notes-file");
+        try argv.append(allocator, f);
+    } else {
+        try argv.append(allocator, "--generate-notes");
+    }
+
+    const res = try util.runCmd(allocator, argv.items);
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    switch (res.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print(
+                    "labelle android deploy: gh release create failed (exit {d}):\n{s}\n",
+                    .{ code, res.stderr },
+                );
+                return error.DeployFailed;
+            }
+        },
+        else => {
+            std.debug.print("labelle android deploy: gh release create terminated abnormally\n", .{});
+            return error.DeployFailed;
+        },
+    }
+
+    std.debug.print(
+        \\labelle android deploy: release {s} published.
+        \\  Testers with Obtainium subscribed to this repo will see the update on next poll.
+        \\
+    , .{tag});
+}
+
+/// Probe that `gh` is installed and authenticated. Cheaper to fail
+/// here than to build the APK and then discover the uploader is
+/// missing.
+fn ensureGhAvailable(allocator: std.mem.Allocator) !void {
+    const res = util.runCmd(allocator, &.{ "gh", "auth", "status" }) catch |err| {
+        std.debug.print(
+            \\labelle android deploy: failed to run `gh` ({s}).
+            \\  Install it from https://cli.github.com/ and run `gh auth login`.
+            \\
+        , .{@errorName(err)});
+        return error.DeployFailed;
+    };
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    const ok = switch (res.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        std.debug.print(
+            \\labelle android deploy: `gh` is installed but not authenticated.
+            \\  Run `gh auth login` to set up GitHub access.
+            \\
+        , .{});
+        return error.DeployFailed;
+    }
+}
+
 /// Default package name from project name.
 fn defaultPackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "com.labelle.{s}", .{name});
@@ -989,6 +1168,7 @@ pub fn printHelp() void {
         \\Commands:
         \\  build      Build for Android device (arm64)
         \\  run        Build and deploy to device/emulator
+        \\  deploy     Build and upload to GitHub Releases (for Obtainium OTA)
         \\  doctor     Probe the Android SDK/NDK environment and report
         \\             the status of every required tool
         \\  help       Show this help
@@ -1006,6 +1186,18 @@ pub fn printHelp() void {
         \\  --keystore-pass <pass>  apksigner --ks-pass (e.g. pass:xxx, env:VAR, file:/p)
         \\  --key-alias <name>      Key alias inside the keystore
         \\  --key-pass <pass>       apksigner --key-pass (defaults to keystore pass)
+        \\
+        \\Deploy (labelle android deploy):
+        \\  --tag <v>               Release tag (required, e.g. v0.3.0)
+        \\  --channel <name>        stable (default) | staging | preview | internal
+        \\                          staging/preview/internal → GitHub pre-release
+        \\  --notes-file <path>     Release notes source (default: --generate-notes
+        \\                          from commits since previous tag)
+        \\
+        \\  Deploy implies a release build (use --release-small to opt into that
+        \\  optimize level) and requires `gh` authenticated locally. Testers
+        \\  install Obtainium once and subscribe to the repo URL; new releases
+        \\  flow automatically.
         \\
     , .{});
 }

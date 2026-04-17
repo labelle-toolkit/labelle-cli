@@ -412,6 +412,7 @@ pub fn main() !void {
                 if (std.mem.startsWith(u8, arg, "-") or
                     std.mem.eql(u8, arg, "build") or
                     std.mem.eql(u8, arg, "run") or
+                    std.mem.eql(u8, arg, "deploy") or
                     std.mem.eql(u8, arg, "doctor") or
                     std.mem.eql(u8, arg, "help"))
                 {
@@ -419,7 +420,10 @@ pub fn main() !void {
                     if (std.mem.eql(u8, arg, "--keystore") or
                         std.mem.eql(u8, arg, "--keystore-pass") or
                         std.mem.eql(u8, arg, "--key-alias") or
-                        std.mem.eql(u8, arg, "--key-pass"))
+                        std.mem.eql(u8, arg, "--key-pass") or
+                        std.mem.eql(u8, arg, "--tag") or
+                        std.mem.eql(u8, arg, "--channel") or
+                        std.mem.eql(u8, arg, "--notes-file"))
                     {
                         expect_value = true;
                     }
