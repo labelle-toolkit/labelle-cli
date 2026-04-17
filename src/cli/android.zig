@@ -1,9 +1,23 @@
 /// Android build and deployment for labelle-cli.
+///
+/// Submodules live in `android/`. Each one owns a cohesive slice of
+/// the Android pipeline and imports the types it needs from this
+/// file (which doubles as the public namespace — `android.DeployOpts`,
+/// `android.buildAndPackage`, …).
 const std = @import("std");
 const gen = @import("generator");
 const runner = @import("runner.zig");
 const util = @import("util.zig");
 const android_sdk = @import("android_sdk.zig");
+
+// ── Submodules ─────────────────────────────────────────────────────
+const deploy_mod = @import("android/deploy.zig");
+
+// Re-export deploy-side public types so callers see them on the
+// `android` namespace (`android.DeployOpts`) without having to know
+// about the internal module layout.
+pub const DeployOpts = deploy_mod.DeployOpts;
+pub const cmdDeploy = deploy_mod.cmdDeploy;
 
 /// Optimisation mode selected from the CLI flags.
 /// `debug` is the default (stack-safe), `fast` is `ReleaseFast`,
@@ -97,6 +111,10 @@ pub fn handleAndroid(
     var all_abis = false;
     var release_mode: ReleaseMode = .debug;
     var signing = SigningConfig{};
+    // Deploy-only flags (ignored by other subcommands).
+    var deploy_tag: ?[]const u8 = null;
+    var deploy_channel: []const u8 = "stable";
+    var deploy_notes_file: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < extra_args.len) : (i += 1) {
@@ -117,6 +135,18 @@ pub fn handleAndroid(
             signing.key_alias = try takeValue(extra_args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--key-pass")) {
             signing.key_pass = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--tag")) {
+            deploy_tag = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--tag=")) {
+            deploy_tag = arg["--tag=".len..];
+        } else if (std.mem.eql(u8, arg, "--channel")) {
+            deploy_channel = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--channel=")) {
+            deploy_channel = arg["--channel=".len..];
+        } else if (std.mem.eql(u8, arg, "--notes-file")) {
+            deploy_notes_file = try takeValue(extra_args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "--notes-file=")) {
+            deploy_notes_file = arg["--notes-file=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -149,23 +179,9 @@ pub fn handleAndroid(
     };
 
     if (std.mem.eql(u8, cmd, "build")) {
-        if (all_abis) {
-            // Arena contains every intermediate path string and the
-            // StagedAbi slice returned by buildAllAbis — they all
-            // live for the duration of the package step and get
-            // released together when the arena drops.
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-            const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
-            const apk_path = try packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
-            defer allocator.free(apk_path);
-            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
-        } else {
-            try androidBuild(allocator, target_dir, emulator, release_mode);
-            const apk_path = try packageApk(allocator, target_dir, cfg, emulator, signing);
-            defer allocator.free(apk_path);
-            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
-        }
+        const apk_path = try buildAndPackage(allocator, target_dir, cfg, release_mode, all_abis, emulator, signing);
+        defer allocator.free(apk_path);
+        std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
     } else if (std.mem.eql(u8, cmd, "run")) {
         if (all_abis) {
             var arena = std.heap.ArenaAllocator.init(allocator);
@@ -176,6 +192,16 @@ pub fn handleAndroid(
             try androidBuild(allocator, target_dir, emulator, release_mode);
             try deployToDevice(allocator, target_dir, cfg, emulator, signing);
         }
+    } else if (std.mem.eql(u8, cmd, "deploy")) {
+        try deploy_mod.cmdDeploy(allocator, target_dir, cfg, .{
+            .tag = deploy_tag,
+            .channel = deploy_channel,
+            .notes_file = deploy_notes_file,
+            .release_mode = if (release_mode == .debug) .fast else release_mode,
+            .all_abis = all_abis,
+            .emulator = emulator,
+            .signing = signing,
+        });
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         try runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -953,6 +979,34 @@ fn ensureDebugKeystore(allocator: std.mem.Allocator) ![]u8 {
     return keystore;
 }
 
+/// Build the shared library and package the APK in one go. Returns the
+/// caller-owned APK path on disk. Shared by the `android build` entry
+/// point and `android/deploy.cmdDeploy` (#141) — the build half of
+/// the deploy command is identical to a regular build.
+pub fn buildAndPackage(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    cfg: gen.ProjectConfig,
+    release_mode: ReleaseMode,
+    all_abis: bool,
+    emulator: bool,
+    signing: SigningConfig,
+) ![]const u8 {
+    if (all_abis) {
+        // Arena contains every intermediate path string and the
+        // StagedAbi slice returned by buildAllAbis — they all live
+        // for the duration of the package step and get released
+        // together when the arena drops.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
+        return packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
+    } else {
+        try androidBuild(allocator, target_dir, emulator, release_mode);
+        return packageApk(allocator, target_dir, cfg, emulator, signing);
+    }
+}
+
 /// Default package name from project name.
 fn defaultPackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "com.labelle.{s}", .{name});
@@ -989,6 +1043,7 @@ pub fn printHelp() void {
         \\Commands:
         \\  build      Build for Android device (arm64)
         \\  run        Build and deploy to device/emulator
+        \\  deploy     Build and upload to GitHub Releases (for Obtainium OTA)
         \\  doctor     Probe the Android SDK/NDK environment and report
         \\             the status of every required tool
         \\  help       Show this help
@@ -1006,6 +1061,18 @@ pub fn printHelp() void {
         \\  --keystore-pass <pass>  apksigner --ks-pass (e.g. pass:xxx, env:VAR, file:/p)
         \\  --key-alias <name>      Key alias inside the keystore
         \\  --key-pass <pass>       apksigner --key-pass (defaults to keystore pass)
+        \\
+        \\Deploy (labelle android deploy):
+        \\  --tag <v>               Release tag (required, e.g. v0.3.0)
+        \\  --channel <name>        stable (default) | staging | preview | internal
+        \\                          staging/preview/internal → GitHub pre-release
+        \\  --notes-file <path>     Release notes source (default: --generate-notes
+        \\                          from commits since previous tag)
+        \\
+        \\  Deploy implies a release build (use --release-small to opt into that
+        \\  optimize level) and requires `gh` authenticated locally. Testers
+        \\  install Obtainium once and subscribe to the repo URL; new releases
+        \\  flow automatically.
         \\
     , .{});
 }
