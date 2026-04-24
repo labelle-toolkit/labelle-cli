@@ -4,6 +4,10 @@
 **Scope:** `labelle-cli` generator — add a general-purpose `plugin.labelle` manifest
 **Prerequisite for:** `labelle-fsm` and any future plugin that introduces its own convention directory
 
+> **Writing a plugin today?** The
+> [plugin authoring guide](./plugin-authoring.md) is the end-to-end
+> walk-through. This doc covers the manifest layer only.
+
 ---
 
 ## Problem
