@@ -147,7 +147,12 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
 
     // Find android.jar
     const target_sdk = android_cfg.target_sdk_version;
-    const android_jar = try std.fmt.allocPrint(allocator, "{s}/platforms/android-{d}/android.jar", .{ sdk_home, target_sdk });
+    // Use std.fs.path.join (not raw string interpolation) so the
+    // separators are platform-native — important for any future Windows
+    // host support.
+    const platform_dir = try std.fmt.allocPrint(allocator, "android-{d}", .{target_sdk});
+    defer allocator.free(platform_dir);
+    const android_jar = try std.fs.path.join(allocator, &.{ sdk_home, "platforms", platform_dir, "android.jar" });
     defer allocator.free(android_jar);
 
     std.fs.cwd().access(android_jar, .{}) catch {
@@ -160,14 +165,12 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     const build_tools_dir = try findBuildTools(allocator, sdk_home);
     defer allocator.free(build_tools_dir);
 
-    const aapt2 = try std.fs.path.join(allocator, &.{ build_tools_dir, "aapt2" });
-    defer allocator.free(aapt2);
+    // We use aapt v1 for packaging (single-step) — aapt2 isn't called
+    // in this function. Keeping only the tools we actually invoke.
     const zipalign = try std.fs.path.join(allocator, &.{ build_tools_dir, "zipalign" });
     defer allocator.free(zipalign);
     const apksigner = try std.fs.path.join(allocator, &.{ build_tools_dir, "apksigner" });
     defer allocator.free(apksigner);
-
-    // Use aapt (v1) for simplicity — it can package in one step
     const aapt = try std.fs.path.join(allocator, &.{ build_tools_dir, "aapt" });
     defer allocator.free(aapt);
 
@@ -390,19 +393,24 @@ fn findBuildTools(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 {
     defer dir.close();
 
     var latest: ?[]const u8 = null;
+    var latest_parsed: u32 = 0;
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        if (entry.kind == .directory) {
-            if (latest) |prev| {
-                // Pick the highest version by lexicographic comparison
-                // (works for dotted semver like "33.0.0" vs "34.0.0")
-                if (std.mem.order(u8, entry.name, prev) == .gt) {
-                    allocator.free(prev);
-                    latest = try allocator.dupe(u8, entry.name);
-                }
-            } else {
+        if (entry.kind != .directory) continue;
+        // Use the existing semver parser instead of lexicographic order.
+        // Lexicographic comparison treats "9.0.0" as greater than
+        // "10.0.0" — wrong once the SDK ships double-digit major
+        // versions (which it already has on platform-tools).
+        const parsed = util.parseVersion(entry.name);
+        if (latest) |prev| {
+            if (parsed > latest_parsed) {
+                allocator.free(prev);
                 latest = try allocator.dupe(u8, entry.name);
+                latest_parsed = parsed;
             }
+        } else {
+            latest = try allocator.dupe(u8, entry.name);
+            latest_parsed = parsed;
         }
     }
 
@@ -468,7 +476,14 @@ fn defaultPackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u
 /// Copy a directory tree recursively.
 fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
     const cwd = std.fs.cwd();
-    cwd.makePath(dst) catch {};
+    // Don't swallow makePath errors. PathAlreadyExists is fine — every
+    // other case (permission denied, read-only fs, …) needs to surface
+    // so the build doesn't continue against an unusable destination
+    // and report a confusing copy-step failure later.
+    cwd.makePath(dst) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
 
     var src_dir = try cwd.openDir(src, .{ .iterate = true });
     defer src_dir.close();
