@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const runner = @import("runner.zig");
 
 /// Directory names that hold generated, cached, or vendored output
 /// rather than user-authored source. We prune them at the iterator
@@ -201,19 +202,12 @@ fn isIdentifierBoundary(c: u8) bool {
 
 /// Run `zig test <rel_path>` from `cwd` with inherited stdio. Running
 /// in `cwd` (the project root) means tests that touch relative paths
-/// see the same filesystem layout as `zig build run` would.
+/// see the same filesystem layout as `zig build run` would. Delegates
+/// the spawn/wait dance to `runner.runZigInherit` so all CLI-driven
+/// zig invocations share one process-management code path.
 fn runZigTest(allocator: std.mem.Allocator, cwd: []const u8, rel_path: []const u8) !bool {
-    var child: std.process.Child = .init(&.{ "zig", "test", rel_path }, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    const term = try child.wait();
-    return switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
+    const code = try runner.runZigInherit(allocator, cwd, &.{ "zig", "test", rel_path }, null);
+    return code == 0;
 }
 
 // --- Tests ---
