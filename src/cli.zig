@@ -835,7 +835,7 @@ pub const ParseOptimizeFlagSpec = struct {
 // `zspec.runAll(@This())` walks into them. Without these re-exports
 // zspec only sees the `pub const` namespaces declared directly in
 // cli.zig and would skip the test_cmd_mod's nested spec structs.
-pub const TestCmdShouldSkipPathSpec = test_cmd_mod.ShouldSkipPathSpec;
+pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
 pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
 
 pub const ParsePlatformValueSpec = struct {

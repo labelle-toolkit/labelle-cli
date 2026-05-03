@@ -1,11 +1,11 @@
 const std = @import("std");
 const config = @import("config.zig");
 
-/// Directories that hold generated, cached, or vendored output rather
-/// than user-authored source. We skip them when discovering test files
-/// so that `labelle test` doesn't try to run `zig test` against the
-/// assembler's emitted build tree (which has its own `zig build test`)
-/// or against pulled-in dependency caches.
+/// Directory names that hold generated, cached, or vendored output
+/// rather than user-authored source. We prune them at the iterator
+/// level so `labelle test` doesn't recurse into the assembler's
+/// emitted build tree (which has its own `zig build test`) or into
+/// large dependency caches.
 const skip_dirs = [_][]const u8{
     ".labelle",
     "zig-out",
@@ -21,12 +21,14 @@ const TestStats = struct {
     files_failed: usize = 0,
 };
 
+const usage = "  usage: labelle test [dir] [--verbose]\n";
+
 /// Run in-file Zig tests across the project's source tree.
 ///
 /// Walks the project directory for `.zig` files, skipping generated
 /// and cache directories, then invokes `zig test <file>` on each file
-/// that contains a `test` block. Aggregates results and exits non-zero
-/// if any file fails so this is usable from CI.
+/// that contains a `test` block. Aggregates results and returns a
+/// non-zero error on any failure so this is usable from CI.
 pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var project_dir: []const u8 = ".";
     var verbose = false;
@@ -37,27 +39,29 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
             verbose = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle test: unknown flag '{s}'\n", .{arg});
-            std.debug.print("  usage: labelle test [dir] [--verbose]\n", .{});
+            std.debug.print(usage, .{});
             return error.UnknownFlag;
         } else if (!dir_set) {
             project_dir = arg;
             dir_set = true;
         } else {
             std.debug.print("labelle test: unexpected argument '{s}'\n", .{arg});
+            std.debug.print(usage, .{});
             return error.TooManyArguments;
         }
     }
 
-    // Confirm we're in a labelle project so users running `labelle test`
-    // outside of one get a familiar error rather than an empty pass.
+    // Confirm we're in a labelle project. Use the quiet variant so we
+    // don't double-print: the inner reader already logs "could not
+    // read ..." which would duplicate the friendly hint below.
     var probe_arena = std.heap.ArenaAllocator.init(allocator);
     defer probe_arena.deinit();
-    _ = config.readProjectConfig(probe_arena.allocator(), project_dir) catch |err| {
+    _ = config.readProjectConfigQuiet(probe_arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
             std.debug.print("  Run `labelle test` from the root of a labelle project.\n\n", .{});
-            return;
         }
+        // Propagate so CI exits non-zero on a misconfigured invocation.
         return err;
     };
 
@@ -70,75 +74,106 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
         stats.files_failed,
     });
 
-    if (stats.files_failed > 0) {
-        std.process.exit(1);
-    }
+    // Return an error rather than calling `std.process.exit` so the
+    // caller's `defer` blocks (allocator deinit, arena cleanup) run.
+    if (stats.files_failed > 0) return error.TestsFailed;
 }
 
-/// Walk `root` recursively, invoking `zig test` on each `.zig` file
-/// that declares at least one `test` block. Skips entries from `skip_dirs`.
+/// Open the project root and recursively walk it, pruning skip dirs.
 fn discoverAndRun(
     allocator: std.mem.Allocator,
-    root: []const u8,
+    project_dir: []const u8,
     stats: *TestStats,
     verbose: bool,
 ) !void {
-    var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch |err| {
-        std.debug.print("labelle test: could not open '{s}': {any}\n", .{ root, err });
+    var root_dir = std.fs.cwd().openDir(project_dir, .{ .iterate = true }) catch |err| {
+        std.debug.print("labelle test: could not open '{s}': {any}\n", .{ project_dir, err });
         return error.OpenFailed;
     };
-    defer dir.close();
+    defer root_dir.close();
 
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
+    var rel_buf: std.ArrayList(u8) = .{};
+    defer rel_buf.deinit(allocator);
 
-    while (try walker.next()) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        if (shouldSkipPath(entry.path)) continue;
+    try walkDir(allocator, project_dir, &root_dir, &rel_buf, stats, verbose);
+}
 
-        const rel_path = try std.fs.path.join(allocator, &.{ root, entry.path });
-        defer allocator.free(rel_path);
+/// Recursive directory walker that maintains `rel_buf` as the
+/// project-relative path of the entry currently being processed.
+/// Prunes `skip_dirs` so the walker never descends into them.
+fn walkDir(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    dir: *std.fs.Dir,
+    rel_buf: *std.ArrayList(u8),
+    stats: *TestStats,
+    verbose: bool,
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        const saved_len = rel_buf.items.len;
+        defer rel_buf.shrinkRetainingCapacity(saved_len);
 
-        stats.files_run += 1;
+        if (saved_len > 0) try rel_buf.append(allocator, std.fs.path.sep);
+        try rel_buf.appendSlice(allocator, entry.name);
 
-        const has_tests = fileHasTestBlock(allocator, rel_path) catch |err| {
-            std.debug.print("labelle test: could not read '{s}': {any}\n", .{ rel_path, err });
-            stats.files_failed += 1;
-            continue;
-        };
-        if (!has_tests) {
-            if (verbose) std.debug.print("  skip {s} (no test blocks)\n", .{rel_path});
-            continue;
-        }
+        switch (entry.kind) {
+            .directory => {
+                if (isSkipDir(entry.name)) continue;
+                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch |err| {
+                    std.debug.print("labelle test: could not open '{s}': {any}\n", .{ rel_buf.items, err });
+                    continue;
+                };
+                defer sub.close();
+                try walkDir(allocator, project_dir, &sub, rel_buf, stats, verbose);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
 
-        stats.files_with_tests += 1;
-        std.debug.print("  test {s}\n", .{rel_path});
-        const ok = try runZigTest(allocator, rel_path);
-        if (!ok) {
-            stats.files_failed += 1;
-            std.debug.print("    FAILED: {s}\n", .{rel_path});
+                // `rel_buf.items` is reused on the next iteration, but
+                // we don't append anything else within this branch, so
+                // the slice is valid for the duration of the file ops.
+                const rel_path = rel_buf.items;
+
+                const full_path = try std.fs.path.join(allocator, &.{ project_dir, rel_path });
+                defer allocator.free(full_path);
+
+                stats.files_run += 1;
+                const has_tests = fileHasTestBlock(allocator, full_path) catch |err| {
+                    std.debug.print("labelle test: could not read '{s}': {any}\n", .{ rel_path, err });
+                    stats.files_failed += 1;
+                    continue;
+                };
+                if (!has_tests) {
+                    if (verbose) std.debug.print("  skip {s} (no test blocks)\n", .{rel_path});
+                    continue;
+                }
+
+                stats.files_with_tests += 1;
+                std.debug.print("  test {s}\n", .{rel_path});
+                const ok = try runZigTest(allocator, project_dir, rel_path);
+                if (!ok) {
+                    stats.files_failed += 1;
+                    std.debug.print("    FAILED: {s}\n", .{rel_path});
+                }
+            },
+            else => {},
         }
     }
 }
 
-/// Return true if `rel_path` (a forward-slash or os-sep separated
-/// relative path produced by `Dir.Walker`) starts with a directory we
-/// want to skip — generated output, cache, vendored deps, etc.
-fn shouldSkipPath(rel_path: []const u8) bool {
-    var iter = std.mem.splitAny(u8, rel_path, "/\\");
-    while (iter.next()) |segment| {
-        if (segment.len == 0) continue;
-        for (skip_dirs) |skip| {
-            if (std.mem.eql(u8, segment, skip)) return true;
-        }
+/// True when `name` is a top-level directory we never descend into.
+fn isSkipDir(name: []const u8) bool {
+    for (skip_dirs) |skip| {
+        if (std.mem.eql(u8, name, skip)) return true;
     }
     return false;
 }
 
 /// Cheap heuristic: scan the source for a `test` keyword followed by
 /// either a string literal or a brace, which catches both
-/// `test "name" { ... }` and `test { ... }` forms. Avoids spawning a
+/// `test "name" { ... }` and `test { ... }` forms — including the
+/// Zig-allowed newline-after-keyword variant. Avoids spawning a
 /// `zig test` process for every .zig file in the tree, most of which
 /// (components, scripts, hooks) won't have inline tests.
 fn fileHasTestBlock(allocator: std.mem.Allocator, path: []const u8) !bool {
@@ -148,14 +183,11 @@ fn fileHasTestBlock(allocator: std.mem.Allocator, path: []const u8) !bool {
     var i: usize = 0;
     while (i < bytes.len) {
         const idx = std.mem.indexOfPos(u8, bytes, i, "test") orelse return false;
-        // Must be at start-of-line or preceded by whitespace so we don't
-        // match identifiers like `latest` or `mytest`.
         const at_word_boundary = idx == 0 or isIdentifierBoundary(bytes[idx - 1]);
         const after = idx + "test".len;
         if (at_word_boundary and after < bytes.len) {
-            // Skip whitespace after the keyword.
             var j = after;
-            while (j < bytes.len and (bytes[j] == ' ' or bytes[j] == '\t')) : (j += 1) {}
+            while (j < bytes.len and std.ascii.isWhitespace(bytes[j])) : (j += 1) {}
             if (j < bytes.len and (bytes[j] == '{' or bytes[j] == '"')) return true;
         }
         i = idx + 1;
@@ -167,10 +199,12 @@ fn isIdentifierBoundary(c: u8) bool {
     return !(std.ascii.isAlphanumeric(c) or c == '_');
 }
 
-/// Run `zig test <path>` with inherited stdio. Returns true on a clean
-/// (exit 0) run, false otherwise.
-fn runZigTest(allocator: std.mem.Allocator, path: []const u8) !bool {
-    var child: std.process.Child = .init(&.{ "zig", "test", path }, allocator);
+/// Run `zig test <rel_path>` from `cwd` with inherited stdio. Running
+/// in `cwd` (the project root) means tests that touch relative paths
+/// see the same filesystem layout as `zig build run` would.
+fn runZigTest(allocator: std.mem.Allocator, cwd: []const u8, rel_path: []const u8) !bool {
+    var child: std.process.Child = .init(&.{ "zig", "test", rel_path }, allocator);
+    child.cwd = cwd;
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
@@ -183,38 +217,42 @@ fn runZigTest(allocator: std.mem.Allocator, path: []const u8) !bool {
 }
 
 // --- Tests ---
+//
+// The specs below are surfaced from `cli.zig` via `pub const`
+// re-exports so `zspec.runAll(@This())` in the cli.zig test root
+// discovers them. We don't add a `test { runAll(@This()) }` block
+// here to avoid double-registering the same tests.
 
 const expect = @import("zspec").expect;
 
-test {
-    @import("zspec").runAll(@This());
-}
-
-pub const ShouldSkipPathSpec = struct {
+pub const IsSkipDirSpec = struct {
     pub const skips = struct {
-        test "skips .labelle subtree" {
-            try expect.equal(shouldSkipPath(".labelle/sokol_desktop/build.zig"), true);
+        test "skips .labelle" {
+            try expect.equal(isSkipDir(".labelle"), true);
         }
-        test "skips zig-out subtree" {
-            try expect.equal(shouldSkipPath("zig-out/bin/foo.zig"), true);
+        test "skips zig-out" {
+            try expect.equal(isSkipDir("zig-out"), true);
         }
-        test "skips nested .zig-cache" {
-            try expect.equal(shouldSkipPath("subdir/.zig-cache/o/x.zig"), true);
+        test "skips .zig-cache" {
+            try expect.equal(isSkipDir(".zig-cache"), true);
         }
-        test "skips .git tree" {
-            try expect.equal(shouldSkipPath(".git/objects/x.zig"), true);
+        test "skips .git" {
+            try expect.equal(isSkipDir(".git"), true);
+        }
+        test "skips node_modules" {
+            try expect.equal(isSkipDir("node_modules"), true);
         }
     };
 
     pub const keeps = struct {
         test "keeps components" {
-            try expect.equal(shouldSkipPath("components/player.zig"), false);
+            try expect.equal(isSkipDir("components"), false);
         }
-        test "keeps scripts/playing" {
-            try expect.equal(shouldSkipPath("scripts/playing/move.zig"), false);
+        test "keeps scripts" {
+            try expect.equal(isSkipDir("scripts"), false);
         }
-        test "keeps top-level zig file" {
-            try expect.equal(shouldSkipPath("util.zig"), false);
+        test "keeps hooks" {
+            try expect.equal(isSkipDir("hooks"), false);
         }
     };
 };
@@ -247,6 +285,9 @@ pub const FileHasTestBlockSpec = struct {
                 \\test "foo works" { }
                 \\
             ), true);
+        }
+        test "newline between keyword and brace" {
+            try expect.equal(try writeAndCheck("test\n{\n    return;\n}\n"), true);
         }
     };
 
