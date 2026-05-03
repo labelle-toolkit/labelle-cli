@@ -12,6 +12,7 @@
 ///   labelle upgrade [dir] [pkg] [ver]   — bump versions in project.labelle
 ///   labelle update [ver]                — self-update the CLI
 ///   labelle clean [--dry-run]           — prune unused package versions
+///   labelle test [dir] [--verbose]      — run inline `test` blocks across the project source tree
 const std = @import("std");
 const gen = @import("generator");
 
@@ -22,6 +23,7 @@ const install = @import("cli/install.zig");
 const upgrade = @import("cli/upgrade.zig");
 const update = @import("cli/update.zig");
 const clean = @import("cli/clean.zig");
+const test_cmd_mod = @import("cli/test.zig");
 const config = @import("cli/config.zig");
 const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
@@ -35,7 +37,7 @@ const ios = @import("cli/ios.zig");
 const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, help_cmd, version, targets, assembler_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, help_cmd, version, targets, assembler_cmd, test_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -398,6 +400,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, first, "clean")) {
             parsed_args.command = .clean_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "test")) {
+            parsed_args.command = .test_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "ios")) {
             parsed_args.command = .ios_cmd;
             // First non-flag arg that isn't a subcommand is the project dir
@@ -481,6 +486,7 @@ pub fn main() !void {
         .install_cmd => return install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .update_cmd => return update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .test_cmd => return test_cmd_mod.cmdTest(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
@@ -824,6 +830,13 @@ pub const ParseOptimizeFlagSpec = struct {
         }
     };
 };
+
+// Surface inline-test specs from the `test` subcommand module so
+// `zspec.runAll(@This())` walks into them. Without these re-exports
+// zspec only sees the `pub const` namespaces declared directly in
+// cli.zig and would skip the test_cmd_mod's nested spec structs.
+pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
+pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
 
 pub const ParsePlatformValueSpec = struct {
     pub const valid_platforms = struct {
