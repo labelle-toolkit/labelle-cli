@@ -258,7 +258,7 @@ pub const IsSkipDirSpec = struct {
 };
 
 pub const FileHasTestBlockSpec = struct {
-    fn writeAndCheck(contents: []const u8) !bool {
+    pub fn writeAndCheck(contents: []const u8) !bool {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const file = try tmp.dir.createFile("x.zig", .{});
