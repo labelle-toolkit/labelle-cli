@@ -93,9 +93,14 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     // fall back to `.labelle/<backend>_<platform>/`. Picking the backend
     // from `project.labelle` (rather than the first dir we find) avoids
     // running stale generations left over from prior backend switches.
-    const tests_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests" });
-    defer allocator.free(tests_dir);
-    if (std.fs.cwd().access(tests_dir, .{})) |_| {
+    //
+    // Probe `tests/build.zig` rather than just the directory so a stale
+    // `.labelle/tests/` left behind by a prior 0.14+ generate (e.g. user
+    // downgraded their assembler pin to 0.13.x) doesn't get preferred
+    // over the still-valid backend dir.
+    const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
+    defer allocator.free(tests_build_zig);
+    if (std.fs.cwd().access(tests_build_zig, .{})) |_| {
         try runGeneratedTestStep(allocator, project_dir, "tests", &stats, verbose);
     } else |_| {
         const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
