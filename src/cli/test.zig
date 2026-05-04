@@ -7,12 +7,17 @@ const runner = @import("runner.zig");
 /// level so `labelle test` doesn't recurse into the assembler's
 /// emitted build tree (which has its own `zig build test`) or into
 /// large dependency caches.
+///
+/// `.claude` holds Claude Code worktrees (snapshot copies of the
+/// project under `.claude/worktrees/<id>/`), which would otherwise
+/// double-count every `.zig` file in the tree against stale checkouts.
 const skip_dirs = [_][]const u8{
     ".labelle",
     "zig-out",
     "zig-cache",
     ".zig-cache",
     ".git",
+    ".claude",
     "node_modules",
 };
 
@@ -126,6 +131,25 @@ fn walkDir(
                     continue;
                 };
                 defer sub.close();
+
+                // If the subdir has its own build.zig, it's a
+                // self-contained Zig package — defer to `zig build
+                // test` there instead of walking its source tree.
+                // Bare `zig test <file>` can't reconstruct the
+                // module-graph wiring (`--dep`, `--mod`) that
+                // standalone test files relying on `@import("<lib>")`
+                // need; only the package's build.zig has that.
+                if (hasBuildZig(&sub)) {
+                    stats.files_with_tests += 1;
+                    std.debug.print("  build-test {s}\n", .{rel_buf.items});
+                    const ok = try runZigBuildTest(allocator, project_dir, rel_buf.items);
+                    if (!ok) {
+                        stats.files_failed += 1;
+                        std.debug.print("    FAILED: {s} (zig build test)\n", .{rel_buf.items});
+                    }
+                    continue;
+                }
+
                 try walkDir(allocator, project_dir, &sub, rel_buf, stats, verbose);
             },
             .file => {
@@ -210,6 +234,23 @@ fn runZigTest(allocator: std.mem.Allocator, cwd: []const u8, rel_path: []const u
     return code == 0;
 }
 
+/// True when `dir` contains a `build.zig` at its top level.
+fn hasBuildZig(dir: *std.fs.Dir) bool {
+    dir.access("build.zig", .{}) catch return false;
+    return true;
+}
+
+/// Run `zig build test` inside `<project_dir>/<rel_path>` so the
+/// package's own build script wires up modules, dependencies, and
+/// test steps. This is how `libs/<lib>/` test files that use
+/// `@import("<lib>")` are exercised.
+fn runZigBuildTest(allocator: std.mem.Allocator, project_dir: []const u8, rel_path: []const u8) !bool {
+    const sub_cwd = try std.fs.path.join(allocator, &.{ project_dir, rel_path });
+    defer allocator.free(sub_cwd);
+    const code = try runner.runZigInherit(allocator, sub_cwd, &.{ "zig", "build", "test" }, null);
+    return code == 0;
+}
+
 // --- Tests ---
 //
 // The specs below are surfaced from `cli.zig` via `pub const`
@@ -232,6 +273,9 @@ pub const IsSkipDirSpec = struct {
         }
         test "skips .git" {
             try expect.equal(isSkipDir(".git"), true);
+        }
+        test "skips .claude" {
+            try expect.equal(isSkipDir(".claude"), true);
         }
         test "skips node_modules" {
             try expect.equal(isSkipDir("node_modules"), true);
