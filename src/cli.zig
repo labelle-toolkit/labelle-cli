@@ -623,9 +623,13 @@ pub fn main() !void {
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
 
-    // fixFingerprint runs `zig build` locally to discover the correct hash.
-    // Skip it for docker builds since the local Zig toolchain may be broken.
-    if (!parsed_args.docker) try runner.fixFingerprint(allocator, target_dir);
+    // fixFingerprints runs `zig build` locally per emitted target dir to
+    // discover the correct hash. With assembler >=0.14.0 there are two
+    // (`<backend>_<platform>/` and `tests/`); patching only the exe dir
+    // would leave `tests/` with a placeholder fingerprint and break
+    // `labelle test`. Skip the whole pass for docker builds since the
+    // local Zig toolchain may be broken.
+    if (!parsed_args.docker) try runner.fixFingerprints(allocator, output_dir);
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     std.debug.print("  generated .labelle/{s}/\n", .{target_name});
 
