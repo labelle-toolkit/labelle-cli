@@ -81,18 +81,32 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     var stats = TestStats{};
     try discoverAndRun(allocator, project_dir, &stats, verbose);
 
-    // Game-side `tests/` are exercised through the assembler-generated
-    // `.labelle/<backend>_<platform>/build.zig`'s `test` step (assembler
-    // >=0.13.0), not via bare `zig test <file>`. The generated build.zig
-    // wires the full module graph the exe sees, so test files can
-    // `@import` game modules the same way `main.zig` does.
+    // Game-side `tests/` are exercised through an assembler-generated
+    // `build.zig`'s `test` step, not via bare `zig test <file>`. The
+    // generated build.zig wires the full module graph the exe sees, so
+    // test files can `@import` game modules the same way `main.zig` does.
     //
-    // Pick the backend dir from `project.labelle` so stale generations
-    // for other backends/platforms (left over in `.labelle/` from prior
-    // runs) don't get exercised with mismatched dep snapshots.
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
-    defer allocator.free(target_name);
-    try runGeneratedTestStep(allocator, project_dir, target_name, &stats, verbose);
+    // Assembler >=0.14.0 emits a backend-agnostic `.labelle/tests/` dir
+    // dedicated to the test step; prefer it when present so we don't
+    // pull raylib (or whatever backend is active) into the test build.
+    // Older assemblers (>=0.13.0, <0.14.0) only emit the exe dir, so
+    // fall back to `.labelle/<backend>_<platform>/`. Picking the backend
+    // from `project.labelle` (rather than the first dir we find) avoids
+    // running stale generations left over from prior backend switches.
+    //
+    // Probe `tests/build.zig` rather than just the directory so a stale
+    // `.labelle/tests/` left behind by a prior 0.14+ generate (e.g. user
+    // downgraded their assembler pin to 0.13.x) doesn't get preferred
+    // over the still-valid backend dir.
+    const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
+    defer allocator.free(tests_build_zig);
+    if (std.fs.cwd().access(tests_build_zig, .{})) |_| {
+        try runGeneratedTestStep(allocator, project_dir, "tests", &stats, verbose);
+    } else |_| {
+        const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+        defer allocator.free(target_name);
+        try runGeneratedTestStep(allocator, project_dir, target_name, &stats, verbose);
+    }
 
     std.debug.print("\nlabelle test: {d} file(s) scanned, {d} ran tests, {d} failed\n", .{
         stats.files_run,

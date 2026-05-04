@@ -106,6 +106,30 @@ fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, t
     _ = kill_child.wait() catch {};
 }
 
+/// Iterate over every immediate subdir of `.labelle/` that contains a
+/// `build.zig.zon` and patch its fingerprint. The assembler emits one
+/// dir per target (e.g. `raylib_desktop/`, plus `tests/` from 0.14.0),
+/// and each generated zon ships a placeholder fingerprint that needs
+/// replacing with the value Zig computes from the dir's actual path.
+pub fn fixFingerprints(allocator: std.mem.Allocator, output_dir: []const u8) !void {
+    var dir = std.fs.cwd().openDir(output_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const sub_path = try std.fs.path.join(allocator, &.{ output_dir, entry.name });
+        defer allocator.free(sub_path);
+        const zon_path = try std.fs.path.join(allocator, &.{ sub_path, "build.zig.zon" });
+        defer allocator.free(zon_path);
+        std.fs.cwd().access(zon_path, .{}) catch continue;
+        try fixFingerprint(allocator, sub_path);
+    }
+}
+
 /// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
 pub fn fixFingerprint(allocator: std.mem.Allocator, output_dir: []const u8) !void {
     const zon_path = try std.fs.path.join(allocator, &.{ output_dir, "build.zig.zon" });

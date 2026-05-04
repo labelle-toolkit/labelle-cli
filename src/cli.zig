@@ -623,9 +623,30 @@ pub fn main() !void {
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
 
-    // fixFingerprint runs `zig build` locally to discover the correct hash.
-    // Skip it for docker builds since the local Zig toolchain may be broken.
-    if (!parsed_args.docker) try runner.fixFingerprint(allocator, target_dir);
+    // fixFingerprints runs `zig build` locally per emitted target dir to
+    // discover the correct hash. With assembler >=0.14.0 there are two
+    // (`<backend>_<platform>/` and `tests/`); patching only the exe dir
+    // would leave `tests/` with a placeholder fingerprint and break
+    // `labelle test`.
+    //
+    // For docker builds we skip the exe target — the host Zig toolchain
+    // may not have the native libs the chosen backend needs (that's why
+    // we're routing through docker in the first place). The tests target
+    // is the exception: it uses the null backend (no native libs), so
+    // host Zig can build it even when --docker is set, and skipping
+    // would leave `labelle test` broken on the host after `labelle build
+    // --docker`. Patch `tests/` directly when present.
+    if (!parsed_args.docker) {
+        try runner.fixFingerprints(allocator, output_dir);
+    } else {
+        const tests_dir = try std.fs.path.join(allocator, &.{ output_dir, "tests" });
+        defer allocator.free(tests_dir);
+        const tests_build_zig = try std.fs.path.join(allocator, &.{ tests_dir, "build.zig" });
+        defer allocator.free(tests_build_zig);
+        if (std.fs.cwd().access(tests_build_zig, .{})) |_| {
+            try runner.fixFingerprint(allocator, tests_dir);
+        } else |_| {}
+    }
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     std.debug.print("  generated .labelle/{s}/\n", .{target_name});
 
