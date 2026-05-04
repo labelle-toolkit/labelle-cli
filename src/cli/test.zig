@@ -11,6 +11,12 @@ const runner = @import("runner.zig");
 /// `.claude` holds Claude Code worktrees (snapshot copies of the
 /// project under `.claude/worktrees/<id>/`), which would otherwise
 /// double-count every `.zig` file in the tree against stale checkouts.
+///
+/// `tests/` is the assembler convention (>=0.13.0): files there get
+/// wired into the generated `.labelle/<backend>/build.zig`'s `test`
+/// step, which we invoke separately after the walk. Running bare
+/// `zig test <file>` on them would fail because the test compile
+/// unit needs the project's full module graph.
 const skip_dirs = [_][]const u8{
     ".labelle",
     "zig-out",
@@ -19,6 +25,7 @@ const skip_dirs = [_][]const u8{
     ".git",
     ".claude",
     "node_modules",
+    "tests",
 };
 
 const TestStats = struct {
@@ -62,7 +69,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     // read ..." which would duplicate the friendly hint below.
     var probe_arena = std.heap.ArenaAllocator.init(allocator);
     defer probe_arena.deinit();
-    _ = config.readProjectConfigQuiet(probe_arena.allocator(), project_dir) catch |err| {
+    const cfg = config.readProjectConfigQuiet(probe_arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
             std.debug.print("  Run `labelle test` from the root of a labelle project.\n\n", .{});
@@ -73,6 +80,19 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
 
     var stats = TestStats{};
     try discoverAndRun(allocator, project_dir, &stats, verbose);
+
+    // Game-side `tests/` are exercised through the assembler-generated
+    // `.labelle/<backend>_<platform>/build.zig`'s `test` step (assembler
+    // >=0.13.0), not via bare `zig test <file>`. The generated build.zig
+    // wires the full module graph the exe sees, so test files can
+    // `@import` game modules the same way `main.zig` does.
+    //
+    // Pick the backend dir from `project.labelle` so stale generations
+    // for other backends/platforms (left over in `.labelle/` from prior
+    // runs) don't get exercised with mismatched dep snapshots.
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+    defer allocator.free(target_name);
+    try runGeneratedTestStep(allocator, project_dir, target_name, &stats, verbose);
 
     std.debug.print("\nlabelle test: {d} file(s) scanned, {d} ran tests, {d} failed\n", .{
         stats.files_run,
@@ -251,6 +271,57 @@ fn runZigBuildTest(allocator: std.mem.Allocator, project_dir: []const u8, rel_pa
     return code == 0;
 }
 
+/// Run `zig build test` in `<project_dir>/.labelle/<target_name>/`.
+/// The generated build.zig there exposes a `test` step (assembler
+/// >=0.13.0) that wires every `tests/**/*.zig` file into the same
+/// module graph the exe uses. When the directory is missing we print
+/// a hint pointing at `labelle generate` and continue — non-fatal so
+/// projects without a `tests/` folder still get a clean run.
+fn runGeneratedTestStep(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    target_name: []const u8,
+    stats: *TestStats,
+    verbose: bool,
+) !void {
+    _ = verbose;
+    const rel_path = try std.fs.path.join(allocator, &.{ ".labelle", target_name });
+    defer allocator.free(rel_path);
+
+    const abs_path = try std.fs.path.join(allocator, &.{ project_dir, rel_path });
+    defer allocator.free(abs_path);
+
+    var sub = std.fs.cwd().openDir(abs_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            const tests_path = try std.fs.path.join(allocator, &.{ project_dir, "tests" });
+            defer allocator.free(tests_path);
+            if (std.fs.cwd().access(tests_path, .{})) |_| {
+                std.debug.print(
+                    "  (skipping tests/ — no .labelle/{s}/ found; run `labelle generate` first)\n",
+                    .{target_name},
+                );
+            } else |_| {}
+            return;
+        },
+        else => return err,
+    };
+    defer sub.close();
+
+    if (!hasBuildZig(&sub)) return;
+
+    stats.files_with_tests += 1;
+    std.debug.print("  build-test {s}\n", .{rel_path});
+    const ok = runZigBuildTest(allocator, project_dir, rel_path) catch |err| {
+        std.debug.print("    FAILED: {s} ({any})\n", .{ rel_path, err });
+        stats.files_failed += 1;
+        return;
+    };
+    if (!ok) {
+        stats.files_failed += 1;
+        std.debug.print("    FAILED: {s} (zig build test)\n", .{rel_path});
+    }
+}
+
 // --- Tests ---
 //
 // The specs below are surfaced from `cli.zig` via `pub const`
@@ -276,6 +347,11 @@ pub const IsSkipDirSpec = struct {
         }
         test "skips .claude" {
             try expect.equal(isSkipDir(".claude"), true);
+        }
+        test "skips tests" {
+            // Game-side tests/ is delegated to the assembler-generated
+            // build.zig's `test` step, not walked file-by-file.
+            try expect.equal(isSkipDir("tests"), true);
         }
         test "skips node_modules" {
             try expect.equal(isSkipDir("node_modules"), true);
