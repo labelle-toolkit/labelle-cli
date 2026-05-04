@@ -19,7 +19,7 @@ pub fn printHelp() void {
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all)
         \\  update [ver] [--no-path]  Update the labelle CLI itself
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
-        \\  test [dir] [--verbose]  Run inline `test` blocks across the project source tree
+        \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
@@ -40,6 +40,7 @@ pub fn printHelp() void {
         \\  labelle upgrade core 0.2.0
         \\  labelle test
         \\  labelle test ../my-game --verbose
+        \\  labelle test --no-libs
         \\
     , .{gen.CLI_VERSION});
 }
