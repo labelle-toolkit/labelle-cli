@@ -3,12 +3,12 @@
 // pin to a slot's screen-space center keep moving on Android while
 // staying stable on desktop).
 //
-// The script drives a single imgui window via the same idiom the
-// real game uses:
+// The script drives a single imgui window using the corrected
+// `worldToFramebuffer` helper (see labelle-gfx#253):
 //
 //     const pos = game.getPosition(entity);
-//     const sc  = cam.worldToScreen(pos.x, pos.y);
-//     ig.igSetNextWindowPosEx(sc, ImGuiCond_Always, pivot=(0.5,0.5));
+//     const fb  = cam.worldToFramebuffer(pos.x, pos.y);
+//     ig.igSetNextWindowPosEx(fb, ImGuiCond_Always, pivot=(0.5,0.5));
 //
 // Plus a per-frame log of the input coords (anchor, imgui DisplaySize,
 // camera viewport) so we can compare desktop vs Android side-by-side.

@@ -7,23 +7,32 @@ Android while staying stable on desktop).
 
 ## What it does
 
-A single world entity sits at `(200, 100)`. Each frame, an imgui
-window is pinned to that world position's screen-space coordinate
-using the same idiom the real game uses:
+A single world entity sits at `(200, 100)`. The camera auto-pans
+±150 world units at 0.25 Hz so the anchor drift is observable
+without input wiring.
+
+Each frame an imgui window is pinned to the rect's center using the
+corrected `worldToFramebuffer` helper (see labelle-gfx#253):
 
 ```zig
-const sc = cam.worldToScreen(FIXED_WORLD_X, FIXED_WORLD_Y);
+const fb = cam.worldToFramebuffer(FIXED_WORLD_X, FIXED_WORLD_Y);
 ig.igSetNextWindowPosEx(
-    .{ .x = sc.x, .y = sc.y },
+    .{ .x = fb.x, .y = fb.y },
     ig.ImGuiCond_Always,
     .{ .x = 0.5, .y = 0.5 }, // pivot at window center
 );
 ```
 
-The window contains two buttons (`Place`, `Cancel`) — same shape
-that drifts in the real game.
+A magenta dot is drawn at the same `fb` coordinate via the imgui
+foreground draw list for eyeball comparison against the world-
+rendered green rect.
 
-A throttled log line each ~60 frames prints `anchor`, `imgui
+The window contains two buttons (`Place`, `Cancel`) — same shape as
+the build menu that exhibited the drift.
+
+A throttled log line each ~60 frames prints `cam`, `sc`
+(design-space `worldToScreen` for comparison), `fb`
+(framebuffer-space `worldToFramebuffer` — the actual anchor), `imgui
 DisplaySize`, and `camera viewport` so the two platforms can be
 compared side-by-side.
 
@@ -42,17 +51,17 @@ adb logcat -s labelle | grep anchor_test
 
 ## Expected vs observed
 
-- **Desktop:** the `Anchor Test` window stays glued to the same
-  pixel position frame after frame; logged `anchor` is constant.
-- **Android (observed bug):** the window drifts even though
-  `FIXED_WORLD_X/Y` are constants. Inspect the log to see whether
-  `anchor`, `imgui_display`, or `cam_vp` is fluctuating.
+With labelle-gfx#253 applied (i.e., `worldToFramebuffer` present):
 
-## Diagnostic value
+- **Desktop:** the magenta dot and `Anchor Test` window stay glued
+  to the green rect through the full auto-pan cycle.
+- **Android:** same — the dot and window stay glued (the drift seen
+  before #253 is gone).
 
-If `anchor` is itself drifting, the bug is in
-`worldToScreen` / camera state on Android. If `anchor` is stable
-but the window renders elsewhere, the bug is in imgui's window
-positioning vs DPI scale. If `imgui_display` ≠ `cam_vp`, the two
-coordinate systems disagree — anchor in render-target pixels gets
-interpreted as imgui display units (or vice versa).
+If drift reappears, inspect the log:
+
+- `sc` vs `fb` — if they differ only by the design→physical scale,
+  the transform is working; if they are identical, `worldToFramebuffer`
+  is falling back to `worldToScreen`.
+- `imgui_display` vs `cam_vp` — if these disagree on Android, imgui
+  is seeing a different coordinate system than the renderer.

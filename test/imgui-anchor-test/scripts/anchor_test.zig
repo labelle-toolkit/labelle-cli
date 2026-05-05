@@ -1,13 +1,12 @@
-// Repro for the build-menu anchor drift bug:
+// Repro and fix validation for the build-menu anchor drift bug:
 // flying-platform-labelle pins an imgui window to a fixed world
-// position via `cam.worldToScreen` + `igSetNextWindowPosEx` with
-// pivot (0.5, 0.5). On desktop the window stays put; on Android
-// it drifts frame-to-frame even though the world position is
-// constant.
+// position. On desktop the window stays put; on Android it drifted
+// frame-to-frame because `worldToScreen` returns design-space coords
+// while imgui expects framebuffer-space coords (labelle-gfx#253).
 //
-// This minimal script reproduces the same idiom against a single
-// world entity and logs the inputs so the two platforms can be
-// compared side-by-side.
+// This script validates the fix: the window and magenta dot are
+// positioned via `cam.worldToFramebuffer` (framebuffer-space). The
+// old `worldToScreen` result is logged alongside for comparison.
 //
 // Three visuals to compare on the screen:
 //   1. The world entity's actual rendered position (the small
@@ -23,7 +22,7 @@
 //
 // The camera auto-pans left-right on its own so you don't need to
 // manually drag anything (no input wiring on this fixture). Slow
-// 1 Hz oscillation, ±150 world units around world (200, 100).
+// 0.25 Hz oscillation (4-second period), ±150 world units.
 
 const std = @import("std");
 const ig = @import("gui_backend").ig;
@@ -54,31 +53,8 @@ pub fn tick(game: anytype, dt: f32) void {
 }
 
 pub fn drawGui(game: anytype) void {
-    // Anchor: use the same pattern flying-platform-labelle's build
-    // menu uses for the Place/Cancel buttons.
     const cam = game.getCamera();
     const sc = cam.worldToScreen(FIXED_WORLD_X, FIXED_WORLD_Y);
-
-    const display = ig.igGetIO().*.DisplaySize;
-    const vp = cam.getViewportDimensions();
-
-    // Throttle the log to once per ~60 frames so logcat doesn't drown.
-    {
-        const Pulse = struct { var n: u32 = 0; };
-        Pulse.n +%= 1;
-        if (Pulse.n % 60 == 0) {
-            game.log.info(
-                "[anchor_test] frame={d} cam=({d:.1},{d:.1}) sc=({d:.1},{d:.1}) imgui_display=({d:.1},{d:.1}) cam_vp=({d:.1},{d:.1})",
-                .{
-                    Pulse.n,
-                    cam.x,        cam.y,
-                    sc.x,         sc.y,
-                    display.x,    display.y,
-                    vp.width,     vp.height,
-                },
-            );
-        }
-    }
 
     // Use the new `worldToFramebuffer` helper instead of re-deriving
     // the design→physical transform inline. Mirrors the renderer's
@@ -88,6 +64,30 @@ pub fn drawGui(game: anytype) void {
     const fb = cam.worldToFramebuffer(FIXED_WORLD_X, FIXED_WORLD_Y);
     const anchor_x = fb.x;
     const anchor_y = fb.y;
+
+    const display = ig.igGetIO().*.DisplaySize;
+    const vp = cam.getViewportDimensions();
+
+    // Throttle the log to once per ~60 frames so logcat doesn't drown.
+    // Logs both sc (design-space worldToScreen) and fb (framebuffer-space
+    // worldToFramebuffer) for side-by-side comparison across platforms.
+    {
+        const Pulse = struct { var n: u32 = 0; };
+        Pulse.n +%= 1;
+        if (Pulse.n % 60 == 0) {
+            game.log.info(
+                "[anchor_test] frame={d} cam=({d:.1},{d:.1}) sc=({d:.1},{d:.1}) fb=({d:.1},{d:.1}) imgui_display=({d:.1},{d:.1}) cam_vp=({d:.1},{d:.1})",
+                .{
+                    Pulse.n,
+                    cam.x,        cam.y,
+                    sc.x,         sc.y,
+                    fb.x,         fb.y,
+                    display.x,    display.y,
+                    vp.width,     vp.height,
+                },
+            );
+        }
+    }
 
     // Magenta dot at the corrected anchor. Should overlay the green
     // rectangle if the math matches what the renderer does.
