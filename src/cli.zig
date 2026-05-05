@@ -858,6 +858,7 @@ pub const ParseOptimizeFlagSpec = struct {
 // cli.zig and would skip the test_cmd_mod's nested spec structs.
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
 pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
+pub const TestCmdParseTestArgsSpec = test_cmd_mod.ParseTestArgsSpec;
 
 pub const ParsePlatformValueSpec = struct {
     pub const valid_platforms = struct {

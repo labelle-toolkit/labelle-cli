@@ -36,6 +36,41 @@ const TestStats = struct {
 
 const usage = "  usage: labelle test [dir] [--verbose] [--no-libs]\n";
 
+const TestArgs = struct {
+    project_dir: []const u8 = ".",
+    verbose: bool = false,
+    /// True when `--no-libs` is set: skip the project-tree walk and only
+    /// run the assembler-generated `.labelle/<target>/` test step. Useful
+    /// in CI where a separate `test-libs` job already runs
+    /// `cd libs/<lib> && zig build test` for each library.
+    skip_libs: bool = false,
+};
+
+/// Pure parser for `cmdTest`'s args. On error, writes the offending arg
+/// into `bad_arg` so the caller can include it in its stderr message
+/// without coupling parsing to I/O. Tested directly via TestArgsSpec.
+fn parseTestArgs(cmd_args: []const []const u8, bad_arg: *?[]const u8) error{ UnknownFlag, TooManyArguments }!TestArgs {
+    var result: TestArgs = .{};
+    var dir_set = false;
+    for (cmd_args) |arg| {
+        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            result.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--no-libs")) {
+            result.skip_libs = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            bad_arg.* = arg;
+            return error.UnknownFlag;
+        } else if (!dir_set) {
+            result.project_dir = arg;
+            dir_set = true;
+        } else {
+            bad_arg.* = arg;
+            return error.TooManyArguments;
+        }
+    }
+    return result;
+}
+
 /// Run in-file Zig tests across the project's source tree.
 ///
 /// Walks the project directory for `.zig` files, skipping generated
@@ -43,33 +78,18 @@ const usage = "  usage: labelle test [dir] [--verbose] [--no-libs]\n";
 /// that contains a `test` block. Aggregates results and returns a
 /// non-zero error on any failure so this is usable from CI.
 pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    var project_dir: []const u8 = ".";
-    var verbose = false;
-    var skip_libs = false;
-    var dir_set = false;
-
-    for (cmd_args) |arg| {
-        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
-            verbose = true;
-        } else if (std.mem.eql(u8, arg, "--no-libs")) {
-            // Skip the project-tree walk entirely. Useful in CI where a
-            // separate job already runs `cd libs/<lib> && zig build test`
-            // and the comprehensive `labelle test` job only needs the
-            // game-side `.labelle/<backend>_<platform>/` step.
-            skip_libs = true;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            std.debug.print("labelle test: unknown flag '{s}'\n", .{arg});
-            std.debug.print(usage, .{});
-            return error.UnknownFlag;
-        } else if (!dir_set) {
-            project_dir = arg;
-            dir_set = true;
-        } else {
-            std.debug.print("labelle test: unexpected argument '{s}'\n", .{arg});
-            std.debug.print(usage, .{});
-            return error.TooManyArguments;
+    var bad_arg: ?[]const u8 = null;
+    const args = parseTestArgs(cmd_args, &bad_arg) catch |err| {
+        switch (err) {
+            error.UnknownFlag => std.debug.print("labelle test: unknown flag '{s}'\n", .{bad_arg.?}),
+            error.TooManyArguments => std.debug.print("labelle test: unexpected argument '{s}'\n", .{bad_arg.?}),
         }
-    }
+        std.debug.print(usage, .{});
+        return err;
+    };
+    const project_dir = args.project_dir;
+    const verbose = args.verbose;
+    const skip_libs = args.skip_libs;
 
     // Confirm we're in a labelle project. Use the quiet variant so we
     // don't double-print: the inner reader already logs "could not
@@ -445,6 +465,61 @@ pub const FileHasTestBlockSpec = struct {
         }
         test "the word test in a comment without a block" {
             try expect.equal(try writeAndCheck("// no test here\n"), false);
+        }
+    };
+};
+
+pub const ParseTestArgsSpec = struct {
+    pub const defaults = struct {
+        test "no args produces defaults: project_dir='.', verbose=false, skip_libs=false" {
+            var bad: ?[]const u8 = null;
+            const parsed = try parseTestArgs(&.{}, &bad);
+            try std.testing.expectEqualStrings(".", parsed.project_dir);
+            try expect.equal(parsed.verbose, false);
+            try expect.equal(parsed.skip_libs, false);
+            try expect.toBeNull(bad);
+        }
+    };
+
+    pub const flags = struct {
+        test "--no-libs sets skip_libs=true" {
+            var bad: ?[]const u8 = null;
+            const parsed = try parseTestArgs(&.{"--no-libs"}, &bad);
+            try expect.equal(parsed.skip_libs, true);
+        }
+
+        test "--verbose sets verbose=true" {
+            var bad: ?[]const u8 = null;
+            const parsed = try parseTestArgs(&.{"--verbose"}, &bad);
+            try expect.equal(parsed.verbose, true);
+        }
+
+        test "-v alias also sets verbose=true" {
+            var bad: ?[]const u8 = null;
+            const parsed = try parseTestArgs(&.{"-v"}, &bad);
+            try expect.equal(parsed.verbose, true);
+        }
+
+        test "flags can combine with each other and a dir" {
+            var bad: ?[]const u8 = null;
+            const parsed = try parseTestArgs(&.{ "../my-game", "--verbose", "--no-libs" }, &bad);
+            try std.testing.expectEqualStrings("../my-game", parsed.project_dir);
+            try expect.equal(parsed.verbose, true);
+            try expect.equal(parsed.skip_libs, true);
+        }
+    };
+
+    pub const errors = struct {
+        test "unknown --flag returns UnknownFlag and reports the offender" {
+            var bad: ?[]const u8 = null;
+            try std.testing.expectError(error.UnknownFlag, parseTestArgs(&.{"--bogus"}, &bad));
+            try std.testing.expectEqualStrings("--bogus", bad.?);
+        }
+
+        test "second positional returns TooManyArguments and reports the offender" {
+            var bad: ?[]const u8 = null;
+            try std.testing.expectError(error.TooManyArguments, parseTestArgs(&.{ "first/dir", "second/dir" }, &bad));
+            try std.testing.expectEqualStrings("second/dir", bad.?);
         }
     };
 };

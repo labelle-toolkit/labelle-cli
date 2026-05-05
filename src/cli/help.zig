@@ -19,7 +19,7 @@ pub fn printHelp() void {
         \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all)
         \\  update [ver] [--no-path]  Update the labelle CLI itself
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
-        \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
+        \\  test [dir] [--verbose] [--no-libs]  Walk the source tree for inline `test` blocks AND run the generated test step (--no-libs runs only the generated step)
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
