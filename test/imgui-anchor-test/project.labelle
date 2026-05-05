@@ -1,0 +1,34 @@
+// Minimal repro for the imgui-anchor drift bug observed on Android
+// in flying-platform-labelle's build menu (Place/Cancel buttons that
+// pin to a slot's screen-space center keep moving on Android while
+// staying stable on desktop).
+//
+// The script drives a single imgui window using the corrected
+// `worldToFramebuffer` helper (see labelle-gfx#253):
+//
+//     const pos = game.getPosition(entity);
+//     const fb  = cam.worldToFramebuffer(pos.x, pos.y);
+//     ig.igSetNextWindowPosEx(fb, ImGuiCond_Always, pivot=(0.5,0.5));
+//
+// Plus a per-frame log of the input coords (anchor, imgui DisplaySize,
+// camera viewport) so we can compare desktop vs Android side-by-side.
+.{
+    .name = "imgui_anchor_test",
+    .title = "ImGui Anchor Test",
+    .backend = .sokol,
+    .ecs = .zig_ecs,
+    .gui = .{ .plugin = "imgui" },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../",
+    .assembler_version = "local:../../../labelle-assembler",
+    .states = .{"playing"},
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+        .{ .name = "ui", .order = 1, .space = .screen },
+    },
+    .plugins = .{
+        .{ .name = "imgui", .repo = "local:../../../labelle-imgui" },
+    },
+}
