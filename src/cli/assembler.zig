@@ -384,12 +384,22 @@ pub fn spawnGenerate(
 /// Otherwise return a copy of `project_dir` unchanged.
 ///
 /// Worktree detection: `<project_dir>/.git` exists as a regular file (not a
-/// directory). The file is a single-line linkfile: `gitdir: <abs>/.git/worktrees/<name>`.
-/// The main checkout is three `dirname` steps above that gitdir value
-/// (strip `<name>`, then `worktrees`, then `.git`).
+/// directory). The file is a linkfile starting with `gitdir: <path>` where
+/// `<path>` matches `<main>/.git/worktrees/<name>`. We validate this exact
+/// shape — git uses `.git` linkfiles for other layouts (submodules end in
+/// `/.git/modules/<name>`, `--separate-git-dir` can land anywhere) and
+/// stripping three dirname levels would return the wrong directory.
 ///
-/// On any error (no .git, parse failure, etc.) returns project_dir unchanged
-/// so non-git callers and the main checkout keep their existing behavior.
+/// `gitdir:` values can be either absolute or relative — git itself supports
+/// both. Relative values are resolved against the directory containing the
+/// `.git` file (i.e. project_dir).
+///
+/// Linkfiles are typically a single line but can carry additional keys like
+/// `commondir:` — only the first line is parsed.
+///
+/// On any error (no .git, parse failure, non-worktree layout, etc.) returns
+/// project_dir unchanged so non-git callers and the main checkout keep
+/// their existing behavior.
 ///
 /// Mirrors labelle-assembler/src/cache.zig:resolveProjectRoot — duplicated
 /// rather than imported to avoid coupling the CLI release cycle to a
@@ -405,19 +415,33 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
         return allocator.dupe(u8, project_dir);
     defer allocator.free(content);
 
-    const line = std.mem.trim(u8, content, " \t\r\n");
+    const eol = std.mem.indexOfAny(u8, content, "\r\n") orelse content.len;
+    const first_line = std.mem.trim(u8, content[0..eol], " \t");
+
     const prefix = "gitdir:";
-    if (!std.mem.startsWith(u8, line, prefix)) return allocator.dupe(u8, project_dir);
+    if (!std.mem.startsWith(u8, first_line, prefix)) return allocator.dupe(u8, project_dir);
 
-    const gitdir = std.mem.trim(u8, line[prefix.len..], " \t");
-    if (gitdir.len == 0) return allocator.dupe(u8, project_dir);
+    const gitdir_raw = std.mem.trim(u8, first_line[prefix.len..], " \t");
+    if (gitdir_raw.len == 0) return allocator.dupe(u8, project_dir);
 
-    var path = gitdir;
-    var i: u8 = 0;
-    while (i < 3) : (i += 1) {
-        path = std.fs.path.dirname(path) orelse return allocator.dupe(u8, project_dir);
-    }
-    return allocator.dupe(u8, path);
+    var gitdir_owned: ?[]u8 = null;
+    defer if (gitdir_owned) |b| allocator.free(b);
+    const gitdir = if (std.fs.path.isAbsolute(gitdir_raw)) gitdir_raw else blk: {
+        const joined = try std.fs.path.join(allocator, &.{ project_dir, gitdir_raw });
+        gitdir_owned = joined;
+        break :blk joined;
+    };
+
+    const wt_dir = std.fs.path.dirname(gitdir) orelse return allocator.dupe(u8, project_dir);
+    if (!std.mem.eql(u8, std.fs.path.basename(wt_dir), "worktrees"))
+        return allocator.dupe(u8, project_dir);
+
+    const dot_git = std.fs.path.dirname(wt_dir) orelse return allocator.dupe(u8, project_dir);
+    if (!std.mem.eql(u8, std.fs.path.basename(dot_git), ".git"))
+        return allocator.dupe(u8, project_dir);
+
+    const main_checkout = std.fs.path.dirname(dot_git) orelse return allocator.dupe(u8, project_dir);
+    return std.fs.cwd().realpathAlloc(allocator, main_checkout) catch allocator.dupe(u8, main_checkout);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -505,5 +529,85 @@ pub const ResolveProjectRoot = struct {
         defer alloc.free(root);
 
         try std.testing.expectEqualStrings(wt_abs, root);
+    }
+
+    test "submodule .git linkfile returns project_dir unchanged" {
+        const alloc = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.makePath("super/.git/modules/sub");
+        try tmp.dir.makePath("super/sub");
+
+        const super_abs = try tmp.dir.realpathAlloc(alloc, "super");
+        defer alloc.free(super_abs);
+        const sub_abs = try tmp.dir.realpathAlloc(alloc, "super/sub");
+        defer alloc.free(sub_abs);
+
+        const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/modules/sub\n", .{super_abs});
+        defer alloc.free(linkfile);
+        const f = try tmp.dir.createFile("super/sub/.git", .{});
+        defer f.close();
+        try f.writeAll(linkfile);
+
+        const root = try resolveProjectRoot(alloc, sub_abs);
+        defer alloc.free(root);
+
+        try std.testing.expectEqualStrings(sub_abs, root);
+    }
+
+    test "relative gitdir is resolved against project_dir" {
+        const alloc = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.makePath("main/.git/worktrees/wt");
+        try tmp.dir.makePath("main/wt");
+
+        const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+        defer alloc.free(main_abs);
+        const wt_abs = try tmp.dir.realpathAlloc(alloc, "main/wt");
+        defer alloc.free(wt_abs);
+
+        const f = try tmp.dir.createFile("main/wt/.git", .{});
+        defer f.close();
+        try f.writeAll("gitdir: ../.git/worktrees/wt\n");
+
+        const root = try resolveProjectRoot(alloc, wt_abs);
+        defer alloc.free(root);
+
+        try std.testing.expectEqualStrings(main_abs, root);
+    }
+
+    test "linkfile with extra keys (commondir) parses first line only" {
+        const alloc = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.makePath("main/.git/worktrees/wt");
+        try tmp.dir.makePath("wt");
+
+        const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+        defer alloc.free(main_abs);
+        const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+        defer alloc.free(wt_abs);
+
+        const linkfile = try std.fmt.allocPrint(
+            alloc,
+            "gitdir: {s}/.git/worktrees/wt\ncommondir: {s}/.git\n",
+            .{ main_abs, main_abs },
+        );
+        defer alloc.free(linkfile);
+        const f = try tmp.dir.createFile("wt/.git", .{});
+        defer f.close();
+        try f.writeAll(linkfile);
+
+        const root = try resolveProjectRoot(alloc, wt_abs);
+        defer alloc.free(root);
+
+        try std.testing.expectEqualStrings(main_abs, root);
     }
 };
