@@ -34,7 +34,7 @@ const TestStats = struct {
     files_failed: usize = 0,
 };
 
-const usage = "  usage: labelle test [dir] [--verbose]\n";
+const usage = "  usage: labelle test [dir] [--verbose] [--no-libs]\n";
 
 /// Run in-file Zig tests across the project's source tree.
 ///
@@ -45,11 +45,18 @@ const usage = "  usage: labelle test [dir] [--verbose]\n";
 pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var project_dir: []const u8 = ".";
     var verbose = false;
+    var skip_libs = false;
     var dir_set = false;
 
     for (cmd_args) |arg| {
         if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             verbose = true;
+        } else if (std.mem.eql(u8, arg, "--no-libs")) {
+            // Skip the project-tree walk entirely. Useful in CI where a
+            // separate job already runs `cd libs/<lib> && zig build test`
+            // and the comprehensive `labelle test` job only needs the
+            // game-side `.labelle/<backend>_<platform>/` step.
+            skip_libs = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle test: unknown flag '{s}'\n", .{arg});
             std.debug.print(usage, .{});
@@ -79,7 +86,9 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     };
 
     var stats = TestStats{};
-    try discoverAndRun(allocator, project_dir, &stats, verbose);
+    if (!skip_libs) {
+        try discoverAndRun(allocator, project_dir, &stats, verbose);
+    }
 
     // Game-side `tests/` are exercised through an assembler-generated
     // `build.zig`'s `test` step, not via bare `zig test <file>`. The
