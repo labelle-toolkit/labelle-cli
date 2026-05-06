@@ -20,12 +20,14 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     try w.print("        .engine = .{{ .version = \"{s}\" }},\n", .{cfg.engine_version});
     try w.print("        .gfx = .{{ .version = \"{s}\" }},\n", .{cfg.gfx_version});
     try w.print("        .labelle = .{{ .version = \"{s}\" }},\n", .{cfg.labelle_version});
-    // NOTE: `platform` is intentionally not persisted. It's a build target picked
-    // from CLI args (e.g. `labelle android run`), not a resolved dependency. Writing
-    // it here caused the lock file to flap between "desktop" and "android" on every
-    // cross-deploy. The lock file is a manifest of resolved versions, not invocation
-    // state.
-    try w.print("        .backend = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.backend)});
+    // NOTE: `backend` (both `name` and `platform`) is intentionally not persisted.
+    // Both fields are invocation state, not resolved dependencies:
+    //   - `platform` is the build target from CLI args (e.g. `labelle android run`).
+    //   - `name` is forced by the same CLI commands — `ios`/`android` pin `.sokol`
+    //     while a desktop run uses whatever the project config picks (could be
+    //     `.raylib`).
+    // Writing either caused the lock file to flap on every cross-deploy. The lock
+    // file is a manifest of resolved package versions, not build-target state.
 
     if (cfg.ecs != .mock) {
         try w.print("        .ecs = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.ecs)});
