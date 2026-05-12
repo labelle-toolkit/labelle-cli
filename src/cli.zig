@@ -339,6 +339,14 @@ fn appendExtraArg(parsed_args: *ParsedArgs, arg: []const u8) ParseError!void {
     parsed_args.extra_count += 1;
 }
 
+fn appendRunForwardedArgs(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator, parsed_args: *const ParsedArgs) !void {
+    if (parsed_args.extra_count == 0) return;
+    try argv.append(allocator, "--");
+    for (parsed_args.extra_args[0..parsed_args.extra_count]) |extra| {
+        try argv.append(allocator, extra);
+    }
+}
+
 /// Handle `labelle assembler <subcommand>`.
 fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     if (cmd_args.len == 0 or std.mem.eql(u8, cmd_args[0], "list")) {
@@ -763,22 +771,17 @@ pub fn main() !void {
             }
             const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
             defer allocator.free(bin_path);
-            const run_result = try runner.runZigInherit(allocator, project_dir, &.{bin_path}, timeout_ns);
+            var run_args: std.ArrayList([]const u8) = .{};
+            defer run_args.deinit(allocator);
+            try run_args.append(allocator, bin_path);
+            try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
+            const run_result = try runner.runZigInherit(allocator, project_dir, run_args.items, timeout_ns);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
         } else {
             try zig_args.append(allocator, "run");
-            // Forward `--`-separated trailing args from `labelle run` to the
-            // game via `zig build run -- <extras>`. Only emit the `--`
-            // separator when there's at least one extra; a dangling `--`
-            // would be harmless but ugly.
-            if (parsed_args.extra_count > 0) {
-                try zig_args.append(allocator, "--");
-                for (parsed_args.extra_args[0..parsed_args.extra_count]) |extra| {
-                    try zig_args.append(allocator, extra);
-                }
-            }
+            try appendRunForwardedArgs(&zig_args, allocator, &parsed_args);
             const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
@@ -1004,4 +1007,29 @@ pub const ParseRunArgsPassthroughSpec = struct {
             try std.testing.expectEqualStrings("somedir", pa.extra_args[0]);
         }
     };
+};
+
+pub const AppendRunForwardedArgsSpec = struct {
+    test "skips separator when there are no forwarded args" {
+        var argv: std.ArrayList([]const u8) = .{};
+        defer argv.deinit(std.testing.allocator);
+        var pa = ParsedArgs{ .command = .run };
+
+        try appendRunForwardedArgs(&argv, std.testing.allocator, &pa);
+        try expect.equal(argv.items.len, @as(usize, 0));
+    }
+
+    test "appends separator and all forwarded args in order" {
+        var argv: std.ArrayList([]const u8) = .{};
+        defer argv.deinit(std.testing.allocator);
+        var pa = ParsedArgs{ .command = .run };
+        try appendExtraArg(&pa, "--preview-mode");
+        try appendExtraArg(&pa, "127.0.0.1:54321");
+
+        try appendRunForwardedArgs(&argv, std.testing.allocator, &pa);
+        try expect.equal(argv.items.len, @as(usize, 3));
+        try std.testing.expectEqualStrings("--", argv.items[0]);
+        try std.testing.expectEqualStrings("--preview-mode", argv.items[1]);
+        try std.testing.expectEqualStrings("127.0.0.1:54321", argv.items[2]);
+    }
 };
