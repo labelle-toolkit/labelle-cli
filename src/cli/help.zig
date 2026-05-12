@@ -11,7 +11,7 @@ pub fn printHelp() void {
         \\  init <name> [dir]    Create a new labelle project
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
         \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build the project
-        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build + run (default)
+        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>] [-- <args>...]  Generate + build + run (default; `--` forwards trailing args to the game)
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  install assembler <ver>  Download and cache an assembler binary
@@ -36,6 +36,7 @@ pub fn printHelp() void {
         \\  labelle build --docker
         \\  labelle build --docker --target=x86_64-windows
         \\  labelle run --docker
+        \\  labelle run -- --preview-mode 127.0.0.1:54321
         \\  labelle install 0.2.0
         \\  labelle upgrade core 0.2.0
         \\  labelle test

@@ -2,7 +2,7 @@
 ///
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] — generate + build + run
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [-- <args>...] — generate + build + run; `--` forwards trailing args to the game
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] — generate + build (no run)
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
@@ -62,9 +62,11 @@ fn sceneArgValue(arg: []const u8) []const u8 {
 }
 
 /// Parse --scene=<name> or --scene <name> from args, consuming the iterator as needed.
+/// `args` is `anytype` so tests can pass a `std.process.ArgIteratorGeneral`
+/// over a fixed string instead of the platform `ArgIterator`.
 fn parseSceneFlag(
     arg: []const u8,
-    args: *std.process.ArgIterator,
+    args: anytype,
     scene_override: *?[]const u8,
     cmd_name: []const u8,
 ) SceneResult {
@@ -229,7 +231,12 @@ fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struc
 }
 
 /// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
-fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir: bool) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
+///
+/// A bare `--` token switches the parser into "passthrough" mode: every
+/// subsequent token is collected verbatim into `parsed_args.extra_args`
+/// without flag interpretation, so callers can forward args to the game
+/// binary via `zig build run -- <extras>` (see run_cmd handler).
+fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_args: *ParsedArgs) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
@@ -239,8 +246,17 @@ fn parseRunArgs(args: *std.process.ArgIterator, cmd_name: []const u8, allow_dir:
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
     var bake = false;
+    var passthrough = false;
 
     while (args.next()) |arg| {
+        if (passthrough) {
+            appendExtraArg(parsed_args, arg) catch return null;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            passthrough = true;
+            continue;
+        }
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
             .parsed => continue,
             .err => return null,
@@ -323,6 +339,14 @@ fn appendExtraArg(parsed_args: *ParsedArgs, arg: []const u8) ParseError!void {
     parsed_args.extra_count += 1;
 }
 
+fn appendRunForwardedArgs(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator, parsed_args: *const ParsedArgs) !void {
+    if (parsed_args.extra_count == 0) return;
+    try argv.append(allocator, "--");
+    for (parsed_args.extra_args[0..parsed_args.extra_count]) |extra| {
+        try argv.append(allocator, extra);
+    }
+}
+
 /// Handle `labelle assembler <subcommand>`.
 fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     if (cmd_args.len == 0 or std.mem.eql(u8, cmd_args[0], "list")) {
@@ -362,7 +386,7 @@ pub fn main() !void {
             parsed_args.bake = result.bake;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
-            const result = parseRunArgs(&args, "run", true) orelse return;
+            const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
@@ -461,7 +485,7 @@ pub fn main() !void {
             parsed_args.command = .targets;
         } else {
             // No command — treat as project dir, default to run
-            const result = parseRunArgs(&args, "run", false) orelse return;
+            const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return;
             parsed_args.project_dir = first;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
@@ -747,12 +771,17 @@ pub fn main() !void {
             }
             const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
             defer allocator.free(bin_path);
-            const run_result = try runner.runZigInherit(allocator, project_dir, &.{bin_path}, timeout_ns);
+            var run_args: std.ArrayList([]const u8) = .{};
+            defer run_args.deinit(allocator);
+            try run_args.append(allocator, bin_path);
+            try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
+            const run_result = try runner.runZigInherit(allocator, project_dir, run_args.items, timeout_ns);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
         } else {
             try zig_args.append(allocator, "run");
+            try appendRunForwardedArgs(&zig_args, allocator, &parsed_args);
             const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
@@ -883,4 +912,124 @@ pub const ParsePlatformValueSpec = struct {
             try expect.equal(parsePlatformValue("windows"), null);
         }
     };
+};
+
+/// Build an in-memory ArgIterator over a fixed argv-like string for
+/// tests of `parseRunArgs`. `parseRunArgs` takes `anytype` so it
+/// accepts both the platform `std.process.ArgIterator` and
+/// `std.process.ArgIteratorGeneral` returned here.
+fn testIter(line: []const u8) std.process.ArgIteratorGeneral(.{}) {
+    return std.process.ArgIteratorGeneral(.{}).init(std.testing.allocator, line) catch unreachable;
+}
+
+pub const ParseRunArgsPassthroughSpec = struct {
+    pub const no_separator = struct {
+        test "empty extras when no `--` token" {
+            var iter = testIter("");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings(".", result.dir);
+            try expect.equal(pa.extra_count, @as(usize, 0));
+        }
+
+        test "scene flag without `--` does not enter passthrough" {
+            var iter = testIter("--scene=main");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("main", result.scene.?);
+            try expect.equal(pa.extra_count, @as(usize, 0));
+        }
+    };
+
+    pub const single_trailing_arg = struct {
+        test "one token after `--` lands in extras" {
+            var iter = testIter("-- --preview-mode");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings(".", result.dir);
+            try expect.equal(pa.extra_count, @as(usize, 1));
+            try std.testing.expectEqualStrings("--preview-mode", pa.extra_args[0]);
+        }
+    };
+
+    pub const multiple_trailing_args = struct {
+        test "multiple tokens after `--` preserved in order" {
+            var iter = testIter("-- --preview-mode 127.0.0.1:54321");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.extra_count, @as(usize, 2));
+            try std.testing.expectEqualStrings("--preview-mode", pa.extra_args[0]);
+            try std.testing.expectEqualStrings("127.0.0.1:54321", pa.extra_args[1]);
+        }
+
+        test "inner `--` after first `--` is a passthrough token, not a re-trigger" {
+            // Once the parser is in passthrough mode it stays there; a
+            // second `--` is forwarded verbatim. zig build run uses the
+            // first `--` as separator and forwards the rest, so an inner
+            // `--` reaches the game unchanged.
+            var iter = testIter("-- --foo -- --bar");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.extra_count, @as(usize, 3));
+            try std.testing.expectEqualStrings("--foo", pa.extra_args[0]);
+            try std.testing.expectEqualStrings("--", pa.extra_args[1]);
+            try std.testing.expectEqualStrings("--bar", pa.extra_args[2]);
+        }
+    };
+
+    pub const mixed_labelle_flags_and_passthrough = struct {
+        test "labelle flags before `--` consumed, after `--` forwarded" {
+            var iter = testIter("mydir --scene=main -- --foo bar");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("mydir", result.dir);
+            try std.testing.expectEqualStrings("main", result.scene.?);
+            try expect.equal(pa.extra_count, @as(usize, 2));
+            try std.testing.expectEqualStrings("--foo", pa.extra_args[0]);
+            try std.testing.expectEqualStrings("bar", pa.extra_args[1]);
+        }
+
+        test "positional dir after `--` is forwarded, not parsed as dir" {
+            // After `--` everything is opaque, so a bare word doesn't
+            // collide with the project_dir slot.
+            var iter = testIter("-- somedir");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings(".", result.dir);
+            try expect.equal(pa.extra_count, @as(usize, 1));
+            try std.testing.expectEqualStrings("somedir", pa.extra_args[0]);
+        }
+    };
+};
+
+pub const AppendRunForwardedArgsSpec = struct {
+    test "skips separator when there are no forwarded args" {
+        var argv: std.ArrayList([]const u8) = .{};
+        defer argv.deinit(std.testing.allocator);
+        var pa = ParsedArgs{ .command = .run };
+
+        try appendRunForwardedArgs(&argv, std.testing.allocator, &pa);
+        try expect.equal(argv.items.len, @as(usize, 0));
+    }
+
+    test "appends separator and all forwarded args in order" {
+        var argv: std.ArrayList([]const u8) = .{};
+        defer argv.deinit(std.testing.allocator);
+        var pa = ParsedArgs{ .command = .run };
+        try appendExtraArg(&pa, "--preview-mode");
+        try appendExtraArg(&pa, "127.0.0.1:54321");
+
+        try appendRunForwardedArgs(&argv, std.testing.allocator, &pa);
+        try expect.equal(argv.items.len, @as(usize, 3));
+        try std.testing.expectEqualStrings("--", argv.items[0]);
+        try std.testing.expectEqualStrings("--preview-mode", argv.items[1]);
+        try std.testing.expectEqualStrings("127.0.0.1:54321", argv.items[2]);
+    }
 };
