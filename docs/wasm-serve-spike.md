@@ -49,7 +49,7 @@ mostly polish + a runtime crash on one backend.
    **Succeeded.** Same artifact shape.
 
 5. Served the raylib artifacts with `python3 -m http.server`, loaded in headless
-   Chrome with software WebGL.
+   Chrome with software WebGL (`--use-gl=swiftshader --enable-unsafe-swiftshader`).
    - Raylib initialises through `PLATFORM: WEB: Initialized successfully`.
    - WebGL 2.0 context obtains GLSL ES 3.00, VAO + NPOT extensions.
    - Default shader + fragment shader compile and link.
@@ -128,7 +128,7 @@ thin CLI surface that exposes the documented flags. Breakdown:
 
 | Task | Size | Notes |
 |------|------|-------|
-| Fix raylib-wasm runtime segfault | M | Cross-repo: labelle-engine + raylib backend likely. Real diagnosis needed. |
+| Fix raylib-wasm runtime segfault | M | Diagnosed (see `wasm-segfault-investigation.md`). Fix lives in labelle-engine + labelle-gfx. |
 | Fix sokol-wasm `stdlib.h` include | S | `labelle-sokol/build.zig` — add `emsdk.emccDefaultFlags`-equivalent include paths to gfx module. |
 | Fix sokol-wasm `allocator` shadow | XS | Single template edit in `labelle-assembler`. |
 | Add `labelle wasm serve` subcommand wrapper (vs reusing `run --platform=wasm`) | S | Just a CLI alias + flag parsing. `serve.zig` already does the work. |
@@ -153,12 +153,10 @@ entirely on diagnosing the segfault.
 
 ## Files / artifacts produced during the spike
 
-- Built artifacts at
-  `/Users/alexandrecalvao/prj/labelle-toolkit/labelle-assembler/examples/raylib/.labelle/raylib_wasm/zig-out/web/`
+- Built artifacts at `labelle-assembler/examples/raylib/.labelle/raylib_wasm/zig-out/web/`
   (kept for reference; safe to `rm -rf .labelle/`).
-- Screenshot of the running raylib-wasm bundle at `/tmp/wasm-raylib-shot.png`
-  (black canvas + emscripten "Exception thrown" banner — proves canvas mounts
-  before the segfault).
+- Screenshot of the running raylib-wasm bundle (kept for reference; black canvas +
+  emscripten "Exception thrown" banner — proves canvas mounts before the segfault).
 
 ## Recommendation
 
