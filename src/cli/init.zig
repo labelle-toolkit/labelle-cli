@@ -1,6 +1,7 @@
 const std = @import("std");
 const gen = @import("generator");
 const assembler = @import("assembler.zig");
+const config = @import("config.zig");
 
 /// Scaffold a new project directory with project.labelle and starter files.
 pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -53,18 +54,19 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     };
 
     const dir = dir_override orelse project_name;
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
-    cwd.makePath(dir) catch |err| {
+    cwd.createDirPath(io, dir) catch |err| {
         std.debug.print("labelle init: could not create '{s}': {any}\n", .{ dir, err });
         return error.InitFailed;
     };
 
     // Write project.labelle
     {
-        var buf = std.ArrayList(u8){};
-        defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var aw = std.Io.Writer.Allocating.init(allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
 
         try w.print(
             \\.{{
@@ -104,9 +106,11 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
 
         const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
         defer allocator.free(path);
-        const file = try cwd.createFile(path, .{ .exclusive = true });
-        defer file.close();
-        try file.writeAll(buf.items);
+        try cwd.writeFile(io, .{
+            .sub_path = path,
+            .data = aw.written(),
+            .flags = .{ .exclusive = true },
+        });
     }
 
     // Create starter directories
@@ -114,43 +118,41 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     for (dirs) |subdir| {
         const path = try std.fs.path.join(allocator, &.{ dir, subdir });
         defer allocator.free(path);
-        cwd.makePath(path) catch {};
+        cwd.createDirPath(io, path) catch {};
     }
 
     // Write a starter scene
     {
         const path = try std.fs.path.join(allocator, &.{ dir, "scenes", "main.zon" });
         defer allocator.free(path);
-        if (cwd.createFile(path, .{ .exclusive = true })) |file| {
-            defer file.close();
-            file.writeAll(
+        cwd.writeFile(io, .{
+            .sub_path = path,
+            .data =
                 \\.{
                 \\    .name = "main",
                 \\    .entities = .{},
                 \\}
                 \\
-            ) catch |err| {
-                std.debug.print("labelle init: failed to write starter scene: {any}\n", .{err});
-                return err;
-            };
-        } else |err| {
-            if (err != error.PathAlreadyExists) return err;
-        }
+            ,
+            .flags = .{ .exclusive = true },
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
     }
 
     // Write .gitignore
     {
         const path = try std.fs.path.join(allocator, &.{ dir, ".gitignore" });
         defer allocator.free(path);
-        if (cwd.createFile(path, .{ .exclusive = true })) |file| {
-            defer file.close();
-            file.writeAll(".labelle/\n") catch |err| {
-                std.debug.print("labelle init: failed to write .gitignore: {any}\n", .{err});
-                return err;
-            };
-        } else |err| {
-            if (err != error.PathAlreadyExists) return err;
-        }
+        cwd.writeFile(io, .{
+            .sub_path = path,
+            .data = ".labelle/\n",
+            .flags = .{ .exclusive = true },
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
     }
 
     std.debug.print("labelle: created project '{s}' in {s}/\n", .{ project_name, dir });

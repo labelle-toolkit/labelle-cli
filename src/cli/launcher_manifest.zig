@@ -5,6 +5,7 @@
 /// break older CLIs. We achieve this by using `ignore_unknown_fields = true`
 /// in the ZON parser.
 const std = @import("std");
+const config = @import("config.zig");
 
 pub const LauncherManifest = struct {
     assembler_version: ?[]const u8 = null,
@@ -19,7 +20,7 @@ pub fn readLauncherManifest(allocator: std.mem.Allocator, project_dir: []const u
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
 
-    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch |err| switch (err) {
+    const source_raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), labelle_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -28,7 +29,7 @@ pub fn readLauncherManifest(allocator: std.mem.Allocator, project_dir: []const u
     const source = try allocator.dupeZ(u8, source_raw);
     defer allocator.free(source);
 
-    return std.zon.parse.fromSlice(LauncherManifest, allocator, source, null, .{
+    return std.zon.parse.fromSliceAlloc(LauncherManifest, allocator, source, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         std.debug.print("labelle: could not parse launcher manifest from project.labelle: {any}\n", .{err});

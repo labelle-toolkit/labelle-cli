@@ -63,16 +63,17 @@ pub fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !voi
 
     var removed_count: u32 = 0;
 
+    const io = config.globalIo();
     for (pkg_names) |pkg_name| {
         const pkg_dir_path = std.fs.path.join(arena_alloc, &.{ packages_dir, pkg_name }) catch continue;
 
-        var pkg_dir = std.fs.cwd().openDir(pkg_dir_path, .{ .iterate = true }) catch continue;
-        defer pkg_dir.close();
+        var pkg_dir = std.Io.Dir.cwd().openDir(io, pkg_dir_path, .{ .iterate = true }) catch continue;
+        defer pkg_dir.close(io);
 
         const version_set = kept.get(pkg_name) orelse continue;
 
         var iter = pkg_dir.iterate();
-        while (iter.next() catch null) |entry| {
+        while (iter.next(io) catch null) |entry| {
             if (entry.kind != .directory and entry.kind != .sym_link) continue;
 
             if (version_set.contains(entry.name)) continue;
@@ -83,12 +84,12 @@ pub fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !voi
                 const full_path = std.fs.path.join(arena_alloc, &.{ pkg_dir_path, entry.name }) catch continue;
 
                 if (entry.kind == .sym_link) {
-                    std.fs.cwd().deleteFile(full_path) catch |err| {
+                    std.Io.Dir.cwd().deleteFile(io, full_path) catch |err| {
                         std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
                         continue;
                     };
                 } else {
-                    std.fs.cwd().deleteTree(full_path) catch |err| {
+                    std.Io.Dir.cwd().deleteTree(io, full_path) catch |err| {
                         std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
                         continue;
                     };

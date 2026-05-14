@@ -3,6 +3,7 @@
 /// `android/build.zig` (after the .so is built) and `android/run.zig`
 /// (single- and multi-arch deploy paths share this module).
 const std = @import("std");
+const config = @import("../config.zig");
 const gen = @import("generator");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
@@ -73,7 +74,7 @@ pub fn packageApkWithAbis(
 
     // Validate every .so exists before we touch the staging dir.
     for (abis) |abi| {
-        std.fs.cwd().access(abi.so_path, .{}) catch {
+        std.Io.Dir.cwd().access(config.globalIo(), abi.so_path, .{}) catch {
             std.debug.print("labelle: Android .so not found at {s}\n", .{abi.so_path});
             return error.BinaryNotFound;
         };
@@ -83,7 +84,7 @@ pub fn packageApkWithAbis(
     const staging_dir = try std.fs.path.join(allocator, &.{ target_dir, "apk-staging" });
     defer allocator.free(staging_dir);
     // Intentionally ignoring errors: the staging directory may not exist on first run.
-    std.fs.cwd().deleteTree(staging_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(config.globalIo(), staging_dir) catch {};
 
     // Fan out every staged .so into `lib/<abi>/libgame.so`. The fat
     // APK case produces multiple directories under `lib/`; apksigner
@@ -91,11 +92,11 @@ pub fn packageApkWithAbis(
     for (abis) |abi| {
         const lib_dir = try std.fs.path.join(allocator, &.{ staging_dir, "lib", abi.abi_dir });
         defer allocator.free(lib_dir);
-        try std.fs.cwd().makePath(lib_dir);
+        try std.Io.Dir.cwd().createDirPath(config.globalIo(), lib_dir);
 
         const staged_so = try std.fs.path.join(allocator, &.{ lib_dir, "libgame.so" });
         defer allocator.free(staged_so);
-        try std.fs.cwd().copyFile(abi.so_path, std.fs.cwd(), staged_so, .{});
+        try std.Io.Dir.cwd().copyFile(abi.so_path, std.Io.Dir.cwd(), staged_so, config.globalIo(), .{});
     }
 
     // Generate AndroidManifest.xml
@@ -103,11 +104,7 @@ pub fn packageApkWithAbis(
     defer allocator.free(manifest_path);
     const manifest = try generateAndroidManifest(allocator, package_name, app_name, android_cfg);
     defer allocator.free(manifest);
-    {
-        const f = try std.fs.cwd().createFile(manifest_path, .{});
-        defer f.close();
-        try f.writeAll(manifest);
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = manifest_path, .data = manifest });
 
     // Stage assets
     const assets_src = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
@@ -155,7 +152,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     const android_jar = try std.fs.path.join(allocator, &.{ sdk_home, "platforms", platform_dir, "android.jar" });
     defer allocator.free(android_jar);
 
-    std.fs.cwd().access(android_jar, .{}) catch {
+    std.Io.Dir.cwd().access(config.globalIo(), android_jar, .{}) catch {
         std.debug.print("labelle: android.jar not found at {s}\n", .{android_jar});
         std.debug.print("  install Android SDK platform {d}: sdkmanager \"platforms;android-{d}\"\n", .{ target_sdk, target_sdk });
         return error.SdkNotFound;
@@ -193,7 +190,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         const aapt_args: []const []const u8 = blk: {
             const base = &[_][]const u8{ aapt, "package", "-f", "-M", manifest_path, "-I", android_jar, "-F", unsigned_apk };
             // Only pass -A if the assets directory actually exists.
-            if (std.fs.cwd().access(assets_dir, .{})) |_| {
+            if (std.Io.Dir.cwd().access(config.globalIo(), assets_dir, .{})) |_| {
                 break :blk try std.mem.concat(allocator, []const u8, &.{ base, &.{ "-A", assets_dir } });
             } else |_| {
                 break :blk try allocator.dupe([]const u8, base);
@@ -207,7 +204,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         switch (result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: aapt package failed: {s}\n", .{result.stderr});
                 return error.PackageFailed;
             },
@@ -219,20 +216,21 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     // Run zip from inside staging_dir so the archive path is lib/<abi>/libgame.so.
     // Resolve both paths to absolute so they survive the CWD change.
     {
-        const staging_abs = try std.fs.cwd().realpathAlloc(allocator, staging_dir);
+        const staging_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), staging_dir, allocator);
         defer allocator.free(staging_abs);
-        const unsigned_abs = try std.fs.cwd().realpathAlloc(allocator, unsigned_apk);
+        const unsigned_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), unsigned_apk, allocator);
         defer allocator.free(unsigned_abs);
 
-        var child = std.process.Child.init(&.{ "zip", "-r", unsigned_abs, "lib" }, allocator);
-        child.cwd = staging_abs;
-        child.stdin_behavior = .Close;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-        const term = try child.wait();
+        var child = try std.process.spawn(config.globalIo(), .{
+            .argv = &.{ "zip", "-r", unsigned_abs, "lib" },
+            .cwd = .{ .path = staging_abs },
+            .stdin = .close,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        const term = try child.wait(config.globalIo());
         switch (term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: zip native lib failed (exit {d})\n", .{code});
                 return error.PackageFailed;
             },
@@ -249,7 +247,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         switch (result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: zipalign failed: {s}\n", .{result.stderr});
                 return error.PackageFailed;
             },
@@ -301,7 +299,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     }
 
     {
-        var args: std.ArrayList([]const u8) = .{};
+        var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(allocator);
         try args.appendSlice(allocator, &.{
             apksigner, "sign",
@@ -319,7 +317,7 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         switch (result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: apksigner failed: {s}\n", .{result.stderr});
                 return error.PackageFailed;
             },
@@ -328,8 +326,8 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     }
 
     // Cleanup intermediates
-    std.fs.cwd().deleteFile(unsigned_apk) catch {};
-    std.fs.cwd().deleteFile(aligned_apk) catch {};
+    std.Io.Dir.cwd().deleteFile(config.globalIo(), unsigned_apk) catch {};
+    std.Io.Dir.cwd().deleteFile(config.globalIo(), aligned_apk) catch {};
 
     std.debug.print("  APK: {s}\n", .{apk_path});
 }
@@ -371,10 +369,10 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
 
 /// Find ANDROID_HOME.
 fn findAndroidSdk(allocator: std.mem.Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "ANDROID_HOME")) |home| {
+    if (config.globalEnviron().getAlloc(allocator, "ANDROID_HOME")) |home| {
         return home;
     } else |_| {}
-    if (std.process.getEnvVarOwned(allocator, "ANDROID_SDK_ROOT")) |home| {
+    if (config.globalEnviron().getAlloc(allocator, "ANDROID_SDK_ROOT")) |home| {
         return home;
     } else |_| {}
     std.debug.print("labelle: Android SDK not found. Set ANDROID_HOME.\n", .{});
@@ -386,16 +384,16 @@ fn findBuildTools(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 {
     const bt_dir = try std.fs.path.join(allocator, &.{ sdk_home, "build-tools" });
     defer allocator.free(bt_dir);
 
-    var dir = std.fs.cwd().openDir(bt_dir, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(config.globalIo(), bt_dir, .{ .iterate = true }) catch {
         std.debug.print("labelle: build-tools not found at {s}\n", .{bt_dir});
         return error.SdkNotFound;
     };
-    defer dir.close();
+    defer dir.close(config.globalIo());
 
     var latest: ?[]const u8 = null;
     var latest_parsed: u32 = 0;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(config.globalIo())) |entry| {
         if (entry.kind != .directory) continue;
         // Use the existing semver parser instead of lexicographic order.
         // Lexicographic comparison treats "9.0.0" as greater than
@@ -430,7 +428,7 @@ fn ensureDebugKeystore(allocator: std.mem.Allocator) ![]u8 {
 
     const keystore = try std.fs.path.join(allocator, &.{ cache_root, "android-debug.keystore" });
 
-    std.fs.cwd().access(keystore, .{}) catch {
+    std.Io.Dir.cwd().access(config.globalIo(), keystore, .{}) catch {
         // Generate debug keystore
         std.debug.print("labelle: generating debug keystore...\n", .{});
         const result = util.runCmd(allocator, &.{
@@ -452,7 +450,7 @@ fn ensureDebugKeystore(allocator: std.mem.Allocator) ![]u8 {
         defer allocator.free(result.stderr);
 
         switch (result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: keytool failed (exit code {d}): {s}\n", .{ code, result.stderr });
                 allocator.free(keystore);
                 return error.KeystoreFailed;
@@ -475,21 +473,22 @@ fn defaultPackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u
 
 /// Copy a directory tree recursively.
 fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
-    const cwd = std.fs.cwd();
-    // Don't swallow makePath errors. PathAlreadyExists is fine — every
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    // Don't swallow createDirPath errors. PathAlreadyExists is fine — every
     // other case (permission denied, read-only fs, …) needs to surface
     // so the build doesn't continue against an unusable destination
     // and report a confusing copy-step failure later.
-    cwd.makePath(dst) catch |err| switch (err) {
+    cwd.createDirPath(io, dst) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    var src_dir = try cwd.openDir(src, .{ .iterate = true });
-    defer src_dir.close();
+    var src_dir = try cwd.openDir(io, src, .{ .iterate = true });
+    defer src_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const src_sub = try std.fs.path.join(allocator, &.{ src, entry.name });
         defer allocator.free(src_sub);
         const dst_sub = try std.fs.path.join(allocator, &.{ dst, entry.name });
@@ -497,7 +496,7 @@ fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8)
 
         switch (entry.kind) {
             .directory => try copyDirectory(allocator, src_sub, dst_sub),
-            .file => try cwd.copyFile(src_sub, cwd, dst_sub, .{}),
+            .file => try cwd.copyFile(src_sub, cwd, dst_sub, io, .{}),
             else => {},
         }
     }

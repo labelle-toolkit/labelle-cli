@@ -179,7 +179,7 @@ fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const 
 }
 
 /// Parse [dir], --scene, --platform, --optimize, --docker, and --target flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.ArgIterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
+fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
@@ -321,7 +321,7 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
 }
 
 /// Collect all remaining args into extra_args buffer.
-fn collectExtraArgs(args: *std.process.ArgIterator, parsed_args: *ParsedArgs) ParseError!void {
+fn collectExtraArgs(args: *std.process.Args.Iterator, parsed_args: *ParsedArgs) ParseError!void {
     while (args.next()) |arg| {
         try appendExtraArg(parsed_args, arg);
     }
@@ -357,12 +357,18 @@ fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
     return error.UnknownSubcommand;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(proc_init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    // Initialize the process-wide Io for both the assembler's helpers
+    // (used via `gen.*`) and the CLI's own filesystem/env helpers. Must
+    // happen before any submodule reaches for `globalIo()`/`globalEnviron()`.
+    gen.initGlobalIo(proc_init.minimal);
+    config.initGlobalIo(proc_init.minimal);
+
+    var args = try std.process.Args.Iterator.initAllocator(proc_init.minimal.args, allocator);
     defer args.deinit();
     _ = args.skip(); // skip program name
 
@@ -667,7 +673,7 @@ pub fn main() !void {
         defer allocator.free(tests_dir);
         const tests_build_zig = try std.fs.path.join(allocator, &.{ tests_dir, "build.zig" });
         defer allocator.free(tests_build_zig);
-        if (std.fs.cwd().access(tests_build_zig, .{})) |_| {
+        if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
             try runner.fixFingerprint(allocator, tests_dir);
         } else |_| {}
     }
@@ -698,7 +704,7 @@ pub fn main() !void {
         null;
     defer if (optimize_flag) |f| allocator.free(f);
 
-    var zig_args: std.ArrayList([]const u8) = .{};
+    var zig_args: std.ArrayList([]const u8) = .empty;
     defer zig_args.deinit(allocator);
     try zig_args.appendSlice(allocator, &.{ "zig", "build" });
     if (optimize_flag) |flag| try zig_args.append(allocator, flag);
@@ -717,7 +723,7 @@ pub fn main() !void {
         defer allocator.free(build_result.stderr);
 
         switch (build_result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
                 return error.BuildFailed;
             },
@@ -771,7 +777,7 @@ pub fn main() !void {
             }
             const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
             defer allocator.free(bin_path);
-            var run_args: std.ArrayList([]const u8) = .{};
+            var run_args: std.ArrayList([]const u8) = .empty;
             defer run_args.deinit(allocator);
             try run_args.append(allocator, bin_path);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
@@ -916,10 +922,13 @@ pub const ParsePlatformValueSpec = struct {
 
 /// Build an in-memory ArgIterator over a fixed argv-like string for
 /// tests of `parseRunArgs`. `parseRunArgs` takes `anytype` so it
-/// accepts both the platform `std.process.ArgIterator` and
-/// `std.process.ArgIteratorGeneral` returned here.
-fn testIter(line: []const u8) std.process.ArgIteratorGeneral(.{}) {
-    return std.process.ArgIteratorGeneral(.{}).init(std.testing.allocator, line) catch unreachable;
+/// accepts both the platform `std.process.Args.Iterator` and
+/// `std.process.Args.IteratorGeneral` returned here.
+///
+/// 0.16 moved `std.process.ArgIteratorGeneral` to
+/// `std.process.Args.IteratorGeneral`.
+fn testIter(line: []const u8) std.process.Args.IteratorGeneral(.{}) {
+    return std.process.Args.IteratorGeneral(.{}).init(std.testing.allocator, line) catch unreachable;
 }
 
 pub const ParseRunArgsPassthroughSpec = struct {
@@ -1011,7 +1020,7 @@ pub const ParseRunArgsPassthroughSpec = struct {
 
 pub const AppendRunForwardedArgsSpec = struct {
     test "skips separator when there are no forwarded args" {
-        var argv: std.ArrayList([]const u8) = .{};
+        var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(std.testing.allocator);
         var pa = ParsedArgs{ .command = .run };
 
@@ -1020,7 +1029,7 @@ pub const AppendRunForwardedArgsSpec = struct {
     }
 
     test "appends separator and all forwarded args in order" {
-        var argv: std.ArrayList([]const u8) = .{};
+        var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(std.testing.allocator);
         var pa = ParsedArgs{ .command = .run };
         try appendExtraArg(&pa, "--preview-mode");

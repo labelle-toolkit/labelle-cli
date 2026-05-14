@@ -21,7 +21,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Build CLI
         run: zig build
@@ -82,6 +82,17 @@ jobs:
 
   docker-build:
     name: Docker Build Test
+    # Validates the WASM/emscripten workarounds for the two Zig 0.16.0
+    # release bugs (both reproduce on the official tarball, not pip-specific):
+    #   * std/Io/Threaded.zig SIG__enum vs u32 mismatch — patched in the
+    #     Dockerfile via a one-line sed cherry-pick of Zig PR #31850
+    #     (see src/cli/docker.zig: install_zig).
+    #   * translate-c rejects emscripten 4.0.9's multi-arg
+    #     __attribute__((deprecated("msg1","msg2"))) — sidestepped by a
+    #     hand-rolled extern shim in the assembler's wasm.txt template
+    #     (no @cImport(emscripten.h)).
+    # Drop the workarounds once Zig 0.16.1+ + translate-c #306 land.
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -94,27 +105,31 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-core
+          ref: feat/zig-0.16-migration
           path: labelle-core
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-engine
+          ref: feat/zig-0.16-migration
           path: labelle-engine
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gfx
+          ref: feat/zig-0.16-migration
           path: labelle-gfx
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
+          ref: feat/zig-0.16-migration
           path: labelle-assembler
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Build CLI
         run: cd labelle-cli && zig build
@@ -155,27 +170,31 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-core
+          ref: feat/zig-0.16-migration
           path: labelle-core
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-engine
+          ref: feat/zig-0.16-migration
           path: labelle-engine
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gfx
+          ref: feat/zig-0.16-migration
           path: labelle-gfx
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
+          ref: feat/zig-0.16-migration
           path: labelle-assembler
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Install system dependencies
         run: |

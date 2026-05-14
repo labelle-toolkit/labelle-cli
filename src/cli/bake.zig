@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const gen = @import("generator");
+const config = @import("config.zig");
 
 const stbi = @cImport({
     @cInclude("stb_image.h");
@@ -68,22 +69,20 @@ pub fn run(
 /// .png's mtime. Missing .rgba (or missing .png) => false so the caller
 /// proceeds to bake; actual PNG-read failures surface there.
 fn isFresh(rgba_path: []const u8, png_path: []const u8) !bool {
-    const rgba_stat = std.fs.cwd().statFile(rgba_path) catch |err| switch (err) {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const rgba_stat = cwd.statFile(io, rgba_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
-    const png_stat = std.fs.cwd().statFile(png_path) catch return false;
-    return rgba_stat.mtime >= png_stat.mtime;
+    const png_stat = cwd.statFile(io, png_path, .{}) catch return false;
+    return rgba_stat.mtime.nanoseconds >= png_stat.mtime.nanoseconds;
 }
 
 fn bakeOne(allocator: std.mem.Allocator, png_path: []const u8, rgba_path: []const u8) !void {
-    const png_file = try std.fs.cwd().openFile(png_path, .{});
-    defer png_file.close();
-    // Read exactly `stat.size` — local build input is trusted, so no
-    // need for a hardcoded cap that would reject legitimate large 4K+
-    // atlases.
-    const png_stat = try png_file.stat();
-    const png_bytes = try png_file.readToEndAlloc(allocator, png_stat.size);
+    const io = config.globalIo();
+    // Read the PNG via the new Io.Dir API; trust the local build input.
+    const png_bytes = try std.Io.Dir.cwd().readFileAlloc(io, png_path, allocator, .unlimited);
     defer allocator.free(png_bytes);
 
     var w: c_int = 0;
@@ -111,14 +110,15 @@ fn bakeOne(allocator: std.mem.Allocator, png_path: []const u8, rgba_path: []cons
     // `errdefer`, a crash/OOM/disk-full mid-write leaves a truncated
     // file that `isFresh` would mistake for a valid cached bake on the
     // next run (mtime >= PNG).
-    var out = try std.fs.cwd().createFile(rgba_path, .{ .truncate = true });
-    errdefer std.fs.cwd().deleteFile(rgba_path) catch {};
-    defer out.close();
+    const cwd = std.Io.Dir.cwd();
+    var out = try cwd.createFile(io, rgba_path, .{ .truncate = true });
+    errdefer cwd.deleteFile(io, rgba_path) catch {};
+    defer out.close(io);
 
     var header: [header_len]u8 = undefined;
     @memcpy(header[0..magic.len], magic);
     std.mem.writeInt(u32, header[magic.len..][0..4], @intCast(w), .little);
     std.mem.writeInt(u32, header[magic.len + 4 ..][0..4], @intCast(h), .little);
-    try out.writeAll(&header);
-    try out.writeAll(@as([*]const u8, @ptrCast(raw))[0..pixels_len]);
+    try out.writeStreamingAll(io, &header);
+    try out.writeStreamingAll(io, @as([*]const u8, @ptrCast(raw))[0..pixels_len]);
 }

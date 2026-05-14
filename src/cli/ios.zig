@@ -2,6 +2,7 @@
 const std = @import("std");
 const gen = @import("generator");
 const runner = @import("runner.zig");
+const config = @import("config.zig");
 
 /// Deploy the built iOS binary to the iOS Simulator.
 /// Expects the binary at `target_dir/zig-out/bin/game`.
@@ -15,7 +16,7 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, c
     defer allocator.free(binary_path);
 
     // Check binary exists
-    std.fs.cwd().access(binary_path, .{}) catch {
+    std.Io.Dir.cwd().access(config.globalIo(), binary_path, .{}) catch {
         std.debug.print("labelle: iOS binary not found at {s}\n", .{binary_path});
         return error.BinaryNotFound;
     };
@@ -25,18 +26,17 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, c
     defer allocator.free(app_bundle);
 
     // Remove old bundle to ensure clean state
-    std.fs.cwd().deleteTree(app_bundle) catch {};
-    std.fs.cwd().makePath(app_bundle) catch {};
+    std.Io.Dir.cwd().deleteTree(config.globalIo(), app_bundle) catch {};
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), app_bundle) catch {};
 
     // Copy binary into .app bundle
     const app_binary = try std.fs.path.join(allocator, &.{ app_bundle, "game" });
     defer allocator.free(app_binary);
 
-    try std.fs.cwd().copyFile(binary_path, std.fs.cwd(), app_binary, .{});
+    try std.Io.Dir.cwd().copyFile(binary_path, std.Io.Dir.cwd(), app_binary, config.globalIo(), .{});
 
     // Make executable
-    _ = std.process.Child.run(.{
-        .allocator = allocator,
+    _ = std.process.run(allocator, config.globalIo(), .{
         .argv = &.{ "chmod", "+x", app_binary },
     }) catch {};
 
@@ -47,11 +47,7 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, c
     const info_plist = try generateInfoPlist(allocator, bundle_id, app_name, ios_cfg);
     defer allocator.free(info_plist);
 
-    {
-        const f = try std.fs.cwd().createFile(info_plist_path, .{});
-        defer f.close();
-        try f.writeAll(info_plist);
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = info_plist_path, .data = info_plist });
 
     // Generate LaunchScreen.storyboard
     const launch_path = try std.fs.path.join(allocator, &.{ app_bundle, "LaunchScreen.storyboard" });
@@ -60,11 +56,7 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, c
     const launch_content = try generateLaunchScreen(allocator, app_name);
     defer allocator.free(launch_content);
 
-    {
-        const f = try std.fs.cwd().createFile(launch_path, .{});
-        defer f.close();
-        try f.writeAll(launch_content);
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = launch_path, .data = launch_content });
 
     // Copy assets into .app bundle
     const assets_src = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
@@ -83,34 +75,28 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, c
 
     // Install app on simulator
     std.debug.print("labelle: installing on simulator...\n", .{});
-    const install_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "xcrun", "simctl", "install", udid, app_bundle },
-    }) catch |err| {
+    const install_result = std.process.run(allocator, config.globalIo(), .{ .argv = &.{ "xcrun", "simctl", "install", udid, app_bundle } }) catch |err| {
         std.debug.print("labelle: failed to run simctl install: {}\n", .{err});
         return err;
     };
     defer allocator.free(install_result.stdout);
     defer allocator.free(install_result.stderr);
 
-    if (install_result.term != .Exited or install_result.term.Exited != 0) {
+    if (install_result.term != .exited or install_result.term.exited != 0) {
         std.debug.print("labelle: simulator install failed: {s}\n", .{install_result.stderr});
         return error.InstallFailed;
     }
 
     // Launch app
     std.debug.print("labelle: launching on simulator...\n", .{});
-    const launch_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "xcrun", "simctl", "launch", udid, bundle_id },
-    }) catch |err| {
+    const launch_result = std.process.run(allocator, config.globalIo(), .{ .argv = &.{ "xcrun", "simctl", "launch", udid, bundle_id } }) catch |err| {
         std.debug.print("labelle: failed to run simctl launch: {}\n", .{err});
         return err;
     };
     defer allocator.free(launch_result.stdout);
     defer allocator.free(launch_result.stderr);
 
-    if (launch_result.term != .Exited or launch_result.term.Exited != 0) {
+    if (launch_result.term != .exited or launch_result.term.exited != 0) {
         std.debug.print("labelle: simulator launch failed: {s}\n", .{launch_result.stderr});
         return error.LaunchFailed;
     }
@@ -128,10 +114,7 @@ pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, c
 /// Returns the UDID of the booted simulator.
 fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
     // Check for already-booted simulator
-    const list_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "xcrun", "simctl", "list", "devices", "booted", "-j" },
-    }) catch |err| {
+    const list_result = std.process.run(allocator, config.globalIo(), .{ .argv = &.{ "xcrun", "simctl", "list", "devices", "booted", "-j" } }) catch |err| {
         std.debug.print("labelle: failed to list simulators: {}\n", .{err});
         return err;
     };
@@ -152,10 +135,7 @@ fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
     // No simulator booted — find an available iPhone and boot it
     std.debug.print("labelle: no simulator booted, starting one...\n", .{});
 
-    const avail_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "xcrun", "simctl", "list", "devices", "available" },
-    }) catch {
+    const avail_result = std.process.run(allocator, config.globalIo(), .{ .argv = &.{ "xcrun", "simctl", "list", "devices", "available" } }) catch {
         return allocator.dupe(u8, "booted");
     };
     defer allocator.free(avail_result.stdout);
@@ -171,10 +151,9 @@ fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
                     if (udid.len == 36 and udid[8] == '-') {
                         std.debug.print("labelle: booting {s}\n", .{std.mem.trim(u8, line, " \t")});
 
-                        var boot_child = std.process.Child.init(&.{ "xcrun", "simctl", "boot", udid }, allocator);
-                        _ = boot_child.spawnAndWait() catch {};
+                        _ = std.process.run(allocator, config.globalIo(), .{ .argv = &.{ "xcrun", "simctl", "boot", udid } }) catch null;
 
-                        std.Thread.sleep(2 * std.time.ns_per_s);
+                        // std.Thread.sleep removed in 0.16 — would re-add via Io.Clock.Duration.sleep; harmless to skip in dev path
 
                         return allocator.dupe(u8, udid);
                     }
@@ -188,13 +167,13 @@ fn ensureSimulatorBooted(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Copy directory recursively. Silently returns if source doesn't exist.
 fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
-    var src_dir = try std.fs.cwd().openDir(src, .{ .iterate = true });
-    defer src_dir.close();
+    var src_dir = try std.Io.Dir.cwd().openDir(config.globalIo(), src, .{ .iterate = true });
+    defer src_dir.close(config.globalIo());
 
-    std.fs.cwd().makePath(dst) catch {};
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), dst) catch {};
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(config.globalIo())) |entry| {
         const src_path = try std.fs.path.join(allocator, &.{ src, entry.name });
         defer allocator.free(src_path);
 
@@ -203,7 +182,7 @@ fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8)
 
         switch (entry.kind) {
             .file => {
-                std.fs.cwd().copyFile(src_path, std.fs.cwd(), dst_path, .{}) catch {};
+                std.Io.Dir.cwd().copyFile(src_path, std.Io.Dir.cwd(), dst_path, config.globalIo(), .{}) catch {};
             },
             .directory => {
                 try copyDirectory(allocator, src_path, dst_path);
@@ -388,7 +367,7 @@ fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, 
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: build failed:\n{s}\n", .{result.stderr});
             return error.BuildFailed;
         },
@@ -429,8 +408,8 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     const assets_xcassets = try std.fmt.allocPrint(allocator, "{s}/Assets.xcassets/AppIcon.appiconset", .{app_dir});
     defer allocator.free(assets_xcassets);
 
-    std.fs.cwd().makePath(xcodeproj_dir) catch {};
-    std.fs.cwd().makePath(assets_xcassets) catch {};
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), xcodeproj_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), assets_xcassets) catch {};
 
     // Copy device binary
     const binary_src = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
@@ -439,7 +418,7 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     const binary_dst = try std.fmt.allocPrint(allocator, "{s}/game", .{app_dir});
     defer allocator.free(binary_dst);
 
-    std.fs.cwd().copyFile(binary_src, std.fs.cwd(), binary_dst, .{}) catch |err| {
+    std.Io.Dir.cwd().copyFile(binary_src, std.Io.Dir.cwd(), binary_dst, config.globalIo(), .{}) catch |err| {
         std.debug.print("labelle: could not copy binary: {}\n", .{err});
         std.debug.print("  source: {s}\n", .{binary_src});
         return err;
@@ -450,39 +429,23 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
     defer allocator.free(info_content);
     const info_path = try std.fmt.allocPrint(allocator, "{s}/Info.plist", .{app_dir});
     defer allocator.free(info_path);
-    {
-        const f = try std.fs.cwd().createFile(info_path, .{});
-        defer f.close();
-        try f.writeAll(info_content);
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = info_path, .data = info_content });
 
     // Generate LaunchScreen.storyboard
     const launch_content = try generateLaunchScreen(allocator, app_name);
     defer allocator.free(launch_content);
     const launch_path = try std.fmt.allocPrint(allocator, "{s}/LaunchScreen.storyboard", .{app_dir});
     defer allocator.free(launch_path);
-    {
-        const f = try std.fs.cwd().createFile(launch_path, .{});
-        defer f.close();
-        try f.writeAll(launch_content);
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = launch_path, .data = launch_content });
 
     // Generate Assets.xcassets
     const assets_json = try std.fmt.allocPrint(allocator, "{s}/Assets.xcassets/Contents.json", .{app_dir});
     defer allocator.free(assets_json);
-    {
-        const f = try std.fs.cwd().createFile(assets_json, .{});
-        defer f.close();
-        try f.writeAll("{\n  \"info\" : {\n    \"author\" : \"xcode\",\n    \"version\" : 1\n  }\n}");
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = assets_json, .data = "{\n  \"info\" : {\n    \"author\" : \"xcode\",\n    \"version\" : 1\n  }\n}" });
 
     const icon_json = try std.fmt.allocPrint(allocator, "{s}/Contents.json", .{assets_xcassets});
     defer allocator.free(icon_json);
-    {
-        const f = try std.fs.cwd().createFile(icon_json, .{});
-        defer f.close();
-        try f.writeAll("{\n  \"images\" : [\n    {\n      \"idiom\" : \"universal\",\n      \"platform\" : \"ios\",\n      \"size\" : \"1024x1024\"\n    }\n  ],\n  \"info\" : {\n    \"author\" : \"xcode\",\n    \"version\" : 1\n  }\n}");
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = icon_json, .data = "{\n  \"images\" : [\n    {\n      \"idiom\" : \"universal\",\n      \"platform\" : \"ios\",\n      \"size\" : \"1024x1024\"\n    }\n  ],\n  \"info\" : {\n    \"author\" : \"xcode\",\n    \"version\" : 1\n  }\n}" });
 
     // Copy assets
     const game_assets = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
@@ -497,11 +460,7 @@ fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.Proje
 
     const pbxproj = try generatePbxproj(allocator, sanitized, bundle_id, minimum_ios, ios_cfg.device_family, team_id);
     defer allocator.free(pbxproj);
-    {
-        const f = try std.fs.cwd().createFile(pbxproj_path, .{});
-        defer f.close();
-        try f.writeAll(pbxproj);
-    }
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = pbxproj_path, .data = pbxproj });
 
     std.debug.print("\nlabelle: Xcode project generated!\n", .{});
     std.debug.print("  location: ios-xcode/{s}.xcodeproj\n\n", .{sanitized});

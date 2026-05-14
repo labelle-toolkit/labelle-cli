@@ -85,7 +85,7 @@ pub fn cmdDeploy(
     const release_title = try std.fmt.allocPrint(allocator, "{s} {s}", .{ app_label, tag });
     defer allocator.free(release_title);
 
-    var argv: std.ArrayList([]const u8) = .{};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
         "gh",          "release", "create",
@@ -105,7 +105,7 @@ pub fn cmdDeploy(
     defer allocator.free(res.stderr);
 
     switch (res.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 std.debug.print(
                     "labelle android deploy: gh release create failed (exit {d}):\n{s}\n",
@@ -143,7 +143,7 @@ fn ensureGhAvailable(allocator: std.mem.Allocator) !void {
     defer allocator.free(res.stderr);
 
     const ok = switch (res.term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
     if (!ok) {

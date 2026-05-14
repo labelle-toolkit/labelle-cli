@@ -109,7 +109,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     // over the still-valid backend dir.
     const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
     defer allocator.free(tests_build_zig);
-    if (std.fs.cwd().access(tests_build_zig, .{})) |_| {
+    if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
         try runGeneratedTestStep(allocator, project_dir, "tests", &stats, verbose);
     } else |_| {
         const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
@@ -135,13 +135,14 @@ fn discoverAndRun(
     stats: *TestStats,
     verbose: bool,
 ) !void {
-    var root_dir = std.fs.cwd().openDir(project_dir, .{ .iterate = true }) catch |err| {
+    const io = config.globalIo();
+    var root_dir = std.Io.Dir.cwd().openDir(io, project_dir, .{ .iterate = true }) catch |err| {
         std.debug.print("labelle test: could not open '{s}': {any}\n", .{ project_dir, err });
         return error.OpenFailed;
     };
-    defer root_dir.close();
+    defer root_dir.close(io);
 
-    var rel_buf: std.ArrayList(u8) = .{};
+    var rel_buf: std.ArrayList(u8) = .empty;
     defer rel_buf.deinit(allocator);
 
     try walkDir(allocator, project_dir, &root_dir, &rel_buf, stats, verbose);
@@ -153,13 +154,14 @@ fn discoverAndRun(
 fn walkDir(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
-    dir: *std.fs.Dir,
+    dir: *std.Io.Dir,
     rel_buf: *std.ArrayList(u8),
     stats: *TestStats,
     verbose: bool,
 ) !void {
+    const io = config.globalIo();
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const saved_len = rel_buf.items.len;
         defer rel_buf.shrinkRetainingCapacity(saved_len);
 
@@ -169,11 +171,11 @@ fn walkDir(
         switch (entry.kind) {
             .directory => {
                 if (isSkipDir(entry.name)) continue;
-                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch |err| {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err| {
                     std.debug.print("labelle test: could not open '{s}': {any}\n", .{ rel_buf.items, err });
                     continue;
                 };
-                defer sub.close();
+                defer sub.close(io);
 
                 // If the subdir has its own build.zig, it's a
                 // self-contained Zig package — defer to `zig build
@@ -245,7 +247,7 @@ fn isSkipDir(name: []const u8) bool {
 /// `zig test` process for every .zig file in the tree, most of which
 /// (components, scripts, hooks) won't have inline tests.
 fn fileHasTestBlock(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(bytes);
 
     var i: usize = 0;
@@ -278,8 +280,8 @@ fn runZigTest(allocator: std.mem.Allocator, cwd: []const u8, rel_path: []const u
 }
 
 /// True when `dir` contains a `build.zig` at its top level.
-fn hasBuildZig(dir: *std.fs.Dir) bool {
-    dir.access("build.zig", .{}) catch return false;
+fn hasBuildZig(dir: *std.Io.Dir) bool {
+    dir.access(config.globalIo(), "build.zig", .{}) catch return false;
     return true;
 }
 
@@ -314,11 +316,12 @@ fn runGeneratedTestStep(
     const abs_path = try std.fs.path.join(allocator, &.{ project_dir, rel_path });
     defer allocator.free(abs_path);
 
-    var sub = std.fs.cwd().openDir(abs_path, .{ .iterate = true }) catch |err| switch (err) {
+    const io = config.globalIo();
+    var sub = std.Io.Dir.cwd().openDir(io, abs_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             const tests_path = try std.fs.path.join(allocator, &.{ project_dir, "tests" });
             defer allocator.free(tests_path);
-            if (std.fs.cwd().access(tests_path, .{})) |_| {
+            if (std.Io.Dir.cwd().access(io, tests_path, .{})) |_| {
                 std.debug.print(
                     "  (skipping tests/ — no .labelle/{s}/ found; run `labelle generate` first)\n",
                     .{target_name},
@@ -328,7 +331,7 @@ fn runGeneratedTestStep(
         },
         else => return err,
     };
-    defer sub.close();
+    defer sub.close(io);
 
     if (!hasBuildZig(&sub)) return;
 
@@ -396,14 +399,13 @@ pub const IsSkipDirSpec = struct {
 
 pub const FileHasTestBlockSpec = struct {
     pub fn writeAndCheck(contents: []const u8) !bool {
+        const io = config.globalIo();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const file = try tmp.dir.createFile("x.zig", .{});
-        try file.writeAll(contents);
-        file.close();
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir_path = try tmp.dir.realpath(".", &buf);
-        const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "x.zig" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "x.zig", .data = contents });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ buf[0..n], "x.zig" });
         defer std.testing.allocator.free(path);
         return try fileHasTestBlock(std.testing.allocator, path);
     }

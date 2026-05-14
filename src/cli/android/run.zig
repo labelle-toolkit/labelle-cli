@@ -6,6 +6,7 @@ const gen = @import("generator");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
 const package = @import("package.zig");
+const config = @import("../config.zig");
 
 const SigningConfig = android.SigningConfig;
 const StagedAbi = android.StagedAbi;
@@ -61,7 +62,7 @@ fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_
     defer allocator.free(install_result.stderr);
 
     switch (install_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: adb install failed: {s}\n", .{install_result.stderr});
             return error.InstallFailed;
         },
@@ -84,7 +85,7 @@ fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_
     defer allocator.free(launch_result.stderr);
 
     switch (launch_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: launch failed: {s}\n", .{launch_result.stderr});
             return error.LaunchFailed;
         },
@@ -97,10 +98,10 @@ fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_
 /// Find adb in ANDROID_HOME/platform-tools/ or PATH.
 fn findAdb(allocator: std.mem.Allocator) ![]u8 {
     // Try ANDROID_HOME first
-    if (std.process.getEnvVarOwned(allocator, "ANDROID_HOME") catch null) |home| {
+    if (config.globalEnviron().getAlloc(allocator, "ANDROID_HOME") catch null) |home| {
         defer allocator.free(home);
         const adb_path = try std.fs.path.join(allocator, &.{ home, "platform-tools", "adb" });
-        if (std.fs.cwd().access(adb_path, .{})) |_| {
+        if (std.Io.Dir.cwd().access(config.globalIo(), adb_path, .{})) |_| {
             return adb_path;
         } else |_| {
             allocator.free(adb_path);
@@ -113,7 +114,7 @@ fn findAdb(allocator: std.mem.Allocator) ![]u8 {
     };
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
-    if (result.term == .Exited and result.term.Exited == 0 and result.stdout.len > 0) {
+    if (result.term == .exited and result.term.exited == 0 and result.stdout.len > 0) {
         const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
         return allocator.dupe(u8, path);
     }

@@ -1,21 +1,23 @@
 const std = @import("std");
+const config = @import("config.zig");
 
 pub fn fileExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
     return true;
 }
 
 pub fn dirExists(path: []const u8) bool {
-    const stat = std.fs.cwd().statFile(path) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch return false;
     return stat.kind == .directory;
 }
 
 /// Get a platform-aware temporary file path.
 pub fn getTempFilePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     const builtin = @import("builtin");
+    const env = config.globalEnviron();
     const tmp_base: []const u8 = if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(allocator, "TEMP") catch
-            std.process.getEnvVarOwned(allocator, "TMP") catch
+        env.getAlloc(allocator, "TEMP") catch
+            env.getAlloc(allocator, "TMP") catch
             try allocator.dupe(u8, "C:\\Windows\\Temp")
     else
         try allocator.dupe(u8, "/tmp");
@@ -24,9 +26,8 @@ pub fn getTempFilePath(allocator: std.mem.Allocator, name: []const u8) ![]const 
     return try std.fs.path.join(allocator, &.{ tmp_base, name });
 }
 
-pub fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.Child.RunResult {
-    return std.process.Child.run(.{
-        .allocator = allocator,
+pub fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) !std.process.RunResult {
+    return std.process.run(allocator, config.globalIo(), .{
         .argv = argv,
     });
 }
@@ -97,7 +98,9 @@ pub fn escapePowerShellString(allocator: std.mem.Allocator, input: []const u8) !
 
 /// Append a line to a shell profile file if it's not already present.
 pub fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []const u8, bin_dir: []const u8) bool {
-    if (std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024)) |content| {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.readFileAlloc(io, path, allocator, .limited(256 * 1024))) |content| {
         defer allocator.free(content);
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |file_line| {
@@ -109,14 +112,20 @@ pub fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []c
         }
     } else |_| {}
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch
-        std.fs.cwd().createFile(path, .{}) catch return false;
-    defer file.close();
+    const file = cwd.openFile(io, path, .{ .mode = .read_write }) catch
+        cwd.createFile(io, path, .{}) catch return false;
+    defer file.close(io);
 
-    file.seekFromEnd(0) catch return false;
-    file.writeAll("\n# Added by labelle CLI\n") catch return false;
-    file.writeAll(line) catch return false;
-    file.writeAll("\n") catch return false;
+    // Use a small writer buffer; append-only short writes.
+    var buf: [256]u8 = undefined;
+    var w = file.writer(io, &buf);
+    // Seek to end via positional length.
+    const end = file.length(io) catch return false;
+    w.seekTo(end) catch return false;
+    w.interface.writeAll("\n# Added by labelle CLI\n") catch return false;
+    w.interface.writeAll(line) catch return false;
+    w.interface.writeAll("\n") catch return false;
+    w.interface.flush() catch return false;
     return true;
 }
 
