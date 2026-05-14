@@ -7,25 +7,24 @@ const gen = @import("generator");
 /// process-level setup in main().
 var _global_threaded: std.Io.Threaded = undefined;
 var _global_io: std.Io = undefined;
-const GlobalEnviron = struct {
-    pub fn getAlloc(_: @This(), allocator: std.mem.Allocator, key: []const u8) ![]u8 {
-        return std.process.getEnvVarOwned(allocator, key);
-    }
-};
-var _global_environ: GlobalEnviron = .{};
+var _global_environ: std.process.Environ = .empty;
 
 /// Initialize the process-wide Io. Call once from main() before any
-/// helper accesses globalIo().
-pub fn initGlobalIo() void {
-    _global_threaded = std.Io.Threaded.init(std.heap.page_allocator);
+/// helper accesses globalIo(). Mirrors labelle-assembler's pattern.
+pub fn initGlobalIo(minimal: std.process.Init.Minimal) void {
+    _global_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .argv0 = .init(minimal.args),
+        .environ = minimal.environ,
+    });
     _global_io = _global_threaded.io();
+    _global_environ = minimal.environ;
 }
 
 pub fn globalIo() std.Io {
     return _global_io;
 }
 
-pub fn globalEnviron() GlobalEnviron {
+pub fn globalEnviron() std.process.Environ {
     return _global_environ;
 }
 
