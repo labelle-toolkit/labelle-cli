@@ -84,10 +84,16 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
 }
 
 fn sleepNanos(ns: u64) void {
-    // 0.16 removed std.Thread.sleep / std.posix.nanosleep. Fall through
-    // to the libc nanosleep directly; this code path only runs on the
-    // timeout-watcher thread, which always links libc on the platforms
-    // we target.
+    // 0.16 removed std.Thread.sleep / std.posix.nanosleep. Use libc
+    // nanosleep on POSIX and Win32 Sleep on Windows.
+    if (@import("builtin").os.tag == .windows) {
+        const SleepFn = struct {
+            extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+        };
+        const ms = @as(u32, @intCast(@min(ns / std.time.ns_per_ms, std.math.maxInt(u32))));
+        SleepFn.Sleep(ms);
+        return;
+    }
     var req: std.c.timespec = .{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
