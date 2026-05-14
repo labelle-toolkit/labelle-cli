@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config = @import("config.zig");
 const is_windows = builtin.os.tag == .windows;
 
 const windows = if (is_windows) struct {
@@ -13,24 +14,25 @@ const TimeoutState = struct {
 };
 
 /// Run a zig command capturing stdout/stderr.
-pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.Child.RunResult {
-    return std.process.Child.run(.{
-        .allocator = allocator,
+pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.RunResult {
+    return std.process.run(allocator, config.globalIo(), .{
         .argv = argv,
-        .cwd = cwd,
+        .cwd = .{ .path = cwd },
     });
 }
 
 /// Run a zig command with inherited stdio (output goes straight to terminal).
 /// Optionally kills the process after `timeout_ns` nanoseconds.
 pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, timeout_ns: ?u64) !u8 {
-    var child: std.process.Child = .init(argv, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    if (!is_windows and timeout_ns != null) child.pgid = 0;
-    try child.spawn();
+    const io = config.globalIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .pgid = if (!is_windows and timeout_ns != null) 0 else null,
+    });
 
     // Heap-allocate so the detached thread can safely access it after this function returns
     var state: ?*TimeoutState = null;
@@ -41,48 +43,66 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
         state.?.* = .{};
 
         if (is_windows) {
-            const win_pid = windows.GetProcessId(child.id);
+            const win_pid = windows.GetProcessId(child.id.?);
             const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ allocator, win_pid, ns, state.? });
             thread.detach();
         } else {
-            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id, ns, state.? });
+            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id.?, ns, state.? });
             thread.detach();
         }
     }
 
-    const term = try child.wait();
+    const term = try child.wait(io);
 
     const did_timeout = if (state) |s| s.timed_out.load(.acquire) else false;
 
     return switch (term) {
-        .Exited => |code| blk: {
+        .exited => |code| blk: {
             if (did_timeout) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 break :blk 0;
             }
             break :blk code;
         },
-        .Signal => |sig| {
+        .signal => |sig| {
             if (did_timeout) {
                 std.debug.print("\nlabelle: timed out\n", .{});
                 return 0;
             }
-            std.debug.print("labelle: killed by signal {d}\n", .{sig});
+            std.debug.print("labelle: killed by signal {d}\n", .{@intFromEnum(sig)});
             return 1;
         },
-        .Stopped => |sig| {
-            std.debug.print("labelle: stopped by signal {d}\n", .{sig});
+        .stopped => |sig| {
+            std.debug.print("labelle: stopped by signal {d}\n", .{@intFromEnum(sig)});
             return 1;
         },
-        .Unknown => |val| {
+        .unknown => |val| {
             std.debug.print("labelle: unknown termination {d}\n", .{val});
             return 1;
         },
     };
 }
 
+fn sleepNanos(ns: u64) void {
+    // 0.16 removed std.Thread.sleep / std.posix.nanosleep. Fall through
+    // to the libc nanosleep directly; this code path only runs on the
+    // timeout-watcher thread, which always links libc on the platforms
+    // we target.
+    var req: std.c.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    var rem: std.c.timespec = undefined;
+    while (true) {
+        const rc = std.c.nanosleep(&req, &rem);
+        if (rc == 0) return;
+        // EINTR — retry with the remaining duration.
+        req = rem;
+    }
+}
+
 fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutState) void {
-    std.Thread.sleep(timeout_ns);
+    sleepNanos(timeout_ns);
     state.timed_out.store(true, .release);
     const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
     std.posix.kill(pgid, std.posix.SIG.TERM) catch |err| {
@@ -93,17 +113,20 @@ fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutS
 }
 
 fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, timeout_ns: u64, state: *TimeoutState) void {
-    std.Thread.sleep(timeout_ns);
+    _ = allocator;
+    sleepNanos(timeout_ns);
     state.timed_out.store(true, .release);
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
     const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };
-    var kill_child: std.process.Child = .init(&argv, allocator);
-    kill_child.stdin_behavior = .Ignore;
-    kill_child.stdout_behavior = .Ignore;
-    kill_child.stderr_behavior = .Ignore;
-    kill_child.spawn() catch return;
-    _ = kill_child.wait() catch {};
+    const io = config.globalIo();
+    var kill_child = std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    _ = kill_child.wait(io) catch {};
 }
 
 /// Iterate over every immediate subdir of `.labelle/` that contains a
@@ -112,26 +135,28 @@ fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, t
 /// and each generated zon ships a placeholder fingerprint that needs
 /// replacing with the value Zig computes from the dir's actual path.
 pub fn fixFingerprints(allocator: std.mem.Allocator, output_dir: []const u8) !void {
-    var dir = std.fs.cwd().openDir(output_dir, .{ .iterate = true }) catch |err| switch (err) {
+    const io = config.globalIo();
+    var dir = std.Io.Dir.cwd().openDir(io, output_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         const sub_path = try std.fs.path.join(allocator, &.{ output_dir, entry.name });
         defer allocator.free(sub_path);
         const zon_path = try std.fs.path.join(allocator, &.{ sub_path, "build.zig.zon" });
         defer allocator.free(zon_path);
-        std.fs.cwd().access(zon_path, .{}) catch continue;
+        std.Io.Dir.cwd().access(io, zon_path, .{}) catch continue;
         try fixFingerprint(allocator, sub_path);
     }
 }
 
 /// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
 pub fn fixFingerprint(allocator: std.mem.Allocator, output_dir: []const u8) !void {
+    const io = config.globalIo();
     const zon_path = try std.fs.path.join(allocator, &.{ output_dir, "build.zig.zon" });
     defer allocator.free(zon_path);
 
@@ -148,7 +173,7 @@ pub fn fixFingerprint(allocator: std.mem.Allocator, output_dir: []const u8) !voi
         }
         const suggested = result.stderr[start..end];
 
-        const zon_content = try std.fs.cwd().readFileAlloc(allocator, zon_path, 1024 * 1024);
+        const zon_content = try std.Io.Dir.cwd().readFileAlloc(io, zon_path, allocator, .limited(1024 * 1024));
         defer allocator.free(zon_content);
 
         const fp_marker = ".fingerprint = ";
@@ -159,15 +184,16 @@ pub fn fixFingerprint(allocator: std.mem.Allocator, output_dir: []const u8) !voi
                 val_end += 1;
             }
 
-            var new_content: std.ArrayList(u8) = .{};
+            var new_content: std.ArrayList(u8) = .empty;
             defer new_content.deinit(allocator);
             try new_content.appendSlice(allocator, zon_content[0..val_start]);
             try new_content.appendSlice(allocator, suggested);
             try new_content.appendSlice(allocator, zon_content[val_end..]);
 
-            const file = try std.fs.cwd().createFile(zon_path, .{});
-            defer file.close();
-            try file.writeAll(new_content.items);
+            try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = zon_path,
+                .data = new_content.items,
+            });
         }
     }
 }

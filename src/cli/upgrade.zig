@@ -1,13 +1,14 @@
 const std = @import("std");
 const gen = @import("generator");
 const assembler = @import("assembler.zig");
+const config = @import("config.zig");
 
 /// Bump version fields in project.labelle.
 pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig, cmd_args: []const []const u8) !void {
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
 
-    var content = try std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024);
+    var content = try std.Io.Dir.cwd().readFileAlloc(config.globalIo(), labelle_path, allocator, .limited(1024 * 1024));
 
     if (cmd_args.len == 0) {
         std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION });
@@ -68,9 +69,10 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: ge
         std.debug.print("labelle: upgrading {s} to {s}...\n", .{ pkg, version });
     }
 
-    const file = try std.fs.cwd().createFile(labelle_path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{
+        .sub_path = labelle_path,
+        .data = content,
+    });
     allocator.free(content);
 
     std.debug.print("labelle: project.labelle updated\n", .{});
@@ -91,7 +93,7 @@ fn replaceVersionField(allocator: std.mem.Allocator, content: []const u8, field_
     defer allocator.free(replace);
 
     if (std.mem.indexOf(u8, content, search)) |idx| {
-        var result = std.ArrayList(u8){};
+        var result: std.ArrayList(u8) = .empty;
         try result.appendSlice(allocator, content[0..idx]);
         try result.appendSlice(allocator, replace);
         try result.appendSlice(allocator, content[idx + search.len ..]);
@@ -111,7 +113,7 @@ fn insertBeforeClosingBrace(allocator: std.mem.Allocator, old_content: []u8, fie
 
     // Find the last `}` in the content.
     if (std.mem.lastIndexOfScalar(u8, old_content, '}')) |idx| {
-        var result = std.ArrayList(u8){};
+        var result: std.ArrayList(u8) = .empty;
         try result.appendSlice(allocator, old_content[0..idx]);
         try result.appendSlice(allocator, line);
         try result.appendSlice(allocator, old_content[idx..]);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const gen = @import("generator");
+const config = @import("config.zig");
 
 const ZIG_VERSION = "0.15.2";
 
@@ -32,11 +33,12 @@ const setup_xcode_frameworks =
     "sed -i \"/exe.linkLibrary/i\\\\    exe.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
 
 fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "ZIG_GLOBAL_CACHE_DIR")) |dir| {
+    const env = config.globalEnviron();
+    if (env.getAlloc(allocator, "ZIG_GLOBAL_CACHE_DIR")) |dir| {
         return dir;
     } else |_| {}
 
-    if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+    if (env.getAlloc(allocator, "HOME")) |home| {
         defer allocator.free(home);
         return std.fs.path.join(allocator, &.{ home, ".cache", "zig" });
     } else |_| {}
@@ -62,7 +64,7 @@ fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
 pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
-    const abs_target = try std.fs.realpathAlloc(allocator, target_dir);
+    const abs_target = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), target_dir, allocator);
     defer allocator.free(abs_target);
 
     const parent = std.fs.path.dirname(abs_target) orelse return error.InvalidPath;
@@ -139,24 +141,27 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
 }
 
 fn spawnAndWait(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
-    var child: std.process.Child = .init(argv, allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
+    _ = allocator;
+    const io = config.globalIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| {
-            std.debug.print("labelle: docker killed by signal {d}\n", .{sig});
+        .exited => |code| code,
+        .signal => |sig| {
+            std.debug.print("labelle: docker killed by signal {d}\n", .{@intFromEnum(sig)});
             return 1;
         },
-        .Stopped => |sig| {
-            std.debug.print("labelle: docker stopped by signal {d}\n", .{sig});
+        .stopped => |sig| {
+            std.debug.print("labelle: docker stopped by signal {d}\n", .{@intFromEnum(sig)});
             return 1;
         },
-        .Unknown => |val| {
+        .unknown => |val| {
             std.debug.print("labelle: docker unknown termination {d}\n", .{val});
             return 1;
         },

@@ -1,11 +1,12 @@
 const std = @import("std");
 const gen = @import("generator");
+const config = @import("config.zig");
 
 /// Write labelle.lock into the project root.
 pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig) !void {
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
 
     try w.writeAll(
         \\// labelle.lock — resolved dependency versions
@@ -53,7 +54,8 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     const lock_path = try std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" });
     defer allocator.free(lock_path);
 
-    const file = try std.fs.cwd().createFile(lock_path, .{});
-    defer file.close();
-    try file.writeAll(buf.items);
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{
+        .sub_path = lock_path,
+        .data = aw.written(),
+    });
 }

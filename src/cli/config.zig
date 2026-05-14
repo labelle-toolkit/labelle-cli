@@ -1,6 +1,35 @@
 const std = @import("std");
 const gen = @import("generator");
 
+/// Process-wide Io handle used by helpers in cli/* that historically
+/// used `std.fs.cwd()` (which no longer exists on 0.16). Must be
+/// initialized from `main()` by calling `initGlobalIo()` with the
+/// process Init.Minimal block, so the underlying Threaded impl sees
+/// the real env. Mirrors the pattern in labelle-assembler/src/config.zig.
+var _global_threaded: std.Io.Threaded = undefined;
+var _global_io: std.Io = undefined;
+var _global_environ: std.process.Environ = .empty;
+
+/// Initialize the process-wide Io. Call once from main() before any
+/// helper accesses globalIo(). The provided minimal block is forwarded
+/// into a Threaded instance whose lifetime is the rest of the process.
+pub fn initGlobalIo(minimal: std.process.Init.Minimal) void {
+    _global_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .argv0 = .init(minimal.args),
+        .environ = minimal.environ,
+    });
+    _global_io = _global_threaded.io();
+    _global_environ = minimal.environ;
+}
+
+pub fn globalIo() std.Io {
+    return _global_io;
+}
+
+pub fn globalEnviron() std.process.Environ {
+    return _global_environ;
+}
+
 pub fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
     return readProjectConfigImpl(allocator, project_dir, true);
 }
@@ -18,7 +47,7 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
 
-    const source_raw = std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024) catch |err| {
+    const source_raw = std.Io.Dir.cwd().readFileAlloc(globalIo(), labelle_path, allocator, .limited(1024 * 1024)) catch |err| {
         if (verbose) std.debug.print("labelle: could not read '{s}': {any}\n", .{ labelle_path, err });
         return error.FileNotFound;
     };
@@ -27,7 +56,7 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     const source = try allocator.dupeZ(u8, source_raw);
     errdefer allocator.free(source);
 
-    return std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
+    return std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
         if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
         return error.ParseError;
     };

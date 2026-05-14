@@ -6,6 +6,7 @@ const gen = @import("generator");
 const runner = @import("../runner.zig");
 const android = @import("../android.zig");
 const package = @import("package.zig");
+const config = @import("../config.zig");
 
 const ReleaseMode = android.ReleaseMode;
 const SigningConfig = android.SigningConfig;
@@ -41,10 +42,10 @@ pub fn buildAllAbis(allocator: std.mem.Allocator, target_dir: []const u8, releas
     // run — we want each invocation to start from a clean slate so
     // aborted builds don't leave half-a-fat-APK lying around. Missing
     // is fine; permission errors will surface on makePath below.
-    std.fs.cwd().deleteTree(stash_root) catch {};
-    try std.fs.cwd().makePath(stash_root);
+    std.Io.Dir.cwd().deleteTree(config.globalIo(), stash_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), stash_root);
 
-    var staged: std.ArrayList(StagedAbi) = .{};
+    var staged: std.ArrayList(StagedAbi) = .empty;
     errdefer {
         for (staged.items) |item| allocator.free(item.so_path);
         staged.deinit(allocator);
@@ -55,18 +56,18 @@ pub fn buildAllAbis(allocator: std.mem.Allocator, target_dir: []const u8, releas
 
         const src = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
         defer allocator.free(src);
-        std.fs.cwd().access(src, .{}) catch {
+        std.Io.Dir.cwd().access(config.globalIo(), src, .{}) catch {
             std.debug.print("labelle: build for {s} did not produce {s}\n", .{ abi.optionValue(), src });
             return error.BinaryNotFound;
         };
 
         const dst_dir = try std.fs.path.join(allocator, &.{ stash_root, abi.libDir() });
         defer allocator.free(dst_dir);
-        try std.fs.cwd().makePath(dst_dir);
+        try std.Io.Dir.cwd().createDirPath(config.globalIo(), dst_dir);
 
         const dst = try std.fs.path.join(allocator, &.{ dst_dir, "libgame.so" });
         errdefer allocator.free(dst);
-        try std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{});
+        try std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), dst, config.globalIo(), .{});
 
         try staged.append(allocator, .{ .abi_dir = abi.libDir(), .so_path = dst });
     }
@@ -86,7 +87,7 @@ fn androidBuildArch(allocator: std.mem.Allocator, target_dir: []const u8, abi: A
     };
     std.debug.print("labelle: building for Android ({s}){s}...\n", .{ abi.libDir(), mode_label });
 
-    var zig_args: std.ArrayList([]const u8) = .{};
+    var zig_args: std.ArrayList([]const u8) = .empty;
     defer zig_args.deinit(allocator);
     try zig_args.appendSlice(allocator, &.{ "zig", "build" });
 
@@ -103,7 +104,7 @@ fn androidBuildArch(allocator: std.mem.Allocator, target_dir: []const u8, abi: A
     defer allocator.free(build_result.stderr);
 
     switch (build_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: Android build failed ({s}):\n{s}\n", .{ abi.libDir(), build_result.stderr });
             return error.BuildFailed;
         },
@@ -127,7 +128,7 @@ pub fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulat
         mode_label,
     });
 
-    var zig_args: std.ArrayList([]const u8) = .{};
+    var zig_args: std.ArrayList([]const u8) = .empty;
     defer zig_args.deinit(allocator);
     try zig_args.appendSlice(allocator, &.{ "zig", "build" });
 
@@ -143,7 +144,7 @@ pub fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulat
     defer allocator.free(build_result.stderr);
 
     switch (build_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: Android build failed:\n{s}\n", .{build_result.stderr});
             return error.BuildFailed;
         },

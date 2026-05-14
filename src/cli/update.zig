@@ -1,6 +1,7 @@
 const std = @import("std");
 const gen = @import("generator");
 const util = @import("util.zig");
+const config = @import("config.zig");
 
 /// Self-update the CLI binary by downloading from the release server.
 pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -36,7 +37,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         defer allocator.free(result.stderr);
 
         switch (result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 std.debug.print("labelle: could not fetch latest version from release server\n", .{});
                 printManualUpdateInstructions("latest");
                 return;
@@ -107,7 +108,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     defer allocator.free(dl_result.stderr);
 
     switch (dl_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: download failed (HTTP error)\n", .{});
             printManualUpdateInstructions(target_version);
             return;
@@ -135,7 +136,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     const bin_path = try std.fs.path.join(allocator, &.{ bin_dir, bin_name });
     defer allocator.free(bin_path);
 
-    std.fs.cwd().makePath(bin_dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), bin_dir) catch |err| {
         std.debug.print("labelle: could not create {s}: {any}\n", .{ bin_dir, err });
         return;
     };
@@ -156,24 +157,23 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         , .{ tmp_path, bin_path });
         defer allocator.free(bat_content);
 
-        const bat_file = std.fs.cwd().createFile(bat_path, .{}) catch |err| {
+        const bat_file = std.Io.Dir.cwd().createFile(config.globalIo(), bat_path, .{}) catch |err| {
             std.debug.print("labelle: could not create update script: {any}\n", .{err});
             std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
             return;
         };
-        bat_file.writeAll(bat_content) catch {
-            bat_file.close();
+        const io_w = config.globalIo();
+        bat_file.writeStreamingAll(io_w, bat_content) catch {
+            bat_file.close(io_w);
             std.debug.print("labelle: could not write update script\n", .{});
             std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
             return;
         };
-        bat_file.close();
+        bat_file.close(io_w);
 
-        var child: std.process.Child = .init(
-            &.{ "cmd.exe", "/c", "start", "/b", bat_path },
-            allocator,
-        );
-        child.spawn() catch |err| {
+        _ = std.process.spawn(io_w, .{
+            .argv = &.{ "cmd.exe", "/c", "start", "/b", bat_path },
+        }) catch |err| {
             std.debug.print("labelle: could not launch update script: {any}\n", .{err});
             std.debug.print("  downloaded to {s} — move it manually to {s}\n", .{ tmp_path, bin_path });
             return;
@@ -188,7 +188,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
             defer allocator.free(result2.stdout);
             defer allocator.free(result2.stderr);
             switch (result2.term) {
-                .Exited => |code| if (code != 0) {
+                .exited => |code| if (code != 0) {
                     std.debug.print("labelle: could not move binary to {s}\n", .{bin_path});
                     std.debug.print("  downloaded v{s} to {s}\n", .{ target_version, tmp_path });
                     std.debug.print("  to complete the update, run:\n", .{});
@@ -230,18 +230,18 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         return;
     }
 
-    if (std.process.getEnvVarOwned(allocator, "PATH")) |current_path| {
+    if (config.globalEnviron().getAlloc(allocator, "PATH")) |current_path| {
         defer allocator.free(current_path);
         if (util.pathContainsDir(current_path, bin_dir)) return;
     } else |_| {}
 
-    const shell_env = std.process.getEnvVarOwned(allocator, "SHELL") catch {
+    const shell_env = config.globalEnviron().getAlloc(allocator, "SHELL") catch {
         std.debug.print("  could not detect shell — add {s} to your PATH manually\n\n", .{bin_dir});
         return;
     };
     defer allocator.free(shell_env);
 
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch {
+    const home_dir = config.globalEnviron().getAlloc(allocator, "HOME") catch {
         std.debug.print("  could not determine home directory — add {s} to your PATH manually\n\n", .{bin_dir});
         return;
     };
@@ -280,7 +280,7 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
             switch (result.term) {
-                .Exited => |code| if (code == 0) {
+                .exited => |code| if (code == 0) {
                     std.debug.print("  added to PATH via fish_add_path\n\n", .{});
                 } else {
                     std.debug.print("  fish_add_path failed — add {s} to your PATH manually\n\n", .{bin_dir});
@@ -323,7 +323,7 @@ fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
         defer allocator.free(set_result.stdout);
         defer allocator.free(set_result.stderr);
         switch (set_result.term) {
-            .Exited => |code| if (code == 0) {
+            .exited => |code| if (code == 0) {
                 std.debug.print("  added {s} to user PATH (restart your terminal to take effect)\n\n", .{bin_dir});
             } else {
                 std.debug.print("  could not update PATH via registry: {s}\n", .{set_result.stderr});

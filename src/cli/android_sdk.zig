@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const util = @import("util.zig");
+const config = @import("config.zig");
 
 pub const Error = error{
     SdkNotFound,
@@ -83,7 +84,7 @@ pub const DetectOptions = struct {
 /// itself unusable.
 pub fn detect(allocator: std.mem.Allocator, opts: DetectOptions) !SdkInfo {
     var info = SdkInfo{ .target_sdk_version = opts.target_sdk_version };
-    var checks: std.ArrayList(Check) = .{};
+    var checks: std.ArrayList(Check) = .empty;
     errdefer checks.deinit(allocator);
 
     // ── SDK home ────────────────────────────────────────────────
@@ -247,8 +248,8 @@ pub fn findSdkHome(allocator: std.mem.Allocator) ![]u8 {
 /// "variable is unset / invalid UTF-8" into `null` while letting
 /// every other error (`OutOfMemory` first and foremost) propagate.
 fn envVarOwnedOptional(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound, error.InvalidWtf8 => null,
+    return config.globalEnviron().getAlloc(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableMissing, error.InvalidWtf8 => null,
         else => err,
     };
 }
@@ -257,7 +258,7 @@ fn envVarOwnedOptional(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
 /// whatever `which adb` returns.
 pub fn findAdbUnder(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 {
     const candidate = try std.fs.path.join(allocator, &.{ sdk_home, "platform-tools", exeName("adb") });
-    if (std.fs.cwd().access(candidate, .{})) |_| {
+    if (std.Io.Dir.cwd().access(config.globalIo(), candidate, .{})) |_| {
         return candidate;
     } else |_| {
         allocator.free(candidate);
@@ -278,15 +279,15 @@ pub fn findBuildTools(allocator: std.mem.Allocator, sdk_home: []const u8) !Build
     const bt_root = try std.fs.path.join(allocator, &.{ sdk_home, "build-tools" });
     defer allocator.free(bt_root);
 
-    var dir = std.fs.cwd().openDir(bt_root, .{ .iterate = true }) catch return error.BuildToolsNotFound;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(config.globalIo(), bt_root, .{ .iterate = true }) catch return error.BuildToolsNotFound;
+    defer dir.close(config.globalIo());
 
     var latest: ?[]const u8 = null;
     var latest_parsed: u32 = 0;
     errdefer if (latest) |v| allocator.free(v);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(config.globalIo())) |entry| {
         if (entry.kind != .directory) continue;
         const parsed = util.parseVersion(entry.name);
         if (latest == null or parsed > latest_parsed) {
@@ -307,7 +308,7 @@ pub fn findAndroidJar(allocator: std.mem.Allocator, sdk_home: []const u8, target
     const platform_dir = try std.fmt.allocPrint(allocator, "android-{d}", .{target_sdk_version});
     defer allocator.free(platform_dir);
     const joined = try std.fs.path.join(allocator, &.{ sdk_home, "platforms", platform_dir, "android.jar" });
-    if (std.fs.cwd().access(joined, .{})) |_| return joined else |_| {
+    if (std.Io.Dir.cwd().access(config.globalIo(), joined, .{})) |_| return joined else |_| {
         allocator.free(joined);
         return error.PlatformNotFound;
     }
@@ -323,21 +324,21 @@ pub fn findNdkSysroot(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 
         const sysroot = try std.fs.path.join(allocator, &.{
             ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot",
         });
-        if (std.fs.cwd().access(sysroot, .{})) |_| return sysroot else |_| allocator.free(sysroot);
+        if (std.Io.Dir.cwd().access(config.globalIo(), sysroot, .{})) |_| return sysroot else |_| allocator.free(sysroot);
     }
 
     // 2. Newest NDK in `<sdk>/ndk/<version>`.
     const ndk_root = try std.fs.path.join(allocator, &.{ sdk_home, "ndk" });
     defer allocator.free(ndk_root);
 
-    var dir = std.fs.cwd().openDir(ndk_root, .{ .iterate = true }) catch return error.NdkNotFound;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(config.globalIo(), ndk_root, .{ .iterate = true }) catch return error.NdkNotFound;
+    defer dir.close(config.globalIo());
 
     var latest: ?[]const u8 = null;
     var latest_parsed: u32 = 0;
     errdefer if (latest) |v| allocator.free(v);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(config.globalIo())) |entry| {
         if (entry.kind != .directory) continue;
         const parsed = util.parseVersion(entry.name);
         if (latest == null or parsed > latest_parsed) {
@@ -352,7 +353,7 @@ pub fn findNdkSysroot(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 
     const sysroot = try std.fs.path.join(allocator, &.{
         ndk_root, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot",
     });
-    if (std.fs.cwd().access(sysroot, .{})) |_| return sysroot else |_| {
+    if (std.Io.Dir.cwd().access(config.globalIo(), sysroot, .{})) |_| return sysroot else |_| {
         allocator.free(sysroot);
         return error.NdkNotFound;
     }
@@ -381,7 +382,7 @@ fn exeName(comptime base: []const u8) []const u8 {
 /// don't want a user-visible error — just a missing-from-report.
 fn joinIfExists(allocator: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
     const joined = std.fs.path.join(allocator, parts) catch return null;
-    if (std.fs.cwd().access(joined, .{})) |_| return joined else |_| {
+    if (std.Io.Dir.cwd().access(config.globalIo(), joined, .{})) |_| return joined else |_| {
         allocator.free(joined);
         return null;
     }
@@ -412,7 +413,7 @@ fn findOnPath(allocator: std.mem.Allocator, name: []const u8, not_found: Error) 
     const result = util.runCmd(allocator, &.{ lookup_cmd, name }) catch return not_found;
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
-    if (result.term == .Exited and result.term.Exited == 0 and result.stdout.len > 0) {
+    if (result.term == .exited and result.term.exited == 0 and result.stdout.len > 0) {
         const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
         // `where` can return multiple lines when a tool is shadowed on
         // PATH — first line is the active one, so drop the rest.

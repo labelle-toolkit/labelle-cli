@@ -2,7 +2,7 @@
     .fingerprint = 0xa3d95bf7b905a401,
     .name = .labelle_cli,
     .version = "1.37.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Pulls the generator module from labelle-assembler (types,
         // GUI resolver, cache helpers) instead of maintaining a
@@ -16,8 +16,8 @@
             // Use the full 40-char SHA — abbreviated SHAs in archive
             // URLs can become ambiguous as upstream gains commits and
             // GitHub will return 404 in that case.
-            .url = "https://github.com/labelle-toolkit/labelle-assembler/archive/1c24f303586cbfcf9238a85c8c3d9906af1ff32b.tar.gz",
-            .hash = "labelle_assembler-0.8.0-pG4XEOZJBACiCUdlxNpfp_v7gB1ZbTobMOd587m3cwKt",
+            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git?ref=feat/zig-0.16-migration#7b06850afb6a15c8b774bc244ecdedc729f19f10",
+            .hash = "labelle_assembler-0.17.0-pG4XEEjIBQDqVz93AWEzJ7qvkD9cL5428bpRxTHwWYPt",
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.8.0.tar.gz",

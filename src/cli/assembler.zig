@@ -17,6 +17,7 @@ const std = @import("std");
 pub const DEFAULT_ASSEMBLER_VERSION = "0.8.0";
 const builtin = @import("builtin");
 const gen = @import("generator");
+const config = @import("config.zig");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
 const runner = @import("runner.zig");
@@ -28,8 +29,8 @@ const ASSEMBLER_RELEASE_BASE = "https://github.com/labelle-toolkit/labelle-assem
 /// unset, in which case the CLI should use the in-process generator.
 /// Returns the heap-allocated path string on success — caller owns it.
 pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, "LABELLE_ASSEMBLER") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
+    return config.globalEnviron().getAlloc(allocator, "LABELLE_ASSEMBLER") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
         else => return err,
     };
 }
@@ -42,6 +43,7 @@ pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
 /// — `local:` paths describe sibling repos that sit next to the main
 /// checkout, not next to the worktree. See resolveProjectRoot.
 fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, project_dir: []const u8) ![]u8 {
+    const io = config.globalIo();
     const source_dir = if (std.fs.path.isAbsolute(rel_path))
         try allocator.dupe(u8, rel_path)
     else blk: {
@@ -51,7 +53,7 @@ fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, pro
     };
     defer allocator.free(source_dir);
 
-    const real_source = std.fs.cwd().realpathAlloc(allocator, source_dir) catch |err| {
+    const real_source = std.Io.Dir.cwd().realPathFileAlloc(io, source_dir, allocator) catch |err| {
         std.debug.print("labelle: local assembler path '{s}' does not exist: {any}\n", .{ source_dir, err });
         return error.AssemblerNotCached;
     };
@@ -65,7 +67,7 @@ fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, pro
     defer allocator.free(build_result.stdout);
     defer allocator.free(build_result.stderr);
     switch (build_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: local assembler build failed (exit {d})\n{s}", .{ code, build_result.stderr });
             return error.AssemblerNotCached;
         },
@@ -76,7 +78,7 @@ fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, pro
     }
 
     const bin_path = try std.fs.path.join(allocator, &.{ real_source, "zig-out", "bin", exe_name });
-    std.fs.cwd().access(bin_path, .{}) catch |err| {
+    std.Io.Dir.cwd().access(io, bin_path, .{}) catch |err| {
         std.debug.print("labelle: local assembler binary not found at {s}: {any}\n", .{ bin_path, err });
         allocator.free(bin_path);
         return error.AssemblerNotCached;
@@ -118,6 +120,7 @@ const exe_name = "labelle-assembler" ++ exe_suffix;
 /// The binary is saved to `~/.labelle/assembler/<version>/labelle-assembler`
 /// and made executable on Unix.
 pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest_path: []const u8) !void {
+    const io = config.globalIo();
     const url = try std.fmt.allocPrint(allocator, "{s}/v{s}/labelle-assembler-{s}-{s}", .{
         ASSEMBLER_RELEASE_BASE,
         version,
@@ -131,7 +134,7 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
 
     // Ensure the parent directory exists.
     if (std.fs.path.dirname(dest_path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
             std.debug.print("labelle: could not create directory {s}: {any}\n", .{ dir, err });
             return error.AssemblerDownloadFailed;
         };
@@ -148,29 +151,29 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: download failed (HTTP error, exit code {d})\n", .{code});
             std.debug.print("  url: {s}\n", .{url});
             std.debug.print("  you can download manually and place it at: {s}\n", .{dest_path});
             // Clean up partial download
-            std.fs.cwd().deleteFile(dest_path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, dest_path) catch {};
             return error.AssemblerDownloadFailed;
         },
         else => {
             std.debug.print("labelle: download process terminated abnormally\n", .{});
-            std.fs.cwd().deleteFile(dest_path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, dest_path) catch {};
             return error.AssemblerDownloadFailed;
         },
     }
 
     // Make executable on Unix.
     if (builtin.os.tag != .windows) {
-        const file = std.fs.cwd().openFile(dest_path, .{}) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(io, dest_path, .{}) catch |err| {
             std.debug.print("labelle: could not open {s} for chmod: {any}\n", .{ dest_path, err });
             return;
         };
-        defer file.close();
-        file.chmod(0o755) catch |err| {
+        defer file.close(io);
+        file.setPermissions(io, .fromMode(0o755)) catch |err| {
             std.debug.print("labelle: chmod failed for {s}: {any}\n", .{ dest_path, err });
         };
     }
@@ -182,12 +185,13 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
 /// Used when no assembler_version is configured in project.labelle.
 /// Caller owns the returned slice and must free it.
 pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
+    const io = config.globalIo();
     const cache_root = try gen.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", DEFAULT_ASSEMBLER_VERSION, exe_name });
 
-    std.fs.cwd().access(asm_path, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(io, asm_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("labelle: no assembler_version in project.labelle — downloading default v{s}...\n", .{DEFAULT_ASSEMBLER_VERSION});
             downloadAssembler(allocator, DEFAULT_ASSEMBLER_VERSION, asm_path) catch |dl_err| {
@@ -219,6 +223,7 @@ pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
 ///
 /// Caller owns the returned slice and must free it.
 pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !?[]u8 {
+    const io = config.globalIo();
     // 1. Env var override always takes priority.
     if (try lookupOverride(allocator)) |path| return path;
 
@@ -243,7 +248,7 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
 
     // Verify the binary exists; if not, auto-download it.
-    std.fs.cwd().access(asm_path, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(io, asm_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             // Phase 4: auto-download instead of just erroring.
             std.debug.print("labelle: assembler v{s} not cached, downloading...\n", .{pinned_version});
@@ -272,6 +277,7 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
 /// Explicitly install (download + cache) an assembler version.
 /// Called by `labelle install assembler <version>`.
 pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !void {
+    const io = config.globalIo();
     const cache_root = try gen.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
@@ -279,7 +285,7 @@ pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !v
     defer allocator.free(asm_path);
 
     // Check if already cached.
-    std.fs.cwd().access(asm_path, .{}) catch {
+    std.Io.Dir.cwd().access(io, asm_path, .{}) catch {
         // Not cached — download it.
         try downloadAssembler(allocator, version, asm_path);
         std.debug.print("labelle: assembler v{s} installed\n", .{version});
@@ -291,22 +297,23 @@ pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !v
 
 /// List cached assembler versions by scanning ~/.labelle/assembler/.
 pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
+    const io = config.globalIo();
     const cache_root = try gen.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_dir = try std.fs.path.join(allocator, &.{ cache_root, "assembler" });
     defer allocator.free(asm_dir);
 
-    var dir = std.fs.cwd().openDir(asm_dir, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(io, asm_dir, .{ .iterate = true }) catch {
         std.debug.print("labelle: no cached assembler versions found\n", .{});
         std.debug.print("  cache directory: {s}\n", .{asm_dir});
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var count: usize = 0;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind == .directory) {
             if (count == 0) {
                 std.debug.print("Cached assembler versions:\n", .{});
@@ -315,7 +322,7 @@ pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
             const bin_path = try std.fs.path.join(allocator, &.{ asm_dir, entry.name, exe_name });
             defer allocator.free(bin_path);
             const exists = blk: {
-                std.fs.cwd().access(bin_path, .{}) catch break :blk false;
+                std.Io.Dir.cwd().access(io, bin_path, .{}) catch break :blk false;
                 break :blk true;
             };
             if (exists) {
@@ -348,7 +355,8 @@ pub fn spawnGenerate(
     platform: gen.Platform,
     backend: gen.Backend,
 ) !void {
-    var argv: std.ArrayList([]const u8) = .{};
+    const io = config.globalIo();
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
     try argv.appendSlice(allocator, &.{ exe_path, "generate", "--project-root", project_dir });
@@ -361,15 +369,16 @@ pub fn spawnGenerate(
     try argv.appendSlice(allocator, &.{ "--platform", @tagName(platform) });
     try argv.appendSlice(allocator, &.{ "--backend", @tagName(backend) });
 
-    var child: std.process.Child = .init(argv.items, allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: assembler '{s}' exited with code {d}\n", .{ exe_path, code });
             return error.AssemblerFailed;
         },
@@ -405,13 +414,15 @@ pub fn spawnGenerate(
 /// rather than imported to avoid coupling the CLI release cycle to a
 /// specific labelle_assembler version bump.
 fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
     const git_path = try std.fs.path.join(allocator, &.{ project_dir, ".git" });
     defer allocator.free(git_path);
 
-    const stat = std.fs.cwd().statFile(git_path) catch return allocator.dupe(u8, project_dir);
+    const stat = cwd.statFile(io, git_path, .{}) catch return allocator.dupe(u8, project_dir);
     if (stat.kind != .file) return allocator.dupe(u8, project_dir);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, git_path, 4096) catch
+    const content = cwd.readFileAlloc(io, git_path, allocator, .limited(4096)) catch
         return allocator.dupe(u8, project_dir);
     defer allocator.free(content);
 
@@ -441,7 +452,7 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
         return allocator.dupe(u8, project_dir);
 
     const main_checkout = std.fs.path.dirname(dot_git) orelse return allocator.dupe(u8, project_dir);
-    return std.fs.cwd().realpathAlloc(allocator, main_checkout) catch allocator.dupe(u8, main_checkout);
+    return cwd.realPathFileAlloc(io, main_checkout, allocator) catch allocator.dupe(u8, main_checkout);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

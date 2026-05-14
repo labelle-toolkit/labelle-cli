@@ -1,6 +1,7 @@
 const std = @import("std");
 const gen = @import("generator");
 const util = @import("util.zig");
+const config = @import("config.zig");
 
 /// Ensure all dependencies declared in the project config are present in the local cache.
 pub fn ensureCache(allocator: std.mem.Allocator, cfg: gen.ProjectConfig) !void {
@@ -109,7 +110,8 @@ pub fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: gen.PluginD
 
 /// Try to find the monorepo root by walking up from the CLI executable path.
 fn findRepoRoot(allocator: std.mem.Allocator) ?[]const u8 {
-    const exe_path = std.fs.selfExePathAlloc(allocator) catch return null;
+    const io = config.globalIo();
+    const exe_path = std.process.executablePathAlloc(io, allocator) catch return null;
     defer allocator.free(exe_path);
 
     var dir = std.fs.path.dirname(exe_path) orelse return null;
@@ -118,7 +120,7 @@ fn findRepoRoot(allocator: std.mem.Allocator) ?[]const u8 {
         const marker = std.fs.path.join(allocator, &.{ dir, "labelle-core" }) catch return null;
         defer allocator.free(marker);
 
-        std.fs.cwd().access(marker, .{}) catch {
+        std.Io.Dir.cwd().access(io, marker, .{}) catch {
             dir = std.fs.path.dirname(dir) orelse return null;
             continue;
         };
