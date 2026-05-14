@@ -89,7 +89,7 @@ jobs:
     #   * translate-c rejects emscripten 4.0.9's multi-arg
     #     __attribute__((deprecated("msg")))
     # Re-enable once Zig 0.16.1+ ships fixes upstream.
-    if: false
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
 
     steps:
