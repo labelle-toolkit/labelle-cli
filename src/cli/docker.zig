@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const gen = @import("generator");
 const config = @import("config.zig");
 
-const ZIG_VERSION = "0.15.2";
+const ZIG_VERSION = "0.16.0";
 
 const host_arch = switch (builtin.cpu.arch) {
     .aarch64 => "aarch64",
@@ -26,11 +26,11 @@ const setup_xcode_frameworks =
     "git clone --depth 1 https://github.com/Corendos/xcode-frameworks.git /tmp/xcode-fw > /dev/null 2>&1 && " ++
     "cd /tmp/xcode-fw && git fetch --depth 1 origin 9a45f3ac977fd25dff77e58c6de1870b6808c4a7 > /dev/null 2>&1 && git checkout FETCH_HEAD > /dev/null 2>&1 && cd - > /dev/null && " ++
     "XCODE_PKG=/tmp/xcode-fw; fi && " ++
-    "if [ -n \"$XCODE_PKG\" ] && grep -q 'exe.linkLibrary' build.zig; then " ++
+    "if [ -n \"$XCODE_PKG\" ] && grep -q 'exe.root_module.linkLibrary' build.zig; then " ++
     "sed -i \"1s|^|// xcode-frameworks injected by labelle --docker\\n|\" build.zig && " ++
-    "sed -i \"/exe.linkLibrary/i\\\\    exe.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\" build.zig && " ++
-    "sed -i \"/exe.linkLibrary/i\\\\    exe.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\" build.zig && " ++
-    "sed -i \"/exe.linkLibrary/i\\\\    exe.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
+    "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\" build.zig && " ++
+    "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\" build.zig && " ++
+    "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
 
 fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
     const env = config.globalEnviron();
