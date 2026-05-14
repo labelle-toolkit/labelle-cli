@@ -19,7 +19,7 @@ const host_target = host_arch ++ "-" ++ @tagName(builtin.os.tag);
 // emscripten SDK's multi-arg `__attribute__((deprecated(...)))`),
 // neither of which reproduce against the official tarball build.
 const install_zig = "apt-get update -qq > /dev/null && " ++
-    "apt-get install -y -qq curl xz-utils ca-certificates > /dev/null && " ++
+    "apt-get install -y -qq curl xz-utils ca-certificates python3 > /dev/null && " ++
     "curl -fsSL https://ziglang.org/download/" ++ ZIG_VERSION ++ "/zig-x86_64-linux-" ++ ZIG_VERSION ++ ".tar.xz | tar -xJ -C /opt > /dev/null && " ++
     "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig";
 
