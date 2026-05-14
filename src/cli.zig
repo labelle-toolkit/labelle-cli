@@ -922,10 +922,13 @@ pub const ParsePlatformValueSpec = struct {
 
 /// Build an in-memory ArgIterator over a fixed argv-like string for
 /// tests of `parseRunArgs`. `parseRunArgs` takes `anytype` so it
-/// accepts both the platform `std.process.ArgIterator` and
-/// `std.process.ArgIteratorGeneral` returned here.
-fn testIter(line: []const u8) std.process.ArgIteratorGeneral(.{}) {
-    return std.process.ArgIteratorGeneral(.{}).init(std.testing.allocator, line) catch unreachable;
+/// accepts both the platform `std.process.Args.Iterator` and
+/// `std.process.Args.IteratorGeneral` returned here.
+///
+/// 0.16 moved `std.process.ArgIteratorGeneral` to
+/// `std.process.Args.IteratorGeneral`.
+fn testIter(line: []const u8) std.process.Args.IteratorGeneral(.{}) {
+    return std.process.Args.IteratorGeneral(.{}).init(std.testing.allocator, line) catch unreachable;
 }
 
 pub const ParseRunArgsPassthroughSpec = struct {

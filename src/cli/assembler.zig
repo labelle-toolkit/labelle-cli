@@ -452,7 +452,13 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
         return allocator.dupe(u8, project_dir);
 
     const main_checkout = std.fs.path.dirname(dot_git) orelse return allocator.dupe(u8, project_dir);
-    return cwd.realPathFileAlloc(io, main_checkout, allocator) catch allocator.dupe(u8, main_checkout);
+    // realPathFileAlloc returns [:0]u8 (allocation size = len+1); the
+    // function's []u8 return type would coerce away the sentinel, leaving
+    // callers to free a 99-byte slice for a 100-byte allocation. Re-dupe
+    // into a plain []u8 so DebugAllocator's size check is satisfied.
+    const canon = cwd.realPathFileAlloc(io, main_checkout, allocator) catch return allocator.dupe(u8, main_checkout);
+    defer allocator.free(canon);
+    return allocator.dupe(u8, canon);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -470,8 +476,9 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("project/.git");
-        const project_abs = try tmp.dir.realpathAlloc(alloc, "project");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "project/.git");
+        const project_abs = try tmp.dir.realPathFileAlloc(io, "project", alloc);
         defer alloc.free(project_abs);
 
         const root = try resolveProjectRoot(alloc, project_abs);
@@ -486,19 +493,18 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("main/.git/worktrees/wt");
-        try tmp.dir.makePath("wt");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "main/.git/worktrees/wt");
+        try tmp.dir.createDirPath(io, "wt");
 
-        const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+        const main_abs = try tmp.dir.realPathFileAlloc(io, "main", alloc);
         defer alloc.free(main_abs);
-        const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+        const wt_abs = try tmp.dir.realPathFileAlloc(io, "wt", alloc);
         defer alloc.free(wt_abs);
 
         const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
         defer alloc.free(linkfile);
-        const f = try tmp.dir.createFile("wt/.git", .{});
-        defer f.close();
-        try f.writeAll(linkfile);
+        try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = linkfile });
 
         const root = try resolveProjectRoot(alloc, wt_abs);
         defer alloc.free(root);
@@ -512,8 +518,9 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("plain");
-        const plain_abs = try tmp.dir.realpathAlloc(alloc, "plain");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "plain");
+        const plain_abs = try tmp.dir.realPathFileAlloc(io, "plain", alloc);
         defer alloc.free(plain_abs);
 
         const root = try resolveProjectRoot(alloc, plain_abs);
@@ -528,13 +535,12 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("wt");
-        const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "wt");
+        const wt_abs = try tmp.dir.realPathFileAlloc(io, "wt", alloc);
         defer alloc.free(wt_abs);
 
-        const f = try tmp.dir.createFile("wt/.git", .{});
-        defer f.close();
-        try f.writeAll("not a gitdir line\n");
+        try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = "not a gitdir line\n" });
 
         const root = try resolveProjectRoot(alloc, wt_abs);
         defer alloc.free(root);
@@ -548,19 +554,18 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("super/.git/modules/sub");
-        try tmp.dir.makePath("super/sub");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "super/.git/modules/sub");
+        try tmp.dir.createDirPath(io, "super/sub");
 
-        const super_abs = try tmp.dir.realpathAlloc(alloc, "super");
+        const super_abs = try tmp.dir.realPathFileAlloc(io, "super", alloc);
         defer alloc.free(super_abs);
-        const sub_abs = try tmp.dir.realpathAlloc(alloc, "super/sub");
+        const sub_abs = try tmp.dir.realPathFileAlloc(io, "super/sub", alloc);
         defer alloc.free(sub_abs);
 
         const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/modules/sub\n", .{super_abs});
         defer alloc.free(linkfile);
-        const f = try tmp.dir.createFile("super/sub/.git", .{});
-        defer f.close();
-        try f.writeAll(linkfile);
+        try tmp.dir.writeFile(io, .{ .sub_path = "super/sub/.git", .data = linkfile });
 
         const root = try resolveProjectRoot(alloc, sub_abs);
         defer alloc.free(root);
@@ -574,17 +579,16 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("main/.git/worktrees/wt");
-        try tmp.dir.makePath("main/wt");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "main/.git/worktrees/wt");
+        try tmp.dir.createDirPath(io, "main/wt");
 
-        const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+        const main_abs = try tmp.dir.realPathFileAlloc(io, "main", alloc);
         defer alloc.free(main_abs);
-        const wt_abs = try tmp.dir.realpathAlloc(alloc, "main/wt");
+        const wt_abs = try tmp.dir.realPathFileAlloc(io, "main/wt", alloc);
         defer alloc.free(wt_abs);
 
-        const f = try tmp.dir.createFile("main/wt/.git", .{});
-        defer f.close();
-        try f.writeAll("gitdir: ../.git/worktrees/wt\n");
+        try tmp.dir.writeFile(io, .{ .sub_path = "main/wt/.git", .data = "gitdir: ../.git/worktrees/wt\n" });
 
         const root = try resolveProjectRoot(alloc, wt_abs);
         defer alloc.free(root);
@@ -598,12 +602,13 @@ pub const ResolveProjectRoot = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("main/.git/worktrees/wt");
-        try tmp.dir.makePath("wt");
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "main/.git/worktrees/wt");
+        try tmp.dir.createDirPath(io, "wt");
 
-        const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+        const main_abs = try tmp.dir.realPathFileAlloc(io, "main", alloc);
         defer alloc.free(main_abs);
-        const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+        const wt_abs = try tmp.dir.realPathFileAlloc(io, "wt", alloc);
         defer alloc.free(wt_abs);
 
         const linkfile = try std.fmt.allocPrint(
@@ -612,9 +617,7 @@ pub const ResolveProjectRoot = struct {
             .{ main_abs, main_abs },
         );
         defer alloc.free(linkfile);
-        const f = try tmp.dir.createFile("wt/.git", .{});
-        defer f.close();
-        try f.writeAll(linkfile);
+        try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = linkfile });
 
         const root = try resolveProjectRoot(alloc, wt_abs);
         defer alloc.free(root);

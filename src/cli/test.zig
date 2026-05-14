@@ -399,14 +399,13 @@ pub const IsSkipDirSpec = struct {
 
 pub const FileHasTestBlockSpec = struct {
     pub fn writeAndCheck(contents: []const u8) !bool {
+        const io = config.globalIo();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const file = try tmp.dir.createFile("x.zig", .{});
-        try file.writeAll(contents);
-        file.close();
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir_path = try tmp.dir.realpath(".", &buf);
-        const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "x.zig" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "x.zig", .data = contents });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ buf[0..n], "x.zig" });
         defer std.testing.allocator.free(path);
         return try fileHasTestBlock(std.testing.allocator, path);
     }
