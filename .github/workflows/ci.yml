@@ -94,21 +94,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-core
+          ref: feat/zig-0.16-migration
           path: labelle-core
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-engine
+          ref: feat/zig-0.16-migration
           path: labelle-engine
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gfx
+          ref: feat/zig-0.16-migration
           path: labelle-gfx
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
+          ref: feat/zig-0.16-migration
           path: labelle-assembler
 
       - name: Setup Zig
@@ -155,21 +159,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-core
+          ref: feat/zig-0.16-migration
           path: labelle-core
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-engine
+          ref: feat/zig-0.16-migration
           path: labelle-engine
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gfx
+          ref: feat/zig-0.16-migration
           path: labelle-gfx
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
+          ref: feat/zig-0.16-migration
           path: labelle-assembler
 
       - name: Setup Zig
