@@ -16,12 +16,16 @@
             // Use the full 40-char SHA — abbreviated SHAs in archive
             // URLs can become ambiguous as upstream gains commits and
             // GitHub will return 404 in that case.
-            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git#36264a14370318cc90bdd8eafb22f797e591dea4",
-            .hash = "labelle_assembler-0.17.0-pG4XEGjIBQC69Ly51GDRF1Sm61CMHkkO9qLzY1ZieYJG",
+            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git#ec0daf6bfe59041506763934b7bfd60cf36675ec",
+            .hash = "labelle_assembler-0.17.0-pG4XEPtZBgAQy0WFNjhgze2ruzHiN5p8YaBIrkciJaJa",
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.8.0.tar.gz",
             .hash = "zspec-0.8.0-jaKLbSK-AwD6myJjkg3OfGAKJyj5iaFzFfVu-pcUsUn1",
+        },
+        .zstbi = .{
+            .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
+            .hash = "zstbi-0.11.0-dev-L0Ea_3GWBwAh7m54XX055vwLKPTPij5hyqyeq92MXPE2",
         },
     },
     .paths = .{
