@@ -357,7 +357,7 @@ fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
     return error.UnknownSubcommand;
 }
 
-pub fn main(proc_init: std.process.Init.Minimal) !void {
+pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -365,10 +365,10 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
     // Initialize the process-wide Io for both the assembler's helpers
     // (used via `gen.*`) and the CLI's own filesystem/env helpers. Must
     // happen before any submodule reaches for `globalIo()`/`globalEnviron()`.
-    gen.initGlobalIo(proc_init);
-    config.initGlobalIo(proc_init);
+    gen.initGlobalIo();
+    config.initGlobalIo();
 
-    var args = try std.process.Args.Iterator.initAllocator(proc_init.args, allocator);
+    var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.skip(); // skip program name
 
