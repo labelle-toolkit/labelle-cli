@@ -13,15 +13,21 @@ const host_arch = switch (builtin.cpu.arch) {
 
 const host_target = host_arch ++ "-" ++ @tagName(builtin.os.tag);
 
-// Download Zig from ziglang.org directly. The pip ziglang package for
-// 0.16.0 ships an std with WASM/emscripten-target compile bugs (Linux
-// SIG enum mismatch in Io/Threaded.zig + translate-c failure on the
-// emscripten SDK's multi-arg `__attribute__((deprecated(...)))`),
-// neither of which reproduce against the official tarball build.
+// Download Zig from ziglang.org directly, then cherry-pick PR #31850's
+// one-line STOPSIG fix into the stdlib. Background: 0.16.0 ships with
+// two WASM/emscripten compile bugs —
+//   1. `std/os/emscripten.zig:STOPSIG` returns `u32` while the body
+//      `@enumFromInt`s into `SIG` (Zig issue #31849, fixed in master by
+//      PR #31850). The sed below applies the same one-line change.
+//   2. translate-c rejects recent emsdk headers' multi-arg
+//      `__attribute__((deprecated("msg1","msg2")))` form (translate-c
+//      issue #306). Avoided by hand-rolled extern shims in the
+//      assembler's WASM template — no stdlib change needed.
 const install_zig = "apt-get update -qq > /dev/null && " ++
     "apt-get install -y -qq curl xz-utils ca-certificates python3 > /dev/null && " ++
     "curl -fsSL https://ziglang.org/download/" ++ ZIG_VERSION ++ "/zig-x86_64-linux-" ++ ZIG_VERSION ++ ".tar.xz | tar -xJ -C /opt > /dev/null && " ++
-    "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig";
+    "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig && " ++
+    "sed -i 's/pub fn STOPSIG(s: u32) u32 {/pub fn STOPSIG(s: u32) SIG {/' /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/lib/std/os/emscripten.zig";
 
 // Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
 // to add framework/include/lib search paths for macOS cross-compilation.
