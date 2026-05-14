@@ -13,9 +13,15 @@ const host_arch = switch (builtin.cpu.arch) {
 
 const host_target = host_arch ++ "-" ++ @tagName(builtin.os.tag);
 
+// Download Zig from ziglang.org directly. The pip ziglang package for
+// 0.16.0 ships an std with WASM/emscripten-target compile bugs (Linux
+// SIG enum mismatch in Io/Threaded.zig + translate-c failure on the
+// emscripten SDK's multi-arg `__attribute__((deprecated(...)))`),
+// neither of which reproduce against the official tarball build.
 const install_zig = "apt-get update -qq > /dev/null && " ++
-    "apt-get install -y -qq python3-pip > /dev/null && " ++
-    "pip3 install ziglang==" ++ ZIG_VERSION ++ " --break-system-packages > /dev/null";
+    "apt-get install -y -qq curl xz-utils ca-certificates > /dev/null && " ++
+    "curl -fsSL https://ziglang.org/download/" ++ ZIG_VERSION ++ "/zig-x86_64-linux-" ++ ZIG_VERSION ++ ".tar.xz | tar -xJ -C /opt > /dev/null && " ++
+    "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig";
 
 // Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
 // to add framework/include/lib search paths for macOS cross-compilation.
@@ -94,9 +100,9 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     defer if (optimize_part) |o| allocator.free(o);
 
     const effective_cmd = if (effective_target.len == 0)
-        try std.fmt.allocPrint(allocator, "python3 -m ziglang build{s}", .{optimize_part orelse ""})
+        try std.fmt.allocPrint(allocator, "zig build{s}", .{optimize_part orelse ""})
     else
-        try std.fmt.allocPrint(allocator, "python3 -m ziglang build -Dtarget={s}{s}", .{ effective_target, optimize_part orelse "" });
+        try std.fmt.allocPrint(allocator, "zig build -Dtarget={s}{s}", .{ effective_target, optimize_part orelse "" });
     defer allocator.free(effective_cmd);
 
     // Only set up xcode-frameworks when the effective target is macOS.
