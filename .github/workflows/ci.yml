@@ -126,6 +126,14 @@ jobs:
           ref: main
           path: labelle-assembler
 
+      # labelle-assembler's build.zig.zon has a `.path = "../labelle-gui/flow-codegen"`
+      # entry, so building it requires labelle-gui as a sibling checkout.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -190,6 +198,14 @@ jobs:
           repository: labelle-toolkit/labelle-assembler
           ref: main
           path: labelle-assembler
+
+      # labelle-assembler's build.zig.zon has a `.path = "../labelle-gui/flow-codegen"`
+      # entry, so building it requires labelle-gui as a sibling checkout.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
