@@ -121,16 +121,21 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
         cwd.createDirPath(io, path) catch {};
     }
 
-    // Write a starter scene
+    // Write a starter scene.
+    //
+    // NOTE: The assembler scans `scenes/` for `.jsonc` files only — the
+    // legacy `.zon` extension is silently ignored, so a freshly scaffolded
+    // project with `main.zon` would build but render nothing (see #204).
+    // Keep this in JSONC to match what the assembler actually loads.
     {
-        const path = try std.fs.path.join(allocator, &.{ dir, "scenes", "main.zon" });
+        const path = try std.fs.path.join(allocator, &.{ dir, "scenes", "main.jsonc" });
         defer allocator.free(path);
         cwd.writeFile(io, .{
             .sub_path = path,
             .data =
-                \\.{
-                \\    .name = "main",
-                \\    .entities = .{},
+                \\{
+                \\    "name": "main",
+                \\    "entities": []
                 \\}
                 \\
             ,
@@ -157,4 +162,46 @@ pub fn cmdInit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
 
     std.debug.print("labelle: created project '{s}' in {s}/\n", .{ project_name, dir });
     std.debug.print("  next: cd {s} && labelle run\n", .{dir});
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────
+//
+// Regression guard for #204: the assembler scans `scenes/` for `.jsonc`
+// only, so scaffolding a `.zon` scene produced an empty game. Make sure
+// `cmdInit` writes `scenes/main.jsonc` with JSONC contents, and does NOT
+// leave a `scenes/main.zon` behind.
+
+test "cmdInit scaffolds scenes/main.jsonc (not .zon) — #204 regression" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = config.globalIo();
+
+    // cmdInit resolves paths relative to cwd, so we pass an absolute path
+    // into the tmpdir. Materialize a subdir first so we can realpath it.
+    try tmp.dir.createDirPath(io, "init-204");
+    const project_dir = try tmp.dir.realPathFileAlloc(io, "init-204", alloc);
+    defer alloc.free(project_dir);
+
+    const args = [_][]const u8{ "init-204", project_dir };
+    try cmdInit(alloc, &args);
+
+    // Confirm scenes/main.jsonc exists and starts with `{` (JSONC, not ZON).
+    const scene_bytes = try tmp.dir.readFileAlloc(
+        io,
+        "init-204/scenes/main.jsonc",
+        alloc,
+        .limited(4096),
+    );
+    defer alloc.free(scene_bytes);
+    try std.testing.expect(scene_bytes.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), scene_bytes[0]);
+
+    // And scenes/main.zon must NOT exist (would silently shadow the real scene).
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "init-204/scenes/main.zon", .{}),
+    );
 }
