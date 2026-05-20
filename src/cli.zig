@@ -4,6 +4,7 @@
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
 ///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [-- <args>...] — generate + build + run; `--` forwards trailing args to the game
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] — generate + build (no run)
+///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
@@ -37,7 +38,7 @@ const ios = @import("cli/ios.zig");
 const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, help_cmd, version, targets, assembler_cmd, test_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -117,7 +118,65 @@ const ParsedArgs = struct {
     docker: bool = false,
     docker_target: ?[]const u8 = null,
     bake: bool = false,
+    // `wasm serve` options. `serve_port` is also read by the wasm
+    // branch of `run`; the others only apply to `wasm serve`.
+    serve_port: u16 = 8080,
+    serve_no_build: bool = false,
+    serve_no_open: bool = false,
 };
+
+/// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
+/// signals a parse error (the helper has already printed a message).
+const WasmServeArgs = struct {
+    dir: []const u8 = ".",
+    port: u16 = 8080,
+    no_build: bool = false,
+    no_open: bool = false,
+};
+
+/// Parse the flags of `labelle wasm serve [dir] [--port <n>]
+/// [--no-build] [--no-open]`. `args` is `anytype` so tests can drive
+/// it with an in-memory `Args.IteratorGeneral`, mirroring
+/// `parseRunArgs`.
+fn parseWasmServeArgs(args: anytype) ?WasmServeArgs {
+    var result = WasmServeArgs{};
+    var dir_set = false;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--no-build")) {
+            result.no_build = true;
+        } else if (std.mem.eql(u8, arg, "--no-open")) {
+            result.no_open = true;
+        } else if (std.mem.startsWith(u8, arg, "--port=") or std.mem.eql(u8, arg, "--port")) {
+            const val = if (std.mem.eql(u8, arg, "--port"))
+                (args.next() orelse {
+                    std.debug.print("labelle wasm serve: --port requires a value (e.g. --port 3000)\n", .{});
+                    return null;
+                })
+            else
+                arg["--port=".len..];
+            result.port = std.fmt.parseInt(u16, val, 10) catch {
+                std.debug.print("labelle wasm serve: invalid --port value '{s}' (expected 1-65535)\n", .{val});
+                return null;
+            };
+            if (result.port == 0) {
+                std.debug.print("labelle wasm serve: --port must be between 1 and 65535\n", .{});
+                return null;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("labelle wasm serve: unknown flag '{s}'\n", .{arg});
+            return null;
+        } else {
+            if (dir_set) {
+                std.debug.print("labelle wasm serve: unexpected argument '{s}'\n", .{arg});
+                return null;
+            }
+            result.dir = arg;
+            dir_set = true;
+        }
+    }
+    return result;
+}
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
 fn parsePlatformValue(val: []const u8) ?Platform {
@@ -480,6 +539,26 @@ pub fn main(proc_init: std.process.Init) !void {
                     parsed_args.project_dir = arg;
                 }
             }
+        } else if (std.mem.eql(u8, first, "wasm")) {
+            // `labelle wasm <subcommand>` — only `serve` exists today.
+            const sub = args.next();
+            if (sub == null or !std.mem.eql(u8, sub.?, "serve")) {
+                if (sub) |s| {
+                    std.debug.print("labelle wasm: unknown subcommand '{s}'\n", .{s});
+                } else {
+                    std.debug.print("labelle wasm: missing subcommand\n", .{});
+                }
+                std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open]\n", .{});
+                return;
+            }
+            parsed_args.command = .wasm_cmd;
+            const result = parseWasmServeArgs(&args) orelse return;
+            parsed_args.project_dir = result.dir;
+            parsed_args.serve_port = result.port;
+            parsed_args.serve_no_build = result.no_build;
+            parsed_args.serve_no_open = result.no_open;
+            // `wasm serve` always builds/serves the WASM target.
+            parsed_args.platform_override = .wasm;
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -593,6 +672,27 @@ pub fn main(proc_init: std.process.Init) !void {
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
         return upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]);
+    }
+
+    // `labelle wasm serve --no-build` — skip the generate+build
+    // pipeline entirely and serve the existing build output. The web
+    // dir lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
+    if (command == .wasm_cmd and parsed_args.serve_no_build) {
+        const wasm_target = try std.fmt.allocPrint(allocator, "{s}_wasm", .{@tagName(parsed.backend)});
+        defer allocator.free(wasm_target);
+        const web_dir = try std.fs.path.join(allocator, &.{
+            project_dir, ".labelle", wasm_target, "zig-out", "web",
+        });
+        defer allocator.free(web_dir);
+        if (std.Io.Dir.cwd().access(config.globalIo(), web_dir, .{})) |_| {} else |_| {
+            std.debug.print(
+                "labelle wasm serve: no existing WASM build at '{s}'\n" ++
+                    "  run `labelle wasm serve` (without --no-build) first.\n",
+                .{web_dir},
+            );
+            return error.BuildFailed;
+        }
+        return serve.serveAndOpen(allocator, web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     }
 
     // Ensure package cache is populated
@@ -742,7 +842,7 @@ pub fn main(proc_init: std.process.Init) !void {
         // WASM: serve via local HTTP server + open browser
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
-        try serve.serveAndOpen(allocator, web_dir, 8080);
+        try serve.serveAndOpen(allocator, web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
@@ -1014,6 +1114,94 @@ pub const ParseRunArgsPassthroughSpec = struct {
             try std.testing.expectEqualStrings(".", result.dir);
             try expect.equal(pa.extra_count, @as(usize, 1));
             try std.testing.expectEqualStrings("somedir", pa.extra_args[0]);
+        }
+    };
+};
+
+pub const ParseWasmServeArgsSpec = struct {
+    pub const defaults = struct {
+        test "no args yields port 8080 and all flags off" {
+            var iter = testIter("");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.port, @as(u16, 8080));
+            try expect.equal(result.no_build, false);
+            try expect.equal(result.no_open, false);
+            try std.testing.expectEqualStrings(".", result.dir);
+        }
+    };
+
+    pub const port_flag = struct {
+        test "--port=3000 sets the port" {
+            var iter = testIter("--port=3000");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.port, @as(u16, 3000));
+        }
+
+        test "--port 3000 (space form) sets the port" {
+            var iter = testIter("--port 3000");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.port, @as(u16, 3000));
+        }
+
+        test "non-numeric --port value is rejected" {
+            var iter = testIter("--port abc");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+
+        test "out-of-range --port value is rejected" {
+            var iter = testIter("--port 99999");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+
+        test "--port 0 is rejected" {
+            var iter = testIter("--port 0");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+    };
+
+    pub const boolean_flags = struct {
+        test "--no-build sets no_build" {
+            var iter = testIter("--no-build");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.no_build, true);
+        }
+
+        test "--no-open sets no_open" {
+            var iter = testIter("--no-open");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.no_open, true);
+        }
+
+        test "flags combine with a custom port and dir" {
+            var iter = testIter("mygame --port 5000 --no-build --no-open");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("mygame", result.dir);
+            try expect.equal(result.port, @as(u16, 5000));
+            try expect.equal(result.no_build, true);
+            try expect.equal(result.no_open, true);
+        }
+    };
+
+    pub const rejects_bad_input = struct {
+        test "unknown flag is rejected" {
+            var iter = testIter("--watch");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+
+        test "a second positional arg is rejected" {
+            var iter = testIter("dir1 dir2");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
     };
 };
