@@ -393,9 +393,14 @@ test "generateAndroidManifest adds NoTitleBar.Fullscreen theme when immersive_mo
     defer allocator.free(xml);
     try std.testing.expect(std.mem.indexOf(u8, xml, "android:theme=\"@android:style/Theme.NoTitleBar.Fullscreen\"") != null);
     // Theme attribute belongs to the <activity> element, before its close `>`.
-    const activity_start = std.mem.indexOf(u8, xml, "<activity").?;
-    const activity_open_end = std.mem.indexOfPos(u8, xml, activity_start, ">").?;
-    const theme_idx = std.mem.indexOf(u8, xml, "android:theme=").?;
+    // Unwrap each lookup explicitly so a missing substring fails the test
+    // with a clear message instead of a generic "unwrap null" panic.
+    const activity_start = std.mem.indexOf(u8, xml, "<activity") orelse
+        return std.testing.expect(false);
+    const activity_open_end = std.mem.indexOfPos(u8, xml, activity_start, ">") orelse
+        return std.testing.expect(false);
+    const theme_idx = std.mem.indexOf(u8, xml, "android:theme=") orelse
+        return std.testing.expect(false);
     try std.testing.expect(theme_idx > activity_start and theme_idx < activity_open_end);
 }
 
