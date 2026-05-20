@@ -121,15 +121,27 @@ fn handleConnection(
     const file_path = try std.fs.path.join(allocator, &.{ web_dir, rel.? });
     defer allocator.free(file_path);
 
-    const body = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .unlimited) catch |err| switch (err) {
+    // Cap the read so a stray huge file in `web_dir` can't OOM the
+    // server. 1 GiB is generous for a WASM bundle + assets.
+    const max_file_bytes = 1024 * 1024 * 1024;
+    const body = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| switch (err) {
         error.FileNotFound => {
             try request.respond("404 Not Found\n", .{ .status = .not_found });
+            return;
+        },
+        // `readFileAlloc` reports a too-large file as a stream-limit
+        // error; answer 413 instead of letting the connection die.
+        error.StreamTooLong => {
+            try request.respond("413 Payload Too Large\n", .{ .status = .payload_too_large });
             return;
         },
         else => return err,
     };
     defer allocator.free(body);
 
+    // `request.respond` omits the body for HEAD requests automatically
+    // while still emitting a `content-length` reflecting the real file
+    // size, so passing the full `body` is correct for GET and HEAD.
     try request.respond(body, .{
         .status = .ok,
         .extra_headers = &.{
@@ -148,6 +160,8 @@ fn handleConnection(
 ///   "/game.wasm"   → "game.wasm"
 ///   "/a/b.js?v=1"  → "a/b.js"
 ///   "/../etc"      → null   (rejected)
+///   "/..\\win.ini" → null   (rejected — backslash)
+///   "//etc/passwd" → null   (rejected — still absolute)
 fn resolveTarget(target: []const u8) ?[]const u8 {
     // Drop the query string / fragment.
     var path = target;
@@ -155,8 +169,21 @@ fn resolveTarget(target: []const u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, path, '#')) |h| path = path[0..h];
 
     if (path.len == 0 or path[0] != '/') return null;
+
+    // Reject any backslash outright. A legit web asset path never has
+    // one, and on Windows '\' is a path separator — so a target like
+    // "/..\..\windows\win.ini" would otherwise be a single segment
+    // that dodges the '..' check below and escapes `web_dir`.
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return null;
+
     path = path[1..]; // strip leading '/'
     if (path.len == 0) return "index.html";
+
+    // A second leading '/' (e.g. "//etc/passwd") would leave the path
+    // absolute after the strip above and flow straight into
+    // `std.fs.path.join`, escaping `web_dir`. Reject anything still
+    // absolute.
+    if (path[0] == '/') return null;
 
     // Reject traversal. A '..' segment or an embedded NUL would let a
     // request walk out of `web_dir`.
@@ -218,6 +245,21 @@ test "resolveTarget: rejects parent traversal" {
     try std.testing.expect(resolveTarget("/assets/../../secret") == null);
 }
 
+test "resolveTarget: rejects backslash (Windows separator traversal)" {
+    // On Windows '\' is a path separator, so "/..\..\win.ini" would be
+    // a single segment that dodges the '..' check. Reject any '\'.
+    try std.testing.expect(resolveTarget("/..\\..\\windows\\win.ini") == null);
+    try std.testing.expect(resolveTarget("/assets\\atlas.png") == null);
+    try std.testing.expect(resolveTarget("/a\\b") == null);
+}
+
+test "resolveTarget: rejects double-slash (still absolute)" {
+    // "//etc/passwd" stays absolute after stripping one leading slash
+    // and would escape web_dir via path.join.
+    try std.testing.expect(resolveTarget("//etc/passwd") == null);
+    try std.testing.expect(resolveTarget("///etc/passwd") == null);
+}
+
 test "resolveTarget: rejects embedded NUL" {
     try std.testing.expect(resolveTarget("/game\x00.wasm") == null);
 }
@@ -257,27 +299,41 @@ fn testServeN(io: std.Io, alloc: std.mem.Allocator, server: *std.Io.net.Server, 
     }
 }
 
+/// Bind 127.0.0.1 on the first free port in a fixed candidate range.
+/// Avoids needing `getsockname` to discover a port-0 assignment —
+/// that symbol isn't linked in Zig's Windows std, so the port-0 +
+/// getsockname trick fails to compile on Windows.
+fn testBindFreePort(io: std.Io) ?struct { server: std.Io.net.Server, port: u16 } {
+    var port: u16 = 49500;
+    while (port < 49600) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+        const server = addr.listen(io, .{ .reuse_address = true }) catch continue;
+        return .{ .server = server, .port = port };
+    }
+    return null;
+}
+
 test "handleConnection: serves a file, 404s a miss, 400s traversal" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
-    // web_dir = /tmp; the served file is a uniquely-named sibling so
-    // the test needs no directory creation.
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = "/tmp/labelle_serve_test.html",
+    // Portable, auto-cleaned temp dir under .zig-cache/tmp/<sub_path>.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(web_dir);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "labelle_serve_test.html",
         .data = "<h1>hi</h1>",
     });
 
-    const bind = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
-    var server = try bind.listen(io, .{ .reuse_address = true });
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    const port = bound.port;
     defer server.deinit(io);
 
-    var sa: std.posix.sockaddr.in = undefined;
-    var sa_len: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
-    _ = std.posix.system.getsockname(server.socket.handle, @ptrCast(&sa), &sa_len);
-    const port = std.mem.bigToNative(u16, sa.port);
-
-    const t = try std.Thread.spawn(.{}, testServeN, .{ io, alloc, &server, "/tmp", @as(usize, 3) });
+    const t = try std.Thread.spawn(.{}, testServeN, .{ io, alloc, &server, web_dir, @as(usize, 3) });
     defer t.join();
 
     const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
