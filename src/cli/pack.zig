@@ -7,7 +7,7 @@
 //! Replaces the external `npx free-tex-packer-cli` step.
 
 const std = @import("std");
-const texpack = @import("texpack");
+const texpack = @import("../texpack/texpack.zig");
 const config = @import("config.zig");
 
 const usage =

@@ -27,10 +27,6 @@
             .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
             .hash = "zstbi-0.11.0-dev-L0Ea_3GWBwAh7m54XX055vwLKPTPij5hyqyeq92MXPE2",
         },
-        .labelle_texpack = .{
-            .url = "git+https://github.com/labelle-toolkit/labelle-texpack.git#1eea9ac19bda696874934f22c48f5d6f23af8cc5",
-            .hash = "labelle_texpack-0.1.0-6m5kL4LiBQCfBCZ8I6KR3BK21fT6H4bX296J8MQgf7y_",
-        },
     },
     .paths = .{
         "build.zig",

@@ -25,19 +25,6 @@ pub fn build(b: *std.Build) void {
     });
     const gen_mod = gen_dep.module("generator");
 
-    // ── texpack module ──────────────────────────────────────────────
-    // The in-house sprite-atlas packer lives in its own standalone repo
-    // (labelle-cli#213) so labelle-gui can depend on it directly rather
-    // than on the CLI. It owns the vendored stb C wiring (PNG decode +
-    // encode); importing the module links those symbols in transitively
-    // — which is also what `bake.zig`'s `@cImport` of stb_image.h binds
-    // against, so the CLI compiles no stb C of its own.
-    const texpack_dep = b.dependency("labelle_texpack", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const texpack_mod = texpack_dep.module("texpack");
-
     const gen_exe = b.addExecutable(.{
         .name = "labelle",
         .root_module = b.createModule(.{
@@ -46,15 +33,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "generator", .module = gen_mod },
-                .{ .name = "texpack", .module = texpack_mod },
             },
         }),
     });
-    // `bake.zig` `@cImport`s stb_image.h directly — it needs the header
-    // on the include path. The stb *implementation* is compiled by the
-    // texpack module above; the symbols link in transitively.
-    gen_exe.root_module.addIncludePath(b.path("src/cli"));
-    gen_exe.root_module.link_libc = true;
+    wireStb(b, gen_exe.root_module);
     b.installArtifact(gen_exe);
 
     const gen_run = b.addRunArtifact(gen_exe);
@@ -74,17 +56,26 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "generator", .module = gen_mod },
-                .{ .name = "texpack", .module = texpack_mod },
                 .{ .name = "zspec", .module = zspec_dep.module("zspec") },
             },
         }),
     });
-    // `bake.zig` `@cImport`s stb_image.h — it needs the header on the
-    // include path. The stb implementation links in via the texpack
-    // module import (same wiring as `gen_exe`).
-    cli_tests.root_module.addIncludePath(b.path("src/cli"));
-    cli_tests.root_module.link_libc = true;
+    wireStb(b, cli_tests.root_module);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
+}
+
+/// Compile the vendored stb implementation (PNG decode + encode) and
+/// put its headers on the include path. Two consumers `@cImport` those
+/// headers: `src/cli/bake.zig` (decode, for the PNG→LRGBA prebake) and
+/// `src/texpack/` (decode + encode, for `labelle pack`). A single `.c`
+/// provides one definition of the symbols for both.
+fn wireStb(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{
+        .file = b.path("src/cli/stb_image_impl.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addIncludePath(b.path("src/cli"));
+    mod.link_libc = true;
 }
