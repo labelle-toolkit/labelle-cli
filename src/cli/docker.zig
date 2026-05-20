@@ -44,6 +44,133 @@ const setup_xcode_frameworks =
     "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\" build.zig && " ++
     "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
 
+/// Recursively copy a directory tree. `src` and `dst` are absolute paths.
+///
+/// Nested symlinks (links *inside* the copied tree) are reproduced as
+/// symlinks rather than dereferenced. This is deliberate: the assembler
+/// only ever links the game's top-level `@embedFile`-able dirs (see
+/// `materializeSymlinks`), and `@embedFile` does not need links *within*
+/// those dirs followed. Crucially, copying nested symlinks as-is means a
+/// circular symlink (e.g. an `assets/` entry pointing at an ancestor dir)
+/// can never make `copyTree` recurse forever — recursion only descends
+/// into real directories, which form a finite tree.
+fn copyTree(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    try cwd.createDirPath(io, dst);
+
+    var src_dir = try cwd.openDir(io, src, .{ .iterate = true });
+    defer src_dir.close(io);
+
+    var iter = src_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        const src_sub = try std.fs.path.join(allocator, &.{ src, entry.name });
+        defer allocator.free(src_sub);
+        const dst_sub = try std.fs.path.join(allocator, &.{ dst, entry.name });
+        defer allocator.free(dst_sub);
+
+        switch (entry.kind) {
+            .directory => try copyTree(allocator, src_sub, dst_sub),
+            .file => try cwd.copyFile(src_sub, cwd, dst_sub, io, .{}),
+            // Reproduce nested symlinks as symlinks — do NOT dereference
+            // them. This avoids unbounded recursion on circular links and
+            // is sufficient for `@embedFile`, which only needs the
+            // top-level dir links resolved (handled by materializeSymlinks).
+            .sym_link => {
+                var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const target_len = cwd.readLink(io, src_sub, &link_buf) catch |err| {
+                    std.debug.print("labelle: warning: skipping unreadable symlink '{s}' for docker build: {any}\n", .{ src_sub, err });
+                    continue;
+                };
+                cwd.symLink(io, link_buf[0..target_len], dst_sub, .{}) catch |err| {
+                    std.debug.print("labelle: warning: could not recreate symlink '{s}' for docker build: {any}\n", .{ dst_sub, err });
+                };
+            },
+            else => {},
+        }
+    }
+}
+
+/// Replace every immediate-child symlink of `target_dir` with a real
+/// recursive copy of its resolved content.
+///
+/// The assembler links the game's `@embedFile`-able directories
+/// (`scenes/`, `prefabs/`, `assets/`, `components/`, …) into the target
+/// dir as relative symlinks pointing at `../../<folder>` in the project
+/// root. The native build resolves those links fine. The Docker build
+/// only volume-mounts `.labelle/` (the target dir's parent), so a link
+/// like `.labelle/<target>/scenes -> ../../scenes` dangles inside the
+/// container — `@embedFile("scenes/main.jsonc")` then fails with
+/// FileNotFound at compile time.
+///
+/// Materializing the links into real directories on the host, before
+/// the mount, makes the embedded sources resolve in-container. This is
+/// Docker-path-only; the native build path is left untouched. Folder
+/// set isn't hard-coded — whatever the assembler linked gets copied —
+/// so it can't drift from the assembler's behavior.
+///
+/// No staleness on iterative builds: this only acts on entries that are
+/// *currently symlinks*, but every `labelle build --docker` invocation
+/// runs the assembler's `generate` step first (cli.zig calls
+/// `assembler.spawnGenerate` unconditionally before `docker.runBuild`).
+/// The assembler's `linkDir` is idempotent and explicitly recreates each
+/// game-dir symlink even when the path is already a real directory left
+/// over from a prior `materializeSymlinks` run — it detects the
+/// `error.NotLink` case, `deleteTree`s the stale copy, and writes a fresh
+/// symlink (see labelle-assembler/src/scanner.zig:linkDir). So the
+/// materialized copies are transient: they exist only between one
+/// `generate` and that build's `docker run`, and are blown away by the
+/// next `generate`. A second `--docker` build therefore always sees fresh
+/// symlinks here, never a stale real dir.
+fn materializeSymlinks(allocator: std.mem.Allocator, target_dir: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var dir = cwd.openDir(io, target_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    // Collect symlink names first; mutating the tree mid-iteration is
+    // unsafe.
+    var links: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (links.items) |n| allocator.free(n);
+        links.deinit(allocator);
+    }
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .sym_link) continue;
+        try links.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    for (links.items) |name| {
+        const link_path = try std.fs.path.join(allocator, &.{ target_dir, name });
+        defer allocator.free(link_path);
+
+        // Resolve the link to its real on-host location while the link
+        // still exists.
+        const resolved = std.Io.Dir.cwd().realPathFileAlloc(io, link_path, allocator) catch |err| {
+            std.debug.print("labelle: warning: could not resolve '{s}' for docker build: {any}\n", .{ link_path, err });
+            continue;
+        };
+        defer allocator.free(resolved);
+
+        const stat = try cwd.statFile(io, link_path, .{});
+
+        // Replace the link with a real copy of its target.
+        try cwd.deleteTree(io, link_path);
+        if (stat.kind == .directory) {
+            try copyTree(allocator, resolved, link_path);
+        } else {
+            try cwd.copyFile(resolved, cwd, link_path, io, .{});
+        }
+    }
+}
+
 fn zigCacheDir(allocator: std.mem.Allocator) ![]const u8 {
     const env = config.globalEnviron();
     if (env.getAlloc(allocator, "ZIG_GLOBAL_CACHE_DIR")) |dir| {
@@ -78,6 +205,14 @@ fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
 pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
     const abs_target = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), target_dir, allocator);
     defer allocator.free(abs_target);
+
+    // The assembler links the game's @embedFile-able dirs (scenes/,
+    // prefabs/, assets/, …) into the target dir as relative symlinks
+    // pointing outside .labelle/. The docker volume only mounts
+    // .labelle/, so those links dangle in-container and @embedFile
+    // fails at compile time. Dereference them into real copies on the
+    // host before the mount. Native builds never call this.
+    try materializeSymlinks(allocator, abs_target);
 
     const parent = std.fs.path.dirname(abs_target) orelse return error.InvalidPath;
     const subdir = std.fs.path.basename(abs_target);
