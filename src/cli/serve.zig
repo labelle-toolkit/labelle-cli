@@ -45,9 +45,21 @@ fn mimeFor(path: []const u8) []const u8 {
 /// accept loop swallows per-connection errors so a flaky tab can't
 /// kill the server).
 ///
+/// `web_dir` is the build output dir (`.labelle/<backend>_wasm/zig-out/web`).
+/// `project_web_dir` is the durable project shell dir (`<project>/web`);
+/// if it holds an `index.html`, that file is served at `/` so the user
+/// gets a clean root page instead of emcc's chrome-heavy `game.html`.
+/// Pass `null` to disable the project-shell lookup.
+///
 /// `open_browser` controls the auto-launch — `labelle wasm serve
 /// --no-open` passes `false` to suppress it.
-pub fn serveAndOpen(allocator: std.mem.Allocator, web_dir: []const u8, port: u16, open_browser_tab: bool) !void {
+pub fn serveAndOpen(
+    allocator: std.mem.Allocator,
+    web_dir: []const u8,
+    project_web_dir: ?[]const u8,
+    port: u16,
+    open_browser_tab: bool,
+) !void {
     const io = config.globalIo();
 
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
@@ -77,10 +89,53 @@ pub fn serveAndOpen(allocator: std.mem.Allocator, web_dir: []const u8, port: u16
             std.debug.print("labelle: accept failed ({s}), continuing\n", .{@errorName(err)});
             continue;
         };
-        handleConnection(io, allocator, stream, web_dir) catch |err| {
+        handleConnection(io, allocator, stream, web_dir, project_web_dir) catch |err| {
             std.debug.print("labelle: connection error ({s})\n", .{@errorName(err)});
         };
     }
+}
+
+/// True if `path` names a regular file that can be opened for reading.
+fn fileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// True if the request target addresses the site root — `/` or a bare
+/// `/index.html` (query string / fragment already stripped by the
+/// caller via `resolveTarget`, which yields `"index.html"` for both).
+fn isRootRequest(rel: []const u8) bool {
+    return std.mem.eql(u8, rel, "index.html");
+}
+
+/// Resolve a root (`/` or `/index.html`) request to the file that
+/// should back it. Resolution order:
+///   a. `<project>/web/index.html` — the clean project shell.
+///   b. `<build web dir>/index.html` — a build-produced shell.
+///   c. `<build web dir>/game.html` — emcc's chrome-heavy shell.
+///   d. else `null` — caller answers 404.
+/// Returns an allocator-owned path the caller must free.
+fn resolveRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    web_dir: []const u8,
+    project_web_dir: ?[]const u8,
+) !?[]const u8 {
+    if (project_web_dir) |pwd| {
+        const shell = try std.fs.path.join(allocator, &.{ pwd, "index.html" });
+        if (fileExists(io, shell)) return shell;
+        allocator.free(shell);
+    }
+
+    const build_index = try std.fs.path.join(allocator, &.{ web_dir, "index.html" });
+    if (fileExists(io, build_index)) return build_index;
+    allocator.free(build_index);
+
+    const game_html = try std.fs.path.join(allocator, &.{ web_dir, "game.html" });
+    if (fileExists(io, game_html)) return game_html;
+    allocator.free(game_html);
+
+    return null;
 }
 
 /// Serve a single HTTP/1.1 request off `stream`, then close it.
@@ -90,6 +145,7 @@ fn handleConnection(
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     web_dir: []const u8,
+    project_web_dir: ?[]const u8,
 ) !void {
     defer stream.close(io);
 
@@ -118,8 +174,24 @@ fn handleConnection(
         return;
     }
 
-    const file_path = try std.fs.path.join(allocator, &.{ web_dir, rel.? });
+    // The root request (`/` or a bare `/index.html`) is resolved
+    // specially: prefer the project's clean shell, then a build-emitted
+    // `index.html`, then emcc's `game.html`. Everything else is a plain
+    // `web_dir`-relative asset. The root candidates are fixed filenames
+    // — not user-controlled — so they don't need `resolveTarget`'s
+    // traversal hardening.
+    const file_path = if (isRootRequest(rel.?))
+        (try resolveRoot(io, allocator, web_dir, project_web_dir)) orelse {
+            try request.respond("404 Not Found\n", .{ .status = .not_found });
+            return;
+        }
+    else
+        try std.fs.path.join(allocator, &.{ web_dir, rel.? });
     defer allocator.free(file_path);
+
+    // For the root request the served file may be `game.html`; report
+    // an HTML content-type regardless of the candidate that matched.
+    const content_type = if (isRootRequest(rel.?)) "text/html; charset=utf-8" else mimeFor(rel.?);
 
     // Cap the read so a stray huge file in `web_dir` can't OOM the
     // server. 1 GiB is generous for a WASM bundle + assets.
@@ -145,7 +217,7 @@ fn handleConnection(
     try request.respond(body, .{
         .status = .ok,
         .extra_headers = &.{
-            .{ .name = "content-type", .value = mimeFor(rel.?) },
+            .{ .name = "content-type", .value = content_type },
             // WASM ships uncompressed and large; spare the browser a
             // re-fetch across reloads within a dev session.
             .{ .name = "cache-control", .value = "no-cache" },
@@ -291,11 +363,18 @@ test "mimeFor: unknown extension falls back to octet-stream" {
 /// Accept `n` connections then return — the test side of the loop in
 /// `serveAndOpen`. Lives in a thread so the test's request side can
 /// drive the real `std.Io.net` round-trip in-process.
-fn testServeN(io: std.Io, alloc: std.mem.Allocator, server: *std.Io.net.Server, web_dir: []const u8, n: usize) void {
+fn testServeN(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    server: *std.Io.net.Server,
+    web_dir: []const u8,
+    project_web_dir: ?[]const u8,
+    n: usize,
+) void {
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const stream = server.accept(io) catch return;
-        handleConnection(io, alloc, stream, web_dir) catch {};
+        handleConnection(io, alloc, stream, web_dir, project_web_dir) catch {};
     }
 }
 
@@ -333,7 +412,7 @@ test "handleConnection: serves a file, 404s a miss, 400s traversal" {
     const port = bound.port;
     defer server.deinit(io);
 
-    const t = try std.Thread.spawn(.{}, testServeN, .{ io, alloc, &server, web_dir, @as(usize, 3) });
+    const t = try std.Thread.spawn(.{}, testServeN, .{ io, alloc, &server, web_dir, @as(?[]const u8, null), @as(usize, 3) });
     defer t.join();
 
     const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
@@ -359,4 +438,112 @@ test "handleConnection: serves a file, 404s a miss, 400s traversal" {
         defer alloc.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, case.want) != null);
     }
+}
+
+/// Issue a single `GET /` over loopback and return the full response.
+/// Caller frees the result.
+fn testRootRequest(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    web_dir: []const u8,
+    project_web_dir: ?[]const u8,
+) ![]u8 {
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    const port = bound.port;
+    defer server.deinit(io);
+
+    const t = try std.Thread.spawn(.{}, testServeN, .{ io, alloc, &server, web_dir, project_web_dir, @as(usize, 1) });
+    defer t.join();
+
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    const s = try peer.connect(io, .{ .mode = .stream });
+    defer s.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    try w.interface.print("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{});
+    try w.interface.flush();
+
+    var rbuf: [8192]u8 = undefined;
+    var r = s.reader(io, &rbuf);
+    return r.interface.allocRemaining(alloc, .unlimited);
+}
+
+test "handleConnection: root prefers the project web/index.html shell" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Build output dir: holds emcc's game.html only.
+    var build_tmp = std.testing.tmpDir(.{});
+    defer build_tmp.cleanup();
+    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &build_tmp.sub_path });
+    defer alloc.free(web_dir);
+    try build_tmp.dir.writeFile(io, .{ .sub_path = "game.html", .data = "<!-- emcc shell -->" });
+
+    // Project web dir: holds the clean shell.
+    var proj_tmp = std.testing.tmpDir(.{});
+    defer proj_tmp.cleanup();
+    const project_web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &proj_tmp.sub_path });
+    defer alloc.free(project_web_dir);
+    try proj_tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = "<!-- clean shell -->" });
+
+    const resp = try testRootRequest(io, alloc, web_dir, project_web_dir);
+    defer alloc.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "clean shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "emcc shell") == null);
+}
+
+test "handleConnection: root falls back to game.html when no project shell" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var build_tmp = std.testing.tmpDir(.{});
+    defer build_tmp.cleanup();
+    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &build_tmp.sub_path });
+    defer alloc.free(web_dir);
+    try build_tmp.dir.writeFile(io, .{ .sub_path = "game.html", .data = "<!-- emcc shell -->" });
+
+    // Project web dir exists but has no index.html.
+    var proj_tmp = std.testing.tmpDir(.{});
+    defer proj_tmp.cleanup();
+    const project_web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &proj_tmp.sub_path });
+    defer alloc.free(project_web_dir);
+
+    const resp = try testRootRequest(io, alloc, web_dir, project_web_dir);
+    defer alloc.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "emcc shell") != null);
+}
+
+test "handleConnection: root prefers a build-emitted index.html over game.html" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var build_tmp = std.testing.tmpDir(.{});
+    defer build_tmp.cleanup();
+    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &build_tmp.sub_path });
+    defer alloc.free(web_dir);
+    try build_tmp.dir.writeFile(io, .{ .sub_path = "game.html", .data = "<!-- emcc shell -->" });
+    try build_tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = "<!-- build index -->" });
+
+    const resp = try testRootRequest(io, alloc, web_dir, null);
+    defer alloc.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "build index") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "emcc shell") == null);
+}
+
+test "handleConnection: root 404s when neither a shell nor game.html exists" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var build_tmp = std.testing.tmpDir(.{});
+    defer build_tmp.cleanup();
+    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &build_tmp.sub_path });
+    defer alloc.free(web_dir);
+
+    const resp = try testRootRequest(io, alloc, web_dir, null);
+    defer alloc.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "404") != null);
 }

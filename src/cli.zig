@@ -692,7 +692,9 @@ pub fn main(proc_init: std.process.Init) !void {
             );
             return error.BuildFailed;
         }
-        return serve.serveAndOpen(allocator, web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
+        const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
+        defer allocator.free(project_web_dir);
+        return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     }
 
     // Ensure package cache is populated
@@ -842,7 +844,9 @@ pub fn main(proc_init: std.process.Init) !void {
         // WASM: serve via local HTTP server + open browser
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
-        try serve.serveAndOpen(allocator, web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
+        const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
+        defer allocator.free(project_web_dir);
+        try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
