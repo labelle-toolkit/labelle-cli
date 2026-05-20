@@ -45,8 +45,15 @@ const setup_xcode_frameworks =
     "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
 
 /// Recursively copy a directory tree. `src` and `dst` are absolute paths.
-/// Symlinks encountered inside the tree are dereferenced (their content
-/// copied), so the resulting `dst` tree is self-contained.
+///
+/// Nested symlinks (links *inside* the copied tree) are reproduced as
+/// symlinks rather than dereferenced. This is deliberate: the assembler
+/// only ever links the game's top-level `@embedFile`-able dirs (see
+/// `materializeSymlinks`), and `@embedFile` does not need links *within*
+/// those dirs followed. Crucially, copying nested symlinks as-is means a
+/// circular symlink (e.g. an `assets/` entry pointing at an ancestor dir)
+/// can never make `copyTree` recurse forever — recursion only descends
+/// into real directories, which form a finite tree.
 fn copyTree(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -66,15 +73,19 @@ fn copyTree(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !voi
         switch (entry.kind) {
             .directory => try copyTree(allocator, src_sub, dst_sub),
             .file => try cwd.copyFile(src_sub, cwd, dst_sub, io, .{}),
-            // Dereference nested symlinks: stat resolves to the real
-            // target, so dirs/files behind a link are copied as content.
+            // Reproduce nested symlinks as symlinks — do NOT dereference
+            // them. This avoids unbounded recursion on circular links and
+            // is sufficient for `@embedFile`, which only needs the
+            // top-level dir links resolved (handled by materializeSymlinks).
             .sym_link => {
-                const stat = try cwd.statFile(io, src_sub, .{});
-                if (stat.kind == .directory) {
-                    try copyTree(allocator, src_sub, dst_sub);
-                } else {
-                    try cwd.copyFile(src_sub, cwd, dst_sub, io, .{});
-                }
+                var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const target_len = cwd.readLink(io, src_sub, &link_buf) catch |err| {
+                    std.debug.print("labelle: warning: skipping unreadable symlink '{s}' for docker build: {any}\n", .{ src_sub, err });
+                    continue;
+                };
+                cwd.symLink(io, link_buf[0..target_len], dst_sub, .{}) catch |err| {
+                    std.debug.print("labelle: warning: could not recreate symlink '{s}' for docker build: {any}\n", .{ dst_sub, err });
+                };
             },
             else => {},
         }
@@ -98,6 +109,20 @@ fn copyTree(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !voi
 /// Docker-path-only; the native build path is left untouched. Folder
 /// set isn't hard-coded — whatever the assembler linked gets copied —
 /// so it can't drift from the assembler's behavior.
+///
+/// No staleness on iterative builds: this only acts on entries that are
+/// *currently symlinks*, but every `labelle build --docker` invocation
+/// runs the assembler's `generate` step first (cli.zig calls
+/// `assembler.spawnGenerate` unconditionally before `docker.runBuild`).
+/// The assembler's `linkDir` is idempotent and explicitly recreates each
+/// game-dir symlink even when the path is already a real directory left
+/// over from a prior `materializeSymlinks` run — it detects the
+/// `error.NotLink` case, `deleteTree`s the stale copy, and writes a fresh
+/// symlink (see labelle-assembler/src/scanner.zig:linkDir). So the
+/// materialized copies are transient: they exist only between one
+/// `generate` and that build's `docker run`, and are blown away by the
+/// next `generate`. A second `--docker` build therefore always sees fresh
+/// symlinks here, never a stale real dir.
 fn materializeSymlinks(allocator: std.mem.Allocator, target_dir: []const u8) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
