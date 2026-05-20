@@ -18,6 +18,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The labelle_assembler git package's build.zig.zon declares
+      # flow_codegen as a relative path-dep (`../labelle-gui/flow-codegen`).
+      # flow-codegen is an in-tree sub-package of labelle-gui (not its own
+      # repo), so it cannot be a fetchable git dep — checking labelle-gui
+      # out into the spot the relative path resolves to is the supported
+      # workaround, mirroring labelle-assembler's own CI.
+      #
+      # That resolution differs by OS: on ubuntu/macos Zig 0.16 resolves
+      # `../labelle-gui/flow-codegen` to `<project>/zig-pkg/labelle-gui/
+      # flow-codegen`, but on windows-latest path-join normalization
+      # collapses the `..` differently and it resolves straight to the
+      # repo root, `<project>/labelle-gui/flow-codegen`. Check labelle-gui
+      # out into BOTH locations so all three OS jobs resolve the dep — a
+      # redundant shallow checkout is cheap.
+      - name: Checkout labelle-gui (flow_codegen sub-package, zig-pkg path)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: zig-pkg/labelle-gui
+
+      - name: Checkout labelle-gui (flow_codegen sub-package, repo-root path)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -127,12 +155,24 @@ jobs:
           path: labelle-assembler
 
       # labelle-assembler's build.zig.zon has a `.path = "../labelle-gui/flow-codegen"`
-      # entry, so building it requires labelle-gui as a sibling checkout.
+      # entry, so building it as a sibling repo requires labelle-gui as a
+      # sibling checkout.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gui
           ref: main
           path: labelle-gui
+
+      # When labelle-cli builds, labelle_assembler is consumed as a git
+      # package unpacked into `labelle-cli/zig-pkg/`; the same path-dep
+      # then resolves to `labelle-cli/zig-pkg/labelle-gui/flow-codegen`.
+      # Check labelle-gui out there too so `cd labelle-cli && zig build`
+      # resolves the transitive flow_codegen dep.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-cli/zig-pkg/labelle-gui
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -200,12 +240,24 @@ jobs:
           path: labelle-assembler
 
       # labelle-assembler's build.zig.zon has a `.path = "../labelle-gui/flow-codegen"`
-      # entry, so building it requires labelle-gui as a sibling checkout.
+      # entry, so building it as a sibling repo requires labelle-gui as a
+      # sibling checkout.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gui
           ref: main
           path: labelle-gui
+
+      # When labelle-cli builds, labelle_assembler is consumed as a git
+      # package unpacked into `labelle-cli/zig-pkg/`; the same path-dep
+      # then resolves to `labelle-cli/zig-pkg/labelle-gui/flow-codegen`.
+      # Check labelle-gui out there too so `cd labelle-cli && zig build`
+      # resolves the transitive flow_codegen dep.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-cli/zig-pkg/labelle-gui
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2

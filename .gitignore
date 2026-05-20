@@ -1,5 +1,7 @@
 .zig-cache/
 zig-out/
+# Zig 0.16 unpacks fetched packages here; never committed.
+zig-pkg/
 
 # Fixture build artifacts — test/*-test/ directories are minimal game
 # projects run by the system-test CI steps. The generator produces

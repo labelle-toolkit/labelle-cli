@@ -340,6 +340,17 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         .all => "unspecified",
     };
 
+    // Immersive mode: launch fullscreen with the status bar + title bar
+    // hidden via the built-in `Theme.NoTitleBar.Fullscreen` framework
+    // theme. This is a framework resource — it needs no custom APK
+    // resources (the APK stays resource-free, `android:hasCode="false"`).
+    // Note: this hides the status bar only, NOT the navigation bar;
+    // immersive-sticky nav-bar hiding needs runtime JNI work (follow-up).
+    const theme_attr: []const u8 = if (cfg.immersive_mode)
+        "\n            android:theme=\"@android:style/Theme.NoTitleBar.Fullscreen\""
+    else
+        "";
+
     return std.fmt.allocPrint(allocator,
         \\<?xml version="1.0" encoding="utf-8"?>
         \\<manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -353,7 +364,7 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         \\    <application android:hasCode="false" android:label="{s}">
         \\        <activity android:name="android.app.NativeActivity"
         \\            android:configChanges="orientation|keyboardHidden|screenSize"
-        \\            android:screenOrientation="{s}"
+        \\            android:screenOrientation="{s}"{s}
         \\            android:exported="true">
         \\            <meta-data android:name="android.app.lib_name" android:value="game" />
         \\            <intent-filter>
@@ -364,7 +375,33 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         \\    </application>
         \\</manifest>
         \\
-    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, orientation });
+    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, orientation, theme_attr });
+}
+
+test "generateAndroidManifest omits theme attribute when immersive_mode is false" {
+    const allocator = std.testing.allocator;
+    const cfg = AndroidConfig{ .immersive_mode = false };
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    defer allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:theme=") == null);
+}
+
+test "generateAndroidManifest adds NoTitleBar.Fullscreen theme when immersive_mode is true" {
+    const allocator = std.testing.allocator;
+    const cfg = AndroidConfig{ .immersive_mode = true };
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    defer allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:theme=\"@android:style/Theme.NoTitleBar.Fullscreen\"") != null);
+    // Theme attribute belongs to the <activity> element, before its close `>`.
+    // Unwrap each lookup explicitly so a missing substring fails the test
+    // with a clear message instead of a generic "unwrap null" panic.
+    const activity_start = std.mem.indexOf(u8, xml, "<activity") orelse
+        return std.testing.expect(false);
+    const activity_open_end = std.mem.indexOfPos(u8, xml, activity_start, ">") orelse
+        return std.testing.expect(false);
+    const theme_idx = std.mem.indexOf(u8, xml, "android:theme=") orelse
+        return std.testing.expect(false);
+    try std.testing.expect(theme_idx > activity_start and theme_idx < activity_open_end);
 }
 
 /// Find ANDROID_HOME.
