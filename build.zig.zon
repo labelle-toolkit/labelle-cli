@@ -28,8 +28,8 @@
             .hash = "zstbi-0.11.0-dev-L0Ea_3GWBwAh7m54XX055vwLKPTPij5hyqyeq92MXPE2",
         },
         .labelle_texpack = .{
-            .url = "git+https://github.com/labelle-toolkit/labelle-texpack.git#c6d14ca01426ab353e0a30ad9c216e1789d9672e",
-            .hash = "labelle_texpack-0.1.0-6m5kL4jPBQDuwZl6LUmIotAanutwP7j0SpHaANqYQlOh",
+            .url = "git+https://github.com/labelle-toolkit/labelle-texpack.git#cd67d1c6fb08e21c90c056923d344c9e0c324be2",
+            .hash = "labelle_texpack-0.1.0-6m5kL97WBQAA-R5qBb5BGI5z8K_xrvKfygVHUektS2E0",
         },
     },
     .paths = .{
