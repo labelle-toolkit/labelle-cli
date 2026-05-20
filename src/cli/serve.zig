@@ -44,7 +44,10 @@ fn mimeFor(path: []const u8) []const u8 {
 /// browser. Blocks forever — returns only on a bind failure (the
 /// accept loop swallows per-connection errors so a flaky tab can't
 /// kill the server).
-pub fn serveAndOpen(allocator: std.mem.Allocator, web_dir: []const u8, port: u16) !void {
+///
+/// `open_browser` controls the auto-launch — `labelle wasm serve
+/// --no-open` passes `false` to suppress it.
+pub fn serveAndOpen(allocator: std.mem.Allocator, web_dir: []const u8, port: u16, open_browser_tab: bool) !void {
     const io = config.globalIo();
 
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
@@ -65,7 +68,7 @@ pub fn serveAndOpen(allocator: std.mem.Allocator, web_dir: []const u8, port: u16
         .{ web_dir, port },
     );
 
-    openBrowser(allocator, port);
+    if (open_browser_tab) openBrowser(allocator, port);
 
     while (true) {
         const stream = server.accept(io) catch |err| {

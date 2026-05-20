@@ -12,6 +12,7 @@ pub fn printHelp() void {
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
         \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build the project
         \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>] [-- <args>...]  Generate + build + run (default; `--` forwards trailing args to the game)
+        \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open]  Build the WASM target, serve it locally (default port 8080), open the browser
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  install assembler <ver>  Download and cache an assembler binary
@@ -31,6 +32,10 @@ pub fn printHelp() void {
         \\  labelle run --scene=settings_menu
         \\  labelle generate --platform=wasm
         \\  labelle build --platform=wasm
+        \\  labelle wasm serve
+        \\  labelle wasm serve --port 3000
+        \\  labelle wasm serve --no-build
+        \\  labelle wasm serve --no-open
         \\  labelle build --optimize=ReleaseFast
         \\  labelle build ../my-game
         \\  labelle build --docker
