@@ -1149,19 +1149,19 @@ pub const ParseWasmServeArgsSpec = struct {
         test "non-numeric --port value is rejected" {
             var iter = testIter("--port abc");
             defer iter.deinit();
-            try expect.equal(parseWasmServeArgs(&iter), null);
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
 
         test "out-of-range --port value is rejected" {
             var iter = testIter("--port 99999");
             defer iter.deinit();
-            try expect.equal(parseWasmServeArgs(&iter), null);
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
 
         test "--port 0 is rejected" {
             var iter = testIter("--port 0");
             defer iter.deinit();
-            try expect.equal(parseWasmServeArgs(&iter), null);
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
     };
 
@@ -1195,13 +1195,13 @@ pub const ParseWasmServeArgsSpec = struct {
         test "unknown flag is rejected" {
             var iter = testIter("--watch");
             defer iter.deinit();
-            try expect.equal(parseWasmServeArgs(&iter), null);
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
 
         test "a second positional arg is rejected" {
             var iter = testIter("dir1 dir2");
             defer iter.deinit();
-            try expect.equal(parseWasmServeArgs(&iter), null);
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
     };
 };
