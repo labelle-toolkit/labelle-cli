@@ -3,6 +3,7 @@ const project_config = @import("project_config.zig");
 const assembler = @import("assembler.zig");
 const config = @import("config.zig");
 const assembler_proc = @import("assembler_proc.zig");
+const util = @import("util.zig");
 
 /// Bump version fields in project.labelle.
 ///
@@ -16,6 +17,13 @@ const assembler_proc = @import("assembler_proc.zig");
 pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig, cmd_args: []const []const u8) !void {
     const is_assembler = cmd_args.len > 0 and std.mem.eql(u8, cmd_args[0], "assembler");
     const is_all = cmd_args.len > 0 and std.mem.eql(u8, cmd_args[0], "all");
+
+    // `--force` / `-f` allows `upgrade all` to apply a version that is older
+    // than what the project currently pins. Without it, downgrades are skipped.
+    var force = false;
+    for (cmd_args) |a| {
+        if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) force = true;
+    }
 
     // Everything except `assembler` / `all` delegates to the binary.
     if (!is_assembler and !is_all) {
@@ -34,10 +42,18 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
 
     if (is_all) {
         std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ project_config.CORE_VERSION, project_config.ENGINE_VERSION, project_config.GFX_VERSION, project_config.CLI_VERSION });
-        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, project_config.CORE_VERSION);
-        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, project_config.ENGINE_VERSION);
-        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, project_config.GFX_VERSION);
-        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, project_config.CLI_VERSION);
+
+        // Never silently downgrade a project. If the compatible-set target is
+        // older than the current pin, skip it (and warn) unless --force.
+        const core_target = pickTarget("core_version", cfg.core_version, project_config.CORE_VERSION, force);
+        const engine_target = pickTarget("engine_version", cfg.engine_version, project_config.ENGINE_VERSION, force);
+        const gfx_target = pickTarget("gfx_version", cfg.gfx_version, project_config.GFX_VERSION, force);
+        const cli_target = pickTarget("labelle_version", cfg.labelle_version, project_config.CLI_VERSION, force);
+
+        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, core_target);
+        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, engine_target);
+        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gfx_target);
+        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, cli_target);
         // Also upgrade assembler if it exists (or add it).
         if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
             const old_asm = cfg.assembler_version orelse "0.0.0";
@@ -66,6 +82,35 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
 
     std.debug.print("labelle: project.labelle updated\n", .{});
     std.debug.print("  run 'labelle generate' to regenerate build files\n", .{});
+}
+
+/// Resolve the version to apply for one field of `upgrade all`.
+///
+/// `upgrade all` pulls its "compatible set" from the CLI's bundled
+/// `versions.zon`. That file can lag behind the project's actual pins
+/// (see issue #223), so applying it blindly can *downgrade* a working
+/// project to versions that no longer build.
+///
+/// Guard: if `target` is older than `current`, do not move backwards —
+/// keep `current` and print a loud warning. `--force` overrides this.
+fn pickTarget(field_name: []const u8, current: []const u8, target: []const u8, force: bool) []const u8 {
+    if (util.parseVersion(target) < util.parseVersion(current)) {
+        if (force) {
+            std.debug.print(
+                "labelle: WARNING: forcing {s} downgrade {s} -> {s} (--force)\n",
+                .{ field_name, current, target },
+            );
+            return target;
+        }
+        std.debug.print(
+            "labelle: WARNING: skipping {s} downgrade {s} -> {s} " ++
+                "(compatible set is older than your pin; keeping {s}). " ++
+                "Pass --force to downgrade anyway.\n",
+            .{ field_name, current, target, current },
+        );
+        return current;
+    }
+    return target;
 }
 
 fn replaceAndFree(allocator: std.mem.Allocator, old_content: []u8, field_name: []const u8, old_value: []const u8, new_value: []const u8) ![]u8 {
