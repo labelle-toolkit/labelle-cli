@@ -7,7 +7,7 @@
 ///   2. `assembler_version` in project.labelle — pinned version resolved
 ///      from the cache at `~/.labelle/assembler/<version>/labelle-assembler`
 ///      If not cached, auto-downloads from GitHub releases (Phase 4).
-///   3. Absent — fall back to the bundled in-process generator
+///   3. Absent — download `DEFAULT_ASSEMBLER_VERSION` from GitHub releases.
 const std = @import("std");
 
 /// Default assembler version the CLI resolves/downloads when a project
@@ -16,7 +16,12 @@ const std = @import("std");
 /// assembler's `generator` module, so this is a pure runtime default —
 /// it must name an assembler binary release whose subcommand protocol
 /// the CLI's `assembler_proc` harness understands.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.8.0";
+///
+/// Must be >= the first release carrying the assembler subcommands the
+/// CLI delegates (`install`/`clean`/`upgrade`/`init`). Bumped from the
+/// obsolete `0.8.0` (generate-only) to the 0.31.0 line that ships them —
+/// keep this in lockstep with the assembler release.
+pub const DEFAULT_ASSEMBLER_VERSION = "0.31.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");

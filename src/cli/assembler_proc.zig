@@ -28,6 +28,13 @@ const std = @import("std");
 const config = @import("config.zig");
 const assembler = @import("assembler.zig");
 
+/// Minimum assembler subcommand protocol this CLI requires. The CLI
+/// delegates `install`/`clean`/`upgrade` (added at protocol 2) and
+/// `init` (protocol 3); an older binary lacks subcommands the CLI
+/// depends on. `resolve` checks this and fails early with a clear
+/// message instead of letting a stale binary reject a subcommand.
+pub const REQUIRED_PROTOCOL: u32 = 3;
+
 /// A located assembler binary, ready to be invoked. Returned by `resolve`
 /// so a caller that runs several subcommands can resolve once and reuse.
 pub const Assembler = struct {
@@ -68,7 +75,39 @@ pub const Assembler = struct {
 pub fn resolve(allocator: std.mem.Allocator, project_dir: []const u8) !Assembler {
     const path = try assembler.resolveAssembler(allocator, project_dir) orelse
         try assembler.resolveDefault(allocator);
+    errdefer allocator.free(path);
+    try checkProtocol(allocator, path);
     return .{ .path = path };
+}
+
+/// Verify the resolved binary speaks a protocol this CLI understands.
+/// `labelle-assembler --protocol-version` prints its integer protocol
+/// to stdout; fail fast and legibly here rather than letting an
+/// outdated binary reject a delegated subcommand opaquely.
+fn checkProtocol(allocator: std.mem.Allocator, path: []const u8) !void {
+    const res = std.process.run(allocator, config.globalIo(), .{
+        .argv = &.{ path, "--protocol-version" },
+    }) catch |err| {
+        std.debug.print("labelle: could not query assembler protocol ('{s}'): {any}\n", .{ path, err });
+        return error.AssemblerFailed;
+    };
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    const reported = std.mem.trim(u8, res.stdout, " \t\r\n");
+    const proto = std.fmt.parseInt(u32, reported, 10) catch {
+        std.debug.print(
+            "labelle: assembler '{s}' did not report a protocol version (too old?); this CLI needs protocol >= {d}\n",
+            .{ path, REQUIRED_PROTOCOL },
+        );
+        return error.AssemblerFailed;
+    };
+    if (proto < REQUIRED_PROTOCOL) {
+        std.debug.print(
+            "labelle: assembler '{s}' speaks protocol {d}, but this CLI needs >= {d} — pin a newer 'assembler_version' in project.labelle\n",
+            .{ path, proto, REQUIRED_PROTOCOL },
+        );
+        return error.AssemblerFailed;
+    }
 }
 
 /// One-shot convenience: locate the assembler and run a single subcommand.
@@ -156,8 +195,12 @@ fn spawnAndWait(
     switch (term) {
         .exited => |code| if (code != 0) {
             // The assembler already printed a diagnostic on its inherited
-            // stderr; surface the code so the CLI exits non-zero too.
-            return error.AssemblerFailed;
+            // stderr. Exit with its *exact* code so the CLI is a faithful
+            // proxy for the delegated subcommand — returning a plain
+            // `error.AssemblerFailed` would collapse every distinct
+            // failure (usage error, config error, build failure) to a
+            // single exit status 1.
+            std.process.exit(code);
         },
         else => {
             std.debug.print("labelle: assembler '{s}' terminated abnormally\n", .{exe_path});

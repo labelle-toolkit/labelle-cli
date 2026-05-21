@@ -33,6 +33,11 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     if (cfg.ecs != .mock) {
         try w.print("        .ecs = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.ecs)});
     }
+    // KNOWN GAP (#222): post-#217, GUI resolution moved into the
+    // assembler's `generate` subcommand, so the CLI never populates
+    // `cfg.resolved_gui` — this branch is currently dead and the
+    // `.gui` entry is omitted from labelle.lock. Restoring it needs
+    // the assembler to report the resolved GUI back to the CLI.
     if (cfg.resolved_gui) |gui| {
         try w.print("        .gui = .{{ .name = \"{s}\" }},\n", .{gui.name});
     }

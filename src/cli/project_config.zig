@@ -17,9 +17,10 @@
 //!
 //! These are PURE TYPES — no I/O, no templates. They mirror the
 //! assembler's `src/config.zig` field-for-field for the fields the CLI
-//! reads. `std.zon.parse` ignores unknown fields by default, so the
-//! assembler can add fields without breaking the CLI; only a field the
-//! CLI *uses* changing shape would require a matching edit here.
+//! reads. The CLI parses project.labelle with `.ignore_unknown_fields
+//! = true` (see `config.zig`), so the assembler can add fields without
+//! breaking the CLI; only a field the CLI *uses* changing shape would
+//! require a matching edit here.
 
 const std = @import("std");
 

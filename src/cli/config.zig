@@ -67,7 +67,14 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     const source = try allocator.dupeZ(u8, source_raw);
     errdefer allocator.free(source);
 
-    return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{}) catch |err| {
+    // `ignore_unknown_fields`: the CLI's `project_config.ProjectConfig`
+    // is a deliberately minimal copy of the assembler's schema (#217).
+    // The assembler owns the schema and may add fields the CLI does not
+    // mirror — without this, a newer project.labelle would fail to parse
+    // and break the CLI for no good reason.
+    return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
         if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
         return error.ParseError;
     };
