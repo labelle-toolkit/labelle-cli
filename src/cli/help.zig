@@ -1,5 +1,5 @@
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 
 pub fn printHelp() void {
     std.debug.print(
@@ -48,11 +48,11 @@ pub fn printHelp() void {
         \\  labelle test ../my-game --verbose
         \\  labelle test --no-libs
         \\
-    , .{gen.CLI_VERSION});
+    , .{project_config.CLI_VERSION});
 }
 
 pub fn printVersion() void {
-    std.debug.print("labelle v{s}\n", .{gen.CLI_VERSION});
+    std.debug.print("labelle v{s}\n", .{project_config.CLI_VERSION});
 }
 
 pub fn printTargets() void {

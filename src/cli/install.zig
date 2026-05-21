@@ -1,12 +1,16 @@
 const std = @import("std");
-const gen = @import("generator");
-const config = @import("config.zig");
-const cache = @import("cache.zig");
 const assembler = @import("assembler.zig");
+const assembler_proc = @import("assembler_proc.zig");
 
 /// Fetch and cache packages without modifying any project.
+///
+/// Issue #217 phase 1: package-cache work is delegated to the standalone
+/// `labelle-assembler` binary (`labelle-assembler install ...`). The one
+/// exception is `install assembler <version>`, which downloads the
+/// assembler *binary* itself — a CLI-owned bootstrap concern the
+/// assembler can't perform for itself.
 pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    // Handle `labelle install assembler <version>` and `labelle install assembler`
+    // `labelle install assembler <version>` — CLI bootstrap. Stays here.
     if (cmd_args.len >= 1 and std.mem.eql(u8, cmd_args[0], "assembler")) {
         if (cmd_args.len < 2) {
             std.debug.print("labelle install assembler: missing version argument\n", .{});
@@ -17,60 +21,24 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
         return assembler.cmdInstallAssembler(allocator, cmd_args[1]);
     }
 
+    // Every other form delegates to the assembler binary.
+    //
+    //   labelle install               → install deps for current project
+    //   labelle install <version>     → cache core/engine/gfx at a version
+    //   labelle install <pkg> <ver>   → cache one package
+    //
+    // The assembler `install` subcommand takes the project form via
+    // `--project-root`; the version/package forms are bare positionals.
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
     if (cmd_args.len == 0) {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const parsed = config.readProjectConfig(arena.allocator(), ".") catch {
-            std.debug.print("labelle install: no project.labelle found. Usage:\n", .{});
-            std.debug.print("  labelle install              — install deps for current project\n", .{});
-            std.debug.print("  labelle install <version>    — cache all packages at a version\n", .{});
-            std.debug.print("  labelle install core <ver>   — cache a specific package\n", .{});
-            return error.MissingArgument;
-        };
-        try cache.ensureCache(allocator, parsed);
-        std.debug.print("labelle: all packages cached\n", .{});
-        return;
-    }
-
-    if (cmd_args.len == 1) {
-        const version = cmd_args[0];
-        std.debug.print("labelle: caching all packages at version {s}...\n", .{version});
-
-        const packages = [_][]const u8{ "core", "engine", "gfx" };
-        for (packages) |pkg| {
-            if (!try gen.isFrameworkCached(allocator, pkg, version)) {
-                std.debug.print("  fetching {s} {s}...\n", .{ pkg, version });
-                try cache.fetchFrameworkWithFallback(allocator, pkg, version);
-            } else {
-                std.debug.print("  {s} {s} already cached\n", .{ pkg, version });
-            }
-        }
-
-        if (!try gen.isAssemblerCached(allocator, version)) {
-            std.debug.print("  fetching assembler {s}...\n", .{version});
-            try cache.fetchAssemblerWithFallback(allocator, version);
-        } else {
-            std.debug.print("  assembler {s} already cached\n", .{version});
-        }
-
-        std.debug.print("labelle: done\n", .{});
-        return;
-    }
-
-    const pkg_name = cmd_args[0];
-    const version = cmd_args[1];
-
-    if (std.mem.eql(u8, pkg_name, "core") or std.mem.eql(u8, pkg_name, "engine") or std.mem.eql(u8, pkg_name, "gfx")) {
-        std.debug.print("labelle: fetching {s} {s}...\n", .{ pkg_name, version });
-        try cache.fetchFrameworkWithFallback(allocator, pkg_name, version);
-    } else if (std.mem.eql(u8, pkg_name, "assembler")) {
-        std.debug.print("labelle: fetching assembler {s}...\n", .{version});
-        try cache.fetchAssemblerWithFallback(allocator, version);
+        // No args — install the current project's deps. The assembler
+        // needs `--project-root` to find project.labelle.
+        try argv.appendSlice(allocator, &.{ "--project-root", "." });
     } else {
-        std.debug.print("labelle install: unknown package '{s}'\n", .{pkg_name});
-        std.debug.print("  known packages: core, engine, gfx, assembler\n", .{});
-        return error.UnknownPackage;
+        try argv.appendSlice(allocator, cmd_args);
     }
 
-    std.debug.print("labelle: done\n", .{});
+    try assembler_proc.runSubcommand(allocator, ".", "install", argv.items);
 }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 
 /// Process-wide Io handle used by helpers in cli/* that historically
 /// used `std.fs.cwd()` (which no longer exists on 0.16). Must be
@@ -41,17 +41,17 @@ pub fn globalEnviron() std.process.Environ {
     return _global_environ;
 }
 
-pub fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
+pub fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !project_config.ProjectConfig {
     return readProjectConfigImpl(allocator, project_dir, true);
 }
 
 /// Same as readProjectConfig but without printing error messages.
 /// Used by commands where a missing project.labelle is expected (e.g. clean).
-pub fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
+pub fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const u8) !project_config.ProjectConfig {
     return readProjectConfigImpl(allocator, project_dir, false);
 }
 
-fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, verbose: bool) !gen.ProjectConfig {
+fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, verbose: bool) !project_config.ProjectConfig {
     // Raise branch quota for std.zon.parse.fromSlice — ProjectConfig has many
     // fields (including nested IosConfig) that exceed the default 1100 limit.
     @setEvalBranchQuota(10000);
@@ -67,7 +67,14 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     const source = try allocator.dupeZ(u8, source_raw);
     errdefer allocator.free(source);
 
-    return std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{}) catch |err| {
+    // `ignore_unknown_fields`: the CLI's `project_config.ProjectConfig`
+    // is a deliberately minimal copy of the assembler's schema (#217).
+    // The assembler owns the schema and may add fields the CLI does not
+    // mirror — without this, a newer project.labelle would fail to parse
+    // and break the CLI for no good reason.
+    return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
         if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
         return error.ParseError;
     };

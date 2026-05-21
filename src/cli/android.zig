@@ -11,7 +11,7 @@
 ///   android/deploy.zig    — GitHub Releases upload (labelle.games v1)
 ///   android/doctor.zig    — SDK/NDK probe + report
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 
 // ── Submodules ─────────────────────────────────────────────────────
 const build_mod = @import("android/build.zig");
@@ -107,7 +107,7 @@ pub const AbiArch = enum {
 pub fn handleAndroid(
     allocator: std.mem.Allocator,
     extra_args: []const []const u8,
-    cfg: gen.ProjectConfig,
+    cfg: project_config.ProjectConfig,
     target_dir: []const u8,
 ) !void {
     var subcmd: ?[]const u8 = null;

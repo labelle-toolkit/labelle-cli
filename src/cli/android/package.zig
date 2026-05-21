@@ -4,12 +4,13 @@
 /// (single- and multi-arch deploy paths share this module).
 const std = @import("std");
 const config = @import("../config.zig");
-const gen = @import("generator");
+const project_config = @import("../project_config.zig");
+const asm_cache = @import("../asm_cache.zig");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
 
-const ProjectConfig = gen.ProjectConfig;
-const AndroidConfig = gen.AndroidConfig;
+const ProjectConfig = project_config.ProjectConfig;
+const AndroidConfig = project_config.AndroidConfig;
 const SigningConfig = android.SigningConfig;
 const StagedAbi = android.StagedAbi;
 
@@ -460,7 +461,7 @@ fn findBuildTools(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 {
 
 /// Ensure a debug keystore exists at ~/.labelle/android-debug.keystore.
 fn ensureDebugKeystore(allocator: std.mem.Allocator) ![]u8 {
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const keystore = try std.fs.path.join(allocator, &.{ cache_root, "android-debug.keystore" });

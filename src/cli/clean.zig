@@ -1,8 +1,12 @@
 const std = @import("std");
-const gen = @import("generator");
-const config = @import("config.zig");
+const assembler_proc = @import("assembler_proc.zig");
 
 /// Remove unused cached package versions from ~/.labelle/packages/.
+///
+/// Issue #217 phase 1: delegated to the standalone `labelle-assembler`
+/// binary (`labelle-assembler clean ...`). The CLI keeps the same
+/// user-facing flags — `--dry-run` and `--project=<dir>` — and translates
+/// `--project=` to the assembler's `--project-root`.
 pub fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var dry_run = false;
     var project_dir: []const u8 = ".";
@@ -18,93 +22,13 @@ pub fn cmdClean(allocator: std.mem.Allocator, cmd_args: []const []const u8) !voi
         }
     }
 
-    const packages_dir = gen.getPackagesDir(allocator) catch {
-        std.debug.print("labelle: could not determine packages directory\n", .{});
-        return;
-    };
-    defer allocator.free(packages_dir);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    if (dry_run) try argv.append(allocator, "--dry-run");
+    try argv.appendSlice(allocator, &.{ "--project-root", project_dir });
 
-    std.debug.print("labelle: scanning {s}...\n", .{packages_dir});
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    var kept = std.StringHashMap(std.StringHashMap(void)).init(arena_alloc);
-
-    const pkg_names = [_][]const u8{ "core", "engine", "gfx", "cli" };
-    const default_versions = [_][]const u8{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION };
-
-    for (pkg_names, 0..) |name, i| {
-        var version_set = std.StringHashMap(void).init(arena_alloc);
-        try version_set.put(default_versions[i], {});
-        try kept.put(name, version_set);
-    }
-
-    var project_arena = std.heap.ArenaAllocator.init(allocator);
-    defer project_arena.deinit();
-    if (config.readProjectConfigQuiet(project_arena.allocator(), project_dir)) |cfg| {
-        const project_refs = [_]struct { name: []const u8, version: []const u8 }{
-            .{ .name = "core", .version = cfg.core_version },
-            .{ .name = "engine", .version = cfg.engine_version },
-            .{ .name = "gfx", .version = cfg.gfx_version },
-            .{ .name = "cli", .version = cfg.labelle_version },
-        };
-        for (project_refs) |ref| {
-            if (gen.isLocalVersion(ref.version)) continue;
-            if (kept.getPtr(ref.name)) |set| {
-                try set.put(ref.version, {});
-            }
-        }
-        std.debug.print("  found project.labelle in '{s}'\n", .{project_dir});
-    } else |_| {
-        std.debug.print("  no project.labelle found — keeping CLI default versions only\n", .{});
-    }
-
-    var removed_count: u32 = 0;
-
-    const io = config.globalIo();
-    for (pkg_names) |pkg_name| {
-        const pkg_dir_path = std.fs.path.join(arena_alloc, &.{ packages_dir, pkg_name }) catch continue;
-
-        var pkg_dir = std.Io.Dir.cwd().openDir(io, pkg_dir_path, .{ .iterate = true }) catch continue;
-        defer pkg_dir.close(io);
-
-        const version_set = kept.get(pkg_name) orelse continue;
-
-        var iter = pkg_dir.iterate();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind != .directory and entry.kind != .sym_link) continue;
-
-            if (version_set.contains(entry.name)) continue;
-
-            if (dry_run) {
-                std.debug.print("  would remove {s}/{s}\n", .{ pkg_name, entry.name });
-            } else {
-                const full_path = std.fs.path.join(arena_alloc, &.{ pkg_dir_path, entry.name }) catch continue;
-
-                if (entry.kind == .sym_link) {
-                    std.Io.Dir.cwd().deleteFile(io, full_path) catch |err| {
-                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
-                        continue;
-                    };
-                } else {
-                    std.Io.Dir.cwd().deleteTree(io, full_path) catch |err| {
-                        std.debug.print("  could not remove {s}/{s}: {any}\n", .{ pkg_name, entry.name, err });
-                        continue;
-                    };
-                }
-                std.debug.print("  removed {s}/{s}\n", .{ pkg_name, entry.name });
-            }
-            removed_count += 1;
-        }
-    }
-
-    if (removed_count == 0) {
-        std.debug.print("  nothing to clean\n", .{});
-    } else if (dry_run) {
-        std.debug.print("  {d} version(s) would be removed (use without --dry-run to delete)\n", .{removed_count});
-    } else {
-        std.debug.print("  cleaned {d} old version(s)\n", .{removed_count});
-    }
+    // `clean` can run from anywhere — pass project_dir so the assembler
+    // resolver checks that project's pinned version; with no
+    // project.labelle it falls back to the CLI-paired default.
+    try assembler_proc.runSubcommand(allocator, project_dir, "clean", argv.items);
 }

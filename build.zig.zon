@@ -4,22 +4,13 @@
     .version = "1.39.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Pulls the generator module from labelle-assembler (types,
-        // GUI resolver, cache helpers) instead of maintaining a
-        // hand-synced mirror under ./generator. Bump the commit SHA
-        // below to pick up new assembler types; the old mirror
-        // approach made every assembler change a double-edit (#151).
-        .labelle_assembler = .{
-            // Pinned to labelle-assembler 0.31.0 (#155) — depends on
-            // flow-codegen by URL instead of the `../labelle-gui`
-            // sibling path, so labelle-cli (and anything that fetches
-            // it, e.g. the flying-platform fly.io deploy) resolves
-            // cleanly. Use the full 40-char SHA — abbreviated SHAs in
-            // archive URLs can become ambiguous as upstream gains
-            // commits and GitHub will return 404 in that case.
-            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git#ec4c7e19d2eb736f573f9ca1e50eb1db2007c065",
-            .hash = "labelle_assembler-0.31.0-pG4XEBTfBwD9J_KehQsowaHW9Pj1ms7vHijCgChxcFsx",
-        },
+        // Issue #217: labelle-cli is a thin driver over the standalone
+        // labelle-assembler binary — it no longer compiles in the
+        // assembler's `generator` module. The former `labelle_assembler`
+        // package dependency (and the `flow_codegen` graph it dragged in)
+        // is gone: the CLI defines its own minimal `project.labelle`
+        // schema (src/cli/project_config.zig) and its own self-contained
+        // assembler-binary bootstrap (src/cli/asm_cache.zig).
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.9.1.tar.gz",
             .hash = "zspec-0.9.1-jaKLbbX4AwBKANdetxzzWc3UTO0UY0lcJJzTagQHlt5K",
