@@ -2,71 +2,60 @@ const std = @import("std");
 const gen = @import("generator");
 const assembler = @import("assembler.zig");
 const config = @import("config.zig");
+const assembler_proc = @import("assembler_proc.zig");
 
 /// Bump version fields in project.labelle.
+///
+/// Issue #217 phase 1: framework/cli version bumps are delegated to the
+/// standalone `labelle-assembler` binary (`labelle-assembler upgrade
+/// ...`). Two cases stay CLI-owned because they touch `assembler_version`
+/// — pinning the assembler *binary* version is a CLI-bootstrap concern,
+/// and the assembler doesn't manage its own pin:
+///   - `upgrade assembler [version]`
+///   - `upgrade all` (which also bumps `assembler_version`)
 pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig, cmd_args: []const []const u8) !void {
+    const is_assembler = cmd_args.len > 0 and std.mem.eql(u8, cmd_args[0], "assembler");
+    const is_all = cmd_args.len > 0 and std.mem.eql(u8, cmd_args[0], "all");
+
+    // Everything except `assembler` / `all` delegates to the binary.
+    if (!is_assembler and !is_all) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(allocator);
+        try argv.appendSlice(allocator, &.{ "--project-root", project_dir });
+        try argv.appendSlice(allocator, cmd_args);
+        return assembler_proc.runSubcommand(allocator, project_dir, "upgrade", argv.items);
+    }
+
+    // ── CLI-owned: cases that touch assembler_version ────────────────
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
 
     var content = try std.Io.Dir.cwd().readFileAlloc(config.globalIo(), labelle_path, allocator, .limited(1024 * 1024));
 
-    if (cmd_args.len == 0) {
+    if (is_all) {
         std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION });
         content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
         content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
         content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
         content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
-    } else {
-        const pkg = cmd_args[0];
-        const default_version: []const u8 = if (std.mem.eql(u8, pkg, "core"))
-            gen.CORE_VERSION
-        else if (std.mem.eql(u8, pkg, "engine"))
-            gen.ENGINE_VERSION
-        else if (std.mem.eql(u8, pkg, "gfx"))
-            gen.GFX_VERSION
-        else if (std.mem.eql(u8, pkg, "assembler"))
-            assembler.DEFAULT_ASSEMBLER_VERSION
-        else
-            gen.CLI_VERSION;
-        const version = if (cmd_args.len > 1) cmd_args[1] else default_version;
-
-        if (std.mem.eql(u8, pkg, "core")) {
-            content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, version);
-        } else if (std.mem.eql(u8, pkg, "engine")) {
-            content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, version);
-        } else if (std.mem.eql(u8, pkg, "gfx")) {
-            content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, version);
-        } else if (std.mem.eql(u8, pkg, "labelle") or std.mem.eql(u8, pkg, "cli")) {
-            content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, version);
-        } else if (std.mem.eql(u8, pkg, "assembler")) {
-            // If assembler_version already exists, replace it; otherwise append it before the closing `}`
-            if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
-                const old_asm = cfg.assembler_version orelse "0.0.0";
-                content = try replaceAndFree(allocator, content, "assembler_version", old_asm, version);
-            } else {
-                // Insert assembler_version before the final closing brace
-                content = try insertBeforeClosingBrace(allocator, content, "assembler_version", version);
-            }
-        } else if (std.mem.eql(u8, pkg, "all")) {
-            content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
-            content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
-            content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
-            content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
-            // Also upgrade assembler if it exists (or add it)
-            if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
-                const old_asm = cfg.assembler_version orelse "0.0.0";
-                content = try replaceAndFree(allocator, content, "assembler_version", old_asm, assembler.DEFAULT_ASSEMBLER_VERSION);
-            } else {
-                content = try insertBeforeClosingBrace(allocator, content, "assembler_version", assembler.DEFAULT_ASSEMBLER_VERSION);
-            }
+        // Also upgrade assembler if it exists (or add it).
+        if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
+            const old_asm = cfg.assembler_version orelse "0.0.0";
+            content = try replaceAndFree(allocator, content, "assembler_version", old_asm, assembler.DEFAULT_ASSEMBLER_VERSION);
         } else {
-            std.debug.print("labelle upgrade: unknown package '{s}'\n", .{pkg});
-            std.debug.print("  packages: core, engine, gfx, cli, assembler, all\n", .{});
-            allocator.free(content);
-            return error.UnknownPackage;
+            content = try insertBeforeClosingBrace(allocator, content, "assembler_version", assembler.DEFAULT_ASSEMBLER_VERSION);
         }
-
-        std.debug.print("labelle: upgrading {s} to {s}...\n", .{ pkg, version });
+        std.debug.print("labelle: upgrading all to compatible set...\n", .{});
+    } else {
+        // is_assembler
+        const version = if (cmd_args.len > 1) cmd_args[1] else assembler.DEFAULT_ASSEMBLER_VERSION;
+        if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
+            const old_asm = cfg.assembler_version orelse "0.0.0";
+            content = try replaceAndFree(allocator, content, "assembler_version", old_asm, version);
+        } else {
+            content = try insertBeforeClosingBrace(allocator, content, "assembler_version", version);
+        }
+        std.debug.print("labelle: upgrading assembler to {s}...\n", .{version});
     }
 
     try std.Io.Dir.cwd().writeFile(config.globalIo(), .{
