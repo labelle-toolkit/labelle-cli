@@ -1,6 +1,7 @@
 const std = @import("std");
 const project_config = @import("project_config.zig");
 const config = @import("config.zig");
+const asm_cache = @import("asm_cache.zig");
 
 /// Write labelle.lock into the project root.
 pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig) !void {
@@ -33,13 +34,24 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     if (cfg.ecs != .mock) {
         try w.print("        .ecs = .{{ .name = \"{s}\" }},\n", .{@tagName(cfg.ecs)});
     }
-    // KNOWN GAP (#222): post-#217, GUI resolution moved into the
-    // assembler's `generate` subcommand, so the CLI never populates
-    // `cfg.resolved_gui` — this branch is currently dead and the
-    // `.gui` entry is omitted from labelle.lock. Restoring it needs
-    // the assembler to report the resolved GUI back to the CLI.
+    // GUI plugin (#222). Post-#217 the assembler owns GUI *resolution*
+    // (it reads `gui.labelle`, validates bridges, populates
+    // `cfg.resolved_gui`), so `cfg.resolved_gui` is always null on the
+    // CLI side. To keep the GUI from silently vanishing from
+    // labelle.lock, the CLI re-derives the plugin name here from the
+    // declared `gui:` reference in project.labelle:
+    //   - `cfg.resolved_gui` is preferred when present (future-proof: if
+    //     the assembler ever reports it back, this picks it up).
+    //   - otherwise `guiLockName` reads the plugin's `gui.labelle`
+    //     manifest `name` (the same authoritative field the assembler
+    //     uses) when the plugin directory is locally resolvable, and
+    //     falls back to a name derived from the declared reference.
     if (cfg.resolved_gui) |gui| {
         try w.print("        .gui = .{{ .name = \"{s}\" }},\n", .{gui.name});
+    } else if (cfg.gui) |gui_ref| {
+        const name = guiLockName(allocator, project_dir, cfg, gui_ref);
+        defer if (name.owned) allocator.free(name.value);
+        try w.print("        .gui = .{{ .name = \"{s}\" }},\n", .{name.value});
     }
 
     try w.writeAll("    },\n");
@@ -63,4 +75,342 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
         .sub_path = lock_path,
         .data = aw.written(),
     });
+}
+
+/// A GUI plugin name destined for the lock file, plus whether the buffer
+/// is heap-owned (and therefore must be freed by the caller).
+const GuiName = struct {
+    value: []const u8,
+    owned: bool,
+};
+
+/// Minimal subset of the `gui.labelle` manifest — only the `name` field,
+/// which is the authoritative GUI plugin name the assembler also keys on.
+/// `ignore_unknown_fields` lets the rest of the manifest evolve freely.
+const GuiManifestName = struct {
+    name: []const u8,
+};
+
+/// Re-derive the GUI plugin name for the lock file from the declared
+/// `gui:` reference in project.labelle.
+///
+/// Preferred source is the plugin's own `gui.labelle` manifest `name`
+/// field — the same value the assembler resolves into `resolved_gui`.
+/// The lock file is written during `labelle generate`, which runs after
+/// `labelle install` has populated the package cache, so the CLI can read
+/// the manifest directly for every reference the assembler can resolve:
+///   - `gui.path`   → `<project_dir>/<path>` (always local).
+///   - `gui.plugin` → a `.plugins` entry. Local repos (`local:` / `@`)
+///     resolve to their path; remote repos resolve to their cached
+///     directory under `~/.labelle/packages/plugins/<repo>/<version>`
+///     (the same path `cache.resolvePlugin` produces).
+///
+/// `gui.package` / `gui.url` are not resolvable here: the assembler's own
+/// `gui_resolve.zig` does not resolve those forms either (it is a TODO —
+/// it only supports `.path` and `.plugin`), so there is no shared cache
+/// path to read. Those fall back to a best-effort label derived from the
+/// declared reference. See `resolveGuiPluginDir`.
+///
+/// When the manifest is genuinely unreadable (cache miss, missing file,
+/// parse error) the name falls back to a best-effort label derived from
+/// the declared reference so the GUI still appears in the lock.
+fn guiLockName(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    cfg: project_config.ProjectConfig,
+    gui_ref: project_config.GuiPlugin,
+) GuiName {
+    if (resolveGuiPluginDir(allocator, project_dir, cfg, gui_ref)) |plugin_dir| {
+        defer allocator.free(plugin_dir);
+        if (readGuiManifestName(allocator, plugin_dir)) |name| {
+            return .{ .value = name, .owned = true };
+        }
+    }
+    // Fallback: a label derived from the declared reference. Borrowed
+    // slices from `cfg` (no allocation, no free).
+    return .{ .value = fallbackGuiName(gui_ref), .owned = false };
+}
+
+/// Resolve the GUI plugin directory.
+///
+/// Handles every reference form the assembler's `gui_resolve.zig` can
+/// resolve, using the same resolution scheme:
+///   - `gui.path`   → `<project_dir>/<path>`.
+///   - `gui.plugin` → a `.plugins` entry. Local repos resolve to their
+///     `local:` / `@` path; remote repos resolve to their cached
+///     directory in `~/.labelle/packages/plugins/<repo>/<version>`.
+///     Remote plugins are present there because the lock file is written
+///     after `labelle install` has populated the cache.
+///
+/// Returns null for `gui.package` / `gui.url`: the assembler does not
+/// resolve those forms yet (`gui_resolve.zig:resolvePluginDir` rejects
+/// them with `error.GuiPluginResolutionNotSupported`), so there is no
+/// authoritative cache path to read — the caller falls back. If the
+/// assembler ever gains `.package` / `.url` resolution, this should be
+/// extended to mirror whatever cache path it lands them at.
+fn resolveGuiPluginDir(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    cfg: project_config.ProjectConfig,
+    gui_ref: project_config.GuiPlugin,
+) ?[]const u8 {
+    if (gui_ref.path) |rel_path| {
+        return std.fs.path.resolve(allocator, &.{ project_dir, rel_path }) catch null;
+    }
+    if (gui_ref.plugin) |name| {
+        const dep = cfg.getPlugin(name) orelse return null;
+        if (dep.isLocal())
+            return std.fs.path.resolve(allocator, &.{ project_dir, dep.localPath() }) catch null;
+        // Remote plugin — resolve from the package cache the same way
+        // `cache.resolvePlugin` does. `labelle install` ran before the
+        // lock file is written, so the plugin is already cached here.
+        return asm_cache.resolveRemotePluginDir(allocator, dep.repo, dep.version) catch null;
+    }
+    return null;
+}
+
+/// Read the `name` field from `<plugin_dir>/gui.labelle`. Returns a
+/// heap-owned copy, or null if the manifest cannot be used.
+///
+/// A *missing* manifest is silent and expected (e.g. a remote plugin not
+/// yet fetched). But a manifest that exists yet fails to read or parse
+/// is a real fault: the lock file then silently records a *derived*
+/// fallback name that can diverge from the assembler-resolved identity.
+/// Such failures emit a warning so the resulting lockfile drift is
+/// diagnosable instead of mysterious.
+fn readGuiManifestName(allocator: std.mem.Allocator, plugin_dir: []const u8) ?[]const u8 {
+    const manifest_path = std.fs.path.join(allocator, &.{ plugin_dir, "gui.labelle" }) catch return null;
+    defer allocator.free(manifest_path);
+
+    const raw = std.Io.Dir.cwd().readFileAlloc(
+        config.globalIo(),
+        manifest_path,
+        allocator,
+        .limited(64 * 1024),
+    ) catch |err| {
+        // FileNotFound is expected (plugin not present) — stay silent.
+        // Anything else (permissions, I/O error, size limit) is a real
+        // fault worth surfacing.
+        if (err != error.FileNotFound) {
+            std.debug.print(
+                "labelle: warning: could not read GUI manifest '{s}': {s} — labelle.lock .gui name falls back to a derived value\n",
+                .{ manifest_path, @errorName(err) },
+            );
+        }
+        return null;
+    };
+    defer allocator.free(raw);
+
+    const raw_z = allocator.dupeZ(u8, raw) catch return null;
+    defer allocator.free(raw_z);
+
+    const manifest = std.zon.parse.fromSliceAlloc(
+        GuiManifestName,
+        allocator,
+        raw_z,
+        null,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| {
+        // The manifest file exists but won't parse — warn so the
+        // fallback name in labelle.lock is not silently misleading.
+        std.debug.print(
+            "labelle: warning: could not parse GUI manifest '{s}': {s} — labelle.lock .gui name falls back to a derived value\n",
+            .{ manifest_path, @errorName(err) },
+        );
+        return null;
+    };
+    defer std.zon.parse.free(allocator, manifest);
+
+    if (manifest.name.len == 0) {
+        std.debug.print(
+            "labelle: warning: GUI manifest '{s}' has an empty .name — labelle.lock .gui name falls back to a derived value\n",
+            .{manifest_path},
+        );
+        return null;
+    }
+    return allocator.dupe(u8, manifest.name) catch null;
+}
+
+/// Best-effort GUI name from the declared reference when the manifest
+/// cannot be read. Borrows slices from the reference — no allocation.
+fn fallbackGuiName(gui_ref: project_config.GuiPlugin) []const u8 {
+    if (gui_ref.plugin) |name| return name;
+    if (gui_ref.path) |path| return lastPathComponent(path);
+    if (gui_ref.package) |pkg| return pkg;
+    if (gui_ref.url) |url| return lastPathComponent(url);
+    return "unknown";
+}
+
+/// Trailing path/URL component, stripping any trailing slashes.
+fn lastPathComponent(s: []const u8) []const u8 {
+    var end = s.len;
+    while (end > 0 and (s[end - 1] == '/' or s[end - 1] == '\\')) end -= 1;
+    var start = end;
+    while (start > 0 and s[start - 1] != '/' and s[start - 1] != '\\') start -= 1;
+    if (start == end) return s;
+    return s[start..end];
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "lastPathComponent: trailing component of a relative path" {
+    try testing.expectEqualStrings("imgui-plugin", lastPathComponent("../plugins/imgui-plugin"));
+}
+
+test "lastPathComponent: strips trailing slash" {
+    try testing.expectEqualStrings("nuklear", lastPathComponent("libs/nuklear/"));
+}
+
+test "lastPathComponent: bare name passes through" {
+    try testing.expectEqualStrings("gui", lastPathComponent("gui"));
+}
+
+test "fallbackGuiName: prefers the declared plugin reference name" {
+    const ref = project_config.GuiPlugin{ .plugin = "my-gui", .path = "../whatever" };
+    try testing.expectEqualStrings("my-gui", fallbackGuiName(ref));
+}
+
+test "fallbackGuiName: derives from path when no plugin reference" {
+    const ref = project_config.GuiPlugin{ .path = "../plugins/imgui-plugin" };
+    try testing.expectEqualStrings("imgui-plugin", fallbackGuiName(ref));
+}
+
+test "fallbackGuiName: derives from package, then url" {
+    try testing.expectEqualStrings("zig-nuklear", fallbackGuiName(.{ .package = "zig-nuklear" }));
+    try testing.expectEqualStrings("repo", fallbackGuiName(.{ .url = "https://example.com/repo" }));
+}
+
+test "fallbackGuiName: unknown when nothing is declared" {
+    try testing.expectEqualStrings("unknown", fallbackGuiName(.{}));
+}
+
+test "guiLockName: reads authoritative name from gui.labelle manifest" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(config.globalIo(), .{
+        .sub_path = "gui.labelle",
+        .data =
+        \\.{
+        \\    .name = "imgui",
+        \\    .rendering = .raw_backend,
+        \\}
+        ,
+    });
+
+    const plugin_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(plugin_dir);
+
+    // project_dir is unused for an absolute-style relative `path` join here;
+    // pass "." so the resolved dir is exactly `plugin_dir`.
+    const cfg = project_config.ProjectConfig{ .name = "t" };
+    const name = guiLockName(alloc, ".", cfg, .{ .path = plugin_dir });
+    defer if (name.owned) alloc.free(name.value);
+
+    try testing.expect(name.owned);
+    try testing.expectEqualStrings("imgui", name.value);
+}
+
+test "guiLockName: falls back to reference name when manifest is missing" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{}); // empty dir — no gui.labelle
+    defer tmp.cleanup();
+    const plugin_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(plugin_dir);
+
+    const cfg = project_config.ProjectConfig{ .name = "t" };
+    const name = guiLockName(alloc, ".", cfg, .{ .path = plugin_dir });
+    defer if (name.owned) alloc.free(name.value);
+
+    // No manifest → borrowed fallback derived from the path's last component.
+    try testing.expect(!name.owned);
+    try testing.expectEqualStrings(lastPathComponent(plugin_dir), name.value);
+}
+
+test "guiLockName: remote plugin with empty cache falls back to reference name" {
+    const alloc = testing.allocator;
+    // `gui.plugin` referencing a remote (non-local) plugin whose package
+    // cache directory does not exist (not installed): resolution finds no
+    // manifest, so it falls back to the declared reference name.
+    var tmp = testing.tmpDir(.{}); // empty — no packages/ tree
+    defer tmp.cleanup();
+    const cache_root = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(cache_root);
+    asm_cache.setCacheRootOverride(cache_root);
+    defer asm_cache.clearCacheRootOverride();
+
+    const cfg = project_config.ProjectConfig{
+        .name = "t",
+        .plugins = &.{.{ .name = "remote-gui", .repo = "github.com/acme/g", .version = "1.0.0" }},
+    };
+    const name = guiLockName(alloc, ".", cfg, .{ .plugin = "remote-gui" });
+    defer if (name.owned) alloc.free(name.value);
+
+    try testing.expect(!name.owned);
+    try testing.expectEqualStrings("remote-gui", name.value);
+}
+
+test "guiLockName: remote plugin reads authoritative name from package cache" {
+    const alloc = testing.allocator;
+    // A remote `gui.plugin` reference, fetched into the package cache by
+    // `labelle install`. The lock file must record the authoritative
+    // `gui.labelle` `name`, not the local `.plugins` alias.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(cache_root);
+    asm_cache.setCacheRootOverride(cache_root);
+    defer asm_cache.clearCacheRootOverride();
+
+    // Lay out the cached plugin exactly where cache.resolvePlugin expects:
+    //   <cache-root>/packages/plugins/<repo>/<version>/gui.labelle
+    const repo = "github.com/acme/imgui-gui";
+    const version = "2.3.0";
+    const rel_dir = try std.fs.path.join(alloc, &.{ "packages", "plugins", repo, version });
+    defer alloc.free(rel_dir);
+    try tmp.dir.createDirPath(config.globalIo(), rel_dir);
+    const rel_manifest = try std.fs.path.join(alloc, &.{ rel_dir, "gui.labelle" });
+    defer alloc.free(rel_manifest);
+    try tmp.dir.writeFile(config.globalIo(), .{
+        .sub_path = rel_manifest,
+        .data = ".{ .name = \"imgui\", .rendering = .raw_backend }",
+    });
+
+    const cfg = project_config.ProjectConfig{
+        .name = "t",
+        // The `.plugins` alias ("remote-gui") deliberately differs from the
+        // authoritative manifest name ("imgui").
+        .plugins = &.{.{ .name = "remote-gui", .repo = repo, .version = version }},
+    };
+    const name = guiLockName(alloc, ".", cfg, .{ .plugin = "remote-gui" });
+    defer if (name.owned) alloc.free(name.value);
+
+    try testing.expect(name.owned);
+    try testing.expectEqualStrings("imgui", name.value);
+}
+
+test "writeLockFile-style: gui entry is emitted from a declared path reference" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(config.globalIo(), .{
+        .sub_path = "gui.labelle",
+        .data = ".{ .name = \"nuklear\", .rendering = .render_interface }",
+    });
+    const plugin_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(plugin_dir);
+
+    const cfg = project_config.ProjectConfig{ .name = "t", .gui = .{ .path = plugin_dir } };
+
+    // Re-derive exactly what writeLockFile would print for the `.gui` line.
+    try testing.expect(cfg.resolved_gui == null); // CLI never populates this
+    const gui_ref = cfg.gui.?;
+    const name = guiLockName(alloc, ".", cfg, gui_ref);
+    defer if (name.owned) alloc.free(name.value);
+    try testing.expectEqualStrings("nuklear", name.value);
 }
