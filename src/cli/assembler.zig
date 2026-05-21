@@ -340,54 +340,11 @@ pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Spawn `labelle-assembler generate` against the given project and
-/// inherit stdio so the user sees the binary's diagnostics directly.
-/// Forwards the same overrides the in-process path applies (scene,
-/// platform, backend) so the binary produces identical output.
-///
-/// On a non-zero exit code, returns `error.AssemblerFailed`. The
-/// binary's stderr already explains what went wrong.
-pub fn spawnGenerate(
-    allocator: std.mem.Allocator,
-    exe_path: []const u8,
-    project_dir: []const u8,
-    scene_override: ?[]const u8,
-    platform: gen.Platform,
-    backend: gen.Backend,
-) !void {
-    const io = config.globalIo();
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    try argv.appendSlice(allocator, &.{ exe_path, "generate", "--project-root", project_dir });
-
-    if (scene_override) |s| try argv.appendSlice(allocator, &.{ "--scene", s });
-
-    // Always forward platform/backend so the binary doesn't have to
-    // re-derive what the CLI may have already mutated (e.g. for the
-    // `labelle ios` subcommand which forces sokol+ios).
-    try argv.appendSlice(allocator, &.{ "--platform", @tagName(platform) });
-    try argv.appendSlice(allocator, &.{ "--backend", @tagName(backend) });
-
-    var child = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    });
-
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            std.debug.print("labelle: assembler '{s}' exited with code {d}\n", .{ exe_path, code });
-            return error.AssemblerFailed;
-        },
-        else => {
-            std.debug.print("labelle: assembler '{s}' terminated abnormally\n", .{exe_path});
-            return error.AssemblerFailed;
-        },
-    }
-}
+// Issue #217 phase 2: `generate` subprocess invocation moved to the
+// shared harness `cli/assembler_proc.zig` (`assembler_proc.generate`).
+// This module keeps only the bootstrap concern — locating/downloading the
+// assembler binary — which the harness builds on via `resolveAssembler` /
+// `resolveDefault`.
 
 /// If `project_dir` is a git worktree, return the path of the main checkout.
 /// Otherwise return a copy of `project_dir` unchanged.

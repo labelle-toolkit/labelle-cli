@@ -113,7 +113,7 @@ fn copyTree(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !voi
 /// No staleness on iterative builds: this only acts on entries that are
 /// *currently symlinks*, but every `labelle build --docker` invocation
 /// runs the assembler's `generate` step first (cli.zig calls
-/// `assembler.spawnGenerate` unconditionally before `docker.runBuild`).
+/// `assembler_proc.generate` unconditionally before `docker.runBuild`).
 /// The assembler's `linkDir` is idempotent and explicitly recreates each
 /// game-dir symlink even when the path is already a real directory left
 /// over from a prior `materializeSymlinks` run — it detects the

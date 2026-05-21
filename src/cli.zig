@@ -31,6 +31,7 @@ const lockfile = @import("cli/lockfile.zig");
 const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const assembler = @import("cli/assembler.zig");
+const assembler_proc = @import("cli/assembler_proc.zig");
 const bake_mod = @import("cli/bake.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
@@ -733,20 +734,27 @@ pub fn main(proc_init: std.process.Init) !void {
         };
     }
 
-    // Route through the standalone labelle-assembler binary.
-    // Resolution order: LABELLE_ASSEMBLER env var > assembler_version
-    // in project.labelle. If neither is set, auto-downloads the default version.
-    const asm_path = try assembler.resolveAssembler(allocator, project_dir) orelse
-        try assembler.resolveDefault(allocator);
-    defer allocator.free(asm_path);
-    std.debug.print("  using assembler: {s}\n", .{asm_path});
-    try assembler.spawnGenerate(
+    // Issue #217 phase 2: delegate code generation to the standalone
+    // labelle-assembler binary via the shared subprocess harness, instead
+    // of calling the in-process `gen.generate()`. The harness resolves the
+    // binary (LABELLE_ASSEMBLER env var > assembler_version in
+    // project.labelle > auto-downloaded default) and forwards `generate`.
+    //
+    // `build` / `run` are not assembler subcommands: the subsequent
+    // `zig build` invocation and binary launch stay CLI-side (see below).
+    // The CLI owns docker orchestration, the WASM serve loop, the
+    // iOS/Android deploy paths and `--timeout` — generation is the only
+    // step the assembler binary delegates.
+    const asm_bin = try assembler_proc.resolve(allocator, project_dir);
+    defer asm_bin.deinit(allocator);
+    std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
+    try assembler_proc.generate(
+        asm_bin,
         allocator,
-        asm_path,
         project_dir,
         parsed_args.scene_override,
-        parsed.platform,
-        parsed.backend,
+        @tagName(parsed.platform),
+        @tagName(parsed.backend),
     );
 
     // Target subdir: .labelle/raylib_desktop/, etc.

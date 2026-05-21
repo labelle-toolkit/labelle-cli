@@ -87,6 +87,44 @@ pub fn runSubcommand(
     try asm_bin.run(allocator, subcommand, args);
 }
 
+/// Run `labelle-assembler generate` against `project_dir`.
+///
+/// Issue #217 phase 2: the CLI's `generate` / `build` / `run` commands
+/// delegate code generation to the assembler binary instead of calling
+/// the in-process `generate()`. `build` / `run` then invoke `zig build`
+/// (and launch the binary) themselves — those steps stay CLI-side because
+/// the CLI owns docker orchestration, WASM serve, the iOS/Android deploy
+/// paths and `--timeout`; only the generation step is delegated.
+///
+/// `platform` / `backend` are forwarded as plain strings (`@tagName` of
+/// the CLI's enums) so this module needs no dependency on the assembler's
+/// type definitions. The assembler validates them against its own enums.
+/// `scene_override` mirrors the user-facing `--scene` flag.
+///
+/// On a non-zero exit code, returns `error.AssemblerFailed`; the binary's
+/// inherited stderr already explains the failure.
+pub fn generate(
+    asm_bin: Assembler,
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    scene_override: ?[]const u8,
+    platform: []const u8,
+    backend: []const u8,
+) !void {
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+
+    try args.appendSlice(allocator, &.{ "--project-root", project_dir });
+    if (scene_override) |s| try args.appendSlice(allocator, &.{ "--scene", s });
+    // Always forward platform/backend — the CLI may have mutated them
+    // (e.g. `labelle ios` forces sokol+ios) and the binary must not
+    // re-derive its own values from project.labelle.
+    try args.appendSlice(allocator, &.{ "--platform", platform });
+    try args.appendSlice(allocator, &.{ "--backend", backend });
+
+    try asm_bin.run(allocator, "generate", args.items);
+}
+
 /// Spawn `exe_path <subcommand> [args...]`, inherit stdio, wait, and map
 /// the result onto a Zig error. Shared by `Assembler.run` and
 /// `runSubcommand`.
