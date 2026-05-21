@@ -652,9 +652,11 @@ pub fn main(proc_init: std.process.Init) !void {
         return;
     };
 
-    // Apply --scene override
+    // Normalize the deprecated `.initial_scene` alias (RFC #560 / #565)
+    // into `.initial_prefab`, then apply the --scene override on top.
+    parsed.normalizeInitialPrefab();
     if (parsed_args.scene_override) |scene| {
-        parsed.initial_scene = scene;
+        parsed.initial_prefab = scene;
     }
 
     // Apply --platform override

@@ -245,7 +245,16 @@ pub const ProjectConfig = struct {
     gfx_version: []const u8 = GFX_VERSION,
     labelle_version: []const u8 = CLI_VERSION,
 
-    /// Explicit initial scene name.
+    /// Explicit initial prefab name. RFC #560 / issue #565 (unify scenes
+    /// and prefabs) renamed `.initial_scene` to `.initial_prefab`. The
+    /// legacy `.initial_scene` field below is still accepted for backward
+    /// compatibility but is deprecated; `initial_prefab` wins when both
+    /// are set. Mirrors `labelle-assembler` `src/config.zig`.
+    initial_prefab: ?[]const u8 = null,
+    /// Deprecated legacy alias for `initial_prefab`. Still accepted in
+    /// `project.labelle` so existing projects keep parsing; when both are
+    /// set, `initial_prefab` wins. Prefer reading
+    /// `resolvedInitialPrefab()` instead of this field directly.
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas / sound / font resources.
     resources: []const ResourceDef = &.{},
@@ -290,5 +299,34 @@ pub const ProjectConfig = struct {
     /// Returns true if a GUI plugin is resolved and active.
     pub fn hasGui(self: ProjectConfig) bool {
         return self.resolved_gui != null;
+    }
+
+    /// Returns the effective initial-prefab name, preferring the new
+    /// `initial_prefab` field and falling back to the deprecated
+    /// `initial_scene` legacy alias. `initial_prefab` wins when both are
+    /// set. Mirrors `labelle-assembler` `src/config.zig`.
+    pub fn resolvedInitialPrefab(self: ProjectConfig) ?[]const u8 {
+        return self.initial_prefab orelse self.initial_scene;
+    }
+
+    /// Normalizes the deprecated `initial_scene` alias into
+    /// `initial_prefab` and clears the legacy field. Emits a deprecation
+    /// warning when the legacy alias was present. RFC #560 / issue #565.
+    pub fn normalizeInitialPrefab(self: *ProjectConfig) void {
+        if (self.initial_scene) |legacy| {
+            if (self.initial_prefab == null) {
+                std.debug.print(
+                    "project.labelle: `.initial_scene` is deprecated; rename it to `.initial_prefab` (`.initial_scene` will be removed in a future release)\n",
+                    .{},
+                );
+                self.initial_prefab = legacy;
+            } else {
+                std.debug.print(
+                    "project.labelle: both `.initial_prefab` and `.initial_scene` are set; `.initial_scene` is deprecated and ignored\n",
+                    .{},
+                );
+            }
+            self.initial_scene = null;
+        }
     }
 };
