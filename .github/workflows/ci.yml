@@ -46,19 +46,14 @@ jobs:
           ref: main
           path: labelle-gui
 
-      # labelle-cli #217: the CLI is now a thin driver — `clean`, `init`,
+      # labelle-cli #217: the CLI is a thin driver — `clean`, `init`,
       # etc. delegate to the standalone labelle-assembler binary, so CI
-      # must build one for the "Test CLI commands" steps. Pinned to the
-      # #217 assembler branch because the CLI requires assembler protocol
-      # 3 (the install/clean/upgrade/init subcommands); `main` is still
-      # protocol 1.
-      # TODO(#217): drop the `ref:` override once labelle-assembler #158
-      # lands on main.
+      # must build one for the "Test CLI commands" steps.
       - name: Checkout labelle-assembler
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
-          ref: feat/217-phase3-init-delegation
+          ref: main
           path: labelle-assembler
 
       - name: Setup Zig
@@ -170,13 +165,10 @@ jobs:
           ref: main
           path: labelle-gfx
 
-      # TODO(#217): drop the `ref:` override once labelle-assembler #158
-      # lands on main — the CLI requires assembler protocol 3 (the
-      # install/clean/upgrade/init subcommands); `main` is still protocol 1.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
-          ref: feat/217-phase3-init-delegation
+          ref: main
           path: labelle-assembler
 
       # labelle-assembler's build.zig.zon has a `.path = "../labelle-gui/flow-codegen"`
@@ -258,13 +250,10 @@ jobs:
           ref: main
           path: labelle-gfx
 
-      # TODO(#217): drop the `ref:` override once labelle-assembler #158
-      # lands on main — the CLI requires assembler protocol 3 (the
-      # install/clean/upgrade/init subcommands); `main` is still protocol 1.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
-          ref: feat/217-phase3-init-delegation
+          ref: main
           path: labelle-assembler
 
       # labelle-assembler's build.zig.zon has a `.path = "../labelle-gui/flow-codegen"`
