@@ -6,7 +6,7 @@
 /// Dispatcher lives in the parent `android.zig` which parses the flags
 /// and hands them over as `DeployOpts`.
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("../project_config.zig");
 
 const util = @import("../util.zig");
 const android = @import("../android.zig");
@@ -30,7 +30,7 @@ pub const DeployOpts = struct {
 pub fn cmdDeploy(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
-    cfg: gen.ProjectConfig,
+    cfg: project_config.ProjectConfig,
     opts: DeployOpts,
 ) !void {
     const tag = opts.tag orelse {
@@ -75,7 +75,7 @@ pub fn cmdDeploy(
     // `packageApkWithAbis` uses `android.app_name ?? cfg.title`; we
     // mirror that precedence, then fall back to `cfg.name` instead of
     // printing an empty label if both are blank.
-    const android_cfg = cfg.android orelse gen.AndroidConfig{};
+    const android_cfg = cfg.android orelse project_config.AndroidConfig{};
     const app_label = if (android_cfg.app_name.len > 0)
         android_cfg.app_name
     else if (cfg.title.len > 0)

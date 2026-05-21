@@ -1,9 +1,9 @@
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 
 /// Write labelle.lock into the project root.
-pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig) !void {
+pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig) !void {
     var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
@@ -15,7 +15,7 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
         \\
     );
 
-    try w.print("    .cli_version = \"{s}\",\n", .{gen.CLI_VERSION});
+    try w.print("    .cli_version = \"{s}\",\n", .{project_config.CLI_VERSION});
     try w.print("    .resolved = .{{\n", .{});
     try w.print("        .core = .{{ .version = \"{s}\" }},\n", .{cfg.core_version});
     try w.print("        .engine = .{{ .version = \"{s}\" }},\n", .{cfg.engine_version});

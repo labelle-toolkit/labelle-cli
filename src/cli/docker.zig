@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 
 const ZIG_VERSION = "0.16.0";
@@ -202,7 +202,7 @@ fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
 /// For macOS targets, shares the Zig cache and injects xcode-frameworks paths.
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
-pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
+pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: project_config.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
     const abs_target = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), target_dir, allocator);
     defer allocator.free(abs_target);
 

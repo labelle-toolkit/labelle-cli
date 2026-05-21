@@ -1,8 +1,8 @@
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 
 /// Validate that declared dependency versions are compatible with each other.
-pub fn validateCompatibility(cfg: gen.ProjectConfig) void {
+pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
     validateStates(cfg.states);
 
     // Validate backend+platform combination
@@ -12,7 +12,7 @@ pub fn validateCompatibility(cfg: gen.ProjectConfig) void {
         std.process.exit(1);
     }
 
-    const is_local = gen.isLocalVersion;
+    const is_local = project_config.isLocalVersion;
     var warnings: u8 = 0;
 
     const core_mm = if (!is_local(cfg.core_version)) parseMajorMinor(cfg.core_version) else null;

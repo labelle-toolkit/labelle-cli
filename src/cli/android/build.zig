@@ -2,7 +2,7 @@
 /// (`--all-abis`) paths, plus the `buildAndPackage` helper that
 /// both `android build` and `android deploy` use.
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("../project_config.zig");
 const runner = @import("../runner.zig");
 const android = @import("../android.zig");
 const package = @import("package.zig");
@@ -163,7 +163,7 @@ pub fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulat
 pub fn buildAndPackage(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
-    cfg: gen.ProjectConfig,
+    cfg: project_config.ProjectConfig,
     release_mode: ReleaseMode,
     all_abis: bool,
     emulator: bool,

@@ -8,7 +8,7 @@
 //! sibling automatically (see labelle-assembler main_zig.zig).
 
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 
 const stbi = @cImport({
@@ -26,7 +26,7 @@ const header_len: usize = magic.len + 8;
 pub fn run(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
-    resources: []const gen.ResourceDef,
+    resources: []const project_config.ResourceDef,
 ) !void {
     var baked: usize = 0;
     var skipped: usize = 0;

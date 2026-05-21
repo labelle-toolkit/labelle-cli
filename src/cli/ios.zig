@@ -1,13 +1,13 @@
 /// iOS build, deployment, and Xcode project generation for labelle-cli.
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 const runner = @import("runner.zig");
 const config = @import("config.zig");
 
 /// Deploy the built iOS binary to the iOS Simulator.
 /// Expects the binary at `target_dir/zig-out/bin/game`.
-pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig) !void {
-    const ios_cfg = cfg.ios orelse gen.IosConfig{};
+pub fn deployToSimulator(allocator: std.mem.Allocator, target_dir: []const u8, cfg: project_config.ProjectConfig) !void {
+    const ios_cfg = cfg.ios orelse project_config.IosConfig{};
     const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else try defaultBundleId(allocator, cfg.name);
     const app_name = if (ios_cfg.app_name.len > 0) ios_cfg.app_name else cfg.title;
 
@@ -193,7 +193,7 @@ fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8)
 }
 
 /// Generate Info.plist with full iOS metadata.
-fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_name: []const u8, ios_cfg: gen.IosConfig) ![]const u8 {
+fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_name: []const u8, ios_cfg: project_config.IosConfig) ![]const u8 {
     const orientations = switch (ios_cfg.orientation) {
         .portrait =>
         \\    <array>
@@ -268,7 +268,7 @@ fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_na
 // ============================================================================
 
 /// Handle `labelle ios <subcommand>` — build, xcode, run for iOS.
-pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, cfg: gen.ProjectConfig, target_dir: []const u8) !void {
+pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, cfg: project_config.ProjectConfig, target_dir: []const u8) !void {
     if (args.len == 0) {
         printIosHelp();
         return;
@@ -380,8 +380,8 @@ fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, 
 }
 
 /// Generate Xcode project for device deployment and code signing.
-fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, team_id_override: ?[]const u8) !void {
-    const ios_cfg = cfg.ios orelse gen.IosConfig{};
+fn iosXcode(allocator: std.mem.Allocator, target_dir: []const u8, cfg: project_config.ProjectConfig, team_id_override: ?[]const u8) !void {
+    const ios_cfg = cfg.ios orelse project_config.IosConfig{};
     const app_name = if (ios_cfg.app_name.len > 0) ios_cfg.app_name else cfg.title;
     const bundle_id = if (ios_cfg.bundle_id.len > 0) ios_cfg.bundle_id else try defaultBundleId(allocator, cfg.name);
     const minimum_ios = ios_cfg.minimum_ios;

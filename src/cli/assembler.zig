@@ -10,13 +10,15 @@
 ///   3. Absent — fall back to the bundled in-process generator
 const std = @import("std");
 
-/// Default assembler version pinned in newly scaffolded projects.
-/// Bump this in lockstep with the labelle_assembler dep in build.zig.zon —
-/// a stale value here would auto-download a binary whose ABI doesn't match
-/// the bundled generator module the CLI is compiled against.
+/// Default assembler version the CLI resolves/downloads when a project
+/// pins none (no `assembler_version` in project.labelle, no
+/// `LABELLE_ASSEMBLER` override). Issue #217: the CLI no longer links the
+/// assembler's `generator` module, so this is a pure runtime default —
+/// it must name an assembler binary release whose subcommand protocol
+/// the CLI's `assembler_proc` harness understands.
 pub const DEFAULT_ASSEMBLER_VERSION = "0.8.0";
 const builtin = @import("builtin");
-const gen = @import("generator");
+const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
@@ -186,7 +188,7 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
 /// Caller owns the returned slice and must free it.
 pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
     const io = config.globalIo();
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", DEFAULT_ASSEMBLER_VERSION, exe_name });
@@ -242,7 +244,7 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     }
 
     // Resolve from cache: ~/.labelle/assembler/<version>/labelle-assembler
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
@@ -278,7 +280,7 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
 /// Called by `labelle install assembler <version>`.
 pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !void {
     const io = config.globalIo();
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", version, exe_name });
@@ -298,7 +300,7 @@ pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !v
 /// List cached assembler versions by scanning ~/.labelle/assembler/.
 pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
     const io = config.globalIo();
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_dir = try std.fs.path.join(allocator, &.{ cache_root, "assembler" });

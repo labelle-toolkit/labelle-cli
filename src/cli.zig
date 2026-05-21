@@ -15,7 +15,7 @@
 ///   labelle clean [--dry-run]           — prune unused package versions
 ///   labelle test [dir] [--verbose]      — run inline `test` blocks across the project source tree
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("cli/project_config.zig");
 
 // Submodules
 const help = @import("cli/help.zig");
@@ -28,7 +28,6 @@ const test_cmd_mod = @import("cli/test.zig");
 const config = @import("cli/config.zig");
 const compatibility = @import("cli/compatibility.zig");
 const lockfile = @import("cli/lockfile.zig");
-const cache = @import("cli/cache.zig");
 const runner = @import("cli/runner.zig");
 const assembler = @import("cli/assembler.zig");
 const assembler_proc = @import("cli/assembler_proc.zig");
@@ -100,7 +99,7 @@ fn parseSceneFlag(
 
 const ParseError = error{TooManyArguments};
 
-const Platform = gen.Platform;
+const Platform = project_config.Platform;
 
 const ParsedArgs = struct {
     command: Command,
@@ -422,10 +421,9 @@ pub fn main(proc_init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize the process-wide Io for both the assembler's helpers
-    // (used via `gen.*`) and the CLI's own filesystem/env helpers. Must
-    // happen before any submodule reaches for `globalIo()`/`globalEnviron()`.
-    gen.initGlobalIo(proc_init.minimal);
+    // Initialize the process-wide Io for the CLI's filesystem/env
+    // helpers. Must happen before any submodule reaches for
+    // `globalIo()`/`globalEnviron()`.
     config.initGlobalIo(proc_init.minimal);
 
     var args = try std.process.Args.Iterator.initAllocator(proc_init.minimal.args, allocator);
@@ -619,7 +617,7 @@ pub fn main(proc_init: std.process.Init) !void {
         if (std.mem.eql(u8, first, "doctor")) {
             var doctor_arena = std.heap.ArenaAllocator.init(allocator);
             defer doctor_arena.deinit();
-            const project_cfg: ?gen.AndroidConfig = blk: {
+            const project_cfg: ?project_config.AndroidConfig = blk: {
                 const parsed_cfg = config.readProjectConfigQuiet(doctor_arena.allocator(), project_dir) catch break :blk null;
                 break :blk parsed_cfg.android;
             };
@@ -698,20 +696,34 @@ pub fn main(proc_init: std.process.Init) !void {
         return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     }
 
-    // Ensure package cache is populated
-    try cache.ensureCache(allocator, parsed);
-
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
 
-    // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
-    try gen.resolveGuiPlugin(arena.allocator(), &parsed, project_dir);
+    // Issue #217: the CLI is a thin driver over the standalone
+    // labelle-assembler binary. Resolve it once here (LABELLE_ASSEMBLER
+    // env var > assembler_version in project.labelle > auto-downloaded
+    // default) and reuse the located binary for both the cache-populate
+    // step and code generation below.
+    const asm_bin = try assembler_proc.resolve(allocator, project_dir);
+    defer asm_bin.deinit(allocator);
+    std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
+
+    // Ensure the package cache is populated. The assembler's `generate`
+    // subcommand assumes a populated cache (it does not fetch packages
+    // itself), so delegate `install --project-root` to the binary first.
+    // This replaces the CLI's former in-process `cache.ensureCache`,
+    // which depended on the assembler's `generator` module.
+    try asm_bin.run(allocator, "install", &.{ "--project-root", project_dir });
 
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
     defer allocator.free(output_dir);
 
-    const gui_label: []const u8 = if (parsed.resolved_gui) |gui| gui.name else "none";
+    // GUI resolution (reading the plugin's gui.labelle manifest) is owned
+    // by the assembler's `generate` subcommand — the CLI no longer
+    // resolves it. The status line reports whether a GUI is *configured*
+    // in project.labelle; the assembler logs the resolved plugin name.
+    const gui_label: []const u8 = if (parsed.gui != null) "configured" else "none";
     std.debug.print("labelle: generating '{s}'...\n", .{parsed.name});
     std.debug.print("  backend: {s}  platform: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
         @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
@@ -736,18 +748,14 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Issue #217 phase 2: delegate code generation to the standalone
     // labelle-assembler binary via the shared subprocess harness, instead
-    // of calling the in-process `gen.generate()`. The harness resolves the
-    // binary (LABELLE_ASSEMBLER env var > assembler_version in
-    // project.labelle > auto-downloaded default) and forwards `generate`.
+    // of calling an in-process generator. The binary was located above
+    // (`asm_bin`) and already used for the `install` cache-populate step.
     //
     // `build` / `run` are not assembler subcommands: the subsequent
     // `zig build` invocation and binary launch stay CLI-side (see below).
     // The CLI owns docker orchestration, the WASM serve loop, the
     // iOS/Android deploy paths and `--timeout` — generation is the only
     // step the assembler binary delegates.
-    const asm_bin = try assembler_proc.resolve(allocator, project_dir);
-    defer asm_bin.deinit(allocator);
-    std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
     try assembler_proc.generate(
         asm_bin,
         allocator,

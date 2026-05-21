@@ -1,5 +1,5 @@
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 const assembler = @import("assembler.zig");
 const config = @import("config.zig");
 const assembler_proc = @import("assembler_proc.zig");
@@ -13,7 +13,7 @@ const assembler_proc = @import("assembler_proc.zig");
 /// and the assembler doesn't manage its own pin:
 ///   - `upgrade assembler [version]`
 ///   - `upgrade all` (which also bumps `assembler_version`)
-pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: gen.ProjectConfig, cmd_args: []const []const u8) !void {
+pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig, cmd_args: []const []const u8) !void {
     const is_assembler = cmd_args.len > 0 and std.mem.eql(u8, cmd_args[0], "assembler");
     const is_all = cmd_args.len > 0 and std.mem.eql(u8, cmd_args[0], "all");
 
@@ -33,11 +33,11 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: ge
     var content = try std.Io.Dir.cwd().readFileAlloc(config.globalIo(), labelle_path, allocator, .limited(1024 * 1024));
 
     if (is_all) {
-        std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION });
-        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, gen.CORE_VERSION);
-        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
-        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
-        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
+        std.debug.print("labelle: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})...\n", .{ project_config.CORE_VERSION, project_config.ENGINE_VERSION, project_config.GFX_VERSION, project_config.CLI_VERSION });
+        content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, project_config.CORE_VERSION);
+        content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, project_config.ENGINE_VERSION);
+        content = try replaceAndFree(allocator, content, "gfx_version", cfg.gfx_version, project_config.GFX_VERSION);
+        content = try replaceAndFree(allocator, content, "labelle_version", cfg.labelle_version, project_config.CLI_VERSION);
         // Also upgrade assembler if it exists (or add it).
         if (std.mem.indexOf(u8, content, ".assembler_version")) |_| {
             const old_asm = cfg.assembler_version orelse "0.0.0";
