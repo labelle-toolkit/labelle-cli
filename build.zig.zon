@@ -10,14 +10,15 @@
         // below to pick up new assembler types; the old mirror
         // approach made every assembler change a double-edit (#151).
         .labelle_assembler = .{
-            // Pinned to labelle-assembler feat/android-immersive-mode —
-            // adds `AndroidConfig.immersive_mode`, consumed by
-            // `generateAndroidManifest()` to emit the fullscreen theme.
-            // Use the full 40-char SHA — abbreviated SHAs in archive
-            // URLs can become ambiguous as upstream gains commits and
-            // GitHub will return 404 in that case.
-            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git#63e4f84f90df8e16e0aa53746ed089ce5a6e1759",
-            .hash = "labelle_assembler-0.27.0-pG4XEJrMBwCEDYrNr8cd71lGt-u7aRK4R7az5TivXCXh",
+            // Pinned to labelle-assembler 0.31.0 (#155) — depends on
+            // flow-codegen by URL instead of the `../labelle-gui`
+            // sibling path, so labelle-cli (and anything that fetches
+            // it, e.g. the flying-platform fly.io deploy) resolves
+            // cleanly. Use the full 40-char SHA — abbreviated SHAs in
+            // archive URLs can become ambiguous as upstream gains
+            // commits and GitHub will return 404 in that case.
+            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git#ec4c7e19d2eb736f573f9ca1e50eb1db2007c065",
+            .hash = "labelle_assembler-0.31.0-pG4XEBTfBwD9J_KehQsowaHW9Pj1ms7vHijCgChxcFsx",
         },
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.9.1.tar.gz",
