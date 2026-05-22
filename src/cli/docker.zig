@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 
 const ZIG_VERSION = "0.16.0";
@@ -113,7 +113,7 @@ fn copyTree(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !voi
 /// No staleness on iterative builds: this only acts on entries that are
 /// *currently symlinks*, but every `labelle build --docker` invocation
 /// runs the assembler's `generate` step first (cli.zig calls
-/// `assembler.spawnGenerate` unconditionally before `docker.runBuild`).
+/// `assembler_proc.generate` unconditionally before `docker.runBuild`).
 /// The assembler's `linkDir` is idempotent and explicitly recreates each
 /// game-dir symlink even when the path is already a real directory left
 /// over from a prior `materializeSymlinks` run — it detects the
@@ -202,7 +202,7 @@ fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
 /// For macOS targets, shares the Zig cache and injects xcode-frameworks paths.
 /// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
-pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: gen.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
+pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: project_config.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
     const abs_target = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), target_dir, allocator);
     defer allocator.free(abs_target);
 

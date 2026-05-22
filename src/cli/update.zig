@@ -1,5 +1,6 @@
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("project_config.zig");
+const asm_cache = @import("asm_cache.zig");
 const util = @import("util.zig");
 const config = @import("config.zig");
 
@@ -18,7 +19,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     }
 
     std.debug.print("labelle: checking for updates...\n", .{});
-    std.debug.print("  current version: {s}\n\n", .{gen.CLI_VERSION});
+    std.debug.print("  current version: {s}\n\n", .{project_config.CLI_VERSION});
 
     var target_version: []const u8 = undefined;
     var target_version_owned: ?[]u8 = null;
@@ -55,14 +56,14 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         target_version = target_version_owned.?;
     }
 
-    const current = util.parseVersion(gen.CLI_VERSION);
+    const current = util.parseVersion(project_config.CLI_VERSION);
     const target = util.parseVersion(target_version);
 
     if (current >= target) {
         if (current > target) {
-            std.debug.print("  you are running a newer version ({s}) than {s}\n", .{ gen.CLI_VERSION, target_version });
+            std.debug.print("  you are running a newer version ({s}) than {s}\n", .{ project_config.CLI_VERSION, target_version });
         } else {
-            std.debug.print("  already on the latest version ({s})\n", .{gen.CLI_VERSION});
+            std.debug.print("  already on the latest version ({s})\n", .{project_config.CLI_VERSION});
         }
         return;
     }
@@ -123,7 +124,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         _ = util.runCmd(allocator, &.{ "chmod", "+x", tmp_path }) catch {};
     }
 
-    const cache_root = gen.getCacheRoot(allocator) catch {
+    const cache_root = asm_cache.getCacheRoot(allocator) catch {
         std.debug.print("labelle: could not determine cache root\n", .{});
         return;
     };

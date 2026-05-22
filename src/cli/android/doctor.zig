@@ -3,10 +3,10 @@
 /// debugging aid before `build` / `run` / `deploy` try to use the
 /// toolchain and blow up with cryptic errors.
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("../project_config.zig");
 const android_sdk = @import("../android_sdk.zig");
 
-pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) !void {
+pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?project_config.AndroidConfig) !void {
     // Every probe allocates path strings and the checks list; they all
     // live until the report is printed at the end of this function. An
     // arena matches that lifetime exactly and avoids tracking every
@@ -15,7 +15,7 @@ pub fn runDoctor(allocator: std.mem.Allocator, android_cfg: ?gen.AndroidConfig) 
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const resolved = android_cfg orelse gen.AndroidConfig{};
+    const resolved = android_cfg orelse project_config.AndroidConfig{};
     const info = try android_sdk.detect(arena_alloc, .{
         .target_sdk_version = resolved.target_sdk_version,
         // In doctor mode the NDK miss is still a hard failure — builds

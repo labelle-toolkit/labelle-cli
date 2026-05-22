@@ -10,20 +10,19 @@ pub fn build(b: *std.Build) void {
     // Library versions from versions.zon — the tested compatible set for this CLI release
     const versions = @import("versions.zon");
 
-    // ── Generator module from labelle-assembler ─────────────────────
-    // Pulled via the labelle_assembler Zig package dep declared in
-    // build.zig.zon. The module exposes the same types/functions the
-    // CLI used to read from a hand-synced mirror at ./generator (see
-    // #151 and #132 for the history).
-    const gen_dep = b.dependency("labelle_assembler", .{
-        .target = target,
-        .optimize = optimize,
-        .cli_version = @as([]const u8, version),
-        .core_version = @as([]const u8, versions.core),
-        .engine_version = @as([]const u8, versions.engine),
-        .gfx_version = @as([]const u8, versions.gfx),
-    });
-    const gen_mod = gen_dep.module("generator");
+    // ── Build options ────────────────────────────────────────────────
+    // Issue #217: the CLI is a thin driver over the standalone
+    // labelle-assembler binary and no longer links the assembler's
+    // `generator` module. The `project.labelle` schema the CLI reads
+    // (src/cli/project_config.zig) pins default framework versions and
+    // the CLI version — those come from this `build_options` module
+    // instead of the assembler package's build options.
+    const options = b.addOptions();
+    options.addOption([]const u8, "cli_version", version);
+    options.addOption([]const u8, "core_version", versions.core);
+    options.addOption([]const u8, "engine_version", versions.engine);
+    options.addOption([]const u8, "gfx_version", versions.gfx);
+    const build_options_mod = options.createModule();
 
     const gen_exe = b.addExecutable(.{
         .name = "labelle",
@@ -32,7 +31,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "generator", .module = gen_mod },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
     });
@@ -55,7 +54,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "generator", .module = gen_mod },
+                .{ .name = "build_options", .module = build_options_mod },
                 .{ .name = "zspec", .module = zspec_dep.module("zspec") },
             },
         }),

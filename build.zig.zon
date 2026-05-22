@@ -1,24 +1,16 @@
 .{
     .fingerprint = 0xa3d95bf7b905a401,
     .name = .labelle_cli,
-    .version = "1.39.0",
+    .version = "1.40.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Pulls the generator module from labelle-assembler (types,
-        // GUI resolver, cache helpers) instead of maintaining a
-        // hand-synced mirror under ./generator. Bump the commit SHA
-        // below to pick up new assembler types; the old mirror
-        // approach made every assembler change a double-edit (#151).
-        .labelle_assembler = .{
-            // Pinned to labelle-assembler feat/android-immersive-mode —
-            // adds `AndroidConfig.immersive_mode`, consumed by
-            // `generateAndroidManifest()` to emit the fullscreen theme.
-            // Use the full 40-char SHA — abbreviated SHAs in archive
-            // URLs can become ambiguous as upstream gains commits and
-            // GitHub will return 404 in that case.
-            .url = "git+https://github.com/labelle-toolkit/labelle-assembler.git#63e4f84f90df8e16e0aa53746ed089ce5a6e1759",
-            .hash = "labelle_assembler-0.27.0-pG4XEJrMBwCEDYrNr8cd71lGt-u7aRK4R7az5TivXCXh",
-        },
+        // Issue #217: labelle-cli is a thin driver over the standalone
+        // labelle-assembler binary — it no longer compiles in the
+        // assembler's `generator` module. The former `labelle_assembler`
+        // package dependency (and the `flow_codegen` graph it dragged in)
+        // is gone: the CLI defines its own minimal `project.labelle`
+        // schema (src/cli/project_config.zig) and its own self-contained
+        // assembler-binary bootstrap (src/cli/asm_cache.zig).
         .zspec = .{
             .url = "https://github.com/apotema/zspec/archive/v0.9.1.tar.gz",
             .hash = "zspec-0.9.1-jaKLbbX4AwBKANdetxzzWc3UTO0UY0lcJJzTagQHlt5K",

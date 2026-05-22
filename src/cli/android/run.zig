@@ -2,7 +2,7 @@
 /// `adb install -r`, and launch the NativeActivity. Built on top of
 /// `android/package.zig` for the packaging half.
 const std = @import("std");
-const gen = @import("generator");
+const project_config = @import("../project_config.zig");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
 const package = @import("package.zig");
@@ -14,7 +14,7 @@ const StagedAbi = android.StagedAbi;
 /// Package APK and deploy to device/emulator via ADB. Single-arch
 /// entry point — picks the ABI from `emulator` + host arch, then
 /// delegates to `deployToDeviceWithAbis`.
-pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: gen.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
+pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: project_config.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
     const abi_dir = package.hostAbiDir(emulator);
     const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_path);
@@ -31,7 +31,7 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
 pub fn deployToDeviceWithAbis(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
-    cfg: gen.ProjectConfig,
+    cfg: project_config.ProjectConfig,
     abis: []const StagedAbi,
     signing: SigningConfig,
 ) !void {

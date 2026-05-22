@@ -7,16 +7,23 @@
 ///   2. `assembler_version` in project.labelle — pinned version resolved
 ///      from the cache at `~/.labelle/assembler/<version>/labelle-assembler`
 ///      If not cached, auto-downloads from GitHub releases (Phase 4).
-///   3. Absent — fall back to the bundled in-process generator
+///   3. Absent — download `DEFAULT_ASSEMBLER_VERSION` from GitHub releases.
 const std = @import("std");
 
-/// Default assembler version pinned in newly scaffolded projects.
-/// Bump this in lockstep with the labelle_assembler dep in build.zig.zon —
-/// a stale value here would auto-download a binary whose ABI doesn't match
-/// the bundled generator module the CLI is compiled against.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.8.0";
+/// Default assembler version the CLI resolves/downloads when a project
+/// pins none (no `assembler_version` in project.labelle, no
+/// `LABELLE_ASSEMBLER` override). Issue #217: the CLI no longer links the
+/// assembler's `generator` module, so this is a pure runtime default —
+/// it must name an assembler binary release whose subcommand protocol
+/// the CLI's `assembler_proc` harness understands.
+///
+/// Must be >= the first release carrying the assembler subcommands the
+/// CLI delegates (`install`/`clean`/`upgrade`/`init`). Bumped from the
+/// obsolete `0.8.0` (generate-only) to the 0.31.0 line that ships them —
+/// keep this in lockstep with the assembler release.
+pub const DEFAULT_ASSEMBLER_VERSION = "0.31.0";
 const builtin = @import("builtin");
-const gen = @import("generator");
+const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
@@ -186,7 +193,7 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
 /// Caller owns the returned slice and must free it.
 pub fn resolveDefault(allocator: std.mem.Allocator) ![]u8 {
     const io = config.globalIo();
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", DEFAULT_ASSEMBLER_VERSION, exe_name });
@@ -242,7 +249,7 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
     }
 
     // Resolve from cache: ~/.labelle/assembler/<version>/labelle-assembler
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", pinned_version, exe_name });
@@ -278,7 +285,7 @@ pub fn resolveAssembler(allocator: std.mem.Allocator, project_dir: []const u8) !
 /// Called by `labelle install assembler <version>`.
 pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !void {
     const io = config.globalIo();
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_path = try std.fs.path.join(allocator, &.{ cache_root, "assembler", version, exe_name });
@@ -298,7 +305,7 @@ pub fn cmdInstallAssembler(allocator: std.mem.Allocator, version: []const u8) !v
 /// List cached assembler versions by scanning ~/.labelle/assembler/.
 pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
     const io = config.globalIo();
-    const cache_root = try gen.getCacheRoot(allocator);
+    const cache_root = try asm_cache.getCacheRoot(allocator);
     defer allocator.free(cache_root);
 
     const asm_dir = try std.fs.path.join(allocator, &.{ cache_root, "assembler" });
@@ -340,54 +347,11 @@ pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Spawn `labelle-assembler generate` against the given project and
-/// inherit stdio so the user sees the binary's diagnostics directly.
-/// Forwards the same overrides the in-process path applies (scene,
-/// platform, backend) so the binary produces identical output.
-///
-/// On a non-zero exit code, returns `error.AssemblerFailed`. The
-/// binary's stderr already explains what went wrong.
-pub fn spawnGenerate(
-    allocator: std.mem.Allocator,
-    exe_path: []const u8,
-    project_dir: []const u8,
-    scene_override: ?[]const u8,
-    platform: gen.Platform,
-    backend: gen.Backend,
-) !void {
-    const io = config.globalIo();
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    try argv.appendSlice(allocator, &.{ exe_path, "generate", "--project-root", project_dir });
-
-    if (scene_override) |s| try argv.appendSlice(allocator, &.{ "--scene", s });
-
-    // Always forward platform/backend so the binary doesn't have to
-    // re-derive what the CLI may have already mutated (e.g. for the
-    // `labelle ios` subcommand which forces sokol+ios).
-    try argv.appendSlice(allocator, &.{ "--platform", @tagName(platform) });
-    try argv.appendSlice(allocator, &.{ "--backend", @tagName(backend) });
-
-    var child = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    });
-
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            std.debug.print("labelle: assembler '{s}' exited with code {d}\n", .{ exe_path, code });
-            return error.AssemblerFailed;
-        },
-        else => {
-            std.debug.print("labelle: assembler '{s}' terminated abnormally\n", .{exe_path});
-            return error.AssemblerFailed;
-        },
-    }
-}
+// Issue #217 phase 2: `generate` subprocess invocation moved to the
+// shared harness `cli/assembler_proc.zig` (`assembler_proc.generate`).
+// This module keeps only the bootstrap concern — locating/downloading the
+// assembler binary — which the harness builds on via `resolveAssembler` /
+// `resolveDefault`.
 
 /// If `project_dir` is a git worktree, return the path of the main checkout.
 /// Otherwise return a copy of `project_dir` unchanged.
