@@ -15,10 +15,10 @@
             .url = "https://github.com/apotema/zspec/archive/v0.9.1.tar.gz",
             .hash = "zspec-0.9.1-jaKLbbX4AwBKANdetxzzWc3UTO0UY0lcJJzTagQHlt5K",
         },
-        .zstbi = .{
-            .url = "git+https://github.com/zig-gamedev/zstbi?ref=main#3813f5f113b26f644cfa01a30155cc76b3526e91",
-            .hash = "zstbi-0.11.0-dev-L0Ea_3GWBwAh7m54XX055vwLKPTPij5hyqyeq92MXPE2",
-        },
+        // `labelle pack` (#214) decodes/encodes PNG via the vendored stb
+        // C sources in src/cli/ (stb_image*.h + stb_image_impl.c), wired
+        // through `wireStb` in build.zig. It is NOT a Zig package, so no
+        // dependency entry is needed here.
     },
     .paths = .{
         "build.zig",
