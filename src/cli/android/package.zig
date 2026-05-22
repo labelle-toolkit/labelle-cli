@@ -510,7 +510,7 @@ fn defaultPackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u
 }
 
 /// Copy a directory tree recursively.
-fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+pub fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     // Don't swallow createDirPath errors. PathAlreadyExists is fine — every
