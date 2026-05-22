@@ -35,14 +35,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // stb_image for the pre-bake step (PNG → LRGBA). Header-only .h
-    // paired with an implementation .c that instantiates the symbols.
-    gen_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/cli/stb_image_impl.c"),
-        .flags = &.{"-std=c99"},
-    });
-    gen_exe.root_module.addIncludePath(b.path("src/cli"));
-    gen_exe.root_module.link_libc = true;
+    wireStb(b, gen_exe.root_module);
     b.installArtifact(gen_exe);
 
     const gen_run = b.addRunArtifact(gen_exe);
@@ -66,16 +59,22 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // Test binary imports the same modules as `gen_exe`, including
-    // `bake.zig` which `@cImport`s stb_image. Reproduce the stb
-    // wiring so the test build finds the header and links libc.
-    cli_tests.root_module.addCSourceFile(.{
-        .file = b.path("src/cli/stb_image_impl.c"),
-        .flags = &.{"-std=c99"},
-    });
-    cli_tests.root_module.addIncludePath(b.path("src/cli"));
-    cli_tests.root_module.link_libc = true;
+    wireStb(b, cli_tests.root_module);
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
+}
+
+/// Compile the vendored stb implementation (PNG decode + encode) and
+/// put its headers on the include path. Two consumers `@cImport` those
+/// headers: `src/cli/bake.zig` (decode, for the PNG→LRGBA prebake) and
+/// `src/texpack/` (decode + encode, for `labelle pack`). A single `.c`
+/// provides one definition of the symbols for both.
+fn wireStb(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{
+        .file = b.path("src/cli/stb_image_impl.c"),
+        .flags = &.{"-std=c99"},
+    });
+    mod.addIncludePath(b.path("src/cli"));
+    mod.link_libc = true;
 }

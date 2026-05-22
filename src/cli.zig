@@ -37,8 +37,9 @@ const serve = @import("cli/serve.zig");
 const ios = @import("cli/ios.zig");
 const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
+const pack = @import("cli/pack.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -491,6 +492,9 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "test")) {
             parsed_args.command = .test_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "pack")) {
+            parsed_args.command = .pack_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "ios")) {
             parsed_args.command = .ios_cmd;
             // First non-flag arg that isn't a subcommand is the project dir
@@ -595,6 +599,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .update_cmd => return update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .test_cmd => return test_cmd_mod.cmdTest(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .pack_cmd => return pack.cmdPack(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
