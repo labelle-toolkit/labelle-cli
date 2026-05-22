@@ -10,6 +10,7 @@
 ///   android/run.zig       — adb install + launch
 ///   android/deploy.zig    — GitHub Releases upload (labelle.games v1)
 ///   android/doctor.zig    — SDK/NDK probe + report
+///   android/studio.zig    — Android Studio (Gradle) project generation
 const std = @import("std");
 const project_config = @import("project_config.zig");
 
@@ -19,6 +20,7 @@ const package_mod = @import("android/package.zig");
 const run_mod = @import("android/run.zig");
 const deploy_mod = @import("android/deploy.zig");
 const doctor_mod = @import("android/doctor.zig");
+const studio_mod = @import("android/studio.zig");
 
 // ── Public re-exports ──────────────────────────────────────────────
 // Keeps `android.buildAndPackage`, `android.deployToDevice`, etc.
@@ -33,6 +35,7 @@ pub const deployToDevice = run_mod.deployToDevice;
 pub const deployToDeviceWithAbis = run_mod.deployToDeviceWithAbis;
 pub const DeployOpts = deploy_mod.DeployOpts;
 pub const cmdDeploy = deploy_mod.cmdDeploy;
+pub const androidStudio = studio_mod.androidStudio;
 
 // ── Shared types ───────────────────────────────────────────────────
 // These cross submodule boundaries (flag parsing here populates them,
@@ -206,6 +209,8 @@ pub fn handleAndroid(
             .emulator = emulator,
             .signing = signing,
         });
+    } else if (std.mem.eql(u8, cmd, "studio")) {
+        try studio_mod.androidStudio(allocator, target_dir, cfg);
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         try doctor_mod.runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -242,6 +247,7 @@ pub fn printHelp() void {
         \\Commands:
         \\  build      Build for Android device (arm64)
         \\  run        Build and deploy to device/emulator
+        \\  studio     Generate an Android Studio (Gradle) project
         \\  deploy     Build and upload to GitHub Releases (for Obtainium OTA)
         \\  doctor     Probe the Android SDK/NDK environment and report
         \\             the status of every required tool

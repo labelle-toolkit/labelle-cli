@@ -519,6 +519,7 @@ pub fn main(proc_init: std.process.Init) !void {
                 if (std.mem.startsWith(u8, arg, "-") or
                     std.mem.eql(u8, arg, "build") or
                     std.mem.eql(u8, arg, "run") or
+                    std.mem.eql(u8, arg, "studio") or
                     std.mem.eql(u8, arg, "deploy") or
                     std.mem.eql(u8, arg, "doctor") or
                     std.mem.eql(u8, arg, "help"))
