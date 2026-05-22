@@ -116,7 +116,12 @@ pub fn packDir(
 }
 
 fn sizeDesc(_: void, a: Sprite, b: Sprite) bool {
-    return @max(a.w, a.h) > @max(b.w, b.h);
+    const am = @max(a.w, a.h);
+    const bm = @max(b.w, b.h);
+    if (am != bm) return am > bm;
+    // Stable tie-break on name so pack order is deterministic regardless
+    // of filesystem iteration order.
+    return std.mem.lessThan(u8, a.name, b.name);
 }
 
 fn nameAsc(_: void, a: Sprite, b: Sprite) bool {
@@ -215,16 +220,26 @@ const SheetSize = struct { w: i32, h: i32 };
 
 /// Find the smallest square power-of-two sheet that fits every sprite,
 /// recording each sprite's placement in `sprites[i].placed`.
+///
+/// Padding sits *between* sprites, never at the outer sheet edges, so a
+/// single N×N sprite still fits an N×N max-size sheet. We model this by
+/// growing the packing bin by `padding` on the right/bottom: each sprite
+/// reserves `padding` of trailing gap, and a sprite flush against the
+/// sheet edge spends that gap in the extra bin margin instead.
 fn packAll(allocator: std.mem.Allocator, sprites: []Sprite, opts: Options) !SheetSize {
-    // Start estimate: a square that comfortably covers the total padded
-    // area, never smaller than the largest single sprite.
+    // Start estimate: a square whose area covers the bare sprite area,
+    // never smaller than the largest single sprite. This is only a
+    // lower-bound starting point — `tryPack` is authoritative and the
+    // loop below grows the bin on failure. Padding is deliberately
+    // excluded from the area term so a single max-size sprite (whose
+    // padded area would otherwise overshoot `max_size`) is not skipped.
     var total_area: i64 = 0;
     var max_dim: i32 = 1;
     for (sprites) |s| {
-        const pw = s.w + opts.padding;
-        const ph = s.h + opts.padding;
-        total_area += @as(i64, pw) * @as(i64, ph);
-        max_dim = @max(max_dim, @max(pw, ph));
+        total_area += @as(i64, s.w) * @as(i64, s.h);
+        // The sprite itself must fit the sheet; trailing padding may
+        // overflow into the bin margin, so don't count it here.
+        max_dim = @max(max_dim, @max(s.w, s.h));
     }
     var size: i32 = 1;
     while (size < max_dim or @as(i64, size) * @as(i64, size) < total_area) {
@@ -239,15 +254,21 @@ fn packAll(allocator: std.mem.Allocator, sprites: []Sprite, opts: Options) !Shee
     return Error.AtlasTooLarge;
 }
 
-/// Attempt to place all sprites into a `size`×`size` bin. On success
-/// every `sprites[i].placed` holds the sprite's rect; on failure the
-/// caller retries with a larger bin.
+/// Attempt to place all sprites into a `size`×`size` sheet. The packing
+/// bin is grown by `padding` on each axis so trailing inter-sprite gaps
+/// of edge sprites land in the margin rather than shrinking usable area.
+/// On success every `sprites[i].placed` holds the sprite's rect; on
+/// failure the caller retries with a larger bin.
 fn tryPack(allocator: std.mem.Allocator, sprites: []Sprite, size: i32, padding: i32) !bool {
-    var packer = try maxrects.Packer.init(allocator, size, size);
+    var packer = try maxrects.Packer.init(allocator, size + padding, size + padding);
     defer packer.deinit();
 
     for (sprites) |*s| {
         const slot = try packer.insert(s.w + padding, s.h + padding) orelse return false;
+        // The sprite occupies only `w`×`h`; the extra `padding` is the
+        // gap to its right/bottom neighbour. Reject placements whose
+        // sprite body would spill past the actual sheet edge.
+        if (slot.x + s.w > size or slot.y + s.h > size) return false;
         s.placed = .{ .x = slot.x, .y = slot.y, .w = s.w, .h = s.h };
     }
     return true;
@@ -411,6 +432,36 @@ pub const PackDir = struct {
         defer c.stbi_image_free(pixels);
         try expect.equal(@as(i32, @intCast(dw)), result.sheet_w);
         try expect.equal(@as(i32, @intCast(dh)), result.sheet_h);
+    }
+
+    test "a single max-size sprite exactly fills the sheet" {
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const cwd = std.Io.Dir.cwd();
+        const work = ".zig-cache/texpack-itest-maxfill";
+        cwd.deleteTree(io, work) catch {};
+        try cwd.createDirPath(io, work);
+        defer cwd.deleteTree(io, work) catch {};
+
+        // A 256×256 sprite must pack into a 256-max-size sheet even with
+        // padding: edge padding must not eat into usable sheet area.
+        const png = try encodeSolidPng(allocator, 256, 256, .{ 1, 2, 3, 255 });
+        defer allocator.free(png);
+        const path = try std.fs.path.join(allocator, &.{ work, "full.png" });
+        defer allocator.free(path);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = png });
+
+        const result = try packDir(allocator, io, work, work, "sheet", .{
+            .padding = 2,
+            .max_size = 256,
+        });
+        defer result.deinit(allocator);
+        try expect.equal(result.sprite_count, @as(usize, 1));
+        try expect.equal(result.sheet_w, @as(i32, 256));
+        try expect.equal(result.sheet_h, @as(i32, 256));
     }
 
     test "reports NoImagesFound for an empty folder" {

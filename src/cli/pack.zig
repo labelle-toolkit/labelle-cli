@@ -52,7 +52,7 @@ pub fn cmdPack(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
 
     const in = input_dir orelse {
         std.debug.print("labelle pack: missing <input-dir>\n{s}", .{usage});
-        return;
+        return error.InvalidArgs;
     };
 
     // Trim a trailing slash so basename/dirname behave as expected.
