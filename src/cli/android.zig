@@ -210,7 +210,7 @@ pub fn handleAndroid(
             .signing = signing,
         });
     } else if (std.mem.eql(u8, cmd, "studio")) {
-        try studio_mod.androidStudio(allocator, target_dir, cfg);
+        try studio_mod.androidStudio(allocator, target_dir, cfg, release_mode);
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         try doctor_mod.runDoctor(allocator, cfg.android);
     } else if (std.mem.eql(u8, cmd, "help")) {

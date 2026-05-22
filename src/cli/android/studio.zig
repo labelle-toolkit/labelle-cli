@@ -48,6 +48,7 @@ pub fn androidStudio(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
     cfg: project_config.ProjectConfig,
+    release_mode: ReleaseMode,
 ) !void {
     const android_cfg = cfg.android orelse AndroidConfig{};
     const app_name = if (android_cfg.app_name.len > 0) android_cfg.app_name else cfg.title;
@@ -58,7 +59,7 @@ pub fn androidStudio(
     // Build the device .so first so the project is runnable as soon
     // as it is opened. arm64-v8a only in v1.
     std.debug.print("labelle: step 1 — building libgame.so for arm64-v8a...\n", .{});
-    try build_mod.androidBuild(allocator, target_dir, false, .debug);
+    try build_mod.androidBuild(allocator, target_dir, false, release_mode);
 
     const so_src = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_src);
@@ -71,7 +72,10 @@ pub fn androidStudio(
     const studio_dir = try std.fs.path.join(allocator, &.{ target_dir, "..", "..", "android-studio" });
     defer allocator.free(studio_dir);
 
-    const main_dir = try std.fs.path.join(allocator, &.{ studio_dir, "app", "src", "main" });
+    const app_dir = try std.fs.path.join(allocator, &.{ studio_dir, "app" });
+    defer allocator.free(app_dir);
+
+    const main_dir = try std.fs.path.join(allocator, &.{ app_dir, "src", "main" });
     defer allocator.free(main_dir);
 
     const jni_dir = try std.fs.path.join(allocator, &.{ main_dir, "jniLibs", "arm64-v8a" });
@@ -93,19 +97,22 @@ pub fn androidStudio(
     defer allocator.free(assets_src);
     const assets_dst = try std.fs.path.join(allocator, &.{ main_dir, "assets" });
     defer allocator.free(assets_dst);
-    // Best-effort: a game without an assets/ directory is still valid.
-    package.copyDirectory(allocator, assets_src, assets_dst) catch {};
+    // A game without an assets/ directory is still valid — skip the
+    // copy in that case, but let genuine I/O errors surface.
+    if (std.Io.Dir.cwd().access(config.globalIo(), assets_src, .{})) |_| {
+        try package.copyDirectory(allocator, assets_src, assets_dst);
+    } else |_| {}
 
     // ── Generated files ───────────────────────────────────────────
     try writeFile(allocator, studio_dir, "settings.gradle.kts", try settingsGradle(allocator, app_name));
-    try writeFile(allocator, studio_dir, "build.gradle.kts", rootBuildGradle());
-    try writeFile(allocator, studio_dir, "gradle.properties", gradleProperties());
+    try writeFile(allocator, studio_dir, "build.gradle.kts", try rootBuildGradle(allocator));
+    try writeFile(allocator, studio_dir, "gradle.properties", try gradleProperties(allocator));
 
     const wrapper_props = try gradleWrapperProperties(allocator);
     try writeFile(allocator, wrapper_dir, "gradle-wrapper.properties", wrapper_props);
 
     const app_gradle = try appBuildGradle(allocator, package_name, android_cfg);
-    try writeFile(allocator, std.fs.path.dirname(main_dir).?, "build.gradle.kts", app_gradle);
+    try writeFile(allocator, app_dir, "build.gradle.kts", app_gradle);
 
     const manifest = try generateStudioManifest(allocator, app_name, android_cfg);
     try writeFile(allocator, main_dir, "AndroidManifest.xml", manifest);
@@ -155,18 +162,21 @@ fn settingsGradle(allocator: std.mem.Allocator, app_name: []const u8) ![]const u
 
 /// Root `build.gradle.kts` — declares the Android Gradle Plugin
 /// version for the `:app` module without applying it at the root.
-fn rootBuildGradle() []const u8 {
-    return "plugins {\n" ++
+/// Returns an owned slice (the content is static, but `writeFile`
+/// takes ownership and frees it).
+fn rootBuildGradle(allocator: std.mem.Allocator) ![]const u8 {
+    return allocator.dupe(u8, "plugins {\n" ++
         "    id(\"com.android.application\") version \"" ++ agp_version ++ "\" apply false\n" ++
-        "}\n";
+        "}\n");
 }
 
 /// `gradle.properties` — JVM args + AndroidX opt-in. Plain NativeActivity
 /// games need neither, but Android Studio's project sync expects them.
-fn gradleProperties() []const u8 {
-    return "org.gradle.jvmargs=-Xmx2048m\n" ++
+/// Returns an owned slice (see `rootBuildGradle`).
+fn gradleProperties(allocator: std.mem.Allocator) ![]const u8 {
+    return allocator.dupe(u8, "org.gradle.jvmargs=-Xmx2048m\n" ++
         "android.useAndroidX=true\n" ++
-        "android.nonTransitiveRClass=true\n";
+        "android.nonTransitiveRClass=true\n");
 }
 
 /// `gradle/wrapper/gradle-wrapper.properties` — points at the Gradle
@@ -284,7 +294,9 @@ test "settingsGradle embeds the app name as the root project name" {
 }
 
 test "rootBuildGradle pins the Android Gradle Plugin version" {
-    const out = rootBuildGradle();
+    const allocator = std.testing.allocator;
+    const out = try rootBuildGradle(allocator);
+    defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "com.android.application") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, agp_version) != null);
     // Root build must not apply the plugin.
