@@ -652,9 +652,11 @@ pub fn main(proc_init: std.process.Init) !void {
         return;
     };
 
-    // Apply --scene override
+    // Normalize the deprecated `.initial_scene` alias (RFC #560 / #565)
+    // into `.initial_prefab`, then apply the --scene override on top.
+    parsed.normalizeInitialPrefab();
     if (parsed_args.scene_override) |scene| {
-        parsed.initial_scene = scene;
+        parsed.initial_prefab = scene;
     }
 
     // Apply --platform override
@@ -1254,5 +1256,54 @@ pub const AppendRunForwardedArgsSpec = struct {
         try std.testing.expectEqualStrings("--", argv.items[0]);
         try std.testing.expectEqualStrings("--preview-mode", argv.items[1]);
         try std.testing.expectEqualStrings("127.0.0.1:54321", argv.items[2]);
+    }
+};
+
+/// Regression tests for the `--scene` / `.initial_prefab` override chain
+/// introduced in RFC #560 / issue #565.  Covers the four cases that the
+/// CLI logic at cli.zig:650-655 must handle correctly:
+///
+///  1. Legacy `.initial_scene` is promoted to `.initial_prefab` when the new
+///     field is absent.
+///  2. `.initial_prefab` wins when both fields are present in the config.
+///  3. A `--scene` CLI override applied *after* normalization takes precedence
+///     over whatever the config file said (legacy or new).
+///  4. Neither field set → normalization is a no-op (null stays null).
+pub const InitialPrefabNormalizationSpec = struct {
+    test "normalizeInitialPrefab promotes legacy initial_scene when initial_prefab is null" {
+        var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_scene = "legacy_scene" };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqualStrings("legacy_scene", cfg.initial_prefab.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_scene);
+    }
+
+    test "normalizeInitialPrefab keeps initial_prefab when both fields are set" {
+        var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_prefab = "new_prefab", .initial_scene = "legacy_scene" };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqualStrings("new_prefab", cfg.initial_prefab.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_scene);
+    }
+
+    test "--scene override takes precedence over normalized initial_scene" {
+        var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_scene = "legacy_scene" };
+        cfg.normalizeInitialPrefab();
+        // Simulate the --scene CLI override applied after normalization (cli.zig:653-655)
+        cfg.initial_prefab = "override_scene";
+        try std.testing.expectEqualStrings("override_scene", cfg.initial_prefab.?);
+    }
+
+    test "--scene override takes precedence over initial_prefab from config" {
+        var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_prefab = "config_prefab" };
+        cfg.normalizeInitialPrefab();
+        // Simulate the --scene CLI override applied after normalization
+        cfg.initial_prefab = "override_scene";
+        try std.testing.expectEqualStrings("override_scene", cfg.initial_prefab.?);
+    }
+
+    test "normalizeInitialPrefab is a no-op when neither field is set" {
+        var cfg = project_config.ProjectConfig{ .name = "test_project" };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_prefab);
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_scene);
     }
 };
