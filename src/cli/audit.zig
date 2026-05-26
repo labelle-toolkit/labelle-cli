@@ -22,19 +22,22 @@
 ///     and reports every such pair with a JSON-pointer-style path.
 ///
 ///  3. **Legacy unified-format patterns** (RFC #560 — precursor to
-///     engine #592)
-///     The engine still accepts three deprecated spellings with a
+///     engine #592 — plus RFC #594 phase 2)
+///     The engine still accepts four deprecated spellings with a
 ///     one-shot deprecation warning each (see
-///     `labelle-engine/src/jsonc/unified_format.zig`). #592 will remove
-///     them in v2.0; the audit surfaces them so projects can migrate
-///     before that lands. Three patterns:
-///       a. Top-level `"entities"` key — should be wrapped in
-///          `"root": { "children": [...] }`.
+///     `labelle-engine/src/jsonc/unified_format.zig`). #592/#594 will
+///     remove them in v2.0; the audit surfaces them so projects can
+///     migrate before that lands. Four patterns:
+///       a. Top-level `"entities"` key — should be hoisted to the
+///          file's top-level `"children"` (post-#594 flat form).
 ///       b. `"components"` on a *prefab reference* entry — should be
 ///          renamed to `"overrides"`. (Distinct from §B2: §B2 is
 ///          `prefab` + `children`; this is `prefab` + `components`.)
 ///       c. Top-level `"assets"` key in a scene — silently ignored;
 ///          assets are inferred from sprite refs (RFC #563).
+///       d. Top-level `"root"` wrapper (RFC #594 phase 2) — the
+///          wrapper is redundant in the flat form; its contents
+///          should be lifted to the file's top level.
 ///
 /// Exit codes:
 ///   0 — all checks pass
@@ -60,8 +63,9 @@ const usage =
     \\  1. Effective-name collisions across the merged namespace.
     \\  2. §B2 violations — `prefab` + `children` on the same entry.
     \\  3. Legacy unified-format patterns slated for removal in
-    \\     engine #592 (top-level "entities", "components" on a prefab
-    \\     reference, top-level "assets").
+    \\     engine #592 / #594 (top-level "entities", "components" on a
+    \\     prefab reference, top-level "assets", redundant top-level
+    \\     "root" wrapper).
     \\
     \\Exits 0 if clean, 1 if findings, 2 on IO error.
     \\
@@ -141,6 +145,7 @@ const Finding = union(enum) {
     legacy_entities: LegacyEntitiesFinding,
     legacy_components_on_ref: LegacyComponentsOnRefFinding,
     legacy_assets: LegacyAssetsFinding,
+    legacy_root_wrapper: LegacyRootWrapperFinding,
 };
 
 const CollisionFinding = struct {
@@ -196,6 +201,18 @@ const LegacyAssetsFinding = struct {
     json_pointer: []const u8,
 };
 
+/// (3d) Top-level `"root"` wrapper (RFC #594 phase 2). The wrapper
+/// adds a layer of nesting that the flat form removes: contents of
+/// the `"root"` object should be lifted to the file's top level.
+/// The engine accepts both shapes today with a one-shot warn; v2.0
+/// will drop the wrapper alongside the other legacy spellings.
+const LegacyRootWrapperFinding = struct {
+    file: []const u8,
+    /// Always `/root` by construction (top-level key), kept as a field
+    /// for symmetry with the other finding types.
+    json_pointer: []const u8,
+};
+
 const FileEntry = struct {
     /// Path relative to the project root (e.g. `scenes/foo.jsonc`).
     rel_path: []const u8,
@@ -234,12 +251,14 @@ const Report = struct {
         var n_legacy_entities: usize = 0;
         var n_legacy_components: usize = 0;
         var n_legacy_assets: usize = 0;
+        var n_legacy_root: usize = 0;
         for (self.findings.items) |f| switch (f) {
             .collision => n_collisions += 1,
             .b2 => n_b2 += 1,
             .legacy_entities => n_legacy_entities += 1,
             .legacy_components_on_ref => n_legacy_components += 1,
             .legacy_assets => n_legacy_assets += 1,
+            .legacy_root_wrapper => n_legacy_root += 1,
         };
 
         if (n_collisions > 0) {
@@ -315,6 +334,19 @@ const Report = struct {
             for (self.findings.items) |f| switch (f) {
                 .legacy_assets => |la| {
                     std.debug.print("  {s}  (at {s})\n\n", .{ la.file, la.json_pointer });
+                },
+                else => {},
+            };
+        }
+
+        if (n_legacy_root > 0) {
+            std.debug.print("─── Legacy \"root\" wrapper ({d}) ───\n", .{n_legacy_root});
+            std.debug.print("  [unified-format] redundant \"root\" wrapper: lift its\n", .{});
+            std.debug.print("  contents to the file's top level (RFC #560 phase 2 / #594)\n", .{});
+            std.debug.print("  Engine v2.0 will remove the wrapper.\n\n", .{});
+            for (self.findings.items) |f| switch (f) {
+                .legacy_root_wrapper => |lr| {
+                    std.debug.print("  {s}  (at {s})\n\n", .{ lr.file, lr.json_pointer });
                 },
                 else => {},
             };
@@ -451,12 +483,13 @@ fn inspectFile(
     }
     try files.append(arena, entry);
 
-    // Top-level legacy keys (3a, 3c). These checks operate on the
-    // root object only — `"entities"` and `"assets"` are file-level
-    // keys; the engine's `fileChildren` / `warnLegacyAssets` mirror
-    // the same shape.
+    // Top-level legacy keys (3a, 3c, 3d). These checks operate on
+    // the root object only — `"entities"`, `"assets"`, and the `"root"`
+    // wrapper are file-level keys; the engine's `fileChildren` /
+    // `warnLegacyAssets` / unified-format wrapper-stripper mirror the
+    // same shapes.
     //
-    // RFC #560 — engine #592 will remove these in v2.0.
+    // RFC #560 / #594 — engine #592 will remove these in v2.0.
     if (parsed.value == .object) {
         const file_obj = parsed.value.object;
         if (file_obj.get("entities") != null) {
@@ -470,6 +503,19 @@ fn inspectFile(
                 .file = rel_path,
                 .json_pointer = try arena.dupe(u8, "/assets"),
             } });
+        }
+        // RFC #594 phase 2: top-level `"root"` wrapper is the
+        // legacy nesting shape. Only fires when the value is an
+        // object — a stray `"root": null` or scalar is malformed
+        // rather than the legacy shape we're targeting, and the
+        // engine's wrapper-stripper bails on those anyway.
+        if (file_obj.get("root")) |root_v| {
+            if (root_v == .object) {
+                try report.add(.{ .legacy_root_wrapper = .{
+                    .file = rel_path,
+                    .json_pointer = try arena.dupe(u8, "/root"),
+                } });
+            }
         }
     }
 
@@ -897,17 +943,17 @@ fn freeAuditResult(r: anytype) void {
 
 pub const RunAuditOnSpec = struct {
     pub const clean_projects = struct {
-        test "scenes/main + prefabs/worker is clean" {
+        test "scenes/main + prefabs/worker (flat form) is clean" {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc",
                 \\{
                 \\  "name": "main",
-                \\  "root": { "children": [{ "prefab": "worker" }] }
+                \\  "children": [{ "prefab": "worker" }]
                 \\}
             );
             try p.write("prefabs/worker.jsonc",
-                \\{ "root": { "components": { "Position": { "x": 0, "y": 0 } } } }
+                \\{ "components": { "Position": { "x": 0, "y": 0 } } }
             );
 
             const result = try runAuditForTest(&p);
@@ -921,7 +967,7 @@ pub const RunAuditOnSpec = struct {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc",
-                \\{ "name": "main", "root": {} }
+                \\{ "name": "main" }
             );
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
@@ -934,10 +980,10 @@ pub const RunAuditOnSpec = struct {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/foo.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
             try p.write("prefabs/foo.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
 
             const result = try runAuditForTest(&p);
@@ -959,10 +1005,10 @@ pub const RunAuditOnSpec = struct {
             // scenes/menu.jsonc has its name overridden to "alpha"; a
             // prefab named alpha.jsonc collides on the override.
             try p.write("scenes/menu.jsonc",
-                \\{ "name": "alpha", "root": {} }
+                \\{ "name": "alpha" }
             );
             try p.write("prefabs/alpha.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
 
             const result = try runAuditForTest(&p);
@@ -981,10 +1027,10 @@ pub const RunAuditOnSpec = struct {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("prefabs/rooms/lab.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
             try p.write("prefabs/debug/lab.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
 
             const result = try runAuditForTest(&p);
@@ -1002,17 +1048,15 @@ pub const RunAuditOnSpec = struct {
     };
 
     pub const b2_violations = struct {
-        test "child entry with prefab+children is flagged" {
+        test "child entry with prefab+children is flagged (flat form)" {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/bad.jsonc",
                 \\{
                 \\  "name": "bad",
-                \\  "root": {
-                \\    "children": [
-                \\      { "prefab": "worker", "children": [{ "components": {} }] }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    { "prefab": "worker", "children": [{ "components": {} }] }
+                \\  ]
                 \\}
             );
 
@@ -1023,14 +1067,17 @@ pub const RunAuditOnSpec = struct {
             switch (result.report.findings.items[0]) {
                 .b2 => |b| {
                     try std.testing.expectEqualStrings("worker", b.prefab_ref);
-                    // Path lands inside /root/children/0.
-                    try std.testing.expect(std.mem.indexOf(u8, b.json_pointer, "/root/children/0") != null);
+                    // Path lands inside /children/0.
+                    try std.testing.expect(std.mem.indexOf(u8, b.json_pointer, "/children/0") != null);
                 },
                 else => return error.TestFailed,
             }
         }
 
-        test "reference-mode root with children is flagged at /root" {
+        test "reference-mode root with children is flagged at /root (legacy wrapper form)" {
+            // Uses the legacy `"root":` wrapper to exercise the `/root`
+            // pointer path. Co-fires legacy_root_wrapper, which is
+            // expected: this is the transitional shape during migration.
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/bad.jsonc",
@@ -1043,11 +1090,13 @@ pub const RunAuditOnSpec = struct {
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
 
-            try expect.equal(result.report.findings.items.len, @as(usize, 1));
-            switch (result.report.findings.items[0]) {
-                .b2 => |b| try std.testing.expectEqualStrings("/root", b.json_pointer),
-                else => return error.TestFailed,
-            }
+            var b2_pointer: ?[]const u8 = null;
+            for (result.report.findings.items) |f| switch (f) {
+                .b2 => |b| b2_pointer = b.json_pointer,
+                else => {},
+            };
+            try std.testing.expect(b2_pointer != null);
+            try std.testing.expectEqualStrings("/root", b2_pointer.?);
         }
 
         test "multiple violations in one project are all reported" {
@@ -1056,18 +1105,16 @@ pub const RunAuditOnSpec = struct {
             try p.write("scenes/one.jsonc",
                 \\{
                 \\  "name": "one",
-                \\  "root": {
-                \\    "children": [
-                \\      { "prefab": "a", "children": [] },
-                \\      { "prefab": "b", "children": [] }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    { "prefab": "a", "children": [] },
+                \\    { "prefab": "b", "children": [] }
+                \\  ]
                 \\}
             );
             try p.write("scenes/two.jsonc",
                 \\{
                 \\  "name": "two",
-                \\  "root": { "prefab": "c", "children": [] }
+                \\  "prefab": "c", "children": []
                 \\}
             );
 
@@ -1090,16 +1137,16 @@ pub const RunAuditOnSpec = struct {
             defer p.deinit();
             // Collision pair.
             try p.write("scenes/foo.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
             try p.write("prefabs/foo.jsonc",
-                \\{ "root": {} }
+                \\{}
             );
             // §B2 violation.
             try p.write("scenes/bad.jsonc",
                 \\{
                 \\  "name": "bad",
-                \\  "root": { "children": [{ "prefab": "x", "children": [] }] }
+                \\  "children": [{ "prefab": "x", "children": [] }]
                 \\}
             );
 
@@ -1187,11 +1234,9 @@ pub const RunAuditOnSpec = struct {
             try p.write("scenes/main.jsonc",
                 \\{
                 \\  "name": "main",
-                \\  "root": {
-                \\    "children": [
-                \\      { "prefab": "worker", "components": { "Position": { "x": 0, "y": 0 } } }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    { "prefab": "worker", "components": { "Position": { "x": 0, "y": 0 } } }
+                \\  ]
                 \\}
             );
 
@@ -1203,7 +1248,7 @@ pub const RunAuditOnSpec = struct {
                 .legacy_components_on_ref => |lc| {
                     try std.testing.expectEqualStrings("worker", lc.prefab_ref);
                     try std.testing.expect(!lc.overrides_also_present);
-                    try std.testing.expect(std.mem.indexOf(u8, lc.json_pointer, "/root/children/0") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, lc.json_pointer, "/children/0") != null);
                 },
                 else => return error.TestFailed,
             }
@@ -1215,15 +1260,13 @@ pub const RunAuditOnSpec = struct {
             try p.write("scenes/main.jsonc",
                 \\{
                 \\  "name": "main",
-                \\  "root": {
-                \\    "children": [
-                \\      {
-                \\        "prefab": "worker",
-                \\        "overrides": { "Position": { "x": 1, "y": 2 } },
-                \\        "components": { "Health": { "hp": 100 } }
-                \\      }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    {
+                \\      "prefab": "worker",
+                \\      "overrides": { "Position": { "x": 1, "y": 2 } },
+                \\      "components": { "Health": { "hp": 100 } }
+                \\    }
+                \\  ]
                 \\}
             );
 
@@ -1248,11 +1291,9 @@ pub const RunAuditOnSpec = struct {
             try p.write("scenes/main.jsonc",
                 \\{
                 \\  "name": "main",
-                \\  "root": {
-                \\    "children": [
-                \\      { "components": { "Position": { "x": 0, "y": 0 } } }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    { "components": { "Position": { "x": 0, "y": 0 } } }
+                \\  ]
                 \\}
             );
 
@@ -1270,15 +1311,13 @@ pub const RunAuditOnSpec = struct {
             try p.write("scenes/bad.jsonc",
                 \\{
                 \\  "name": "bad",
-                \\  "root": {
-                \\    "children": [
-                \\      {
-                \\        "prefab": "x",
-                \\        "children": [],
-                \\        "components": { "Position": { "x": 0, "y": 0 } }
-                \\      }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    {
+                \\      "prefab": "x",
+                \\      "children": [],
+                \\      "components": { "Position": { "x": 0, "y": 0 } }
+                \\    }
+                \\  ]
                 \\}
             );
 
@@ -1302,10 +1341,10 @@ pub const RunAuditOnSpec = struct {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/a.jsonc",
-                \\{ "root": { "children": [{ "prefab": "p", "components": {} }] } }
+                \\{ "children": [{ "prefab": "p", "components": {} }] }
             );
             try p.write("scenes/b.jsonc",
-                \\{ "root": { "children": [{ "prefab": "q", "components": {} }] } }
+                \\{ "children": [{ "prefab": "q", "components": {} }] }
             );
 
             const result = try runAuditForTest(&p);
@@ -1336,7 +1375,7 @@ pub const RunAuditOnSpec = struct {
                 \\{
                 \\  "name": "main",
                 \\  "assets": { "sprites": ["foo.png"] },
-                \\  "root": { "children": [] }
+                \\  "children": []
                 \\}
             );
 
@@ -1357,10 +1396,10 @@ pub const RunAuditOnSpec = struct {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/a.jsonc",
-                \\{ "assets": {}, "root": {} }
+                \\{ "assets": {} }
             );
             try p.write("scenes/b.jsonc",
-                \\{ "assets": {}, "root": {} }
+                \\{ "assets": {} }
             );
 
             const result = try runAuditForTest(&p);
@@ -1384,7 +1423,7 @@ pub const RunAuditOnSpec = struct {
     };
 
     pub const all_legacy_in_one_file = struct {
-        test "entities + assets + components-on-ref all surface from one file" {
+        test "entities + assets + root + components-on-ref all surface from one file" {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/legacy.jsonc",
@@ -1393,7 +1432,8 @@ pub const RunAuditOnSpec = struct {
                 \\  "assets": {},
                 \\  "entities": [
                 \\    { "prefab": "worker", "components": { "Position": { "x": 0, "y": 0 } } }
-                \\  ]
+                \\  ],
+                \\  "root": { "children": [] }
                 \\}
             );
 
@@ -1403,35 +1443,36 @@ pub const RunAuditOnSpec = struct {
             var n_entities: usize = 0;
             var n_assets: usize = 0;
             var n_components: usize = 0;
+            var n_root: usize = 0;
             for (result.report.findings.items) |f| switch (f) {
                 .legacy_entities => n_entities += 1,
                 .legacy_assets => n_assets += 1,
                 .legacy_components_on_ref => n_components += 1,
+                .legacy_root_wrapper => n_root += 1,
                 else => {},
             };
             try expect.equal(n_entities, @as(usize, 1));
             try expect.equal(n_assets, @as(usize, 1));
             try expect.equal(n_components, @as(usize, 1));
+            try expect.equal(n_root, @as(usize, 1));
         }
     };
 
     pub const unified_shape_is_clean = struct {
-        test "fully unified file with overrides reports no legacy findings" {
+        test "fully unified file (flat form) with overrides reports no legacy findings" {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc",
                 \\{
                 \\  "name": "main",
-                \\  "root": {
-                \\    "children": [
-                \\      { "prefab": "worker", "overrides": { "Position": { "x": 0, "y": 0 } } },
-                \\      { "components": { "Position": { "x": 1, "y": 1 } } }
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    { "prefab": "worker", "overrides": { "Position": { "x": 0, "y": 0 } } },
+                \\    { "components": { "Position": { "x": 1, "y": 1 } } }
+                \\  ]
                 \\}
             );
             try p.write("prefabs/worker.jsonc",
-                \\{ "root": { "components": { "Position": { "x": 0, "y": 0 } } } }
+                \\{ "components": { "Position": { "x": 0, "y": 0 } } }
             );
 
             const result = try runAuditForTest(&p);
@@ -1450,21 +1491,182 @@ pub const RunAuditOnSpec = struct {
                 \\{
                 \\  "name": "main",
                 \\  // a trailing comment
-                \\  "root": {
-                \\    "children": [
-                \\      { "prefab": "worker", "overrides": { "Position": { "x": 0, "y": 0 } } },
-                \\    ]
-                \\  }
+                \\  "children": [
+                \\    { "prefab": "worker", "overrides": { "Position": { "x": 0, "y": 0 } } },
+                \\  ]
                 \\}
             );
             try p.write("prefabs/worker.jsonc",
-                \\{ "root": { "components": { "Position": { "x": 0, "y": 0 } } } }
+                \\{ "components": { "Position": { "x": 0, "y": 0 } } }
             );
 
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
 
             try expect.equal(result.report.findings.items.len, @as(usize, 0));
+        }
+    };
+
+    pub const legacy_root_wrapper = struct {
+        test "scene with root wrapper fires legacy_root_wrapper" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "root": { "children": [] }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 1));
+            switch (result.report.findings.items[0]) {
+                .legacy_root_wrapper => |lr| {
+                    try std.testing.expectEqualStrings("/root", lr.json_pointer);
+                    try std.testing.expect(std.mem.indexOf(u8, lr.file, "main.jsonc") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, lr.file, "scenes") != null);
+                },
+                else => return error.TestFailed,
+            }
+        }
+
+        test "prefab with root wrapper fires legacy_root_wrapper" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("prefabs/worker.jsonc",
+                \\{
+                \\  "root": { "components": { "Position": { "x": 0, "y": 0 } } }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 1));
+            switch (result.report.findings.items[0]) {
+                .legacy_root_wrapper => |lr| {
+                    try std.testing.expectEqualStrings("/root", lr.json_pointer);
+                    try std.testing.expect(std.mem.indexOf(u8, lr.file, "worker.jsonc") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, lr.file, "prefabs") != null);
+                },
+                else => return error.TestFailed,
+            }
+        }
+
+        test "scene without root wrapper (flat form) fires no finding" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "children": [
+                \\    { "components": { "Position": { "x": 0, "y": 0 } } }
+                \\  ]
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 0));
+        }
+
+        test "prefab without root wrapper (flat form) fires no finding" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("prefabs/worker.jsonc",
+                \\{ "components": { "Position": { "x": 0, "y": 0 } } }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 0));
+        }
+
+        test "co-fires with legacy_entities when both root and entities are present" {
+            // Weird transitional shape: file has BOTH a top-level
+            // "entities" array AND a "root" wrapper. Both findings
+            // should fire — the project owner will need to pick one
+            // canonical form during migration.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/weird.jsonc",
+                \\{
+                \\  "name": "weird",
+                \\  "entities": [],
+                \\  "root": { "children": [] }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n_entities: usize = 0;
+            var n_root: usize = 0;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_entities => n_entities += 1,
+                .legacy_root_wrapper => n_root += 1,
+                else => {},
+            };
+            try expect.equal(n_entities, @as(usize, 1));
+            try expect.equal(n_root, @as(usize, 1));
+        }
+
+        test "two files with root wrappers surface two findings (arena dedup)" {
+            // Mirrors the legacy_entities/legacy_assets arena tests:
+            // confirms file paths are duped into the arena so the
+            // iterator's transient buffer can't be aliased between
+            // findings.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/a.jsonc",
+                \\{ "root": { "children": [] } }
+            );
+            try p.write("scenes/b.jsonc",
+                \\{ "root": { "children": [] } }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n: usize = 0;
+            var saw_a = false;
+            var saw_b = false;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_root_wrapper => |lr| {
+                    n += 1;
+                    if (std.mem.indexOf(u8, lr.file, "a.jsonc") != null) saw_a = true;
+                    if (std.mem.indexOf(u8, lr.file, "b.jsonc") != null) saw_b = true;
+                },
+                else => {},
+            };
+            try expect.equal(n, @as(usize, 2));
+            try std.testing.expect(saw_a);
+            try std.testing.expect(saw_b);
+        }
+
+        test "root with non-object value (e.g. null) does NOT fire" {
+            // The legacy shape we care about is `"root": { ... }`.
+            // A scalar/null at that key is malformed input rather
+            // than a migration target.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/odd.jsonc",
+                \\{ "root": null }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n_root: usize = 0;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_root_wrapper => n_root += 1,
+                else => {},
+            };
+            try expect.equal(n_root, @as(usize, 0));
         }
     };
 };
