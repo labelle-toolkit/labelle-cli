@@ -1306,6 +1306,7 @@ pub const MigrateTransformComponentsOnRefSpec = migrate.TransformComponentsOnRef
 pub const MigrateTransformAssetsDeleteSpec = migrate.TransformAssetsDeleteSpec;
 pub const MigrateIdempotencySpec = migrate.IdempotencySpec;
 pub const MigrateMixedFileSpec = migrate.MixedFileSpec;
+pub const MigrateDeleteTopLevelKeyBlockCommentSpec = migrate.DeleteTopLevelKeyBlockCommentSpec;
 
 pub const ParsePlatformValueSpec = struct {
     pub const valid_platforms = struct {
