@@ -2,7 +2,7 @@
 ///
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [-- <args>...] — generate + build + run; `--` forwards trailing args to the game
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path> (raylib picks PNG/BMP by extension); `--` forwards trailing args to the game
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] — generate + build (no run)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
 ///   labelle [dir]                       — alias for `run`
@@ -125,6 +125,15 @@ const ParsedArgs = struct {
     serve_port: u16 = 8080,
     serve_no_build: bool = false,
     serve_no_open: bool = false,
+    // labelle-cli#227 — out-of-band screenshot capture. `--screenshot`
+    // takes a destination path (raylib picks the format from the
+    // extension); `--after` is an optional delay (parsed via
+    // `parseDuration`, default 0 = fire on the first frame). Wired
+    // through to the spawned game via `LABELLE_SCREENSHOT_PATH` +
+    // `LABELLE_SCREENSHOT_AFTER_SEC` env vars so the assembler
+    // templates stay argv-agnostic.
+    screenshot_path: ?[]const u8 = null,
+    screenshot_after_ns: ?u64 = null,
 };
 
 /// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
@@ -297,7 +306,7 @@ fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?str
 /// subsequent token is collected verbatim into `parsed_args.extra_args`
 /// without flag interpretation, so callers can forward args to the game
 /// binary via `zig build run -- <extras>` (see run_cmd handler).
-fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_args: *ParsedArgs) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
+fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_args: *ParsedArgs) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, screenshot_path: ?[]const u8, screenshot_after_ns: ?u64 } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
@@ -307,6 +316,8 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
     var bake = false;
+    var screenshot_path: ?[]const u8 = null;
+    var screenshot_after_ns: ?u64 = null;
     var passthrough = false;
 
     while (args.next()) |arg| {
@@ -366,6 +377,47 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
                 std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
                 return null;
             }
+        } else if (std.mem.startsWith(u8, arg, "--screenshot=")) {
+            const val = arg["--screenshot=".len..];
+            if (val.len == 0) {
+                std.debug.print("labelle {s}: --screenshot requires a path (e.g. --screenshot=/tmp/shot.png)\n", .{cmd_name});
+                return null;
+            }
+            screenshot_path = val;
+            continue;
+        } else if (std.mem.eql(u8, arg, "--screenshot")) {
+            if (args.next()) |val| {
+                if (val.len == 0) {
+                    std.debug.print("labelle {s}: --screenshot requires a path (e.g. --screenshot /tmp/shot.png)\n", .{cmd_name});
+                    return null;
+                }
+                screenshot_path = val;
+            } else {
+                std.debug.print("labelle {s}: --screenshot requires a path (e.g. --screenshot /tmp/shot.png)\n", .{cmd_name});
+                return null;
+            }
+            continue;
+        } else if (std.mem.startsWith(u8, arg, "--after=")) {
+            screenshot_after_ns = util.parseDuration(arg["--after=".len..]);
+            if (screenshot_after_ns == null) {
+                std.debug.print("labelle {s}: invalid --after value '{s}'\n", .{ cmd_name, arg["--after=".len..] });
+                std.debug.print("  expected format: --after=2s, --after=500ms\n", .{});
+                return null;
+            }
+            continue;
+        } else if (std.mem.eql(u8, arg, "--after")) {
+            if (args.next()) |val| {
+                screenshot_after_ns = util.parseDuration(val);
+                if (screenshot_after_ns == null) {
+                    std.debug.print("labelle {s}: invalid --after value '{s}'\n", .{ cmd_name, val });
+                    std.debug.print("  expected format: --after 2s, --after 500ms\n", .{});
+                    return null;
+                }
+            } else {
+                std.debug.print("labelle {s}: --after requires a value (e.g. --after 2s)\n", .{cmd_name});
+                return null;
+            }
+            continue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -378,7 +430,13 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake };
+    // `--after` without `--screenshot` is a user mistake worth flagging
+    // — the delay has no observable effect by itself. Don't fail though;
+    // a warning preserves forward-compat if future flags reuse `--after`.
+    if (screenshot_after_ns != null and screenshot_path == null) {
+        std.debug.print("labelle {s}: warning: --after has no effect without --screenshot\n", .{cmd_name});
+    }
+    return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .screenshot_path = screenshot_path, .screenshot_after_ns = screenshot_after_ns };
 }
 
 /// Collect all remaining args into extra_args buffer.
@@ -461,6 +519,8 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
             parsed_args.bake = result.bake;
+            parsed_args.screenshot_path = result.screenshot_path;
+            parsed_args.screenshot_after_ns = result.screenshot_after_ns;
         } else if (std.mem.eql(u8, first, "init")) {
             parsed_args.command = .init_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -587,6 +647,8 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
             parsed_args.bake = result.bake;
+            parsed_args.screenshot_path = result.screenshot_path;
+            parsed_args.screenshot_after_ns = result.screenshot_after_ns;
         }
     }
 
@@ -906,21 +968,39 @@ pub fn main(proc_init: std.process.Init) !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
-        // cli#229: when --scene=<name> was passed, also surface the
-        // requested scene to the child via the `LABELLE_SCENE` env var.
-        // Loading-controller scripts read this AFTER `assets.allReady`
-        // succeeds and call `setScene(requested)`, so asset streaming
-        // for large scenes (e.g. flying-platform-labelle's `colony`,
-        // 6 atlas packs) no longer races boot. The legacy
-        // `.initial_prefab` rewrite above is kept as a deprecation
+        // Build a combined env map for the child when --scene (cli#229)
+        // and/or --screenshot (cli#227) are set. Both flags need to be
+        // surfaced as env vars to the spawned game:
+        //  - LABELLE_SCENE          (cli#229 runtime scene-override)
+        //  - LABELLE_SCREENSHOT_PATH
+        //  - LABELLE_SCREENSHOT_AFTER_SEC
+        // Loading-controller scripts read LABELLE_SCENE *after*
+        // assets.allReady succeeds and call setScene(requested), so
+        // asset streaming for large scenes no longer races boot. The
+        // legacy .initial_prefab rewrite above stays as a deprecation
         // bridge for projects without a loading-scene gate.
         var env_map_storage: ?std.process.Environ.Map = null;
         defer if (env_map_storage) |*m| m.deinit();
         var env_map_ptr: ?*const std.process.Environ.Map = null;
-        if (parsed_args.scene_override) |scene| {
-            env_map_storage = try runner.buildEnvironWithExtra(allocator, &.{
-                .{ .key = "LABELLE_SCENE", .value = scene },
-            });
+        const has_scene_env = parsed_args.scene_override != null;
+        const has_screenshot_env = parsed_args.screenshot_path != null;
+        if (has_scene_env or has_screenshot_env) {
+            var extras: std.ArrayList(runner.EnvKV) = .empty;
+            defer extras.deinit(allocator);
+            if (parsed_args.scene_override) |scene| {
+                try extras.append(allocator, .{ .key = "LABELLE_SCENE", .value = scene });
+            }
+            var sec_buf: [32]u8 = undefined;
+            if (parsed_args.screenshot_path) |path| {
+                try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_PATH", .value = path });
+                if (parsed_args.screenshot_after_ns) |ns| {
+                    const sec_f64 = @as(f64, @floatFromInt(ns)) / @as(f64, std.time.ns_per_s);
+                    const sec_str = try std.fmt.bufPrint(&sec_buf, "{d:.3}", .{sec_f64});
+                    try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_AFTER_SEC", .value = sec_str });
+                }
+                std.debug.print("labelle: screenshot will be written to '{s}'\n", .{path});
+            }
+            env_map_storage = try runner.buildEnvironWithExtra(allocator, extras.items);
             env_map_ptr = &env_map_storage.?;
         }
 

@@ -11,7 +11,7 @@ pub fn printHelp() void {
         \\  init <name> [dir]    Create a new labelle project
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
         \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build the project
-        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>] [-- <args>...]  Generate + build + run (default; `--` forwards trailing args to the game)
+        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>] [--screenshot=<path> [--after=<dur>]] [-- <args>...]  Generate + build + run (default; `--screenshot` captures one frame; `--` forwards trailing args to the game)
         \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open]  Build the WASM target, serve it locally (default port 8080), open the browser
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
@@ -31,6 +31,7 @@ pub fn printHelp() void {
         \\  labelle run
         \\  labelle run --timeout=30s
         \\  labelle run --scene=settings_menu
+        \\  labelle run --screenshot=/tmp/shot.png --after=2s
         \\  labelle generate --platform=wasm
         \\  labelle build --platform=wasm
         \\  labelle wasm serve
