@@ -22,6 +22,7 @@ pub fn printHelp() void {
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
         \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
         \\  audit unification [dir]  Pre-flight check for the unified scene/prefab loader (RFC #560)
+        \\  migrate unified [dir] [--dry-run]  Auto-fix legacy unified-format patterns (RFC #594 / engine#592)
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
@@ -51,6 +52,8 @@ pub fn printHelp() void {
         \\  labelle test --no-libs
         \\  labelle audit unification
         \\  labelle audit unification ../my-game
+        \\  labelle migrate unified
+        \\  labelle migrate unified --dry-run
         \\
     , .{project_config.CLI_VERSION});
 }

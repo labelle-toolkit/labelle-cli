@@ -39,8 +39,9 @@ const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
 const pack = @import("cli/pack.zig");
 const audit = @import("cli/audit.zig");
+const migrate = @import("cli/migrate.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, audit_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, audit_cmd, migrate_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -559,6 +560,9 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "audit")) {
             parsed_args.command = .audit_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "migrate")) {
+            parsed_args.command = .migrate_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "ios")) {
             parsed_args.command = .ios_cmd;
             // First non-flag arg that isn't a subcommand is the project dir
@@ -668,6 +672,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .test_cmd => return test_cmd_mod.cmdTest(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .pack_cmd => return pack.cmdPack(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .audit_cmd => return audit.cmdAudit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .migrate_cmd => return migrate.cmdMigrate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
@@ -1292,6 +1297,15 @@ pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
 pub const AuditStripJsoncToJsonSpec = audit.StripJsoncToJsonSpec;
 pub const AuditBasenameWithoutExtSpec = audit.BasenameWithoutExtSpec;
 pub const AuditRunAuditOnSpec = audit.RunAuditOnSpec;
+
+// Surface migrate-command spec namespaces so `zspec.runAll(@This())`
+// walks into them.
+pub const MigrateTransformRootWrapperSpec = migrate.TransformRootWrapperSpec;
+pub const MigrateTransformEntitiesRenameSpec = migrate.TransformEntitiesRenameSpec;
+pub const MigrateTransformComponentsOnRefSpec = migrate.TransformComponentsOnRefSpec;
+pub const MigrateTransformAssetsDeleteSpec = migrate.TransformAssetsDeleteSpec;
+pub const MigrateIdempotencySpec = migrate.IdempotencySpec;
+pub const MigrateMixedFileSpec = migrate.MixedFileSpec;
 
 pub const ParsePlatformValueSpec = struct {
     pub const valid_platforms = struct {
