@@ -624,9 +624,16 @@ fn deleteTopLevelKey(arena: std.mem.Allocator, src: []const u8, key: []const u8)
             const c = src[@intCast(p)];
             if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
             if (c == '/' and p > 0 and src[@intCast(p - 1)] == '*') {
-                // walk back through a block comment
+                // Walk back through a block comment. On entry `p` is at
+                // the `/` of `*/`. After this block the next outer
+                // iteration's `p -= 1` must land us on the byte BEFORE
+                // the `/` of `/*` — i.e. we want `p` (post-decrement) to
+                // be `(index of /*-slash) - 1`. The inner loop ends with
+                // `p` at the `*` of `/*`, so step one further back to
+                // the `/` and let the outer step take us past it.
                 p -= 2;
                 while (p >= 1 and !(src[@intCast(p - 1)] == '/' and src[@intCast(p)] == '*')) p -= 1;
+                if (p >= 1) p -= 1;
                 continue;
             }
             if (c == ',') {
@@ -746,11 +753,18 @@ fn liftTopLevelRoot(arena: std.mem.Allocator, src: []const u8) ?[]u8 {
     dedentBy(arena, &dedented, body, outer_indent) catch return null;
 
     // Splice from the `"root":` line's indent run (line_start) through
-    // the `}` of root's value (and the trailing comma if any).
+    // the `}` of root's value (and the trailing comma if any). When the
+    // `"root"` entry HAD a trailing comma (i.e. it is NOT the last key
+    // of the outer object), we must re-emit that comma after the lifted
+    // body — otherwise the last lifted entry runs into the next sibling
+    // with no separator, producing invalid JSON. We append the comma to
+    // the dedented body so it lands on the same line as the last inner
+    // entry: `"children": []` becomes `"children": [],`.
     const splice_start: usize = loc.line_start;
     var splice_end: usize = loc.value_end;
     if (loc.comma_after) |c| {
         splice_end = c + 1;
+        dedented.append(arena, ',') catch return null;
     }
 
     var out: std.ArrayList(u8) = .empty;
@@ -758,36 +772,6 @@ fn liftTopLevelRoot(arena: std.mem.Allocator, src: []const u8) ?[]u8 {
     out.appendSlice(arena, dedented.items) catch return null;
     out.appendSlice(arena, src[splice_end..]) catch return null;
     return out.toOwnedSlice(arena) catch null;
-}
-
-/// Detect the smallest indent step used in `body`. We sample the
-/// leading whitespace of every non-empty line and take the minimum
-/// non-zero indent — that's the project's indent unit. Falls back to
-/// 4 (the labelle-cli house style) when nothing is found.
-fn detectIndentUnit(body: []const u8) usize {
-    var min_indent: ?usize = null;
-    var i: usize = 0;
-    while (i < body.len) {
-        // Find start of line.
-        const line_start = i;
-        _ = line_start;
-        var indent: usize = 0;
-        while (i < body.len and body[i] == ' ') {
-            indent += 1;
-            i += 1;
-        }
-        // If this line is blank or comment-only, skip.
-        const line_first = if (i < body.len) body[i] else 0;
-        if (line_first != '\n' and line_first != 0 and !(line_first == '/' and i + 1 < body.len and (body[i + 1] == '/' or body[i + 1] == '*'))) {
-            if (indent > 0) {
-                if (min_indent == null or indent < min_indent.?) min_indent = indent;
-            }
-        }
-        // Advance to next line.
-        while (i < body.len and body[i] != '\n') i += 1;
-        if (i < body.len) i += 1;
-    }
-    return min_indent orelse 4;
 }
 
 /// Append `body` to `out`, removing up to `unit` leading spaces from
@@ -1095,6 +1079,111 @@ pub const TransformRootWrapperSpec = struct {
             try std.testing.expect(std.mem.indexOf(u8, out, "\"root\"") == null);
         }
     };
+
+    pub const root_in_middle_of_metadata = struct {
+        // Regression for cursor[bot] finding: when `"root"` is not the
+        // LAST top-level key (i.e. has a trailing comma) the lift used to
+        // consume the comma but never re-emit it, producing invalid JSON
+        // like `..."children": []"metadata": "x"...`.
+        test "root in middle of metadata keys produces valid JSON" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const src =
+                "{\n" ++
+                "    \"name\": \"main\",\n" ++
+                "    \"root\": {\n" ++
+                "        \"children\": []\n" ++
+                "    },\n" ++
+                "    \"metadata\": \"x\"\n" ++
+                "}\n";
+            const out = try applyAllArena(&arena, src);
+            // Must round-trip through the JSON parser.
+            const stripped = try stripJsoncToJson(arena.allocator(), out);
+            var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expect(obj.get("root") == null);
+            try std.testing.expect(obj.get("children") != null);
+            try std.testing.expectEqualStrings("main", obj.get("name").?.string);
+            try std.testing.expectEqualStrings("x", obj.get("metadata").?.string);
+        }
+
+        test "root in middle with trailing comma on its own line" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const src =
+                "{\n" ++
+                "    \"name\": \"main\",\n" ++
+                "    \"root\": {\n" ++
+                "        \"children\": []\n" ++
+                "    }\n" ++
+                "    ,\n" ++
+                "    \"metadata\": \"x\"\n" ++
+                "}\n";
+            const out = try applyAllArena(&arena, src);
+            const stripped = try stripJsoncToJson(arena.allocator(), out);
+            var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expect(obj.get("root") == null);
+            try std.testing.expect(obj.get("children") != null);
+            try std.testing.expectEqualStrings("x", obj.get("metadata").?.string);
+        }
+
+        test "root in middle with line comment between `}` and next key" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const src =
+                "{\n" ++
+                "    \"name\": \"main\",\n" ++
+                "    \"root\": {\n" ++
+                "        \"children\": []\n" ++
+                "    }, // close root\n" ++
+                "    \"metadata\": \"x\"\n" ++
+                "}\n";
+            const out = try applyAllArena(&arena, src);
+            const stripped = try stripJsoncToJson(arena.allocator(), out);
+            var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expect(obj.get("root") == null);
+            try std.testing.expect(obj.get("children") != null);
+            try std.testing.expectEqualStrings("x", obj.get("metadata").?.string);
+        }
+    };
+};
+
+pub const DeleteTopLevelKeyBlockCommentSpec = struct {
+    // Regression for cursor[bot] finding: the backward walk that looks
+    // for the preceding comma when the target key is the LAST entry used
+    // to land one byte too late after skipping a `/* ... */` block. The
+    // outer `p -= 1` from the for-loop then put `p` on the `/` of `/*`,
+    // which broke the walk early and left the preceding sibling with a
+    // dangling `,` — producing invalid JSON.
+    test "deletes last key preceded by a block comment" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"main\",\n" ++
+            "    /* trailing note */\n" ++
+            "    \"assets\": [\"a\"]\n" ++
+            "}\n";
+        const out = try applyAllArena(&arena, src);
+        // Pre-fix the backward walk lost the preceding `,` because it
+        // landed on the `/` of `/*` and broke. The trailing comma after
+        // `"main"` MUST be removed — otherwise the raw .jsonc parses as
+        // {"name":"main",} which is illegal JSON (the JSONC-stripper
+        // happens to forgive trailing commas, but a strict reader does
+        // not).
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"main\",") == null);
+        // And it must round-trip through the JSON parser too.
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("main", parsed.value.object.get("name").?.string);
+    }
 };
 
 pub const TransformEntitiesRenameSpec = struct {
