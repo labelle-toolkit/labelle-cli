@@ -1,7 +1,7 @@
 /// `labelle audit unification <project-dir>` — pre-flight check for the
 /// unified scene/prefab loader (RFC #560 / engine issue #581).
 ///
-/// Two read-only checks are run against `<project-dir>/scenes/**/*.jsonc`
+/// Read-only checks are run against `<project-dir>/scenes/**/*.jsonc`
 /// and `<project-dir>/prefabs/**/*.jsonc`:
 ///
 ///  1. **Effective-name collisions** (RFC #560 §"Resolution and naming")
@@ -21,9 +21,26 @@
 ///     value, including embedded entity arrays inside component fields)
 ///     and reports every such pair with a JSON-pointer-style path.
 ///
+///  3. **Legacy unified-format patterns** (RFC #560 — precursor to
+///     engine #592)
+///     The engine still accepts three deprecated spellings with a
+///     one-shot deprecation warning each (see
+///     `labelle-engine/src/jsonc/unified_format.zig`). #592 will remove
+///     them in v2.0; the audit surfaces them so projects can migrate
+///     before that lands. Three patterns:
+///       a. Top-level `"entities"` key — should be wrapped in
+///          `"root": { "children": [...] }`.
+///       b. `"components"` on a *prefab reference* entry — should be
+///          renamed to `"overrides"`. (Distinct from §B2: §B2 is
+///          `prefab` + `children`; this is `prefab` + `components`.)
+///       c. Top-level `"assets"` key in a scene — silently ignored;
+///          assets are inferred from sprite refs (RFC #563).
+///
 /// Exit codes:
-///   0 — both checks pass
-///   1 — one or more findings (formatted report on stdout)
+///   0 — all checks pass
+///   1 — one or more findings (formatted report on stdout). Legacy
+///       findings are counted alongside the others: they're migration
+///       debt the project owner needs to address before v2.0.
 ///   2 — IO error (could not open project / files / dirs)
 ///
 /// Read-only. The audit never modifies project files.
@@ -42,6 +59,9 @@ const usage =
     \\Walks <dir>/scenes/ and <dir>/prefabs/ and reports:
     \\  1. Effective-name collisions across the merged namespace.
     \\  2. §B2 violations — `prefab` + `children` on the same entry.
+    \\  3. Legacy unified-format patterns slated for removal in
+    \\     engine #592 (top-level "entities", "components" on a prefab
+    \\     reference, top-level "assets").
     \\
     \\Exits 0 if clean, 1 if findings, 2 on IO error.
     \\
@@ -118,6 +138,9 @@ fn runUnificationAudit(allocator: std.mem.Allocator, cmd_args: []const []const u
 const Finding = union(enum) {
     collision: CollisionFinding,
     b2: B2Finding,
+    legacy_entities: LegacyEntitiesFinding,
+    legacy_components_on_ref: LegacyComponentsOnRefFinding,
+    legacy_assets: LegacyAssetsFinding,
 };
 
 const CollisionFinding = struct {
@@ -134,6 +157,43 @@ const B2Finding = struct {
     /// reference-mode root.
     json_pointer: []const u8,
     prefab_ref: []const u8,
+};
+
+/// (3a) Top-level `"entities"` key — legacy scene shape. Engine v2.0
+/// (#592) will reject this; today it loads with a one-shot warn.
+/// Replacement: wrap the array in `"root": { "children": [...] }`.
+const LegacyEntitiesFinding = struct {
+    file: []const u8,
+    /// Always `/entities` by construction (top-level key), kept as a
+    /// field for symmetry with the other finding types and to make a
+    /// future hoisted-array variant (#592 follow-up) trivial to add.
+    json_pointer: []const u8,
+};
+
+/// (3b) `"components"` on a prefab *reference* entry (an object with
+/// `"prefab"`). Distinct from §B2 (prefab + children); this is
+/// prefab + components, which the engine accepts as a legacy synonym
+/// for `"overrides"`. #592 will remove the synonym in v2.0.
+const LegacyComponentsOnRefFinding = struct {
+    file: []const u8,
+    /// JSON-pointer to the offending reference entry (the object
+    /// carrying both `prefab` and `components`), e.g.
+    /// `/root/children/2`.
+    json_pointer: []const u8,
+    prefab_ref: []const u8,
+    /// True iff `"overrides"` was *also* present on the same entry.
+    /// When true, the engine takes overrides and warns; when false,
+    /// the engine falls back to components and warns. The audit
+    /// surfaces both so the project owner can migrate either way.
+    overrides_also_present: bool,
+};
+
+/// (3c) Top-level `"assets"` key in a scene/prefab file. The unified
+/// loader infers assets from sprite references (RFC #563) and ignores
+/// this field silently today; #592 will remove the field entirely.
+const LegacyAssetsFinding = struct {
+    file: []const u8,
+    json_pointer: []const u8,
 };
 
 const FileEntry = struct {
@@ -171,9 +231,15 @@ const Report = struct {
 
         var n_collisions: usize = 0;
         var n_b2: usize = 0;
+        var n_legacy_entities: usize = 0;
+        var n_legacy_components: usize = 0;
+        var n_legacy_assets: usize = 0;
         for (self.findings.items) |f| switch (f) {
             .collision => n_collisions += 1,
             .b2 => n_b2 += 1,
+            .legacy_entities => n_legacy_entities += 1,
+            .legacy_components_on_ref => n_legacy_components += 1,
+            .legacy_assets => n_legacy_assets += 1,
         };
 
         if (n_collisions > 0) {
@@ -204,6 +270,51 @@ const Report = struct {
                 .b2 => |b| {
                     std.debug.print("  {s}  (at {s})\n", .{ b.file, b.json_pointer });
                     std.debug.print("    prefab: \"{s}\"\n\n", .{b.prefab_ref});
+                },
+                else => {},
+            };
+        }
+
+        if (n_legacy_entities > 0) {
+            std.debug.print("─── Legacy \"entities\" key ({d}) ───\n", .{n_legacy_entities});
+            std.debug.print("  [unified-format] legacy \"entities\" key: wrap the entity array\n", .{});
+            std.debug.print("  in a \"root\" block and rename it to \"children\" (RFC #560)\n", .{});
+            std.debug.print("  Engine v2.0 (#592) will remove this fallback.\n\n", .{});
+            for (self.findings.items) |f| switch (f) {
+                .legacy_entities => |le| {
+                    std.debug.print("  {s}  (at {s})\n\n", .{ le.file, le.json_pointer });
+                },
+                else => {},
+            };
+        }
+
+        if (n_legacy_components > 0) {
+            std.debug.print("─── Legacy \"components\" on prefab reference ({d}) ───\n", .{n_legacy_components});
+            std.debug.print("  [unified-format] legacy \"components\" on a prefab reference:\n", .{});
+            std.debug.print("  rename it to \"overrides\" (RFC #560). When both are present,\n", .{});
+            std.debug.print("  \"overrides\" wins — remove \"components\".\n", .{});
+            std.debug.print("  Engine v2.0 (#592) will remove the synonym.\n\n", .{});
+            for (self.findings.items) |f| switch (f) {
+                .legacy_components_on_ref => |lc| {
+                    if (lc.overrides_also_present) {
+                        std.debug.print("  {s}  (at {s})  [overrides also present]\n", .{ lc.file, lc.json_pointer });
+                    } else {
+                        std.debug.print("  {s}  (at {s})\n", .{ lc.file, lc.json_pointer });
+                    }
+                    std.debug.print("    prefab: \"{s}\"\n\n", .{lc.prefab_ref});
+                },
+                else => {},
+            };
+        }
+
+        if (n_legacy_assets > 0) {
+            std.debug.print("─── Legacy \"assets\" key ({d}) ───\n", .{n_legacy_assets});
+            std.debug.print("  [unified-format] legacy \"assets\" key is ignored — assets\n", .{});
+            std.debug.print("  are inferred from sprite references (RFC #560, #563).\n", .{});
+            std.debug.print("  Engine v2.0 (#592) will remove the field entirely.\n\n", .{});
+            for (self.findings.items) |f| switch (f) {
+                .legacy_assets => |la| {
+                    std.debug.print("  {s}  (at {s})\n\n", .{ la.file, la.json_pointer });
                 },
                 else => {},
             };
@@ -340,9 +451,36 @@ fn inspectFile(
     }
     try files.append(arena, entry);
 
-    // §B2 walk.
+    // Top-level legacy keys (3a, 3c). These checks operate on the
+    // root object only — `"entities"` and `"assets"` are file-level
+    // keys; the engine's `fileChildren` / `warnLegacyAssets` mirror
+    // the same shape.
+    //
+    // RFC #560 — engine #592 will remove these in v2.0.
+    if (parsed.value == .object) {
+        const file_obj = parsed.value.object;
+        if (file_obj.get("entities") != null) {
+            try report.add(.{ .legacy_entities = .{
+                .file = rel_path,
+                .json_pointer = try arena.dupe(u8, "/entities"),
+            } });
+        }
+        if (file_obj.get("assets") != null) {
+            try report.add(.{ .legacy_assets = .{
+                .file = rel_path,
+                .json_pointer = try arena.dupe(u8, "/assets"),
+            } });
+        }
+    }
+
+    // §B2 walk + legacy-components-on-ref walk. Both are tree walks
+    // over the same parsed object; co-locating the legacy walk keeps
+    // the recursion in one place and avoids re-parsing.
     var path_buf: std.ArrayList(u8) = .empty;
     try walkB2(arena, parsed.value, rel_path, &path_buf, report);
+
+    var path_buf2: std.ArrayList(u8) = .empty;
+    try walkLegacyComponentsOnRef(arena, parsed.value, rel_path, &path_buf2, report);
 }
 
 fn basenameWithoutExt(name: []const u8) []const u8 {
@@ -456,6 +594,69 @@ fn walkB2(
                 const idx = std.fmt.bufPrint(&buf, "/{d}", .{i}) catch unreachable;
                 try path_buf.appendSlice(arena, idx);
                 try walkB2(arena, item, file, path_buf, report);
+            }
+        },
+        else => {},
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Check 3 — Legacy unified-format patterns (precursor to engine #592)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Recursive walker that flags any object with BOTH `"prefab"` (a
+/// string) and `"components"` as siblings — i.e. a prefab *reference*
+/// carrying the legacy override-key spelling. The engine's
+/// `entityPatch` accessor treats `"components"` here as a synonym for
+/// `"overrides"` and warns once; #592 will remove the synonym.
+///
+/// Distinct from §B2 (which fires on `prefab` + `children`): the two
+/// can co-occur on the same entry — both findings will be raised.
+///
+/// `path_buf` accumulates a JSON-pointer-style location, mirroring
+/// `walkB2`. Restored on every return so siblings see a clean buffer.
+fn walkLegacyComponentsOnRef(
+    arena: std.mem.Allocator,
+    value: std.json.Value,
+    file: []const u8,
+    path_buf: *std.ArrayList(u8),
+    report: *Report,
+) error{OutOfMemory}!void {
+    switch (value) {
+        .object => |obj| {
+            const prefab_v = obj.get("prefab");
+            const has_components = obj.get("components") != null;
+            if (prefab_v != null and prefab_v.? == .string and has_components) {
+                const prefab_name = prefab_v.?.string;
+                const ptr = if (path_buf.items.len == 0)
+                    try arena.dupe(u8, "/")
+                else
+                    try arena.dupe(u8, path_buf.items);
+                try report.add(.{ .legacy_components_on_ref = .{
+                    .file = file,
+                    .json_pointer = ptr,
+                    .prefab_ref = try arena.dupe(u8, prefab_name),
+                    .overrides_also_present = obj.get("overrides") != null,
+                } });
+            }
+
+            var it = obj.iterator();
+            while (it.next()) |kv| {
+                const saved = path_buf.items.len;
+                defer path_buf.shrinkRetainingCapacity(saved);
+                try path_buf.append(arena, '/');
+                try appendJsonPointerToken(arena, path_buf, kv.key_ptr.*);
+                try walkLegacyComponentsOnRef(arena, kv.value_ptr.*, file, path_buf, report);
+            }
+        },
+        .array => |arr| {
+            for (arr.items, 0..) |item, i| {
+                const saved = path_buf.items.len;
+                defer path_buf.shrinkRetainingCapacity(saved);
+                var buf: [32]u8 = undefined;
+                const idx = std.fmt.bufPrint(&buf, "/{d}", .{i}) catch unreachable;
+                try path_buf.appendSlice(arena, idx);
+                try walkLegacyComponentsOnRef(arena, item, file, path_buf, report);
             }
         },
         else => {},
@@ -910,9 +1111,334 @@ pub const RunAuditOnSpec = struct {
             for (result.report.findings.items) |f| switch (f) {
                 .collision => n_coll += 1,
                 .b2 => n_b2 += 1,
+                else => {},
             };
             try expect.equal(n_coll, @as(usize, 1));
             try expect.equal(n_b2, @as(usize, 1));
+        }
+    };
+
+    pub const legacy_entities_key = struct {
+        test "top-level entities array is flagged" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/old.jsonc",
+                \\{
+                \\  "name": "old",
+                \\  "entities": [
+                \\    { "components": { "Position": { "x": 0, "y": 0 } } }
+                \\  ]
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 1));
+            switch (result.report.findings.items[0]) {
+                .legacy_entities => |le| {
+                    try std.testing.expectEqualStrings("/entities", le.json_pointer);
+                    // file path is project-relative under scenes/.
+                    try std.testing.expect(std.mem.indexOf(u8, le.file, "old.jsonc") != null);
+                },
+                else => return error.TestFailed,
+            }
+        }
+
+        test "entities arrays in two files surface two findings (arena dedup)" {
+            // Drives the same `inspectFile` -> Dir.iterate() path that
+            // PR #232's arena-dup fix protects: each entry_name lives on
+            // the iterator's transient buffer. If we ever regress on
+            // duplication here, file paths would alias and one of the
+            // two findings would lose its file string.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/a.jsonc",
+                \\{ "entities": [] }
+            );
+            try p.write("scenes/b.jsonc",
+                \\{ "entities": [] }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n: usize = 0;
+            var saw_a = false;
+            var saw_b = false;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_entities => |le| {
+                    n += 1;
+                    if (std.mem.indexOf(u8, le.file, "a.jsonc") != null) saw_a = true;
+                    if (std.mem.indexOf(u8, le.file, "b.jsonc") != null) saw_b = true;
+                },
+                else => {},
+            };
+            try expect.equal(n, @as(usize, 2));
+            try std.testing.expect(saw_a);
+            try std.testing.expect(saw_b);
+        }
+    };
+
+    pub const legacy_components_on_ref = struct {
+        test "prefab + components (no overrides) is flagged" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "root": {
+                \\    "children": [
+                \\      { "prefab": "worker", "components": { "Position": { "x": 0, "y": 0 } } }
+                \\    ]
+                \\  }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 1));
+            switch (result.report.findings.items[0]) {
+                .legacy_components_on_ref => |lc| {
+                    try std.testing.expectEqualStrings("worker", lc.prefab_ref);
+                    try std.testing.expect(!lc.overrides_also_present);
+                    try std.testing.expect(std.mem.indexOf(u8, lc.json_pointer, "/root/children/0") != null);
+                },
+                else => return error.TestFailed,
+            }
+        }
+
+        test "prefab + components + overrides flags both keys on one entry" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "root": {
+                \\    "children": [
+                \\      {
+                \\        "prefab": "worker",
+                \\        "overrides": { "Position": { "x": 1, "y": 2 } },
+                \\        "components": { "Health": { "hp": 100 } }
+                \\      }
+                \\    ]
+                \\  }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 1));
+            switch (result.report.findings.items[0]) {
+                .legacy_components_on_ref => |lc| {
+                    try std.testing.expectEqualStrings("worker", lc.prefab_ref);
+                    try std.testing.expect(lc.overrides_also_present);
+                },
+                else => return error.TestFailed,
+            }
+        }
+
+        test "components on an INLINE entry (no prefab) is not a legacy finding" {
+            // Inline entries (no `prefab`) legitimately use `components`.
+            // The legacy synonym only applies to *reference* entries.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "root": {
+                \\    "children": [
+                \\      { "components": { "Position": { "x": 0, "y": 0 } } }
+                \\    ]
+                \\  }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 0));
+        }
+
+        test "§B2 and legacy-components-on-ref can co-fire on the same entry" {
+            // prefab + children + components — both walks should
+            // report against the same offending entry.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/bad.jsonc",
+                \\{
+                \\  "name": "bad",
+                \\  "root": {
+                \\    "children": [
+                \\      {
+                \\        "prefab": "x",
+                \\        "children": [],
+                \\        "components": { "Position": { "x": 0, "y": 0 } }
+                \\      }
+                \\    ]
+                \\  }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n_b2: usize = 0;
+            var n_legacy: usize = 0;
+            for (result.report.findings.items) |f| switch (f) {
+                .b2 => n_b2 += 1,
+                .legacy_components_on_ref => n_legacy += 1,
+                else => {},
+            };
+            try expect.equal(n_b2, @as(usize, 1));
+            try expect.equal(n_legacy, @as(usize, 1));
+        }
+
+        test "two files with legacy components each surface two findings" {
+            // Arena/dedup coverage across files — see the
+            // legacy_entities sibling test for the rationale.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/a.jsonc",
+                \\{ "root": { "children": [{ "prefab": "p", "components": {} }] } }
+            );
+            try p.write("scenes/b.jsonc",
+                \\{ "root": { "children": [{ "prefab": "q", "components": {} }] } }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n: usize = 0;
+            var saw_a = false;
+            var saw_b = false;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_components_on_ref => |lc| {
+                    n += 1;
+                    if (std.mem.indexOf(u8, lc.file, "a.jsonc") != null) saw_a = true;
+                    if (std.mem.indexOf(u8, lc.file, "b.jsonc") != null) saw_b = true;
+                },
+                else => {},
+            };
+            try expect.equal(n, @as(usize, 2));
+            try std.testing.expect(saw_a);
+            try std.testing.expect(saw_b);
+        }
+    };
+
+    pub const legacy_assets_key = struct {
+        test "top-level assets is flagged" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "assets": { "sprites": ["foo.png"] },
+                \\  "root": { "children": [] }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            try expect.equal(result.report.findings.items.len, @as(usize, 1));
+            switch (result.report.findings.items[0]) {
+                .legacy_assets => |la| {
+                    try std.testing.expectEqualStrings("/assets", la.json_pointer);
+                    try std.testing.expect(std.mem.indexOf(u8, la.file, "main.jsonc") != null);
+                },
+                else => return error.TestFailed,
+            }
+        }
+
+        test "two files with assets each surface two findings (arena dedup)" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/a.jsonc",
+                \\{ "assets": {}, "root": {} }
+            );
+            try p.write("scenes/b.jsonc",
+                \\{ "assets": {}, "root": {} }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n: usize = 0;
+            var saw_a = false;
+            var saw_b = false;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_assets => |la| {
+                    n += 1;
+                    if (std.mem.indexOf(u8, la.file, "a.jsonc") != null) saw_a = true;
+                    if (std.mem.indexOf(u8, la.file, "b.jsonc") != null) saw_b = true;
+                },
+                else => {},
+            };
+            try expect.equal(n, @as(usize, 2));
+            try std.testing.expect(saw_a);
+            try std.testing.expect(saw_b);
+        }
+    };
+
+    pub const all_legacy_in_one_file = struct {
+        test "entities + assets + components-on-ref all surface from one file" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/legacy.jsonc",
+                \\{
+                \\  "name": "legacy",
+                \\  "assets": {},
+                \\  "entities": [
+                \\    { "prefab": "worker", "components": { "Position": { "x": 0, "y": 0 } } }
+                \\  ]
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n_entities: usize = 0;
+            var n_assets: usize = 0;
+            var n_components: usize = 0;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_entities => n_entities += 1,
+                .legacy_assets => n_assets += 1,
+                .legacy_components_on_ref => n_components += 1,
+                else => {},
+            };
+            try expect.equal(n_entities, @as(usize, 1));
+            try expect.equal(n_assets, @as(usize, 1));
+            try expect.equal(n_components, @as(usize, 1));
+        }
+    };
+
+    pub const unified_shape_is_clean = struct {
+        test "fully unified file with overrides reports no legacy findings" {
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc",
+                \\{
+                \\  "name": "main",
+                \\  "root": {
+                \\    "children": [
+                \\      { "prefab": "worker", "overrides": { "Position": { "x": 0, "y": 0 } } },
+                \\      { "components": { "Position": { "x": 1, "y": 1 } } }
+                \\    ]
+                \\  }
+                \\}
+            );
+            try p.write("prefabs/worker.jsonc",
+                \\{ "root": { "components": { "Position": { "x": 0, "y": 0 } } } }
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            // No findings of any flavor.
+            try expect.equal(result.report.findings.items.len, @as(usize, 0));
         }
     };
 
