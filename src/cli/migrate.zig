@@ -600,8 +600,9 @@ fn skipWsAndComments(src: []const u8, start: usize) usize {
 /// we drop the comma along with the entry. If it was the LAST entry
 /// (no trailing comma), we drop the preceding comma instead — failing
 /// to do that would leave the previous sibling with a now-illegal
-/// trailing comma. The hunt-back walks past whitespace + comments to
-/// find a `,` and rewinds to just before it.
+/// trailing comma. The hunt-back walks past whitespace + `/* */` block
+/// comments + `//` line comments to find a `,` and rewinds to just
+/// before it.
 fn deleteTopLevelKey(arena: std.mem.Allocator, src: []const u8, key: []const u8) ?[]u8 {
     const loc = findTopLevelKey(src, key) orelse return null;
 
@@ -622,7 +623,32 @@ fn deleteTopLevelKey(arena: std.mem.Allocator, src: []const u8, key: []const u8)
         p -= 1;
         while (p >= 0) : (p -= 1) {
             const c = src[@intCast(p)];
-            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
+            if (c == ' ' or c == '\t' or c == '\r') continue;
+            if (c == '\n') {
+                // We just stepped into the end of the preceding line.
+                // If that line is a pure `//` line-comment (only
+                // whitespace before the `//`), skip the entire line so
+                // the comment text isn't interpreted as code. The next
+                // outer `p -= 1` will land us on the `\n` of the line
+                // before that.
+                const newline_idx: usize = @intCast(p);
+                // Find the start of this line (the one whose `\n` we
+                // are sitting on).
+                var ls: usize = newline_idx;
+                while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
+                // Scan from `ls` looking for `//` after only whitespace.
+                var s: usize = ls;
+                while (s < newline_idx and (src[s] == ' ' or src[s] == '\t')) s += 1;
+                if (s + 1 < newline_idx and src[s] == '/' and src[s + 1] == '/') {
+                    // Jump to just before the line start; outer step
+                    // moves us one further (onto the prior `\n`).
+                    p = @as(isize, @intCast(ls));
+                    // After `continue` the for-loop runs `p -= 1`, so
+                    // we want p such that p-1 lands on the byte just
+                    // before `ls`. That means p = ls.
+                }
+                continue;
+            }
             if (c == '/' and p > 0 and src[@intCast(p - 1)] == '*') {
                 // Walk back through a block comment. On entry `p` is at
                 // the `/` of `*/`. After this block the next outer
@@ -1130,6 +1156,34 @@ pub const TransformRootWrapperSpec = struct {
             try std.testing.expectEqualStrings("x", obj.get("metadata").?.string);
         }
 
+        // Adversarial: root not last, a `//` line comment between two
+        // outer-level keys, and a `/* */` block comment elsewhere. The
+        // whole file must round-trip through the JSON parser after the
+        // lift.
+        test "root in middle with mixed line + block comments around" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const src =
+                "{\n" ++
+                "    \"name\": \"main\",\n" ++
+                "    // line note between name and root\n" ++
+                "    \"root\": {\n" ++
+                "        /* inside-root block note */\n" ++
+                "        \"children\": []\n" ++
+                "    },\n" ++
+                "    \"metadata\": \"x\"\n" ++
+                "}\n";
+            const out = try applyAllArena(&arena, src);
+            const stripped = try stripJsoncToJson(arena.allocator(), out);
+            var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expect(obj.get("root") == null);
+            try std.testing.expect(obj.get("children") != null);
+            try std.testing.expectEqualStrings("main", obj.get("name").?.string);
+            try std.testing.expectEqualStrings("x", obj.get("metadata").?.string);
+        }
+
         test "root in middle with line comment between `}` and next key" {
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena.deinit();
@@ -1179,6 +1233,55 @@ pub const DeleteTopLevelKeyBlockCommentSpec = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "\"main\",") == null);
         // And it must round-trip through the JSON parser too.
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("main", parsed.value.object.get("name").?.string);
+    }
+
+    // Regression for cursor[bot] finding: the backward walk that looks
+    // for the preceding comma when the target key is the LAST entry
+    // claims (per its doc) to skip "whitespace + comments", but only
+    // handled `/* ... */` block comments — never `//` line comments. A
+    // `//` comment sitting on its own line between the preceding comma
+    // and the deleted key made the walk hit the comment text and break
+    // before finding the comma — leaving a dangling trailing comma on
+    // the preceding sibling and producing invalid strict JSON.
+    test "deletes last key preceded by a `//` line comment" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"main\",\n" ++
+            "    // trailing note\n" ++
+            "    \"assets\": [\"a\"]\n" ++
+            "}\n";
+        const out = try applyAllArena(&arena, src);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\"") == null);
+        // Trailing comma on `"main"` must be gone.
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"main\",") == null);
+        // Round-trip through the JSON parser to be safe.
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("main", parsed.value.object.get("name").?.string);
+    }
+
+    // Adversarial: both kinds of comments interleaved before the
+    // deleted last-key.
+    test "deletes last key preceded by mixed `//` and `/* */` comments" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"main\",\n" ++
+            "    // line note\n" ++
+            "    /* block note */\n" ++
+            "    \"assets\": [\"a\"]\n" ++
+            "}\n";
+        const out = try applyAllArena(&arena, src);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"main\",") == null);
         const stripped = try stripJsoncToJson(arena.allocator(), out);
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
