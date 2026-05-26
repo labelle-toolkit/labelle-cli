@@ -43,12 +43,13 @@ pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
 
     for (cfg.plugins) |plugin| {
         if (plugin.isLocal()) continue;
-        const plugin_mm = parseMajorMinor(plugin.version);
-        if (core_mm != null and plugin_mm != core_mm.?) {
-            std.debug.print("labelle: warning: plugin {s} {s} may be incompatible with core {s}\n", .{ plugin.name, plugin.version, cfg.core_version });
-            std.debug.print("  plugins depend on core — their major.minor versions should match\n", .{});
-            std.debug.print("  hint: update the plugin version in project.labelle\n\n", .{});
-            warnings += 1;
+        if (core_mm) |cmm| {
+            if (pluginCompatWarn(plugin.version, cmm)) {
+                std.debug.print("labelle: warning: plugin {s} {s} may be incompatible with core {s}\n", .{ plugin.name, plugin.version, cfg.core_version });
+                std.debug.print("  plugins depend on core — their major.minor versions should match\n", .{});
+                std.debug.print("  hint: update the plugin version in project.labelle\n\n", .{});
+                warnings += 1;
+            }
         }
     }
 
@@ -96,8 +97,26 @@ fn validateStates(states: []const []const u8) void {
     }
 }
 
-/// Parse a semver string into a major.minor comparable value.
-fn parseMajorMinor(version: []const u8) u32 {
+/// Decide whether a plugin version should emit a compat warning against
+/// the given core major.minor value.
+///
+/// 0.x plugins are "pre-stable" by toolkit convention and live on a
+/// separate version train from a 1.x+ core, so the major.minor equality
+/// check does not apply to them — they are always skipped here. See
+/// https://github.com/labelle-toolkit/labelle-cli/issues/230. A declared
+/// compat range from `plugin.labelle` would supersede this skip and is
+/// tracked as the proper long-term fix.
+fn pluginCompatWarn(plugin_version: []const u8, core_mm: u32) bool {
+    const plugin = parseVersion(plugin_version);
+    // Skip the check for 0.x plugins entirely (pre-stable train).
+    // Test the major directly — the major*100+minor encoding collides
+    // for e.g. 0.100 vs 1.0, so we can't recover major from the composite.
+    if (plugin.major == 0) return false;
+    return (plugin.major * 100 + plugin.minor) != core_mm;
+}
+
+/// Parse a semver string into its major/minor components.
+fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
     var parts: [3]u32 = .{ 0, 0, 0 };
     var part_idx: u8 = 0;
 
@@ -110,5 +129,57 @@ fn parseMajorMinor(version: []const u8) u32 {
         }
     }
 
-    return parts[0] * 100 + parts[1];
+    return .{ .major = parts[0], .minor = parts[1] };
+}
+
+/// Parse a semver string into a major.minor comparable value.
+///
+/// Note: the major*100+minor encoding is ambiguous (0.100 collides with 1.0).
+/// Callers that need to distinguish 0.x from 1.x should use `parseVersion`.
+fn parseMajorMinor(version: []const u8) u32 {
+    const v = parseVersion(version);
+    return v.major * 100 + v.minor;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "pluginCompatWarn: 0.x plugin vs 1.x core — no warning (issue #230)" {
+    const core_mm = parseMajorMinor("1.14.1");
+    try std.testing.expect(!pluginCompatWarn("0.5.0", core_mm));
+    try std.testing.expect(!pluginCompatWarn("0.6.1", core_mm));
+}
+
+test "pluginCompatWarn: 0.x plugin vs 0.x core with matching minor — no warning" {
+    const core_mm = parseMajorMinor("0.5.0");
+    try std.testing.expect(!pluginCompatWarn("0.5.2", core_mm));
+}
+
+test "pluginCompatWarn: 0.x plugin vs 0.x core with mismatched minor — no warning (0.x always skipped)" {
+    const core_mm = parseMajorMinor("0.5.0");
+    try std.testing.expect(!pluginCompatWarn("0.6.0", core_mm));
+    try std.testing.expect(!pluginCompatWarn("0.3.0", core_mm));
+}
+
+test "pluginCompatWarn: 1.x plugin matches 1.x core — no warning" {
+    const core_mm = parseMajorMinor("1.14.1");
+    try std.testing.expect(!pluginCompatWarn("1.14.0", core_mm));
+    try std.testing.expect(!pluginCompatWarn("1.14.5", core_mm));
+}
+
+test "pluginCompatWarn: 1.x plugin mismatched with 1.x core — warns" {
+    const core_mm = parseMajorMinor("1.14.1");
+    try std.testing.expect(pluginCompatWarn("1.13.0", core_mm));
+    try std.testing.expect(pluginCompatWarn("1.15.0", core_mm));
+    try std.testing.expect(pluginCompatWarn("2.0.0", core_mm));
+}
+
+test "pluginCompatWarn: 0.100.x plugin is still treated as 0.x (no warn vs 1.x core)" {
+    // Regression: parseMajorMinor("0.100.0") encodes as 100, which would
+    // collide with 1.0 under a naive `< 100` check. Major must be tested
+    // directly.
+    const core_mm = parseMajorMinor("1.14.1");
+    try std.testing.expect(!pluginCompatWarn("0.100.0", core_mm));
+    // Also confirm against a 1.0 core where the encoded values would match.
+    const core_10 = parseMajorMinor("1.0.0");
+    try std.testing.expect(!pluginCompatWarn("0.100.0", core_10));
 }
