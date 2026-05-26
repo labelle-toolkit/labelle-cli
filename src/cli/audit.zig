@@ -72,13 +72,20 @@ pub fn cmdAudit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !voi
 
 fn runUnificationAudit(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var project_dir: []const u8 = ".";
+    var dir_set = false;
     for (cmd_args) |arg| {
         if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("labelle audit unification: unknown flag '{s}'\n", .{arg});
             std.debug.print("{s}", .{usage});
             std.process.exit(2);
         }
+        if (dir_set) {
+            std.debug.print("labelle audit unification: unexpected argument '{s}' (only one project dir accepted)\n", .{arg});
+            std.debug.print("{s}", .{usage});
+            std.process.exit(2);
+        }
         project_dir = arg;
+        dir_set = true;
     }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -261,7 +268,13 @@ fn walkSubdir(
 
         switch (entry.kind) {
             .directory => {
-                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err| {
+                    // Propagate so the top-level catch in runUnificationAudit
+                    // exits with code 2 instead of silently producing a
+                    // clean-looking but partial scan.
+                    std.debug.print("labelle audit unification: could not open '{s}': {s}\n", .{ rel_buf.items, @errorName(err) });
+                    return err;
+                };
                 defer sub.close(io);
                 try walkSubdir(arena, &sub, rel_buf, files, report);
             },
@@ -289,16 +302,21 @@ fn inspectFile(
     // practice the largest in-tree file is well under 64 KiB. This
     // mirrors `prefab_cache.zig`'s engine-side bound so we don't
     // diverge.
+    //
+    // IO and parse failures are propagated rather than swallowed so
+    // the audit cannot exit 0-clean on a partial scan: a broken file
+    // is treated as a hard error (exit code 2) per the documented
+    // exit-code contract at the top of this file.
     const raw = dir.readFileAlloc(io, entry_name, arena, .limited(1024 * 1024)) catch |err| {
         std.debug.print("labelle audit unification: could not read '{s}': {s}\n", .{ rel_path, @errorName(err) });
-        return;
+        return err;
     };
 
     const stripped = try stripJsoncToJson(arena, raw);
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena, stripped, .{}) catch |err| {
         std.debug.print("labelle audit unification: could not parse '{s}': {s}\n", .{ rel_path, @errorName(err) });
-        return;
+        return err;
     };
     defer parsed.deinit();
 
@@ -330,6 +348,24 @@ fn inspectFile(
 fn basenameWithoutExt(name: []const u8) []const u8 {
     if (std.mem.endsWith(u8, name, ".jsonc")) return name[0 .. name.len - ".jsonc".len];
     return name;
+}
+
+/// Append `token` to `buf`, escaping the two characters that have
+/// special meaning in JSON Pointer reference tokens (RFC 6901):
+///   '~' → "~0"
+///   '/' → "~1"
+/// The order matters: escape '~' first so the '0'/'1' we introduce for
+/// '/' cannot be mistaken for a pre-existing '~' escape.
+fn appendJsonPointerToken(
+    arena: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    token: []const u8,
+) !void {
+    for (token) |c| switch (c) {
+        '~' => try buf.appendSlice(arena, "~0"),
+        '/' => try buf.appendSlice(arena, "~1"),
+        else => try buf.append(arena, c),
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -404,7 +440,11 @@ fn walkB2(
                 const saved = path_buf.items.len;
                 defer path_buf.shrinkRetainingCapacity(saved);
                 try path_buf.append(arena, '/');
-                try path_buf.appendSlice(arena, kv.key_ptr.*);
+                // Per RFC 6901: '~' → "~0", '/' → "~1" in reference tokens.
+                // Object keys can legitimately contain these characters
+                // (e.g. resource paths in override blocks), so unescaped
+                // appends would produce ambiguous pointers.
+                try appendJsonPointerToken(arena, path_buf, kv.key_ptr.*);
                 try walkB2(arena, kv.value_ptr.*, file, path_buf, report);
             }
         },
