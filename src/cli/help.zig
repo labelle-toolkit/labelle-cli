@@ -21,6 +21,7 @@ pub fn printHelp() void {
         \\  update [ver] [--no-path]  Update the labelle CLI itself
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
         \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
+        \\  audit unification [dir]  Pre-flight check for the unified scene/prefab loader (RFC #560)
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
@@ -47,6 +48,8 @@ pub fn printHelp() void {
         \\  labelle test
         \\  labelle test ../my-game --verbose
         \\  labelle test --no-libs
+        \\  labelle audit unification
+        \\  labelle audit unification ../my-game
         \\
     , .{project_config.CLI_VERSION});
 }
