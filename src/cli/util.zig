@@ -129,9 +129,20 @@ pub fn appendToProfile(allocator: std.mem.Allocator, path: []const u8, line: []c
     return true;
 }
 
-/// Parse a duration string like "30s", "2m", or bare "30" (seconds).
+/// Parse a duration string like "500ms", "30s", "2m", or bare "30" (seconds).
+///
+/// `ms` is matched before the single-char suffixes so that the help
+/// text in `--after=<dur>` (which advertises `500ms`) actually works;
+/// without this branch the trailing `s` would parse as seconds and the
+/// leading `500m` would fail integer parsing.
 pub fn parseDuration(input: []const u8) ?u64 {
     if (input.len == 0) return null;
+
+    if (std.mem.endsWith(u8, input, "ms")) {
+        const num_str = input[0 .. input.len - 2];
+        const ms = std.fmt.parseInt(u64, num_str, 10) catch return null;
+        return std.math.mul(u64, ms, std.time.ns_per_ms) catch return null;
+    }
 
     const last = input[input.len - 1];
     const multiplier: u64 = switch (last) {

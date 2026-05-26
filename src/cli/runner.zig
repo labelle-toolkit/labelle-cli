@@ -26,7 +26,8 @@ pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []con
 ///
 /// `environ_map`, when non-null, *replaces* the child's environment block.
 /// Callers that need to *augment* the parent env (e.g. to inject
-/// `LABELLE_SCENE` for the cli#229 runtime scene-override flow) should
+/// `LABELLE_SCENE` for the cli#229 runtime scene-override flow, or
+/// `LABELLE_SCREENSHOT_PATH` for the cli#227 screenshot flow) should
 /// build the map by snapshotting the current process environ and adding
 /// the extra entries on top — see `runZigInheritWithEnv` below.
 pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, timeout_ns: ?u64) !u8 {
