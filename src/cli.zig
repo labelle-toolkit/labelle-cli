@@ -980,6 +980,160 @@ pub const SceneArgValue = struct {
     }
 };
 
+/// Smoke tests for the full `parseSceneFlag` parser (issue #228).
+///
+/// `ParseSceneArg` and `SceneArgValue` above test the two lower-level
+/// helpers in isolation, but the actual CLI dispatch (`parseDirAndScene`,
+/// `parseRunArgs`) goes through `parseSceneFlag`, which combines them
+/// and additionally consumes the *next* arg for the space-separated
+/// `--scene name` form. This spec exercises that combined path so a
+/// refactor of either helper can't silently drop the contract that
+/// PR #216 / RFC #565 introduced.
+pub const ParseSceneFlagSpec = struct {
+    pub const equals_form = struct {
+        test "--scene=name sets the override and reports parsed" {
+            var iter = testIter("--scene=main_menu");
+            defer iter.deinit();
+            var scene: ?[]const u8 = null;
+            const arg = iter.next().?;
+            const result = parseSceneFlag(arg, &iter, &scene, "build");
+            try expect.equal(result, .parsed);
+            try std.testing.expectEqualStrings("main_menu", scene.?);
+        }
+    };
+
+    pub const space_form = struct {
+        test "--scene name (separate tokens) consumes the next arg" {
+            var iter = testIter("--scene main_menu");
+            defer iter.deinit();
+            var scene: ?[]const u8 = null;
+            const arg = iter.next().?;
+            const result = parseSceneFlag(arg, &iter, &scene, "build");
+            try expect.equal(result, .parsed);
+            try std.testing.expectEqualStrings("main_menu", scene.?);
+            // The value arg should have been consumed off the iterator.
+            try std.testing.expect(iter.next() == null);
+        }
+    };
+
+    pub const empty_value = struct {
+        test "--scene= (empty after equals) returns .err and leaves override null" {
+            var iter = testIter("--scene=");
+            defer iter.deinit();
+            var scene: ?[]const u8 = null;
+            const arg = iter.next().?;
+            const result = parseSceneFlag(arg, &iter, &scene, "build");
+            try expect.equal(result, .err);
+            try std.testing.expect(scene == null);
+        }
+    };
+
+    pub const missing_value = struct {
+        test "bare --scene with no following arg returns .err" {
+            var iter = testIter("--scene");
+            defer iter.deinit();
+            var scene: ?[]const u8 = null;
+            const arg = iter.next().?;
+            const result = parseSceneFlag(arg, &iter, &scene, "build");
+            try expect.equal(result, .err);
+            try std.testing.expect(scene == null);
+        }
+    };
+
+    pub const unrelated = struct {
+        test "non-scene arg returns .not_scene and leaves override untouched" {
+            var iter = testIter("--platform=desktop");
+            defer iter.deinit();
+            var scene: ?[]const u8 = null;
+            const arg = iter.next().?;
+            const result = parseSceneFlag(arg, &iter, &scene, "build");
+            try expect.equal(result, .not_scene);
+            try std.testing.expect(scene == null);
+        }
+    };
+};
+
+/// End-to-end pipeline smoke test for the `--scene` → `.initial_prefab`
+/// contract that PR #216 introduced. This wires `parseSceneFlag` to the
+/// post-#216 application code at cli.zig:657-660 (normalizeInitialPrefab
+/// then assign the override) so the full chain is exercised together.
+///
+/// Tracked by issue #228.
+pub const SceneOverridePipelineSpec = struct {
+    test "--scene=name overrides initial_prefab on an empty config" {
+        var iter = testIter("--scene=mymain");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .parsed);
+
+        var cfg = project_config.ProjectConfig{ .name = "smoke" };
+        cfg.normalizeInitialPrefab();
+        if (scene_override) |s| cfg.initial_prefab = s;
+        try std.testing.expectEqualStrings("mymain", cfg.initial_prefab.?);
+    }
+
+    test "--scene name (space form) overrides initial_prefab" {
+        var iter = testIter("--scene mymain");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .parsed);
+
+        var cfg = project_config.ProjectConfig{ .name = "smoke" };
+        cfg.normalizeInitialPrefab();
+        if (scene_override) |s| cfg.initial_prefab = s;
+        try std.testing.expectEqualStrings("mymain", cfg.initial_prefab.?);
+    }
+
+    test "legacy initial_scene in fixture normalizes, then --scene wins" {
+        var iter = testIter("--scene=override");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .parsed);
+
+        // Fixture simulates a project.labelle that still uses the legacy
+        // `.initial_scene` alias. After normalization it should be promoted
+        // to `.initial_prefab`, then the --scene override wins on top.
+        var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_scene = "legacy" };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqualStrings("legacy", cfg.initial_prefab.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_scene);
+        if (scene_override) |s| cfg.initial_prefab = s;
+        try std.testing.expectEqualStrings("override", cfg.initial_prefab.?);
+    }
+
+    test "no --scene flag preserves normalized initial_prefab from config" {
+        // No `--scene` on the command line — only normalization runs.
+        var iter = testIter("--platform=desktop");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .not_scene);
+
+        var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_prefab = "from_config" };
+        cfg.normalizeInitialPrefab();
+        if (scene_override) |s| cfg.initial_prefab = s;
+        try std.testing.expectEqualStrings("from_config", cfg.initial_prefab.?);
+    }
+
+    test "empty --scene= aborts the override; initial_prefab untouched" {
+        var iter = testIter("--scene=");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .err);
+
+        // The CLI bails on .err (returns null from parseDirAndScene / parseRunArgs),
+        // so initial_prefab should remain whatever the (normalized) config said.
+        var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_prefab = "untouched" };
+        cfg.normalizeInitialPrefab();
+        if (scene_override) |s| cfg.initial_prefab = s;
+        try std.testing.expectEqualStrings("untouched", cfg.initial_prefab.?);
+    }
+};
+
 pub const ParseOptimizeFlagSpec = struct {
     pub const valid_modes = struct {
         test "parses all valid modes" {
