@@ -23,7 +23,27 @@ pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []con
 
 /// Run a zig command with inherited stdio (output goes straight to terminal).
 /// Optionally kills the process after `timeout_ns` nanoseconds.
+///
+/// `environ_map`, when non-null, *replaces* the child's environment block.
+/// Callers that need to *augment* the parent env (e.g. to inject
+/// `LABELLE_SCENE` for the cli#229 runtime scene-override flow) should
+/// build the map by snapshotting the current process environ and adding
+/// the extra entries on top — see `runZigInheritWithEnv` below.
 pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, timeout_ns: ?u64) !u8 {
+    return runZigInheritWithEnv(allocator, cwd, argv, timeout_ns, null);
+}
+
+/// Like `runZigInherit`, but accepts an optional environment map that
+/// replaces the child's environ when non-null. The map must already
+/// contain everything the child needs (parent env + extra keys); see
+/// `buildEnvironWithExtra` for the standard snapshot-and-add helper.
+pub fn runZigInheritWithEnv(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    timeout_ns: ?u64,
+    environ_map: ?*const std.process.Environ.Map,
+) !u8 {
     const io = config.globalIo();
     var child = try std.process.spawn(io, .{
         .argv = argv,
@@ -32,6 +52,7 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
         .stdout = .inherit,
         .stderr = .inherit,
         .pgid = if (!is_windows and timeout_ns != null) 0 else null,
+        .environ_map = environ_map,
     });
 
     // Heap-allocate so the detached thread can safely access it after this function returns
@@ -81,6 +102,41 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
             return 1;
         },
     };
+}
+
+/// Build a fresh `Environ.Map` that mirrors the current process's
+/// environment block plus the entries in `extras`. The caller owns the
+/// returned map and must `deinit()` it after the spawned child has
+/// been waited on.
+///
+/// This exists because Zig's `process.spawn` treats `environ_map` as a
+/// *replacement* for the parent block — passing a one-entry map would
+/// strip PATH, HOME, etc. The cli#229 `LABELLE_SCENE` flow wants
+/// "parent env + one extra var," so we snapshot first.
+pub const EnvKV = struct { key: []const u8, value: []const u8 };
+
+pub fn buildEnvironWithExtra(
+    allocator: std.mem.Allocator,
+    extras: []const EnvKV,
+) !std.process.Environ.Map {
+    var map = std.process.Environ.Map.init(allocator);
+    errdefer map.deinit();
+
+    const environ = config.globalEnviron();
+    const block = environ.block;
+    switch (@TypeOf(block)) {
+        std.process.Environ.PosixBlock => try map.putPosixBlock(block.view()),
+        std.process.Environ.WindowsBlock => try map.putWindowsBlock(block.view()),
+        std.process.Environ.GlobalBlock => {
+            // Nothing to snapshot for global blocks — extras-only env.
+        },
+        else => @compileError("unsupported Environ.Block variant"),
+    }
+
+    for (extras) |kv| {
+        try map.put(kv.key, kv.value);
+    }
+    return map;
 }
 
 fn sleepNanos(ns: u64) void {

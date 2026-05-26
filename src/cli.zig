@@ -659,6 +659,13 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Normalize the deprecated `.initial_scene` alias (RFC #560 / #565)
     // into `.initial_prefab`, then apply the --scene override on top.
+    //
+    // cli#229: `--scene` now ALSO sets `LABELLE_SCENE` in the spawned
+    // game's env so loading-scene controllers can pick up the requested
+    // scene AFTER `assets.allReady` (the safe, race-free path). The
+    // legacy `.initial_prefab` rewrite below stays as a deprecation
+    // bridge for projects without a loading-scene gate — once every
+    // game adopts the env-var path, the rewrite can be removed.
     parsed.normalizeInitialPrefab();
     if (parsed_args.scene_override) |scene| {
         parsed.initial_prefab = scene;
@@ -899,6 +906,24 @@ pub fn main(proc_init: std.process.Init) !void {
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
+        // cli#229: when --scene=<name> was passed, also surface the
+        // requested scene to the child via the `LABELLE_SCENE` env var.
+        // Loading-controller scripts read this AFTER `assets.allReady`
+        // succeeds and call `setScene(requested)`, so asset streaming
+        // for large scenes (e.g. flying-platform-labelle's `colony`,
+        // 6 atlas packs) no longer races boot. The legacy
+        // `.initial_prefab` rewrite above is kept as a deprecation
+        // bridge for projects without a loading-scene gate.
+        var env_map_storage: ?std.process.Environ.Map = null;
+        defer if (env_map_storage) |*m| m.deinit();
+        var env_map_ptr: ?*const std.process.Environ.Map = null;
+        if (parsed_args.scene_override) |scene| {
+            env_map_storage = try runner.buildEnvironWithExtra(allocator, &.{
+                .{ .key = "LABELLE_SCENE", .value = scene },
+            });
+            env_map_ptr = &env_map_storage.?;
+        }
+
         // When --docker was used, run the built binary directly instead of
         // calling `zig build run` (local Zig may be broken).
         if (parsed_args.docker) {
@@ -914,14 +939,14 @@ pub fn main(proc_init: std.process.Init) !void {
             defer run_args.deinit(allocator);
             try run_args.append(allocator, bin_path);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
-            const run_result = try runner.runZigInherit(allocator, project_dir, run_args.items, timeout_ns);
+            const run_result = try runner.runZigInheritWithEnv(allocator, project_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
         } else {
             try zig_args.append(allocator, "run");
             try appendRunForwardedArgs(&zig_args, allocator, &parsed_args);
-            const run_result = try runner.runZigInherit(allocator, target_dir, zig_args.items, timeout_ns);
+            const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, zig_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
