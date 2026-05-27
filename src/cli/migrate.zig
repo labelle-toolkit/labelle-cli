@@ -1969,14 +1969,20 @@ fn mergeIntoExistingMeta(
     // space for readability.
     while (splice_at > meta_open + 1) {
         const c = src[splice_at - 1];
-        if (c == ' ' or c == '\t') {
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
             splice_at -= 1;
             continue;
         }
         break;
     }
+    // JSONC allows a trailing comma before `}`. If the last structural
+    // byte is already a `,`, we must NOT prepend another `,` — that
+    // would yield `..., , "newkey": ...` (invalid JSON). Detect it and
+    // suppress the prepended separator.
+    const has_trailing_comma = !empty and splice_at > meta_open + 1 and
+        src[splice_at - 1] == ',';
     out.appendSlice(arena, src[0..splice_at]) catch return null;
-    if (!empty) {
+    if (!empty and !has_trailing_comma) {
         out.appendSlice(arena, ", ") catch return null;
     } else {
         out.append(arena, ' ') catch return null;
@@ -3178,6 +3184,34 @@ pub const TransformDirectivesToMetaHeaderSpec = struct {
             "    ]\n" ++
             "}\n";
         const out = try applyAllArenaFull(&arena, src, "demo");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("hello", meta.get("tooltip").?.string);
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+    }
+
+    test "directive merges into existing meta block with trailing comma" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // Pre-existing meta has a JSONC-legal trailing comma before `}`.
+        // The merge must NOT emit a second comma — `, , "initial_state"`
+        // is invalid JSON and would fail to round-trip.
+        const src =
+            "{\n" ++
+            "    \"meta\": { \"tooltip\": \"hello\", },\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"x\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        // Guard: the raw output must not contain a `,,` separator
+        // inside the meta block.
+        try std.testing.expect(std.mem.indexOf(u8, out, ",,") == null);
         const stripped = try stripJsoncToJson(arena.allocator(), out);
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
