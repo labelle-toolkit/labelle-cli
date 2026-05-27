@@ -282,6 +282,16 @@ fn runMigrateOn(
 /// AND other files reference it as `{prefab: "<X>"}` — those references
 /// must be updated by hand (or the file renamed). The migrator can't
 /// auto-resolve the ambiguity, so it just emits a warning per file.
+/// Walks `<project_dir>/<subdir>` and collects every `{prefab: "X"}` xref
+/// into `xrefs` (which lives in the main `arena`). Uses a per-file temp
+/// arena that is reset after each file so the raw bytes + JSONC-stripped
+/// buffer + parsed JSON tree for one file don't accumulate in the main
+/// arena across N files — on a 1000-file project that would otherwise be
+/// N file buffers + N parsed trees held simultaneously until the migrator
+/// finishes. The only thing that survives the per-file reset is the xref
+/// name string, which `collectPrefabRefsFromValue` dupes into `arena`
+/// before returning. Future contributors: if you add anything that
+/// outlives one file iteration, dupe it into `arena` here too.
 fn collectPrefabRefs(
     arena: std.mem.Allocator,
     project_dir: []const u8,
@@ -295,11 +305,15 @@ fn collectPrefabRefs(
         else => return err,
     };
     defer dir.close(io);
-    try walkSubdirRefs(arena, &dir, xrefs);
+
+    var temp_arena = std.heap.ArenaAllocator.init(arena);
+    defer temp_arena.deinit();
+    try walkSubdirRefs(arena, &temp_arena, &dir, xrefs);
 }
 
 fn walkSubdirRefs(
     arena: std.mem.Allocator,
+    temp_arena: *std.heap.ArenaAllocator,
     dir: *std.Io.Dir,
     xrefs: *std.StringHashMap(void),
 ) !void {
@@ -310,12 +324,17 @@ fn walkSubdirRefs(
             .directory => {
                 var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
                 defer sub.close(io);
-                try walkSubdirRefs(arena, &sub, xrefs);
+                try walkSubdirRefs(arena, temp_arena, &sub, xrefs);
             },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
-                const raw = dir.readFileAlloc(io, entry.name, arena, .limited(1024 * 1024)) catch continue;
-                scanPrefabRefs(arena, raw, xrefs) catch {};
+                const temp = temp_arena.allocator();
+                const raw = dir.readFileAlloc(io, entry.name, temp, .limited(1024 * 1024)) catch {
+                    _ = temp_arena.reset(.retain_capacity);
+                    continue;
+                };
+                scanPrefabRefs(arena, temp, raw, xrefs) catch {};
+                _ = temp_arena.reset(.retain_capacity);
             },
             else => {},
         }
@@ -327,13 +346,19 @@ fn walkSubdirRefs(
 /// shared JSONC pre-stripper + `std.json` so comments don't confuse the
 /// scan; we don't care about structural context (a `prefab:` key inside
 /// a deeply-nested object is still a valid reference).
+///
+/// `temp` is reset by the caller after each file — raw bytes, the
+/// stripped JSON buffer, and the parsed tree all live in `temp`. Only
+/// xref name strings get duped into `arena` (the long-lived one that
+/// owns `xrefs`).
 fn scanPrefabRefs(
     arena: std.mem.Allocator,
+    temp: std.mem.Allocator,
     raw: []const u8,
     xrefs: *std.StringHashMap(void),
 ) !void {
-    const stripped = try stripJsoncToJson(arena, raw);
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, stripped, .{}) catch return;
+    const stripped = try stripJsoncToJson(temp, raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, temp, stripped, .{}) catch return;
     defer parsed.deinit();
     try collectPrefabRefsFromValue(arena, parsed.value, xrefs);
 }
@@ -347,8 +372,15 @@ fn collectPrefabRefsFromValue(
         .object => |obj| {
             if (obj.get("prefab")) |pv| {
                 if (pv == .string) {
-                    const name_copy = try arena.dupe(u8, pv.string);
-                    try xrefs.put(name_copy, {});
+                    // Dedup before duping: the value lives in the
+                    // per-file temp arena and will vanish on reset, so
+                    // the key MUST be duped into `arena` — but only on
+                    // first sight, otherwise we leak a copy per
+                    // reference across the project.
+                    if (!xrefs.contains(pv.string)) {
+                        const name_copy = try arena.dupe(u8, pv.string);
+                        try xrefs.put(name_copy, {});
+                    }
                 }
             }
             var it = obj.iterator();
@@ -2821,5 +2853,91 @@ pub const Rfc596MixedFileSpec = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .array);
+    }
+};
+
+pub const PreScanXrefsSpec = struct {
+    test "scanPrefabRefs dedups: N files referencing the same prefab yield ONE xref entry" {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var temp_arena = std.heap.ArenaAllocator.init(arena);
+        defer temp_arena.deinit();
+
+        var xrefs: std.StringHashMap(void) = .init(arena);
+
+        // Five "files" all referencing the same prefab name "Hero". After
+        // resetting the temp arena between each file, the xref name must
+        // survive (duped into main arena) AND only one entry must exist
+        // (dedup via xrefs.contains in collectPrefabRefsFromValue).
+        const files = [_][]const u8{
+            "[{ \"prefab\": \"Hero\" }]",
+            "[{ \"prefab\": \"Hero\", \"overrides\": { \"Position\": { \"x\": 1 } } }]",
+            "{ \"children\": [{ \"prefab\": \"Hero\" }] }",
+            "[{ \"prefab\": \"Hero\" }, { \"prefab\": \"Hero\" }]", // intra-file dup too
+            "[{ \"prefab\": \"Hero\" }]",
+        };
+        for (files) |raw| {
+            try scanPrefabRefs(arena, temp_arena.allocator(), raw, &xrefs);
+            _ = temp_arena.reset(.retain_capacity);
+        }
+
+        try std.testing.expectEqual(@as(u32, 1), xrefs.count());
+        try std.testing.expect(xrefs.contains("Hero"));
+    }
+
+    test "scanPrefabRefs collects multiple distinct prefabs and dedups each" {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var temp_arena = std.heap.ArenaAllocator.init(arena);
+        defer temp_arena.deinit();
+
+        var xrefs: std.StringHashMap(void) = .init(arena);
+
+        const files = [_][]const u8{
+            "[{ \"prefab\": \"Hero\" }, { \"prefab\": \"Goblin\" }]",
+            "[{ \"prefab\": \"Hero\" }]", // duplicate of Hero
+            "[{ \"prefab\": \"Sword\" }]",
+            "[{ \"prefab\": \"Goblin\" }]", // duplicate of Goblin
+        };
+        for (files) |raw| {
+            try scanPrefabRefs(arena, temp_arena.allocator(), raw, &xrefs);
+            _ = temp_arena.reset(.retain_capacity);
+        }
+
+        try std.testing.expectEqual(@as(u32, 3), xrefs.count());
+        try std.testing.expect(xrefs.contains("Hero"));
+        try std.testing.expect(xrefs.contains("Goblin"));
+        try std.testing.expect(xrefs.contains("Sword"));
+    }
+
+    test "xref keys survive temp-arena reset (lifetime check)" {
+        // Regression guard: if a future contributor accidentally dupes
+        // the xref key into the temp arena instead of the main arena,
+        // the key bytes will be invalidated by the reset and this test
+        // will read garbage on the contains() lookup.
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var temp_arena = std.heap.ArenaAllocator.init(arena);
+        defer temp_arena.deinit();
+
+        var xrefs: std.StringHashMap(void) = .init(arena);
+
+        // Use a long name so a stale pointer is less likely to land on
+        // identical bytes by coincidence.
+        try scanPrefabRefs(arena, temp_arena.allocator(), "[{ \"prefab\": \"VeryLongPrefabNameForLifetimeCheck\" }]", &xrefs);
+        _ = temp_arena.reset(.retain_capacity);
+
+        // Fill temp with unrelated bytes to clobber any released pages.
+        const noise = try temp_arena.allocator().alloc(u8, 4096);
+        @memset(noise, 0xAA);
+
+        try std.testing.expectEqual(@as(u32, 1), xrefs.count());
+        try std.testing.expect(xrefs.contains("VeryLongPrefabNameForLifetimeCheck"));
     }
 };
