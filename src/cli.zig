@@ -725,18 +725,15 @@ pub fn main(proc_init: std.process.Init) !void {
     };
 
     // Normalize the deprecated `.initial_scene` alias (RFC #560 / #565)
-    // into `.initial_prefab`, then apply the --scene override on top.
-    //
-    // cli#229: `--scene` now ALSO sets `LABELLE_SCENE` in the spawned
-    // game's env so loading-scene controllers can pick up the requested
-    // scene AFTER `assets.allReady` (the safe, race-free path). The
-    // legacy `.initial_prefab` rewrite below stays as a deprecation
-    // bridge for projects without a loading-scene gate — once every
-    // game adopts the env-var path, the rewrite can be removed.
+    // into `.initial_prefab`. The `--scene=` flag does NOT rewrite
+    // `.initial_prefab` anymore — it sets `LABELLE_SCENE=<name>` in the
+    // spawned game's env (cli#229) and the project's loading-scene
+    // controller reads it via `engine.requestedScene()` and transitions
+    // once `assets.allReady`. The legacy initial-prefab-rewrite path was
+    // removed because it bypassed the loading gate and made the game
+    // stick on the target scene's async-load forever for projects with
+    // a loading-scene gate.
     parsed.normalizeInitialPrefab();
-    if (parsed_args.scene_override) |scene| {
-        parsed.initial_prefab = scene;
-    }
 
     // Apply --platform override
     if (parsed_args.platform_override) |platform| {
@@ -981,9 +978,9 @@ pub fn main(proc_init: std.process.Init) !void {
         //  - LABELLE_SCREENSHOT_AFTER_SEC
         // Loading-controller scripts read LABELLE_SCENE *after*
         // assets.allReady succeeds and call setScene(requested), so
-        // asset streaming for large scenes no longer races boot. The
-        // legacy .initial_prefab rewrite above stays as a deprecation
-        // bridge for projects without a loading-scene gate.
+        // asset streaming for large scenes no longer races boot. This
+        // is now the ONLY mechanism for `--scene=` — the legacy
+        // `.initial_prefab` rewrite was removed (see above).
         var env_map_storage: ?std.process.Environ.Map = null;
         defer if (env_map_storage) |*m| m.deinit();
         var env_map_ptr: ?*const std.process.Environ.Map = null;
@@ -1168,14 +1165,17 @@ pub const ParseSceneFlagSpec = struct {
     };
 };
 
-/// End-to-end pipeline smoke test for the `--scene` → `.initial_prefab`
-/// contract that PR #216 introduced. This wires `parseSceneFlag` to the
-/// post-#216 application code at cli.zig:657-660 (normalizeInitialPrefab
-/// then assign the override) so the full chain is exercised together.
+/// End-to-end pipeline smoke test for the `--scene` flow.
 ///
-/// Tracked by issue #228.
+/// Contract as of fix/scene-flag-no-initial-prefab-rewrite:
+///   - `--scene=X` does NOT rewrite `cfg.initial_prefab`.
+///   - `--scene=X` injects `LABELLE_SCENE=X` into the spawned game's env.
+///   - Loading-scene controllers read `engine.requestedScene()` after
+///     `assets.allReady` and call `setScene(requested)`.
+///
+/// Tracked by issue #228 (cli#229 follow-through).
 pub const SceneOverridePipelineSpec = struct {
-    test "--scene=name overrides initial_prefab on an empty config" {
+    test "--scene=name does NOT rewrite initial_prefab on an empty config" {
         var iter = testIter("--scene=mymain");
         defer iter.deinit();
         var scene_override: ?[]const u8 = null;
@@ -1184,11 +1184,13 @@ pub const SceneOverridePipelineSpec = struct {
 
         var cfg = project_config.ProjectConfig{ .name = "smoke" };
         cfg.normalizeInitialPrefab();
-        if (scene_override) |s| cfg.initial_prefab = s;
-        try std.testing.expectEqualStrings("mymain", cfg.initial_prefab.?);
+        // Post-fix: cli does NOT assign scene_override onto cfg.initial_prefab.
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_prefab);
+        // The override is still captured for env-var injection downstream.
+        try std.testing.expectEqualStrings("mymain", scene_override.?);
     }
 
-    test "--scene name (space form) overrides initial_prefab" {
+    test "--scene name (space form) does NOT rewrite initial_prefab" {
         var iter = testIter("--scene mymain");
         defer iter.deinit();
         var scene_override: ?[]const u8 = null;
@@ -1197,11 +1199,11 @@ pub const SceneOverridePipelineSpec = struct {
 
         var cfg = project_config.ProjectConfig{ .name = "smoke" };
         cfg.normalizeInitialPrefab();
-        if (scene_override) |s| cfg.initial_prefab = s;
-        try std.testing.expectEqualStrings("mymain", cfg.initial_prefab.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_prefab);
+        try std.testing.expectEqualStrings("mymain", scene_override.?);
     }
 
-    test "legacy initial_scene in fixture normalizes, then --scene wins" {
+    test "legacy initial_scene normalizes; --scene does NOT clobber it" {
         var iter = testIter("--scene=override");
         defer iter.deinit();
         var scene_override: ?[]const u8 = null;
@@ -1210,13 +1212,33 @@ pub const SceneOverridePipelineSpec = struct {
 
         // Fixture simulates a project.labelle that still uses the legacy
         // `.initial_scene` alias. After normalization it should be promoted
-        // to `.initial_prefab`, then the --scene override wins on top.
+        // to `.initial_prefab`. The --scene override must NOT clobber it
+        // anymore — it only feeds LABELLE_SCENE downstream.
         var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_scene = "legacy" };
         cfg.normalizeInitialPrefab();
         try std.testing.expectEqualStrings("legacy", cfg.initial_prefab.?);
         try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_scene);
-        if (scene_override) |s| cfg.initial_prefab = s;
-        try std.testing.expectEqualStrings("override", cfg.initial_prefab.?);
+        try std.testing.expectEqualStrings("override", scene_override.?);
+        // Critical: initial_prefab stays "legacy" so loading-gated projects
+        // still boot through their loading scene.
+        try std.testing.expectEqualStrings("legacy", cfg.initial_prefab.?);
+    }
+
+    test "config initial_prefab=\"loading\" stays \"loading\" even with --scene=colony" {
+        var iter = testIter("--scene=colony");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .parsed);
+
+        // The loading-scene-gate case: project boots into "loading", whose
+        // controller reads engine.requestedScene() and transitions to
+        // "colony" after assets.allReady. The CLI must NOT rewrite
+        // initial_prefab to "colony" — that bypasses the gate and hangs.
+        var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_prefab = "loading" };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqualStrings("loading", cfg.initial_prefab.?);
+        try std.testing.expectEqualStrings("colony", scene_override.?);
     }
 
     test "no --scene flag preserves normalized initial_prefab from config" {
@@ -1229,8 +1251,8 @@ pub const SceneOverridePipelineSpec = struct {
 
         var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_prefab = "from_config" };
         cfg.normalizeInitialPrefab();
-        if (scene_override) |s| cfg.initial_prefab = s;
         try std.testing.expectEqualStrings("from_config", cfg.initial_prefab.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), scene_override);
     }
 
     test "empty --scene= aborts the override; initial_prefab untouched" {
@@ -1244,8 +1266,30 @@ pub const SceneOverridePipelineSpec = struct {
         // so initial_prefab should remain whatever the (normalized) config said.
         var cfg = project_config.ProjectConfig{ .name = "smoke", .initial_prefab = "untouched" };
         cfg.normalizeInitialPrefab();
-        if (scene_override) |s| cfg.initial_prefab = s;
         try std.testing.expectEqualStrings("untouched", cfg.initial_prefab.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), scene_override);
+    }
+
+    test "--scene=X feeds LABELLE_SCENE via buildEnvironWithExtra" {
+        // Verify the env-var injection path used by the spawn site at
+        // cli.zig:~990. This is the canonical mechanism after the fix.
+        var iter = testIter("--scene=colony");
+        defer iter.deinit();
+        var scene_override: ?[]const u8 = null;
+        const arg = iter.next().?;
+        try expect.equal(parseSceneFlag(arg, &iter, &scene_override, "build"), .parsed);
+
+        const allocator = std.testing.allocator;
+        var extras: std.ArrayList(runner.EnvKV) = .empty;
+        defer extras.deinit(allocator);
+        if (scene_override) |scene| {
+            try extras.append(allocator, .{ .key = "LABELLE_SCENE", .value = scene });
+        }
+        var env_map = try runner.buildEnvironWithExtra(allocator, extras.items);
+        defer env_map.deinit();
+
+        const got = env_map.get("LABELLE_SCENE") orelse return error.MissingLabelleScene;
+        try std.testing.expectEqualStrings("colony", got);
     }
 };
 
@@ -1545,16 +1589,20 @@ pub const AppendRunForwardedArgsSpec = struct {
     }
 };
 
-/// Regression tests for the `--scene` / `.initial_prefab` override chain
-/// introduced in RFC #560 / issue #565.  Covers the four cases that the
-/// CLI logic at cli.zig:650-655 must handle correctly:
+/// Regression tests for `ProjectConfig.normalizeInitialPrefab()` — the
+/// legacy `.initial_scene` → `.initial_prefab` alias promotion introduced
+/// in RFC #560 / issue #565.
 ///
+/// Scope: this spec covers normalization in isolation. The `--scene` CLI
+/// override contract (which intentionally does NOT rewrite
+/// `cfg.initial_prefab` as of cli#229 follow-through) is covered by
+/// `SceneOverridePipelineSpec` above.
+///
+/// Cases:
 ///  1. Legacy `.initial_scene` is promoted to `.initial_prefab` when the new
 ///     field is absent.
 ///  2. `.initial_prefab` wins when both fields are present in the config.
-///  3. A `--scene` CLI override applied *after* normalization takes precedence
-///     over whatever the config file said (legacy or new).
-///  4. Neither field set → normalization is a no-op (null stays null).
+///  3. Neither field set → normalization is a no-op (null stays null).
 pub const InitialPrefabNormalizationSpec = struct {
     test "normalizeInitialPrefab promotes legacy initial_scene when initial_prefab is null" {
         var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_scene = "legacy_scene" };
@@ -1568,22 +1616,6 @@ pub const InitialPrefabNormalizationSpec = struct {
         cfg.normalizeInitialPrefab();
         try std.testing.expectEqualStrings("new_prefab", cfg.initial_prefab.?);
         try std.testing.expectEqual(@as(?[]const u8, null), cfg.initial_scene);
-    }
-
-    test "--scene override takes precedence over normalized initial_scene" {
-        var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_scene = "legacy_scene" };
-        cfg.normalizeInitialPrefab();
-        // Simulate the --scene CLI override applied after normalization (cli.zig:653-655)
-        cfg.initial_prefab = "override_scene";
-        try std.testing.expectEqualStrings("override_scene", cfg.initial_prefab.?);
-    }
-
-    test "--scene override takes precedence over initial_prefab from config" {
-        var cfg = project_config.ProjectConfig{ .name = "test_project", .initial_prefab = "config_prefab" };
-        cfg.normalizeInitialPrefab();
-        // Simulate the --scene CLI override applied after normalization
-        cfg.initial_prefab = "override_scene";
-        try std.testing.expectEqualStrings("override_scene", cfg.initial_prefab.?);
     }
 
     test "normalizeInitialPrefab is a no-op when neither field is set" {
