@@ -8,7 +8,7 @@
 /// them in place so projects can move to the canonical flat form
 /// without hand-edits across hundreds of files.
 ///
-/// The eight transforms (idempotent — running twice on the same file
+/// The nine transforms (idempotent — running twice on the same file
 /// produces no further changes):
 ///
 ///   1. **`legacy_entities`** — top-level `"entities"` key. Rename to
@@ -44,11 +44,23 @@
 ///      those references must be hand-fixed (option (b) of the RFC's
 ///      "cross-reference handling" choices).
 ///
-///   8. **`legacy_file_object_no_root`** (RFC #596) — wrapping object
-///      with only `"children": [...]` (no entity-shape sibling keys)
+///   8. **file-level directives → meta header** (RFC #596 update) —
+///      top-level `initial_state`, `scripts`, `include` (engine-known
+///      directives) and any other lowercase non-structural key move into
+///      a `"meta": {...}` block at the file level so transform 9 can
+///      emit them as the bundle's first element. Runs only on files
+///      with `children:` (or after rename, post-transform 1) and no
+///      PascalCase top-level keys — for true single-root entities,
+///      directives at the file level are out of scope here.
+///
+///   9. **`legacy_file_object_no_root`** (RFC #596) — wrapping object
+///      with `"children": [...]` (no entity-shape sibling keys)
 ///      collapses to a top-level array, dropping the now-redundant
-///      braces. Files with a true root entity (PascalCase components on
-///      the wrapping object) stay objects.
+///      braces. If a sibling `meta:` block exists (typically populated
+///      by transform 7 and/or 8) it lands as the bundle's first
+///      element: `[ { meta: {...} }, ...children-items ]`. Files with
+///      a true root entity (PascalCase components on the wrapping
+///      object) stay objects.
 ///
 /// **Comment-preserving strategy.** A naive re-serialize would round-
 /// trip through `std.json.Value` and lose every JSONC comment plus
@@ -91,7 +103,10 @@ const usage =
     \\    6. "components": { X, Y } inline entity → X, Y as siblings
     \\    7. top-level "name": "X" matching basename → dropped
     \\       top-level "name": "X" differing → meta.name = "X"
-    \\    8. wrapping object { children: [...] } → top-level [ ... ]
+    \\    8. file-level directives (initial_state, scripts, include) →
+    \\       merged into meta: block
+    \\    9. wrapping object { meta?, children: [...] } → top-level
+    \\       [ {meta: {...}}?, ...children-items ]
     \\
     \\Comments and unchanged keys are preserved byte-for-byte (the
     \\migrator operates on raw bytes, not a re-serialized parse).
@@ -186,6 +201,7 @@ pub const Summary = struct {
     name_field_drops: usize = 0,
     name_field_meta_moves: usize = 0,
     name_field_xref_warnings: usize = 0,
+    directives_to_meta_moves: usize = 0,
     parse_errors: usize = 0,
     write_errors: usize = 0,
 
@@ -241,6 +257,11 @@ pub const Summary = struct {
         std.debug.print("  {d} divergent 'name' field{s} {s} into 'meta.name'\n", .{
             self.name_field_meta_moves,
             if (self.name_field_meta_moves == 1) "" else "s",
+            moved,
+        });
+        std.debug.print("  {d} file-level directive{s} {s} into 'meta'\n", .{
+            self.directives_to_meta_moves,
+            if (self.directives_to_meta_moves == 1) "" else "s",
             moved,
         });
         if (self.name_field_xref_warnings > 0) {
@@ -504,6 +525,7 @@ fn migrateFile(
     summary.name_field_drops += counts.name_field_drops;
     summary.name_field_meta_moves += counts.name_field_meta_moves;
     summary.name_field_xref_warnings += counts.name_field_xref_warnings;
+    summary.directives_to_meta_moves += counts.directives_to_meta_moves;
 
     if (counts.totalEdits() == 0) {
         summary.files_clean += 1;
@@ -530,6 +552,7 @@ const FileCounts = struct {
     name_field_drops: usize = 0,
     name_field_meta_moves: usize = 0,
     name_field_xref_warnings: usize = 0,
+    directives_to_meta_moves: usize = 0,
 
     fn totalEdits(self: FileCounts) usize {
         return self.entities_renames +
@@ -540,7 +563,8 @@ const FileCounts = struct {
             self.components_lifts +
             self.file_as_array_collapses +
             self.name_field_drops +
-            self.name_field_meta_moves;
+            self.name_field_meta_moves +
+            self.directives_to_meta_moves;
     }
 };
 
@@ -584,7 +608,14 @@ const TransformCtx = struct {
 ///   7. RFC #596: top-level `name:` → `meta.name` or drop. MUST run
 ///      BEFORE pass 8 — pass 8 collapses the wrapping object and there
 ///      is no longer anywhere to place a separate `name` key.
-///   8. RFC #596: collapse wrapping object to bundle array.
+///   8. RFC #596 (update): file-level engine directives (`initial_state`,
+///      `scripts`, `include`) and any other unknown lowercase top-level
+///      key move into a `meta:` block. Must run BEFORE pass 9 — pass 9
+///      collapses the wrapping object, so this is the last chance to
+///      route directives into a header-bearing element.
+///   9. RFC #596: collapse wrapping object to bundle array. When a
+///      `meta:` block is present it is emitted as the bundle's first
+///      element `{ "meta": {...} }`.
 ///
 /// Each pass re-parses the working buffer to refresh structural info,
 /// then locates the target key in the raw JSONC bytes. Idempotency
@@ -737,12 +768,34 @@ fn transformBytes(
         }
     }
 
-    // Pass 8 — RFC #596: collapse file-level wrapping object to a top-
+    // Pass 8 — RFC #596 update: file-level engine directives →
+    // `meta:` block. Looks for `initial_state`, `scripts`, `include`,
+    // and any other lowercase non-structural top-level key on a file
+    // shaped like `{ ...directives, children?: [...], no PascalCase }`.
+    // Each such key is moved into a `meta:` block (created if absent,
+    // merged into otherwise). Runs in a fixed-point loop because each
+    // edit invalidates byte offsets.
+    while (true) {
+        const stripped = try stripJsoncToJson(arena, current);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena, stripped, .{});
+        defer parsed.deinit();
+        const edited = moveOneDirectiveToMeta(arena, current, parsed.value) catch null;
+        if (edited) |out| {
+            current = out;
+            counts.directives_to_meta_moves += 1;
+            continue;
+        }
+        break;
+    }
+
+    // Pass 9 — RFC #596: collapse file-level wrapping object to a top-
     // level array when its only entity-bearing key is `children:`. A
-    // file like `{ children: [...] }` (post-pass-7, so `name:` is
-    // already either dropped or migrated into `meta:`) becomes `[...]`,
-    // with an optional `{meta: ...}` header element if a `meta:` block
-    // was present.
+    // file like `{ children: [...] }` (post-pass-7/8, so `name:` and
+    // directives are already dropped or migrated into `meta:`) becomes
+    // `[...]`, with an optional `{meta: ...}` header element if a
+    // `meta:` block was present. Edge case: file with ONLY `meta:` (no
+    // `children:`) becomes `[ {meta: ...} ]` — a bundle with just the
+    // header.
     {
         const stripped = try stripJsoncToJson(arena, current);
         var parsed = try std.json.parseFromSlice(std.json.Value, arena, stripped, .{});
@@ -1743,38 +1796,238 @@ fn moveNameToMeta(arena: std.mem.Allocator, src: []const u8, name_value: []const
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Transform H (RFC #596) — collapse file-level wrapping object to array
+// Transform H (RFC #596 update) — file-level directives → meta block
+// ─────────────────────────────────────────────────────────────────────
+
+/// Return true if `key` looks like an "entity-shape" key — either a
+/// component override (PascalCase: first ASCII letter is uppercase) or
+/// a structural key the per-entity layer owns (`prefab`). The file-as-
+/// array collapse and the directives-to-meta transform both refuse to
+/// touch files whose top level contains any such key — that's the
+/// "single root entity at file top-level" case, which doesn't map to
+/// the bundle shape (yet).
+fn isEntityShapeKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    if (std.mem.eql(u8, key, "prefab")) return true;
+    const c = key[0];
+    return c >= 'A' and c <= 'Z';
+}
+
+/// Engine-known file-header directive names per RFC #596 (updated). The
+/// migrator treats these as the canonical "must move into meta" set;
+/// any other lowercase non-structural top-level key (custom author
+/// keys) ALSO flows into meta — they have no other home post-bundle.
+fn isStructuralFileKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "name") or
+        std.mem.eql(u8, key, "meta") or
+        std.mem.eql(u8, key, "children");
+}
+
+/// Find one top-level key that should be moved into `meta:` and return
+/// the rewritten buffer. Returns `null` when no eligible key remains
+/// (fixed point reached). Only fires when:
+///   - file's top-level is an object,
+///   - it contains no entity-shape keys (no PascalCase, no `prefab`),
+///   - at least one lowercase non-structural key (not `name`, not
+///     `meta`, not `children`) is present.
+/// The presence of `children:` is NOT required — the rare "directives
+/// only, no children" file also routes through this transform so that
+/// pass 9 can emit a header-only bundle.
+fn moveOneDirectiveToMeta(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    parsed_value: std.json.Value,
+) !?[]u8 {
+    if (parsed_value != .object) return null;
+    const obj = parsed_value.object;
+    // Reject if any entity-shape key is present.
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        if (isEntityShapeKey(kv.key_ptr.*)) return null;
+    }
+    // Find the first eligible key to move (skip structural keys).
+    it = obj.iterator();
+    const target_key: []const u8 = while (it.next()) |kv| {
+        const k = kv.key_ptr.*;
+        if (isStructuralFileKey(k)) continue;
+        break k;
+    } else return null;
+
+    // Locate the key in the raw bytes and capture its value bytes.
+    const loc = findTopLevelKey(src, target_key) orelse return null;
+    const value_bytes = src[loc.value_start..loc.value_end];
+
+    // Drop the directive from the file (handles trailing/leading
+    // comma fixup correctly — already proven by `deleteTopLevelKey`).
+    const without_directive = deleteTopLevelKey(arena, src, target_key) orelse return null;
+
+    // Now insert the directive into a `meta:` block. If `meta:` is
+    // absent we create one; if present we merge.
+    const has_meta = obj.get("meta") != null;
+    if (has_meta) {
+        return try mergeIntoExistingMeta(arena, without_directive, target_key, value_bytes);
+    }
+    return try insertNewMeta(arena, without_directive, target_key, value_bytes);
+}
+
+/// Insert a new top-level `"meta": { "<key>": <value> }` entry into
+/// `src`. The new entry is placed at the very top of the outer object
+/// (right after `{` + the first newline) so the file's structural
+/// layout starts with the bundle-header-to-be.
+fn insertNewMeta(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    key: []const u8,
+    value_bytes: []const u8,
+) !?[]u8 {
+    // Find the file's outer `{`.
+    const file_start = skipWsAndComments(src, 0);
+    if (file_start >= src.len or src[file_start] != '{') return null;
+    // Probe the object's first key (if any) to determine the indent
+    // we should match. Default to four spaces if the object is empty.
+    var indent_buf: [16]u8 = [_]u8{' '} ** 16;
+    var indent_len: usize = 4;
+    {
+        var i: usize = file_start + 1;
+        // Skip whitespace and comments to find first key.
+        i = skipWsAndComments(src, i);
+        if (i < src.len and src[i] == '"') {
+            // Walk back to the line start to measure the indent.
+            var ls: usize = i;
+            while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
+            const measured = i - ls;
+            if (measured > 0 and measured <= indent_buf.len) {
+                indent_len = measured;
+                // Copy real indent bytes (may be tabs).
+                var k: usize = 0;
+                while (k < measured) : (k += 1) indent_buf[k] = src[ls + k];
+            }
+        }
+    }
+    const indent = indent_buf[0..indent_len];
+
+    // Compose: <pre `{`><...> + `\n<indent>"meta": { "<key>": <value> },`
+    //        + <existing inside-`{` content>.
+    var out: std.ArrayList(u8) = .empty;
+    // Bytes through and including `{`.
+    out.appendSlice(arena, src[0 .. file_start + 1]) catch return null;
+    // If the existing first byte after `{` is `\n`, eat it (we'll add
+    // our own newline below). Otherwise leave whatever is there alone.
+    var rest_start: usize = file_start + 1;
+    if (rest_start < src.len and src[rest_start] == '\n') {
+        rest_start += 1;
+    }
+    // Emit the inserted meta entry on its own line, with a trailing
+    // comma so it slots in front of whatever existed.
+    out.append(arena, '\n') catch return null;
+    out.appendSlice(arena, indent) catch return null;
+    out.appendSlice(arena, "\"meta\": { \"") catch return null;
+    out.appendSlice(arena, key) catch return null;
+    out.appendSlice(arena, "\": ") catch return null;
+    out.appendSlice(arena, value_bytes) catch return null;
+    out.appendSlice(arena, " }") catch return null;
+    // Determine whether the original object had any remaining content
+    // after the `{` — if so, append a comma + the rest. If the object
+    // is empty (just `{}` post-deletion), no comma needed.
+    var probe: usize = rest_start;
+    probe = skipWsAndComments(src, probe);
+    const has_more = probe < src.len and src[probe] != '}';
+    if (has_more) {
+        out.append(arena, ',') catch return null;
+    }
+    out.append(arena, '\n') catch return null;
+    out.appendSlice(arena, src[rest_start..]) catch return null;
+    return out.toOwnedSlice(arena) catch null;
+}
+
+/// Merge `<key>: <value>` into an existing top-level `meta: { ... }`
+/// block. The new entry is appended right before the closing `}` of
+/// the meta object, with a leading `,` if the meta object isn't empty.
+fn mergeIntoExistingMeta(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    key: []const u8,
+    value_bytes: []const u8,
+) !?[]u8 {
+    const loc = findTopLevelKey(src, "meta") orelse return null;
+    if (loc.value_start >= src.len or src[loc.value_start] != '{') return null;
+    const meta_open = loc.value_start; // `{`
+    const meta_close = loc.value_end - 1; // `}`
+    if (meta_close <= meta_open or src[meta_close] != '}') return null;
+
+    // Probe to see whether the meta object is empty.
+    var probe: usize = meta_open + 1;
+    probe = skipWsAndComments(src, probe);
+    const empty = probe >= meta_close;
+
+    var out: std.ArrayList(u8) = .empty;
+    // Everything up to and including the meta-close-brace's prior byte.
+    // We splice in just before the `}`.
+    var splice_at: usize = meta_close;
+    // Trim any trailing whitespace right before `}` so our injection
+    // does not produce e.g. `..., \n }` with awkward spacing. Keep one
+    // space for readability.
+    while (splice_at > meta_open + 1) {
+        const c = src[splice_at - 1];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            splice_at -= 1;
+            continue;
+        }
+        break;
+    }
+    // JSONC allows a trailing comma before `}`. If the last structural
+    // byte is already a `,`, we must NOT prepend another `,` — that
+    // would yield `..., , "newkey": ...` (invalid JSON). Detect it and
+    // suppress the prepended separator.
+    const has_trailing_comma = !empty and splice_at > meta_open + 1 and
+        src[splice_at - 1] == ',';
+    out.appendSlice(arena, src[0..splice_at]) catch return null;
+    if (!empty and !has_trailing_comma) {
+        out.appendSlice(arena, ", ") catch return null;
+    } else {
+        out.append(arena, ' ') catch return null;
+    }
+    out.append(arena, '"') catch return null;
+    out.appendSlice(arena, key) catch return null;
+    out.appendSlice(arena, "\": ") catch return null;
+    out.appendSlice(arena, value_bytes) catch return null;
+    out.append(arena, ' ') catch return null;
+    out.appendSlice(arena, src[splice_at..]) catch return null;
+    return out.toOwnedSlice(arena) catch null;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Transform I (RFC #596) — collapse file-level wrapping object to array
 // ─────────────────────────────────────────────────────────────────────
 
 /// File top-level is `{...}` whose only entity-bearing key is
-/// `children:` (no `prefab`, no PascalCase components, no `meta`).
+/// `children:` (no `prefab`, no PascalCase components). A sibling
+/// `meta:` block is now ACCEPTED — `collapseFileToArray` emits it as
+/// the bundle's first element. Likewise the rare "meta only, no
+/// children" file is accepted and collapses to `[ {meta: {...}} ]`.
 ///
-/// We conservatively REJECT collapse when the file still has a `meta:`
-/// sibling: the RFC says that becomes the bundle header
-/// (`[{meta:...}, ...]`), but the byte-edit shape for "lift meta out
-/// of the wrapping object, emit as array's first element, then collapse
-/// the rest" is materially more complex than the no-meta case. For
-/// PRs in flight (FP / bouncing-ball / assembler-example) the
-/// divergent-name files are rare enough that landing the meta-header
-/// emission can be a follow-up — the audit catches the missing
-/// collapse, the user re-runs the migrator after the follow-up lands.
-/// Until then, divergent-name files end up with `{meta: ..., children:
-/// [...]}` which is still RFC-#596-shape-valid (it's just a non-bundle
-/// shape).
+/// Any other top-level key (lowercase non-structural, e.g. an
+/// `initial_state` directive that the upstream `moveOneDirectiveToMeta`
+/// pass missed) blocks the collapse — the audit will re-fire and a
+/// human can decide.
 fn shouldCollapseFileToArray(value: std.json.Value) bool {
     if (value != .object) return false;
     const obj = value.object;
     const has_children = obj.get("children") != null;
-    if (!has_children) return false;
-    // Reject anything that adds semantic content the array form can't
-    // represent: components (PascalCase keys), prefab references, meta
-    // (would need a header element — out of scope here), or any other
-    // structural key we don't recognise (e.g. an `include:` declared by
-    // a plugin). Only `children:` on its own qualifies.
+    const has_meta = obj.get("meta") != null;
+    // Need at least one of `children:` or `meta:` to have anything to
+    // emit. The empty `{}` case is rejected — that's a malformed file,
+    // not a bundle.
+    if (!has_children and !has_meta) return false;
+    // Reject anything that adds semantic content we can't carry through.
+    // The two accepted structural keys at this stage are `children:` and
+    // `meta:`. PascalCase, `prefab:`, and any other lowercase key block
+    // the collapse.
     var it = obj.iterator();
     while (it.next()) |kv| {
         const k = kv.key_ptr.*;
         if (std.mem.eql(u8, k, "children")) continue;
+        if (std.mem.eql(u8, k, "meta")) continue;
         return false;
     }
     return true;
@@ -1787,13 +2040,42 @@ fn shouldCollapseFileToArray(value: std.json.Value) bool {
 /// `/* */` comment, dropping the lines that hold the just-dropped/just-
 /// moved siblings (e.g. the empty trailing comma after `name:` got
 /// removed by pass 7).
+///
+/// When a sibling `meta:` block exists, the bundle gains a header
+/// element: `[ {meta: {...}}, ...children-items ]`. When ONLY `meta:`
+/// is present (no `children:`), the result is `[ {meta: {...}} ]` —
+/// the rare directives-only file edge case.
 fn collapseFileToArray(arena: std.mem.Allocator, src: []const u8, parsed_value: std.json.Value) ?[]u8 {
-    _ = parsed_value;
     // Find the file's outer `{` and matching `}`.
     const file_start = skipWsAndComments(src, 0);
     if (file_start >= src.len or src[file_start] != '{') return null;
     const file_end = skipContainer(src, file_start);
     if (file_end > src.len or src[file_end - 1] != '}') return null;
+
+    // Capture the meta value bytes if a `meta:` block is present —
+    // it becomes the bundle's first element.
+    var meta_value_bytes: ?[]const u8 = null;
+    if (parsed_value == .object and parsed_value.object.get("meta") != null) {
+        if (findTopLevelKey(src, "meta")) |mloc| {
+            meta_value_bytes = src[mloc.value_start..mloc.value_end];
+        }
+    }
+
+    // Special case: file has `meta:` but NO `children:`. Emit a
+    // header-only bundle.
+    if (parsed_value == .object and parsed_value.object.get("children") == null) {
+        const meta_bytes = meta_value_bytes orelse return null;
+        const pre_header = src[0..file_start];
+        const footer = if (file_end < src.len) src[file_end..] else "";
+        var out: std.ArrayList(u8) = .empty;
+        out.appendSlice(arena, pre_header) catch return null;
+        out.appendSlice(arena, "[\n    { \"meta\": ") catch return null;
+        out.appendSlice(arena, meta_bytes) catch return null;
+        out.appendSlice(arena, " }\n]") catch return null;
+        // Preserve trailing newline if present in footer.
+        out.appendSlice(arena, footer) catch return null;
+        return out.toOwnedSlice(arena) catch null;
+    }
 
     // Find the `children` key.
     const loc = findTopLevelKey(src, "children") orelse return null;
@@ -1903,7 +2185,45 @@ fn collapseFileToArray(arena: std.mem.Allocator, src: []const u8, parsed_value: 
     var out: std.ArrayList(u8) = .empty;
     out.appendSlice(arena, header) catch return null;
     out.appendSlice(arena, harvested.items) catch return null;
-    out.appendSlice(arena, dedented.items) catch return null;
+    // If a `meta:` block was present at the file level, splice a
+    // `{ "meta": <value> },` header element into the bundle right after
+    // the opening `[`. `dedented.items` starts with `[` and (typically)
+    // a newline; we inject our header on its own indented line.
+    if (meta_value_bytes) |mvb| {
+        if (dedented.items.len > 0 and dedented.items[0] == '[') {
+            out.append(arena, '[') catch return null;
+            // Find where the first array entry would have started — if
+            // the next byte is `\n`, emit our header on its own line; if
+            // the array is `[]` (or `[ ]` with whitespace and `]`),
+            // produce a header-only bundle.
+            var tail_start: usize = 1;
+            // Probe whether the rest of `dedented.items` is empty array.
+            var p2: usize = 1;
+            while (p2 < dedented.items.len and (dedented.items[p2] == ' ' or dedented.items[p2] == '\t' or dedented.items[p2] == '\n' or dedented.items[p2] == '\r')) p2 += 1;
+            const is_empty_array = p2 < dedented.items.len and dedented.items[p2] == ']';
+            if (is_empty_array) {
+                // `[ ]` — replace with header-only bundle.
+                out.appendSlice(arena, "\n    { \"meta\": ") catch return null;
+                out.appendSlice(arena, mvb) catch return null;
+                out.appendSlice(arena, " }\n]") catch return null;
+                tail_start = dedented.items.len; // skip the rest
+            } else {
+                out.appendSlice(arena, "\n    { \"meta\": ") catch return null;
+                out.appendSlice(arena, mvb) catch return null;
+                out.appendSlice(arena, " },") catch return null;
+                // Leave the existing `\n` (and indented next entry) in
+                // place so the first child entry lands on its own line.
+                // `tail_start` defaults to 1 (skip just the `[`).
+            }
+            out.appendSlice(arena, dedented.items[tail_start..]) catch return null;
+        } else {
+            // Defensive: shouldn't happen (an array body must start
+            // with `[`).
+            out.appendSlice(arena, dedented.items) catch return null;
+        }
+    } else {
+        out.appendSlice(arena, dedented.items) catch return null;
+    }
     out.appendSlice(arena, footer) catch return null;
     return out.toOwnedSlice(arena) catch null;
 }
@@ -2630,23 +2950,27 @@ pub const TransformNameFieldSpec = struct {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         // basename "demo_scene", declared name "Production Demo" —
-        // divergent. Should rewrite to `{meta: {name: "Production
-        // Demo"}, ...}`.
+        // divergent. Pass 7 moves the `name:` into a `meta:` block;
+        // pass 9 then collapses the wrapping object to a bundle with
+        // a `{ meta: {...} }` header element (RFC #596 update).
         const src =
             "{\n" ++
             "    \"name\": \"Production Demo\",\n" ++
             "    \"children\": []\n" ++
             "}\n";
         const out = try applyAllArenaFull(&arena, src, "demo_scene");
-        // `name:` no longer top-level; `meta:` block present.
+        // `name:` no longer top-level; `meta:` block present in the
+        // emitted bundle's header element.
         try std.testing.expect(std.mem.indexOf(u8, out, "\"meta\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "Production Demo") != null);
-        // Should NOT collapse (has a meta sibling), so still an object.
+        // Collapses to a bundle array with a header element.
         const stripped = try stripJsoncToJson(arena.allocator(), out);
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
-        try std.testing.expect(parsed.value == .object);
-        const meta = parsed.value.object.get("meta").?.object;
+        try std.testing.expect(parsed.value == .array);
+        try std.testing.expect(parsed.value.array.items.len >= 1);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
         try std.testing.expectEqualStrings("Production Demo", meta.get("name").?.string);
     }
 
@@ -2745,6 +3069,253 @@ pub const TransformFileAsArraySpec = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .array);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// RFC #596 (update) — Transform 8: file-level directives → meta header
+// ─────────────────────────────────────────────────────────────────────
+
+pub const TransformDirectivesToMetaHeaderSpec = struct {
+    test "initial_state + children collapses to bundle with meta header" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"ship_carcase\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "fitness_test");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+        // First element is the meta header.
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+        // Second element is the child entity.
+        const child = parsed.value.array.items[1].object;
+        try std.testing.expectEqualStrings("ship_carcase", child.get("prefab").?.string);
+    }
+
+    test "initial_state + name matching basename drops name, keeps directive" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"fitness_test\",\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"ship_carcase\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "fitness_test");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+        // name was redundant — must have been dropped by pass 7.
+        try std.testing.expect(meta.get("name") == null);
+    }
+
+    test "initial_state + name differing from basename moves both to meta" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"Production Demo\",\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"ship_carcase\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo_scene");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+        try std.testing.expectEqualStrings("Production Demo", meta.get("name").?.string);
+    }
+
+    test "unknown lowercase key flows into meta" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // `tooltip` isn't an engine-known directive — but it's a
+        // lowercase non-structural top-level key, so it has no home
+        // post-bundle and must flow into `meta:`.
+        const src =
+            "{\n" ++
+            "    \"tooltip\": \"hello\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"x\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("hello", meta.get("tooltip").?.string);
+    }
+
+    test "directive merges into existing meta block" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // Pre-existing meta + sibling directive: the two must merge
+        // into a single meta object on the bundle header.
+        const src =
+            "{\n" ++
+            "    \"meta\": { \"tooltip\": \"hello\" },\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"x\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("hello", meta.get("tooltip").?.string);
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+    }
+
+    test "directive merges into existing meta block with trailing comma" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // Pre-existing meta has a JSONC-legal trailing comma before `}`.
+        // The merge must NOT emit a second comma — `, , "initial_state"`
+        // is invalid JSON and would fail to round-trip.
+        const src =
+            "{\n" ++
+            "    \"meta\": { \"tooltip\": \"hello\", },\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        { \"prefab\": \"x\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        // Guard: the raw output must not contain a `,,` separator
+        // inside the meta block.
+        try std.testing.expect(std.mem.indexOf(u8, out, ",,") == null);
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("hello", meta.get("tooltip").?.string);
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+    }
+
+    test "directives only — no children — produces header-only bundle" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"initial_state\": \"playing\"\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expectEqualStrings("playing", meta.get("initial_state").?.string);
+    }
+
+    test "comments above directive line preserved across transform" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "// header file note\n" ++
+            "{\n" ++
+            "    // note about initial state\n" ++
+            "    \"initial_state\": \"playing\",\n" ++
+            "    \"children\": [\n" ++
+            "        // entry note\n" ++
+            "        { \"prefab\": \"x\" }\n" ++
+            "    ]\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        try std.testing.expect(std.mem.indexOf(u8, out, "// header file note") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "// entry note") != null);
+        // Validate it round-trips as an array.
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+    }
+
+    test "scripts directive flows into meta" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"scripts\": [\"a\", \"b\"],\n" ++
+            "    \"children\": []\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "demo");
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const scripts = header.get("meta").?.object.get("scripts").?.array;
+        try std.testing.expectEqual(@as(usize, 2), scripts.items.len);
+    }
+
+    test "PascalCase root key blocks directive migration" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // A single-root entity at file top-level with a sibling
+        // directive — out of scope for this transform; leave alone.
+        const src =
+            "{\n" ++
+            "    \"Workstation\": { \"kind\": \"kitchen\" },\n" ++
+            "    \"initial_state\": \"playing\"\n" ++
+            "}\n";
+        const out = try applyAllArenaFull(&arena, src, "kitchen");
+        // initial_state must remain — transform is gated out by
+        // presence of PascalCase root key.
+        try std.testing.expect(std.mem.indexOf(u8, out, "initial_state") != null);
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        // Still has top-level initial_state (NOT moved into meta).
+        try std.testing.expect(parsed.value.object.get("initial_state") != null);
+    }
+
+    test "idempotent — already-migrated bundle is a no-op" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "[\n" ++
+            "    { \"meta\": { \"initial_state\": \"playing\" } },\n" ++
+            "    { \"prefab\": \"x\" }\n" ++
+            "]\n";
+        const once = try applyAllArenaFull(&arena, src, "demo");
+        const twice = try applyAllArenaFull(&arena, once, "demo");
+        try std.testing.expectEqualStrings(once, twice);
+        // And running on this should be a no-op (no transformation).
+        try std.testing.expectEqualStrings(src, once);
     }
 };
 
