@@ -840,11 +840,16 @@ pub fn main(proc_init: std.process.Init) !void {
     // The CLI owns docker orchestration, the WASM serve loop, the
     // iOS/Android deploy paths and `--timeout` — generation is the only
     // step the assembler binary delegates.
+    // `parsed_args.scene_override` is intentionally NOT forwarded to the
+    // assembler. PR #243 removed the CLI's `cfg.initial_prefab` rewrite for
+    // exactly this reason; the assembler's own `--scene` handling does the
+    // same rewrite, which bypasses any loading-scene gate the project
+    // declares. The override is delivered at runtime via the
+    // `LABELLE_SCENE` env var injected at the spawn site (~line 990).
     try assembler_proc.generate(
         asm_bin,
         allocator,
         project_dir,
-        parsed_args.scene_override,
         @tagName(parsed.platform),
         @tagName(parsed.backend),
     );

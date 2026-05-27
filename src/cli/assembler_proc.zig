@@ -138,7 +138,15 @@ pub fn runSubcommand(
 /// `platform` / `backend` are forwarded as plain strings (`@tagName` of
 /// the CLI's enums) so this module needs no dependency on the assembler's
 /// type definitions. The assembler validates them against its own enums.
-/// `scene_override` mirrors the user-facing `--scene` flag.
+///
+/// The `--scene` flag is *not* forwarded to the assembler: PR #243 (cli#229
+/// follow-through) removed the CLI's `cfg.initial_prefab` rewrite, but the
+/// assembler still rewrites `cfg.initial_prefab = scene_override` when it
+/// receives `--scene`, which re-introduces the same loading-scene-gate
+/// bypass on the assembler side. The runtime `LABELLE_SCENE` env-var
+/// injection (see cli.zig:~990) is now the sole mechanism for the
+/// user-facing `--scene` flag; the assembler always compiles a stable
+/// artifact with `initial_prefab` taken straight from `project.labelle`.
 ///
 /// On a non-zero exit code, returns `error.AssemblerFailed`; the binary's
 /// inherited stderr already explains the failure.
@@ -146,23 +154,88 @@ pub fn generate(
     asm_bin: Assembler,
     allocator: std.mem.Allocator,
     project_dir: []const u8,
-    scene_override: ?[]const u8,
     platform: []const u8,
     backend: []const u8,
 ) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
+    try buildGenerateArgs(allocator, &args, project_dir, platform, backend);
+
+    try asm_bin.run(allocator, "generate", args.items);
+}
+
+/// Build the argv slice for the assembler's `generate` subcommand.
+/// Extracted so a test can assert the CLI never injects `--scene` into
+/// the assembler invocation, even though the user-facing `--scene` flag
+/// is still accepted by the CLI (it routes through `LABELLE_SCENE` env
+/// injection at the spawn site instead — see cli.zig:~990).
+fn buildGenerateArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    project_dir: []const u8,
+    platform: []const u8,
+    backend: []const u8,
+) !void {
     try args.appendSlice(allocator, &.{ "--project-root", project_dir });
-    if (scene_override) |s| try args.appendSlice(allocator, &.{ "--scene", s });
     // Always forward platform/backend — the CLI may have mutated them
     // (e.g. `labelle ios` forces sokol+ios) and the binary must not
     // re-derive its own values from project.labelle.
     try args.appendSlice(allocator, &.{ "--platform", platform });
     try args.appendSlice(allocator, &.{ "--backend", backend });
-
-    try asm_bin.run(allocator, "generate", args.items);
 }
+
+const expect = @import("zspec").expect;
+
+test {
+    @import("zspec").runAll(@This());
+}
+
+/// Regression guard for the cli#229 follow-through (#2). PR #243 removed
+/// the CLI's own `cfg.initial_prefab` rewrite when `--scene=X` was passed,
+/// but the assembler binary *also* rewrites `cfg.initial_prefab =
+/// scene_override` whenever it receives `--scene` — bypassing the
+/// loading-scene gate exactly the same way the CLI rewrite used to.
+///
+/// Contract: even when the user passes `--scene=X` to the CLI, the
+/// argv this module sends to `labelle-assembler generate` must NOT
+/// contain `--scene`. The override travels at runtime via the
+/// `LABELLE_SCENE` env var the CLI injects when it spawns the game.
+pub const BuildGenerateArgsSpec = struct {
+    pub const no_scene_forwarding = struct {
+        test "argv to assembler never contains --scene" {
+            const allocator = std.testing.allocator;
+            var args: std.ArrayList([]const u8) = .empty;
+            defer args.deinit(allocator);
+
+            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "raylib");
+
+            for (args.items) |a| {
+                try std.testing.expect(!std.mem.eql(u8, a, "--scene"));
+            }
+        }
+    };
+
+    pub const forwards_project_platform_backend = struct {
+        test "argv carries --project-root, --platform, --backend" {
+            const allocator = std.testing.allocator;
+            var args: std.ArrayList([]const u8) = .empty;
+            defer args.deinit(allocator);
+
+            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "raylib");
+
+            const expected: []const []const u8 = &.{
+                "--project-root", "/proj",
+                "--platform",     "desktop",
+                "--backend",      "raylib",
+            };
+            try std.testing.expectEqual(expected.len, args.items.len);
+            for (expected, args.items) |want, got| {
+                try std.testing.expectEqualStrings(want, got);
+            }
+        }
+    };
+};
 
 /// Spawn `exe_path <subcommand> [args...]`, inherit stdio, wait, and map
 /// the result onto a Zig error. Shared by `Assembler.run` and
