@@ -135,6 +135,22 @@ const ParsedArgs = struct {
     // templates stay argv-agnostic.
     screenshot_path: ?[]const u8 = null,
     screenshot_after_ns: ?u64 = null,
+    // Headless perf / CI knobs. Wired through to the spawned game via
+    // `LABELLE_HEADLESS` / `LABELLE_HEADLESS_UNCAPPED` /
+    // `LABELLE_HEADLESS_TICKS` env vars (the sokol desktop backend reads
+    // them). `--uncapped` and `--ticks` both imply `--headless`.
+    //   - headless          windowless run (no GUI window)
+    //   - headless_uncapped  drop the ~16ms/frame sleep (run flat-out)
+    //   - headless_ticks     exit cleanly after N frames (null = run forever)
+    headless: bool = false,
+    headless_uncapped: bool = false,
+    headless_ticks: ?u64 = null,
+    // `--profile` surfaces as the `LABELLE_PROFILE=1` env var, which the
+    // engine's built-in per-script/per-plugin frame profiler reads to
+    // enable recording (it logs a worst-first ranking via
+    // `std.log.scoped(.profiler)`). Independent of `--headless` — you can
+    // profile a windowed run too.
+    profile: bool = false,
 };
 
 /// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
@@ -419,6 +435,32 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
                 return null;
             }
             continue;
+        } else if (std.mem.eql(u8, arg, "--headless")) {
+            parsed_args.headless = true;
+            continue;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            parsed_args.profile = true;
+            continue;
+        } else if (std.mem.eql(u8, arg, "--uncapped")) {
+            // Implies --headless (the backend only honours the uncapped
+            // path when it's already in headless mode).
+            parsed_args.headless = true;
+            parsed_args.headless_uncapped = true;
+            continue;
+        } else if (std.mem.startsWith(u8, arg, "--ticks=")) {
+            const val = arg["--ticks=".len..];
+            const n = std.fmt.parseInt(u64, val, 10) catch null;
+            if (n == null or n.? == 0) {
+                std.debug.print("labelle {s}: invalid --ticks value '{s}'\n", .{ cmd_name, val });
+                std.debug.print("  expected a positive integer, e.g. --ticks=600\n", .{});
+                return null;
+            }
+            parsed_args.headless = true; // --ticks implies --headless
+            parsed_args.headless_ticks = n.?;
+            continue;
+        } else if (std.mem.eql(u8, arg, "--ticks")) {
+            std.debug.print("labelle {s}: --ticks requires a value (e.g. --ticks=600)\n", .{cmd_name});
+            return null;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -991,11 +1033,34 @@ pub fn main(proc_init: std.process.Init) !void {
         var env_map_ptr: ?*const std.process.Environ.Map = null;
         const has_scene_env = parsed_args.scene_override != null;
         const has_screenshot_env = parsed_args.screenshot_path != null;
-        if (has_scene_env or has_screenshot_env) {
+        // --headless (and the flags that imply it) surface as
+        // LABELLE_HEADLESS=1 plus the optional uncapped/ticks knobs that
+        // the sokol desktop backend reads. `parsed_args.headless` is
+        // already set true by `--uncapped`/`--ticks`, so this one check
+        // covers all three.
+        const has_headless_env = parsed_args.headless;
+        // --profile surfaces as LABELLE_PROFILE=1, enabling the engine's
+        // built-in frame profiler. Independent of --headless.
+        const has_profile_env = parsed_args.profile;
+        if (has_scene_env or has_screenshot_env or has_headless_env or has_profile_env) {
             var extras: std.ArrayList(runner.EnvKV) = .empty;
             defer extras.deinit(allocator);
             if (parsed_args.scene_override) |scene| {
                 try extras.append(allocator, .{ .key = "LABELLE_SCENE", .value = scene });
+            }
+            var ticks_buf: [32]u8 = undefined;
+            if (parsed_args.headless) {
+                try extras.append(allocator, .{ .key = "LABELLE_HEADLESS", .value = "1" });
+                if (parsed_args.headless_uncapped) {
+                    try extras.append(allocator, .{ .key = "LABELLE_HEADLESS_UNCAPPED", .value = "1" });
+                }
+                if (parsed_args.headless_ticks) |n| {
+                    const ticks_str = try std.fmt.bufPrint(&ticks_buf, "{d}", .{n});
+                    try extras.append(allocator, .{ .key = "LABELLE_HEADLESS_TICKS", .value = ticks_str });
+                }
+            }
+            if (parsed_args.profile) {
+                try extras.append(allocator, .{ .key = "LABELLE_PROFILE", .value = "1" });
             }
             var sec_buf: [32]u8 = undefined;
             if (parsed_args.screenshot_path) |path| {
@@ -1477,6 +1542,93 @@ pub const ParseRunArgsPassthroughSpec = struct {
             try std.testing.expectEqualStrings(".", result.dir);
             try expect.equal(pa.extra_count, @as(usize, 1));
             try std.testing.expectEqualStrings("somedir", pa.extra_args[0]);
+        }
+    };
+};
+
+/// Headless perf / CI knobs (`--headless` / `--uncapped` / `--ticks`).
+/// These set fields directly on `ParsedArgs`, which the spawn site turns
+/// into `LABELLE_HEADLESS` / `LABELLE_HEADLESS_UNCAPPED` /
+/// `LABELLE_HEADLESS_TICKS`. `--uncapped` and `--ticks` both imply
+/// `--headless`.
+pub const ParseHeadlessFlagsSpec = struct {
+    pub const headless_alone = struct {
+        test "--headless sets headless only" {
+            var iter = testIter("--headless");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.headless, true);
+            try expect.equal(pa.headless_uncapped, false);
+            try expect.equal(pa.headless_ticks, @as(?u64, null));
+        }
+    };
+
+    pub const profile_independent = struct {
+        test "--profile sets profile, not headless" {
+            var iter = testIter("--profile");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.profile, true);
+            try expect.equal(pa.headless, false);
+        }
+    };
+
+    pub const uncapped_implies_headless = struct {
+        test "--uncapped sets headless + uncapped" {
+            var iter = testIter("--uncapped");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.headless, true);
+            try expect.equal(pa.headless_uncapped, true);
+        }
+    };
+
+    pub const ticks_implies_headless = struct {
+        test "--ticks=600 sets headless + ticks" {
+            var iter = testIter("--ticks=600");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.headless, true);
+            try expect.equal(pa.headless_ticks, @as(?u64, 600));
+        }
+    };
+
+    pub const composes = struct {
+        test "--headless --uncapped --ticks=600 all set" {
+            var iter = testIter("--headless --uncapped --ticks=600");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.headless, true);
+            try expect.equal(pa.headless_uncapped, true);
+            try expect.equal(pa.headless_ticks, @as(?u64, 600));
+        }
+    };
+
+    pub const invalid_ticks = struct {
+        test "--ticks=0 is rejected" {
+            var iter = testIter("--ticks=0");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+        }
+
+        test "--ticks=abc is rejected" {
+            var iter = testIter("--ticks=abc");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+        }
+
+        test "--ticks without value is rejected" {
+            var iter = testIter("--ticks");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
         }
     };
 };
