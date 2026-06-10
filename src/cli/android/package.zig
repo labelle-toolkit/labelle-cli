@@ -107,12 +107,20 @@ pub fn packageApkWithAbis(
     defer allocator.free(manifest);
     try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = manifest_path, .data = manifest });
 
-    // Stage assets
+    // Stage assets. A project that declares no `.resources` (e.g. a pure-HUD
+    // gamepad demo) generates no `<target>/assets/` dir, so skip the copy when
+    // the source is absent rather than failing the whole package step on a
+    // missing directory. aapt is happy with an APK that has no assets/ entry.
     const assets_src = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
     defer allocator.free(assets_src);
     const assets_dst = try std.fs.path.join(allocator, &.{ staging_dir, "assets" });
     defer allocator.free(assets_dst);
-    try copyDirectory(allocator, assets_src, assets_dst);
+    if (std.Io.Dir.cwd().access(config.globalIo(), assets_src, .{})) |_| {
+        try copyDirectory(allocator, assets_src, assets_dst);
+    } else |err| switch (err) {
+        error.FileNotFound => {}, // no assets to stage — fine
+        else => return err,
+    }
 
     // Build APK
     const apk_path = try std.fs.path.join(allocator, &.{ target_dir, "game.apk" });
