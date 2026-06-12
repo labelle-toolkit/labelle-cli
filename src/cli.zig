@@ -459,8 +459,21 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
             parsed_args.headless_ticks = n.?;
             continue;
         } else if (std.mem.eql(u8, arg, "--ticks")) {
-            std.debug.print("labelle {s}: --ticks requires a value (e.g. --ticks=600)\n", .{cmd_name});
-            return null;
+            // Space-separated form, same as `--timeout 30s`.
+            if (args.next()) |val| {
+                const n = std.fmt.parseInt(u64, val, 10) catch null;
+                if (n == null or n.? == 0) {
+                    std.debug.print("labelle {s}: invalid --ticks value '{s}'\n", .{ cmd_name, val });
+                    std.debug.print("  expected a positive integer, e.g. --ticks 600\n", .{});
+                    return null;
+                }
+                parsed_args.headless = true; // --ticks implies --headless
+                parsed_args.headless_ticks = n.?;
+            } else {
+                std.debug.print("labelle {s}: --ticks requires a value (e.g. --ticks=600)\n", .{cmd_name});
+                return null;
+            }
+            continue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -1595,6 +1608,15 @@ pub const ParseHeadlessFlagsSpec = struct {
             try expect.equal(pa.headless, true);
             try expect.equal(pa.headless_ticks, @as(?u64, 600));
         }
+
+        test "--ticks 600 (space form) sets headless + ticks" {
+            var iter = testIter("--ticks 600");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try expect.equal(pa.headless, true);
+            try expect.equal(pa.headless_ticks, @as(?u64, 600));
+        }
     };
 
     pub const composes = struct {
@@ -1626,6 +1648,13 @@ pub const ParseHeadlessFlagsSpec = struct {
 
         test "--ticks without value is rejected" {
             var iter = testIter("--ticks");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+        }
+
+        test "--ticks abc (space form) is rejected" {
+            var iter = testIter("--ticks abc");
             defer iter.deinit();
             var pa = ParsedArgs{ .command = .run };
             try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
