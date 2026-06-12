@@ -38,6 +38,28 @@ pub fn cachedLibDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ cache_root, "sdl2", "SDL2-" ++ SDL2_VERSION, "x86_64-w64-mingw32", "lib" });
 }
 
+/// First cached SDL2 lib dir containing the import lib, ANY version —
+/// scans `~/.labelle/sdl2/*/x86_64-w64-mingw32/lib`. This is the single
+/// acceptance rule shared by `labelle doctor`'s detection and
+/// `autoWireEnv`, so doctor never reports a cache green that build/run
+/// then ignore. (`cachedLibDir` above stays pinned — it's the
+/// provisioning *target*, not the detection rule.) Arena-allocated.
+pub fn findCachedLibDir(a: std.mem.Allocator) ?[]const u8 {
+    const io = config.globalIo();
+    const root = asm_cache.getCacheRoot(a) catch return null;
+    const sdl_root = join(a, &.{ root, "sdl2" }) orelse return null;
+    var dir = std.Io.Dir.cwd().openDir(io, sdl_root, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return null) |entry| {
+        if (entry.kind != .directory) continue;
+        const lib = join(a, &.{ sdl_root, entry.name, "x86_64-w64-mingw32", "lib" }) orelse continue;
+        const probe = join(a, &.{ lib, "libSDL2.dll.a" }) orelse continue;
+        if (util.fileExists(probe)) return lib;
+    }
+    return null;
+}
+
 /// Ensure SDL2 is available, downloading it on Windows if needed.
 pub fn provisionSdl2(gpa: std.mem.Allocator) Result {
     switch (builtin.os.tag) {
@@ -79,9 +101,8 @@ pub fn autoWireEnv(gpa: std.mem.Allocator) void {
     defer arena_inst.deinit();
     const a = arena_inst.allocator();
 
-    const lib_dir = cachedLibDir(a) catch return;
-    const importlib = join(a, &.{ lib_dir, "libSDL2.dll.a" }) orelse return;
-    if (!util.fileExists(importlib)) return; // nothing provisioned
+    // Accept any cached version — same rule as doctor's detection.
+    const lib_dir = findCachedLibDir(a) orelse return; // nothing provisioned
 
     const env = config.globalEnviron();
 
@@ -92,9 +113,19 @@ pub fn autoWireEnv(gpa: std.mem.Allocator) void {
         std.debug.print("labelle: using cached SDL2 ({s})\n", .{lib_dir});
     }
 
-    // PATH — prepend the cache lib dir (contains SDL2.dll) for runtime, once.
+    // PATH — prepend the cache lib dir (contains SDL2.dll) for runtime,
+    // once. Exact segment comparison (not substring) so an unrelated
+    // entry that merely contains this dir's text can't suppress it.
     const old_path = (env.getAlloc(a, "PATH") catch null) orelse "";
-    if (std.mem.indexOf(u8, old_path, lib_dir) == null) {
+    var on_path = false;
+    var seg_it = std.mem.splitScalar(u8, old_path, ';');
+    while (seg_it.next()) |seg| {
+        if (util.windowsPathEql(seg, lib_dir)) {
+            on_path = true;
+            break;
+        }
+    }
+    if (!on_path) {
         const new_path = std.fmt.allocPrint(a, "{s};{s}", .{ lib_dir, old_path }) catch return;
         setEnvW(a, "PATH", new_path);
     }

@@ -18,7 +18,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const project_config = @import("project_config.zig");
-const asm_cache = @import("asm_cache.zig");
 const sdl_provision = @import("sdl_provision.zig");
 
 const Check = struct {
@@ -228,6 +227,13 @@ fn checkSdl2Headers(arena: std.mem.Allocator) Check {
                 const inc = std.fs.path.join(arena, &.{ dir, "..", "include", "SDL2", "SDL.h" }) catch dir;
                 if (fileExists(inc)) return ok(name, inc);
             }
+            // The --fix-provisioned MinGW package ships headers beside the
+            // lib — accept the cache here the same way checkSdl2Lib does,
+            // so a fixed setup passes the headers check too.
+            if (findCachedSdl2Lib(arena)) |libdir| {
+                const inc = std.fs.path.join(arena, &.{ libdir, "..", "include", "SDL2", "SDL.h" }) catch libdir;
+                if (fileExists(inc)) return ok(name, inc);
+            }
             return fail(name, "SDL2 headers not found. The `sdl` render backend needs the SDL2 dev headers (SDL2/SDL.h) from the MinGW dev package.");
         },
         .linux => {
@@ -308,20 +314,10 @@ fn onPath(arena: std.mem.Allocator, filename: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Scan `~/.labelle/sdl2/*/x86_64-w64-mingw32/lib` for the import lib (the
-/// layout Phase 2 provisioning will populate).
+/// Cached SDL2 lib dir, any version. Delegates to the provisioner's scan
+/// so detection here and the build/run env wiring share one acceptance
+/// rule — doctor must never report a cache green that autoWireEnv then
+/// ignores.
 fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
-    const io = config.globalIo();
-    const root = asm_cache.getCacheRoot(arena) catch return null;
-    const sdl_root = std.fs.path.join(arena, &.{ root, "sdl2" }) catch return null;
-    var dir = std.Io.Dir.cwd().openDir(io, sdl_root, .{ .iterate = true }) catch return null;
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (it.next(io) catch return null) |entry| {
-        if (entry.kind != .directory) continue;
-        const lib = std.fs.path.join(arena, &.{ sdl_root, entry.name, "x86_64-w64-mingw32", "lib" }) catch continue;
-        const probe = std.fs.path.join(arena, &.{ lib, "libSDL2.dll.a" }) catch continue;
-        if (fileExists(probe)) return lib;
-    }
-    return null;
+    return sdl_provision.findCachedLibDir(arena);
 }

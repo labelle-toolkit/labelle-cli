@@ -793,10 +793,12 @@ pub fn main(proc_init: std.process.Init) !void {
     // build/run environment so desktop games that need it (raylib/sokol
     // gamepad, sdl backend) link + run without the user setting
     // LABELLE_SDL2_LIB by hand. No-op when SDL2 isn't in the cache or the
-    // user already set the var. (cli desktop SDL2 provisioning.)
-    if (parsed.platform == .desktop and
-        (parsed.backend == .raylib or parsed.backend == .sokol or parsed.backend == .sdl))
-    {
+    // user already set the var. Scoped like `labelle doctor`: the sdl
+    // backend always needs SDL2; raylib/sokol only for the gamepad
+    // source, so `.gamepad = .none` projects get nothing injected.
+    const wants_sdl2 = parsed.backend == .sdl or
+        ((parsed.backend == .raylib or parsed.backend == .sokol) and parsed.gamepad != .none);
+    if (parsed.platform == .desktop and wants_sdl2) {
         sdl_provision.autoWireEnv(allocator);
     }
 

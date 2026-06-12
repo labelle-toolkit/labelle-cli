@@ -220,6 +220,9 @@ pub const ResolvedGui = struct {
     bridge_artifact: []const u8 = "",
 };
 
+/// Gamepad opt-out, mirroring assembler `src/config.zig` (gamepad: .auto | .none).
+pub const GamepadMode = enum { auto, none };
+
 pub const ProjectConfig = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -231,6 +234,10 @@ pub const ProjectConfig = struct {
     backend: Backend = .raylib,
     platform: Platform = .desktop,
     ecs: EcsChoice = .mock,
+    /// Gamepad input mode (assembler#274 opt-out flag): `.auto` (default)
+    /// pulls the shared SDL gamepad source into raylib/sokol desktop
+    /// builds; `.none` disables it (and drops the SDL2 link dependency).
+    gamepad: GamepadMode = .auto,
     /// GUI plugin reference — parsed from project.labelle.
     gui: ?GuiPlugin = null,
     layers: []const LayerDef = &.{
