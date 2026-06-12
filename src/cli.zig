@@ -40,8 +40,10 @@ const util = @import("cli/util.zig");
 const pack = @import("cli/pack.zig");
 const audit = @import("cli/audit.zig");
 const migrate = @import("cli/migrate.zig");
+const doctor = @import("cli/doctor.zig");
+const sdl_provision = @import("cli/sdl_provision.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, audit_cmd, migrate_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, audit_cmd, migrate_cmd, doctor_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -618,6 +620,9 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "migrate")) {
             parsed_args.command = .migrate_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "doctor")) {
+            parsed_args.command = .doctor_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "ios")) {
             parsed_args.command = .ios_cmd;
             // First non-flag arg that isn't a subcommand is the project dir
@@ -728,6 +733,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .pack_cmd => return pack.cmdPack(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .audit_cmd => return audit.cmdAudit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .migrate_cmd => return migrate.cmdMigrate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .doctor_cmd => return doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
@@ -837,6 +843,19 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
+
+    // Auto-wire a cache-provisioned SDL2 (`labelle doctor --fix`) into the
+    // build/run environment so desktop games that need it (raylib/sokol
+    // gamepad, sdl backend) link + run without the user setting
+    // LABELLE_SDL2_LIB by hand. No-op when SDL2 isn't in the cache or the
+    // user already set the var. Scoped like `labelle doctor`: the sdl
+    // backend always needs SDL2; raylib/sokol only for the gamepad
+    // source, so `.gamepad = .none` projects get nothing injected.
+    const wants_sdl2 = parsed.backend == .sdl or
+        ((parsed.backend == .raylib or parsed.backend == .sokol) and parsed.gamepad != .none);
+    if (parsed.platform == .desktop and wants_sdl2) {
+        sdl_provision.autoWireEnv(allocator);
+    }
 
     // Issue #217: the CLI is a thin driver over the standalone
     // labelle-assembler binary. Resolve it once here (LABELLE_ASSEMBLER
