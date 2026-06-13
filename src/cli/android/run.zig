@@ -2,6 +2,7 @@
 /// `adb install -r`, and launch the NativeActivity. Built on top of
 /// `android/package.zig` for the packaging half.
 const std = @import("std");
+const builtin = @import("builtin");
 const project_config = @import("../project_config.zig");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
@@ -97,26 +98,42 @@ fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_
 
 /// Find adb in ANDROID_HOME/platform-tools/ or PATH.
 fn findAdb(allocator: std.mem.Allocator) ![]u8 {
+    const is_windows = builtin.target.os.tag == .windows;
+    // On Windows the binary is `adb.exe`; elsewhere it's bare `adb`.
+    // Probe the Windows name first, then the bare name, so a POSIX-named
+    // checkout on Windows (or vice versa) still resolves.
+    const adb_names: []const []const u8 = if (is_windows)
+        &.{ "adb.exe", "adb" }
+    else
+        &.{"adb"};
+
     // Try ANDROID_HOME first
     if (config.globalEnviron().getAlloc(allocator, "ANDROID_HOME") catch null) |home| {
         defer allocator.free(home);
-        const adb_path = try std.fs.path.join(allocator, &.{ home, "platform-tools", "adb" });
-        if (std.Io.Dir.cwd().access(config.globalIo(), adb_path, .{})) |_| {
-            return adb_path;
-        } else |_| {
-            allocator.free(adb_path);
+        for (adb_names) |name| {
+            const adb_path = try std.fs.path.join(allocator, &.{ home, "platform-tools", name });
+            if (std.Io.Dir.cwd().access(config.globalIo(), adb_path, .{})) |_| {
+                return adb_path;
+            } else |_| {
+                allocator.free(adb_path);
+            }
         }
     }
-    // Fall back to PATH
-    const result = util.runCmd(allocator, &.{ "which", "adb" }) catch {
+    // Fall back to PATH. Windows uses `where`, POSIX uses `which`.
+    const locator = if (is_windows) "where" else "which";
+    const result = util.runCmd(allocator, &.{ locator, "adb" }) catch {
         std.debug.print("labelle: adb not found. Set ANDROID_HOME or add adb to PATH.\n", .{});
         return error.AdbNotFound;
     };
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
     if (result.term == .exited and result.term.exited == 0 and result.stdout.len > 0) {
-        const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-        return allocator.dupe(u8, path);
+        // `where` can print several matches (one per line); take the
+        // first. `which` prints a single path. Trim CR/LF/space either way.
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        const first = lines.next() orelse result.stdout;
+        const path = std.mem.trim(u8, first, &std.ascii.whitespace);
+        if (path.len > 0) return allocator.dupe(u8, path);
     }
     std.debug.print("labelle: adb not found. Set ANDROID_HOME or add adb to PATH.\n", .{});
     return error.AdbNotFound;
