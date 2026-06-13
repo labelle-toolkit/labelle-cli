@@ -3,6 +3,7 @@
 /// `android/build.zig` (after the .so is built) and `android/run.zig`
 /// (single- and multi-arch deploy paths share this module).
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
 const project_config = @import("../project_config.zig");
 const asm_cache = @import("../asm_cache.zig");
@@ -133,7 +134,6 @@ pub fn packageApkWithAbis(
 /// the Android emulator runs ARM64 images; on Intel Macs it runs
 /// x86_64. Physical device builds always target arm64-v8a.
 pub fn hostAbiDir(emulator: bool) []const u8 {
-    const builtin = @import("builtin");
     return if (emulator and builtin.cpu.arch != .aarch64) "x86_64" else "arm64-v8a";
 }
 
@@ -173,11 +173,15 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
 
     // We use aapt v1 for packaging (single-step) — aapt2 isn't called
     // in this function. Keeping only the tools we actually invoke.
-    const zipalign = try std.fs.path.join(allocator, &.{ build_tools_dir, "zipalign" });
+    //
+    // Resolve with the host-correct extension: on Windows the SDK ships
+    // `aapt.exe` / `zipalign.exe` (native binaries) but `apksigner.bat`
+    // (a JVM launcher wrapper). On macOS/Linux all three are bare names.
+    const zipalign = try sdkToolPath(allocator, build_tools_dir, "zipalign", .native_exe);
     defer allocator.free(zipalign);
-    const apksigner = try std.fs.path.join(allocator, &.{ build_tools_dir, "apksigner" });
+    const apksigner = try sdkToolPath(allocator, build_tools_dir, "apksigner", .script);
     defer allocator.free(apksigner);
-    const aapt = try std.fs.path.join(allocator, &.{ build_tools_dir, "aapt" });
+    const aapt = try sdkToolPath(allocator, build_tools_dir, "aapt", .native_exe);
     defer allocator.free(aapt);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, "AndroidManifest.xml" });
@@ -221,26 +225,36 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
         }
     }
 
-    // Add native libs to the APK with zip (aapt does not handle .so files).
-    // Run zip from inside staging_dir so the archive path is lib/<abi>/libgame.so.
-    // Resolve both paths to absolute so they survive the CWD change.
+    // Add native libs to the APK (aapt does not handle .so files).
+    //
+    // The original code shelled out to the Unix-only `zip` tool, which
+    // doesn't exist on Windows. Use the JDK's `jar` instead — it ships
+    // with every JDK (and the Android SDK requires a JDK), so it's
+    // available uniformly on Windows/macOS/Linux.
+    //
+    // `--update --no-compress -C <staging> lib` adds the `lib/<abi>/*.so`
+    // tree to the existing aapt-produced unsigned APK *stored*
+    // (uncompressed). Android API 30+ requires .so entries (and
+    // resources.arsc) be stored uncompressed; `--no-compress` only
+    // affects the newly-added entries, so the aapt-produced manifest /
+    // resources.arsc already in the base APK are untouched. Running with
+    // `-C staging_dir lib` makes the archive paths `lib/<abi>/libgame.so`
+    // without a CWD change.
     {
-        const staging_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), staging_dir, allocator);
-        defer allocator.free(staging_abs);
-        const unsigned_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), unsigned_apk, allocator);
-        defer allocator.free(unsigned_abs);
+        const jar = try findJar(allocator);
+        defer allocator.free(jar);
 
-        var child = try std.process.spawn(config.globalIo(), .{
-            .argv = &.{ "zip", "-r", unsigned_abs, "lib" },
-            .cwd = .{ .path = staging_abs },
-            .stdin = .close,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        });
-        const term = try child.wait(config.globalIo());
-        switch (term) {
+        const result = util.runCmd(allocator, &.{
+            jar, "--update", "--no-compress", "--file", unsigned_apk, "-C", staging_dir, "lib",
+        }) catch |err| {
+            std.debug.print("labelle: jar (add native libs) failed: {}\n", .{err});
+            return err;
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
             .exited => |code| if (code != 0) {
-                std.debug.print("labelle: zip native lib failed (exit {d})\n", .{code});
+                std.debug.print("labelle: jar (add native libs) failed: {s}\n", .{result.stderr});
                 return error.PackageFailed;
             },
             else => return error.PackageFailed,
@@ -423,6 +437,52 @@ fn findAndroidSdk(allocator: std.mem.Allocator) ![]u8 {
     } else |_| {}
     std.debug.print("labelle: Android SDK not found. Set ANDROID_HOME.\n", .{});
     return error.SdkNotFound;
+}
+
+/// How an SDK build-tools entry is launched on the host, which decides
+/// the executable suffix to append on Windows. `native_exe` covers true
+/// native binaries (aapt, zipalign → `.exe`); `script` covers the JVM
+/// launcher wrappers (apksigner → `.bat`). On macOS/Linux both kinds are
+/// bare names with no suffix.
+const SdkToolKind = enum { native_exe, script };
+
+/// Join a build-tools directory with a tool name, appending the
+/// host-correct executable suffix. Caller owns the returned slice.
+fn sdkToolPath(allocator: std.mem.Allocator, build_tools_dir: []const u8, name: []const u8, kind: SdkToolKind) ![]u8 {
+    if (builtin.target.os.tag == .windows) {
+        const suffix = switch (kind) {
+            .native_exe => ".exe",
+            .script => ".bat",
+        };
+        const file = try std.fmt.allocPrint(allocator, "{s}{s}", .{ name, suffix });
+        defer allocator.free(file);
+        return std.fs.path.join(allocator, &.{ build_tools_dir, file });
+    }
+    return std.fs.path.join(allocator, &.{ build_tools_dir, name });
+}
+
+/// Resolve the JDK's `jar` executable via JAVA_HOME (the Android SDK
+/// requires a JDK, so JAVA_HOME is expected to point at one). On Windows
+/// the binary is `jar.exe`; elsewhere it's bare `jar`. Caller owns the
+/// returned slice.
+fn findJar(allocator: std.mem.Allocator) ![]u8 {
+    const java_home = config.globalEnviron().getAlloc(allocator, "JAVA_HOME") catch {
+        std.debug.print("labelle: JAVA_HOME not set — cannot locate the JDK's 'jar' tool.\n", .{});
+        std.debug.print("  set JAVA_HOME to a JDK install (the Android SDK requires one).\n", .{});
+        return error.SdkNotFound;
+    };
+    defer allocator.free(java_home);
+
+    const jar_name = if (builtin.target.os.tag == .windows) "jar.exe" else "jar";
+    const jar_path = try std.fs.path.join(allocator, &.{ java_home, "bin", jar_name });
+    errdefer allocator.free(jar_path);
+
+    std.Io.Dir.cwd().access(config.globalIo(), jar_path, .{}) catch {
+        std.debug.print("labelle: 'jar' not found at {s}\n", .{jar_path});
+        std.debug.print("  ensure JAVA_HOME points at a JDK (not just a JRE).\n", .{});
+        return error.SdkNotFound;
+    };
+    return jar_path;
 }
 
 /// Find the latest build-tools directory.
