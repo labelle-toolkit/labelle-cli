@@ -105,6 +105,29 @@ fn parseSceneFlag(
 const ParseError = error{TooManyArguments};
 
 const Platform = project_config.Platform;
+const Backend = project_config.Backend;
+
+/// Resolve the backend for an `labelle android` invocation, honoring the
+/// project's declared backend when it can actually target Android.
+///
+/// Android-capable backends are `sokol` and `bgfx` (the bgfx-on-Android
+/// bring-up, cli#300-#303). A project that declares either keeps it. Any
+/// other backend (`raylib`/`sdl`/`wgpu`/`null` — desktop/web only) can't
+/// target Android, so we fall back to `sokol` to preserve the historical
+/// behavior for projects that just say "android" without a real Android
+/// backend (#252).
+fn resolveAndroidBackend(project_backend: Backend) Backend {
+    return switch (project_backend) {
+        .sokol, .bgfx => project_backend,
+        .raylib, .sdl, .wgpu, .null => blk: {
+            std.debug.print(
+                "labelle android: backend '{s}' can't target Android; defaulting to sokol.\n",
+                .{@tagName(project_backend)},
+            );
+            break :blk .sokol;
+        },
+    };
+}
 
 const ParsedArgs = struct {
     command: Command,
@@ -807,10 +830,13 @@ pub fn main(proc_init: std.process.Init) !void {
         parsed.backend = .sokol;
     }
 
-    // `labelle android` always implies sokol + android platform
+    // `labelle android` implies the android platform. The backend is
+    // resolved from the project's declared backend, honoring an
+    // Android-capable choice (`sokol` or `bgfx`) and falling back to
+    // sokol otherwise (#252).
     if (command == .android_cmd) {
         parsed.platform = .android;
-        parsed.backend = .sokol;
+        parsed.backend = resolveAndroidBackend(parsed.backend);
     }
 
     // Upgrade modifies project.labelle in the project directory
@@ -1476,6 +1502,32 @@ pub const ParsePlatformValueSpec = struct {
         }
         test "returns null for unknown value" {
             try expect.equal(parsePlatformValue("windows"), null);
+        }
+    };
+};
+
+pub const ResolveAndroidBackendSpec = struct {
+    pub const android_capable_backends_kept = struct {
+        test "bgfx project keeps bgfx (#252)" {
+            try expect.equal(resolveAndroidBackend(.bgfx), Backend.bgfx);
+        }
+        test "sokol project keeps sokol" {
+            try expect.equal(resolveAndroidBackend(.sokol), Backend.sokol);
+        }
+    };
+
+    pub const non_android_backends_fall_back_to_sokol = struct {
+        test "raylib falls back to sokol" {
+            try expect.equal(resolveAndroidBackend(.raylib), Backend.sokol);
+        }
+        test "sdl falls back to sokol" {
+            try expect.equal(resolveAndroidBackend(.sdl), Backend.sokol);
+        }
+        test "wgpu falls back to sokol" {
+            try expect.equal(resolveAndroidBackend(.wgpu), Backend.sokol);
+        }
+        test "null falls back to sokol" {
+            try expect.equal(resolveAndroidBackend(.null), Backend.sokol);
         }
     };
 };
