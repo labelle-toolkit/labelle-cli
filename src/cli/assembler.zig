@@ -21,7 +21,7 @@ const std = @import("std");
 /// CLI delegates (`install`/`clean`/`upgrade`/`init`). Bumped from the
 /// obsolete `0.8.0` (generate-only) to the 0.31.0 line that ships them —
 /// keep this in lockstep with the assembler release.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.31.0";
+pub const DEFAULT_ASSEMBLER_VERSION = "0.40.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");
