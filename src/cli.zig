@@ -116,16 +116,13 @@ const Backend = project_config.Backend;
 /// target Android, so we fall back to `sokol` to preserve the historical
 /// behavior for projects that just say "android" without a real Android
 /// backend (#252).
+///
+/// Pure: the caller logs when the resolved backend differs from the
+/// project's, so unit tests can call this without polluting console output.
 fn resolveAndroidBackend(project_backend: Backend) Backend {
     return switch (project_backend) {
         .sokol, .bgfx => project_backend,
-        .raylib, .sdl, .wgpu, .null => blk: {
-            std.debug.print(
-                "labelle android: backend '{s}' can't target Android; defaulting to sokol.\n",
-                .{@tagName(project_backend)},
-            );
-            break :blk .sokol;
-        },
+        .raylib, .sdl, .wgpu, .null => .sokol,
     };
 }
 
@@ -836,7 +833,14 @@ pub fn main(proc_init: std.process.Init) !void {
     // sokol otherwise (#252).
     if (command == .android_cmd) {
         parsed.platform = .android;
-        parsed.backend = resolveAndroidBackend(parsed.backend);
+        const android_backend = resolveAndroidBackend(parsed.backend);
+        if (android_backend != parsed.backend) {
+            std.debug.print(
+                "labelle android: backend '{s}' can't target Android; defaulting to sokol.\n",
+                .{@tagName(parsed.backend)},
+            );
+        }
+        parsed.backend = android_backend;
     }
 
     // Upgrade modifies project.labelle in the project directory
