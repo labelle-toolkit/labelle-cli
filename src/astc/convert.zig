@@ -51,6 +51,37 @@ pub const BlockSize = enum {
     }
 };
 
+/// What ASTC block sizes a backend's *runtime* can actually upload. Emitting a
+/// block the target can't load produces `.astc` files that fail at load time
+/// with `error.LoadFailed` (surfaced live on the FP sokol trial: an 8×8 default
+/// left the game stuck on the loading scene). sokol ships ONLY 4×4; raylib
+/// ships 4×4 and 8×8; bgfx/wgpu accept the full astcenc range. This mirrors
+/// each backend's `astcFormat` mapping in its `gfx/texture.zig`.
+pub const BackendCaps = enum {
+    sokol_4x4_only,
+    raylib_4x4_8x8,
+    full,
+
+    /// Can this backend's runtime upload `block` as-is?
+    pub fn supports(self: BackendCaps, block: BlockSize) bool {
+        return switch (self) {
+            .sokol_4x4_only => block == .@"4x4",
+            .raylib_4x4_8x8 => block == .@"4x4" or block == .@"8x8",
+            .full => true,
+        };
+    }
+
+    /// Block to use when the caller didn't pass `--block`: the smallest GPU
+    /// footprint (largest block) the backend can still load. sokol can only do
+    /// 4×4; everyone else gets the 8×8 sprite-atlas default.
+    pub fn defaultBlock(self: BackendCaps) BlockSize {
+        return switch (self) {
+            .sokol_4x4_only => .@"4x4",
+            else => .@"8x8",
+        };
+    }
+};
+
 /// astcenc effort/quality preset. `-fast` is a good default — encode time is
 /// tiny (~0.16 s for a 4K atlas, measured in #339) and quality is plenty for
 /// 2D sprite art.
@@ -154,6 +185,33 @@ test "BlockSize.dims parses the tag into x/y (matches .astc header bytes 4/5)" {
     try std.testing.expectEqual(@as(u8, 4), BlockSize.@"4x4".dims().x);
     try std.testing.expectEqual(@as(u8, 12), BlockSize.@"12x12".dims().y);
     try std.testing.expectEqual(@as(u8, 10), BlockSize.@"10x10".dims().x);
+}
+
+test "BackendCaps.supports gates blocks by what the runtime can upload" {
+    // sokol's astcFormat only maps 4×4 — everything else fails sg.makeImage.
+    try std.testing.expect(BackendCaps.sokol_4x4_only.supports(.@"4x4"));
+    try std.testing.expect(!BackendCaps.sokol_4x4_only.supports(.@"8x8"));
+    try std.testing.expect(!BackendCaps.sokol_4x4_only.supports(.@"6x6"));
+    // raylib loads 4×4 and 8×8, but not the in-between/large sizes.
+    try std.testing.expect(BackendCaps.raylib_4x4_8x8.supports(.@"4x4"));
+    try std.testing.expect(BackendCaps.raylib_4x4_8x8.supports(.@"8x8"));
+    try std.testing.expect(!BackendCaps.raylib_4x4_8x8.supports(.@"6x6"));
+    try std.testing.expect(!BackendCaps.raylib_4x4_8x8.supports(.@"12x12"));
+    // bgfx/wgpu take the full astcenc range.
+    try std.testing.expect(BackendCaps.full.supports(.@"4x4"));
+    try std.testing.expect(BackendCaps.full.supports(.@"12x12"));
+}
+
+test "BackendCaps.defaultBlock picks the smallest footprint each backend can load" {
+    // sokol must fall back to 4×4 (the blocker this fix exists for).
+    try std.testing.expectEqual(BlockSize.@"4x4", BackendCaps.sokol_4x4_only.defaultBlock());
+    // others keep the 8×8 sprite-atlas default, and it must be loadable.
+    try std.testing.expectEqual(BlockSize.@"8x8", BackendCaps.raylib_4x4_8x8.defaultBlock());
+    try std.testing.expectEqual(BlockSize.@"8x8", BackendCaps.full.defaultBlock());
+    // a backend's own default is always one it supports.
+    inline for (std.enums.values(BackendCaps)) |caps| {
+        try std.testing.expect(caps.supports(caps.defaultBlock()));
+    }
 }
 
 test "Quality/ColorSpace map to astcenc flags" {
