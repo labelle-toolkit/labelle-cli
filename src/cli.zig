@@ -909,7 +909,7 @@ pub fn main(proc_init: std.process.Init) !void {
     // falls back to the source PNG, so the build still succeeds.
     if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
         astc_cmd.cmdAstc(allocator, &.{project_dir}) catch |err| {
-            std.debug.print("labelle: ASTC conversion failed ({any}); falling back to PNG atlases\n", .{err});
+            std.debug.print("labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n", .{@errorName(err)});
         };
     }
 
