@@ -34,6 +34,18 @@ fn parseQuality(s: []const u8) ?convert.Quality {
     return std.meta.stringToEnum(convert.Quality, s);
 }
 
+/// Whether the existing `.astc` at `out` was encoded at `block` (bytes 4/5 of
+/// the ASTC header). Returns false if it's missing/short/unreadable so the
+/// caller re-encodes. (Quality isn't recoverable from the header — a `--quality`
+/// change still needs a clean rebuild; block is the format-determining param.)
+fn existingBlockMatches(allocator: std.mem.Allocator, out: []const u8, block: convert.BlockSize) bool {
+    // 64 MiB covers any 4K atlas even at 4x4 (8 bpp); we only need the header.
+    const data = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), out, allocator, .limited(64 * 1024 * 1024)) catch return false;
+    if (data.len < 16) return false;
+    const d = block.dims();
+    return data[4] == d.x and data[5] == d.y;
+}
+
 pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // One arena for the whole command: the parsed ProjectConfig + every path
     // join / subprocess buffer frees in a single deinit (the config strings
@@ -90,7 +102,10 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         const out = try convert.outputPath(allocator, src);
         defer allocator.free(out);
 
-        if (!convert.needsReencode(Stat, src, out)) {
+        // Up-to-date only if the output is newer than the source AND was
+        // encoded at the requested block size — otherwise a `--block` change
+        // would silently keep the stale format (the mtime alone can't see it).
+        if (!convert.needsReencode(Stat, src, out) and existingBlockMatches(allocator, out, opts.block)) {
             cached += 1;
             continue;
         }

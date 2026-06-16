@@ -37,6 +37,18 @@ pub const BlockSize = enum {
     pub fn parse(s: []const u8) ?BlockSize {
         return std.meta.stringToEnum(BlockSize, s);
     }
+
+    /// The block's X/Y dimensions, parsed from the `"<x>x<y>"` tag name. These
+    /// match bytes 4/5 of an `.astc` header, so a converted file can be checked
+    /// against the requested block size (the cache must re-encode on a change).
+    pub fn dims(self: BlockSize) struct { x: u8, y: u8 } {
+        const name = @tagName(self);
+        const sep = std.mem.indexOfScalar(u8, name, 'x').?;
+        return .{
+            .x = std.fmt.parseInt(u8, name[0..sep], 10) catch unreachable,
+            .y = std.fmt.parseInt(u8, name[sep + 1 ..], 10) catch unreachable,
+        };
+    }
 };
 
 /// astcenc effort/quality preset. `-fast` is a good default — encode time is
@@ -134,6 +146,14 @@ test "BlockSize.parse round-trips supported sizes and rejects others" {
     try std.testing.expect(BlockSize.parse("7x7") == null);
     try std.testing.expect(BlockSize.parse("") == null);
     try std.testing.expectEqualStrings("8x8", BlockSize.@"8x8".arg());
+}
+
+test "BlockSize.dims parses the tag into x/y (matches .astc header bytes 4/5)" {
+    try std.testing.expectEqual(@as(u8, 8), BlockSize.@"8x8".dims().x);
+    try std.testing.expectEqual(@as(u8, 8), BlockSize.@"8x8".dims().y);
+    try std.testing.expectEqual(@as(u8, 4), BlockSize.@"4x4".dims().x);
+    try std.testing.expectEqual(@as(u8, 12), BlockSize.@"12x12".dims().y);
+    try std.testing.expectEqual(@as(u8, 10), BlockSize.@"10x10".dims().x);
 }
 
 test "Quality/ColorSpace map to astcenc flags" {
