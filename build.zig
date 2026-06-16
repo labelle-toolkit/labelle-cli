@@ -63,6 +63,18 @@ pub fn build(b: *std.Build) void {
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
+
+    // Build-time ASTC conversion core (assembler#340). `src/astc/convert.zig`
+    // is pure command/path/cache logic (std-only), so it runs standalone on the
+    // host — independent of the full CLI module graph.
+    const astc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/astc/convert.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(astc_tests).step);
 }
 
 /// Compile the vendored stb implementation (PNG decode + encode) and
