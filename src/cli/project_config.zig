@@ -27,6 +27,29 @@ const std = @import("std");
 /// Graphics / windowing backend selection. `null` is a headless backend.
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
+
+/// Texture container a platform ships atlases in — `.png` (CPU-decoded) or
+/// `.astc` (GPU-native, zero decode). Mirrors the assembler's `AssetFormat`
+/// (the assembler does the catalog swap; the CLI reads this to know whether to
+/// run `labelle astc` before generating). See labelle-gfx#269 / #340.
+pub const AssetFormat = enum { png, astc };
+
+/// Per-platform `AssetFormat` selection; default `.png` everywhere (opt-in).
+pub const AssetCompression = struct {
+    desktop: AssetFormat = .png,
+    android: AssetFormat = .png,
+    ios: AssetFormat = .png,
+    web: AssetFormat = .png,
+
+    pub fn formatFor(self: AssetCompression, platform: Platform) AssetFormat {
+        return switch (platform) {
+            .desktop => self.desktop,
+            .android => self.android,
+            .ios => self.ios,
+            .wasm => self.web,
+        };
+    }
+};
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 
 /// CLI version — injected from build.zig via build options.
@@ -265,6 +288,10 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas / sound / font resources.
     resources: []const ResourceDef = &.{},
+    /// Per-platform texture-compression selection (read by `build`/`run` to
+    /// auto-run `labelle astc` before generating; the assembler does the
+    /// catalog `.png → .astc` swap). Default `.png` everywhere.
+    asset_compression: AssetCompression = .{},
     /// When true, the window is created hidden (headless CI).
     hidden: bool = false,
     /// Plugins — each declares its repo and version.
@@ -337,3 +364,12 @@ pub const ProjectConfig = struct {
         }
     }
 };
+
+test "AssetCompression.formatFor + default png" {
+    const def = AssetCompression{};
+    inline for (.{ Platform.desktop, .android, .ios, .wasm }) |p|
+        try @import("std").testing.expectEqual(AssetFormat.png, def.formatFor(p));
+    const m = AssetCompression{ .android = .astc, .desktop = .astc };
+    try @import("std").testing.expectEqual(AssetFormat.astc, m.formatFor(.android));
+    try @import("std").testing.expectEqual(AssetFormat.png, m.formatFor(.wasm));
+}

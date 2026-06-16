@@ -901,6 +901,18 @@ pub fn main(proc_init: std.process.Init) !void {
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
 
+    // ASTC build-time conversion (#340): when this platform ships ASTC atlases
+    // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
+    // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
+    // before the assembler steps (it only needs project.labelle + the PNGs +
+    // astcenc). Non-fatal — on any failure the assembler finds no sibling and
+    // falls back to the source PNG, so the build still succeeds.
+    if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
+        astc_cmd.cmdAstc(allocator, &.{project_dir}) catch |err| {
+            std.debug.print("labelle: ASTC conversion failed ({any}); falling back to PNG atlases\n", .{err});
+        };
+    }
+
     // Ensure the package cache is populated. The assembler's `generate`
     // subcommand assumes a populated cache (it does not fetch packages
     // itself), so delegate `install --project-root` to the binary first.
