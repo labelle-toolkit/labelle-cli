@@ -35,10 +35,7 @@ pub const BlockSize = enum {
     /// Parse a `project.labelle` block-size string (e.g. `"8x8"`). Null if it
     /// isn't one of the supported sizes.
     pub fn parse(s: []const u8) ?BlockSize {
-        inline for (@typeInfo(BlockSize).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @field(BlockSize, f.name);
-        }
-        return null;
+        return std.meta.stringToEnum(BlockSize, s);
     }
 };
 

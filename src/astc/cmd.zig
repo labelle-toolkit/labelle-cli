@@ -31,10 +31,7 @@ const Stat = struct {
 };
 
 fn parseQuality(s: []const u8) ?convert.Quality {
-    inline for (@typeInfo(convert.Quality).@"enum".fields) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @field(convert.Quality, f.name);
-    }
-    return null;
+    return std.meta.stringToEnum(convert.Quality, s);
 }
 
 pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {

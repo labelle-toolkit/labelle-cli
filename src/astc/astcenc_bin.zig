@@ -5,8 +5,8 @@
 //! vendoring astcenc's multi-file C++/per-ISA build) matches the existing
 //! external-asset-tool pattern and keeps the toolchain light.
 //!
-//! Pure parts (asset-suffix / URL / cache-path) take their inputs explicitly so
-//! they're host-testable; `ensure` does the download + extract.
+//! Pure parts (asset-suffix / URL / candidate-names / version-dir) take their
+//! inputs explicitly so they're host-testable; `ensure` does download + extract.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,67 +38,97 @@ pub fn assetSuffix(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) error{Unsup
     };
 }
 
+/// The `bin/`-relative binary names to look for, in preference order. CRITICAL:
+/// the macOS universal archive ships a single `astcenc`, but the Linux/Windows
+/// archives ship ISA-specific builds (`astcenc-sse2`/`-sse4.1`/`-avx2`, or
+/// `-neon` on arm64) with NO plain `astcenc`. We prefer the SAFEST build that
+/// always runs (sse2 on any x86-64) so the tool never SIGILLs on an older CPU —
+/// astcenc is fast enough that the ISA tier barely matters for a build step.
+pub fn candidateNames(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) []const []const u8 {
+    return switch (os) {
+        .macos => &.{"astcenc"},
+        .windows => switch (arch) {
+            .aarch64 => &.{"astcenc-neon.exe"},
+            else => &.{ "astcenc-sse2.exe", "astcenc-sse4.1.exe", "astcenc-avx2.exe" },
+        },
+        else => switch (arch) { // linux + any other unix
+            .aarch64 => &.{"astcenc-neon"},
+            else => &.{ "astcenc-sse2", "astcenc-sse4.1", "astcenc-avx2" },
+        },
+    };
+}
+
 /// `https://.../<version>/astcenc-<version>-<suffix>.zip`. Caller owns the slice.
 pub fn releaseUrl(allocator: std.mem.Allocator, version: []const u8, suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}/astcenc-{s}-{s}.zip", .{ RELEASE_BASE, version, version, suffix });
 }
 
-/// Cached binary path: `<cache_root>/astcenc/<version>/bin/astcenc[.exe]` — the
-/// `bin/` matches the layout inside the release archive, so extraction lands
-/// the binary exactly here with no move. Caller owns the slice.
-pub fn binPath(allocator: std.mem.Allocator, cache_root: []const u8, version: []const u8) ![]u8 {
-    const exe = if (builtin.os.tag == .windows) "astcenc.exe" else "astcenc";
-    return std.fs.path.join(allocator, &.{ cache_root, "astcenc", version, "bin", exe });
+/// `<cache_root>/astcenc/<version>` — the archive extracts its own `bin/...`
+/// under here. Caller owns the slice.
+pub fn versionDir(allocator: std.mem.Allocator, cache_root: []const u8, version: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ cache_root, "astcenc", version });
+}
+
+/// First candidate binary that exists under `<ver_dir>/bin/`, or null. Caller
+/// owns the returned slice.
+fn resolveExisting(allocator: std.mem.Allocator, ver_dir: []const u8) !?[]u8 {
+    for (candidateNames(builtin.os.tag, builtin.cpu.arch)) |name| {
+        const p = try std.fs.path.join(allocator, &.{ ver_dir, "bin", name });
+        if (util.fileExists(p)) return p;
+        allocator.free(p);
+    }
+    return null;
 }
 
 /// Resolve a usable astcenc path: the cached binary if present, else download +
 /// extract the release archive into the cache and return that. `cache_root` is
 /// the labelle home (e.g. from `asm_cache.getCacheRoot`). Caller owns the slice.
 pub fn ensure(allocator: std.mem.Allocator, cache_root: []const u8, version: []const u8) ![]u8 {
-    const dest = try binPath(allocator, cache_root, version);
-    errdefer allocator.free(dest);
+    const ver_dir = try versionDir(allocator, cache_root, version);
+    defer allocator.free(ver_dir);
 
-    if (util.fileExists(dest)) return dest;
+    if (try resolveExisting(allocator, ver_dir)) |p| return p;
 
     const suffix = assetSuffix(builtin.os.tag, builtin.cpu.arch) catch {
-        std.debug.print("labelle: no prebuilt astcenc for this platform; install it and place it at {s}\n", .{dest});
+        std.debug.print("labelle: no prebuilt astcenc for this platform; install astcenc {s} under {s}/bin/\n", .{ version, ver_dir });
         return error.AstcencUnavailable;
     };
     const url = try releaseUrl(allocator, version, suffix);
     defer allocator.free(url);
 
-    // dest = <cache>/astcenc/<version>/bin/astcenc; extract into the version dir
-    // (parent of bin/) so the archive's own `bin/astcenc` lands exactly at dest.
-    const ver_dir = std.fs.path.dirname(std.fs.path.dirname(dest).?).?;
     const zip_path = try std.fmt.allocPrint(allocator, "{s}/astcenc.zip", .{ver_dir});
     defer allocator.free(zip_path);
 
     std.debug.print("labelle: downloading astcenc {s}...\n  url: {s}\n", .{ version, url });
     std.Io.Dir.cwd().createDirPath(util_io(), ver_dir) catch {};
 
-    // curl the archive, then extract. `tar -xf` reads zips on macOS, Linux
-    // (bsdtar), and Windows 10+ — one extractor for every CI platform, no
-    // dependency on `unzip` being installed.
     if (!runOk(allocator, &.{ "curl", "-fSL", "-o", zip_path, url })) {
-        std.debug.print("labelle: astcenc download failed (curl). Place the binary at {s}\n", .{dest});
+        std.debug.print("labelle: astcenc download failed (curl). Install astcenc under {s}/bin/\n", .{ver_dir});
         return error.AstcencDownloadFailed;
     }
-    if (!runOk(allocator, &.{ "tar", "-xf", zip_path, "-C", ver_dir })) {
-        std.debug.print("labelle: astcenc extract failed (tar). Place the binary at {s}\n", .{dest});
+    // Extract: `unzip` on unix (GNU tar can't read zips), bsdtar on Windows
+    // (where `unzip` isn't shipped but `tar` reads zips since Win10).
+    const extracted = if (builtin.os.tag == .windows)
+        runOk(allocator, &.{ "tar", "-xf", zip_path, "-C", ver_dir })
+    else
+        runOk(allocator, &.{ "unzip", "-o", "-q", zip_path, "-d", ver_dir });
+    if (!extracted) {
+        std.debug.print("labelle: astcenc extract failed. Install astcenc under {s}/bin/\n", .{ver_dir});
         return error.AstcencExtractFailed;
     }
-    if (!util.fileExists(dest)) {
-        std.debug.print("labelle: astcenc not at expected archive path {s}\n", .{dest});
+
+    const bin = (try resolveExisting(allocator, ver_dir)) orelse {
+        std.debug.print("labelle: astcenc binary not found after extracting {s}\n", .{zip_path});
         return error.AstcencExtractFailed;
-    }
+    };
     if (builtin.os.tag != .windows) {
-        if (std.Io.Dir.cwd().openFile(util_io(), dest, .{})) |f| {
+        if (std.Io.Dir.cwd().openFile(util_io(), bin, .{})) |f| {
             defer f.close(util_io());
             f.setPermissions(util_io(), .fromMode(0o755)) catch {};
         } else |_| {}
     }
-    std.debug.print("  cached at {s}\n", .{dest});
-    return dest;
+    std.debug.print("  cached at {s}\n", .{bin});
+    return bin;
 }
 
 fn util_io() std.Io {
@@ -115,11 +145,10 @@ fn runOk(allocator: std.mem.Allocator, argv: []const []const u8) bool {
     };
 }
 
-// ── Tests (pure path/url/suffix logic) ───────────────────────────────────────
+// ── Tests (pure suffix/url/candidate/path logic) ─────────────────────────────
 
 test "assetSuffix maps platforms" {
     try std.testing.expectEqualStrings("macos-universal", try assetSuffix(.macos, .aarch64));
-    try std.testing.expectEqualStrings("macos-universal", try assetSuffix(.macos, .x86_64));
     try std.testing.expectEqualStrings("linux-x64", try assetSuffix(.linux, .x86_64));
     try std.testing.expectEqualStrings("linux-arm64", try assetSuffix(.linux, .aarch64));
     try std.testing.expectEqualStrings("windows-x64", try assetSuffix(.windows, .x86_64));
@@ -127,18 +156,25 @@ test "assetSuffix maps platforms" {
     try std.testing.expectError(error.UnsupportedPlatform, assetSuffix(.linux, .arm));
 }
 
-test "releaseUrl + binPath shapes" {
+test "candidateNames: macOS single, x64 ISA tiers (sse2 first), arm64 neon, .exe on Windows" {
+    try std.testing.expectEqualStrings("astcenc", candidateNames(.macos, .aarch64)[0]);
+    const lx = candidateNames(.linux, .x86_64);
+    try std.testing.expectEqualStrings("astcenc-sse2", lx[0]); // safest first
+    try std.testing.expectEqual(@as(usize, 3), lx.len);
+    try std.testing.expectEqualStrings("astcenc-neon", candidateNames(.linux, .aarch64)[0]);
+    try std.testing.expectEqualStrings("astcenc-sse2.exe", candidateNames(.windows, .x86_64)[0]);
+}
+
+test "releaseUrl + versionDir shapes" {
     const a = std.testing.allocator;
-    const url = try releaseUrl(a, "5.5.0", "macos-universal");
+    const url = try releaseUrl(a, "5.5.0", "linux-x64");
     defer a.free(url);
     try std.testing.expectEqualStrings(
-        "https://github.com/ARM-software/astc-encoder/releases/download/5.5.0/astcenc-5.5.0-macos-universal.zip",
+        "https://github.com/ARM-software/astc-encoder/releases/download/5.5.0/astcenc-5.5.0-linux-x64.zip",
         url,
     );
-    const p = try binPath(a, "/home/u/.labelle", "5.5.0");
-    defer a.free(p);
-    const expected_tail = if (builtin.os.tag == .windows) "astcenc.exe" else "astcenc";
-    try std.testing.expect(std.mem.indexOf(u8, p, "/.labelle") != null or std.mem.indexOf(u8, p, "\\.labelle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p, "5.5.0") != null);
-    try std.testing.expect(std.mem.endsWith(u8, p, expected_tail));
+    const vd = try versionDir(a, "/home/u/.labelle", "5.5.0");
+    defer a.free(vd);
+    try std.testing.expect(std.mem.endsWith(u8, vd, "5.5.0"));
+    try std.testing.expect(std.mem.indexOf(u8, vd, "astcenc") != null);
 }
