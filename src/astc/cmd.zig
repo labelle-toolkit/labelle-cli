@@ -57,6 +57,11 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
 
     var dir: []const u8 = ".";
     var opts = convert.Options{};
+    // Whether the user pinned `--block` explicitly. When they didn't, we pick a
+    // backend-safe default below (sokol can only load 4×4); when they did, we
+    // validate it against the backend instead of silently emitting an
+    // unloadable file.
+    var block_explicit = false;
 
     var i: usize = 0;
     while (i < cmd_args.len) : (i += 1) {
@@ -65,6 +70,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             i += 1;
             if (i >= cmd_args.len) return usageErr("--block needs a value (e.g. 8x8)");
             opts.block = convert.BlockSize.parse(cmd_args[i]) orelse return usageErr("unsupported --block size");
+            block_explicit = true;
         } else if (std.mem.eql(u8, arg, "--quality")) {
             i += 1;
             if (i >= cmd_args.len) return usageErr("--quality needs a value");
@@ -83,6 +89,31 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         std.debug.print("labelle astc: could not read project.labelle in '{s}'\n", .{dir});
         return error.InvalidArgs;
     };
+
+    // The target backend constrains which block sizes are loadable at runtime.
+    // sokol ships ASTC 4×4 only — an 8×8 atlas parses but fails to upload
+    // (error.LoadFailed), which on FP left the game stuck on the loading scene.
+    // Default to a backend-safe block when the user didn't pin one; reject an
+    // explicit block the backend can't load rather than baking a dud.
+    const caps: convert.BackendCaps = switch (cfg.backend) {
+        .sokol => .sokol_4x4_only,
+        .raylib => .raylib_4x4_8x8,
+        .bgfx, .wgpu => .full,
+        // sdl/null aren't ASTC upload targets; the gfx seam falls back to PNG
+        // decode if they ever see a compressed blob, so leave block unconstrained.
+        .sdl, .null => .full,
+    };
+    if (block_explicit) {
+        if (!caps.supports(opts.block)) {
+            std.debug.print(
+                "labelle astc: backend '{s}' cannot upload ASTC {s} (try {s})\n",
+                .{ @tagName(cfg.backend), opts.block.arg(), caps.defaultBlock().arg() },
+            );
+            return error.InvalidArgs;
+        }
+    } else {
+        opts.block = caps.defaultBlock();
+    }
 
     // Resolve the astcenc binary (download + cache on first use).
     const cache_root = try asm_cache.getCacheRoot(allocator);
