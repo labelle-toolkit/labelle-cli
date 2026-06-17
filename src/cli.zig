@@ -832,16 +832,26 @@ pub fn main(proc_init: std.process.Init) !void {
         parsed.backend = .sokol;
     }
 
-    // `labelle android` implies the android platform. The backend is
-    // resolved from the project's declared backend, honoring an
-    // Android-capable choice (`sokol` or `bgfx`) and falling back to
-    // sokol otherwise (#252).
+    // `labelle android` implies the android platform.
     if (command == .android_cmd) {
         parsed.platform = .android;
+    }
+
+    // Resolve the backend for ANY android-targeting invocation —
+    // `labelle android`, `labelle run --platform=android`, or
+    // `labelle build --platform=android` all land here. The backend is
+    // taken from the project's declared backend, honoring an
+    // Android-capable choice (`sokol` or `bgfx`) and falling back to
+    // sokol otherwise (#252). Keying off the resolved platform (rather
+    // than the subcommand) means a `.backend = .raylib` project run with
+    // `--platform=android` gets the same helpful fallback as `labelle
+    // android` instead of failing later on a missing `raylib_android`
+    // target dir.
+    if (parsed.platform == .android) {
         const android_backend = resolveAndroidBackend(parsed.backend);
         if (android_backend != parsed.backend) {
             std.debug.print(
-                "labelle android: backend '{s}' can't target Android; defaulting to sokol.\n",
+                "labelle: backend '{s}' can't target Android; defaulting to sokol.\n",
                 .{@tagName(parsed.backend)},
             );
         }
@@ -1063,7 +1073,19 @@ pub fn main(proc_init: std.process.Init) !void {
     }
     std.debug.print("  build ok\n", .{});
 
-    if (command == .build) return;
+    if (command == .build) {
+        // `labelle build --platform=android` builds the shared library
+        // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
+        // but, unlike `labelle android build`, used to stop there and leave
+        // a bare `.so`. Package it into a signed APK so the artifact is
+        // installable — backend-agnostic, so it covers sokol and bgfx alike.
+        if (parsed.platform == .android) {
+            const apk_path = try android.packageApk(allocator, target_dir, parsed, false, .{});
+            defer allocator.free(apk_path);
+            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
+        }
+        return;
+    }
 
     // Run
     if (parsed.platform == .wasm) {
