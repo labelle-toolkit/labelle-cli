@@ -1186,7 +1186,13 @@ pub fn main(proc_init: std.process.Init) !void {
                 std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
                 return;
             }
-            const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", "game" });
+            // The assembler names the desktop binary after the project
+            // (sanitized) so concurrent games are distinguishable to
+            // `pgrep` (labelle-assembler#362). Derive the same name here so
+            // the docker run path execs the binary by its real on-disk name.
+            const exe_name = try util.sanitizeExeName(allocator, parsed.name);
+            defer allocator.free(exe_name);
+            const bin_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", exe_name });
             defer allocator.free(bin_path);
             var run_args: std.ArrayList([]const u8) = .empty;
             defer run_args.deinit(allocator);
@@ -1505,6 +1511,10 @@ pub const ParseOptimizeFlagSpec = struct {
 // cli.zig and would skip the test_cmd_mod's nested spec structs.
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
 pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
+
+// Surface the exe-name sanitizer's spec namespace (labelle-assembler#362)
+// so `zspec.runAll(@This())` walks into it.
+pub const UtilSanitizeExeNameSpec = util.SanitizeExeName;
 
 // Surface audit-command spec namespaces so `zspec.runAll(@This())`
 // walks into them. Without these re-exports the audit tests would

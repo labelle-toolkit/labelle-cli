@@ -32,6 +32,36 @@ pub fn runCmd(allocator: std.mem.Allocator, argv: []const []const u8) !std.proce
     });
 }
 
+/// Sanitize a project name into the desktop-executable name the
+/// assembler bakes into `build.zig` (labelle-assembler#362). The
+/// assembler now names the desktop binary after the project so a running
+/// game is identifiable by `pgrep -f <name>` instead of every project
+/// building to an indistinguishable `zig-out/bin/game`. The `--docker`
+/// run path execs the built binary by absolute path, so it must derive
+/// the same name to locate it.
+///
+/// Keeps only `[A-Za-z0-9_-]` (byte-identical to the assembler's
+/// `sanitizeExeName`); every other byte is dropped, falling back to
+/// `"game"` when the result is empty. Caller owns the returned slice.
+pub fn sanitizeExeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (name) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-';
+        if (ok) try buf.append(allocator, c);
+    }
+    if (buf.items.len == 0) {
+        // Allocate the fallback BEFORE freeing `buf`: if `dupe` OOMs, the
+        // `errdefer` frees `buf` (once). Freeing `buf` first would let the
+        // `errdefer` deinit it a second time on that OOM — a double free.
+        const fallback = try allocator.dupe(u8, "game");
+        buf.deinit(allocator);
+        return fallback;
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Parse semantic version string into a comparable number.
 /// "1.2.3" -> 1*1000000 + 2*1000 + 3 = 1002003
 pub fn parseVersion(version: []const u8) u32 {
@@ -158,3 +188,34 @@ pub fn parseDuration(input: []const u8) ?u64 {
     const val = std.fmt.parseInt(u64, num_str, 10) catch return null;
     return std.math.mul(u64, val, multiplier) catch return null;
 }
+
+// --- Tests ---
+
+/// `sanitizeExeName` must stay byte-identical to the assembler's helper
+/// of the same name (labelle-assembler#362), so the docker run path
+/// resolves the same `zig-out/bin/<name>` the build.zig produced.
+pub const SanitizeExeName = struct {
+    test "passes through a clean name" {
+        const got = try sanitizeExeName(std.testing.allocator, "energy_flow");
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings("energy_flow", got);
+    }
+
+    test "keeps hyphens and digits" {
+        const got = try sanitizeExeName(std.testing.allocator, "my-game-2");
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings("my-game-2", got);
+    }
+
+    test "drops spaces and punctuation" {
+        const got = try sanitizeExeName(std.testing.allocator, "energy flow!");
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings("energyflow", got);
+    }
+
+    test "falls back to game when nothing survives" {
+        const got = try sanitizeExeName(std.testing.allocator, "!!!");
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings("game", got);
+    }
+};
