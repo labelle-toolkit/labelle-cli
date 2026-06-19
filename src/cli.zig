@@ -1203,9 +1203,36 @@ pub fn main(proc_init: std.process.Init) !void {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
         } else {
-            try zig_args.append(allocator, "run");
-            try appendRunForwardedArgs(&zig_args, allocator, &parsed_args);
-            const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, zig_args.items, timeout_ns, env_map_ptr);
+            // Build, then run the game BINARY DIRECTLY rather than via
+            // `zig build run`. `zig build run` launches the game in its own
+            // child process group, which ESCAPES the --timeout kill: the
+            // watchdog signals labelle's direct child (the `zig build`
+            // process), the game survives in its separate group, gets
+            // reparented to init, and orphans. Run as labelle's own child and
+            // the game stays in the process group the watchdog signals, so
+            // SIGTERM→SIGKILL actually reaches it. Mirrors the --docker path.
+            //
+            // Build with no timeout (only the run is time-limited); keep the
+            // game's cwd at `target_dir` (a target_dir-relative argv[0]) so
+            // saves land exactly where `zig build run` put them.
+            const build_result = try runner.runZigInheritWithEnv(allocator, target_dir, zig_args.items, null, env_map_ptr);
+            if (build_result != 0) {
+                std.debug.print("\nlabelle: build failed (exit {d})\n", .{build_result});
+                return;
+            }
+            // The generated build.zig names the desktop exe `game`. Run it by
+            // a target_dir-relative path so its cwd stays `target_dir` (saves
+            // land where `zig build run` put them). NOTE: when
+            // labelle-assembler#362 renames the exe after the sanitized
+            // project name, derive that name here (mirroring the --docker
+            // path) with a `game` fallback.
+            const rel_bin = try std.fs.path.join(allocator, &.{ "zig-out", "bin", "game" });
+            defer allocator.free(rel_bin);
+            var run_args: std.ArrayList([]const u8) = .empty;
+            defer run_args.deinit(allocator);
+            try run_args.append(allocator, rel_bin);
+            try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
+            const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
