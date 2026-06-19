@@ -10,7 +10,22 @@ const windows = if (is_windows) struct {
 /// Shared state between the main thread and the timeout thread.
 /// Heap-allocated so it outlives the spawning stack frame.
 const TimeoutState = struct {
+    allocator: std.mem.Allocator,
     timed_out: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Both the main thread and the detached timeout thread hold a reference
+    // (init 2); whoever drops the last one frees it. Without this the main
+    // thread's `defer` frees `state` as soon as `child.wait` returns — and if
+    // the child exits BEFORE the timeout fires, the still-sleeping timeout
+    // thread then writes `timed_out` into freed memory (use-after-free).
+    ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
+
+    fn release(self: *TimeoutState) void {
+        // `.acq_rel`: the decrement publishes our writes to other releasers
+        // and, on the last decrement, observes theirs before we destroy.
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            self.allocator.destroy(self);
+        }
+    }
 };
 
 /// Run a zig command capturing stdout/stderr.
@@ -58,11 +73,11 @@ pub fn runZigInheritWithEnv(
 
     // Heap-allocate so the detached thread can safely access it after this function returns
     var state: ?*TimeoutState = null;
-    defer if (state) |s| allocator.destroy(s);
+    defer if (state) |s| s.release();
 
     if (timeout_ns) |ns| {
         state = try allocator.create(TimeoutState);
-        state.?.* = .{};
+        state.?.* = .{ .allocator = allocator };
 
         if (is_windows) {
             const win_pid = windows.GetProcessId(child.id.?);
@@ -168,6 +183,7 @@ fn sleepNanos(ns: u64) void {
 const KILL_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 
 fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutState) void {
+    defer state.release();
     sleepNanos(timeout_ns);
     state.timed_out.store(true, .release);
     // Negative pid = the child's whole process group. The child was spawned
@@ -201,6 +217,7 @@ fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutS
 
 fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, timeout_ns: u64, state: *TimeoutState) void {
     _ = allocator;
+    defer state.release();
     sleepNanos(timeout_ns);
     state.timed_out.store(true, .release);
     var pid_buf: [16]u8 = undefined;
