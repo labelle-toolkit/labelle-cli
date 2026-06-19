@@ -52,8 +52,12 @@ pub fn sanitizeExeName(allocator: std.mem.Allocator, name: []const u8) ![]const 
         if (ok) try buf.append(allocator, c);
     }
     if (buf.items.len == 0) {
+        // Allocate the fallback BEFORE freeing `buf`: if `dupe` OOMs, the
+        // `errdefer` frees `buf` (once). Freeing `buf` first would let the
+        // `errdefer` deinit it a second time on that OOM — a double free.
+        const fallback = try allocator.dupe(u8, "game");
         buf.deinit(allocator);
-        return allocator.dupe(u8, "game");
+        return fallback;
     }
     return buf.toOwnedSlice(allocator);
 }
