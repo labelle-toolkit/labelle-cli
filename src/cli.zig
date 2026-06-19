@@ -1220,13 +1220,19 @@ pub fn main(proc_init: std.process.Init) !void {
                 std.debug.print("\nlabelle: build failed (exit {d})\n", .{build_result});
                 return;
             }
-            // The generated build.zig names the desktop exe `game`. Run it by
-            // a target_dir-relative path so its cwd stays `target_dir` (saves
-            // land where `zig build run` put them). NOTE: when
-            // labelle-assembler#362 renames the exe after the sanitized
-            // project name, derive that name here (mirroring the --docker
-            // path) with a `game` fallback.
-            const rel_bin = try std.fs.path.join(allocator, &.{ "zig-out", "bin", "game" });
+            // Exe name: the assembler names the desktop exe after the
+            // sanitized project (labelle-assembler#362); older generated
+            // build.zig still emit `game`. Prefer the project name; fall back
+            // to `game` when that binary isn't on disk, so this works both
+            // before and after the rename ships. Run it by a target_dir-
+            // relative path so the game's cwd stays `target_dir` (saves land
+            // where `zig build run` put them). Mirrors the --docker path.
+            const sanitized = try util.sanitizeExeName(allocator, parsed.name);
+            defer allocator.free(sanitized);
+            const sanitized_full = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", sanitized });
+            defer allocator.free(sanitized_full);
+            const exe_basename: []const u8 = if (util.fileExists(sanitized_full)) sanitized else "game";
+            const rel_bin = try std.fs.path.join(allocator, &.{ "zig-out", "bin", exe_basename });
             defer allocator.free(rel_bin);
             var run_args: std.ArrayList([]const u8) = .empty;
             defer run_args.deinit(allocator);
