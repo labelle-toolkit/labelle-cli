@@ -135,19 +135,18 @@ pub fn buildEnvironWithExtra(
     allocator: std.mem.Allocator,
     extras: []const EnvKV,
 ) !std.process.Environ.Map {
-    var map = std.process.Environ.Map.init(allocator);
-    errdefer map.deinit();
-
+    // `Environ.createMap` is the platform-correct snapshot: on Windows the
+    // inherited environment is a *global* block (read live from the PEB),
+    // NOT a `WindowsBlock` slice, so the old `switch (@TypeOf(block))` hit
+    // the global branch and produced an extras-ONLY map — stripping PATH,
+    // LOCALAPPDATA, etc. That made every env-injecting `run` flag
+    // (--headless/--scene/--screenshot/--profile) fail with
+    // `AppDataDirUnavailable` because the child `zig build` lost its cache
+    // dir. createMap reads the PEB on Windows, `environ` on POSIX, and the
+    // WASI environ API on WASI, so the parent env is preserved everywhere.
     const environ = config.globalEnviron();
-    const block = environ.block;
-    switch (@TypeOf(block)) {
-        std.process.Environ.PosixBlock => try map.putPosixBlock(block.view()),
-        std.process.Environ.WindowsBlock => try map.putWindowsBlock(block.view()),
-        std.process.Environ.GlobalBlock => {
-            // Nothing to snapshot for global blocks — extras-only env.
-        },
-        else => @compileError("unsupported Environ.Block variant"),
-    }
+    var map = try environ.createMap(allocator);
+    errdefer map.deinit();
 
     for (extras) |kv| {
         try map.put(kv.key, kv.value);
