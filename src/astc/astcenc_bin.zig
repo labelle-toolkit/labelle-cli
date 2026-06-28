@@ -116,7 +116,12 @@ pub fn ensure(allocator: std.mem.Allocator, cache_root: []const u8, version: []c
     // extract would fail only for those users. The absolute path always hits the
     // libarchive-backed system tar. Falls back to bare `tar` if SystemRoot is unset.
     const extracted = if (builtin.os.tag == .windows) blk: {
-        const tar_exe = windowsTarPath(allocator) catch try allocator.dupe(u8, "tar");
+        const tar_exe = windowsTarPath(allocator) catch |err| switch (err) {
+            // OOM is fatal — don't mask it behind the bare-`tar` fallback,
+            // which only exists for a missing SystemRoot/windir.
+            error.OutOfMemory => return error.OutOfMemory,
+            else => try allocator.dupe(u8, "tar"),
+        };
         defer allocator.free(tar_exe);
         break :blk runOk(allocator, &.{ tar_exe, "-xf", zip_path, "-C", ver_dir });
     } else runOk(allocator, &.{ "unzip", "-o", "-q", zip_path, "-d", ver_dir });
@@ -150,8 +155,12 @@ fn windowsTarPath(allocator: std.mem.Allocator) ![]u8 {
     const env = @import("../cli/config.zig").globalEnviron();
     // `SystemRoot` is the canonical var (e.g. C:\Windows); `windir` is its
     // historical alias. Try both before giving up.
-    const root = env.getAlloc(allocator, "SystemRoot") catch
-        try env.getAlloc(allocator, "windir");
+    const root = env.getAlloc(allocator, "SystemRoot") catch |err| switch (err) {
+        // OOM is fatal — only fall back to the `windir` alias when SystemRoot
+        // is genuinely absent, not when the allocation itself failed.
+        error.OutOfMemory => return error.OutOfMemory,
+        else => try env.getAlloc(allocator, "windir"),
+    };
     defer allocator.free(root);
     return std.fmt.allocPrint(allocator, "{s}\\System32\\tar.exe", .{root});
 }
