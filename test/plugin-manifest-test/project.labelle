@@ -3,6 +3,7 @@
     .title = "Plugin Manifest Test",
     .backend = .raylib,
     .ecs = .mock,
+    .y_axis = .up,
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
