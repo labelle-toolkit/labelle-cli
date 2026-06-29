@@ -16,6 +16,7 @@
     .name = "imgui_anchor_test",
     .title = "ImGui Anchor Test",
     .backend = .sokol,
+    .y_axis = .up,
     .ecs = .zig_ecs,
     .gui = .{ .plugin = "imgui" },
     .core_version = "local:../../../labelle-core",

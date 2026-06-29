@@ -2,6 +2,7 @@
     .name = "nuklear_plugin_test",
     .title = "Nuklear Plugin Test",
     .backend = .raylib,
+    .y_axis = .up,
     .ecs = .mock,
     .gui = .{ .path = "../../../labelle-assembler/plugins/nuklear" },
     .plugins = .{
