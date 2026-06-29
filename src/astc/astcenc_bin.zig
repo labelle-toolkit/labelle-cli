@@ -117,10 +117,13 @@ pub fn ensure(allocator: std.mem.Allocator, cache_root: []const u8, version: []c
     // libarchive-backed system tar. Falls back to bare `tar` if SystemRoot is unset.
     const extracted = if (builtin.os.tag == .windows) blk: {
         const tar_exe = windowsTarPath(allocator) catch |err| switch (err) {
-            // OOM is fatal — don't mask it behind the bare-`tar` fallback,
-            // which only exists for a missing SystemRoot/windir.
-            error.OutOfMemory => return error.OutOfMemory,
-            else => try allocator.dupe(u8, "tar"),
+            // The bare-`tar` fallback exists ONLY for an unset/invalid
+            // SystemRoot+windir (the same cases `envVarOwnedOptional` collapses
+            // to null). Everything else — OOM first and foremost — propagates,
+            // so a real failure isn't silently masked by running whatever `tar`
+            // is on PATH (reintroducing the Git Bash GNU-tar shadowing bug).
+            error.EnvironmentVariableMissing, error.InvalidWtf8 => try allocator.dupe(u8, "tar"),
+            else => return err,
         };
         defer allocator.free(tar_exe);
         break :blk runOk(allocator, &.{ tar_exe, "-xf", zip_path, "-C", ver_dir });
@@ -156,10 +159,12 @@ fn windowsTarPath(allocator: std.mem.Allocator) ![]u8 {
     // `SystemRoot` is the canonical var (e.g. C:\Windows); `windir` is its
     // historical alias. Try both before giving up.
     const root = env.getAlloc(allocator, "SystemRoot") catch |err| switch (err) {
-        // OOM is fatal — only fall back to the `windir` alias when SystemRoot
-        // is genuinely absent, not when the allocation itself failed.
-        error.OutOfMemory => return error.OutOfMemory,
-        else => try env.getAlloc(allocator, "windir"),
+        // Only fall through to the `windir` alias when SystemRoot is unset or
+        // invalid UTF-8 (the cases `envVarOwnedOptional` treats as "not set").
+        // OOM and any other error propagate rather than masking a corrupt
+        // environment behind the alias lookup.
+        error.EnvironmentVariableMissing, error.InvalidWtf8 => try env.getAlloc(allocator, "windir"),
+        else => return err,
     };
     defer allocator.free(root);
     return std.fmt.allocPrint(allocator, "{s}\\System32\\tar.exe", .{root});
