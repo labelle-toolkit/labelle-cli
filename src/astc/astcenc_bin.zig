@@ -108,10 +108,26 @@ pub fn ensure(allocator: std.mem.Allocator, cache_root: []const u8, version: []c
     }
     // Extract: `unzip` on unix (GNU tar can't read zips), bsdtar on Windows
     // (where `unzip` isn't shipped but `tar` reads zips since Win10).
-    const extracted = if (builtin.os.tag == .windows)
-        runOk(allocator, &.{ "tar", "-xf", zip_path, "-C", ver_dir })
-    else
-        runOk(allocator, &.{ "unzip", "-o", "-q", zip_path, "-d", ver_dir });
+    //
+    // On Windows resolve bsdtar by ABSOLUTE path (<SystemRoot>\System32\tar.exe)
+    // rather than a bare `tar`: when labelle runs from a Git Bash / MSYS / Cygwin
+    // shell, that environment's GNU `tar` shadows the System32 bsdtar on PATH, and
+    // GNU tar can't read a zip ("This does not look like a tar archive") — so the
+    // extract would fail only for those users. The absolute path always hits the
+    // libarchive-backed system tar. Falls back to bare `tar` if SystemRoot is unset.
+    const extracted = if (builtin.os.tag == .windows) blk: {
+        const tar_exe = windowsTarPath(allocator) catch |err| switch (err) {
+            // The bare-`tar` fallback exists ONLY for an unset/invalid
+            // SystemRoot+windir (the same cases `envVarOwnedOptional` collapses
+            // to null). Everything else — OOM first and foremost — propagates,
+            // so a real failure isn't silently masked by running whatever `tar`
+            // is on PATH (reintroducing the Git Bash GNU-tar shadowing bug).
+            error.EnvironmentVariableMissing, error.InvalidWtf8 => try allocator.dupe(u8, "tar"),
+            else => return err,
+        };
+        defer allocator.free(tar_exe);
+        break :blk runOk(allocator, &.{ tar_exe, "-xf", zip_path, "-C", ver_dir });
+    } else runOk(allocator, &.{ "unzip", "-o", "-q", zip_path, "-d", ver_dir });
     if (!extracted) {
         std.debug.print("labelle: astcenc extract failed. Install astcenc under {s}/bin/\n", .{ver_dir});
         return error.AstcencExtractFailed;
@@ -133,6 +149,25 @@ pub fn ensure(allocator: std.mem.Allocator, cache_root: []const u8, version: []c
 
 fn util_io() std.Io {
     return @import("../cli/config.zig").globalIo();
+}
+
+/// `<SystemRoot>\System32\tar.exe` — the libarchive-backed bsdtar shipped with
+/// Windows 10+. Resolving it absolutely sidesteps a Git Bash / MSYS GNU `tar`
+/// that may shadow it on PATH (GNU tar can't read zips). Caller owns the slice.
+fn windowsTarPath(allocator: std.mem.Allocator) ![]u8 {
+    const env = @import("../cli/config.zig").globalEnviron();
+    // `SystemRoot` is the canonical var (e.g. C:\Windows); `windir` is its
+    // historical alias. Try both before giving up.
+    const root = env.getAlloc(allocator, "SystemRoot") catch |err| switch (err) {
+        // Only fall through to the `windir` alias when SystemRoot is unset or
+        // invalid UTF-8 (the cases `envVarOwnedOptional` treats as "not set").
+        // OOM and any other error propagate rather than masking a corrupt
+        // environment behind the alias lookup.
+        error.EnvironmentVariableMissing, error.InvalidWtf8 => try env.getAlloc(allocator, "windir"),
+        else => return err,
+    };
+    defer allocator.free(root);
+    return std.fmt.allocPrint(allocator, "{s}\\System32\\tar.exe", .{root});
 }
 
 fn runOk(allocator: std.mem.Allocator, argv: []const []const u8) bool {

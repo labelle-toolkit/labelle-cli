@@ -2,6 +2,7 @@
     .name = "gui_plugin_test",
     .title = "GUI Plugin Test",
     .backend = .raylib,
+    .y_axis = .up,
     .ecs = .mock,
     .gui = .{ .path = "../../../labelle-assembler/plugins/imgui" },
     .core_version = "local:../../../labelle-core",
