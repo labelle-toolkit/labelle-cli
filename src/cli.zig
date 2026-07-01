@@ -14,6 +14,7 @@
 ///   labelle update [ver]                — self-update the CLI
 ///   labelle clean [--dry-run]           — prune unused package versions
 ///   labelle test [dir] [--verbose]      — run inline `test` blocks across the project source tree
+///   labelle check [dir]                 — lint packs for §6 convention violations (Packs RFC)
 const std = @import("std");
 const project_config = @import("cli/project_config.zig");
 
@@ -41,10 +42,11 @@ const pack = @import("cli/pack.zig");
 const astc_cmd = @import("astc/cmd.zig");
 const audit = @import("cli/audit.zig");
 const migrate = @import("cli/migrate.zig");
+const check = @import("cli/check.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd };
+const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -644,6 +646,9 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "migrate")) {
             parsed_args.command = .migrate_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "check")) {
+            parsed_args.command = .check_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "doctor")) {
             parsed_args.command = .doctor_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -758,6 +763,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .astc_cmd => return astc_cmd.cmdAstc(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .audit_cmd => return audit.cmdAudit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .migrate_cmd => return migrate.cmdMigrate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .check_cmd => return check.cmdCheck(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .doctor_cmd => return doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
