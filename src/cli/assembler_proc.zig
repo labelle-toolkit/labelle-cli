@@ -46,12 +46,12 @@ pub const MIN_PROTOCOL: u32 = 3;
 /// new subcommand is a one-line entry that never raises the floor for
 /// existing commands or the auto-downloaded default.
 ///
-/// Extensible: sibling work adds `check` → 5 (#273) as another entry.
+/// Extensible: adding a new gated subcommand is a one-line entry here.
 fn minProtocolFor(subcommand: []const u8) u32 {
     const Gate = struct { name: []const u8, min: u32 };
     const gates = [_]Gate{
         .{ .name = "add", .min = 4 }, // Packs scaffold (#271)
-        // .{ .name = "check", .min = 5 }, // reserved for #273
+        .{ .name = "check", .min = 5 }, // Packs §6 lint (#273)
     };
     for (gates) |g| {
         if (std.mem.eql(u8, g.name, subcommand)) return g.min;
@@ -274,12 +274,18 @@ pub const BuildGenerateArgsSpec = struct {
 /// raised globally — the auto-downloaded `DEFAULT_ASSEMBLER_VERSION` only
 /// speaks the floor (protocol 3), so a global bump breaks every fresh
 /// install before any command runs. These specs pin the per-subcommand
-/// map: `add` gates at 4, the floor commands stay at 3, and an unknown
-/// subcommand falls back to the floor. #273 will add `check` → 5.
+/// map: `add` gates at 4, `check` gates at 5, the floor commands stay at 3,
+/// and an unknown subcommand falls back to the floor.
 pub const MinProtocolForSpec = struct {
     pub const add_gates_higher = struct {
         test "add requires protocol 4" {
             try std.testing.expectEqual(@as(u32, 4), minProtocolFor("add"));
+        }
+    };
+
+    pub const check_gates_higher = struct {
+        test "check requires protocol 5" {
+            try std.testing.expectEqual(@as(u32, 5), minProtocolFor("check"));
         }
     };
 

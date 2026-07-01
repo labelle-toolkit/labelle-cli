@@ -25,6 +25,7 @@ pub fn printHelp() void {
         \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
         \\  audit unification [dir]  Pre-flight check for the unified scene/prefab loader (RFC #560)
         \\  migrate unified [dir] [--dry-run]  Auto-fix legacy unified-format patterns (RFC #594 / engine#592)
+        \\  check [dir]          Lint packs for §6 convention violations (Packs RFC)
         \\  doctor [dir]         Check desktop build requirements (SDL2, Zig) and report fixes
         \\  help                 Show this help
         \\  version              Show CLI version
