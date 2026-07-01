@@ -51,6 +51,28 @@ pub fn readProjectConfigQuiet(allocator: std.mem.Allocator, project_dir: []const
     return readProjectConfigImpl(allocator, project_dir, false);
 }
 
+/// True when `<project_dir>/project.labelle` exists — i.e. `project_dir`
+/// is (the root of) a Labelle project. Used by standalone-dispatched
+/// commands that still require a project (e.g. `add`, #271) to reject
+/// running outside one before they mutate the filesystem.
+pub fn projectExists(project_dir: []const u8) bool {
+    const labelle_path = std.fs.path.join(std.heap.page_allocator, &.{ project_dir, "project.labelle" }) catch return false;
+    defer std.heap.page_allocator.free(labelle_path);
+    std.Io.Dir.cwd().access(globalIo(), labelle_path, .{}) catch return false;
+    return true;
+}
+
+/// Print the standard "no project.labelle found" guidance. Shared so a
+/// standalone-dispatched command that requires a project emits the exact
+/// message the main project-config guard (see cli.zig) prints.
+pub fn printNoProjectError(project_dir: []const u8) void {
+    std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
+    std.debug.print("  To create a new project:\n", .{});
+    std.debug.print("    labelle init <name>\n\n", .{});
+    std.debug.print("  To see all commands:\n", .{});
+    std.debug.print("    labelle help\n\n", .{});
+}
+
 fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, verbose: bool) !project_config.ProjectConfig {
     // Raise branch quota for std.zon.parse.fromSlice — ProjectConfig has many
     // fields (including nested IosConfig) that exceed the default 1100 limit.
@@ -79,3 +101,45 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
         return error.ParseError;
     };
 }
+
+const expect = @import("zspec").expect;
+
+test {
+    @import("zspec").runAll(@This());
+}
+
+/// Codex review (#272): `add` is dispatched from the standalone-command
+/// switch, skipping the `readProjectConfig` guard project-scoped commands
+/// use. `projectExists` is the guard `cli/add.zig` calls before scaffolding
+/// so `labelle add ...` in a non-project cwd errors instead of writing
+/// `packs/`/`components/`/`scripts/` into the wrong directory.
+pub const ProjectExistsSpec = struct {
+    pub const with_manifest = struct {
+        test "returns true when project.labelle is present" {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = globalIo();
+            try tmp.dir.writeFile(io, .{ .sub_path = "project.labelle", .data = ".{}" });
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const n = try tmp.dir.realPath(io, &buf);
+            try expect.toBeTrue(projectExists(buf[0..n]));
+        }
+    };
+
+    pub const without_manifest = struct {
+        test "returns false in a directory with no project.labelle" {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = globalIo();
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const n = try tmp.dir.realPath(io, &buf);
+            try expect.toBeFalse(projectExists(buf[0..n]));
+        }
+
+        test "returns false for a path that does not exist" {
+            try expect.toBeFalse(projectExists("/no/such/labelle/dir/xyzzy"));
+        }
+    };
+};

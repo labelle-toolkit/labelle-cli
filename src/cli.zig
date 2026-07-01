@@ -808,11 +808,7 @@ pub fn main(proc_init: std.process.Init) !void {
     defer arena.deinit();
     var parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
-            std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
-            std.debug.print("  To create a new project:\n", .{});
-            std.debug.print("    labelle init <name>\n\n", .{});
-            std.debug.print("  To see all commands:\n", .{});
-            std.debug.print("    labelle help\n\n", .{});
+            config.printNoProjectError(project_dir);
         }
         return;
     };
@@ -914,7 +910,7 @@ pub fn main(proc_init: std.process.Init) !void {
     // env var > assembler_version in project.labelle > auto-downloaded
     // default) and reuse the located binary for both the cache-populate
     // step and code generation below.
-    const asm_bin = try assembler_proc.resolve(allocator, project_dir);
+    const asm_bin = try assembler_proc.resolve(allocator, project_dir, "generate");
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
 
