@@ -6,9 +6,9 @@ pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
     validateStates(cfg.states);
 
     // Validate backend+platform combination
-    if (cfg.platform == .wasm and cfg.backend != .raylib and cfg.backend != .sokol) {
-        std.debug.print("labelle: error: WASM builds are only supported with raylib or sokol backends (got {s})\n", .{@tagName(cfg.backend)});
-        std.debug.print("  hint: set backend = \"raylib\" or backend = \"sokol\" in project.labelle\n\n", .{});
+    if (cfg.platform == .wasm and cfg.backend != .raylib and cfg.backend != .sokol and cfg.backend != .bgfx) {
+        std.debug.print("labelle: error: WASM builds are only supported with raylib, sokol, or bgfx backends (got {s})\n", .{@tagName(cfg.backend)});
+        std.debug.print("  hint: set backend = \"raylib\", \"sokol\", or \"bgfx\" in project.labelle\n\n", .{});
         std.process.exit(1);
     }
 

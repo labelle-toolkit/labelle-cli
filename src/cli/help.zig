@@ -9,6 +9,8 @@ pub fn printHelp() void {
         \\
         \\Commands:
         \\  init <name> [dir]    Create a new labelle project
+        \\  add pack <name>      Scaffold a pack (packs/<name>/ + pack.labelle)
+        \\  add feature <kind> <name>  Scaffold a feature-unit (kind: need, role, status)
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
         \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build the project
         \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>] [--screenshot=<path> [--after=<dur>]] [--headless] [--uncapped] [--ticks=<N>] [--profile] [-- <args>...]  Generate + build + run (default; `--screenshot` captures one frame; `--headless` runs windowless, `--uncapped` removes the frame sleep, `--ticks=<N>` exits after N frames — last two imply `--headless`; `--profile` enables the engine frame profiler (per-script/per-plugin ms to the log); `--` forwards trailing args to the game)
@@ -30,6 +32,8 @@ pub fn printHelp() void {
         \\
         \\Examples:
         \\  labelle init my-game
+        \\  labelle add pack citizens
+        \\  labelle add feature need boredom
         \\  labelle generate
         \\  labelle run
         \\  labelle run --timeout=30s
