@@ -29,11 +29,12 @@ const config = @import("config.zig");
 const assembler = @import("assembler.zig");
 
 /// Minimum assembler subcommand protocol this CLI requires. The CLI
-/// delegates `install`/`clean`/`upgrade` (added at protocol 2) and
-/// `init` (protocol 3); an older binary lacks subcommands the CLI
-/// depends on. `resolve` checks this and fails early with a clear
-/// message instead of letting a stale binary reject a subcommand.
-pub const REQUIRED_PROTOCOL: u32 = 3;
+/// delegates `install`/`clean`/`upgrade` (added at protocol 2),
+/// `init` (protocol 3), and `add` (protocol 4); an older binary lacks
+/// subcommands the CLI depends on. `resolve` checks this and fails early
+/// with a clear message instead of letting a stale binary reject a
+/// subcommand.
+pub const REQUIRED_PROTOCOL: u32 = 4;
 
 /// A located assembler binary, ready to be invoked. Returned by `resolve`
 /// so a caller that runs several subcommands can resolve once and reuse.
