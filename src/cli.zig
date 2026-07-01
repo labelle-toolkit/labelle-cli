@@ -20,6 +20,7 @@ const project_config = @import("cli/project_config.zig");
 // Submodules
 const help = @import("cli/help.zig");
 const init = @import("cli/init.zig");
+const add = @import("cli/add.zig");
 const install = @import("cli/install.zig");
 const upgrade = @import("cli/upgrade.zig");
 const update = @import("cli/update.zig");
@@ -44,7 +45,7 @@ const migrate = @import("cli/migrate.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
 
-const Command = enum { generate, build, run, init_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd };
+const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -641,6 +642,11 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "audit")) {
             parsed_args.command = .audit_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "add")) {
+            // `add pack <name>` / `add feature <kind> <name>` — forwarded
+            // verbatim to the assembler's `add` subcommand (Packs #271).
+            parsed_args.command = .add_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "migrate")) {
             parsed_args.command = .migrate_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -750,6 +756,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .version => return help.printVersion(),
         .targets => return help.printTargets(),
         .init_cmd => return init.cmdInit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .add_cmd => return add.cmdAdd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .install_cmd => return install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .update_cmd => return update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
@@ -801,11 +808,7 @@ pub fn main(proc_init: std.process.Init) !void {
     defer arena.deinit();
     var parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
-            std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
-            std.debug.print("  To create a new project:\n", .{});
-            std.debug.print("    labelle init <name>\n\n", .{});
-            std.debug.print("  To see all commands:\n", .{});
-            std.debug.print("    labelle help\n\n", .{});
+            config.printNoProjectError(project_dir);
         }
         return;
     };
@@ -907,7 +910,7 @@ pub fn main(proc_init: std.process.Init) !void {
     // env var > assembler_version in project.labelle > auto-downloaded
     // default) and reuse the located binary for both the cache-populate
     // step and code generation below.
-    const asm_bin = try assembler_proc.resolve(allocator, project_dir);
+    const asm_bin = try assembler_proc.resolve(allocator, project_dir, "generate");
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
 

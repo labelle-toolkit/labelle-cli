@@ -28,12 +28,36 @@ const std = @import("std");
 const config = @import("config.zig");
 const assembler = @import("assembler.zig");
 
-/// Minimum assembler subcommand protocol this CLI requires. The CLI
-/// delegates `install`/`clean`/`upgrade` (added at protocol 2) and
-/// `init` (protocol 3); an older binary lacks subcommands the CLI
-/// depends on. `resolve` checks this and fails early with a clear
-/// message instead of letting a stale binary reject a subcommand.
-pub const REQUIRED_PROTOCOL: u32 = 3;
+/// Global floor: every subcommand the CLI delegates needs at least this
+/// protocol (`install`/`clean`/`upgrade` arrived at protocol 2, `init` at
+/// protocol 3). Crucially, this floor also gates the *auto-downloaded*
+/// `DEFAULT_ASSEMBLER_VERSION` (see `assembler.resolveDefault`): a fresh
+/// install with no project pin runs the default binary, so raising this
+/// number would reject that default before ANY command can run — a breaking
+/// change for every existing user. Keep the floor at what the paired default
+/// speaks (protocol 3) and gate newer subcommands per-command via
+/// `minProtocolFor` instead of bumping this.
+pub const MIN_PROTOCOL: u32 = 3;
+
+/// Per-subcommand minimum protocol. Most subcommands need only the global
+/// floor (`MIN_PROTOCOL`); a subcommand that depends on an assembler feature
+/// added after the paired default declares a higher minimum here. Modelling
+/// this as a small lookup (rather than one global constant) means gating a
+/// new subcommand is a one-line entry that never raises the floor for
+/// existing commands or the auto-downloaded default.
+///
+/// Extensible: sibling work adds `check` → 5 (#273) as another entry.
+fn minProtocolFor(subcommand: []const u8) u32 {
+    const Gate = struct { name: []const u8, min: u32 };
+    const gates = [_]Gate{
+        .{ .name = "add", .min = 4 }, // Packs scaffold (#271)
+        // .{ .name = "check", .min = 5 }, // reserved for #273
+    };
+    for (gates) |g| {
+        if (std.mem.eql(u8, g.name, subcommand)) return g.min;
+    }
+    return MIN_PROTOCOL;
+}
 
 /// A located assembler binary, ready to be invoked. Returned by `resolve`
 /// so a caller that runs several subcommands can resolve once and reuse.
@@ -71,20 +95,28 @@ pub const Assembler = struct {
 /// for commands that may run outside a project (the resolver tolerates a
 /// missing manifest and falls through to step 3).
 ///
+/// `subcommand` is the assembler subcommand about to be delegated; it
+/// selects the minimum protocol via `minProtocolFor` (so `add` can require
+/// a newer binary than `generate` without raising the global floor).
+///
 /// Caller owns the returned `Assembler` and must `deinit` it.
-pub fn resolve(allocator: std.mem.Allocator, project_dir: []const u8) !Assembler {
+pub fn resolve(allocator: std.mem.Allocator, project_dir: []const u8, subcommand: []const u8) !Assembler {
     const path = try assembler.resolveAssembler(allocator, project_dir) orelse
         try assembler.resolveDefault(allocator);
     errdefer allocator.free(path);
-    try checkProtocol(allocator, path);
+    try checkProtocol(allocator, path, subcommand);
     return .{ .path = path };
 }
 
-/// Verify the resolved binary speaks a protocol this CLI understands.
-/// `labelle-assembler --protocol-version` prints its integer protocol
-/// to stdout; fail fast and legibly here rather than letting an
-/// outdated binary reject a delegated subcommand opaquely.
-fn checkProtocol(allocator: std.mem.Allocator, path: []const u8) !void {
+/// Verify the resolved binary speaks a protocol high enough for
+/// `subcommand`. `labelle-assembler --protocol-version` prints its integer
+/// protocol to stdout; fail fast and legibly here rather than letting an
+/// outdated binary reject a delegated subcommand opaquely. The required
+/// minimum is per-subcommand (`minProtocolFor`) so newer subcommands don't
+/// reject a binary that older subcommands (and the auto-downloaded default)
+/// still work with.
+fn checkProtocol(allocator: std.mem.Allocator, path: []const u8, subcommand: []const u8) !void {
+    const required = minProtocolFor(subcommand);
     const res = std.process.run(allocator, config.globalIo(), .{
         .argv = &.{ path, "--protocol-version" },
     }) catch |err| {
@@ -96,15 +128,15 @@ fn checkProtocol(allocator: std.mem.Allocator, path: []const u8) !void {
     const reported = std.mem.trim(u8, res.stdout, " \t\r\n");
     const proto = std.fmt.parseInt(u32, reported, 10) catch {
         std.debug.print(
-            "labelle: assembler '{s}' did not report a protocol version (too old?); this CLI needs protocol >= {d}\n",
-            .{ path, REQUIRED_PROTOCOL },
+            "labelle: assembler '{s}' did not report a protocol version (too old?); '{s}' needs protocol >= {d}\n",
+            .{ path, subcommand, required },
         );
         return error.AssemblerFailed;
     };
-    if (proto < REQUIRED_PROTOCOL) {
+    if (proto < required) {
         std.debug.print(
-            "labelle: assembler '{s}' speaks protocol {d}, but this CLI needs >= {d} — pin a newer 'assembler_version' in project.labelle\n",
-            .{ path, proto, REQUIRED_PROTOCOL },
+            "labelle: '{s}' needs assembler protocol >= {d}, but '{s}' speaks {d} — pin a newer 'assembler_version' in project.labelle\n",
+            .{ subcommand, required, path, proto },
         );
         return error.AssemblerFailed;
     }
@@ -121,7 +153,7 @@ pub fn runSubcommand(
     subcommand: []const u8,
     args: []const []const u8,
 ) !void {
-    const asm_bin = try resolve(allocator, project_dir);
+    const asm_bin = try resolve(allocator, project_dir, subcommand);
     defer asm_bin.deinit(allocator);
     try asm_bin.run(allocator, subcommand, args);
 }
@@ -233,6 +265,48 @@ pub const BuildGenerateArgsSpec = struct {
             for (expected, args.items) |want, got| {
                 try std.testing.expectEqualStrings(want, got);
             }
+        }
+    };
+};
+
+/// Codex review (#272): the `add` subcommand needs a newer assembler
+/// (protocol 4) than the global floor, but that requirement must NOT be
+/// raised globally — the auto-downloaded `DEFAULT_ASSEMBLER_VERSION` only
+/// speaks the floor (protocol 3), so a global bump breaks every fresh
+/// install before any command runs. These specs pin the per-subcommand
+/// map: `add` gates at 4, the floor commands stay at 3, and an unknown
+/// subcommand falls back to the floor. #273 will add `check` → 5.
+pub const MinProtocolForSpec = struct {
+    pub const add_gates_higher = struct {
+        test "add requires protocol 4" {
+            try std.testing.expectEqual(@as(u32, 4), minProtocolFor("add"));
+        }
+    };
+
+    pub const floor_commands = struct {
+        test "generate accepts the global floor (3)" {
+            try std.testing.expectEqual(MIN_PROTOCOL, minProtocolFor("generate"));
+            try std.testing.expectEqual(@as(u32, 3), minProtocolFor("generate"));
+        }
+
+        test "install/clean/upgrade/init stay at the floor" {
+            for ([_][]const u8{ "install", "clean", "upgrade", "init" }) |cmd| {
+                try std.testing.expectEqual(MIN_PROTOCOL, minProtocolFor(cmd));
+            }
+        }
+    };
+
+    pub const unknown_falls_back = struct {
+        test "unknown subcommand uses the floor" {
+            try std.testing.expectEqual(MIN_PROTOCOL, minProtocolFor("does-not-exist"));
+        }
+    };
+
+    pub const gate_exceeds_floor = struct {
+        test "a protocol-3 binary would be rejected for add but not generate" {
+            const proto: u32 = 3;
+            try std.testing.expect(proto < minProtocolFor("add"));
+            try std.testing.expect(proto >= minProtocolFor("generate"));
         }
     };
 };
