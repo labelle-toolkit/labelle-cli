@@ -134,12 +134,42 @@ const TimeoutState = struct {
     }
 };
 
+/// Report a failed process spawn with the executable + cwd, so a missing
+/// tool or DLL is diagnosable instead of surfacing as a bare
+/// `error: FileNotFound` from main's default error printer (cli#277, cli#285).
+/// On Windows a missing implicitly-linked DLL (e.g. SDL2.dll) also makes
+/// process creation fail with FileNotFound, so the hint names it too.
+fn reportSpawnFailure(err: anyerror, argv: []const []const u8, cwd: []const u8) void {
+    if (err != error.FileNotFound) return;
+    const exe = if (argv.len > 0) argv[0] else "(no executable)";
+    std.debug.print("labelle: could not launch `{s}` in {s}\n", .{ exe, cwd });
+    if (is_windows) {
+        // On Windows a missing implicitly-linked DLL also surfaces as
+        // FileNotFound from process creation, so name it here.
+        std.debug.print(
+            "  hint: the executable was not found on PATH, or a required DLL\n" ++
+                "        (e.g. SDL2.dll) is missing next to it. Run `labelle doctor`\n" ++
+                "        to check your toolchain and system libraries.\n",
+            .{},
+        );
+    } else {
+        std.debug.print(
+            "  hint: the executable was not found on PATH or at that path. Run\n" ++
+                "        `labelle doctor` to check your toolchain.\n",
+            .{},
+        );
+    }
+}
+
 /// Run a zig command capturing stdout/stderr.
 pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.RunResult {
     return std.process.run(allocator, config.globalIo(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
-    });
+    }) catch |err| {
+        reportSpawnFailure(err, argv, cwd);
+        return err;
+    };
 }
 
 /// Like `runZig`, but with an optional environment map (used to inject
@@ -182,7 +212,7 @@ pub fn runZigInheritWithEnv(
     environ_map: ?*const std.process.Environ.Map,
 ) !u8 {
     const io = config.globalIo();
-    var child = try std.process.spawn(io, .{
+    var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .stdin = .inherit,
@@ -190,7 +220,10 @@ pub fn runZigInheritWithEnv(
         .stderr = .inherit,
         .pgid = if (!is_windows and timeout_ns != null) 0 else null,
         .environ_map = environ_map,
-    });
+    }) catch |err| {
+        reportSpawnFailure(err, argv, cwd);
+        return err;
+    };
 
     // Heap-allocate so the detached thread can safely access it after this function returns
     var state: ?*TimeoutState = null;
