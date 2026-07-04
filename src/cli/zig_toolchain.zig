@@ -377,13 +377,29 @@ fn locateSeedSig(allocator: std.mem.Allocator, seed_path: []const u8) !?[]u8 {
 }
 
 /// Pure signature resolution over an injected `env_sig` value (testable).
+///
+/// `LABELLE_ZIG_SEED_SIG` is an EXPLICIT opt-in: when it is set (non-empty),
+/// the signature file MUST exist and be readable — a missing/unreadable path
+/// is a hard error (`error.SeedSignatureMissing`), NEVER a silent downgrade to
+/// adjacent-`.minisig` or no-sig. Otherwise a typo in the env var would install
+/// an UNSIGNED seed, defeating the very opt-in the user asked for. The
+/// adjacent-`.minisig` auto-detect below stays best-effort — it only applies
+/// when the env var is NOT set.
 fn resolveSeedSig(allocator: std.mem.Allocator, seed_path: []const u8, env_sig: ?[]const u8) !?[]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
     if (env_sig) |p| {
         if (p.len > 0) {
-            if (cwd.access(io, p, .{})) |_| return try allocator.dupe(u8, p) else |_| {}
+            if (cwd.access(io, p, .{})) |_| {
+                return try allocator.dupe(u8, p);
+            } else |err| {
+                std.debug.print(
+                    "labelle: {s}={s} is set but the signature file is missing/unreadable ({any}) — refusing to install an unsigned seed\n",
+                    .{ SEED_SIG_ENV, p, err },
+                );
+                return error.SeedSignatureMissing;
+            }
         }
     }
 
@@ -685,13 +701,27 @@ pub fn verifyMinisign(pub_key_b64: []const u8, file_data: []const u8, sig_text: 
 // ── Extraction ─────────────────────────────────────────────────────────
 
 /// Extract `archive_path` into `dest_dir`, stripping the single leading
-/// `zig-<arch>-<os>-<ver>/` component so `dest_dir` is flat. Dispatch is by
-/// the archive's EXTENSION (not the host): `.zip` → PowerShell `Expand-Archive`
-/// + flatten, everything else → `tar -xJf --strip-components=1`. A downloaded
-/// archive is `.zip` on Windows and `.tar.xz` elsewhere, so this preserves
-/// #279's behavior while letting a #280 seed be unpacked by its real format.
+/// `zig-<arch>-<os>-<ver>/` component so `dest_dir` is flat. Dispatch is by the
+/// archive's EXTENSION: `.zip` → PowerShell `Expand-Archive` + flatten,
+/// everything else → `tar -xJf --strip-components=1`. A downloaded archive is
+/// `.zip` on Windows and `.tar.xz` elsewhere, so this preserves #279's
+/// behavior while letting a #280 seed be unpacked by its real format.
+///
+/// `.zip` is host-aware: `Expand-Archive` is Windows-only, so a `.zip` seed
+/// handed to a Unix host (e.g. a mis-set `LABELLE_ZIG_SEED`) fails fast with a
+/// clear error naming the host/format pair instead of silently invoking a
+/// PowerShell that isn't there. Zig releases on Unix are `.tar.xz` anyway.
 fn extractArchive(allocator: std.mem.Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
-    if (std.mem.endsWith(u8, archive_path, ".zip")) return extractZipWindows(allocator, archive_path, dest_dir);
+    if (std.mem.endsWith(u8, archive_path, ".zip")) {
+        if (!is_windows) {
+            std.debug.print(
+                "labelle: cannot extract a .zip archive on {s} (Zig releases are .tar.xz here); provide a .tar.xz seed\n  archive: {s}\n",
+                .{ @tagName(builtin.os.tag), archive_path },
+            );
+            return error.ZigSeedFormatUnsupported;
+        }
+        return extractZipWindows(allocator, archive_path, dest_dir);
+    }
     return extractTarXz(allocator, archive_path, dest_dir);
 }
 
@@ -1202,6 +1232,41 @@ test "resolveSeedSig: env sig wins; else adjacent .minisig; else null" {
         defer if (got) |g| alloc.free(g);
         try testing.expectEqualStrings(env_sig, got.?);
     }
+}
+
+test "resolveSeedSig: LABELLE_ZIG_SEED_SIG set-but-missing FAILS CLOSED (no silent unsigned)" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf);
+
+    const seed = try std.fs.path.join(alloc, &.{ base, "seed.tar.xz" });
+    defer alloc.free(seed);
+    try touch(seed);
+
+    // An ADJACENT `.minisig` exists — so a silent downgrade would happily use
+    // it — but the explicit env opt-in points at a typo path. Must hard-error,
+    // never fall back to the adjacent sig or to no-sig.
+    const adjacent = try std.fmt.allocPrint(alloc, "{s}.minisig", .{seed});
+    defer alloc.free(adjacent);
+    try touch(adjacent);
+
+    const missing = try std.fs.path.join(alloc, &.{ base, "typo.minisig" });
+    defer alloc.free(missing);
+    try testing.expectError(error.SeedSignatureMissing, resolveSeedSig(alloc, seed, missing));
+}
+
+test "extractArchive: a .zip on a non-Windows host fails fast (no PowerShell on unix)" {
+    // On Windows the download path legitimately produces .zip → Expand-Archive;
+    // this guard is about a mis-set seed on Unix, so it only asserts there.
+    if (is_windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    // Path need not exist — dispatch fails before touching the filesystem.
+    try testing.expectError(
+        error.ZigSeedFormatUnsupported,
+        extractArchive(alloc, "/tmp/whatever-seed.zip", "/tmp/dest"),
+    );
 }
 
 /// Build a minimal Zig-shaped seed archive (`zig-fixture/zig` + `.../lib/std.zig`)
