@@ -1,7 +1,38 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const zig_toolchain = @import("zig_toolchain.zig");
+const zig_cache = @import("zig_cache.zig");
 const is_windows = builtin.os.tag == .windows;
+
+/// Resolve the managed `zig` binary for `project_dir` (labelle-cli#279).
+/// This is the ONE place spawns get a `zig` path — never PATH. Downloads +
+/// verifies the required toolchain on a cache miss. Caller owns the slice.
+pub fn resolveZigExe(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
+    return zig_toolchain.resolveZig(allocator, project_dir);
+}
+
+/// Build an env map for a child `zig` that inherits the parent environment
+/// and adds `ZIG_GLOBAL_CACHE_DIR` / `ZIG_LOCAL_CACHE_DIR` pointing into the
+/// labelle cache tree, plus any `extras`. Keeps the compiler's own cache in
+/// user-writable space (never next to a read-only install). Caller owns the
+/// map and must `deinit()` it after the child is waited on.
+pub fn buildZigEnv(allocator: std.mem.Allocator, extras: []const EnvKV) !std.process.Environ.Map {
+    const global = try zig_cache.globalCacheDir(allocator);
+    defer allocator.free(global);
+    const local = try zig_cache.localCacheDir(allocator);
+    defer allocator.free(local);
+    // Ensure the dirs exist so zig doesn't choke on a missing cache root.
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), global) catch {};
+    std.Io.Dir.cwd().createDirPath(config.globalIo(), local) catch {};
+
+    var all: std.ArrayList(EnvKV) = .empty;
+    defer all.deinit(allocator);
+    try all.append(allocator, .{ .key = "ZIG_GLOBAL_CACHE_DIR", .value = global });
+    try all.append(allocator, .{ .key = "ZIG_LOCAL_CACHE_DIR", .value = local });
+    try all.appendSlice(allocator, extras);
+    return buildEnvironWithExtra(allocator, all.items);
+}
 
 const windows = if (is_windows) struct {
     extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.c) std.os.windows.DWORD;
@@ -33,6 +64,21 @@ pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []con
     return std.process.run(allocator, config.globalIo(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
+    });
+}
+
+/// Like `runZig`, but with an optional environment map (used to inject
+/// `ZIG_*_CACHE_DIR` — see `buildZigEnv`). When null, inherits the parent env.
+pub fn runZigWithEnv(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !std.process.RunResult {
+    return std.process.run(allocator, config.globalIo(), .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
     });
 }
 
@@ -237,7 +283,7 @@ fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, t
 /// dir per target (e.g. `raylib_desktop/`, plus `tests/` from 0.14.0),
 /// and each generated zon ships a placeholder fingerprint that needs
 /// replacing with the value Zig computes from the dir's actual path.
-pub fn fixFingerprints(allocator: std.mem.Allocator, output_dir: []const u8) !void {
+pub fn fixFingerprints(allocator: std.mem.Allocator, project_dir: []const u8, output_dir: []const u8) !void {
     const io = config.globalIo();
     var dir = std.Io.Dir.cwd().openDir(io, output_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -253,17 +299,19 @@ pub fn fixFingerprints(allocator: std.mem.Allocator, output_dir: []const u8) !vo
         const zon_path = try std.fs.path.join(allocator, &.{ sub_path, "build.zig.zon" });
         defer allocator.free(zon_path);
         std.Io.Dir.cwd().access(io, zon_path, .{}) catch continue;
-        try fixFingerprint(allocator, sub_path);
+        try fixFingerprint(allocator, project_dir, sub_path);
     }
 }
 
 /// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
-pub fn fixFingerprint(allocator: std.mem.Allocator, output_dir: []const u8) !void {
+pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, output_dir: []const u8) !void {
     const io = config.globalIo();
     const zon_path = try std.fs.path.join(allocator, &.{ output_dir, "build.zig.zon" });
     defer allocator.free(zon_path);
 
-    const result = try runZig(allocator, output_dir, &.{ "zig", "build" });
+    const zig_exe = try resolveZigExe(allocator, project_dir);
+    defer allocator.free(zig_exe);
+    const result = try runZig(allocator, output_dir, &.{ zig_exe, "build" });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 

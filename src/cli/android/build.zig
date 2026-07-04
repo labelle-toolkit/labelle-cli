@@ -87,9 +87,11 @@ fn androidBuildArch(allocator: std.mem.Allocator, target_dir: []const u8, abi: A
     };
     std.debug.print("labelle: building for Android ({s}){s}...\n", .{ abi.libDir(), mode_label });
 
+    const zig_exe = try runner.resolveZigExe(allocator, target_dir);
+    defer allocator.free(zig_exe);
     var zig_args: std.ArrayList([]const u8) = .empty;
     defer zig_args.deinit(allocator);
-    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+    try zig_args.appendSlice(allocator, &.{ zig_exe, "build" });
 
     const arch_flag = try std.fmt.allocPrint(allocator, "-Dandroid_arch={s}", .{abi.optionValue()});
     defer allocator.free(arch_flag);
@@ -128,9 +130,11 @@ pub fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulat
         mode_label,
     });
 
+    const zig_exe = try runner.resolveZigExe(allocator, target_dir);
+    defer allocator.free(zig_exe);
     var zig_args: std.ArrayList([]const u8) = .empty;
     defer zig_args.deinit(allocator);
-    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+    try zig_args.appendSlice(allocator, &.{ zig_exe, "build" });
 
     if (emulator) {
         try zig_args.append(allocator, "-Demulator=true");

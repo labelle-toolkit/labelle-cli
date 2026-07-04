@@ -1,6 +1,7 @@
 const std = @import("std");
 const assembler = @import("assembler.zig");
 const assembler_proc = @import("assembler_proc.zig");
+const zig_toolchain = @import("zig_toolchain.zig");
 
 /// Fetch and cache packages without modifying any project.
 ///
@@ -19,6 +20,18 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
             return error.MissingArgument;
         }
         return assembler.cmdInstallAssembler(allocator, cmd_args[1]);
+    }
+
+    // `labelle install zig <version>` — CLI bootstrap (cli#279). Download +
+    // verify + extract a managed Zig into `~/.labelle/zig/<version>/`.
+    if (cmd_args.len >= 1 and std.mem.eql(u8, cmd_args[0], "zig")) {
+        if (cmd_args.len < 2) {
+            std.debug.print("labelle install zig: missing version argument\n", .{});
+            std.debug.print("  usage: labelle install zig <version>\n", .{});
+            std.debug.print("  example: labelle install zig {s}\n", .{zig_toolchain.DEFAULT_ZIG_VERSION});
+            return error.MissingArgument;
+        }
+        return zig_toolchain.cmdInstallZig(allocator, cmd_args[1]);
     }
 
     // Every other form delegates to the assembler binary.
