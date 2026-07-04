@@ -159,6 +159,11 @@ pub fn stageSdl2DllBesideExe(gpa: std.mem.Allocator, bin_dir: []const u8) void {
     copyFileVia(a, io, src, dst);
     if (util.fileExists(dst)) {
         std.debug.print("labelle: staged SDL2.dll next to the game exe ({s})\n", .{dst});
+    } else {
+        // Located a source DLL but the copy did not land (permissions, AV
+        // lock, ...). Surface it so this failure mode is diagnosable rather
+        // than silently indistinguishable from "nothing to stage".
+        std.debug.print("labelle: found SDL2.dll at {s} but failed to copy it to {s}\n", .{ src, dst });
     }
 }
 

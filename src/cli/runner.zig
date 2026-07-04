@@ -36,13 +36,23 @@ const TimeoutState = struct {
 fn reportSpawnFailure(err: anyerror, argv: []const []const u8, cwd: []const u8) void {
     if (err != error.FileNotFound) return;
     const exe = if (argv.len > 0) argv[0] else "(no executable)";
-    std.debug.print(
-        "labelle: could not launch `{s}` in {s}\n" ++
+    std.debug.print("labelle: could not launch `{s}` in {s}\n", .{ exe, cwd });
+    if (is_windows) {
+        // On Windows a missing implicitly-linked DLL also surfaces as
+        // FileNotFound from process creation, so name it here.
+        std.debug.print(
             "  hint: the executable was not found on PATH, or a required DLL\n" ++
-            "        (e.g. SDL2.dll) is missing next to it. Run `labelle doctor`\n" ++
-            "        to check your toolchain and system libraries.\n",
-        .{ exe, cwd },
-    );
+                "        (e.g. SDL2.dll) is missing next to it. Run `labelle doctor`\n" ++
+                "        to check your toolchain and system libraries.\n",
+            .{},
+        );
+    } else {
+        std.debug.print(
+            "  hint: the executable was not found on PATH or at that path. Run\n" ++
+                "        `labelle doctor` to check your toolchain.\n",
+            .{},
+        );
+    }
 }
 
 /// Run a zig command capturing stdout/stderr.
