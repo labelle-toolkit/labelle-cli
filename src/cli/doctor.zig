@@ -54,8 +54,20 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     const effective_backend = cfg.backend orelse .raylib;
 
     const needs_sdl_render = effective_backend == .sdl;
+    // Which backends pull in SDL2 for the shared desktop gamepad source. This
+    // MUST match what the assembler actually wires, or doctor gives an
+    // all-clear and `labelle build` then fails at link with "unable to find
+    // dynamic system library 'SDL2'" (cli#286). The assembler's source of
+    // truth is `labelle-assembler/src/deps_linker.zig:stagesSdlGamepad`, which
+    // stages `backends/sdl_gamepad` (→ `-lSDL2`) for `.raylib, .sokol, .bgfx`
+    // whenever `gamepad == .auto`. bgfx was missing here, so its default
+    // (gamepad-enabled) desktop builds linked SDL2 while doctor reported
+    // `gamepad: n/a` and `--fix` refused to provision it. `.sdl` is kept in
+    // this set too: the sdl render backend links SDL2 unconditionally (as the
+    // renderer, see needs_sdl_render), so surfacing the requirement there is
+    // correct regardless of gamepad.
     const needs_sdl_gamepad = switch (effective_backend) {
-        .raylib, .sokol, .sdl => !cfg.gamepad_off,
+        .raylib, .sokol, .bgfx, .sdl => !cfg.gamepad_off,
         else => false,
     };
     const needs_sdl = needs_sdl_render or needs_sdl_gamepad;
