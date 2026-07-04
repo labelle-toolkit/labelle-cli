@@ -131,6 +131,62 @@ pub fn autoWireEnv(gpa: std.mem.Allocator) void {
     }
 }
 
+/// Stage the runtime `SDL2.dll` next to a freshly-built desktop game exe so
+/// the build is launchable in place. On Windows the OS resolves a process's
+/// implicitly-linked DLLs from the exe's OWN directory first; the build
+/// installs the exe into `.labelle/<target>/zig-out/bin/` but nothing puts
+/// `SDL2.dll` there, so `labelle run` (and a hand-launched `zig-out/bin` exe)
+/// fails at process creation with a bare `error: FileNotFound` (cli#285).
+///
+/// This complements `autoWireEnv`, which only *prepends* the SDL2 cache dir to
+/// PATH — PATH is consulted by the loader AFTER the exe's own dir, and a
+/// user-provided `LABELLE_SDL2_LIB` is not on PATH at all, so neither
+/// reliably covers the launched exe. Copying the DLL beside the exe does.
+///
+/// No-op off Windows, when no `SDL2.dll` can be located, or when it is already
+/// staged. `bin_dir` is the exe's output dir (`.labelle/<target>/zig-out/bin`).
+pub fn stageSdl2DllBesideExe(gpa: std.mem.Allocator, bin_dir: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const io = config.globalIo();
+
+    const dst = join(a, &.{ bin_dir, "SDL2.dll" }) orelse return;
+    if (util.fileExists(dst)) return; // already staged — leave it in place
+
+    const src = locateSdl2Dll(a) orelse return; // nothing to stage
+    copyFileVia(a, io, src, dst);
+    if (util.fileExists(dst)) {
+        std.debug.print("labelle: staged SDL2.dll next to the game exe ({s})\n", .{dst});
+    }
+}
+
+/// Locate a runtime `SDL2.dll`, mirroring the linker's own SDL2 resolution:
+///   1. `LABELLE_SDL2_LIB`/SDL2.dll   (the provisioner drops the DLL in lib/)
+///   2. `LABELLE_SDL2_LIB`/../bin/SDL2.dll   (upstream MinGW package layout)
+///   3. the labelle SDL2 cache lib dir (`findCachedLibDir`, holds SDL2.dll)
+/// Arena-allocated; returns null when none is present.
+fn locateSdl2Dll(a: std.mem.Allocator) ?[]const u8 {
+    const env = config.globalEnviron();
+    if (env.getAlloc(a, "LABELLE_SDL2_LIB") catch null) |lib| {
+        if (lib.len > 0) {
+            if (join(a, &.{ lib, "SDL2.dll" })) |p| {
+                if (util.fileExists(p)) return p;
+            }
+            if (join(a, &.{ lib, "..", "bin", "SDL2.dll" })) |p| {
+                if (util.fileExists(p)) return p;
+            }
+        }
+    }
+    if (findCachedLibDir(a)) |lib| {
+        if (join(a, &.{ lib, "SDL2.dll" })) |p| {
+            if (util.fileExists(p)) return p;
+        }
+    }
+    return null;
+}
+
 extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
 
 /// Set an environment variable on the current process (Windows). Children

@@ -905,8 +905,14 @@ pub fn main(proc_init: std.process.Init) !void {
     // user already set the var. Scoped like `labelle doctor`: the sdl
     // backend always needs SDL2; raylib/sokol only for the gamepad
     // source, so `.gamepad = .none` projects get nothing injected.
+    // Backends that pull in SDL2: the `sdl` renderer always, and
+    // raylib/sokol/bgfx for the shared desktop gamepad source unless gamepad
+    // is opted out. Mirrors the assembler's `deps_linker.stagesSdlGamepad`
+    // (raylib/sokol/bgfx with `gamepad == .auto`) — bgfx was previously
+    // missing here, so its default gamepad-enabled desktop builds never got
+    // SDL2 auto-wired or the runtime DLL staged (cli#285 / cli#286).
     const wants_sdl2 = parsed.backend == .sdl or
-        ((parsed.backend == .raylib or parsed.backend == .sokol) and parsed.gamepad != .none);
+        ((parsed.backend == .raylib or parsed.backend == .sokol or parsed.backend == .bgfx) and parsed.gamepad != .none);
     if (parsed.platform == .desktop and wants_sdl2) {
         sdl_provision.autoWireEnv(allocator);
     }
@@ -1081,6 +1087,19 @@ pub fn main(proc_init: std.process.Init) !void {
         }
     }
     std.debug.print("  build ok\n", .{});
+
+    // Stage the runtime SDL2.dll next to the freshly-built desktop exe. A
+    // gamepad/SDL2 build's exe fails process creation with a bare
+    // `FileNotFound` when SDL2.dll isn't in its own directory (cli#285): the
+    // Windows loader resolves implicitly-linked DLLs from the exe dir first,
+    // and neither the PATH prepend from autoWireEnv nor a user-set
+    // LABELLE_SDL2_LIB puts the DLL there. Docker builds are skipped — their
+    // exe is built for the container's OS, so a host SDL2.dll is irrelevant.
+    if (!parsed_args.docker and parsed.platform == .desktop and wants_sdl2) {
+        const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
+        defer allocator.free(bin_dir);
+        sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
+    }
 
     if (command == .build) {
         // `labelle build --platform=android` builds the shared library
