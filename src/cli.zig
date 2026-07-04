@@ -33,6 +33,7 @@ const lockfile = @import("cli/lockfile.zig");
 const runner = @import("cli/runner.zig");
 const assembler = @import("cli/assembler.zig");
 const assembler_proc = @import("cli/assembler_proc.zig");
+const zig_toolchain = @import("cli/zig_toolchain.zig");
 const bake_mod = @import("cli/bake.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
@@ -47,7 +48,7 @@ const check = @import("cli/check.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
 
-const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd };
+const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, toolchain_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -262,6 +263,37 @@ fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8
     return true;
 }
 
+/// Parse the `--zig <path>` / `--zig=<path>` escape hatch (cli#279, folding
+/// in the superseded cli#203 option 2). Records the override in
+/// `zig_toolchain` so `resolveZig` returns it directly. `LABELLE_ZIG` still
+/// wins (checked first in `resolveZig`). Returns true when consumed, false
+/// when `arg` is not `--zig`, and null on a missing value. The stored slice
+/// borrows argv, which lives for the whole `main()` call.
+fn parseZigFlag(arg: []const u8, args: anytype) ?bool {
+    if (std.mem.startsWith(u8, arg, "--zig=")) {
+        const val = arg["--zig=".len..];
+        if (val.len == 0) {
+            std.debug.print("labelle: --zig requires a path (e.g. --zig=/opt/zig/zig)\n", .{});
+            return null;
+        }
+        zig_toolchain.setFlagOverride(val);
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--zig")) {
+        const val = args.next() orelse {
+            std.debug.print("labelle: --zig requires a path (e.g. --zig /opt/zig/zig)\n", .{});
+            return null;
+        };
+        if (val.len == 0) {
+            std.debug.print("labelle: --zig requires a non-empty path (e.g. --zig /opt/zig/zig)\n", .{});
+            return null;
+        }
+        zig_toolchain.setFlagOverride(val);
+        return true;
+    }
+    return false;
+}
+
 const valid_optimize_modes = [_][]const u8{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" };
 
 /// Try to parse --optimize=<value> from an argument. Returns true if consumed,
@@ -328,6 +360,9 @@ fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?str
             docker_target = val;
             continue;
         }
+        if (parseZigFlag(arg, args)) |consumed| {
+            if (consumed) continue;
+        } else return null;
         if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
             return null;
@@ -500,17 +535,20 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
                 return null;
             }
             continue;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
-            return null;
-        } else {
+        } else if (parseZigFlag(arg, args)) |consumed| {
+            if (consumed) continue;
+            // parseZigFlag returned false → fall through to unknown-flag/dir.
+            if (std.mem.startsWith(u8, arg, "--")) {
+                std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
+                return null;
+            }
             if (dir_set) {
                 std.debug.print("labelle {s}: unexpected argument '{s}'\n", .{ cmd_name, arg });
                 return null;
             }
             dir = arg;
             dir_set = true;
-        }
+        } else return null;
     }
     // `--after` without `--screenshot` is a user mistake worth flagging
     // — the delay has no observable effect by itself. Don't fail though;
@@ -555,6 +593,22 @@ fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
     }
     std.debug.print("labelle assembler: unknown subcommand '{s}'\n", .{cmd_args[0]});
     std.debug.print("  usage: labelle assembler list\n", .{});
+    return error.UnknownSubcommand;
+}
+
+/// Handle `labelle toolchain <subcommand>` — managed Zig introspection (cli#279).
+///   list         — cached versions under `~/.labelle/zig/`
+///   which [dir]  — the version + source + path the project would use
+fn handleToolchainCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
+    if (cmd_args.len == 0 or std.mem.eql(u8, cmd_args[0], "list")) {
+        return zig_toolchain.cmdToolchainList(allocator);
+    }
+    if (std.mem.eql(u8, cmd_args[0], "which")) {
+        const dir = if (cmd_args.len >= 2) cmd_args[1] else ".";
+        return zig_toolchain.cmdToolchainWhich(allocator, dir);
+    }
+    std.debug.print("labelle toolchain: unknown subcommand '{s}'\n", .{cmd_args[0]});
+    std.debug.print("  usage: labelle toolchain list | labelle toolchain which [dir]\n", .{});
     return error.UnknownSubcommand;
 }
 
@@ -654,6 +708,10 @@ pub fn main(proc_init: std.process.Init) !void {
             try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "check")) {
             parsed_args.command = .check_cmd;
+            try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "toolchain")) {
+            // `labelle toolchain list|which` — managed Zig introspection (cli#279).
+            parsed_args.command = .toolchain_cmd;
             try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "doctor")) {
             parsed_args.command = .doctor_cmd;
@@ -773,6 +831,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .check_cmd => return check.cmdCheck(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .doctor_cmd => return doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .toolchain_cmd => return handleToolchainCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
 
@@ -1014,14 +1073,14 @@ pub fn main(proc_init: std.process.Init) !void {
     // would leave `labelle test` broken on the host after `labelle build
     // --docker`. Patch `tests/` directly when present.
     if (!parsed_args.docker) {
-        try runner.fixFingerprints(allocator, output_dir);
+        try runner.fixFingerprints(allocator, project_dir, output_dir);
     } else {
         const tests_dir = try std.fs.path.join(allocator, &.{ output_dir, "tests" });
         defer allocator.free(tests_dir);
         const tests_build_zig = try std.fs.path.join(allocator, &.{ tests_dir, "build.zig" });
         defer allocator.free(tests_build_zig);
         if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
-            try runner.fixFingerprint(allocator, tests_dir);
+            try runner.fixFingerprint(allocator, project_dir, tests_dir);
         } else |_| {}
     }
     try lockfile.writeLockFile(allocator, project_dir, parsed);
@@ -1051,9 +1110,22 @@ pub fn main(proc_init: std.process.Init) !void {
         null;
     defer if (optimize_flag) |f| allocator.free(f);
 
+    // Resolve the managed Zig toolchain (labelle-cli#279): every `zig` spawn
+    // uses this binary, never PATH. Downloads + verifies on a cache miss.
+    // Skipped for docker builds — the toolchain lives inside the container.
+    const managed_zig: ?[]u8 = if (parsed_args.docker) null else try runner.resolveZigExe(allocator, project_dir);
+    defer if (managed_zig) |z| allocator.free(z);
+
+    // Build a base env for child `zig` that pins ZIG_*_CACHE_DIR into the
+    // labelle cache tree (user-writable, never next to a read-only install).
+    var zig_env_storage: ?std.process.Environ.Map = if (parsed_args.docker) null else try runner.buildZigEnv(allocator, &.{});
+    defer if (zig_env_storage) |*m| m.deinit();
+    const zig_env_ptr: ?*const std.process.Environ.Map = if (zig_env_storage) |*m| m else null;
+
     var zig_args: std.ArrayList([]const u8) = .empty;
     defer zig_args.deinit(allocator);
-    try zig_args.appendSlice(allocator, &.{ "zig", "build" });
+    try zig_args.append(allocator, managed_zig orelse "zig");
+    try zig_args.append(allocator, "build");
     if (optimize_flag) |flag| try zig_args.append(allocator, flag);
 
     if (parsed_args.docker) {
@@ -1065,7 +1137,7 @@ pub fn main(proc_init: std.process.Init) !void {
         }
     } else {
         std.debug.print("labelle: building...\n", .{});
-        const build_result = try runner.runZig(allocator, target_dir, zig_args.items);
+        const build_result = try runner.runZigWithEnv(allocator, target_dir, zig_args.items, zig_env_ptr);
         defer allocator.free(build_result.stdout);
         defer allocator.free(build_result.stderr);
 
@@ -1138,9 +1210,11 @@ pub fn main(proc_init: std.process.Init) !void {
         // asset streaming for large scenes no longer races boot. This
         // is now the ONLY mechanism for `--scene=` — the legacy
         // `.initial_prefab` rewrite was removed (see above).
+        // Default the child env to the ZIG_*_CACHE_DIR map (cli#279) so the
+        // rebuilt-and-run step still lands the compiler cache in user space.
         var env_map_storage: ?std.process.Environ.Map = null;
         defer if (env_map_storage) |*m| m.deinit();
-        var env_map_ptr: ?*const std.process.Environ.Map = null;
+        var env_map_ptr: ?*const std.process.Environ.Map = zig_env_ptr;
         const has_scene_env = parsed_args.scene_override != null;
         const has_screenshot_env = parsed_args.screenshot_path != null;
         // --headless (and the flags that imply it) surface as
@@ -1182,7 +1256,13 @@ pub fn main(proc_init: std.process.Init) !void {
                 }
                 std.debug.print("labelle: screenshot will be written to '{s}'\n", .{path});
             }
-            env_map_storage = try runner.buildEnvironWithExtra(allocator, extras.items);
+            // For a non-docker run, fold the ZIG_*_CACHE_DIR vars in too so
+            // both the build and run children share the managed cache. For a
+            // docker run there is no managed toolchain, so just add extras.
+            env_map_storage = if (parsed_args.docker)
+                try runner.buildEnvironWithExtra(allocator, extras.items)
+            else
+                try runner.buildZigEnv(allocator, extras.items);
             env_map_ptr = &env_map_storage.?;
         }
 

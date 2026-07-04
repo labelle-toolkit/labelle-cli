@@ -347,9 +347,14 @@ fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, 
     const config_label: []const u8 = if (release) "Release" else "Debug";
     std.debug.print("labelle: building for {s} ({s})...\n", .{ target_label, config_label });
 
+    // Managed Zig (cli#279) — resolve against the generated target dir; it
+    // has no project.labelle, so this falls back to the CLI's default Zig.
+    const zig_exe = try runner.resolveZigExe(allocator, target_dir);
+    defer allocator.free(zig_exe);
+
     var argv_buf: [8][]const u8 = undefined;
     var argc: usize = 0;
-    argv_buf[argc] = "zig";
+    argv_buf[argc] = zig_exe;
     argc += 1;
     argv_buf[argc] = "build";
     argc += 1;

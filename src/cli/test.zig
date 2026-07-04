@@ -275,7 +275,9 @@ fn isIdentifierBoundary(c: u8) bool {
 /// the spawn/wait dance to `runner.runZigInherit` so all CLI-driven
 /// zig invocations share one process-management code path.
 fn runZigTest(allocator: std.mem.Allocator, cwd: []const u8, rel_path: []const u8) !bool {
-    const code = try runner.runZigInherit(allocator, cwd, &.{ "zig", "test", rel_path }, null);
+    const zig_exe = try runner.resolveZigExe(allocator, cwd);
+    defer allocator.free(zig_exe);
+    const code = try runner.runZigInherit(allocator, cwd, &.{ zig_exe, "test", rel_path }, null);
     return code == 0;
 }
 
@@ -292,7 +294,9 @@ fn hasBuildZig(dir: *std.Io.Dir) bool {
 fn runZigBuildTest(allocator: std.mem.Allocator, project_dir: []const u8, rel_path: []const u8) !bool {
     const sub_cwd = try std.fs.path.join(allocator, &.{ project_dir, rel_path });
     defer allocator.free(sub_cwd);
-    const code = try runner.runZigInherit(allocator, sub_cwd, &.{ "zig", "build", "test" }, null);
+    const zig_exe = try runner.resolveZigExe(allocator, project_dir);
+    defer allocator.free(zig_exe);
+    const code = try runner.runZigInherit(allocator, sub_cwd, &.{ zig_exe, "build", "test" }, null);
     return code == 0;
 }
 

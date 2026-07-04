@@ -67,7 +67,14 @@ fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, pro
     defer allocator.free(real_source);
 
     std.debug.print("labelle: building local assembler at {s}...\n", .{real_source});
-    const build_result = runner.runZig(allocator, real_source, &.{ "zig", "build" }) catch |err| {
+    // Managed Zig (cli#279) — the local assembler checkout has no
+    // project.labelle, so this resolves to the CLI's default Zig.
+    const zig_exe = runner.resolveZigExe(allocator, real_source) catch |err| {
+        std.debug.print("labelle: could not resolve managed Zig: {any}\n", .{err});
+        return error.AssemblerNotCached;
+    };
+    defer allocator.free(zig_exe);
+    const build_result = runner.runZig(allocator, real_source, &.{ zig_exe, "build" }) catch |err| {
         std.debug.print("labelle: failed to run 'zig build' in {s}: {any}\n", .{ real_source, err });
         return error.AssemblerNotCached;
     };

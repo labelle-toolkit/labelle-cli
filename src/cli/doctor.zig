@@ -19,6 +19,8 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const project_config = @import("project_config.zig");
 const sdl_provision = @import("sdl_provision.zig");
+const zig_toolchain = @import("zig_toolchain.zig");
+const zig_cache = @import("zig_cache.zig");
 
 const Check = struct {
     name: []const u8,
@@ -62,7 +64,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     var checks: std.ArrayList(Check) = .empty;
 
-    try checks.append(arena, checkZig(arena));
+    try checks.append(arena, checkZig(arena, project_dir));
 
     if (needs_sdl) {
         var lib = checkSdl2Lib(arena);
@@ -155,25 +157,33 @@ fn readProjectConfig(arena: std.mem.Allocator, project_dir: []const u8) Cfg {
 
 // ── Individual checks ───────────────────────────────────────────────────
 
-fn checkZig(arena: std.mem.Allocator) Check {
-    const res = std.process.run(arena, config.globalIo(), .{ .argv = &.{ "zig", "version" } }) catch {
-        return .{
-            .name = "Zig toolchain",
-            .ok = false,
-            .hint = "`zig` not found on PATH. Install Zig 0.15.2+ (https://ziglang.org/download), or use zvm.",
-        };
+fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
+    // Post-cli#279 the CLI owns Zig: it resolves + downloads + verifies a
+    // managed toolchain on demand, so "zig on PATH" is no longer required.
+    // Report the managed toolchain the next build would use, without
+    // triggering a download. Scoped to `project_dir` so `labelle doctor <dir>`
+    // reports the target project's Zig, not the CWD's (cli#279 review).
+    if (zig_toolchain.lookupEnvOverride(arena) catch null) |path| {
+        return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "LABELLE_ZIG override: {s}", .{path}) catch "LABELLE_ZIG override" };
+    }
+    const resolved = zig_toolchain.resolveRequiredVersion(arena, project_dir) catch {
+        return .{ .name = "Zig toolchain", .ok = false, .hint = "could not resolve the required Zig version" };
     };
-    const passed = switch (res.term) {
-        .exited => |c| c == 0,
-        else => false,
+    const bin = zig_cache.binaryPath(arena, resolved.version) catch {
+        return .{ .name = "Zig toolchain", .ok = false, .hint = "could not compute the managed Zig path" };
     };
-    if (!passed) return .{
+    const installed = blk: {
+        std.Io.Dir.cwd().access(config.globalIo(), bin, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (installed) {
+        return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "managed zig {s} ({s})", .{ resolved.version, resolved.source.label() }) catch "managed zig" };
+    }
+    return .{
         .name = "Zig toolchain",
-        .ok = false,
-        .hint = "`zig` is on PATH but failed to run. Reinstall Zig 0.15.2+.",
+        .ok = true,
+        .detail = std.fmt.allocPrint(arena, "managed zig {s} — will download + verify on first build", .{resolved.version}) catch "managed zig (not yet installed)",
     };
-    const ver = std.mem.trim(u8, res.stdout, " \r\n\t");
-    return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "zig {s}", .{ver}) catch "zig (version unknown)" };
 }
 
 fn checkSdl2Lib(arena: std.mem.Allocator) Check {

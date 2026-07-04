@@ -9,7 +9,13 @@ const config = @import("config.zig");
 
 pub const LauncherManifest = struct {
     assembler_version: ?[]const u8 = null,
-    // Future: zig_version, etc.
+    /// Explicit managed-Zig pin (labelle-cli#279). When set, it is the
+    /// highest-precedence *version* source (below only the LABELLE_ZIG /
+    /// `--zig` path overrides). See `zig_toolchain.resolveRequiredVersion`.
+    zig_version: ?[]const u8 = null,
+    /// Pinned engine version — the CLI derives the required Zig from it when
+    /// no explicit `zig_version` is set (`zig_toolchain.zigVersionForEngine`).
+    engine_version: ?[]const u8 = null,
 };
 
 /// Read and parse project.labelle into a LauncherManifest.
