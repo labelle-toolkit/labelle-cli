@@ -284,6 +284,10 @@ fn parseZigFlag(arg: []const u8, args: anytype) ?bool {
             std.debug.print("labelle: --zig requires a path (e.g. --zig /opt/zig/zig)\n", .{});
             return null;
         };
+        if (val.len == 0) {
+            std.debug.print("labelle: --zig requires a non-empty path (e.g. --zig /opt/zig/zig)\n", .{});
+            return null;
+        }
         zig_toolchain.setFlagOverride(val);
         return true;
     }

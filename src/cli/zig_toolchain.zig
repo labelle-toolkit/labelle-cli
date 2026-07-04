@@ -273,10 +273,33 @@ pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void 
 
     const bin_path = try zig_cache.binaryPath(allocator, version);
     defer allocator.free(bin_path);
+    // Fast path: already installed, no lock contention.
     if (cwd.access(io, bin_path, .{})) |_| return else |_| {}
 
     const dest_dir = try zig_cache.versionDir(allocator, version);
     defer allocator.free(dest_dir);
+
+    // Serialize installs of the SAME version across processes with a
+    // per-version advisory lock. Without it, two concurrent `labelle`
+    // processes could each stage + publish, and the loser's
+    // `deleteTree(dest_dir)` would nuke the winner's already-published
+    // toolchain out from under a running build. The lock releases when the
+    // holding process exits (even on crash). See labelle-cli#279 review.
+    const zroot = try zig_cache.zigRoot(allocator);
+    defer allocator.free(zroot);
+    cwd.createDirPath(io, zroot) catch {};
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}.lock", .{ zroot, std.fs.path.sep, version });
+    defer allocator.free(lock_path);
+    const lock_file = cwd.createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive }) catch |err| {
+        std.debug.print("labelle: could not acquire install lock {s}: {any}\n", .{ lock_path, err });
+        return error.ZigInstallLockFailed;
+    };
+    defer lock_file.close(io); // releases the advisory lock
+
+    // Double-checked: another process may have finished installing while we
+    // were blocked on the lock. If so, we're done — never re-download or
+    // touch the published dir.
+    if (cwd.access(io, bin_path, .{})) |_| return else |_| {}
 
     // Stage everything under a temp sibling of the version dir. The suffix
     // only needs to avoid collisions with a concurrent/stale staging dir, not
@@ -336,7 +359,11 @@ pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void 
         } else |_| {}
     }
 
-    // Publish atomically. Remove any stale/partial dest first.
+    // Publish atomically. We hold the install lock and re-checked above that
+    // `bin_path` is absent, so any `dest_dir` here is an INCOMPLETE leftover
+    // from a crashed prior install (no working `zig` inside it → no build can
+    // be using it). Removing it is safe; a fully-published toolchain is never
+    // reached here because the lock + double-check returned early.
     cwd.deleteTree(io, dest_dir) catch {};
     if (std.fs.path.dirname(dest_dir)) |parent| cwd.createDirPath(io, parent) catch {};
     try cwd.rename(staging, cwd, dest_dir, io);
@@ -348,7 +375,12 @@ pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void 
 /// cleanup on failure). Fails with `error.ZigDownloadFailed`.
 fn curlDownload(allocator: std.mem.Allocator, url: []const u8, dest: []const u8) !void {
     const io = config.globalIo();
-    const result = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", dest, url }) catch {
+    // `--connect-timeout` bounds the TCP handshake; `--max-time` bounds the
+    // whole transfer so a stalled mirror can't hang `labelle build` forever.
+    // 600s is a generous ceiling for the ~50MB archive on a slow link (cli#279 review).
+    const result = util.runCmd(allocator, &.{
+        "curl", "-fSL", "--connect-timeout", "30", "--max-time", "600", "-o", dest, url,
+    }) catch {
         std.debug.print("labelle: download failed (is curl installed?)\n  url: {s}\n", .{url});
         return error.ZigDownloadFailed;
     };
@@ -504,9 +536,16 @@ fn extractZipWindows(allocator: std.mem.Allocator, archive_path: []const u8, des
     defer allocator.free(scratch);
     cwd.createDirPath(io, scratch) catch {};
 
+    // Escape embedded single quotes (`'` → `''`) so a path like
+    // `C:\Users\O'Neil\...` (or a LABELLE_HOME with a quote) can't break out
+    // of the single-quoted PowerShell string arg (cli#279 review).
+    const archive_q = try util.escapePowerShellString(allocator, archive_path);
+    defer allocator.free(archive_q);
+    const scratch_q = try util.escapePowerShellString(allocator, scratch);
+    defer allocator.free(scratch_q);
     const ps = try std.fmt.allocPrint(allocator,
         \\Expand-Archive -LiteralPath '{s}' -DestinationPath '{s}' -Force
-    , .{ archive_path, scratch });
+    , .{ archive_q, scratch_q });
     defer allocator.free(ps);
     const result = util.runCmd(allocator, &.{ "powershell", "-NoProfile", "-Command", ps }) catch {
         return error.ZigExtractFailed;
@@ -518,22 +557,33 @@ fn extractZipWindows(allocator: std.mem.Allocator, archive_path: []const u8, des
         else => return error.ZigExtractFailed,
     }
 
-    // Move the single `zig-*/` child's contents up into dest_dir.
-    var sd = try cwd.openDir(io, scratch, .{ .iterate = true });
-    defer sd.close(io);
-    var it = sd.iterate();
-    const top = (try it.next(io)) orelse return error.ZigArchiveLayoutUnexpected;
-    const inner = try std.fs.path.join(allocator, &.{ scratch, top.name });
+    // Find the single `zig-*/` release dir by kind+prefix (not by assuming the
+    // first iterated entry — a stray desktop.ini/Thumbs.db would mis-select).
+    // Scope the dir handles so they close BEFORE deleteTree(scratch) below;
+    // an open iterate handle on Windows would block the tree removal.
+    const inner = blk: {
+        var sd = try cwd.openDir(io, scratch, .{ .iterate = true });
+        defer sd.close(io);
+        var it = sd.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind == .directory and std.mem.startsWith(u8, e.name, "zig-"))
+                break :blk try std.fs.path.join(allocator, &.{ scratch, e.name });
+        }
+        return error.ZigArchiveLayoutUnexpected;
+    };
     defer allocator.free(inner);
-    var id = try cwd.openDir(io, inner, .{ .iterate = true });
-    defer id.close(io);
-    var iit = id.iterate();
-    while (try iit.next(io)) |entry| {
-        const from = try std.fs.path.join(allocator, &.{ inner, entry.name });
-        defer allocator.free(from);
-        const to = try std.fs.path.join(allocator, &.{ dest_dir, entry.name });
-        defer allocator.free(to);
-        try cwd.rename(from, cwd, to, io);
+
+    {
+        var id = try cwd.openDir(io, inner, .{ .iterate = true });
+        defer id.close(io);
+        var iit = id.iterate();
+        while (try iit.next(io)) |entry| {
+            const from = try std.fs.path.join(allocator, &.{ inner, entry.name });
+            defer allocator.free(from);
+            const to = try std.fs.path.join(allocator, &.{ dest_dir, entry.name });
+            defer allocator.free(to);
+            try cwd.rename(from, cwd, to, io);
+        }
     }
     cwd.deleteTree(io, scratch) catch {};
 }

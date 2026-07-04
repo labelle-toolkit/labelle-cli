@@ -64,7 +64,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     var checks: std.ArrayList(Check) = .empty;
 
-    try checks.append(arena, checkZig(arena));
+    try checks.append(arena, checkZig(arena, project_dir));
 
     if (needs_sdl) {
         var lib = checkSdl2Lib(arena);
@@ -157,15 +157,16 @@ fn readProjectConfig(arena: std.mem.Allocator, project_dir: []const u8) Cfg {
 
 // ── Individual checks ───────────────────────────────────────────────────
 
-fn checkZig(arena: std.mem.Allocator) Check {
+fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
     // Post-cli#279 the CLI owns Zig: it resolves + downloads + verifies a
     // managed toolchain on demand, so "zig on PATH" is no longer required.
     // Report the managed toolchain the next build would use, without
-    // triggering a download.
+    // triggering a download. Scoped to `project_dir` so `labelle doctor <dir>`
+    // reports the target project's Zig, not the CWD's (cli#279 review).
     if (zig_toolchain.lookupEnvOverride(arena) catch null) |path| {
         return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "LABELLE_ZIG override: {s}", .{path}) catch "LABELLE_ZIG override" };
     }
-    const resolved = zig_toolchain.resolveRequiredVersion(arena, ".") catch {
+    const resolved = zig_toolchain.resolveRequiredVersion(arena, project_dir) catch {
         return .{ .name = "Zig toolchain", .ok = false, .hint = "could not resolve the required Zig version" };
     };
     const bin = zig_cache.binaryPath(arena, resolved.version) catch {

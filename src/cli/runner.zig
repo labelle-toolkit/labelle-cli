@@ -311,7 +311,11 @@ pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, out
 
     const zig_exe = try resolveZigExe(allocator, project_dir);
     defer allocator.free(zig_exe);
-    const result = try runZig(allocator, output_dir, &.{ zig_exe, "build" });
+    // Give the fingerprint build the same ZIG_*_CACHE_DIR wiring as every
+    // other managed spawn, so its compiler cache lands in user-writable space.
+    var zig_env = try buildZigEnv(allocator, &.{});
+    defer zig_env.deinit();
+    const result = try runZigWithEnv(allocator, output_dir, &.{ zig_exe, "build" }, &zig_env);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
