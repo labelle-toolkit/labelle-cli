@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
+const emsdk_toolchain = @import("emsdk_toolchain.zig");
+const emsdk_cache = @import("emsdk_cache.zig");
 const is_windows = builtin.os.tag == .windows;
 
 /// Resolve the managed `zig` binary for `project_dir` (labelle-cli#279).
@@ -10,6 +12,79 @@ const is_windows = builtin.os.tag == .windows;
 /// verifies the required toolchain on a cache miss. Caller owns the slice.
 pub fn resolveZigExe(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
     return zig_toolchain.resolveZig(allocator, project_dir);
+}
+
+/// PATH separator for the host (`;` on Windows, `:` elsewhere).
+const path_sep = if (is_windows) ";" else ":";
+
+/// Build an env map for a child `zig build` that targets wasm: the standard
+/// `buildZigEnv` layer (ZIG_*_CACHE_DIR) PLUS the managed emsdk wiring
+/// (labelle-cli#283) when a managed/overridden emcc is AVAILABLE. Exports:
+///   - `EMSDK`      → the managed emsdk version dir
+///   - `EM_CONFIG`  → its `.emscripten` (absolute paths into upstream/+node/)
+///   - `PATH`       → the managed `upstream/emscripten` dir prepended, so a
+///                    bare `emcc` resolves to the managed toolchain, never a
+///                    PATH `emcc` (`/opt/homebrew/bin`, `~/emsdk`).
+///
+/// This is the emsdk analog of pointing every `zig` spawn at the managed
+/// binary. It is intentionally NON-forcing: it uses
+/// `resolveEmccIfAvailable`, so it never blocks a wasm build on a fresh
+/// multi-hundred-MB `emsdk install/activate`. Provision the managed emsdk
+/// ahead of time with `labelle install emsdk <ver>`, or point
+/// `LABELLE_EMSDK`/`--emcc` at an existing emcc; when neither is present this
+/// falls back to the plain Zig env (unchanged behavior for the current
+/// zig-package emsdk build path). Caller owns the map.
+pub fn buildWasmEnv(allocator: std.mem.Allocator, project_dir: []const u8) !std.process.Environ.Map {
+    // Escape hatches (LABELLE_EMSDK / --emcc) short-circuit into a bare emcc
+    // path; a managed emsdk is used only if already activated. No provisioning
+    // side effect here.
+    const emcc = (try emsdk_toolchain.resolveEmccIfAvailable(allocator, project_dir)) orelse
+        return buildZigEnv(allocator, &.{});
+    defer allocator.free(emcc);
+
+    // The emsdk root is emcc's grandparent-of-grandparent:
+    // <emsdk>/upstream/emscripten/emcc → <emsdk>. Derive it from `emcc` so an
+    // overridden emcc (LABELLE_EMSDK/--emcc) still yields a coherent EMSDK.
+    const emscripten_dir = std.fs.path.dirname(emcc) orelse emcc; // .../upstream/emscripten
+    const upstream_dir = std.fs.path.dirname(emscripten_dir) orelse emscripten_dir; // .../upstream
+    const emsdk_dir = std.fs.path.dirname(upstream_dir) orelse upstream_dir; // <emsdk>
+
+    const em_config = try std.fs.path.join(allocator, &.{ emsdk_dir, emsdk_cache.em_config_name });
+    defer allocator.free(em_config);
+
+    // Prepend the emscripten bin dir to the inherited PATH.
+    const old_path = config.globalEnviron().getAlloc(allocator, "PATH") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(old_path);
+    const new_path = if (old_path.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ emscripten_dir, path_sep, old_path })
+    else
+        try allocator.dupe(u8, emscripten_dir);
+    defer allocator.free(new_path);
+
+    // Only export EMSDK/EM_CONFIG when the derived `.emscripten` actually
+    // exists (a real activated-emsdk layout). For an escape-hatch emcc that
+    // ISN'T in an emsdk layout (a system `/usr/bin/emcc`, a Homebrew emcc via
+    // LABELLE_EMSDK/--emcc), the derived EMSDK/EM_CONFIG would be bogus paths
+    // (`/`, `/.emscripten`) that BREAK an otherwise self-contained emcc. In
+    // that case wire only PATH and leave any inherited EMSDK/EM_CONFIG intact
+    // (buildZigEnv snapshots the parent env, so they are preserved).
+    const has_config = blk: {
+        std.Io.Dir.cwd().access(config.globalIo(), em_config, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (has_config) {
+        return buildZigEnv(allocator, &.{
+            .{ .key = "EMSDK", .value = emsdk_dir },
+            .{ .key = "EM_CONFIG", .value = em_config },
+            .{ .key = "PATH", .value = new_path },
+        });
+    }
+    return buildZigEnv(allocator, &.{
+        .{ .key = "PATH", .value = new_path },
+    });
 }
 
 /// Build an env map for a child `zig` that inherits the parent environment

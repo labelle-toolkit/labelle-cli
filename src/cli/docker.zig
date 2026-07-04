@@ -2,8 +2,33 @@ const std = @import("std");
 const builtin = @import("builtin");
 const project_config = @import("project_config.zig");
 const config = @import("config.zig");
+const emsdk_toolchain = @import("emsdk_toolchain.zig");
 
 const ZIG_VERSION = "0.16.0";
+
+/// emsdk version the in-container wasm build activates. Kept in lockstep with
+/// the host manager's default (labelle-cli#283) and the assembler's pin.
+const EMSDK_VERSION = emsdk_toolchain.DEFAULT_EMSDK_VERSION;
+
+// In-container emsdk activation for the wasm build (labelle-cli#283 / fixes
+// labelle-assembler#492). The generated wasm `build.zig` links via the emsdk
+// zig-dependency package's `emcc`, but that package is fetched-but-NOT-activated
+// — `upstream/emscripten/emcc` is FileNotFound until `emsdk install/activate`
+// runs. The first `zig build` (the fingerprint pass below) fetches + unpacks the
+// emsdk package into the project-local `zig-pkg/<hash>/` dir (NOT the global Zig
+// cache); this snippet then locates it, makes it writable (Zig marks package
+// dirs read-only), and runs the emsdk install + **activate** flow in place so
+// the second `zig build` finds `emcc`. `zig-pkg` is searched relative to the
+// build dir (we run after `cd /labelle/<subdir>`), with the global Zig package
+// cache as a fallback for non-vendored layouts. Exports EMSDK/EM_CONFIG so emcc
+// resolves its toolchain config.
+const activate_emsdk =
+    "EMSDK_PKG=$(find zig-pkg /root/.cache/zig/p -maxdepth 2 -type f -name emsdk.py 2>/dev/null | head -1 | xargs -r dirname) && " ++
+    "if [ -n \"$EMSDK_PKG\" ]; then " ++
+    "chmod -R u+w \"$EMSDK_PKG\" 2>/dev/null || true; " ++
+    "(cd \"$EMSDK_PKG\" && chmod +x ./emsdk 2>/dev/null; ./emsdk install " ++ EMSDK_VERSION ++ " && ./emsdk activate " ++ EMSDK_VERSION ++ ") && " ++
+    "export EMSDK=\"$(cd \"$EMSDK_PKG\" && pwd)\" && export EM_CONFIG=\"$EMSDK/.emscripten\"; " ++
+    "else echo 'labelle: could not locate the fetched emsdk package to activate' >&2; fi && ";
 
 const host_arch = switch (builtin.cpu.arch) {
     .aarch64 => "aarch64",
@@ -259,16 +284,27 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     else
         "";
 
+    // WASM: after the fingerprint pass has fetched the emsdk package, activate
+    // it in place so `emcc` exists for the real build (fixes #492). No-op for
+    // every other platform.
+    const emsdk_setup: []const u8 = if (platform == .wasm)
+        activate_emsdk
+    else
+        "";
+
     // Fix fingerprint: run build once to get the error, patch if needed, then build for real.
     // Only re-runs the build if a fingerprint was actually found and patched.
+    // For wasm, the fingerprint pass also warms the Zig package cache so the
+    // emsdk activation snippet can find + activate the fetched emsdk package.
     const script = try std.fmt.allocPrint(allocator,
         "{s} && cd /labelle/{s} && " ++
             "BUILD_OUT=$({s} 2>&1 || true) && " ++
             "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | head -1 | sed 's/.*use this value: //') && " ++
             "if [ -n \"$FP\" ]; then sed -i \"s|.fingerprint = .*,|.fingerprint = $FP,|\" build.zig.zon; fi && " ++
             "{s}" ++
+            "{s}" ++
             "{s}",
-        .{ install_zig, subdir, effective_cmd, macos_setup, effective_cmd },
+        .{ install_zig, subdir, effective_cmd, emsdk_setup, macos_setup, effective_cmd },
     );
     defer allocator.free(script);
 

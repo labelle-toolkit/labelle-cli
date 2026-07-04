@@ -16,6 +16,11 @@ pub const LauncherManifest = struct {
     /// Pinned engine version — the CLI derives the required Zig from it when
     /// no explicit `zig_version` is set (`zig_toolchain.zigVersionForEngine`).
     engine_version: ?[]const u8 = null,
+    /// Explicit managed-emsdk pin (labelle-cli#283). When set, it is the
+    /// highest-precedence *version* source for the wasm emcc toolchain (below
+    /// only the LABELLE_EMSDK / `--emcc` path overrides). See
+    /// `emsdk_toolchain.resolveRequiredVersion`.
+    emsdk_version: ?[]const u8 = null,
 };
 
 /// Read and parse project.labelle into a LauncherManifest.
