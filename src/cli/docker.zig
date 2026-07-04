@@ -14,17 +14,20 @@ const EMSDK_VERSION = emsdk_toolchain.DEFAULT_EMSDK_VERSION;
 // labelle-assembler#492). The generated wasm `build.zig` links via the emsdk
 // zig-dependency package's `emcc`, but that package is fetched-but-NOT-activated
 // — `upstream/emscripten/emcc` is FileNotFound until `emsdk install/activate`
-// runs. The first `zig build` (the fingerprint pass below) fetches the emsdk
-// package into the container's Zig package cache; this snippet then locates it,
-// makes it writable (Zig marks package dirs read-only), and runs the emsdk
-// install + **activate** flow in place so the second `zig build` finds `emcc`.
-// Exports EMSDK/EM_CONFIG so emcc resolves its toolchain config.
+// runs. The first `zig build` (the fingerprint pass below) fetches + unpacks the
+// emsdk package into the project-local `zig-pkg/<hash>/` dir (NOT the global Zig
+// cache); this snippet then locates it, makes it writable (Zig marks package
+// dirs read-only), and runs the emsdk install + **activate** flow in place so
+// the second `zig build` finds `emcc`. `zig-pkg` is searched relative to the
+// build dir (we run after `cd /labelle/<subdir>`), with the global Zig package
+// cache as a fallback for non-vendored layouts. Exports EMSDK/EM_CONFIG so emcc
+// resolves its toolchain config.
 const activate_emsdk =
-    "EMSDK_PKG=$(find /root/.cache/zig/p -maxdepth 2 -type f -name emsdk.py 2>/dev/null | head -1 | xargs -r dirname) && " ++
+    "EMSDK_PKG=$(find zig-pkg /root/.cache/zig/p -maxdepth 2 -type f -name emsdk.py 2>/dev/null | head -1 | xargs -r dirname) && " ++
     "if [ -n \"$EMSDK_PKG\" ]; then " ++
     "chmod -R u+w \"$EMSDK_PKG\" 2>/dev/null || true; " ++
     "(cd \"$EMSDK_PKG\" && chmod +x ./emsdk 2>/dev/null; ./emsdk install " ++ EMSDK_VERSION ++ " && ./emsdk activate " ++ EMSDK_VERSION ++ ") && " ++
-    "export EMSDK=\"$EMSDK_PKG\" && export EM_CONFIG=\"$EMSDK_PKG/.emscripten\"; " ++
+    "export EMSDK=\"$(cd \"$EMSDK_PKG\" && pwd)\" && export EM_CONFIG=\"$EMSDK/.emscripten\"; " ++
     "else echo 'labelle: could not locate the fetched emsdk package to activate' >&2; fi && ";
 
 const host_arch = switch (builtin.cpu.arch) {
