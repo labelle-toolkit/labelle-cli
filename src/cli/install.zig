@@ -2,6 +2,7 @@ const std = @import("std");
 const assembler = @import("assembler.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
+const emsdk_toolchain = @import("emsdk_toolchain.zig");
 
 /// Fetch and cache packages without modifying any project.
 ///
@@ -32,6 +33,18 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
             return error.MissingArgument;
         }
         return zig_toolchain.cmdInstallZig(allocator, cmd_args[1]);
+    }
+
+    // `labelle install emsdk <version>` — CLI bootstrap (cli#283). Fetch +
+    // verify + **activate** a managed emsdk into `~/.labelle/emsdk/<version>/`.
+    if (cmd_args.len >= 1 and std.mem.eql(u8, cmd_args[0], "emsdk")) {
+        if (cmd_args.len < 2) {
+            std.debug.print("labelle install emsdk: missing version argument\n", .{});
+            std.debug.print("  usage: labelle install emsdk <version>\n", .{});
+            std.debug.print("  example: labelle install emsdk {s}\n", .{emsdk_toolchain.DEFAULT_EMSDK_VERSION});
+            return error.MissingArgument;
+        }
+        return emsdk_toolchain.cmdInstallEmsdk(allocator, cmd_args[1]);
     }
 
     // Every other form delegates to the assembler binary.

@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
+const emsdk_toolchain = @import("emsdk_toolchain.zig");
+const emsdk_cache = @import("emsdk_cache.zig");
 const is_windows = builtin.os.tag == .windows;
 
 /// Resolve the managed `zig` binary for `project_dir` (labelle-cli#279).
@@ -10,6 +12,56 @@ const is_windows = builtin.os.tag == .windows;
 /// verifies the required toolchain on a cache miss. Caller owns the slice.
 pub fn resolveZigExe(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
     return zig_toolchain.resolveZig(allocator, project_dir);
+}
+
+/// PATH separator for the host (`;` on Windows, `:` elsewhere).
+const path_sep = if (is_windows) ";" else ":";
+
+/// Build an env map for a child `zig build` that targets wasm: the standard
+/// `buildZigEnv` layer (ZIG_*_CACHE_DIR) PLUS the managed emsdk wiring
+/// (labelle-cli#283). Resolves + fetches + **activates** the required emsdk on
+/// a cache miss, then exports:
+///   - `EMSDK`      → the managed emsdk version dir
+///   - `EM_CONFIG`  → its `.emscripten` (absolute paths into upstream/+node/)
+///   - `PATH`       → the managed `upstream/emscripten` dir prepended, so a
+///                    bare `emcc` resolves to the managed toolchain, never a
+///                    PATH `emcc` (`/opt/homebrew/bin`, `~/emsdk`).
+/// This is the emsdk analog of pointing every `zig` spawn at the managed
+/// binary. Caller owns the map and must `deinit()` it after the child waits.
+pub fn buildWasmEnv(allocator: std.mem.Allocator, project_dir: []const u8) !std.process.Environ.Map {
+    // Escape hatches (LABELLE_EMSDK / --emcc) short-circuit into a bare emcc
+    // path; env resolution still needs the version dir for EMSDK/EM_CONFIG, so
+    // resolve the emcc path first (this also triggers fetch+activate on a miss).
+    const emcc = try emsdk_toolchain.resolveEmcc(allocator, project_dir);
+    defer allocator.free(emcc);
+
+    // The emsdk root is emcc's grandparent-of-grandparent:
+    // <emsdk>/upstream/emscripten/emcc → <emsdk>. Derive it from `emcc` so an
+    // overridden emcc (LABELLE_EMSDK/--emcc) still yields a coherent EMSDK.
+    const emscripten_dir = std.fs.path.dirname(emcc) orelse emcc; // .../upstream/emscripten
+    const upstream_dir = std.fs.path.dirname(emscripten_dir) orelse emscripten_dir; // .../upstream
+    const emsdk_dir = std.fs.path.dirname(upstream_dir) orelse upstream_dir; // <emsdk>
+
+    const em_config = try std.fs.path.join(allocator, &.{ emsdk_dir, emsdk_cache.em_config_name });
+    defer allocator.free(em_config);
+
+    // Prepend the emscripten bin dir to the inherited PATH.
+    const old_path = config.globalEnviron().getAlloc(allocator, "PATH") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(old_path);
+    const new_path = if (old_path.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ emscripten_dir, path_sep, old_path })
+    else
+        try allocator.dupe(u8, emscripten_dir);
+    defer allocator.free(new_path);
+
+    return buildZigEnv(allocator, &.{
+        .{ .key = "EMSDK", .value = emsdk_dir },
+        .{ .key = "EM_CONFIG", .value = em_config },
+        .{ .key = "PATH", .value = new_path },
+    });
 }
 
 /// Build an env map for a child `zig` that inherits the parent environment

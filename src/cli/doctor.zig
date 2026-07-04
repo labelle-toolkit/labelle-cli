@@ -21,6 +21,8 @@ const project_config = @import("project_config.zig");
 const sdl_provision = @import("sdl_provision.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
+const emsdk_toolchain = @import("emsdk_toolchain.zig");
+const emsdk_cache = @import("emsdk_cache.zig");
 
 const Check = struct {
     name: []const u8,
@@ -65,6 +67,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     var checks: std.ArrayList(Check) = .empty;
 
     try checks.append(arena, checkZig(arena, project_dir));
+    try checks.append(arena, checkEmsdk(arena, project_dir));
 
     if (needs_sdl) {
         var lib = checkSdl2Lib(arena);
@@ -183,6 +186,34 @@ fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
         .name = "Zig toolchain",
         .ok = true,
         .detail = std.fmt.allocPrint(arena, "managed zig {s} — will download + verify on first build", .{resolved.version}) catch "managed zig (not yet installed)",
+    };
+}
+
+fn checkEmsdk(arena: std.mem.Allocator, project_dir: []const u8) Check {
+    // Post-cli#283 the CLI owns emsdk/emcc for wasm builds: it resolves +
+    // fetches + verifies + ACTIVATES a managed emsdk on demand, so "emcc on
+    // PATH" is no longer required. Report the managed toolchain the next wasm
+    // build would use, without triggering a fetch/activate.
+    if (emsdk_toolchain.lookupEnvOverride(arena) catch null) |path| {
+        return .{ .name = "emsdk toolchain (wasm)", .ok = true, .detail = std.fmt.allocPrint(arena, "LABELLE_EMSDK override: {s}", .{path}) catch "LABELLE_EMSDK override" };
+    }
+    const resolved = emsdk_toolchain.resolveRequiredVersion(arena, project_dir) catch {
+        return .{ .name = "emsdk toolchain (wasm)", .ok = false, .hint = "could not resolve the required emsdk version" };
+    };
+    const emcc = emsdk_cache.emccPath(arena, resolved.version) catch {
+        return .{ .name = "emsdk toolchain (wasm)", .ok = false, .hint = "could not compute the managed emcc path" };
+    };
+    const activated = blk: {
+        std.Io.Dir.cwd().access(config.globalIo(), emcc, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (activated) {
+        return .{ .name = "emsdk toolchain (wasm)", .ok = true, .detail = std.fmt.allocPrint(arena, "managed emsdk {s} ({s})", .{ resolved.version, resolved.source.label() }) catch "managed emsdk" };
+    }
+    return .{
+        .name = "emsdk toolchain (wasm)",
+        .ok = true,
+        .detail = std.fmt.allocPrint(arena, "managed emsdk {s} — will fetch + activate on first wasm build", .{resolved.version}) catch "managed emsdk (not yet activated)",
     };
 }
 

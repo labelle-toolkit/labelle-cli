@@ -34,6 +34,7 @@ const runner = @import("cli/runner.zig");
 const assembler = @import("cli/assembler.zig");
 const assembler_proc = @import("cli/assembler_proc.zig");
 const zig_toolchain = @import("cli/zig_toolchain.zig");
+const emsdk_toolchain = @import("cli/emsdk_toolchain.zig");
 const bake_mod = @import("cli/bake.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
@@ -294,6 +295,44 @@ fn parseZigFlag(arg: []const u8, args: anytype) ?bool {
     return false;
 }
 
+/// Parse the `--emcc <path>` / `--emcc=<path>` escape hatch (cli#283), the
+/// emsdk analog of `--zig`. Records the override in `emsdk_toolchain` so
+/// `resolveEmcc` returns it directly. `LABELLE_EMSDK` still wins (checked first
+/// in `resolveEmcc`). Returns true when consumed, false when `arg` is not
+/// `--emcc`, and null on a missing value. The stored slice borrows argv.
+fn parseEmccFlag(arg: []const u8, args: anytype) ?bool {
+    if (std.mem.startsWith(u8, arg, "--emcc=")) {
+        const val = arg["--emcc=".len..];
+        if (val.len == 0) {
+            std.debug.print("labelle: --emcc requires a path (e.g. --emcc=/opt/emsdk/upstream/emscripten/emcc)\n", .{});
+            return null;
+        }
+        emsdk_toolchain.setFlagOverride(val);
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--emcc")) {
+        const val = args.next() orelse {
+            std.debug.print("labelle: --emcc requires a path (e.g. --emcc /opt/emsdk/upstream/emscripten/emcc)\n", .{});
+            return null;
+        };
+        if (val.len == 0) {
+            std.debug.print("labelle: --emcc requires a non-empty path\n", .{});
+            return null;
+        }
+        emsdk_toolchain.setFlagOverride(val);
+        return true;
+    }
+    return false;
+}
+
+/// Try the managed-toolchain path overrides (`--zig`, then `--emcc`) for one
+/// arg. true = consumed, false = neither flag, null = a flag with a bad value.
+fn parseToolchainFlag(arg: []const u8, args: anytype) ?bool {
+    const zig = parseZigFlag(arg, args) orelse return null;
+    if (zig) return true;
+    return parseEmccFlag(arg, args);
+}
+
 const valid_optimize_modes = [_][]const u8{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" };
 
 /// Try to parse --optimize=<value> from an argument. Returns true if consumed,
@@ -360,7 +399,7 @@ fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?str
             docker_target = val;
             continue;
         }
-        if (parseZigFlag(arg, args)) |consumed| {
+        if (parseToolchainFlag(arg, args)) |consumed| {
             if (consumed) continue;
         } else return null;
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -535,9 +574,9 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
                 return null;
             }
             continue;
-        } else if (parseZigFlag(arg, args)) |consumed| {
+        } else if (parseToolchainFlag(arg, args)) |consumed| {
             if (consumed) continue;
-            // parseZigFlag returned false → fall through to unknown-flag/dir.
+            // parseToolchainFlag returned false → fall through to unknown-flag/dir.
             if (std.mem.startsWith(u8, arg, "--")) {
                 std.debug.print("labelle {s}: unknown flag '{s}'\n", .{ cmd_name, arg });
                 return null;
@@ -607,8 +646,13 @@ fn handleToolchainCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
         const dir = if (cmd_args.len >= 2) cmd_args[1] else ".";
         return zig_toolchain.cmdToolchainWhich(allocator, dir);
     }
+    // `toolchain emsdk [dir]` — managed emsdk/emcc resolution (cli#283).
+    if (std.mem.eql(u8, cmd_args[0], "emsdk")) {
+        const dir = if (cmd_args.len >= 2) cmd_args[1] else ".";
+        return emsdk_toolchain.cmdEmsdkWhich(allocator, dir);
+    }
     std.debug.print("labelle toolchain: unknown subcommand '{s}'\n", .{cmd_args[0]});
-    std.debug.print("  usage: labelle toolchain list | labelle toolchain which [dir]\n", .{});
+    std.debug.print("  usage: labelle toolchain list | labelle toolchain which [dir] | labelle toolchain emsdk [dir]\n", .{});
     return error.UnknownSubcommand;
 }
 
@@ -1118,7 +1162,15 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Build a base env for child `zig` that pins ZIG_*_CACHE_DIR into the
     // labelle cache tree (user-writable, never next to a read-only install).
-    var zig_env_storage: ?std.process.Environ.Map = if (parsed_args.docker) null else try runner.buildZigEnv(allocator, &.{});
+    // For a wasm build, also fetch + **activate** the managed emsdk and layer
+    // its EMSDK/EM_CONFIG/PATH wiring on top (labelle-cli#283) so `emcc`
+    // resolves to the managed toolchain, never a PATH `emcc`.
+    var zig_env_storage: ?std.process.Environ.Map = if (parsed_args.docker)
+        null
+    else if (parsed.platform == .wasm)
+        try runner.buildWasmEnv(allocator, project_dir)
+    else
+        try runner.buildZigEnv(allocator, &.{});
     defer if (zig_env_storage) |*m| m.deinit();
     const zig_env_ptr: ?*const std.process.Environ.Map = if (zig_env_storage) |*m| m else null;
 
