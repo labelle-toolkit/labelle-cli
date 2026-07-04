@@ -289,6 +289,28 @@ pub fn resolveEmcc(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 
     return emcc_path;
 }
 
+/// Like `resolveEmcc`, but NEVER triggers a fetch/activate: returns the emcc
+/// path only when it is already usable — an override (`LABELLE_EMSDK`/`--emcc`)
+/// or an already-activated managed emsdk — else null. Used to layer the emsdk
+/// env onto a wasm `zig build` spawn without paying (or blocking on) a
+/// multi-hundred-MB activation the current build may not consume. Provision
+/// explicitly with `labelle install emsdk <ver>` (or let the override point at
+/// an existing emcc). Caller owns the returned slice.
+pub fn resolveEmccIfAvailable(allocator: std.mem.Allocator, project_dir: []const u8) !?[]u8 {
+    if (try lookupEnvOverride(allocator)) |path| return path;
+    if (_flag_override) |path| return try allocator.dupe(u8, path);
+
+    const resolved = try resolveRequiredVersion(allocator, project_dir);
+    defer allocator.free(resolved.version);
+    const emcc_path = try emsdk_cache.emccPath(allocator, resolved.version);
+    errdefer allocator.free(emcc_path);
+    std.Io.Dir.cwd().access(config.globalIo(), emcc_path, .{}) catch {
+        allocator.free(emcc_path);
+        return null;
+    };
+    return emcc_path;
+}
+
 // ── Install (fetch + verify + ACTIVATE, atomic) ────────────────────────
 
 /// Ensure emsdk `version` is FETCHED + ACTIVATED in the managed cache. No-op if
@@ -649,6 +671,30 @@ test "resolveEmcc activates on a cache miss and returns the managed emcc path" {
     const expected = try emsdk_cache.emccPath(alloc, DEFAULT_EMSDK_VERSION);
     defer alloc.free(expected);
     try testing.expectEqualStrings(expected, emcc);
+}
+
+test "resolveEmccIfAvailable: null on a clean cache (no forced download), path on override" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(config.globalIo(), &buf);
+    const root = buf[0..n];
+
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+
+    // Nothing activated, no override → null (a wasm build must NOT block on a
+    // fresh emsdk install here).
+    const none = try resolveEmccIfAvailable(alloc, root);
+    try testing.expect(none == null);
+
+    // --emcc override → returned verbatim without touching the cache.
+    setFlagOverride("/opt/custom/emcc");
+    defer setFlagOverride(null);
+    const overridden = (try resolveEmccIfAvailable(alloc, root)).?;
+    defer alloc.free(overridden);
+    try testing.expectEqualStrings("/opt/custom/emcc", overridden);
 }
 
 test "DEFAULT_EMSDK_COMMIT is a full 40-char git sha" {

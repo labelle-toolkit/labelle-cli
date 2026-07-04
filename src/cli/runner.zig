@@ -19,20 +19,27 @@ const path_sep = if (is_windows) ";" else ":";
 
 /// Build an env map for a child `zig build` that targets wasm: the standard
 /// `buildZigEnv` layer (ZIG_*_CACHE_DIR) PLUS the managed emsdk wiring
-/// (labelle-cli#283). Resolves + fetches + **activates** the required emsdk on
-/// a cache miss, then exports:
+/// (labelle-cli#283) when a managed/overridden emcc is AVAILABLE. Exports:
 ///   - `EMSDK`      → the managed emsdk version dir
 ///   - `EM_CONFIG`  → its `.emscripten` (absolute paths into upstream/+node/)
 ///   - `PATH`       → the managed `upstream/emscripten` dir prepended, so a
 ///                    bare `emcc` resolves to the managed toolchain, never a
 ///                    PATH `emcc` (`/opt/homebrew/bin`, `~/emsdk`).
+///
 /// This is the emsdk analog of pointing every `zig` spawn at the managed
-/// binary. Caller owns the map and must `deinit()` it after the child waits.
+/// binary. It is intentionally NON-forcing: it uses
+/// `resolveEmccIfAvailable`, so it never blocks a wasm build on a fresh
+/// multi-hundred-MB `emsdk install/activate`. Provision the managed emsdk
+/// ahead of time with `labelle install emsdk <ver>`, or point
+/// `LABELLE_EMSDK`/`--emcc` at an existing emcc; when neither is present this
+/// falls back to the plain Zig env (unchanged behavior for the current
+/// zig-package emsdk build path). Caller owns the map.
 pub fn buildWasmEnv(allocator: std.mem.Allocator, project_dir: []const u8) !std.process.Environ.Map {
     // Escape hatches (LABELLE_EMSDK / --emcc) short-circuit into a bare emcc
-    // path; env resolution still needs the version dir for EMSDK/EM_CONFIG, so
-    // resolve the emcc path first (this also triggers fetch+activate on a miss).
-    const emcc = try emsdk_toolchain.resolveEmcc(allocator, project_dir);
+    // path; a managed emsdk is used only if already activated. No provisioning
+    // side effect here.
+    const emcc = (try emsdk_toolchain.resolveEmccIfAvailable(allocator, project_dir)) orelse
+        return buildZigEnv(allocator, &.{});
     defer allocator.free(emcc);
 
     // The emsdk root is emcc's grandparent-of-grandparent:
