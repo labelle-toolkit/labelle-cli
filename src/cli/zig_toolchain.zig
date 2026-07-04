@@ -49,6 +49,44 @@ const is_windows = builtin.os.tag == .windows;
 /// (the toolkit rides one Zig train) and with the SUB2/#280 bundled seed.
 pub const DEFAULT_ZIG_VERSION = "0.16.0";
 
+// ── First-run seed (SUB2 / labelle-cli#280) ────────────────────────────
+//
+// The pre-seeded half of the hybrid: make first run work offline and
+// instantly. When the cache lacks the DEFAULT toolchain, `ensureInstalled`
+// extracts a bundled archive *instead of* downloading — the resulting tree is
+// byte-identical in layout to a downloaded one, so nothing downstream can tell
+// them apart. Only the default version is ever seeded; any other pinned
+// version still downloads + verifies via the network path.
+
+/// Env var the studio (SUB3/#26) sets to the absolute path of the bundled Zig
+/// seed archive it ships as an installer resource. The PRIMARY seed mechanism
+/// — the CLI does not hardcode the studio's bundle layout, it just consumes the
+/// archive this points at.
+pub const SEED_ENV = "LABELLE_ZIG_SEED";
+
+/// Optional env var: absolute path to a minisign signature for the seed
+/// archive. When set (or when a `<seed>.minisig` sits next to the archive) the
+/// seed is verified before install — otherwise the seed is trusted by
+/// provenance (it ships inside our eventually-signed installer). See PR notes
+/// on the trust model.
+pub const SEED_SIG_ENV = "LABELLE_ZIG_SEED_SIG";
+
+/// Only the DEFAULT toolchain is ever seeded. Any other pinned version must
+/// download + verify from the network so a seed can never masquerade as an
+/// arbitrary requested version.
+fn seedAllowedFor(version: []const u8) bool {
+    return std.mem.eql(u8, version, DEFAULT_ZIG_VERSION);
+}
+
+/// The canonical seed filename for `version` on this host — the same name the
+/// download path uses (`zig-<arch>-<os>-<ver>.<ext>`). This is what a
+/// CLI-only distribution places under its `seeds/` dir. Caller owns the slice.
+pub fn seedArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "zig-{s}-{s}-{s}.{s}", .{
+        try archName(), try osName(), version, archive_ext,
+    });
+}
+
 /// Zig's published minisign public key (from ziglang.org/download). Pinned so
 /// verification does not trust anything fetched at runtime. Base64 of
 /// `signature_algorithm[2] || key_id[8] || ed25519_public_key[32]` (42 bytes).
@@ -261,13 +299,127 @@ pub fn resolveZig(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
     return bin_path;
 }
 
+// ── Seed lookup (SUB2 / #280) ──────────────────────────────────────────
+
+/// Locate a bundled seed archive for `version`, or null to fall through to the
+/// network download. Resolution order (exactly as the ticket specifies):
+///   1. `LABELLE_ZIG_SEED` env — absolute path to an archive (studio's hook).
+///   2. `seeds/<zig-<arch>-<os>-<ver>.<ext>>` next to the CLI executable.
+///   3. none → null.
+/// Caller owns the returned slice. This is the env/exe-reading shell; the pure
+/// resolution logic lives in `resolveSeedArchive` for testability.
+fn locateSeedArchive(allocator: std.mem.Allocator, version: []const u8) !?[]u8 {
+    const env_seed = config.globalEnviron().getAlloc(allocator, SEED_ENV) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+    defer if (env_seed) |s| allocator.free(s);
+
+    // The `seeds/` dir sits next to the executable. If the exe path can't be
+    // resolved (rare), just skip step 2 rather than failing the whole install.
+    const exe_dir = std.process.executableDirPathAlloc(config.globalIo(), allocator) catch null;
+    defer if (exe_dir) |d| allocator.free(d);
+
+    return resolveSeedArchive(allocator, version, env_seed, exe_dir);
+}
+
+/// Pure seed resolution over injected inputs (no process env / exe lookup) so
+/// tests can drive every branch. `env_seed` is the `LABELLE_ZIG_SEED` value
+/// (null if unset); `exe_dir` is the CLI executable's directory (null if
+/// unresolvable). Returns an allocated path to an EXISTING archive, or null.
+fn resolveSeedArchive(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    env_seed: ?[]const u8,
+    exe_dir: ?[]const u8,
+) !?[]u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    // 1. LABELLE_ZIG_SEED — the studio's primary hook. Set-but-missing is a
+    //    misconfiguration; warn and fall through rather than failing (an
+    //    offline default build can still succeed via the exe-adjacent seed).
+    if (env_seed) |p| {
+        if (p.len > 0) {
+            if (cwd.access(io, p, .{})) |_| {
+                return try allocator.dupe(u8, p);
+            } else |_| {
+                std.debug.print("labelle: {s}={s} does not exist; ignoring seed\n", .{ SEED_ENV, p });
+            }
+        }
+    }
+
+    // 2. `seeds/` next to the CLI executable (CLI-only distribution).
+    if (exe_dir) |dir| {
+        const name = try seedArchiveName(allocator, version);
+        defer allocator.free(name);
+        const cand = try std.fs.path.join(allocator, &.{ dir, "seeds", name });
+        if (cwd.access(io, cand, .{})) |_| {
+            return cand;
+        } else |_| allocator.free(cand);
+    }
+
+    // 3. No seed — caller downloads.
+    return null;
+}
+
+/// Locate a signature for the seed archive, or null when unsigned. Order:
+///   1. `LABELLE_ZIG_SEED_SIG` env.
+///   2. `<seed>.minisig` adjacent to the archive.
+/// Caller owns the returned slice.
+fn locateSeedSig(allocator: std.mem.Allocator, seed_path: []const u8) !?[]u8 {
+    const env_sig = config.globalEnviron().getAlloc(allocator, SEED_SIG_ENV) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+    defer if (env_sig) |s| allocator.free(s);
+    return resolveSeedSig(allocator, seed_path, env_sig);
+}
+
+/// Pure signature resolution over an injected `env_sig` value (testable).
+fn resolveSeedSig(allocator: std.mem.Allocator, seed_path: []const u8, env_sig: ?[]const u8) !?[]u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    if (env_sig) |p| {
+        if (p.len > 0) {
+            if (cwd.access(io, p, .{})) |_| return try allocator.dupe(u8, p) else |_| {}
+        }
+    }
+
+    const adjacent = try std.fmt.allocPrint(allocator, "{s}.minisig", .{seed_path});
+    if (cwd.access(io, adjacent, .{})) |_| {
+        return adjacent;
+    } else |_| allocator.free(adjacent);
+
+    return null;
+}
+
 // ── Install (download + verify + extract, atomic) ──────────────────────
 
 /// Ensure Zig `version` is installed in the managed cache. No-op if already
-/// present. On a miss: download the archive + `.minisig`, verify the
-/// signature, extract into a temp dir, then atomically rename into place so a
-/// half-extracted toolchain is never observed as installed.
+/// present. On a miss for the DEFAULT version, extract from a bundled seed if
+/// one is reachable (offline first-run, #280); otherwise download the archive +
+/// `.minisig`, verify the signature, and install. Either way the toolchain is
+/// staged in a temp dir then atomically renamed into place so a half-extracted
+/// toolchain is never observed as installed.
 pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void {
+    // #280: only the DEFAULT toolchain is ever seeded. Resolving the seed
+    // before staging keeps `ensureInstalledWithSeed` free of env/exe lookups.
+    const seed: ?[]u8 = if (seedAllowedFor(version))
+        try locateSeedArchive(allocator, version)
+    else
+        null;
+    defer if (seed) |s| allocator.free(s);
+    return ensureInstalledWithSeed(allocator, version, seed);
+}
+
+/// Install `version` into the cache, extracting from `seed` when non-null
+/// (offline path) or downloading + verifying when null (network path). Shares
+/// one stage-then-publish scaffold so a seeded tree is byte-identical to a
+/// downloaded one. Split from `ensureInstalled` so tests can drive the seed
+/// path with a fixture archive and no env/network.
+fn ensureInstalledWithSeed(allocator: std.mem.Allocator, version: []const u8, seed: ?[]const u8) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
@@ -312,38 +464,66 @@ pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void 
     try cwd.createDirPath(io, staging);
     defer cwd.deleteTree(io, staging) catch {};
 
-    const url = try archiveUrl(allocator, version);
-    defer allocator.free(url);
-    const archive_name = try std.fmt.allocPrint(allocator, "zig-{s}.{s}", .{ version, archive_ext });
-    defer allocator.free(archive_name);
-    const archive_path = try std.fs.path.join(allocator, &.{ staging, archive_name });
-    defer allocator.free(archive_path);
-    const sig_path = try std.fmt.allocPrint(allocator, "{s}.minisig", .{archive_path});
-    defer allocator.free(sig_path);
-    const sig_url = try std.fmt.allocPrint(allocator, "{s}.minisig", .{url});
-    defer allocator.free(sig_url);
+    if (seed) |seed_path| {
+        // ── Offline seed path (#280) ──────────────────────────────────
+        // The seed is the same official Zig archive the download path would
+        // fetch. We extract it straight into staging (no copy) so the
+        // published tree is byte-identical to a downloaded one.
+        std.debug.print("labelle: seeding Zig {s} (offline) from {s}\n", .{ version, seed_path });
 
-    std.debug.print("labelle: downloading Zig {s}...\n", .{version});
-    std.debug.print("  url: {s}\n", .{url});
-    try curlDownload(allocator, url, archive_path);
-    try curlDownload(allocator, sig_url, sig_path);
+        // Trust model: the seed ships inside our (eventually-signed)
+        // installer, so it is trusted by provenance and typically carries no
+        // separate minisig — verification is OPTIONAL here. But if a signature
+        // IS shipped (env or adjacent `.minisig`), verify it and fail closed
+        // on a bad one. This never weakens the download path's mandatory check.
+        if (try locateSeedSig(allocator, seed_path)) |sig_path| {
+            defer allocator.free(sig_path);
+            std.debug.print("  verifying seed signature...\n", .{});
+            verifyArchive(allocator, seed_path, sig_path) catch |err| {
+                std.debug.print("labelle: Zig {s} seed signature verification FAILED — refusing to install\n", .{version});
+                return err;
+            };
+            std.debug.print("  signature ok\n", .{});
+        }
 
-    std.debug.print("  verifying signature...\n", .{});
-    verifyArchive(allocator, archive_path, sig_path) catch |err| {
-        std.debug.print("labelle: Zig {s} signature verification FAILED — refusing to install\n", .{version});
-        return err;
-    };
-    std.debug.print("  signature ok\n", .{});
+        std.debug.print("  extracting...\n", .{});
+        try extractArchive(allocator, seed_path, staging);
+    } else {
+        // ── Network download + verify path (#279) ─────────────────────
+        const url = try archiveUrl(allocator, version);
+        defer allocator.free(url);
+        const archive_name = try std.fmt.allocPrint(allocator, "zig-{s}.{s}", .{ version, archive_ext });
+        defer allocator.free(archive_name);
+        const archive_path = try std.fs.path.join(allocator, &.{ staging, archive_name });
+        defer allocator.free(archive_path);
+        const sig_path = try std.fmt.allocPrint(allocator, "{s}.minisig", .{archive_path});
+        defer allocator.free(sig_path);
+        const sig_url = try std.fmt.allocPrint(allocator, "{s}.minisig", .{url});
+        defer allocator.free(sig_url);
 
-    std.debug.print("  extracting...\n", .{});
-    try extractArchive(allocator, archive_path, staging);
+        std.debug.print("labelle: downloading Zig {s}...\n", .{version});
+        std.debug.print("  url: {s}\n", .{url});
+        try curlDownload(allocator, url, archive_path);
+        try curlDownload(allocator, sig_url, sig_path);
 
-    // The archive unpacks a single `zig-<arch>-<os>-<ver>/` dir. Promote its
-    // contents so the version dir is flat (the #280 seed contract). We extract
-    // with strip-of-leading-component below, so `staging` already holds `zig`,
-    // `lib/`, etc. directly — drop the downloaded archive + sig first.
-    cwd.deleteFile(io, archive_path) catch {};
-    cwd.deleteFile(io, sig_path) catch {};
+        std.debug.print("  verifying signature...\n", .{});
+        verifyArchive(allocator, archive_path, sig_path) catch |err| {
+            std.debug.print("labelle: Zig {s} signature verification FAILED — refusing to install\n", .{version});
+            return err;
+        };
+        std.debug.print("  signature ok\n", .{});
+
+        std.debug.print("  extracting...\n", .{});
+        try extractArchive(allocator, archive_path, staging);
+
+        // The archive unpacks a single `zig-<arch>-<os>-<ver>/` dir. Promote
+        // its contents so the version dir is flat (the #280 seed contract).
+        // `extractArchive` strips the leading component, so `staging` already
+        // holds `zig`, `lib/`, etc. directly — drop the downloaded archive +
+        // sig so only the flattened toolchain is published.
+        cwd.deleteFile(io, archive_path) catch {};
+        cwd.deleteFile(io, sig_path) catch {};
+    }
 
     // Sanity: the binary must exist in staging before we publish.
     const staged_bin = try std.fs.path.join(allocator, &.{ staging, zig_cache.zig_exe_name });
@@ -505,11 +685,18 @@ pub fn verifyMinisign(pub_key_b64: []const u8, file_data: []const u8, sig_text: 
 // ── Extraction ─────────────────────────────────────────────────────────
 
 /// Extract `archive_path` into `dest_dir`, stripping the single leading
-/// `zig-<arch>-<os>-<ver>/` component so `dest_dir` is flat. Unix uses
-/// `tar -xJf --strip-components=1`; Windows uses PowerShell `Expand-Archive`
-/// then flattens the one top-level dir.
+/// `zig-<arch>-<os>-<ver>/` component so `dest_dir` is flat. Dispatch is by
+/// the archive's EXTENSION (not the host): `.zip` → PowerShell `Expand-Archive`
+/// + flatten, everything else → `tar -xJf --strip-components=1`. A downloaded
+/// archive is `.zip` on Windows and `.tar.xz` elsewhere, so this preserves
+/// #279's behavior while letting a #280 seed be unpacked by its real format.
 fn extractArchive(allocator: std.mem.Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
-    if (is_windows) return extractZipWindows(allocator, archive_path, dest_dir);
+    if (std.mem.endsWith(u8, archive_path, ".zip")) return extractZipWindows(allocator, archive_path, dest_dir);
+    return extractTarXz(allocator, archive_path, dest_dir);
+}
+
+/// `tar -xJf <archive> -C <dest> --strip-components=1`.
+fn extractTarXz(allocator: std.mem.Allocator, archive_path: []const u8, dest_dir: []const u8) !void {
     const result = util.runCmd(allocator, &.{
         "tar", "-xJf", archive_path, "-C", dest_dir, "--strip-components=1",
     }) catch {
@@ -865,4 +1052,234 @@ test "verifyMinisign: key_id mismatch is caught before crypto" {
     defer fx.deinit(alloc);
     // Zig's real key has a different key_id than our fixture's {1..8}.
     try testing.expectError(MinisignError.MinisignKeyIdMismatch, verifyMinisign(MINISIGN_PUBLIC_KEY, "x", fx.sig_text));
+}
+
+// ── Seed tests (SUB2 / #280) ───────────────────────────────────────────
+
+/// realPath of a fresh tmp dir into `buf`; returns the slice. Shared setup for
+/// the seed tests, which all need an absolute scratch root to build fixtures in.
+fn tmpBase(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    const n = try tmp.dir.realPath(config.globalIo(), buf);
+    return buf[0..n];
+}
+
+/// Write a zero-byte file at absolute `path` (its parent must exist).
+fn touch(path: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = path, .data = "" });
+}
+
+test "seedAllowedFor: only the DEFAULT version is ever seeded" {
+    try testing.expect(seedAllowedFor(DEFAULT_ZIG_VERSION));
+    try testing.expect(!seedAllowedFor("0.15.2"));
+    try testing.expect(!seedAllowedFor("0.17.0"));
+}
+
+test "seedArchiveName matches the downloaded archive's basename" {
+    const alloc = testing.allocator;
+    const name = try seedArchiveName(alloc, "0.16.0");
+    defer alloc.free(name);
+    const url = try archiveUrl(alloc, "0.16.0");
+    defer alloc.free(url);
+    // The seed a CLI-only distribution ships in `seeds/` is the SAME archive
+    // the download path would fetch — so its name is the URL's basename.
+    try testing.expectEqualStrings(std.fs.path.basename(url), name);
+}
+
+test "resolveSeedArchive: LABELLE_ZIG_SEED path wins when it exists" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf);
+
+    const seed = try std.fs.path.join(alloc, &.{ base, "custom-seed.tar.xz" });
+    defer alloc.free(seed);
+    try touch(seed);
+
+    const got = try resolveSeedArchive(alloc, DEFAULT_ZIG_VERSION, seed, null);
+    defer if (got) |g| alloc.free(g);
+    try testing.expect(got != null);
+    try testing.expectEqualStrings(seed, got.?);
+}
+
+test "resolveSeedArchive: env precedence — env wins over exe seeds/" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf);
+
+    // Env archive.
+    const env_seed = try std.fs.path.join(alloc, &.{ base, "env-seed.tar.xz" });
+    defer alloc.free(env_seed);
+    try touch(env_seed);
+
+    // Also a valid exe-adjacent seeds/<name> — must be ignored while env wins.
+    const name = try seedArchiveName(alloc, DEFAULT_ZIG_VERSION);
+    defer alloc.free(name);
+    const seeds_dir = try std.fs.path.join(alloc, &.{ base, "seeds" });
+    defer alloc.free(seeds_dir);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), seeds_dir);
+    const exe_seed = try std.fs.path.join(alloc, &.{ seeds_dir, name });
+    defer alloc.free(exe_seed);
+    try touch(exe_seed);
+
+    const got = try resolveSeedArchive(alloc, DEFAULT_ZIG_VERSION, env_seed, base);
+    defer if (got) |g| alloc.free(g);
+    try testing.expectEqualStrings(env_seed, got.?);
+}
+
+test "resolveSeedArchive: falls back to seeds/ next to the exe" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf);
+
+    const name = try seedArchiveName(alloc, DEFAULT_ZIG_VERSION);
+    defer alloc.free(name);
+    const seeds_dir = try std.fs.path.join(alloc, &.{ base, "seeds" });
+    defer alloc.free(seeds_dir);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), seeds_dir);
+    const exe_seed = try std.fs.path.join(alloc, &.{ seeds_dir, name });
+    defer alloc.free(exe_seed);
+    try touch(exe_seed);
+
+    // No env; exe_dir = base → resolves to base/seeds/<name>.
+    const got = try resolveSeedArchive(alloc, DEFAULT_ZIG_VERSION, null, base);
+    defer if (got) |g| alloc.free(g);
+    try testing.expectEqualStrings(exe_seed, got.?);
+}
+
+test "resolveSeedArchive: env set but missing falls through (does not fail)" {
+    const alloc = testing.allocator;
+    // Env points at a non-existent archive, no exe seeds/ → null, not an error.
+    const got = try resolveSeedArchive(alloc, DEFAULT_ZIG_VERSION, "/no/such/seed.tar.xz", null);
+    try testing.expect(got == null);
+}
+
+test "resolveSeedArchive: no env + no exe seeds/ -> null (falls through to download)" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf); // exists, but has no seeds/ subdir
+
+    const got = try resolveSeedArchive(alloc, DEFAULT_ZIG_VERSION, null, base);
+    try testing.expect(got == null);
+}
+
+test "resolveSeedSig: env sig wins; else adjacent .minisig; else null" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf);
+
+    const seed = try std.fs.path.join(alloc, &.{ base, "seed.tar.xz" });
+    defer alloc.free(seed);
+    try touch(seed);
+
+    // Unsigned seed → null.
+    try testing.expect((try resolveSeedSig(alloc, seed, null)) == null);
+
+    // Adjacent `<seed>.minisig` → picked up.
+    const adjacent = try std.fmt.allocPrint(alloc, "{s}.minisig", .{seed});
+    defer alloc.free(adjacent);
+    try touch(adjacent);
+    {
+        const got = try resolveSeedSig(alloc, seed, null);
+        defer if (got) |g| alloc.free(g);
+        try testing.expectEqualStrings(adjacent, got.?);
+    }
+
+    // Explicit env sig overrides the adjacent one.
+    const env_sig = try std.fs.path.join(alloc, &.{ base, "explicit.minisig" });
+    defer alloc.free(env_sig);
+    try touch(env_sig);
+    {
+        const got = try resolveSeedSig(alloc, seed, env_sig);
+        defer if (got) |g| alloc.free(g);
+        try testing.expectEqualStrings(env_sig, got.?);
+    }
+}
+
+/// Build a minimal Zig-shaped seed archive (`zig-fixture/zig` + `.../lib/std.zig`)
+/// at `archive_path` using the host `tar`. Returns error.SkipZigTest when tar/xz
+/// is unavailable (or on Windows) so the suite stays green without the tools —
+/// the same tar+xz the download path already depends on.
+fn makeSeedFixture(alloc: std.mem.Allocator, src_dir: []const u8, archive_path: []const u8) !void {
+    if (is_windows) return error.SkipZigTest;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const top = try std.fs.path.join(alloc, &.{ src_dir, "zig-fixture" });
+    defer alloc.free(top);
+    const libdir = try std.fs.path.join(alloc, &.{ top, "lib" });
+    defer alloc.free(libdir);
+    try cwd.createDirPath(io, libdir);
+
+    const zbin = try std.fs.path.join(alloc, &.{ top, "zig" });
+    defer alloc.free(zbin);
+    try cwd.writeFile(io, .{ .sub_path = zbin, .data = "#!/bin/sh\necho 0.16.0\n" });
+    const zstd = try std.fs.path.join(alloc, &.{ libdir, "std.zig" });
+    defer alloc.free(zstd);
+    try cwd.writeFile(io, .{ .sub_path = zstd, .data = "// fixture std\n" });
+
+    const res = util.runCmd(alloc, &.{ "tar", "-cJf", archive_path, "-C", src_dir, "zig-fixture" }) catch return error.SkipZigTest;
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+}
+
+test "ensureInstalledWithSeed: DEFAULT seed extracts to the downloaded layout, no network" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpBase(&tmp, &buf);
+
+    // Build a Zig-shaped seed archive (skips cleanly if tar/xz is absent).
+    const src = try std.fs.path.join(alloc, &.{ base, "src" });
+    defer alloc.free(src);
+    try cwd.createDirPath(io, src);
+    const seed = try std.fs.path.join(alloc, &.{ base, "seed.tar.xz" });
+    defer alloc.free(seed);
+    try makeSeedFixture(alloc, src, seed);
+
+    // Point the shared cache root at <base>/home and install FROM the seed.
+    // No env, no network — the seed path is exercised directly.
+    const home = try std.fs.path.join(alloc, &.{ base, "home" });
+    defer alloc.free(home);
+    asm_cache.setCacheRootOverride(home);
+    defer asm_cache.clearCacheRootOverride();
+
+    try ensureInstalledWithSeed(alloc, DEFAULT_ZIG_VERSION, seed);
+
+    // The published tree must match the EXACT cache paths #279 asserts: the
+    // binary sits directly in the flat version dir, with lib/ beside it.
+    const bin = try zig_cache.binaryPath(alloc, DEFAULT_ZIG_VERSION);
+    defer alloc.free(bin);
+    try cwd.access(io, bin, .{}); // <root>/zig/0.16.0/zig
+
+    const vdir = try zig_cache.versionDir(alloc, DEFAULT_ZIG_VERSION);
+    defer alloc.free(vdir);
+    const lib_std = try std.fs.path.join(alloc, &.{ vdir, "lib", "std.zig" });
+    defer alloc.free(lib_std);
+    try cwd.access(io, lib_std, .{}); // flattened: lib/ directly under the version dir
+
+    // The leading `zig-fixture/` component was stripped — no nested release dir
+    // (this is what makes a seeded tree indistinguishable from a downloaded one).
+    const nested = try std.fs.path.join(alloc, &.{ vdir, "zig-fixture" });
+    defer alloc.free(nested);
+    try testing.expectError(error.FileNotFound, cwd.access(io, nested, .{}));
+
+    // Idempotent: a second call is a no-op fast-path (already installed).
+    try ensureInstalledWithSeed(alloc, DEFAULT_ZIG_VERSION, seed);
 }
