@@ -64,9 +64,25 @@ pub fn buildWasmEnv(allocator: std.mem.Allocator, project_dir: []const u8) !std.
         try allocator.dupe(u8, emscripten_dir);
     defer allocator.free(new_path);
 
+    // Only export EMSDK/EM_CONFIG when the derived `.emscripten` actually
+    // exists (a real activated-emsdk layout). For an escape-hatch emcc that
+    // ISN'T in an emsdk layout (a system `/usr/bin/emcc`, a Homebrew emcc via
+    // LABELLE_EMSDK/--emcc), the derived EMSDK/EM_CONFIG would be bogus paths
+    // (`/`, `/.emscripten`) that BREAK an otherwise self-contained emcc. In
+    // that case wire only PATH and leave any inherited EMSDK/EM_CONFIG intact
+    // (buildZigEnv snapshots the parent env, so they are preserved).
+    const has_config = blk: {
+        std.Io.Dir.cwd().access(config.globalIo(), em_config, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (has_config) {
+        return buildZigEnv(allocator, &.{
+            .{ .key = "EMSDK", .value = emsdk_dir },
+            .{ .key = "EM_CONFIG", .value = em_config },
+            .{ .key = "PATH", .value = new_path },
+        });
+    }
     return buildZigEnv(allocator, &.{
-        .{ .key = "EMSDK", .value = emsdk_dir },
-        .{ .key = "EM_CONFIG", .value = em_config },
         .{ .key = "PATH", .value = new_path },
     });
 }

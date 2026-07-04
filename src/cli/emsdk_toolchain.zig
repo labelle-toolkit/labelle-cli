@@ -177,6 +177,24 @@ fn execStep(allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]cons
 
 // ── Version resolution ─────────────────────────────────────────────────
 
+/// A narrow allowlist for a version token before it is used as a filesystem
+/// path component (cache/lock/staging dir) and a `git clone --branch` ref.
+/// `std.fs.path.join` is lexical only, so a `../` or a separator in a
+/// project-supplied `emsdk_version` could escape `<cache-root>/emsdk/`, and a
+/// leading `-` could be misread as a `git` flag. Accept only
+/// `[0-9A-Za-z._-]`, non-empty, no leading dash, no `..`.
+pub fn isSafeVersion(v: []const u8) bool {
+    if (v.len == 0 or v.len > 64) return false;
+    if (v[0] == '-') return false;
+    if (std.mem.indexOf(u8, v, "..") != null) return false;
+    for (v) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or c == '.' or c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// Map a pinned engine version to its required emsdk version. The toolkit
 /// currently ships on a single emsdk train, so any engine on the 1.x major maps
 /// to `DEFAULT_EMSDK_VERSION`. Returns null for an unrecognized engine so the
@@ -201,10 +219,17 @@ pub fn resolveRequiredVersion(allocator: std.mem.Allocator, project_dir: []const
 
     const manifest = try launcher_manifest.readLauncherManifest(a, project_dir);
 
-    // 3. Explicit emsdk_version pin.
+    // 3. Explicit emsdk_version pin. Reject an unsafe pin (path-traversal /
+    //    git-flag injection) rather than feeding it to the filesystem/git —
+    //    fall through to the engine-derived/default source with a warning.
     if (manifest) |m| {
         if (m.emsdk_version) |v| {
-            if (v.len > 0) return .{ .version = try allocator.dupe(u8, v), .source = .project_pin };
+            if (v.len > 0) {
+                if (isSafeVersion(v)) {
+                    return .{ .version = try allocator.dupe(u8, v), .source = .project_pin };
+                }
+                std.debug.print("labelle: ignoring unsafe emsdk_version pin '{s}' in project.labelle\n", .{v});
+            }
         }
     }
 
@@ -265,6 +290,8 @@ pub fn resolveEmcc(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 
     const emcc_path = try emsdk_cache.emccPath(allocator, resolved.version);
     errdefer allocator.free(emcc_path);
 
+    // The `errdefer` above owns `emcc_path` cleanup on every error return, so
+    // the branches below must NOT free it manually (that would double-free).
     std.Io.Dir.cwd().access(config.globalIo(), emcc_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             ensureInstalled(allocator, resolved.version) catch |dl_err| {
@@ -277,14 +304,10 @@ pub fn resolveEmcc(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 
                     \\    - pin a different emsdk_version in project.labelle
                     \\
                 , .{ resolved.version, resolved.version });
-                allocator.free(emcc_path);
                 return dl_err;
             };
         },
-        else => {
-            allocator.free(emcc_path);
-            return err;
-        },
+        else => return err,
     };
     return emcc_path;
 }
@@ -319,6 +342,13 @@ pub fn resolveEmccIfAvailable(allocator: std.mem.Allocator, project_dir: []const
 /// half-activated emsdk is never observed as installed (mirrors #279's
 /// stage-then-publish scaffold + per-version lock).
 pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void {
+    // Defense-in-depth: `version` reaches path builders + `git clone --branch`
+    // here; reject anything outside the allowlist (also guards the CLI-arg path
+    // via `labelle install emsdk <ver>`).
+    if (!isSafeVersion(version)) {
+        std.debug.print("labelle: invalid emsdk version '{s}' (allowed: letters, digits, '.', '_', '-')\n", .{version});
+        return error.EmsdkInvalidVersion;
+    }
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
@@ -695,6 +725,45 @@ test "resolveEmccIfAvailable: null on a clean cache (no forced download), path o
     const overridden = (try resolveEmccIfAvailable(alloc, root)).?;
     defer alloc.free(overridden);
     try testing.expectEqualStrings("/opt/custom/emcc", overridden);
+}
+
+test "isSafeVersion accepts real versions, rejects traversal / flag injection" {
+    try testing.expect(isSafeVersion("4.0.9"));
+    try testing.expect(isSafeVersion("3.1.50"));
+    try testing.expect(isSafeVersion("tot")); // emsdk supports a 'tot' channel
+    try testing.expect(!isSafeVersion(""));
+    try testing.expect(!isSafeVersion("../evil"));
+    try testing.expect(!isSafeVersion("4.0.9/../.."));
+    try testing.expect(!isSafeVersion("-rf")); // git-flag lookalike
+    try testing.expect(!isSafeVersion("a b"));
+    try testing.expect(!isSafeVersion("x/y"));
+}
+
+test "ensureInstalled rejects an unsafe version before touching git/fs" {
+    const alloc = testing.allocator;
+    setExecOverrideForTest(StepRecorder.exec);
+    defer setExecOverrideForTest(null);
+    StepRecorder.reset();
+    try testing.expectError(error.EmsdkInvalidVersion, ensureInstalled(alloc, "../../etc"));
+    try testing.expect(!StepRecorder.saw_clone);
+}
+
+test "resolveRequiredVersion: an unsafe emsdk_version pin is ignored, not used" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(config.globalIo(), .{
+        .sub_path = "project.labelle",
+        .data = ".{ .name = \"t\", .emsdk_version = \"../evil\", .engine_version = \"1.65.0\" }",
+    });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(config.globalIo(), &buf);
+
+    const r = try resolveRequiredVersion(alloc, buf[0..n]);
+    defer alloc.free(r.version);
+    // Falls through to the engine-derived default, never the unsafe pin.
+    try testing.expectEqualStrings(DEFAULT_EMSDK_VERSION, r.version);
+    try testing.expectEqual(VersionSource.engine_derived, r.source);
 }
 
 test "DEFAULT_EMSDK_COMMIT is a full 40-char git sha" {
