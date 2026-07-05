@@ -1,5 +1,6 @@
 const std = @import("std");
 const project_config = @import("project_config.zig");
+const progress = @import("progress.zig");
 
 /// Validate that declared dependency versions are compatible with each other.
 pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
@@ -9,7 +10,7 @@ pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
     if (cfg.platform == .wasm and cfg.backend != .raylib and cfg.backend != .sokol and cfg.backend != .bgfx) {
         std.debug.print("labelle: error: WASM builds are only supported with raylib, sokol, or bgfx backends (got {s})\n", .{@tagName(cfg.backend)});
         std.debug.print("  hint: set backend = \"raylib\", \"sokol\", or \"bgfx\" in project.labelle\n\n", .{});
-        std.process.exit(1);
+        progress.fatalExit(1);
     }
 
     const is_local = project_config.isLocalVersion;
@@ -63,25 +64,25 @@ fn validateStates(states: []const []const u8) void {
     if (states.len == 0) {
         std.debug.print("labelle: error: .states must contain at least one state\n", .{});
         std.debug.print("  hint: remove .states to use the default (\"running\"), or add at least one state name\n\n", .{});
-        std.process.exit(1);
+        progress.fatalExit(1);
     }
 
     for (states) |name| {
         if (name.len == 0) {
             std.debug.print("labelle: error: state name cannot be empty\n", .{});
-            std.process.exit(1);
+            progress.fatalExit(1);
         }
         // First character must be [a-z_] — digits would produce invalid Zig identifiers in codegen
         if (name[0] >= '0' and name[0] <= '9') {
             std.debug.print("labelle: error: state name \"{s}\" cannot start with a digit\n", .{name});
             std.debug.print("  hint: prefix with a letter (e.g., \"level_1\" not \"1_level\")\n\n", .{});
-            std.process.exit(1);
+            progress.fatalExit(1);
         }
         for (name) |c| {
             if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_')) {
                 std.debug.print("labelle: error: invalid state name \"{s}\" — must be lowercase alphanumeric with underscores [a-z0-9_]\n", .{name});
                 std.debug.print("  hint: rename to a valid identifier (e.g., \"main_menu\" not \"Main Menu\")\n\n", .{});
-                std.process.exit(1);
+                progress.fatalExit(1);
             }
         }
     }
@@ -91,7 +92,7 @@ fn validateStates(states: []const []const u8) void {
         for (states[i + 1 ..]) |other| {
             if (std.mem.eql(u8, name, other)) {
                 std.debug.print("labelle: error: duplicate state name \"{s}\" in .states\n", .{name});
-                std.process.exit(1);
+                progress.fatalExit(1);
             }
         }
     }

@@ -2,8 +2,9 @@
 ///
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path> (raylib picks PNG/BMP by extension); `--` forwards trailing args to the game
-///   labelle build [dir] [--scene=name] [--optimize=MODE] — generate + build (no run)
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path> (raylib picks PNG/BMP by extension); `--` forwards trailing args to the game
+///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] — generate + build (no run)
+///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
@@ -42,6 +43,8 @@ const ios = @import("cli/ios.zig");
 const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
 const pack = @import("cli/pack.zig");
+const progress = @import("cli/progress.zig");
+const status_mod = @import("cli/status.zig");
 const astc_cmd = @import("astc/cmd.zig");
 const audit = @import("cli/audit.zig");
 const migrate = @import("cli/migrate.zig");
@@ -49,7 +52,7 @@ const check = @import("cli/check.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
 
-const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, toolchain_cmd };
+const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, toolchain_cmd, status_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -179,6 +182,12 @@ const ParsedArgs = struct {
     // `std.log.scoped(.profiler)`). Independent of `--headless` — you can
     // profile a windowed run too.
     profile: bool = false,
+    // `--progress=<mode>` (cli#284): how build/run progress is surfaced on
+    // the terminal — `human` (default; spinner on TTY stderr), `json`
+    // (NDJSON records on stdout for studio/CI), or `off`. The live status
+    // file `.labelle/<target>/.build-progress.json` is written in every
+    // mode (that's what `labelle status` reads).
+    progress_mode: progress.Mode = .human,
 };
 
 /// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
@@ -333,6 +342,19 @@ fn parseToolchainFlag(arg: []const u8, args: anytype) ?bool {
     return parseEmccFlag(arg, args);
 }
 
+/// Try to parse `--progress=<mode>` (cli#284). Returns true if consumed,
+/// false if `arg` is not a `--progress` flag, and null on an invalid value.
+fn parseProgressFlag(arg: []const u8, mode: *progress.Mode, cmd_name: []const u8) ?bool {
+    if (!std.mem.startsWith(u8, arg, "--progress=")) return false;
+    const val = arg["--progress=".len..];
+    if (std.meta.stringToEnum(progress.Mode, val)) |m| {
+        mode.* = m;
+        return true;
+    }
+    std.debug.print("labelle {s}: unknown progress mode '{s}' (expected: human, json, off)\n", .{ cmd_name, val });
+    return null;
+}
+
 const valid_optimize_modes = [_][]const u8{ "Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall" };
 
 /// Try to parse --optimize=<value> from an argument. Returns true if consumed,
@@ -362,8 +384,8 @@ fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []const 
     return null;
 }
 
-/// Parse [dir], --scene, --platform, --optimize, --docker, and --target flags for generate/build commands.
-fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool } {
+/// Parse [dir], --scene, --platform, --optimize, --progress, --docker, and --target flags for generate/build commands.
+fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
@@ -372,6 +394,7 @@ fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?str
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
     var bake = false;
+    var progress_mode: progress.Mode = .human;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -382,6 +405,7 @@ fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?str
         }
         if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
         if (parseOptimizeFlag(arg, &optimize, cmd_name) orelse return null) continue;
+        if (parseProgressFlag(arg, &progress_mode, cmd_name) orelse return null) continue;
         if (std.mem.eql(u8, arg, "--docker")) {
             docker_build = true;
             continue;
@@ -414,7 +438,7 @@ fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?str
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode };
 }
 
 /// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
@@ -456,6 +480,9 @@ fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_arg
             if (consumed) continue;
         } else return null;
         if (parseOptimizeFlag(arg, &optimize, cmd_name)) |consumed| {
+            if (consumed) continue;
+        } else return null;
+        if (parseProgressFlag(arg, &parsed_args.progress_mode, cmd_name)) |consumed| {
             if (consumed) continue;
         } else return null;
         if (std.mem.eql(u8, arg, "--docker")) {
@@ -688,6 +715,7 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
             parsed_args.bake = result.bake;
+            parsed_args.progress_mode = result.progress_mode;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return;
@@ -756,6 +784,11 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "toolchain")) {
             // `labelle toolchain list|which` — managed Zig introspection (cli#279).
             parsed_args.command = .toolchain_cmd;
+            try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "status")) {
+            // `labelle status [dir] [--json]` — read the live build-progress
+            // status file from a second shell (cli#284).
+            parsed_args.command = .status_cmd;
             try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "doctor")) {
             parsed_args.command = .doctor_cmd;
@@ -876,6 +909,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .doctor_cmd => return doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .toolchain_cmd => return handleToolchainCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .status_cmd => return status_mod.cmdStatus(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         else => {},
     }
 
@@ -998,6 +1032,44 @@ pub fn main(proc_init: std.process.Init) !void {
         return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     }
 
+    // ── Build-progress feed (cli#284) ──────────────────────────────────
+    // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so
+    // the live status file `.labelle/<target>/.build-progress.json` has a
+    // home from the first `resolve` record onward (the dir is created by
+    // the reporter; the assembler generates into it later).
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), @tagName(parsed.platform) });
+    defer allocator.free(target_name);
+    const target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", target_name });
+    defer allocator.free(target_dir);
+
+    // One event source, three access modes: NDJSON on stdout
+    // (`--progress=json`), the atomically-rewritten status file (all
+    // modes; read by `labelle status` + studio), and a spinner on TTY
+    // stderr (default human mode). Enabled for the commands that run the
+    // shared build pipeline; `labelle generate` and the ios/android
+    // subcommands (which own their own build flows) stay report-free. A
+    // reporter that fails to initialize downgrades to the pre-#284
+    // behavior instead of blocking the build.
+    var reporter_storage: progress.Reporter = undefined;
+    const reporter: ?*progress.Reporter = blk: {
+        if (command != .build and command != .run and command != .wasm_cmd) break :blk null;
+        reporter_storage = progress.Reporter.init(allocator, config.globalIo(), parsed_args.progress_mode, target_dir) catch break :blk null;
+        break :blk &reporter_storage;
+    };
+    defer if (reporter) |r| r.deinit();
+    // Any error path from here on marks the status file `failed`, so an
+    // out-of-band reader never sees a live phase for a dead build.
+    // (Pipeline code that terminates via process-exit instead of an error
+    // return goes through `progress.fatalExit`, which does the same.)
+    errdefer if (reporter) |r| r.failIfActive(1);
+    if (reporter) |r| {
+        // Registers the fatalExit hook + starts the keepalive ticker that
+        // refreshes elapsed/updated timestamps while child processes own
+        // the foreground (assembler, zig, game).
+        r.activate();
+        r.beginPhase(.resolve, "resolving toolchain + packages");
+    }
+
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
 
@@ -1057,6 +1129,7 @@ pub fn main(proc_init: std.process.Init) !void {
     // resolves it. The status line reports whether a GUI is *configured*
     // in project.labelle; the assembler logs the resolved plugin name.
     const gui_label: []const u8 = if (parsed.gui != null) "configured" else "none";
+    if (reporter) |r| r.beginPhase(.generate, "assembler generate");
     std.debug.print("labelle: generating '{s}'...\n", .{parsed.name});
     std.debug.print("  backend: {s}  platform: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
         @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
@@ -1103,11 +1176,8 @@ pub fn main(proc_init: std.process.Init) !void {
         @tagName(parsed.backend),
     );
 
-    // Target subdir: .labelle/raylib_desktop/, etc.
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), @tagName(parsed.platform) });
-    defer allocator.free(target_name);
-    const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
-    defer allocator.free(target_dir);
+    // (`target_name`/`target_dir` — .labelle/raylib_desktop/, etc. — are
+    // computed up front, before the progress reporter init; see cli#284.)
 
     // fixFingerprints runs `zig build` locally per emitted target dir to
     // discover the correct hash. With assembler >=0.14.0 there are two
@@ -1187,10 +1257,31 @@ pub fn main(proc_init: std.process.Init) !void {
     if (optimize_flag) |flag| try zig_args.append(allocator, flag);
 
     if (parsed_args.docker) {
+        // Docker builds get phase-level progress only: the toolchain (and
+        // its progress pipe) lives inside the container.
+        if (reporter) |r| r.beginPhase(.compile, "docker build");
         std.debug.print("labelle: building via docker...\n", .{});
         const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target, effective_optimize);
+        if (reporter) |r| r.clearSpinner();
         if (docker_exit != 0) {
+            if (reporter) |r| r.finishFailed(docker_exit, "docker build failed");
             std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
+            return error.BuildFailed;
+        }
+    } else if (reporter) |r| {
+        // cli#284: spawn `zig build` with Zig's std.Progress IPC pipe
+        // attached — live node names + keepalives flow into the feed
+        // during the compile (see runner.zig for what Zig 0.16 actually
+        // relays), and stdio is inherited so compile errors stream to the
+        // terminal unaltered (nothing is captured or eaten).
+        std.debug.print("labelle: building...\n", .{});
+        r.beginPhase(.compile, "zig build");
+        const build_code = try runner.runZigInheritProgress(allocator, target_dir, zig_args.items, zig_env_ptr, r);
+        // Wipe the spinner line before anything else prints on it.
+        r.clearSpinner();
+        if (build_code != 0) {
+            r.finishFailed(build_code, "zig build failed");
+            std.debug.print("labelle: build failed (exit {d})\n", .{build_code});
             return error.BuildFailed;
         }
     } else {
@@ -1236,12 +1327,16 @@ pub fn main(proc_init: std.process.Init) !void {
             defer allocator.free(apk_path);
             std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
         }
+        if (reporter) |r| r.finishDone(0);
         return;
     }
 
     // Run
     if (parsed.platform == .wasm) {
-        // WASM: serve via local HTTP server + open browser
+        // WASM: serve via local HTTP server + open browser. The build
+        // pipeline is complete here — the serve loop is interactive (runs
+        // until Ctrl+C), so the terminal `done` record lands first.
+        if (reporter) |r| r.finishDone(0);
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
@@ -1249,12 +1344,16 @@ pub fn main(proc_init: std.process.Init) !void {
         try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
+        if (reporter) |r| r.beginPhase(.run, "deploying to iOS Simulator");
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
         try ios.deployToSimulator(allocator, target_dir, parsed);
+        if (reporter) |r| r.finishDone(0);
     } else if (parsed.platform == .android) {
         // Android: deploy to device/emulator
+        if (reporter) |r| r.beginPhase(.run, "deploying to Android");
         std.debug.print("labelle: deploying to Android...\n", .{});
         try android.deployToDevice(allocator, target_dir, parsed, false, .{});
+        if (reporter) |r| r.finishDone(0);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
@@ -1344,6 +1443,7 @@ pub fn main(proc_init: std.process.Init) !void {
             if (parsed_args.docker_target) |t| {
                 std.debug.print("labelle: cannot run cross-compiled binary (target: {s})\n", .{t});
                 std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
+                if (reporter) |r| r.finishDone(0); // build succeeded; run skipped
                 return;
             }
             // The assembler names the desktop binary after the project
@@ -1358,10 +1458,14 @@ pub fn main(proc_init: std.process.Init) !void {
             defer run_args.deinit(allocator);
             try run_args.append(allocator, bin_path);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
+            if (reporter) |r| r.beginPhase(.run, exe_name);
             const run_result = try runner.runZigInheritWithEnv(allocator, project_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
+            // The game ran: the pipeline is `done` even on a nonzero game
+            // exit — the code is carried in the terminal record.
+            if (reporter) |r| r.finishDone(run_result);
         } else {
             // Build, then run the game BINARY DIRECTLY rather than via
             // `zig build run`. `zig build run` launches the game in its own
@@ -1375,8 +1479,13 @@ pub fn main(proc_init: std.process.Init) !void {
             // Build with no timeout (only the run is time-limited); keep the
             // game's cwd at `target_dir` (a target_dir-relative argv[0]) so
             // saves land exactly where `zig build run` put them.
+            // The main compile already ran under the `compile`/`link`
+            // phases above; this re-build is a warm-cache no-op, so it
+            // stays in the compile/link phase — `run` begins when the game
+            // binary is about to spawn.
             const build_result = try runner.runZigInheritWithEnv(allocator, target_dir, zig_args.items, null, env_map_ptr);
             if (build_result != 0) {
+                if (reporter) |r| r.finishFailed(build_result, "zig build failed");
                 std.debug.print("\nlabelle: build failed (exit {d})\n", .{build_result});
                 return;
             }
@@ -1398,10 +1507,14 @@ pub fn main(proc_init: std.process.Init) !void {
             defer run_args.deinit(allocator);
             try run_args.append(allocator, rel_bin);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
+            if (reporter) |r| r.beginPhase(.run, exe_basename);
             const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
+            // The game ran: the pipeline is `done` even on a nonzero game
+            // exit — the code is carried in the terminal record.
+            if (reporter) |r| r.finishDone(run_result);
         }
     }
 }
@@ -1729,6 +1842,18 @@ pub const MigrateDeleteTopLevelKeyBlockCommentSpec = migrate.DeleteTopLevelKeyBl
 // Surface the check-command spec namespace so `zspec.runAll(@This())`
 // walks into it (mirrors the audit/migrate re-exports above).
 pub const CheckParseCheckArgsSpec = check.ParseCheckArgsSpec;
+
+// Surface the build-progress feed specs (cli#284) so
+// `zspec.runAll(@This())` walks into them: the phase state machine,
+// NDJSON encoding, atomic status-file writes, the fake-build reporter
+// pipeline, the std.Progress IPC packet decoder, and `labelle status`
+// formatting.
+pub const ProgressPhaseMachineSpec = progress.PhaseMachineSpec;
+pub const ProgressNdjsonEncodingSpec = progress.NdjsonEncodingSpec;
+pub const ProgressAtomicStatusFileSpec = progress.AtomicStatusFileSpec;
+pub const ProgressReporterPipelineSpec = progress.ReporterPipelineSpec;
+pub const ZigProgressPacketDecodingSpec = @import("cli/zig_progress.zig").PacketDecodingSpec;
+pub const StatusFormatHumanSpec = status_mod.FormatHumanSpec;
 
 pub const ParsePlatformValueSpec = struct {
     pub const valid_platforms = struct {
