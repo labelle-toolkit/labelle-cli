@@ -12,9 +12,10 @@ pub fn printHelp() void {
         \\  add pack <name>      Scaffold a pack (packs/<name>/ + pack.labelle)
         \\  add feature <kind> <name>  Scaffold a feature-unit (kind: need, role, status)
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
-        \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>]  Generate + build the project
-        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--docker] [--target=<t>] [--screenshot=<path> [--after=<dur>]] [--headless] [--uncapped] [--ticks=<N>] [--profile] [-- <args>...]  Generate + build + run (default; `--screenshot` captures one frame; `--headless` runs windowless, `--uncapped` removes the frame sleep, `--ticks=<N>` exits after N frames — last two imply `--headless`; `--profile` enables the engine frame profiler (per-script/per-plugin ms to the log); `--` forwards trailing args to the game)
-        \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open]  Build the WASM target, serve it locally (default port 8080), open the browser
+        \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>]  Generate + build the project (`--progress=json` streams NDJSON progress records on stdout; modes: human, json, off)
+        \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>] [--screenshot=<path> [--after=<dur>]] [--headless] [--uncapped] [--ticks=<N>] [--profile] [-- <args>...]  Generate + build + run (default; `--screenshot` captures one frame; `--headless` runs windowless, `--uncapped` removes the frame sleep, `--ticks=<N>` exits after N frames — last two imply `--headless`; `--profile` enables the engine frame profiler (per-script/per-plugin ms to the log); `--` forwards trailing args to the game)
+        \\  status [dir] [--json]  Print the current/last build progress from .labelle/<target>/.build-progress.json (works from a second shell while a build runs)
+        \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--progress=<m>]  Build the WASM target, serve it locally (default port 8080), open the browser
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  install assembler <ver>  Download and cache an assembler binary
@@ -38,6 +39,9 @@ pub fn printHelp() void {
         \\  labelle run
         \\  labelle run --timeout=30s
         \\  labelle run --scene=settings_menu
+        \\  labelle build --progress=json
+        \\  labelle status
+        \\  labelle status --json
         \\  labelle run --screenshot=/tmp/shot.png --after=2s
         \\  labelle run --headless --uncapped --ticks=600
         \\  labelle run --headless --uncapped --profile

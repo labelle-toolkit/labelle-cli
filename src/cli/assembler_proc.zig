@@ -27,6 +27,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const assembler = @import("assembler.zig");
+const progress = @import("progress.zig");
 
 /// Global floor: every subcommand the CLI delegates needs at least this
 /// protocol (`install`/`clean`/`upgrade` arrived at protocol 2, `init` at
@@ -352,8 +353,11 @@ fn spawnAndWait(
             // proxy for the delegated subcommand — returning a plain
             // `error.AssemblerFailed` would collapse every distinct
             // failure (usage error, config error, build failure) to a
-            // single exit status 1.
-            std.process.exit(code);
+            // single exit status 1. `progress.fatalExit` (cli#284) first
+            // marks any active build-status file `failed` — a bare
+            // process-exit would skip the errdefer that does that and
+            // leave the status file claiming the build is still alive.
+            progress.fatalExit(code);
         },
         else => {
             std.debug.print("labelle: assembler '{s}' terminated abnormally\n", .{exe_path});
