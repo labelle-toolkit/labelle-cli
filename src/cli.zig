@@ -197,17 +197,27 @@ const WasmServeArgs = struct {
     port: u16 = 8080,
     no_build: bool = false,
     no_open: bool = false,
+    // `wasm serve` runs the same resolve→generate→build pipeline as
+    // `labelle build`, so it carries the cli#284 progress feed too (the
+    // reporter marks the pipeline `done` before the interactive serve
+    // loop takes over).
+    progress_mode: progress.Mode = .human,
 };
 
 /// Parse the flags of `labelle wasm serve [dir] [--port <n>]
-/// [--no-build] [--no-open]`. `args` is `anytype` so tests can drive
-/// it with an in-memory `Args.IteratorGeneral`, mirroring
+/// [--no-build] [--no-open] [--progress=<m>]`. `args` is `anytype` so
+/// tests can drive it with an in-memory `Args.IteratorGeneral`, mirroring
 /// `parseRunArgs`.
 fn parseWasmServeArgs(args: anytype) ?WasmServeArgs {
     var result = WasmServeArgs{};
     var dir_set = false;
 
     while (args.next()) |arg| {
+        // Same tri-state idiom as parseRunArgs: consumed → next arg,
+        // not-a-progress-flag → fall through, bad value → parse error.
+        if (parseProgressFlag(arg, &result.progress_mode, "wasm serve")) |consumed| {
+            if (consumed) continue;
+        } else return null;
         if (std.mem.eql(u8, arg, "--no-build")) {
             result.no_build = true;
         } else if (std.mem.eql(u8, arg, "--no-open")) {
@@ -850,7 +860,7 @@ pub fn main(proc_init: std.process.Init) !void {
                 } else {
                     std.debug.print("labelle wasm: missing subcommand\n", .{});
                 }
-                std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open]\n", .{});
+                std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--progress=<m>]\n", .{});
                 return;
             }
             parsed_args.command = .wasm_cmd;
@@ -859,6 +869,7 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.serve_port = result.port;
             parsed_args.serve_no_build = result.no_build;
             parsed_args.serve_no_open = result.no_open;
+            parsed_args.progress_mode = result.progress_mode;
             // `wasm serve` always builds/serves the WASM target.
             parsed_args.platform_override = .wasm;
         } else if (std.mem.eql(u8, first, "assembler")) {
@@ -2117,7 +2128,36 @@ pub const ParseWasmServeArgsSpec = struct {
             try expect.equal(result.port, @as(u16, 8080));
             try expect.equal(result.no_build, false);
             try expect.equal(result.no_open, false);
+            try expect.equal(result.progress_mode, progress.Mode.human);
             try std.testing.expectEqualStrings(".", result.dir);
+        }
+    };
+
+    // cli#284 review follow-up: `wasm serve` runs the same build pipeline,
+    // so `--progress=` must parse here too instead of dying in the
+    // unknown-flag branch.
+    pub const progress_flag = struct {
+        test "--progress=json is accepted and sets the mode" {
+            var iter = testIter("--progress=json");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.progress_mode, progress.Mode.json);
+        }
+
+        test "--progress=off combines with other flags" {
+            var iter = testIter("mygame --port 5000 --progress=off --no-open");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.progress_mode, progress.Mode.off);
+            try expect.equal(result.port, @as(u16, 5000));
+            try expect.equal(result.no_open, true);
+            try std.testing.expectEqualStrings("mygame", result.dir);
+        }
+
+        test "invalid --progress value is rejected" {
+            var iter = testIter("--progress=verbose");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
     };
 
