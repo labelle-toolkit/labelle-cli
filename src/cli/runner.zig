@@ -252,6 +252,13 @@ pub fn runZigInheritWithEnv(
     if (timeout_ns) |ns| {
         state = try std.heap.page_allocator.create(TimeoutState);
         state.?.* = .{ .allocator = std.heap.page_allocator };
+        // If the spawn below fails, the timer thread never comes into
+        // existence to take its ref — drop it here so the function-level
+        // `defer` (LIFO: it runs after this errdefer) releases the LAST ref
+        // and actually frees. No-op once the spawn succeeds: this errdefer
+        // is scoped to this block, so later errors (e.g. `child.wait`)
+        // don't double-release the thread's ref.
+        errdefer state.?.release();
 
         if (is_windows) {
             const win_pid = windows.GetProcessId(child.id.?);
