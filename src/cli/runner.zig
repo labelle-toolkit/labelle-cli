@@ -117,6 +117,20 @@ const windows = if (is_windows) struct {
 
 /// Shared state between the main thread and the timeout thread.
 /// Heap-allocated so it outlives the spawning stack frame.
+///
+/// Allocate it from `std.heap.page_allocator`, NEVER from the CLI's
+/// DebugAllocator: the detached timeout thread is *designed* to be
+/// abandoned mid-sleep at process exit (see `timeoutKillPosix` — it
+/// sleeps out the timeout and then a SIGKILL grace period), so the ref
+/// it holds routinely outlives `main`'s `gpa.deinit()` leak check.
+/// Tracked by the DebugAllocator, that still-referenced state made
+/// EVERY `labelle run --timeout` whose child died on the first SIGTERM
+/// (or exited before the timeout) print a bogus
+/// `error(DebugAllocator): memory address 0x... leaked: (empty stack
+/// trace)` at shutdown — labelle-assembler#558. Page-allocator memory
+/// is invisible to that leak check and is reclaimed by the OS at exit;
+/// when both sides do release in time, the last `release()` still
+/// frees it normally.
 const TimeoutState = struct {
     allocator: std.mem.Allocator,
     timed_out: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -227,13 +241,17 @@ pub fn runZigInheritWithEnv(
         return err;
     };
 
-    // Heap-allocate so the detached thread can safely access it after this function returns
+    // Heap-allocate so the detached thread can safely access it after this
+    // function returns. Page allocator on purpose — the detached thread may
+    // be abandoned still holding its ref at process exit, and the caller's
+    // (Debug)allocator would report that as a shutdown leak (#558); see the
+    // TimeoutState doc comment.
     var state: ?*TimeoutState = null;
     defer if (state) |s| s.release();
 
     if (timeout_ns) |ns| {
-        state = try allocator.create(TimeoutState);
-        state.?.* = .{ .allocator = allocator };
+        state = try std.heap.page_allocator.create(TimeoutState);
+        state.?.* = .{ .allocator = std.heap.page_allocator };
 
         if (is_windows) {
             const win_pid = windows.GetProcessId(child.id.?);
@@ -697,3 +715,27 @@ pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, out
         }
     }
 }
+
+// --- Tests ---
+
+const expect = @import("zspec").expect;
+
+test {
+    @import("zspec").runAll(@This());
+}
+
+pub const TimeoutStateSpec = struct {
+    test "last release frees exactly once" {
+        // Guard for the ref-count contract the #558 fix relies on: two
+        // holders, the LAST `release()` frees. `testing.allocator`'s
+        // per-test leak check fails this test if the final destroy is
+        // ever skipped; a double destroy would trip its double-free
+        // detection. (Production code allocates from `page_allocator`
+        // precisely so an ABANDONED timer-thread ref — process exiting
+        // mid-sleep — is not reported as a shutdown leak.)
+        const s = try std.testing.allocator.create(TimeoutState);
+        s.* = .{ .allocator = std.testing.allocator };
+        s.release(); // timer thread's ref
+        s.release(); // main thread's ref — last one frees
+    }
+};
