@@ -52,13 +52,31 @@ fn activateFetchedEmsdkImpl(allocator: std.mem.Allocator, build_dir: []const u8,
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
-    const pkg = (try locateFetchedEmsdk(allocator, build_dir)) orelse return;
+    const located = (try locateFetchedEmsdk(allocator, build_dir)) orelse return;
+    defer allocator.free(located);
+
+    // Canonicalize to an ABSOLUTE path. `activateStep` sets the child cwd to
+    // `pkg` and execs the launcher (argv[0]); a RELATIVE launcher would resolve
+    // against pkg itself → a nonexistent nested `pkg/<relative>/emsdk` → ENOENT
+    // → activation silently skips and the wasm build still dies with #492. The
+    // common `labelle build --platform wasm` reaches here with a relative
+    // build_dir → relative pkg, so this matters. `located` exists (we just
+    // found it), so realPath resolves. The absolute path also keys the advisory
+    // lock canonically, so relative-vs-absolute spellings share one lock. (F1/F2)
+    const pkg = try cwd.realPathFileAlloc(io, located, allocator);
     defer allocator.free(pkg);
 
     const emcc_path = try std.fs.path.join(allocator, &.{ pkg, emsdk_cache.emcc_relpath });
     defer allocator.free(emcc_path);
-    // Fast path: already activated (emcc present), no lock contention.
-    if (cwd.access(io, emcc_path, .{})) |_| return else |_| {}
+    // `.emscripten` (EM_CONFIG) at the pkg root is the activation-completion
+    // marker: `emsdk install` can create `upstream/.../emcc` before `activate`
+    // writes this file. Treating the checkout as done on `emcc` alone would let
+    // a half-activated (interrupted-after-install) tree fast-path forever while
+    // the build still fails — so the done-check requires BOTH. (F3)
+    const marker_path = try std.fs.path.join(allocator, &.{ pkg, emsdk_cache.em_config_name });
+    defer allocator.free(marker_path);
+    // Fast path: already fully activated (emcc + marker present), no lock.
+    if (isActivated(io, cwd, emcc_path, marker_path)) return;
 
     // Serialize activation of the SAME package across processes with an
     // advisory lock (mirrors `ensureInstalled`): two concurrent `labelle wasm`
@@ -78,7 +96,7 @@ fn activateFetchedEmsdkImpl(allocator: std.mem.Allocator, build_dir: []const u8,
 
     // Double-checked: another process may have finished activating while we
     // were blocked on the lock.
-    if (cwd.access(io, emcc_path, .{})) |_| return else |_| {}
+    if (isActivated(io, cwd, emcc_path, marker_path)) return;
 
     // Zig marks fetched package dirs read-only; `emsdk install` must create
     // `upstream/`, `node/`, `.emscripten` under this tree. Make it writable +
@@ -100,12 +118,23 @@ fn activateFetchedEmsdkImpl(allocator: std.mem.Allocator, build_dir: []const u8,
     std.debug.print("  emsdk activate {s}...\n", .{version});
     try emsdk_toolchain.activateStep(allocator, launcher, pkg, "activate", version);
 
-    // Sanity: emcc must exist now, else the build will still fail — surface why.
-    cwd.access(io, emcc_path, .{}) catch {
-        std.debug.print("labelle: emsdk {s} activated but '{s}' is still missing under {s}\n", .{ version, emsdk_cache.emcc_relpath, pkg });
+    // Sanity: emcc AND the `.emscripten` marker must exist now, else the build
+    // will still fail — surface why.
+    if (!isActivated(io, cwd, emcc_path, marker_path)) {
+        std.debug.print("labelle: emsdk {s} activated but '{s}' or '{s}' is still missing under {s}\n", .{ version, emsdk_cache.emcc_relpath, emsdk_cache.em_config_name, pkg });
         return error.EmsdkActivationIncomplete;
-    };
+    }
     std.debug.print("  emcc ready ({s})\n", .{emcc_path});
+}
+
+/// A checkout is fully activated only when BOTH `emcc` (from `emsdk install`)
+/// AND the `.emscripten` EM_CONFIG marker (from `emsdk activate`) exist — an
+/// interrupted activation can leave `emcc` present with no marker, which must
+/// re-activate rather than fast-path forever. (F3)
+fn isActivated(io: std.Io, cwd: std.Io.Dir, emcc_path: []const u8, marker_path: []const u8) bool {
+    if (std.meta.isError(cwd.access(io, emcc_path, .{}))) return false;
+    if (std.meta.isError(cwd.access(io, marker_path, .{}))) return false;
+    return true;
 }
 
 /// Locate the fetched emsdk package dir — a directory that directly contains
@@ -126,7 +155,20 @@ fn locateFetchedEmsdk(allocator: std.mem.Allocator, build_dir: []const u8) !?[]u
         defer allocator.free(gc);
         const root = try std.fs.path.join(allocator, &.{ gc, "p" });
         defer allocator.free(root);
-        if (try findEmsdkUnder(allocator, root)) |p| return p;
+        if (try findEmsdkUnder(allocator, root)) |p| {
+            // Heuristic fallback: this is the FIRST emsdk-shaped dir under the
+            // global cache, not necessarily the one THIS target's generated
+            // build.zig.zon references (could be an older/unrelated checkout).
+            // Project-local zig-pkg/ (searched above) is what the generated
+            // build + studio acceptance actually use, so this only bites
+            // unusual layouts — warn loudly. Precise match tracked in
+            // labelle-cli#294. (F4)
+            std.debug.print(
+                "labelle: no project-local emsdk under <build_dir>/zig-pkg; falling back to a heuristic pick from the global package cache ({s}) — if the wasm build activates the wrong emsdk, see labelle-cli#294\n",
+                .{p},
+            );
+            return p;
+        }
     } else |_| {}
     return null;
 }
@@ -192,11 +234,22 @@ const StepRecorder = struct {
     var saw_clone: bool = false;
     var saw_install: bool = false;
     var saw_activate: bool = false;
+    /// The launcher (argv[0], or argv[2] under the Windows `cmd /c` wrapper)
+    /// the last step exec'd with — captured so a test can assert it is an
+    /// ABSOLUTE path (the child cwd is `pkg`, so a relative launcher fails to
+    /// resolve). Owned by `page_allocator`; freed/replaced on the next exec.
+    var last_launcher: ?[]u8 = null;
+    /// When true, `activate` writes only `emcc` and NOT the `.emscripten`
+    /// marker — simulating an activation interrupted after `install`. (F3)
+    var skip_marker: bool = false;
 
     fn reset() void {
         saw_clone = false;
         saw_install = false;
         saw_activate = false;
+        if (last_launcher) |l| std.heap.page_allocator.free(l);
+        last_launcher = null;
+        skip_marker = false;
     }
 
     fn exec(allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!emsdk_toolchain.ExecResult {
@@ -204,6 +257,13 @@ const StepRecorder = struct {
             if (std.mem.eql(u8, a, "clone")) saw_clone = true;
             if (std.mem.eql(u8, a, "install")) saw_install = true;
             if (std.mem.eql(u8, a, "activate")) saw_activate = true;
+        }
+        // Launcher is argv[2] under the Windows `cmd /c <launcher>` wrapper,
+        // argv[0] otherwise.
+        const launcher_idx: usize = if (is_windows and argv.len >= 3 and std.mem.eql(u8, argv[0], "cmd")) 2 else 0;
+        if (argv.len > launcher_idx) {
+            if (last_launcher) |l| std.heap.page_allocator.free(l);
+            last_launcher = try std.heap.page_allocator.dupe(u8, argv[launcher_idx]);
         }
         if (saw_activate) {
             const dir = cwd orelse return .{ .exit_code = 1 };
@@ -214,6 +274,14 @@ const StepRecorder = struct {
             const emcc = try std.fs.path.join(allocator, &.{ em_dir, emsdk_cache.emcc_name });
             defer allocator.free(emcc);
             std.Io.Dir.cwd().writeFile(io, .{ .sub_path = emcc, .data = "#!/bin/sh\n" }) catch {};
+            // Real `emsdk activate` also writes the `.emscripten` EM_CONFIG
+            // marker at the emsdk root; mirror that so the done-check + the
+            // idempotent fast path see what a real activation produces. (F3)
+            if (!skip_marker) {
+                const marker = try std.fs.path.join(allocator, &.{ dir, emsdk_cache.em_config_name });
+                defer allocator.free(marker);
+                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = "# emscripten config\n" }) catch {};
+            }
         }
         return .{ .exit_code = 0 };
     }
@@ -321,6 +389,94 @@ test "activateFetchedEmsdk ignores an unsafe version without running any step" {
 
     // Unsafe version rejected before spawning `emsdk` (guarded, non-fatal).
     activateFetchedEmsdk(alloc, build_dir, "../../etc");
+    try testing.expect(!StepRecorder.saw_install);
+    try testing.expect(!StepRecorder.saw_activate);
+}
+
+test "activateFetchedEmsdk canonicalizes a RELATIVE build_dir to an absolute launcher (F1 regression)" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    // Save + restore the process cwd around the chdir this test needs to make
+    // `build_dir` genuinely relative. Hold the original cwd as a dir handle
+    // (the special cwd() handle can't realPath) and fchdir back. The restore
+    // defer is registered AFTER tmp.cleanup, so (LIFO) cwd is restored before
+    // the tmp tree is deleted.
+    var orig_dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer orig_dir.close(io);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+    StepRecorder.reset();
+    emsdk_toolchain.setExecOverrideForTest(StepRecorder.exec);
+    defer emsdk_toolchain.setExecOverrideForTest(null);
+
+    // Stage the fetched pkg under an ABSOLUTE build dir first...
+    const abs_build_dir = try std.fs.path.join(alloc, &.{ root, "build" });
+    defer alloc.free(abs_build_dir);
+    const pkg = try stageFetchedEmsdkPkg(alloc, abs_build_dir);
+    defer alloc.free(pkg);
+
+    // ...then chdir into `root` and drive activation with a RELATIVE build_dir,
+    // exactly like `labelle build --platform wasm` from a project directory.
+    try std.process.setCurrentPath(io, root);
+    activateFetchedEmsdk(alloc, "build", DEFAULT_EMSDK_VERSION);
+
+    // Pre-fix, the launcher exec'd was the RELATIVE `build/zig-pkg/.../emsdk`,
+    // which the child (cwd=pkg) resolved against pkg → ENOENT → silent skip
+    // (no steps ran). The fix canonicalizes pkg to absolute, so the launcher is
+    // absolute and resolves regardless of the child cwd.
+    try testing.expect(StepRecorder.saw_install);
+    try testing.expect(StepRecorder.saw_activate);
+    try testing.expect(StepRecorder.last_launcher != null);
+    try testing.expect(std.fs.path.isAbsolute(StepRecorder.last_launcher.?));
+}
+
+test "activateFetchedEmsdk re-activates a half-activated checkout (emcc present, .emscripten absent) (F3 regression)" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+    StepRecorder.reset();
+    emsdk_toolchain.setExecOverrideForTest(StepRecorder.exec);
+    defer emsdk_toolchain.setExecOverrideForTest(null);
+
+    const build_dir = try std.fs.path.join(alloc, &.{ root, "build" });
+    defer alloc.free(build_dir);
+    const pkg = try stageFetchedEmsdkPkg(alloc, build_dir);
+    defer alloc.free(pkg);
+
+    // Simulate an activation interrupted after `install`: `emcc` exists but the
+    // `.emscripten` EM_CONFIG marker was never written.
+    const em_dir = try std.fs.path.join(alloc, &.{ pkg, "upstream", "emscripten" });
+    defer alloc.free(em_dir);
+    try std.Io.Dir.cwd().createDirPath(io, em_dir);
+    const emcc = try std.fs.path.join(alloc, &.{ em_dir, emsdk_cache.emcc_name });
+    defer alloc.free(emcc);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = emcc, .data = "#!/bin/sh\n" });
+
+    // Pre-fix (emcc-only done-check) this fast-paths as "done" and runs no
+    // steps; post-fix the missing marker forces a re-activation.
+    activateFetchedEmsdk(alloc, build_dir, DEFAULT_EMSDK_VERSION);
+    try testing.expect(StepRecorder.saw_install);
+    try testing.expect(StepRecorder.saw_activate);
+
+    // The re-activation wrote the marker, so the NEXT call fast-paths (both
+    // emcc and `.emscripten` present now).
+    StepRecorder.reset();
+    activateFetchedEmsdk(alloc, build_dir, DEFAULT_EMSDK_VERSION);
     try testing.expect(!StepRecorder.saw_install);
     try testing.expect(!StepRecorder.saw_activate);
 }
