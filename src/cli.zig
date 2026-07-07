@@ -36,6 +36,7 @@ const assembler = @import("cli/assembler.zig");
 const assembler_proc = @import("cli/assembler_proc.zig");
 const zig_toolchain = @import("cli/zig_toolchain.zig");
 const emsdk_toolchain = @import("cli/emsdk_toolchain.zig");
+const emsdk_activate = @import("cli/emsdk_activate.zig");
 const bake_mod = @import("cli/bake.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
@@ -1217,6 +1218,22 @@ pub fn main(proc_init: std.process.Init) !void {
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     std.debug.print("  generated .labelle/{s}/\n", .{target_name});
 
+    // For a wasm build: activate the emsdk checkout Zig just fetched into the
+    // project-local `zig-pkg/` (during the fingerprint pass above) so the emcc
+    // link step finds `upstream/emscripten/emcc`. Without this a fresh
+    // `labelle build --platform wasm` — or `generate --platform wasm` followed
+    // by a manual `zig build` — dies at the emcc step because the fetched emsdk
+    // package is NOT activated: the remaining half of labelle-assembler#492 (the
+    // docker path already does this in-container). Run it BEFORE the `generate`
+    // early-return so the generate-then-build path is covered too. Best-effort +
+    // idempotent; on failure the build still surfaces the clear #492 guidance.
+    // The PINNED version keeps activation deterministic.
+    if (!parsed_args.docker and parsed.platform == .wasm) {
+        const resolved_emsdk = try emsdk_toolchain.resolveRequiredVersion(allocator, project_dir);
+        defer allocator.free(resolved_emsdk.version);
+        emsdk_activate.activateFetchedEmsdk(allocator, target_dir, resolved_emsdk.version);
+    }
+
     if (command == .generate) return;
 
     // `labelle ios` subcommand — handles its own build/xcode/run
@@ -1249,9 +1266,10 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Build a base env for child `zig` that pins ZIG_*_CACHE_DIR into the
     // labelle cache tree (user-writable, never next to a read-only install).
-    // For a wasm build, also fetch + **activate** the managed emsdk and layer
-    // its EMSDK/EM_CONFIG/PATH wiring on top (labelle-cli#283) so `emcc`
-    // resolves to the managed toolchain, never a PATH `emcc`.
+    // For a wasm build, ALSO layer the managed emsdk's EMSDK/EM_CONFIG/PATH
+    // wiring on top when one is already provisioned (labelle-cli#283) — an
+    // escape hatch for builds/backends that resolve `emcc` via PATH/env rather
+    // than the fetched package activated just above.
     var zig_env_storage: ?std.process.Environ.Map = if (parsed_args.docker)
         null
     else if (parsed.platform == .wasm)

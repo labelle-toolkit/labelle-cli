@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xa3d95bf7b905a401,
     .name = .labelle_cli,
-    .version = "1.51.0",
+    .version = "1.55.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Issue #217: labelle-cli is a thin driver over the standalone

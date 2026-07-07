@@ -437,8 +437,10 @@ pub fn ensureInstalled(allocator: std.mem.Allocator, version: []const u8) !void 
 }
 
 /// Invoke the emsdk launcher for a subcommand (`install`/`activate`) in `dir`.
-/// On Windows the launcher is a `.bat`, so it runs through `cmd /c`.
-fn activateStep(allocator: std.mem.Allocator, launcher: []const u8, dir: []const u8, subcmd: []const u8, version: []const u8) !void {
+/// On Windows the launcher is a `.bat`, so it runs through `cmd /c`. Public so
+/// `emsdk_activate.zig` can reuse it (and the shared test exec seam) to activate
+/// the FETCHED zig-package emsdk in place.
+pub fn activateStep(allocator: std.mem.Allocator, launcher: []const u8, dir: []const u8, subcmd: []const u8, version: []const u8) !void {
     if (is_windows) {
         try execStep(allocator, &.{ "cmd", "/c", launcher, subcmd, version }, dir);
     } else {
