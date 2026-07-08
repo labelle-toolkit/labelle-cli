@@ -191,18 +191,34 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # R2's S3 API needs a region for the AWS CLI to initialise (#297).
+          AWS_DEFAULT_REGION: auto
+          # aws v2 (the preinstalled CLI) sends integrity checksums that R2
+          # rejects; `when_required` restricts them to operations that
+          # actually need them. Without these, dropping the pip v1 install
+          # below swaps a PEP-668 failure for a checksum-rejection failure.
+          # Same settings labelle-studio's working R2 upload uses.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
-          pip install awscli
+          # Use the aws CLI preinstalled on ubuntu-latest (v2). NOT
+          # `pip install awscli` — that installs v1 into the system Python
+          # and fails on PEP-668 (externally-managed-environment) once the
+          # runner image enforces it, breaking the release before any
+          # upload runs (#297). Higher-stakes than the assembler's mirror
+          # of this bug: studio has no GitHub fallback for the CLI sidecar,
+          # so a CLI R2 outage is user-visible in every bundle build.
           VERSION=${GITHUB_REF#refs/tags/}
-          
+
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            file=$(ls "$dir")
-            aws s3 cp "$dir$file" "s3://$R2_BUCKET/cli/$VERSION/$name" \
-              --endpoint-url $R2_ENDPOINT
+            for file in "$dir"*; do
+              aws s3 cp "$file" "s3://$R2_BUCKET/cli/$VERSION/$name" \
+                --endpoint-url "$R2_ENDPOINT"
+            done
           done
-          
+
           echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/cli/latest.txt" \
-            --endpoint-url $R2_ENDPOINT
-          
+            --endpoint-url "$R2_ENDPOINT"
+
           echo "Released $VERSION to R2"
