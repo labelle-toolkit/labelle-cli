@@ -4,6 +4,7 @@ const assembler = @import("assembler.zig");
 const config = @import("config.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const util = @import("util.zig");
+const update_check = @import("update_check.zig");
 
 /// Bump version fields in project.labelle.
 ///
@@ -22,6 +23,18 @@ const UpgradeArgs = struct {
     /// than what the project currently pins (downgrades are skipped
     /// without it).
     force: bool,
+    /// `--check` — report current pins vs latest WITHOUT touching
+    /// project.labelle (labelle-cli#276).
+    check: bool,
+    /// `--json` — machine-readable output; implies `--check` (a tool asking
+    /// for JSON must never trigger a mutating upgrade).
+    json: bool,
+
+    /// True when the invocation is a read-only pin check rather than a
+    /// version bump.
+    fn reportOnly(self: UpgradeArgs) bool {
+        return self.check or self.json;
+    }
 
     fn deinit(self: *UpgradeArgs, allocator: std.mem.Allocator) void {
         self.positionals.deinit(allocator);
@@ -38,14 +51,29 @@ fn parseUpgradeArgs(allocator: std.mem.Allocator, cmd_args: []const []const u8) 
     var positionals: std.ArrayList([]const u8) = .empty;
     errdefer positionals.deinit(allocator);
     var force = false;
+    var check = false;
+    var json = false;
     for (cmd_args) |a| {
         if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) {
             force = true;
+        } else if (std.mem.eql(u8, a, "--check")) {
+            check = true;
+        } else if (std.mem.eql(u8, a, "--json")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Reject unknown flags rather than treating them as a package /
+            // version positional — a typo like `--chek` must not slip past
+            // the read-only `--check` guard into the mutating upgrade path
+            // (CodeRabbit, PR #299). Symmetric with parseUpdateArgs; the
+            // errdefer above frees `positionals` on this early return.
+            std.debug.print("labelle upgrade: unknown flag '{s}'\n", .{a});
+            std.debug.print("  usage: labelle upgrade [dir] [pkg] [ver] [--check] [--json] [--force]\n", .{});
+            return error.InvalidArguments;
         } else {
             try positionals.append(allocator, a);
         }
     }
-    return .{ .positionals = positionals, .force = force };
+    return .{ .positionals = positionals, .force = force, .check = check, .json = json };
 }
 
 pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig, cmd_args: []const []const u8) !void {
@@ -53,6 +81,13 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
     defer parsed_args.deinit(allocator);
     const args = parsed_args.positionals.items;
     const force = parsed_args.force;
+
+    // Read-only pin check (labelle-cli#276): report current pins vs the
+    // versions this CLI targets WITHOUT rewriting project.labelle. `--json`
+    // implies `--check`, so a machine consumer never triggers a mutation.
+    if (parsed_args.reportOnly()) {
+        return cmdUpgradeCheck(allocator, project_dir, cfg, parsed_args.json);
+    }
 
     // Subcommand is the first positional (flags already stripped), so
     // `--force` may appear before or after it.
@@ -128,6 +163,64 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
 
     std.debug.print("labelle: project.labelle updated\n", .{});
     std.debug.print("  run 'labelle generate' to regenerate build files\n", .{});
+}
+
+/// `labelle upgrade [dir] --check [--json]` (labelle-cli#276): report the
+/// project's current pins vs the versions this CLI targets (its bundled
+/// compatible set — the same set `upgrade all` would apply) WITHOUT touching
+/// project.labelle. This is a read-only mode over what `upgrade` already
+/// knows; no network is required.
+///
+/// `latest` sources (all baked into this CLI at build time):
+///   - core/engine/gfx → versions.zon (`project_config.*_VERSION`)
+///   - labelle         → this CLI's own version (`CLI_VERSION`)
+///   - assembler       → `DEFAULT_ASSEMBLER_VERSION`
+///   - plugins         → unknown (the CLI has no plugin-latest registry); the
+///                       pin is still reported so studio can display it.
+///
+/// Emits `{ "cli": null, "packages": [...] }` under `--json` (studio#7).
+/// Exits 2 when any pin is behind its target, else 0.
+fn cmdUpgradeCheck(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    cfg: project_config.ProjectConfig,
+    json: bool,
+) !void {
+    var packages: std.ArrayList(update_check.PackageStatus) = .empty;
+    errdefer packages.deinit(allocator);
+
+    // Order mirrors the issue: core/engine/gfx/assembler/labelle + plugins.
+    try packages.append(allocator, update_check.packageStatus("core", cfg.core_version, project_config.CORE_VERSION));
+    try packages.append(allocator, update_check.packageStatus("engine", cfg.engine_version, project_config.ENGINE_VERSION));
+    try packages.append(allocator, update_check.packageStatus("gfx", cfg.gfx_version, project_config.GFX_VERSION));
+    try packages.append(allocator, update_check.packageStatus("labelle", cfg.labelle_version, project_config.CLI_VERSION));
+    try packages.append(allocator, update_check.packageStatus("assembler", cfg.assembler_version, assembler.DEFAULT_ASSEMBLER_VERSION));
+    for (cfg.plugins) |p| {
+        // Empty version string → not pinned to a specific version.
+        const pinned: ?[]const u8 = if (p.version.len > 0) p.version else null;
+        // The CLI can't resolve a plugin's latest offline, so `latest` is
+        // null (checked=false); the pin is still surfaced for studio.
+        var status = update_check.packageStatus(p.name, pinned, null);
+        // A `local:`/`@` plugin repo is a dev override — flag it distinctly
+        // so studio can tell "local checkout" from "remote, latest unknown".
+        if (p.isLocal()) status.@"error" = update_check.err_local_override;
+        try packages.append(allocator, status);
+    }
+
+    const report = update_check.Report{ .cli = null, .packages = packages.items };
+
+    var out_buf: [8192]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(config.globalIo(), &out_buf);
+    if (json) {
+        update_check.writeJson(&w.interface, report) catch {};
+    } else {
+        update_check.writeHumanPackages(&w.interface, project_dir, packages.items) catch {};
+    }
+    w.interface.flush() catch {};
+
+    const code = update_check.exitCode(report);
+    packages.deinit(allocator); // free before a possible std.process.exit
+    if (code != 0) std.process.exit(code);
 }
 
 /// Resolve the version to apply for one field of `upgrade all`.
@@ -270,4 +363,49 @@ test "pickTarget guards assembler_version downgrade" {
     // Regression: `upgrade all` must route assembler_version through the
     // same guard so a newer assembler pin is not silently downgraded.
     try testing.expectEqualStrings("0.40.0", pickTarget("assembler_version", "0.40.0", assembler.DEFAULT_ASSEMBLER_VERSION, false));
+}
+
+test "parseUpgradeArgs strips --check and reports report-only mode" {
+    var parsed = try parseUpgradeArgs(testing.allocator, &.{"--check"});
+    defer parsed.deinit(testing.allocator);
+    try testing.expect(parsed.check);
+    try testing.expect(!parsed.json);
+    try testing.expect(parsed.reportOnly());
+    try testing.expectEqual(@as(usize, 0), parsed.positionals.items.len);
+}
+
+test "parseUpgradeArgs: --json implies report-only" {
+    var parsed = try parseUpgradeArgs(testing.allocator, &.{"--json"});
+    defer parsed.deinit(testing.allocator);
+    try testing.expect(parsed.json);
+    try testing.expect(parsed.reportOnly());
+}
+
+test "parseUpgradeArgs strips --check/--json but keeps subcommand positional" {
+    // `upgrade all --check --json` must leave `all` as the sole positional
+    // so the (short-circuited) subcommand path never sees the flags.
+    var parsed = try parseUpgradeArgs(testing.allocator, &.{ "all", "--check", "--json" });
+    defer parsed.deinit(testing.allocator);
+    try testing.expect(parsed.check and parsed.json);
+    try testing.expectEqual(@as(usize, 1), parsed.positionals.items.len);
+    try testing.expectEqualStrings("all", parsed.positionals.items[0]);
+}
+
+test "parseUpgradeArgs: --force is independent of report-only" {
+    var parsed = try parseUpgradeArgs(testing.allocator, &.{"--force"});
+    defer parsed.deinit(testing.allocator);
+    try testing.expect(parsed.force);
+    try testing.expect(!parsed.reportOnly());
+}
+
+test "parseUpgradeArgs rejects an unknown flag instead of taking it as a positional" {
+    // Without the reject branch `--jso` becomes a positional and the
+    // command proceeds to the mutating path — CodeRabbit PR #299.
+    try testing.expectError(error.InvalidArguments, parseUpgradeArgs(testing.allocator, &.{"--jso"}));
+}
+
+test "parseUpgradeArgs rejects an unknown flag even before a valid subcommand" {
+    // `--chek all` must not run the mutating `upgrade all`; the typo is
+    // rejected before the subcommand is ever reached.
+    try testing.expectError(error.InvalidArguments, parseUpgradeArgs(testing.allocator, &.{ "--chek", "all" }));
 }
