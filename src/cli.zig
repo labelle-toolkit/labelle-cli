@@ -11,8 +11,8 @@
 ///   labelle install [pkg] [ver]         — fetch packages into cache
 ///   labelle install assembler <ver>    — download and cache an assembler binary
 ///   labelle assembler list             — list cached assembler versions
-///   labelle upgrade [dir] [pkg] [ver]   — bump versions in project.labelle
-///   labelle update [ver]                — self-update the CLI
+///   labelle upgrade [dir] [pkg] [ver] [--check] [--json]  — bump versions in project.labelle; `--check`/`--json` report pins vs latest read-only (labelle-cli#276)
+///   labelle update [ver] [--check] [--json]  — self-update the CLI; `--check`/`--json` report installed vs latest read-only (labelle-cli#276)
 ///   labelle clean [--dry-run]           — prune unused package versions
 ///   labelle test [dir] [--verbose]      — run inline `test` blocks across the project source tree
 ///   labelle check [dir]                 — lint packs for §6 convention violations (Packs RFC)
@@ -26,6 +26,7 @@ const add = @import("cli/add.zig");
 const install = @import("cli/install.zig");
 const upgrade = @import("cli/upgrade.zig");
 const update = @import("cli/update.zig");
+const update_check = @import("cli/update_check.zig");
 const clean = @import("cli/clean.zig");
 const test_cmd_mod = @import("cli/test.zig");
 const config = @import("cli/config.zig");
@@ -748,8 +749,22 @@ pub fn main(proc_init: std.process.Init) !void {
             try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "upgrade")) {
             parsed_args.command = .upgrade_cmd;
-            if (args.next()) |next_arg| {
-                if (std.mem.eql(u8, next_arg, "core") or
+            // Grammar: `upgrade [dir] [flags] [<subcommand> [args...]]`.
+            // Flags (`--check`/`--json`/`--force`/`-f`) may appear anywhere;
+            // the first bare non-subcommand token is the project dir; once a
+            // subcommand is seen, the remaining tokens are its args. A
+            // leading-dash token must NEVER be captured as the project dir —
+            // otherwise `upgrade --check` would send `--check` to
+            // readProjectConfig and bail before the check runs (this also
+            // fixes the same latent bug for a leading `--force`).
+            var seen_subcommand = false;
+            var dir_set = false;
+            while (args.next()) |next_arg| {
+                if (std.mem.startsWith(u8, next_arg, "-")) {
+                    try appendExtraArg(&parsed_args, next_arg);
+                } else if (seen_subcommand) {
+                    try appendExtraArg(&parsed_args, next_arg);
+                } else if (std.mem.eql(u8, next_arg, "core") or
                     std.mem.eql(u8, next_arg, "engine") or
                     std.mem.eql(u8, next_arg, "gfx") or
                     std.mem.eql(u8, next_arg, "cli") or
@@ -758,11 +773,14 @@ pub fn main(proc_init: std.process.Init) !void {
                     std.mem.eql(u8, next_arg, "all"))
                 {
                     try appendExtraArg(&parsed_args, next_arg);
-                } else {
+                    seen_subcommand = true;
+                } else if (!dir_set) {
                     parsed_args.project_dir = next_arg;
+                    dir_set = true;
+                } else {
+                    try appendExtraArg(&parsed_args, next_arg);
                 }
             }
-            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "update")) {
             parsed_args.command = .update_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -1871,6 +1889,14 @@ pub const MigrateDeleteTopLevelKeyBlockCommentSpec = migrate.DeleteTopLevelKeyBl
 // Surface the check-command spec namespace so `zspec.runAll(@This())`
 // walks into it (mirrors the audit/migrate re-exports above).
 pub const CheckParseCheckArgsSpec = check.ParseCheckArgsSpec;
+
+// Surface the machine-readable update/upgrade `--check`/`--json` specs
+// (labelle-cli#276) so `zspec.runAll(@This())` walks into them.
+pub const UpdateCheckCliStatusSpec = update_check.CliStatusSpec;
+pub const UpdateCheckPackageStatusSpec = update_check.PackageStatusSpec;
+pub const UpdateCheckExitCodeSpec = update_check.ExitCodeSpec;
+pub const UpdateCheckJsonShapeSpec = update_check.JsonShapeSpec;
+pub const UpdateParseArgsSpec = update.ParseUpdateArgsSpec;
 
 // Surface the build-progress feed specs (cli#284) so
 // `zspec.runAll(@This())` walks into them: the phase state machine,

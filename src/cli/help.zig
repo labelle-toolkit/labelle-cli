@@ -20,8 +20,8 @@ pub fn printHelp() void {
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  install assembler <ver>  Download and cache an assembler binary
         \\  assembler list       List cached assembler versions
-        \\  upgrade [dir] [pkg] [ver]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all)
-        \\  update [ver] [--no-path]  Update the labelle CLI itself
+        \\  upgrade [dir] [pkg] [ver] [--check] [--json]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all); `--check` reports pins vs latest WITHOUT writing (exit 2 = updates available), `--json` emits a machine-readable report (implies --check)
+        \\  update [ver] [--no-path] [--check] [--json]  Update the labelle CLI itself; `--check` reports installed vs latest WITHOUT installing (exit 2 = update available), `--json` emits a machine-readable report (implies --check)
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
         \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
         \\  audit unification [dir]  Pre-flight check for the unified scene/prefab loader (RFC #560)
@@ -59,6 +59,10 @@ pub fn printHelp() void {
         \\  labelle run -- --preview-mode 127.0.0.1:54321
         \\  labelle install 0.2.0
         \\  labelle upgrade core 0.2.0
+        \\  labelle update --check
+        \\  labelle update --check --json
+        \\  labelle upgrade --check
+        \\  labelle upgrade --check --json
         \\  labelle test
         \\  labelle test ../my-game --verbose
         \\  labelle test --no-libs

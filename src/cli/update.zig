@@ -3,20 +3,110 @@ const project_config = @import("project_config.zig");
 const asm_cache = @import("asm_cache.zig");
 const util = @import("util.zig");
 const config = @import("config.zig");
+const update_check = @import("update_check.zig");
+
+/// Release server that hosts the CLI binaries + `latest.txt`.
+const r2_base_url = "https://releases.labelle.games/cli";
+
+/// Parsed `update` flags. `--check`/`--json` select the read-only,
+/// machine-readable reporting mode (labelle-cli#276); `--json` implies
+/// `--check` so a tool asking for JSON never triggers a mutating install.
+const UpdateArgs = struct {
+    skip_path: bool = false,
+    check: bool = false,
+    json: bool = false,
+    version_arg: ?[]const u8 = null,
+
+    /// True when the invocation is a read-only version check rather than a
+    /// self-update install.
+    fn reportOnly(self: UpdateArgs) bool {
+        return self.check or self.json;
+    }
+};
+
+fn parseUpdateArgs(cmd_args: []const []const u8) UpdateArgs {
+    var out = UpdateArgs{};
+    for (cmd_args) |arg| {
+        if (std.mem.eql(u8, arg, "--no-path")) {
+            out.skip_path = true;
+        } else if (std.mem.eql(u8, arg, "--check")) {
+            out.check = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            out.json = true;
+        } else {
+            out.version_arg = arg;
+        }
+    }
+    return out;
+}
+
+/// Fetch the newest published CLI version from the R2 release server.
+/// Returns an owned, trimmed version string (leading `v` stripped), or
+/// `null` on any failure (curl missing, network error, HTTP error, empty
+/// body). Read-only — never downloads a binary.
+fn fetchLatestCliVersion(allocator: std.mem.Allocator) ?[]u8 {
+    const latest_url = r2_base_url ++ "/latest.txt";
+    const result = util.runCmd(allocator, &.{ "curl", "-s", "-f", latest_url }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    var latest = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    if (std.mem.startsWith(u8, latest, "v")) latest = latest[1..];
+    if (latest.len == 0) return null;
+    return allocator.dupe(u8, latest) catch null;
+}
+
+/// `labelle update --check [--json]` (labelle-cli#276): report the running
+/// CLI version vs the newest published release WITHOUT installing anything.
+/// Emits `{ "cli": {...}, "packages": [] }` under `--json` (studio#7) or a
+/// human line otherwise. Exits 2 when an update is available, else 0.
+fn cmdUpdateCheck(allocator: std.mem.Allocator, version_arg: ?[]const u8, json: bool) !void {
+    // `latest` is either an explicit version arg (borrowed from argv) or a
+    // fetched owned string; track ownership so we free only what we alloc.
+    var latest_owned: ?[]u8 = null;
+    defer if (latest_owned) |l| allocator.free(l);
+    const latest: ?[]const u8 = version_arg orelse blk: {
+        latest_owned = fetchLatestCliVersion(allocator);
+        break :blk latest_owned;
+    };
+
+    const cli = update_check.cliStatus(project_config.CLI_VERSION, latest);
+    const report = update_check.Report{ .cli = cli };
+
+    var out_buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(config.globalIo(), &out_buf);
+    if (json) {
+        update_check.writeJson(&w.interface, report) catch {};
+    } else {
+        update_check.writeHumanCli(&w.interface, cli) catch {};
+    }
+    w.interface.flush() catch {};
+
+    const code = update_check.exitCode(report);
+    if (code != 0) {
+        // std.process.exit skips defers — free before leaving.
+        if (latest_owned) |l| allocator.free(l);
+        latest_owned = null;
+        std.process.exit(code);
+    }
+}
 
 /// Self-update the CLI binary by downloading from the release server.
 pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    const r2_base_url = "https://releases.labelle.games/cli";
+    const parsed = parseUpdateArgs(cmd_args);
 
-    var skip_path = false;
-    var version_arg: ?[]const u8 = null;
-    for (cmd_args) |arg| {
-        if (std.mem.eql(u8, arg, "--no-path")) {
-            skip_path = true;
-        } else {
-            version_arg = arg;
-        }
+    // Read-only reporting mode: never mutate/install (labelle-cli#276).
+    if (parsed.reportOnly()) {
+        return cmdUpdateCheck(allocator, parsed.version_arg, parsed.json);
     }
+
+    const skip_path = parsed.skip_path;
+    const version_arg = parsed.version_arg;
 
     std.debug.print("labelle: checking for updates...\n", .{});
     std.debug.print("  current version: {s}\n\n", .{project_config.CLI_VERSION});
@@ -28,31 +118,11 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     if (version_arg) |ver| {
         target_version = ver;
     } else {
-        const latest_url = r2_base_url ++ "/latest.txt";
-        const result = util.runCmd(allocator, &.{ "curl", "-s", "-f", latest_url }) catch {
-            std.debug.print("labelle: could not check for updates (is curl installed?)\n", .{});
+        target_version_owned = fetchLatestCliVersion(allocator) orelse {
+            std.debug.print("labelle: could not check for updates (is curl installed / are you online?)\n", .{});
             printManualUpdateInstructions("latest");
             return;
         };
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-
-        switch (result.term) {
-            .exited => |code| if (code != 0) {
-                std.debug.print("labelle: could not fetch latest version from release server\n", .{});
-                printManualUpdateInstructions("latest");
-                return;
-            },
-            else => {
-                std.debug.print("labelle: curl terminated abnormally\n", .{});
-                return;
-            },
-        }
-
-        var latest = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-        if (std.mem.startsWith(u8, latest, "v")) latest = latest[1..];
-
-        target_version_owned = try allocator.dupe(u8, latest);
         target_version = target_version_owned.?;
     }
 
@@ -298,7 +368,7 @@ fn setupPath(allocator: std.mem.Allocator, bin_dir: []const u8) void {
 
 fn setupPathWindows(allocator: std.mem.Allocator, bin_dir: []const u8) void {
     const get_result = util.runCmd(allocator, &.{
-        "powershell", "-NoProfile", "-Command",
+        "powershell",                                            "-NoProfile", "-Command",
         "[Environment]::GetEnvironmentVariable('Path', 'User')",
     }) catch {
         std.debug.print("  could not read current PATH — add {s} to your PATH manually\n\n", .{bin_dir});
@@ -362,3 +432,54 @@ fn printManualUpdateInstructions(version: []const u8) void {
     std.debug.print("    git clone https://github.com/labelle-toolkit/labelle-cli.git\n", .{});
     std.debug.print("    zig build -Doptimize=ReleaseSafe\n", .{});
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test {
+    @import("zspec").runAll(@This());
+}
+
+/// Flag parsing for `labelle update` (labelle-cli#276). Re-exported into
+/// cli.zig so `zspec.runAll` walks into it under `zig build test`.
+pub const ParseUpdateArgsSpec = struct {
+    const testing = std.testing;
+
+    test "bare update: install mode, no version, keeps PATH setup" {
+        const a = parseUpdateArgs(&.{});
+        try testing.expect(!a.reportOnly());
+        try testing.expect(!a.skip_path);
+        try testing.expect(a.version_arg == null);
+    }
+
+    test "--no-path is still recognized and stays install mode" {
+        const a = parseUpdateArgs(&.{"--no-path"});
+        try testing.expect(a.skip_path);
+        try testing.expect(!a.reportOnly());
+    }
+
+    test "--check selects read-only report mode (not json)" {
+        const a = parseUpdateArgs(&.{"--check"});
+        try testing.expect(a.check);
+        try testing.expect(!a.json);
+        try testing.expect(a.reportOnly());
+    }
+
+    test "--json implies report-only (never mutates)" {
+        const a = parseUpdateArgs(&.{"--json"});
+        try testing.expect(a.json);
+        try testing.expect(a.reportOnly());
+    }
+
+    test "--check --json together" {
+        const a = parseUpdateArgs(&.{ "--check", "--json" });
+        try testing.expect(a.check);
+        try testing.expect(a.json);
+        try testing.expect(a.reportOnly());
+    }
+
+    test "explicit version arg is captured alongside --check" {
+        const a = parseUpdateArgs(&.{ "--check", "1.99.0" });
+        try testing.expect(a.reportOnly());
+        try testing.expectEqualStrings("1.99.0", a.version_arg.?);
+    }
+};
