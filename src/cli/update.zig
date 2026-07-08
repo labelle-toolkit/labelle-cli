@@ -24,7 +24,7 @@ const UpdateArgs = struct {
     }
 };
 
-fn parseUpdateArgs(cmd_args: []const []const u8) UpdateArgs {
+fn parseUpdateArgs(cmd_args: []const []const u8) !UpdateArgs {
     var out = UpdateArgs{};
     for (cmd_args) |arg| {
         if (std.mem.eql(u8, arg, "--no-path")) {
@@ -33,6 +33,16 @@ fn parseUpdateArgs(cmd_args: []const []const u8) UpdateArgs {
             out.check = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             out.json = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            // Reject unknown flags instead of silently treating them as the
+            // target version. Critical: a typo like `--chek` — especially
+            // `--chek 1.60.0`, where the good version would overwrite the
+            // dropped typo — must NEVER slip past the read-only `--check`
+            // guard into the binary-replacing install path (CodeRabbit,
+            // PR #299). Mirrors the `labelle status` unknown-flag convention.
+            std.debug.print("labelle update: unknown flag '{s}'\n", .{arg});
+            std.debug.print("  usage: labelle update [ver] [--no-path] [--check] [--json]\n", .{});
+            return error.InvalidArguments;
         } else {
             out.version_arg = arg;
         }
@@ -98,7 +108,7 @@ fn cmdUpdateCheck(allocator: std.mem.Allocator, version_arg: ?[]const u8, json: 
 
 /// Self-update the CLI binary by downloading from the release server.
 pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
-    const parsed = parseUpdateArgs(cmd_args);
+    const parsed = try parseUpdateArgs(cmd_args);
 
     // Read-only reporting mode: never mutate/install (labelle-cli#276).
     if (parsed.reportOnly()) {
@@ -445,41 +455,60 @@ pub const ParseUpdateArgsSpec = struct {
     const testing = std.testing;
 
     test "bare update: install mode, no version, keeps PATH setup" {
-        const a = parseUpdateArgs(&.{});
+        const a = try parseUpdateArgs(&.{});
         try testing.expect(!a.reportOnly());
         try testing.expect(!a.skip_path);
         try testing.expect(a.version_arg == null);
     }
 
     test "--no-path is still recognized and stays install mode" {
-        const a = parseUpdateArgs(&.{"--no-path"});
+        const a = try parseUpdateArgs(&.{"--no-path"});
         try testing.expect(a.skip_path);
         try testing.expect(!a.reportOnly());
     }
 
     test "--check selects read-only report mode (not json)" {
-        const a = parseUpdateArgs(&.{"--check"});
+        const a = try parseUpdateArgs(&.{"--check"});
         try testing.expect(a.check);
         try testing.expect(!a.json);
         try testing.expect(a.reportOnly());
     }
 
     test "--json implies report-only (never mutates)" {
-        const a = parseUpdateArgs(&.{"--json"});
+        const a = try parseUpdateArgs(&.{"--json"});
         try testing.expect(a.json);
         try testing.expect(a.reportOnly());
     }
 
     test "--check --json together" {
-        const a = parseUpdateArgs(&.{ "--check", "--json" });
+        const a = try parseUpdateArgs(&.{ "--check", "--json" });
         try testing.expect(a.check);
         try testing.expect(a.json);
         try testing.expect(a.reportOnly());
     }
 
     test "explicit version arg is captured alongside --check" {
-        const a = parseUpdateArgs(&.{ "--check", "1.99.0" });
+        const a = try parseUpdateArgs(&.{ "--check", "1.99.0" });
         try testing.expect(a.reportOnly());
         try testing.expectEqualStrings("1.99.0", a.version_arg.?);
+    }
+
+    test "unknown flag is rejected, not treated as a version" {
+        // Without the reject branch this returns version_arg="--jso" and
+        // proceeds to the mutating install path — CodeRabbit PR #299.
+        try testing.expectError(error.InvalidArguments, parseUpdateArgs(&.{"--jso"}));
+    }
+
+    test "typo'd flag before a real version is rejected (never mutates)" {
+        // The safety-critical exploit: `--chek 1.60.0` — the dropped typo
+        // leaves 1.60.0 as version_arg and INSTALLS it. Reject on the
+        // unknown flag before the version is ever considered.
+        try testing.expectError(error.InvalidArguments, parseUpdateArgs(&.{ "--chek", "1.60.0" }));
+    }
+
+    test "a bare non-dash token is still a valid version positional" {
+        const a = try parseUpdateArgs(&.{"1.2.3"});
+        try testing.expect(!a.reportOnly());
+        try testing.expectEqualStrings("1.2.3", a.version_arg.?);
     }
 };

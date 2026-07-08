@@ -60,6 +60,15 @@ fn parseUpgradeArgs(allocator: std.mem.Allocator, cmd_args: []const []const u8) 
             check = true;
         } else if (std.mem.eql(u8, a, "--json")) {
             json = true;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Reject unknown flags rather than treating them as a package /
+            // version positional — a typo like `--chek` must not slip past
+            // the read-only `--check` guard into the mutating upgrade path
+            // (CodeRabbit, PR #299). Symmetric with parseUpdateArgs; the
+            // errdefer above frees `positionals` on this early return.
+            std.debug.print("labelle upgrade: unknown flag '{s}'\n", .{a});
+            std.debug.print("  usage: labelle upgrade [dir] [pkg] [ver] [--check] [--json] [--force]\n", .{});
+            return error.InvalidArguments;
         } else {
             try positionals.append(allocator, a);
         }
@@ -387,4 +396,16 @@ test "parseUpgradeArgs: --force is independent of report-only" {
     defer parsed.deinit(testing.allocator);
     try testing.expect(parsed.force);
     try testing.expect(!parsed.reportOnly());
+}
+
+test "parseUpgradeArgs rejects an unknown flag instead of taking it as a positional" {
+    // Without the reject branch `--jso` becomes a positional and the
+    // command proceeds to the mutating path — CodeRabbit PR #299.
+    try testing.expectError(error.InvalidArguments, parseUpgradeArgs(testing.allocator, &.{"--jso"}));
+}
+
+test "parseUpgradeArgs rejects an unknown flag even before a valid subcommand" {
+    // `--chek all` must not run the mutating `upgrade all`; the typo is
+    // rejected before the subcommand is ever reached.
+    try testing.expectError(error.InvalidArguments, parseUpgradeArgs(testing.allocator, &.{ "--chek", "all" }));
 }
