@@ -62,18 +62,24 @@ pub const PluginMeta = struct {
 /// listing surfaces.
 ///
 /// Returns `null` when the plugin has no `plugin.labelle` (legal — plugins
-/// like labelle-pathfinder ship without one) or when the manifest cannot be
-/// read/parsed. A parse failure is surfaced as a one-line warning rather
-/// than an error so a single malformed manifest never aborts the whole
-/// listing — the row simply falls back to `-` placeholders.
+/// like labelle-pathfinder ship without one) or when the manifest exists but
+/// cannot be read/parsed (a one-line warning is printed and the row falls
+/// back to `-` placeholders, so a single malformed manifest never aborts the
+/// whole listing).
+///
+/// `error.OutOfMemory` is *propagated*, not swallowed: a genuine allocation
+/// failure is a real listing fault and must surface rather than silently
+/// dropping a plugin. Only the legitimate "no manifest / unreadable /
+/// unparseable" cases degrade to `null`.
 ///
 /// The returned `PluginMeta` owns its strings as independent heap copies;
 /// call `deinit` to release them.
-pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) ?PluginMeta {
-    const manifest_path = std.fs.path.join(allocator, &.{ plugin_dir, "plugin.labelle" }) catch return null;
+pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) error{OutOfMemory}!?PluginMeta {
+    const manifest_path = try std.fs.path.join(allocator, &.{ plugin_dir, "plugin.labelle" });
     defer allocator.free(manifest_path);
 
     const raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024)) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         // FileNotFound is the common, legal "no manifest" case — stay
         // silent. Anything else is worth a diagnostic breadcrumb.
         if (err != error.FileNotFound) {
@@ -83,12 +89,13 @@ pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) ?Plu
     };
     defer allocator.free(raw);
 
-    const raw_z = allocator.dupeZ(u8, raw) catch return null;
+    const raw_z = try allocator.dupeZ(u8, raw);
     defer allocator.free(raw_z);
 
     const parsed = std.zon.parse.fromSliceAlloc(ZonPluginMeta, allocator, raw_z, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         std.debug.print("labelle: warning: could not parse '{s}': {s} — listing it without license/author\n", .{ manifest_path, @errorName(err) });
         return null;
     };
@@ -97,9 +104,11 @@ pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) ?Plu
     // `PluginMeta.deinit`.
     defer std.zon.parse.free(allocator, parsed);
 
-    const name = allocator.dupe(u8, parsed.name) catch return null;
-    const license = if (parsed.license) |l| (allocator.dupe(u8, l) catch null) else null;
-    const author = if (parsed.author) |a| (allocator.dupe(u8, a) catch null) else null;
+    const name = try allocator.dupe(u8, parsed.name);
+    errdefer allocator.free(name);
+    const license = if (parsed.license) |l| try allocator.dupe(u8, l) else null;
+    errdefer if (license) |l| allocator.free(l);
+    const author = if (parsed.author) |a| try allocator.dupe(u8, a) else null;
 
     return PluginMeta{
         .name = name,
@@ -114,14 +123,19 @@ pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) ?Plu
 /// lives in. Local plugins (`local:` / `@`) resolve against `project_dir`;
 /// remote plugins resolve to the shared package cache the same way the
 /// assembler / lockfile writer does. Caller owns the returned slice.
+///
+/// Resolution is pure path construction — it never inspects the filesystem —
+/// so there is no "not found" case to fold into a `null`; failures
+/// (`OutOfMemory`, `NoHomeDirectory` from cache-root resolution) are real and
+/// propagate to the caller.
 fn resolvePluginDir(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
     dep: project_config.PluginDep,
-) ?[]const u8 {
+) ![]const u8 {
     if (dep.isLocal())
-        return std.fs.path.resolve(allocator, &.{ project_dir, dep.localPath() }) catch null;
-    return asm_cache.resolveRemotePluginDir(allocator, dep.repo, dep.version) catch null;
+        return std.fs.path.resolve(allocator, &.{ project_dir, dep.localPath() });
+    return asm_cache.resolveRemotePluginDir(allocator, dep.repo, dep.version);
 }
 
 /// A single row of the `labelle plugins` table. Pure data so the renderer
@@ -215,11 +229,10 @@ pub fn cmdPlugins(allocator: std.mem.Allocator, args: []const []const u8) !void 
         var license: []const u8 = NONE;
         var author: []const u8 = NONE;
 
-        if (resolvePluginDir(a, project_dir, dep)) |plugin_dir| {
-            if (readPluginMeta(a, plugin_dir)) |meta| {
-                if (meta.license) |l| license = l;
-                if (meta.author) |au| author = au;
-            }
+        const plugin_dir = try resolvePluginDir(a, project_dir, dep);
+        if (try readPluginMeta(a, plugin_dir)) |meta| {
+            if (meta.license) |l| license = l;
+            if (meta.author) |au| author = au;
         }
 
         try rows.append(a, .{
@@ -271,7 +284,7 @@ pub const ReadPluginMetaSpec = struct {
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const dir = try tmpRealPath(&tmp, &buf);
 
-            var meta = readPluginMeta(std.testing.allocator, dir).?;
+            var meta = (try readPluginMeta(std.testing.allocator, dir)).?;
             defer meta.deinit();
 
             try std.testing.expectEqualStrings("atlas-overlay", meta.name);
@@ -295,7 +308,7 @@ pub const ReadPluginMetaSpec = struct {
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const dir = try tmpRealPath(&tmp, &buf);
 
-            var meta = readPluginMeta(std.testing.allocator, dir).?;
+            var meta = (try readPluginMeta(std.testing.allocator, dir)).?;
             defer meta.deinit();
 
             try std.testing.expectEqualStrings("bare", meta.name);
@@ -312,7 +325,7 @@ pub const ReadPluginMetaSpec = struct {
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const dir = try tmpRealPath(&tmp, &buf);
 
-            try expect.toBeNull(readPluginMeta(std.testing.allocator, dir));
+            try expect.toBeNull(try readPluginMeta(std.testing.allocator, dir));
         }
     };
 };
