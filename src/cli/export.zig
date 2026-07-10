@@ -602,16 +602,28 @@ fn formatSize(buf: []u8, bytes: u64) []const u8 {
 
 // ── path helpers ────────────────────────────────────────────────────
 
+/// Path-boundary equality, case-insensitive on Windows (whose
+/// filesystems are case-insensitive).
+fn pathEql(a: []const u8, b: []const u8) bool {
+    return if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(a, b)
+    else
+        std.mem.eql(u8, a, b);
+}
+
 /// Strip trailing path separators (keeping at least one char) so a value
 /// like `release/` yields `release` before a suffix is appended.
+/// `isSep` is platform-aware: on Windows both `/` and `\` are stripped;
+/// on POSIX only `/` (a `\` there is a legitimate filename byte).
 fn trimTrailingSeps(path: []const u8) []const u8 {
     var end = path.len;
-    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
+    while (end > 1 and std.fs.path.isSep(path[end - 1])) end -= 1;
     return path[0..end];
 }
 
 /// True when `inner` is `outer` or nested under it. Both are normalized
-/// (`resolve` collapses `.`/`..`) so `a/b/../out` vs `a/out` compare
+/// (`resolve` collapses `.`/`..` and unifies separators to the platform's
+/// own) so `a/b/../out` vs `a/out`, and mixed `/`+`\` on Windows, compare
 /// correctly. Paths are compared as-passed (both cwd-relative here), so
 /// no filesystem access is needed.
 fn pathIsWithin(allocator: std.mem.Allocator, inner_raw: []const u8, outer_raw: []const u8) !bool {
@@ -619,10 +631,10 @@ fn pathIsWithin(allocator: std.mem.Allocator, inner_raw: []const u8, outer_raw: 
     defer allocator.free(inner);
     const outer = try std.fs.path.resolve(allocator, &.{outer_raw});
     defer allocator.free(outer);
-    if (std.mem.eql(u8, inner, outer)) return true;
+    if (pathEql(inner, outer)) return true;
     return inner.len > outer.len and
-        std.mem.startsWith(u8, inner, outer) and
-        inner[outer.len] == std.fs.path.sep;
+        pathEql(inner[0..outer.len], outer) and
+        std.fs.path.isSep(inner[outer.len]);
 }
 
 // ── small IO helpers ────────────────────────────────────────────────
@@ -717,6 +729,18 @@ test "pathIsWithin: nesting detection" {
     try std.testing.expect(!try pathIsWithin(a, "release", "web"));
     // "webby" must not count as inside "web" (boundary check).
     try std.testing.expect(!try pathIsWithin(a, "webby", "web"));
+}
+
+test "pathIsWithin: Windows backslash + case-insensitive nesting" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // Backslash + mixed separators normalize to the same tree.
+    try std.testing.expect(try pathIsWithin(a, "web\\out", "web"));
+    try std.testing.expect(try pathIsWithin(a, "web/out\\deep", "web"));
+    // Case-insensitive: WEB\out is inside web.
+    try std.testing.expect(try pathIsWithin(a, "WEB\\out", "web"));
+    // Boundary still holds under case folding.
+    try std.testing.expect(!try pathIsWithin(a, "WEBBY", "web"));
 }
 
 test "packageExport: refuses a file --output (and leaves it intact)" {
