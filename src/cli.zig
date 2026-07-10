@@ -6,6 +6,7 @@
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] — generate + build (no run)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
+///   labelle wasm export [dir] [--output dir] [--zip] [--platform itch|github-pages] [--no-build] — build + package a deployment-ready WASM dir
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
@@ -41,6 +42,7 @@ const emsdk_activate = @import("cli/emsdk_activate.zig");
 const bake_mod = @import("cli/bake.zig");
 const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
+const export_mod = @import("cli/export.zig");
 const ios = @import("cli/ios.zig");
 const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
@@ -159,6 +161,14 @@ const ParsedArgs = struct {
     serve_port: u16 = 8080,
     serve_no_build: bool = false,
     serve_no_open: bool = false,
+    // `wasm export` options. `wasm_export` selects the export action of
+    // the shared `wasm_cmd`; the rest configure packaging. `serve_no_build`
+    // (above) is reused as the shared "skip build, package existing output"
+    // flag for both `wasm serve --no-build` and `wasm export --no-build`.
+    wasm_export: bool = false,
+    export_output: []const u8 = "release",
+    export_zip: bool = false,
+    export_pkg_platform: export_mod.Platform = .none,
     // labelle-cli#227 — out-of-band screenshot capture. `--screenshot`
     // takes a destination path (raylib picks the format from the
     // extension); `--after` is an optional delay (parsed via
@@ -253,6 +263,156 @@ fn parseWasmServeArgs(args: anytype) ?WasmServeArgs {
         }
     }
     return result;
+}
+
+/// Parsed `wasm export` flags. Returned by `parseWasmExportArgs`; `null`
+/// signals a parse error (the helper has already printed a message).
+const WasmExportArgs = struct {
+    dir: []const u8 = ".",
+    output: []const u8 = "release",
+    zip: bool = false,
+    no_build: bool = false,
+    pkg_platform: export_mod.Platform = .none,
+    progress_mode: progress.Mode = .human,
+};
+
+/// Parse the flags of `labelle wasm export [dir] [--output <dir>]
+/// [--zip] [--platform <itch|github-pages>] [--no-build]
+/// [--progress=<m>]`. `args` is `anytype` so tests can drive it with an
+/// in-memory `Args.IteratorGeneral`, mirroring `parseWasmServeArgs`.
+fn parseWasmExportArgs(args: anytype) ?WasmExportArgs {
+    var result = WasmExportArgs{};
+    var dir_set = false;
+
+    while (args.next()) |arg| {
+        // Tri-state progress idiom shared with parseWasmServeArgs.
+        if (parseProgressFlag(arg, &result.progress_mode, "wasm export")) |consumed| {
+            if (consumed) continue;
+        } else return null;
+        if (std.mem.eql(u8, arg, "--zip")) {
+            result.zip = true;
+        } else if (std.mem.eql(u8, arg, "--no-build")) {
+            result.no_build = true;
+        } else if (std.mem.startsWith(u8, arg, "--output=") or std.mem.eql(u8, arg, "--output")) {
+            const val = if (std.mem.eql(u8, arg, "--output"))
+                (args.next() orelse {
+                    std.debug.print("labelle wasm export: --output requires a value (e.g. --output ./release)\n", .{});
+                    return null;
+                })
+            else
+                arg["--output=".len..];
+            if (val.len == 0) {
+                std.debug.print("labelle wasm export: --output requires a non-empty directory\n", .{});
+                return null;
+            }
+            result.output = val;
+        } else if (std.mem.startsWith(u8, arg, "--platform=") or std.mem.eql(u8, arg, "--platform")) {
+            const val = if (std.mem.eql(u8, arg, "--platform"))
+                (args.next() orelse {
+                    std.debug.print("labelle wasm export: --platform requires a value (itch | github-pages)\n", .{});
+                    return null;
+                })
+            else
+                arg["--platform=".len..];
+            result.pkg_platform = export_mod.parsePlatform(val) orelse {
+                std.debug.print("labelle wasm export: unknown --platform '{s}' (expected itch | github-pages)\n", .{val});
+                return null;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("labelle wasm export: unknown flag '{s}'\n", .{arg});
+            return null;
+        } else {
+            if (dir_set) {
+                std.debug.print("labelle wasm export: unexpected argument '{s}'\n", .{arg});
+                return null;
+            }
+            result.dir = arg;
+            dir_set = true;
+        }
+    }
+    return result;
+}
+
+/// Resolve the `wasm export --output` value to a path the packager can
+/// use. Absolute paths pass through; a relative path is anchored to the
+/// project dir so `labelle wasm export ../game --output release` writes
+/// under the project, matching where the build output already lives.
+/// Caller owns the returned slice.
+///
+/// SAFETY: the export dir is wiped (`deleteTree`) on every run, so a
+/// destructive `--output` — `.`, `..`, the project/cwd root, or any
+/// ancestor of them — would delete the user's source tree. Such targets
+/// are refused with `error.DestructiveOutputPath` instead. (The
+/// complementary "non-empty dir not created by a prior export" guard
+/// lives in `export.packageExport`, which owns the deletion.)
+fn resolveExportOutput(allocator: std.mem.Allocator, project_dir: []const u8, output: []const u8) ![]const u8 {
+    // Normalized form of `output` alone (collapses `.`/`..`; keeps a
+    // relative path relative). `resolve` does NOT anchor relatives at the
+    // cwd in Zig 0.16, so this is pure path math — no filesystem access,
+    // which also keeps it unit-testable.
+    const norm = try std.fs.path.resolve(allocator, &.{output});
+    defer allocator.free(norm);
+
+    const destructive = if (std.fs.path.isAbsolute(norm))
+        // Absolute output: refuse the filesystem root (no parent to scope
+        // the wipe) or the project dir / an ancestor of it when the
+        // project path is itself absolute. Other absolute dirs are still
+        // guarded by the non-empty-without-marker check in packageExport.
+        std.fs.path.dirname(norm) == null or
+            (std.fs.path.isAbsolute(project_dir) and try absTargetHitsProject(allocator, norm, project_dir))
+    else
+        // Relative output: refuse the project root itself (`.`) or any
+        // path that escapes above it (leading `..`) — wiping either would
+        // delete the project / a parent tree.
+        std.mem.eql(u8, norm, ".") or escapesUpward(norm);
+
+    if (destructive) {
+        std.debug.print(
+            "labelle wasm export: refusing to use '{s}' as --output\n" ++
+                "  the export directory is wiped on every run, and this path is the\n" ++
+                "  project directory, an ancestor of it, or the filesystem root.\n" ++
+                "  choose a dedicated subdirectory, e.g. --output ./release\n",
+            .{output},
+        );
+        return error.DestructiveOutputPath;
+    }
+
+    if (std.fs.path.isAbsolute(output)) return allocator.dupe(u8, output);
+    return std.fs.path.join(allocator, &.{ project_dir, output });
+}
+
+/// True when a relative, normalized `norm` names the project root
+/// itself (`.` is handled by the caller) via an upward escape — i.e. its
+/// first path component is `..`. Separator-agnostic: matches both `../`
+/// and `..\` so a Windows-style output is caught even if `resolve`
+/// emitted the other separator.
+fn escapesUpward(norm: []const u8) bool {
+    if (std.mem.eql(u8, norm, "..")) return true;
+    return norm.len > 2 and std.mem.eql(u8, norm[0..2], "..") and std.fs.path.isSep(norm[2]);
+}
+
+/// Path-boundary equality, case-insensitive on Windows (whose
+/// filesystems are case-insensitive, so `C:\Proj` and `c:\proj` name the
+/// same dir — a destructive-ancestor check must treat them as equal).
+fn pathEql(a: []const u8, b: []const u8) bool {
+    return if (@import("builtin").os.tag == .windows)
+        std.ascii.eqlIgnoreCase(a, b)
+    else
+        std.mem.eql(u8, a, b);
+}
+
+/// True when the absolute, normalized output `norm` is the (absolute)
+/// project dir itself or an ancestor of it.
+fn absTargetHitsProject(allocator: std.mem.Allocator, norm: []const u8, project_dir: []const u8) !bool {
+    const proj_abs = try std.fs.path.resolve(allocator, &.{project_dir});
+    defer allocator.free(proj_abs);
+    if (pathEql(norm, proj_abs)) return true;
+    // `norm` is an ancestor of `proj_abs` only if it extends it at a path
+    // boundary — guards against "/foo" matching "/foobar". `isSep` accepts
+    // either separator so a mixed-separator input still lands correctly.
+    return proj_abs.len > norm.len and
+        pathEql(proj_abs[0..norm.len], norm) and
+        std.fs.path.isSep(proj_abs[norm.len]);
 }
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -871,26 +1031,42 @@ pub fn main(proc_init: std.process.Init) !void {
                 }
             }
         } else if (std.mem.eql(u8, first, "wasm")) {
-            // `labelle wasm <subcommand>` — only `serve` exists today.
+            // `labelle wasm <subcommand>` — `serve` and `export`.
             const sub = args.next();
-            if (sub == null or !std.mem.eql(u8, sub.?, "serve")) {
+            if (sub != null and std.mem.eql(u8, sub.?, "serve")) {
+                parsed_args.command = .wasm_cmd;
+                const result = parseWasmServeArgs(&args) orelse return;
+                parsed_args.project_dir = result.dir;
+                parsed_args.serve_port = result.port;
+                parsed_args.serve_no_build = result.no_build;
+                parsed_args.serve_no_open = result.no_open;
+                parsed_args.progress_mode = result.progress_mode;
+                // `wasm serve` always builds/serves the WASM target.
+                parsed_args.platform_override = .wasm;
+            } else if (sub != null and std.mem.eql(u8, sub.?, "export")) {
+                parsed_args.command = .wasm_cmd;
+                parsed_args.wasm_export = true;
+                const result = parseWasmExportArgs(&args) orelse return;
+                parsed_args.project_dir = result.dir;
+                parsed_args.export_output = result.output;
+                parsed_args.export_zip = result.zip;
+                parsed_args.export_pkg_platform = result.pkg_platform;
+                // `--no-build` is the shared "skip build, package existing
+                // output" flag (see ParsedArgs.serve_no_build).
+                parsed_args.serve_no_build = result.no_build;
+                parsed_args.progress_mode = result.progress_mode;
+                // `wasm export` always builds/packages the WASM target.
+                parsed_args.platform_override = .wasm;
+            } else {
                 if (sub) |s| {
                     std.debug.print("labelle wasm: unknown subcommand '{s}'\n", .{s});
                 } else {
                     std.debug.print("labelle wasm: missing subcommand\n", .{});
                 }
                 std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--progress=<m>]\n", .{});
+                std.debug.print("         labelle wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]\n", .{});
                 return;
             }
-            parsed_args.command = .wasm_cmd;
-            const result = parseWasmServeArgs(&args) orelse return;
-            parsed_args.project_dir = result.dir;
-            parsed_args.serve_port = result.port;
-            parsed_args.serve_no_build = result.no_build;
-            parsed_args.serve_no_open = result.no_open;
-            parsed_args.progress_mode = result.progress_mode;
-            // `wasm serve` always builds/serves the WASM target.
-            parsed_args.platform_override = .wasm;
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -1039,9 +1215,9 @@ pub fn main(proc_init: std.process.Init) !void {
         return upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]);
     }
 
-    // `labelle wasm serve --no-build` — skip the generate+build
-    // pipeline entirely and serve the existing build output. The web
-    // dir lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
+    // `labelle wasm serve|export --no-build` — skip the generate+build
+    // pipeline entirely and serve/package the existing build output. The
+    // web dir lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
     if (command == .wasm_cmd and parsed_args.serve_no_build) {
         const wasm_target = try std.fmt.allocPrint(allocator, "{s}_wasm", .{@tagName(parsed.backend)});
         defer allocator.free(wasm_target);
@@ -1050,15 +1226,25 @@ pub fn main(proc_init: std.process.Init) !void {
         });
         defer allocator.free(web_dir);
         if (std.Io.Dir.cwd().access(config.globalIo(), web_dir, .{})) |_| {} else |_| {
+            const verb = if (parsed_args.wasm_export) "export" else "serve";
             std.debug.print(
-                "labelle wasm serve: no existing WASM build at '{s}'\n" ++
-                    "  run `labelle wasm serve` (without --no-build) first.\n",
-                .{web_dir},
+                "labelle wasm {s}: no existing WASM build at '{s}'\n" ++
+                    "  run `labelle wasm {s}` (without --no-build) first.\n",
+                .{ verb, web_dir, verb },
             );
             return error.BuildFailed;
         }
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
+        if (parsed_args.wasm_export) {
+            const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
+            defer allocator.free(out_abs);
+            return export_mod.packageExport(allocator, web_dir, project_web_dir, .{
+                .output_dir = out_abs,
+                .zip = parsed_args.export_zip,
+                .platform = parsed_args.export_pkg_platform,
+            });
+        }
         return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
     }
 
@@ -1380,15 +1566,34 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Run
     if (parsed.platform == .wasm) {
-        // WASM: serve via local HTTP server + open browser. The build
-        // pipeline is complete here — the serve loop is interactive (runs
-        // until Ctrl+C), so the terminal `done` record lands first.
-        if (reporter) |r| r.finishDone(0);
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
-        try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
+        if (parsed_args.wasm_export) {
+            // `wasm export`: package the fresh build into a deployment dir
+            // instead of serving it. Packaging runs AFTER the build, so
+            // keep the progress feed open across it (a run phase) and only
+            // mark `done` once the artifacts are on disk — otherwise a
+            // `--progress=json` consumer sees `done` before the export.
+            if (reporter) |r| {
+                r.beginPhase(.run, "packaging wasm export");
+                r.clearSpinner();
+            }
+            const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
+            defer allocator.free(out_abs);
+            try export_mod.packageExport(allocator, web_dir, project_web_dir, .{
+                .output_dir = out_abs,
+                .zip = parsed_args.export_zip,
+                .platform = parsed_args.export_pkg_platform,
+            });
+            if (reporter) |r| r.finishDone(0);
+        } else {
+            // WASM serve: the loop is interactive (runs until Ctrl+C), so
+            // the terminal `done` record lands before the serve loop.
+            if (reporter) |r| r.finishDone(0);
+            try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
+        }
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
         if (reporter) |r| r.beginPhase(.run, "deploying to iOS Simulator");
@@ -2276,6 +2481,238 @@ pub const ParseWasmServeArgsSpec = struct {
             var iter = testIter("dir1 dir2");
             defer iter.deinit();
             try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+    };
+};
+
+pub const ParseWasmExportArgsSpec = struct {
+    pub const defaults = struct {
+        test "no args yields release output, no zip, platform none" {
+            var iter = testIter("");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("release", result.output);
+            try expect.equal(result.zip, false);
+            try expect.equal(result.no_build, false);
+            try expect.equal(result.pkg_platform, export_mod.Platform.none);
+            try expect.equal(result.progress_mode, progress.Mode.human);
+            try std.testing.expectEqualStrings(".", result.dir);
+        }
+    };
+
+    pub const output_flag = struct {
+        test "--output=./dist sets the output dir" {
+            var iter = testIter("--output=./dist");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("./dist", result.output);
+        }
+
+        test "--output ./dist (space form) sets the output dir" {
+            var iter = testIter("--output ./dist");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("./dist", result.output);
+        }
+
+        test "empty --output value is rejected" {
+            var iter = testIter("--output=");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmExportArgs(&iter) == null);
+        }
+    };
+
+    pub const platform_flag = struct {
+        test "--platform itch is accepted" {
+            var iter = testIter("--platform itch");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.pkg_platform, export_mod.Platform.itch);
+        }
+
+        test "--platform=github-pages is accepted" {
+            var iter = testIter("--platform=github-pages");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.pkg_platform, export_mod.Platform.github_pages);
+        }
+
+        test "unknown --platform value is rejected" {
+            var iter = testIter("--platform steam");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmExportArgs(&iter) == null);
+        }
+    };
+
+    pub const boolean_flags = struct {
+        test "--zip sets zip" {
+            var iter = testIter("--zip");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.zip, true);
+        }
+
+        test "--no-build sets no_build" {
+            var iter = testIter("--no-build");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.no_build, true);
+        }
+
+        test "flags combine with a dir, output, platform and progress" {
+            var iter = testIter("mygame --output ./rel --zip --platform itch --no-build --progress=off");
+            defer iter.deinit();
+            const result = parseWasmExportArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("mygame", result.dir);
+            try std.testing.expectEqualStrings("./rel", result.output);
+            try expect.equal(result.zip, true);
+            try expect.equal(result.pkg_platform, export_mod.Platform.itch);
+            try expect.equal(result.no_build, true);
+            try expect.equal(result.progress_mode, progress.Mode.off);
+        }
+    };
+
+    pub const rejects_bad_input = struct {
+        test "unknown flag is rejected" {
+            var iter = testIter("--watch");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmExportArgs(&iter) == null);
+        }
+
+        test "a second positional arg is rejected" {
+            var iter = testIter("dir1 dir2");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmExportArgs(&iter) == null);
+        }
+
+        test "invalid --progress value is rejected" {
+            var iter = testIter("--progress=verbose");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmExportArgs(&iter) == null);
+        }
+    };
+};
+
+pub const ResolveExportOutputSpec = struct {
+    // The export dir is wiped on every run, so a destructive `--output`
+    // must be refused before it can delete the user's source tree.
+    pub const rejects_destructive = struct {
+        test "--output . (the project dir) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "."),
+            );
+        }
+
+        test "--output .. (an ancestor) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", ".."),
+            );
+        }
+
+        test "--output ../.. (a higher ancestor) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "../.."),
+            );
+        }
+
+        test "--output / (filesystem root) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "/"),
+            );
+        }
+
+        test "an absolute --output equal to the project dir is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "/proj/root"),
+            );
+        }
+
+        test "an absolute --output that is an ancestor of the project is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "/proj"),
+            );
+        }
+
+        test "foo/../.. collapsing to an escape is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "foo/../.."),
+            );
+        }
+    };
+
+    pub const accepts_dedicated = struct {
+        test "a dedicated subdir under the project is accepted" {
+            const a = std.testing.allocator;
+            const out = try resolveExportOutput(a, "/proj/root", "release");
+            defer a.free(out);
+            // Compare against `join` rather than a hardcoded "/" so the
+            // assertion holds on Windows (where join uses '\\').
+            const want = try std.fs.path.join(a, &.{ "/proj/root", "release" });
+            defer a.free(want);
+            try std.testing.expectEqualStrings(want, out);
+        }
+
+        test "a nested dedicated subdir is accepted" {
+            const a = std.testing.allocator;
+            const out = try resolveExportOutput(a, "/proj/root", "dist/web");
+            defer a.free(out);
+            const want = try std.fs.path.join(a, &.{ "/proj/root", "dist/web" });
+            defer a.free(want);
+            try std.testing.expectEqualStrings(want, out);
+        }
+
+        test "an unrelated absolute --output is accepted verbatim" {
+            // "/tmp/..." is absolute on POSIX and "rooted" (absolute) on
+            // Windows, so it returns verbatim on both.
+            const out = try resolveExportOutput(std.testing.allocator, "/proj/root", "/tmp/exports/game");
+            defer std.testing.allocator.free(out);
+            try std.testing.expectEqualStrings("/tmp/exports/game", out);
+        }
+    };
+
+    // Windows treats both '/' and '\\' as separators and its filesystem is
+    // case-insensitive. These run only on Windows CI (skipped elsewhere)
+    // so the directory-wiping guard is actually exercised for those shapes
+    // — a hardcoded '/' comparison here would wrongly allow a destructive
+    // backslash/drive-letter `--output`.
+    pub const windows_separators = struct {
+        test "upward escapes via '\\' or mixed separators are rejected" {
+            if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            for ([_][]const u8{ "..\\secret", "../secret", "foo\\..\\..", "foo/..\\.." }) |esc| {
+                try std.testing.expectError(
+                    error.DestructiveOutputPath,
+                    resolveExportOutput(a, "C:\\proj\\root", esc),
+                );
+            }
+        }
+
+        test "a case-differing absolute ancestor is rejected" {
+            if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            // Same directory on Windows (case-insensitive) — must be
+            // treated as a destructive ancestor, not wrongly accepted.
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(a, "C:\\Proj\\Root", "c:\\proj"),
+            );
+        }
+
+        test "a dedicated backslash subdir is accepted" {
+            if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            const out = try resolveExportOutput(a, "C:\\proj\\root", "release");
+            defer a.free(out);
+            const want = try std.fs.path.join(a, &.{ "C:\\proj\\root", "release" });
+            defer a.free(want);
+            try std.testing.expectEqualStrings(want, out);
         }
     };
 };
