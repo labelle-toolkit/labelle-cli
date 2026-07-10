@@ -420,19 +420,33 @@ const WatchState = struct {
 /// load-bearing one — the rebuild writes there, so watching it would loop.
 const watch_skip_dirs = [_][]const u8{ "zig-out", "zig-cache", "zig-pkg" };
 
-/// A cheap fingerprint of a source tree: file count, summed size, and the
-/// newest mtime. Any add / remove / edit changes at least one field, so
-/// inequality is a reliable "something changed" signal without hashing
-/// file contents.
+/// A cheap fingerprint of a source tree: a file count plus a `digest`
+/// that folds in every file's `(path, size, mtime)`. Folding per file
+/// (rather than only summing sizes + tracking the single newest mtime)
+/// makes the signature sensitive to *any* single-file change — including a
+/// same-size edit to a non-newest file, or swapping content between two
+/// files — so any add / edit / remove / mtime-change flips it.
 const TreeSignature = struct {
     file_count: u64 = 0,
-    total_size: u64 = 0,
-    latest_mtime_ns: i128 = 0,
+    /// Order-independent digest: each file contributes an independent
+    /// 64-bit hash of its path+size+mtime, XOR-folded in. XOR is
+    /// commutative, so directory iteration order doesn't matter, and a
+    /// change to any single file toggles the bits its hash owns.
+    digest: u64 = 0,
+
+    /// Fold one file's identity into the signature.
+    fn mix(self: *TreeSignature, path: []const u8, size: u64, mtime_ns: i128) void {
+        var h = std.hash.Wyhash.init(0);
+        h.update(path);
+        h.update(std.mem.asBytes(&size));
+        const m: i128 = mtime_ns;
+        h.update(std.mem.asBytes(&m));
+        self.file_count += 1;
+        self.digest ^= h.final();
+    }
 
     fn eql(a: TreeSignature, b: TreeSignature) bool {
-        return a.file_count == b.file_count and
-            a.total_size == b.total_size and
-            a.latest_mtime_ns == b.latest_mtime_ns;
+        return a.file_count == b.file_count and a.digest == b.digest;
     }
 };
 
@@ -471,10 +485,7 @@ fn computeSignature(
             const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(fpath);
             const st = std.Io.Dir.cwd().statFile(io, fpath, .{}) catch continue;
-            sig.file_count += 1;
-            sig.total_size +%= st.size;
-            const m: i128 = st.mtime.nanoseconds;
-            if (m > sig.latest_mtime_ns) sig.latest_mtime_ns = m;
+            sig.mix(fpath, st.size, st.mtime.nanoseconds);
         }
     }
 }
@@ -889,21 +900,20 @@ test "computeSignature: changes on add, edit, and remove" {
     computeSignature(io, alloc, dir_path, &base);
     try std.testing.expectEqual(@as(u64, 1), base.file_count);
 
-    // Add a file → count + size change.
+    // Add a file → count + digest change.
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "twelve!" });
     var after_add = TreeSignature{};
     computeSignature(io, alloc, dir_path, &after_add);
     try std.testing.expect(!base.eql(after_add));
     try std.testing.expectEqual(@as(u64, 2), after_add.file_count);
 
-    // Edit a file in place, keeping the byte count identical → size + count
-    // stay put but the mtime advances, so the signature still differs.
+    // Edit a file in place, keeping the byte count identical → count + size
+    // stay put but the mtime advances, so the digest (and signature) differ.
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "TWELVE!" });
     var after_edit = TreeSignature{};
     computeSignature(io, alloc, dir_path, &after_edit);
     try std.testing.expectEqual(after_add.file_count, after_edit.file_count);
-    try std.testing.expectEqual(after_add.total_size, after_edit.total_size);
-    try std.testing.expect(after_edit.latest_mtime_ns >= after_add.latest_mtime_ns);
+    try std.testing.expect(!after_add.eql(after_edit));
 
     // Remove a file → back down to one entry, different from every prior sig.
     try tmp.dir.deleteFile(io, "b.txt");
@@ -911,6 +921,54 @@ test "computeSignature: changes on add, edit, and remove" {
     computeSignature(io, alloc, dir_path, &after_rm);
     try std.testing.expectEqual(@as(u64, 1), after_rm.file_count);
     try std.testing.expect(!after_rm.eql(after_add));
+}
+
+test "TreeSignature: a same-size edit to a NON-newest file still flips the signature" {
+    // Regression for the codex finding: a summed-size + single-newest-mtime
+    // signature misses a same-size edit to a file that isn't the newest.
+    // Two files; the second (mtime 200) is the newest. Edit the first to the
+    // SAME size (10 bytes) with a new mtime that is still older than the
+    // newest (150 < 200) — total size (30) and the newest mtime (200) are
+    // both unchanged, so the old scheme would report "no change". The
+    // per-file digest catches it.
+    var before = TreeSignature{};
+    before.mix("old.txt", 10, 100);
+    before.mix("new.txt", 20, 200);
+
+    var after = TreeSignature{};
+    after.mix("old.txt", 10, 150); // same size, newer mtime, still not newest
+    after.mix("new.txt", 20, 200);
+
+    try std.testing.expectEqual(before.file_count, after.file_count);
+    try std.testing.expect(!before.eql(after));
+}
+
+test "computeSignature: a same-size in-place edit triggers a rebuild" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(dir_path);
+
+    // Two files; `b.txt` is written last (newest). Editing the OLDER `a.txt`
+    // to the same length is the case the naive signature missed.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "aaaa" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "bbbb" });
+
+    var applied = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &applied);
+
+    // Same 4-byte length, different content → only the mtime moves.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "AAAA" });
+    var now = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &now);
+
+    try std.testing.expectEqual(applied.file_count, now.file_count);
+    try std.testing.expect(!applied.eql(now));
+    // …and that unbuilt delta drives a rebuild once it's held steady.
+    try std.testing.expect(shouldRebuild(!now.eql(applied), 2, 2));
 }
 
 test "computeSignature: skips .labelle build-output dir (no self-trigger)" {
