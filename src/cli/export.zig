@@ -84,10 +84,36 @@ pub fn packageExport(
         return error.BuildFailed;
     };
 
-    // Safety gate: refuse to wipe a destructive or user-owned directory.
-    // `resolveExportOutput` (cli.zig) already rejects the cwd/project root
-    // and ancestors; this is the second half — refuse a pre-existing,
-    // non-empty dir that no prior export created.
+    // Safety gate 1: refuse an output that names an existing regular FILE.
+    // `outputDirIsUnsafe` can't see this (its `openDir` just fails), so the
+    // wipe below would silently delete the user's file and replace it with
+    // a directory.
+    if (cwd.statFile(io, opts.output_dir, .{})) |st| {
+        if (st.kind != .directory) {
+            std.debug.print(
+                "labelle wasm export: --output '{s}' is a file, not a directory\n" ++
+                    "  choose a directory path, e.g. --output ./release\n",
+                .{opts.output_dir},
+            );
+            return error.DestructiveOutputPath;
+        }
+    } else |_| {}
+
+    // Safety gate 2: refuse an output nested inside the build's web output.
+    // Copying `web_dir` into a directory that lives under `web_dir` would
+    // recursively copy the source into itself.
+    if (try pathIsWithin(allocator, opts.output_dir, web_dir)) {
+        std.debug.print(
+            "labelle wasm export: --output '{s}' is inside the build output '{s}'\n" ++
+                "  choose a destination outside the web build dir, e.g. --output ./release\n",
+            .{ opts.output_dir, web_dir },
+        );
+        return error.DestructiveOutputPath;
+    }
+
+    // Safety gate 3: refuse to wipe a pre-existing, non-empty dir that no
+    // prior export created. `resolveExportOutput` (cli.zig) already rejects
+    // the cwd/project root and ancestors; this is the complementary guard.
     if (outputDirIsUnsafe(io, opts.output_dir)) {
         std.debug.print(
             "labelle wasm export: refusing to overwrite non-empty '{s}'\n" ++
@@ -98,8 +124,15 @@ pub fn packageExport(
         return error.DestructiveOutputPath;
     }
 
-    // Fresh output dir — never leak stale files from a prior export.
-    cwd.deleteTree(io, opts.output_dir) catch {};
+    // Fresh output dir — never leak stale files from a prior export. A wipe
+    // failure is fatal: proceeding would blend stale files into the release.
+    cwd.deleteTree(io, opts.output_dir) catch |err| {
+        std.debug.print(
+            "labelle wasm export: could not clear output dir '{s}': {s}\n",
+            .{ opts.output_dir, @errorName(err) },
+        );
+        return err;
+    };
     try cwd.createDirPath(io, opts.output_dir);
     // Drop the marker immediately so even a partial/failed export is
     // recognized as ours on the next run (and excluded from the archive).
@@ -206,7 +239,9 @@ fn walkInto(
 /// Ensure `<output>/index.html` exists. Resolution order mirrors the
 /// serve loop: project shell → an emitted index.html → emcc's game.html.
 /// When only `game.html` exists it is copied (not renamed) to
-/// `index.html` so relative asset references keep resolving.
+/// `index.html` so relative asset references keep resolving. Errors with
+/// `error.NoHtmlShell` when none of the three is available — a release
+/// with no root page is broken, so fail loudly rather than ship it.
 fn ensureIndexHtml(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -239,7 +274,17 @@ fn ensureIndexHtml(
     if (fileExists(io, game_html)) {
         try cwd.copyFile(game_html, cwd, dst_index, io, .{ .make_path = true });
         recordOrUpdate(allocator, files, "index.html", fileSize(io, dst_index)) catch {};
+        return;
     }
+
+    // (d) No shell anywhere — a release with no root page is broken.
+    std.debug.print(
+        "labelle wasm export: no HTML shell found\n" ++
+            "  expected one of: a project web/index.html, an emitted index.html,\n" ++
+            "  or emcc's game.html in '{s}'.\n",
+        .{web_dir},
+    );
+    return error.NoHtmlShell;
 }
 
 /// Best-effort `wasm-opt -O3` over every top-level `.wasm` in
@@ -382,7 +427,10 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
     const cd_size: u32 = @intCast(buf.items.len - cd_offset);
     try appendEndRecord(allocator, &buf, @intCast(central.items.len), cd_size, cd_offset);
 
-    const zip_path = try std.fmt.allocPrint(allocator, "{s}.zip", .{output_dir});
+    // Normalize before appending `.zip` — a trailing separator would make
+    // `release/.zip` (a dotfile inside the dir) instead of `release.zip`.
+    const base = trimTrailingSeps(output_dir);
+    const zip_path = try std.fmt.allocPrint(allocator, "{s}.zip", .{base});
     errdefer allocator.free(zip_path);
     try cwd.writeFile(io, .{ .sub_path = zip_path, .data = buf.items });
     return zip_path;
@@ -552,6 +600,31 @@ fn formatSize(buf: []u8, bytes: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "?";
 }
 
+// ── path helpers ────────────────────────────────────────────────────
+
+/// Strip trailing path separators (keeping at least one char) so a value
+/// like `release/` yields `release` before a suffix is appended.
+fn trimTrailingSeps(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
+    return path[0..end];
+}
+
+/// True when `inner` is `outer` or nested under it. Both are normalized
+/// (`resolve` collapses `.`/`..`) so `a/b/../out` vs `a/out` compare
+/// correctly. Paths are compared as-passed (both cwd-relative here), so
+/// no filesystem access is needed.
+fn pathIsWithin(allocator: std.mem.Allocator, inner_raw: []const u8, outer_raw: []const u8) !bool {
+    const inner = try std.fs.path.resolve(allocator, &.{inner_raw});
+    defer allocator.free(inner);
+    const outer = try std.fs.path.resolve(allocator, &.{outer_raw});
+    defer allocator.free(outer);
+    if (std.mem.eql(u8, inner, outer)) return true;
+    return inner.len > outer.len and
+        std.mem.startsWith(u8, inner, outer) and
+        inner[outer.len] == std.fs.path.sep;
+}
+
 // ── small IO helpers ────────────────────────────────────────────────
 
 fn fileExists(io: std.Io, path: []const u8) bool {
@@ -627,6 +700,84 @@ test "formatSize: byte/KB/MB thresholds" {
     try std.testing.expectEqualStrings("512 B", formatSize(&buf, 512));
     try std.testing.expectEqualStrings("2 KB", formatSize(&buf, 2048));
     try std.testing.expectEqualStrings("1.5 MB", formatSize(&buf, 1024 * 1024 * 3 / 2));
+}
+
+test "trimTrailingSeps: strips trailing separators" {
+    try std.testing.expectEqualStrings("release", trimTrailingSeps("release/"));
+    try std.testing.expectEqualStrings("release", trimTrailingSeps("release///"));
+    try std.testing.expectEqualStrings("a/b", trimTrailingSeps("a/b"));
+    try std.testing.expectEqualStrings("/", trimTrailingSeps("/"));
+}
+
+test "pathIsWithin: nesting detection" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try pathIsWithin(a, "web/out", "web"));
+    try std.testing.expect(try pathIsWithin(a, "web", "web"));
+    try std.testing.expect(try pathIsWithin(a, "web/a/../out", "web"));
+    try std.testing.expect(!try pathIsWithin(a, "release", "web"));
+    // "webby" must not count as inside "web" (boundary check).
+    try std.testing.expect(!try pathIsWithin(a, "webby", "web"));
+}
+
+test "packageExport: refuses a file --output (and leaves it intact)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(base);
+
+    // A fake web build output with a shell.
+    try tmp.dir.createDirPath(io, "web");
+    try tmp.dir.writeFile(io, .{ .sub_path = "web/game.html", .data = "<html>g</html>" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "web/game.wasm", .data = "\x00asm" });
+    const web_dir = try std.fs.path.join(alloc, &.{ base, "web" });
+    defer alloc.free(web_dir);
+
+    // `--output` names an existing regular file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "out_is_file", .data = "keep me" });
+    const out_file = try std.fs.path.join(alloc, &.{ base, "out_is_file" });
+    defer alloc.free(out_file);
+
+    try std.testing.expectError(
+        error.DestructiveOutputPath,
+        packageExport(alloc, web_dir, null, .{ .output_dir = out_file }),
+    );
+    // The file must survive (not wiped + replaced by a dir).
+    try std.testing.expect(fileExists(io, out_file));
+    const st = try std.Io.Dir.cwd().statFile(io, out_file, .{});
+    try std.testing.expect(st.kind != .directory);
+}
+
+test "ensureIndexHtml: errors when no HTML shell exists" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(base);
+
+    // web_dir has no game.html; output dir has no index.html.
+    try tmp.dir.createDirPath(io, "web");
+    try tmp.dir.writeFile(io, .{ .sub_path = "web/game.wasm", .data = "\x00asm" });
+    try tmp.dir.createDirPath(io, "out");
+    const web_dir = try std.fs.path.join(alloc, &.{ base, "web" });
+    defer alloc.free(web_dir);
+    const out_dir = try std.fs.path.join(alloc, &.{ base, "out" });
+    defer alloc.free(out_dir);
+
+    var files: std.ArrayList(FileReport) = .empty;
+    defer {
+        for (files.items) |f| alloc.free(f.rel);
+        files.deinit(alloc);
+    }
+
+    try std.testing.expectError(
+        error.NoHtmlShell,
+        ensureIndexHtml(alloc, io, web_dir, null, out_dir, &files),
+    );
 }
 
 test "copyTree: mirrors a nested web dir" {
