@@ -53,10 +53,11 @@ const astc_cmd = @import("astc/cmd.zig");
 const audit = @import("cli/audit.zig");
 const migrate = @import("cli/migrate.zig");
 const check = @import("cli/check.zig");
+const plugins = @import("cli/plugins.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
 
-const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, toolchain_cmd, status_cmd };
+const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -970,6 +971,11 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "check")) {
             parsed_args.command = .check_cmd;
             try collectExtraArgs(&args, &parsed_args);
+        } else if (std.mem.eql(u8, first, "plugins")) {
+            // `labelle plugins [dir]` — list attached plugins with their
+            // version + license/author provenance (labelle-cli#300).
+            parsed_args.command = .plugins_cmd;
+            try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "toolchain")) {
             // `labelle toolchain list|which` — managed Zig introspection (cli#279).
             parsed_args.command = .toolchain_cmd;
@@ -1112,6 +1118,7 @@ pub fn main(proc_init: std.process.Init) !void {
         .audit_cmd => return audit.cmdAudit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .migrate_cmd => return migrate.cmdMigrate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .check_cmd => return check.cmdCheck(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .plugins_cmd => return plugins.cmdPlugins(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .doctor_cmd => return doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
         .toolchain_cmd => return handleToolchainCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
@@ -2094,6 +2101,12 @@ pub const MigrateDeleteTopLevelKeyBlockCommentSpec = migrate.DeleteTopLevelKeyBl
 // Surface the check-command spec namespace so `zspec.runAll(@This())`
 // walks into it (mirrors the audit/migrate re-exports above).
 pub const CheckParseCheckArgsSpec = check.ParseCheckArgsSpec;
+
+// Surface the `labelle plugins` listing specs (labelle-cli#300) so
+// `zspec.runAll(@This())` walks into the plugin.labelle reader tests and
+// the table renderer tests.
+pub const PluginsReadPluginMetaSpec = plugins.ReadPluginMetaSpec;
+pub const PluginsRenderTableSpec = plugins.RenderTableSpec;
 
 // Surface the machine-readable update/upgrade `--check`/`--json` specs
 // (labelle-cli#276) so `zspec.runAll(@This())` walks into them.
