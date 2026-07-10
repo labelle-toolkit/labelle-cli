@@ -8,6 +8,8 @@
 const std = @import("std");
 const scanner = @import("scanner.zig");
 const walk = @import("walk.zig");
+const pipeline = @import("pipeline.zig");
+const transforms = @import("transforms.zig");
 const helpers = @import("tests_helpers.zig");
 
 const expect = @import("zspec").expect;
@@ -15,6 +17,8 @@ const expect = @import("zspec").expect;
 const stripJsoncToJson = scanner.stripJsoncToJson;
 const scanPrefabRefs = walk.scanPrefabRefs;
 const applyAllArenaFull = helpers.applyAllArenaFull;
+const applyAllFullCounts = helpers.applyAllFullCounts;
+const FileCounts = pipeline.FileCounts;
 
 
 // ─────────────────────────────────────────────────────────────────────
@@ -284,6 +288,94 @@ pub const TransformNameFieldSpec = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .array);
+    }
+
+    test "divergent name WITHOUT existing meta counts as a move" {
+        // Stat-accuracy (cli #241): a divergent `name:` on a file with no
+        // `meta:` block is genuinely renamed to `meta.name` — count it as
+        // a move, not a divergent drop.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"Production Demo\",\n" ++
+            "    \"children\": []\n" ++
+            "}\n";
+        var counts = FileCounts{};
+        _ = try applyAllFullCounts(arena.allocator(), src, "demo_scene", &counts);
+        try std.testing.expectEqual(@as(usize, 1), counts.name_field_meta_moves);
+        try std.testing.expectEqual(@as(usize, 0), counts.name_field_divergent_drops);
+    }
+
+    test "divergent name WITH existing meta counts as a drop, not a move" {
+        // Stat-accuracy (cli #241): when a `meta:` block already exists we
+        // conservatively DROP the bare divergent `name:` (byte-merging is
+        // unsafe). The summary must report this as a divergent drop, NOT a
+        // move into meta.name — the value never made it into meta.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "{\n" ++
+            "    \"name\": \"Production Demo\",\n" ++
+            "    \"meta\": { \"author\": \"kb\" },\n" ++
+            "    \"children\": []\n" ++
+            "}\n";
+        var counts = FileCounts{};
+        const out = try applyAllFullCounts(arena.allocator(), src, "demo_scene", &counts);
+        // Reported accurately: a divergent drop, not a meta.name move.
+        try std.testing.expectEqual(@as(usize, 1), counts.name_field_divergent_drops);
+        try std.testing.expectEqual(@as(usize, 0), counts.name_field_meta_moves);
+        // The bare divergent name really was dropped — it is NOT present
+        // in the existing meta (no merge happened).
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        // Header-bundle: first element's meta preserves the ORIGINAL meta
+        // (author) but does not gain a `name` from the dropped field.
+        try std.testing.expect(parsed.value == .array);
+        const header = parsed.value.array.items[0].object;
+        const meta = header.get("meta").?.object;
+        try std.testing.expect(meta.get("name") == null);
+        try std.testing.expect(meta.get("author") != null);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// RFC #596 — prefab-guard consistency (cli #241 item 6)
+// ─────────────────────────────────────────────────────────────────────
+
+pub const PrefabGuardConsistencySpec = struct {
+    fn treeSays(json_src: []const u8) !bool {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_src, .{});
+        defer parsed.deinit();
+        return transforms.treeHasInlineComponentsWrapper(parsed.value);
+    }
+
+    test "string prefab sibling suppresses the inline-components gate" {
+        // A real prefab ref carrying a `components:` object is handled by
+        // the overrides pass — the inline-components gate must skip it.
+        try std.testing.expect(!try treeSays(
+            "{ \"prefab\": \"x\", \"components\": { \"Position\": {} } }",
+        ));
+    }
+
+    test "no prefab sibling — inline-components gate fires" {
+        try std.testing.expect(try treeSays(
+            "{ \"components\": { \"Position\": {} } }",
+        ));
+    }
+
+    test "non-string prefab does NOT suppress the gate (matches byte scanner)" {
+        // Regression for cli #241 item 6: the tree gate previously treated
+        // ANY `prefab` key as a prefab ref, while the byte scanner only
+        // keys off a STRING prefab. A malformed non-string `prefab` must
+        // therefore NOT suppress the inline-components lift, so both paths
+        // agree.
+        try std.testing.expect(try treeSays(
+            "{ \"prefab\": 123, \"components\": { \"Position\": {} } }",
+        ));
     }
 };
 

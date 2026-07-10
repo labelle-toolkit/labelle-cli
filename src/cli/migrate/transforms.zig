@@ -461,7 +461,16 @@ pub fn treeHasWrapperOnRef(value: std.json.Value, wrapper: []const u8) bool {
 pub fn treeHasInlineComponentsWrapper(value: std.json.Value) bool {
     switch (value) {
         .object => |obj| {
-            const has_prefab = obj.get("prefab") != null;
+            // A `prefab:` sibling only counts as a prefab-ref when it is a
+            // string — matching both `treeHasWrapperOnRef` above and the
+            // byte scanner `objectHasWrapper` (which keys off
+            // `prefab_is_string`). A malformed non-string `prefab` must
+            // NOT suppress the inline-components lift, or the tree gate and
+            // the byte scanner would disagree.
+            const has_prefab = blk: {
+                const v = obj.get("prefab") orelse break :blk false;
+                break :blk v == .string;
+            };
             if (!has_prefab) {
                 if (obj.get("components")) |cv| {
                     if (cv == .object) return true;

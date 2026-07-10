@@ -241,6 +241,7 @@ const tests_rfc596 = @import("migrate/tests_rfc596.zig");
 pub const TransformLiftOverridesSpec = tests_rfc596.TransformLiftOverridesSpec;
 pub const TransformLiftComponentsSpec = tests_rfc596.TransformLiftComponentsSpec;
 pub const TransformNameFieldSpec = tests_rfc596.TransformNameFieldSpec;
+pub const PrefabGuardConsistencySpec = tests_rfc596.PrefabGuardConsistencySpec;
 pub const TransformFileAsArraySpec = tests_rfc596.TransformFileAsArraySpec;
 pub const TransformDirectivesToMetaHeaderSpec = tests_rfc596.TransformDirectivesToMetaHeaderSpec;
 pub const Rfc596IdempotencySpec = tests_rfc596.Rfc596IdempotencySpec;

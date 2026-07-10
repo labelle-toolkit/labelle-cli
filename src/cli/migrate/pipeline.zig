@@ -28,7 +28,7 @@ const stripJsoncToJson = scanner.stripJsoncToJson;
 ///   audit.legacy_overrides_wrapper ↔ summary.overrides_lifts
 ///   audit.legacy_components_wrapper ↔ summary.components_lifts
 ///   audit.legacy_file_object_no_root ↔ summary.file_as_array_collapses
-///   audit.legacy_name_field         ↔ summary.name_field_drops + summary.name_field_meta_moves
+///   audit.legacy_name_field         ↔ summary.name_field_drops + summary.name_field_divergent_drops + summary.name_field_meta_moves
 pub const Summary = struct {
     files_scanned: usize = 0,
     files_modified: usize = 0,
@@ -42,6 +42,7 @@ pub const Summary = struct {
     components_lifts: usize = 0,
     file_as_array_collapses: usize = 0,
     name_field_drops: usize = 0,
+    name_field_divergent_drops: usize = 0,
     name_field_meta_moves: usize = 0,
     name_field_xref_warnings: usize = 0,
     directives_to_meta_moves: usize = 0,
@@ -97,6 +98,11 @@ pub const Summary = struct {
             if (self.name_field_drops == 1) "" else "s",
             dropped,
         });
+        std.debug.print("  {d} divergent 'name' field{s} {s} (meta already present — merge manually)\n", .{
+            self.name_field_divergent_drops,
+            if (self.name_field_divergent_drops == 1) "" else "s",
+            dropped,
+        });
         std.debug.print("  {d} divergent 'name' field{s} {s} into 'meta.name'\n", .{
             self.name_field_meta_moves,
             if (self.name_field_meta_moves == 1) "" else "s",
@@ -129,6 +135,7 @@ pub const FileCounts = struct {
     components_lifts: usize = 0,
     file_as_array_collapses: usize = 0,
     name_field_drops: usize = 0,
+    name_field_divergent_drops: usize = 0,
     name_field_meta_moves: usize = 0,
     name_field_xref_warnings: usize = 0,
     directives_to_meta_moves: usize = 0,
@@ -142,6 +149,7 @@ pub const FileCounts = struct {
             self.components_lifts +
             self.file_as_array_collapses +
             self.name_field_drops +
+            self.name_field_divergent_drops +
             self.name_field_meta_moves +
             self.directives_to_meta_moves;
     }
@@ -326,13 +334,20 @@ pub fn transformBytes(
                             counts.name_field_drops += 1;
                         }
                     } else {
-                        // Divergent — move to meta.name. If `meta:`
-                        // already exists, merge into it; otherwise rename
-                        // the `name:` key and wrap its value in `{}`.
+                        // Divergent. If `meta:` already exists we can't
+                        // safely byte-merge, so `moveNameToMeta` drops the
+                        // bare `name:` (audit re-fires for manual merge) —
+                        // count that as a divergent DROP, not a move.
+                        // Otherwise the `name:` key is renamed to
+                        // `meta.name` — a genuine move.
                         const has_meta = parsed.value.object.get("meta") != null;
-                        if (transforms_meta.moveNameToMeta(arena, current, name, has_meta)) |out| {
+                        if (transforms_meta.moveNameToMeta(arena, current, has_meta)) |out| {
                             current = out;
-                            counts.name_field_meta_moves += 1;
+                            if (has_meta) {
+                                counts.name_field_divergent_drops += 1;
+                            } else {
+                                counts.name_field_meta_moves += 1;
+                            }
                             if (ctx.xrefs.contains(name)) {
                                 counts.name_field_xref_warnings += 1;
                                 std.debug.print(
