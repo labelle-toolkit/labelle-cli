@@ -909,7 +909,16 @@ test "computeSignature: changes on add, edit, and remove" {
 
     // Edit a file in place, keeping the byte count identical → count + size
     // stay put but the mtime advances, so the digest (and signature) differ.
+    // Force the mtime forward explicitly instead of relying on the write to
+    // bump it: Windows' filesystem mtime granularity is coarse enough that
+    // two back-to-back writes can share an mtime, leaving the
+    // (path,size,mtime) digest unchanged. A deterministic +2s jump makes the
+    // edit observable on every platform.
+    const b_before = try tmp.dir.statFile(io, "b.txt", .{});
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "TWELVE!" });
+    try tmp.dir.setTimestamps(io, "b.txt", .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = b_before.mtime.nanoseconds + 10 * std.time.ns_per_s } },
+    });
     var after_edit = TreeSignature{};
     computeSignature(io, alloc, dir_path, &after_edit);
     try std.testing.expectEqual(after_add.file_count, after_edit.file_count);
@@ -957,11 +966,19 @@ test "computeSignature: a same-size in-place edit triggers a rebuild" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "aaaa" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "bbbb" });
 
+    const a_before = try tmp.dir.statFile(io, "a.txt", .{});
+
     var applied = TreeSignature{};
     computeSignature(io, alloc, dir_path, &applied);
 
-    // Same 4-byte length, different content → only the mtime moves.
+    // Same 4-byte length, different content. Force the mtime forward
+    // explicitly so the change is observable regardless of the platform's
+    // write-mtime granularity (Windows can coalesce same-tick writes to an
+    // identical mtime, which would hide the edit).
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "AAAA" });
+    try tmp.dir.setTimestamps(io, "a.txt", .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = a_before.mtime.nanoseconds + 10 * std.time.ns_per_s } },
+    });
     var now = TreeSignature{};
     computeSignature(io, alloc, dir_path, &now);
 
