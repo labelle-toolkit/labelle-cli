@@ -383,6 +383,7 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         \\
         \\    <uses-sdk android:minSdkVersion="{d}" android:targetSdkVersion="{d}" />
         \\    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+        \\    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
         \\
         \\    <application android:hasCode="false" android:label="{s}">
         \\        <activity android:name="android.app.NativeActivity"
@@ -425,6 +426,14 @@ test "generateAndroidManifest adds NoTitleBar.Fullscreen theme when immersive_mo
     const theme_idx = std.mem.indexOf(u8, xml, "android:theme=") orelse
         return std.testing.expect(false);
     try std.testing.expect(theme_idx > activity_start and theme_idx < activity_open_end);
+}
+
+test "generateAndroidManifest advertises the gamepad as an optional feature" {
+    const allocator = std.testing.allocator;
+    const cfg = AndroidConfig{};
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    defer allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<uses-feature android:name=\"android.hardware.gamepad\" android:required=\"false\" />") != null);
 }
 
 /// Find ANDROID_HOME.

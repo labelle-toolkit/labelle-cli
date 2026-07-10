@@ -265,6 +265,7 @@ fn generateStudioManifest(
         \\<manifest xmlns:android="http://schemas.android.com/apk/res/android">
         \\
         \\    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+        \\    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
         \\
         \\    <application android:hasCode="false" android:label="{s}">
         \\        <activity android:name="android.app.NativeActivity"
@@ -345,4 +346,12 @@ test "generateStudioManifest honours orientation and immersive_mode" {
     const immersive = try generateStudioManifest(allocator, "T", .{ .immersive_mode = true });
     defer allocator.free(immersive);
     try std.testing.expect(std.mem.indexOf(u8, immersive, "Theme.NoTitleBar.Fullscreen") != null);
+}
+
+test "generateStudioManifest advertises the gamepad as an optional feature" {
+    const allocator = std.testing.allocator;
+    const cfg = AndroidConfig{};
+    const out = try generateStudioManifest(allocator, "Test", cfg);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<uses-feature android:name=\"android.hardware.gamepad\" android:required=\"false\" />") != null);
 }
