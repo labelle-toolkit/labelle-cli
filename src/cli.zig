@@ -162,6 +162,8 @@ const ParsedArgs = struct {
     serve_port: u16 = 8080,
     serve_no_build: bool = false,
     serve_no_open: bool = false,
+    // `wasm serve --watch` (cli#208): rebuild + live-reload on source change.
+    serve_watch: bool = false,
     // `wasm export` options. `wasm_export` selects the export action of
     // the shared `wasm_cmd`; the rest configure packaging. `serve_no_build`
     // (above) is reused as the shared "skip build, package existing output"
@@ -203,6 +205,64 @@ const ParsedArgs = struct {
     progress_mode: progress.Mode = .human,
 };
 
+/// Rebuild context for `wasm serve --watch` (cli#208). Bundles the
+/// generate+build inputs the initial pipeline computed so the serve
+/// loop's watcher thread can re-run them on a source change. Passed to
+/// `serve.serveAndOpen` as an opaque `*anyopaque` + a static `rebuild`
+/// entry point matching `serve.RebuildFn`.
+const WasmRebuildCtx = struct {
+    allocator: std.mem.Allocator,
+    asm_bin: assembler_proc.Assembler,
+    project_dir: []const u8,
+    platform_tag: []const u8,
+    backend_tag: []const u8,
+    output_dir: []const u8,
+    target_dir: []const u8,
+    zig_args: []const []const u8,
+    zig_env: ?*const std.process.Environ.Map,
+
+    /// Re-run generate → fixFingerprints → `zig build`. Returns true only
+    /// on a clean rebuild; on any failure it prints the error (keeping the
+    /// server alive) and returns false so the browser is NOT reloaded onto
+    /// a broken build.
+    fn rebuild(ctx_ptr: *anyopaque) bool {
+        const self: *WasmRebuildCtx = @ptrCast(@alignCast(ctx_ptr));
+        const a = self.allocator;
+
+        // 1. Regenerate — scene/prefab/script *structure* (new files, added
+        //    components) can change, not just @embedFile'd content.
+        assembler_proc.generate(self.asm_bin, a, self.project_dir, self.platform_tag, self.backend_tag) catch |err| {
+            std.debug.print("labelle: rebuild generate failed ({s})\n", .{@errorName(err)});
+            return false;
+        };
+        // 2. `generate` rewrites build.zig with a placeholder fingerprint;
+        //    re-fix it before building.
+        runner.fixFingerprints(a, self.project_dir, self.output_dir) catch |err| {
+            std.debug.print("labelle: rebuild fingerprint fix failed ({s})\n", .{@errorName(err)});
+            return false;
+        };
+        // 3. Rebuild the WASM bundle (captured output so a compile error
+        //    surfaces in the terminal without killing the serve loop).
+        const res = runner.runZigWithEnv(a, self.target_dir, self.zig_args, self.zig_env) catch |err| {
+            std.debug.print("labelle: rebuild could not spawn zig ({s})\n", .{@errorName(err)});
+            return false;
+        };
+        defer a.free(res.stdout);
+        defer a.free(res.stderr);
+        switch (res.term) {
+            .exited => |code| if (code != 0) {
+                std.debug.print("labelle: rebuild failed:\n{s}\n", .{res.stderr});
+                return false;
+            },
+            else => {
+                std.debug.print("labelle: rebuild terminated abnormally\n{s}\n", .{res.stderr});
+                return false;
+            },
+        }
+        return true;
+    }
+};
+
 /// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
 /// signals a parse error (the helper has already printed a message).
 const WasmServeArgs = struct {
@@ -210,6 +270,11 @@ const WasmServeArgs = struct {
     port: u16 = 8080,
     no_build: bool = false,
     no_open: bool = false,
+    // `--watch` (cli#208): after the initial build, watch the project
+    // source tree and re-run generate+build on change, then push a live
+    // reload to connected browsers. Mutually exclusive with `--no-build`
+    // (there's no build pipeline to re-run in the skip-build path).
+    watch: bool = false,
     // `wasm serve` runs the same resolve→generate→build pipeline as
     // `labelle build`, so it carries the cli#284 progress feed too (the
     // reporter marks the pipeline `done` before the interactive serve
@@ -235,6 +300,8 @@ fn parseWasmServeArgs(args: anytype) ?WasmServeArgs {
             result.no_build = true;
         } else if (std.mem.eql(u8, arg, "--no-open")) {
             result.no_open = true;
+        } else if (std.mem.eql(u8, arg, "--watch")) {
+            result.watch = true;
         } else if (std.mem.startsWith(u8, arg, "--port=") or std.mem.eql(u8, arg, "--port")) {
             const val = if (std.mem.eql(u8, arg, "--port"))
                 (args.next() orelse {
@@ -262,6 +329,11 @@ fn parseWasmServeArgs(args: anytype) ?WasmServeArgs {
             result.dir = arg;
             dir_set = true;
         }
+    }
+    if (result.watch and result.no_build) {
+        std.debug.print("labelle wasm serve: --watch cannot be combined with --no-build " ++
+            "(there's no build pipeline to re-run)\n", .{});
+        return null;
     }
     return result;
 }
@@ -1046,6 +1118,7 @@ pub fn main(proc_init: std.process.Init) !void {
                 parsed_args.serve_port = result.port;
                 parsed_args.serve_no_build = result.no_build;
                 parsed_args.serve_no_open = result.no_open;
+                parsed_args.serve_watch = result.watch;
                 parsed_args.progress_mode = result.progress_mode;
                 // `wasm serve` always builds/serves the WASM target.
                 parsed_args.platform_override = .wasm;
@@ -1069,7 +1142,7 @@ pub fn main(proc_init: std.process.Init) !void {
                 } else {
                     std.debug.print("labelle wasm: missing subcommand\n", .{});
                 }
-                std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--progress=<m>]\n", .{});
+                std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]\n", .{});
                 std.debug.print("         labelle wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]\n", .{});
                 return;
             }
@@ -1252,7 +1325,9 @@ pub fn main(proc_init: std.process.Init) !void {
                 .platform = parsed_args.export_pkg_platform,
             });
         }
-        return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
+        // No watch in the `--no-build` path (the parser already rejects the
+        // `--watch --no-build` combination, so `serve_watch` is false here).
+        return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
     }
 
     // ── Build-progress feed (cli#284) ──────────────────────────────────
@@ -1599,7 +1674,30 @@ pub fn main(proc_init: std.process.Init) !void {
             // WASM serve: the loop is interactive (runs until Ctrl+C), so
             // the terminal `done` record lands before the serve loop.
             if (reporter) |r| r.finishDone(0);
-            try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
+            if (parsed_args.serve_watch) {
+                // `--watch` (cli#208): hand the serve loop a rebuild callback
+                // that re-runs the same generate→fingerprint→zig-build steps
+                // this pipeline just did. The context borrows locals that stay
+                // alive because `serveAndOpen` blocks until Ctrl+C.
+                var rebuild_ctx = WasmRebuildCtx{
+                    .allocator = allocator,
+                    .asm_bin = asm_bin,
+                    .project_dir = project_dir,
+                    .platform_tag = @tagName(parsed.platform),
+                    .backend_tag = @tagName(parsed.backend),
+                    .output_dir = output_dir,
+                    .target_dir = target_dir,
+                    .zig_args = zig_args.items,
+                    .zig_env = zig_env_ptr,
+                };
+                try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
+                    .watch_dir = project_dir,
+                    .rebuild_fn = WasmRebuildCtx.rebuild,
+                    .rebuild_ctx = &rebuild_ctx,
+                });
+            } else {
+                try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
+            }
         }
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
@@ -2483,9 +2581,48 @@ pub const ParseWasmServeArgsSpec = struct {
         }
     };
 
+    // cli#208: `--watch` is now a first-class flag (previously rejected).
+    pub const watch_flag = struct {
+        test "defaults to off" {
+            var iter = testIter("");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.watch, false);
+        }
+
+        test "--watch sets watch" {
+            var iter = testIter("--watch");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.watch, true);
+        }
+
+        test "--watch combines with a custom port, dir and --no-open" {
+            var iter = testIter("mygame --port 5000 --watch --no-open");
+            defer iter.deinit();
+            const result = parseWasmServeArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("mygame", result.dir);
+            try expect.equal(result.port, @as(u16, 5000));
+            try expect.equal(result.watch, true);
+            try expect.equal(result.no_open, true);
+        }
+
+        test "--watch is rejected together with --no-build" {
+            var iter = testIter("--watch --no-build");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+
+        test "--no-build is rejected together with --watch (order-independent)" {
+            var iter = testIter("--no-build --watch");
+            defer iter.deinit();
+            try std.testing.expect(parseWasmServeArgs(&iter) == null);
+        }
+    };
+
     pub const rejects_bad_input = struct {
         test "unknown flag is rejected" {
-            var iter = testIter("--watch");
+            var iter = testIter("--frobnicate");
             defer iter.deinit();
             try std.testing.expect(parseWasmServeArgs(&iter) == null);
         }
