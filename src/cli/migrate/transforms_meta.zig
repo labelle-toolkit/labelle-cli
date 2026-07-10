@@ -37,8 +37,7 @@ const deleteTopLevelKey = transforms.deleteTopLevelKey;
 ///   2. No `meta:` — rename the `name:` key in place to `meta`, and
 ///      wrap its string value `"<X>"` as `{ "name": "<X>" }`. Cheap and
 ///      preserves the original line structure.
-pub fn moveNameToMeta(arena: std.mem.Allocator, src: []const u8, name_value: []const u8, has_meta: bool) ?[]u8 {
-    _ = name_value;
+pub fn moveNameToMeta(arena: std.mem.Allocator, src: []const u8, has_meta: bool) ?[]u8 {
     if (has_meta) {
         // Conservative: leave the existing `meta:` block alone (merging
         // is structurally risky to do byte-level). Just drop the bare
@@ -353,6 +352,18 @@ pub fn collapseFileToArray(arena: std.mem.Allocator, src: []const u8, parsed_val
     const arr_start = loc.value_start;
     const arr_end = loc.value_end;
 
+    // Outer indent = the column of the `"children":` key (its line's
+    // leading-space run). Computed ONCE here and reused by both the
+    // comment-harvest dedent and the array-body dedent below — the
+    // wrapping `{` added exactly this many spaces to every inner line,
+    // and post-collapse the `[` lands at column 0.
+    const outer_indent = blk: {
+        var w: usize = 0;
+        var q0 = loc.line_start;
+        while (q0 < loc.key_start and src[q0] == ' ') : (q0 += 1) w += 1;
+        break :blk w;
+    };
+
     // Leading content (BEFORE the outer `{`) — kept verbatim.
     const pre_header = src[0..file_start];
 
@@ -387,13 +398,6 @@ pub fn collapseFileToArray(arena: std.mem.Allocator, src: []const u8, parsed_val
             // Comment line — keep, dedented by the outer indent
             // (matches the `[` of the array, which lives at column 0
             // post-collapse).
-            // The outer indent equals the column of `"children":`.
-            const outer_indent = blk: {
-                var w: usize = 0;
-                var q = loc.line_start;
-                while (q < loc.key_start and src[q] == ' ') : (q += 1) w += 1;
-                break :blk w;
-            };
             var stripped: usize = 0;
             while (stripped < outer_indent and stripped < s) : (stripped += 1) {}
             harvested.appendSlice(arena, line[stripped..]) catch return null;
@@ -406,13 +410,9 @@ pub fn collapseFileToArray(arena: std.mem.Allocator, src: []const u8, parsed_val
     const header = pre_header;
 
     // Body: dedent the array by one indent level if the inner body uses
-    // a non-zero indent (the wrapping `{` added 4 spaces to every line).
-    // We measure by looking at the column of `[` in the `children:`
-    // line and shifting every line of the array's interior by that
-    // amount minus the file's base indent (0 — top level).
-    var dedent: usize = 0;
-    var q: usize = loc.line_start;
-    while (q < loc.key_start and src[q] == ' ') : (q += 1) dedent += 1;
+    // a non-zero indent (the wrapping `{` added `outer_indent` spaces to
+    // every line). Reuse the cached `outer_indent` computed above.
+    const dedent = outer_indent;
 
     // Build dedented array.
     var body = src[arr_start..arr_end];

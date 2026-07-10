@@ -29,10 +29,22 @@ pub fn applyAllFull(arena: std.mem.Allocator, src: []const u8, basename: []const
 }
 
 pub fn applyImpl(arena: std.mem.Allocator, src: []const u8, basename: []const u8, rfc596: bool) ![]u8 {
+    var counts = FileCounts{};
+    return applyImplCounts(arena, src, basename, rfc596, &counts);
+}
+
+/// Like `applyImpl` but writes the per-file transform counts into
+/// `counts` so stat-accuracy specs can assert on them.
+pub fn applyImplCounts(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    basename: []const u8,
+    rfc596: bool,
+    counts: *FileCounts,
+) ![]u8 {
     const stripped = try stripJsoncToJson(arena, src);
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, stripped, .{});
     defer parsed.deinit();
-    var counts = FileCounts{};
     var xrefs: std.StringHashMap(void) = .init(arena);
     const ctx = TransformCtx{
         .basename = basename,
@@ -40,7 +52,18 @@ pub fn applyImpl(arena: std.mem.Allocator, src: []const u8, basename: []const u8
         .rel_path = "<test>",
         .rfc596 = rfc596,
     };
-    return try transformBytes(arena, src, parsed.value, ctx, &counts);
+    return try transformBytes(arena, src, parsed.value, ctx, counts);
+}
+
+/// Run every transform (RFC #596 included) and return the resulting
+/// per-file counts alongside the transformed buffer.
+pub fn applyAllFullCounts(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    basename: []const u8,
+    counts: *FileCounts,
+) ![]u8 {
+    return applyImplCounts(arena, src, basename, true, counts);
 }
 
 /// Convenience for tests — runs `applyAll` (legacy 1-4 only) against an

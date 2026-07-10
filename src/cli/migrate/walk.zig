@@ -245,6 +245,7 @@ fn migrateFile(
     summary.components_lifts += counts.components_lifts;
     summary.file_as_array_collapses += counts.file_as_array_collapses;
     summary.name_field_drops += counts.name_field_drops;
+    summary.name_field_divergent_drops += counts.name_field_divergent_drops;
     summary.name_field_meta_moves += counts.name_field_meta_moves;
     summary.name_field_xref_warnings += counts.name_field_xref_warnings;
     summary.directives_to_meta_moves += counts.directives_to_meta_moves;

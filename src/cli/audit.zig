@@ -996,7 +996,16 @@ fn walkLegacyComponentsWrapper(
     switch (value) {
         .object => |obj| {
             const has_components = obj.get("components") != null;
-            const has_prefab = obj.get("prefab") != null;
+            // A `prefab:` sibling only marks this entry as a reference
+            // (handled by `walkLegacyComponentsOnRef`, which requires a
+            // STRING prefab) when the prefab value IS a string. A
+            // malformed non-string `prefab` must NOT suppress the inline-
+            // components-wrapper finding — otherwise the dry-run audit
+            // count would diverge from what `migrate` actually lifts,
+            // whose `treeHasInlineComponentsWrapper` / byte scanner also
+            // key off a string prefab (cli #241 item 6).
+            const prefab_v = obj.get("prefab");
+            const has_prefab = prefab_v != null and prefab_v.? == .string;
             if (has_components and !has_prefab) {
                 const ptr = if (path_buf.items.len == 0)
                     try arena.dupe(u8, "/")
@@ -2170,6 +2179,48 @@ pub const RunAuditOnSpec = struct {
             };
             try expect.equal(n_wrapper, @as(usize, 0));
             try expect.equal(n_on_ref, @as(usize, 1));
+        }
+
+        test "malformed non-string prefab: dry-run audit count matches apply count (cli #241)" {
+            // codex P2 on cli #304: a malformed `{ "prefab": <non-string>,
+            // "components": {...} }` is NOT a real prefab ref. The migrator
+            // treats it as an inline-components entity and LIFTS it, so the
+            // dry-run audit must ALSO flag it (as legacy_components_wrapper)
+            // — otherwise `migrate --dry-run` reports fewer edits than
+            // `migrate` applies. This test pins the two counts together.
+            const src =
+                \\[ { "prefab": 123, "components": { "Position": { "x": 0, "y": 0 } } } ]
+            ;
+
+            // Audit (dry-run) side.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("scenes/main.jsonc", src);
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var audit_wrapper: usize = 0;
+            var audit_on_ref: usize = 0;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_components_wrapper => audit_wrapper += 1,
+                .legacy_components_on_ref => audit_on_ref += 1,
+                else => {},
+            };
+            // Non-string prefab does not count as a ref-wrapper.
+            try expect.equal(audit_on_ref, @as(usize, 0));
+            try expect.equal(audit_wrapper, @as(usize, 1));
+
+            // Apply side — run the real migrate transform pipeline.
+            const migrate_helpers = @import("migrate/tests_helpers.zig");
+            const migrate_pipeline = @import("migrate/pipeline.zig");
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var counts = migrate_pipeline.FileCounts{};
+            _ = try migrate_helpers.applyAllFullCounts(arena.allocator(), src, "main", &counts);
+            try expect.equal(counts.components_lifts, @as(usize, 1));
+
+            // The audit dry-run wrapper count matches what apply lifts.
+            try expect.equal(audit_wrapper, counts.components_lifts);
         }
     };
 
