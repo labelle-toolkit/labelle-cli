@@ -27,6 +27,7 @@ pub fn printHelp() void {
         \\  audit unification [dir]  Pre-flight check for the unified scene/prefab loader (RFC #560)
         \\  migrate unified [dir] [--dry-run]  Auto-fix legacy unified-format patterns (RFC #594 / engine#592)
         \\  check [dir]          Lint packs for §6 convention violations (Packs RFC)
+        \\  plugins [dir]        List attached plugins with version, license, and author
         \\  doctor [dir]         Check desktop build requirements (SDL2, Zig) and report fixes
         \\  help                 Show this help
         \\  version              Show CLI version
@@ -70,6 +71,7 @@ pub fn printHelp() void {
         \\  labelle audit unification ../my-game
         \\  labelle migrate unified
         \\  labelle migrate unified --dry-run
+        \\  labelle plugins
         \\
     , .{project_config.CLI_VERSION});
 }
