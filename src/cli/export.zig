@@ -28,6 +28,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 
+/// Marker file written into the output dir. Its presence tells a later
+/// run that the dir is a labelle export (safe to wipe + recreate). A
+/// pre-existing non-empty dir WITHOUT this marker is refused — see
+/// `outputDirIsUnsafe` — so `--output <a dir with your stuff>` can't
+/// silently delete unrelated files.
+pub const export_marker = ".labelle-export";
+
 /// Deployment target for `--platform`. `none` is the plain export.
 pub const Platform = enum { none, itch, github_pages };
 
@@ -77,9 +84,28 @@ pub fn packageExport(
         return error.BuildFailed;
     };
 
+    // Safety gate: refuse to wipe a destructive or user-owned directory.
+    // `resolveExportOutput` (cli.zig) already rejects the cwd/project root
+    // and ancestors; this is the second half — refuse a pre-existing,
+    // non-empty dir that no prior export created.
+    if (outputDirIsUnsafe(io, opts.output_dir)) {
+        std.debug.print(
+            "labelle wasm export: refusing to overwrite non-empty '{s}'\n" ++
+                "  it wasn't created by a previous export (no {s} marker).\n" ++
+                "  choose an empty/dedicated dir, or delete it yourself first.\n",
+            .{ opts.output_dir, export_marker },
+        );
+        return error.DestructiveOutputPath;
+    }
+
     // Fresh output dir — never leak stale files from a prior export.
     cwd.deleteTree(io, opts.output_dir) catch {};
     try cwd.createDirPath(io, opts.output_dir);
+    // Drop the marker immediately so even a partial/failed export is
+    // recognized as ours on the next run (and excluded from the archive).
+    const marker_path = try std.fs.path.join(allocator, &.{ opts.output_dir, export_marker });
+    defer allocator.free(marker_path);
+    cwd.writeFile(io, .{ .sub_path = marker_path, .data = "labelle wasm export output dir\n" }) catch {};
 
     // 1. Copy the whole web tree.
     var files: std.ArrayList(FileReport) = .empty;
@@ -160,6 +186,9 @@ fn walkInto(
                 try walkInto(allocator, io, src_root, dst_root, child_rel, out);
             },
             .file => {
+                // `child_rel` ownership transfers into `out` on success;
+                // free it if any step before the append fails.
+                errdefer allocator.free(child_rel);
                 const src_path = try std.fs.path.join(allocator, &.{ src_root, child_rel });
                 defer allocator.free(src_path);
                 const dst_path = try std.fs.path.join(allocator, &.{ dst_root, child_rel });
@@ -167,7 +196,6 @@ fn walkInto(
 
                 try cwd.copyFile(src_path, cwd, dst_path, io, .{ .make_path = true });
                 const size = fileSize(io, dst_path);
-                // `child_rel` ownership transfers into `out`.
                 try out.append(allocator, .{ .rel = child_rel, .before = size, .after = size });
             },
             else => allocator.free(child_rel),
@@ -274,11 +302,18 @@ fn recordOrUpdate(
 ) !void {
     for (files.items) |*f| {
         if (std.mem.eql(u8, f.rel, rel)) {
+            // A replacement copy (e.g. the project shell overwriting the
+            // emitted stub) — reset BOTH sizes so the report shows the
+            // current size, never a stale before→after delta (which would
+            // also underflow `before - after` when the file grew).
+            f.before = size;
             f.after = size;
             return;
         }
     }
-    try files.append(allocator, .{ .rel = try allocator.dupe(u8, rel), .before = size, .after = size });
+    const owned = try allocator.dupe(u8, rel);
+    errdefer allocator.free(owned);
+    try files.append(allocator, .{ .rel = owned, .before = size, .after = size });
 }
 
 // ── ZIP writer (stored, no external dependency) ─────────────────────
@@ -303,7 +338,11 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
 
     const CentralEntry = struct { name: []const u8, crc: u32, size: u32, offset: u32 };
     var central: std.ArrayList(CentralEntry) = .empty;
+    // Register both cleanups up front (LIFO: free the duped names, then
+    // the list). This frees names appended so far even if an error is
+    // raised part-way through the loop below.
     defer central.deinit(allocator);
+    defer for (central.items) |c| allocator.free(c.name);
 
     for (entries.items) |rel| {
         const full = try std.fs.path.join(allocator, &.{ output_dir, rel });
@@ -323,16 +362,17 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
         try buf.appendSlice(allocator, zip_name);
         try buf.appendSlice(allocator, data);
 
-        // Central-dir names are borrowed from `entries` (via a stable
-        // duped copy) so they outlive this loop iteration.
+        // Central-dir names need a stable copy that outlives this loop
+        // iteration (`zip_name` is freed at iteration end).
+        const owned_name = try allocator.dupe(u8, zip_name);
+        errdefer allocator.free(owned_name);
         try central.append(allocator, .{
-            .name = try allocator.dupe(u8, zip_name),
+            .name = owned_name,
             .crc = crc,
             .size = size,
             .offset = offset,
         });
     }
-    defer for (central.items) |c| allocator.free(c.name);
 
     const cd_offset: u32 = @intCast(buf.items.len);
     for (central.items) |c| {
@@ -432,6 +472,9 @@ fn collectRelFiles(
 
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
+        // Don't archive the export marker (see `export_marker`).
+        if (rel.len == 0 and std.mem.eql(u8, entry.name, export_marker)) continue;
+
         const child_rel = if (rel.len == 0)
             try allocator.dupe(u8, entry.name)
         else
@@ -441,7 +484,11 @@ fn collectRelFiles(
                 defer allocator.free(child_rel);
                 try collectRelFiles(allocator, io, root, child_rel, out);
             },
-            .file => try out.append(allocator, child_rel),
+            .file => {
+                // Ownership transfers on success; free on append failure.
+                errdefer allocator.free(child_rel);
+                try out.append(allocator, child_rel);
+            },
             else => allocator.free(child_rel),
         }
     }
@@ -461,7 +508,10 @@ fn printReport(items: []const FileReport, opts: Options, wasm_opt_ran: bool, zip
     var bbuf: [32]u8 = undefined;
     var abuf: [32]u8 = undefined;
     for (items) |f| {
-        if (f.after != f.before) {
+        // Only render a before→after delta when the file actually shrank
+        // (wasm-opt). `f.after < f.before` also guards `before - after`
+        // against unsigned underflow.
+        if (f.after < f.before) {
             const pct = if (f.before == 0) 0 else (100 * (f.before - f.after)) / f.before;
             std.debug.print("  {s}: {s} -> {s} ({d}% smaller)\n", .{
                 f.rel, formatSize(&bbuf, f.before), formatSize(&abuf, f.after), pct,
@@ -509,6 +559,22 @@ fn fileExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+/// True when `path` is a pre-existing, non-empty directory that no prior
+/// export created (i.e. it lacks `export_marker`). Wiping such a dir
+/// could destroy the user's files, so `packageExport` refuses. A missing
+/// path, an empty dir, or a marker-bearing dir is safe (returns false).
+pub fn outputDirIsUnsafe(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var empty = true;
+    while (it.next(io) catch return false) |entry| {
+        if (std.mem.eql(u8, entry.name, export_marker)) return false; // a prior export
+        empty = false;
+    }
+    return !empty;
+}
+
 fn fileSize(io: std.Io, path: []const u8) u64 {
     const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
     return st.size;
@@ -522,6 +588,38 @@ test "parsePlatform: known + unknown" {
     try std.testing.expectEqual(Platform.github_pages, parsePlatform("github_pages").?);
     try std.testing.expect(parsePlatform("nope") == null);
     try std.testing.expect(parsePlatform("") == null);
+}
+
+test "outputDirIsUnsafe: missing/empty/marked are safe, populated is not" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(base);
+
+    // Missing path → safe.
+    const missing = try std.fs.path.join(alloc, &.{ base, "nope" });
+    defer alloc.free(missing);
+    try std.testing.expect(!outputDirIsUnsafe(io, missing));
+
+    // Empty dir → safe.
+    try tmp.dir.createDirPath(io, "empty");
+    const empty = try std.fs.path.join(alloc, &.{ base, "empty" });
+    defer alloc.free(empty);
+    try std.testing.expect(!outputDirIsUnsafe(io, empty));
+
+    // Populated, no marker → UNSAFE (would clobber the user's files).
+    try tmp.dir.createDirPath(io, "user");
+    try tmp.dir.writeFile(io, .{ .sub_path = "user/keepme.txt", .data = "important" });
+    const user = try std.fs.path.join(alloc, &.{ base, "user" });
+    defer alloc.free(user);
+    try std.testing.expect(outputDirIsUnsafe(io, user));
+
+    // Populated WITH the export marker → safe (a prior export).
+    try tmp.dir.writeFile(io, .{ .sub_path = "user/" ++ export_marker, .data = "" });
+    try std.testing.expect(!outputDirIsUnsafe(io, user));
 }
 
 test "formatSize: byte/KB/MB thresholds" {

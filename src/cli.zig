@@ -338,9 +338,62 @@ fn parseWasmExportArgs(args: anytype) ?WasmExportArgs {
 /// project dir so `labelle wasm export ../game --output release` writes
 /// under the project, matching where the build output already lives.
 /// Caller owns the returned slice.
+///
+/// SAFETY: the export dir is wiped (`deleteTree`) on every run, so a
+/// destructive `--output` — `.`, `..`, the project/cwd root, or any
+/// ancestor of them — would delete the user's source tree. Such targets
+/// are refused with `error.DestructiveOutputPath` instead. (The
+/// complementary "non-empty dir not created by a prior export" guard
+/// lives in `export.packageExport`, which owns the deletion.)
 fn resolveExportOutput(allocator: std.mem.Allocator, project_dir: []const u8, output: []const u8) ![]const u8 {
+    // Normalized form of `output` alone (collapses `.`/`..`; keeps a
+    // relative path relative). `resolve` does NOT anchor relatives at the
+    // cwd in Zig 0.16, so this is pure path math — no filesystem access,
+    // which also keeps it unit-testable.
+    const norm = try std.fs.path.resolve(allocator, &.{output});
+    defer allocator.free(norm);
+
+    const destructive = if (std.fs.path.isAbsolute(norm))
+        // Absolute output: refuse the filesystem root (no parent to scope
+        // the wipe) or the project dir / an ancestor of it when the
+        // project path is itself absolute. Other absolute dirs are still
+        // guarded by the non-empty-without-marker check in packageExport.
+        std.fs.path.dirname(norm) == null or
+            (std.fs.path.isAbsolute(project_dir) and try absTargetHitsProject(allocator, norm, project_dir))
+    else
+        // Relative output: refuse the project root itself (`.`) or any
+        // path that escapes above it (leading `..`) — wiping either would
+        // delete the project / a parent tree.
+        std.mem.eql(u8, norm, ".") or
+            std.mem.eql(u8, norm, "..") or
+            std.mem.startsWith(u8, norm, ".." ++ std.fs.path.sep_str);
+
+    if (destructive) {
+        std.debug.print(
+            "labelle wasm export: refusing to use '{s}' as --output\n" ++
+                "  the export directory is wiped on every run, and this path is the\n" ++
+                "  project directory, an ancestor of it, or the filesystem root.\n" ++
+                "  choose a dedicated subdirectory, e.g. --output ./release\n",
+            .{output},
+        );
+        return error.DestructiveOutputPath;
+    }
+
     if (std.fs.path.isAbsolute(output)) return allocator.dupe(u8, output);
     return std.fs.path.join(allocator, &.{ project_dir, output });
+}
+
+/// True when the absolute, normalized output `norm` is the (absolute)
+/// project dir itself or an ancestor of it.
+fn absTargetHitsProject(allocator: std.mem.Allocator, norm: []const u8, project_dir: []const u8) !bool {
+    const proj_abs = try std.fs.path.resolve(allocator, &.{project_dir});
+    defer allocator.free(proj_abs);
+    if (std.mem.eql(u8, norm, proj_abs)) return true;
+    // `norm` is an ancestor of `proj_abs` only if it extends it at a path
+    // boundary — guards against "/foo" matching "/foobar".
+    return proj_abs.len > norm.len and
+        std.mem.startsWith(u8, proj_abs, norm) and
+        proj_abs[norm.len] == std.fs.path.sep;
 }
 
 /// Parse a --platform=<value> string into a Platform enum, or null if invalid.
@@ -1494,17 +1547,20 @@ pub fn main(proc_init: std.process.Init) !void {
 
     // Run
     if (parsed.platform == .wasm) {
-        // WASM: serve via local HTTP server + open browser. The build
-        // pipeline is complete here — the serve loop is interactive (runs
-        // until Ctrl+C), so the terminal `done` record lands first.
-        if (reporter) |r| r.finishDone(0);
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
         if (parsed_args.wasm_export) {
             // `wasm export`: package the fresh build into a deployment dir
-            // instead of serving it.
+            // instead of serving it. Packaging runs AFTER the build, so
+            // keep the progress feed open across it (a run phase) and only
+            // mark `done` once the artifacts are on disk — otherwise a
+            // `--progress=json` consumer sees `done` before the export.
+            if (reporter) |r| {
+                r.beginPhase(.run, "packaging wasm export");
+                r.clearSpinner();
+            }
             const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
             defer allocator.free(out_abs);
             try export_mod.packageExport(allocator, web_dir, project_web_dir, .{
@@ -1512,7 +1568,11 @@ pub fn main(proc_init: std.process.Init) !void {
                 .zip = parsed_args.export_zip,
                 .platform = parsed_args.export_pkg_platform,
             });
+            if (reporter) |r| r.finishDone(0);
         } else {
+            // WASM serve: the loop is interactive (runs until Ctrl+C), so
+            // the terminal `done` record lands before the serve loop.
+            if (reporter) |r| r.finishDone(0);
             try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open);
         }
     } else if (parsed.platform == .ios) {
@@ -2510,6 +2570,81 @@ pub const ParseWasmExportArgsSpec = struct {
             var iter = testIter("--progress=verbose");
             defer iter.deinit();
             try std.testing.expect(parseWasmExportArgs(&iter) == null);
+        }
+    };
+};
+
+pub const ResolveExportOutputSpec = struct {
+    // The export dir is wiped on every run, so a destructive `--output`
+    // must be refused before it can delete the user's source tree.
+    pub const rejects_destructive = struct {
+        test "--output . (the project dir) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "."),
+            );
+        }
+
+        test "--output .. (an ancestor) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", ".."),
+            );
+        }
+
+        test "--output ../.. (a higher ancestor) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "../.."),
+            );
+        }
+
+        test "--output / (filesystem root) is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "/"),
+            );
+        }
+
+        test "an absolute --output equal to the project dir is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "/proj/root"),
+            );
+        }
+
+        test "an absolute --output that is an ancestor of the project is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "/proj"),
+            );
+        }
+
+        test "foo/../.. collapsing to an escape is rejected" {
+            try std.testing.expectError(
+                error.DestructiveOutputPath,
+                resolveExportOutput(std.testing.allocator, "/proj/root", "foo/../.."),
+            );
+        }
+    };
+
+    pub const accepts_dedicated = struct {
+        test "a dedicated subdir under the project is accepted" {
+            const out = try resolveExportOutput(std.testing.allocator, "/proj/root", "release");
+            defer std.testing.allocator.free(out);
+            try std.testing.expectEqualStrings("/proj/root/release", out);
+        }
+
+        test "a nested dedicated subdir is accepted" {
+            const out = try resolveExportOutput(std.testing.allocator, "/proj/root", "dist/web");
+            defer std.testing.allocator.free(out);
+            try std.testing.expectEqualStrings("/proj/root/dist/web", out);
+        }
+
+        test "an unrelated absolute --output is accepted verbatim" {
+            const out = try resolveExportOutput(std.testing.allocator, "/proj/root", "/tmp/exports/game");
+            defer std.testing.allocator.free(out);
+            try std.testing.expectEqualStrings("/tmp/exports/game", out);
         }
     };
 };
