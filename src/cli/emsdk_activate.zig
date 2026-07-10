@@ -169,7 +169,7 @@ fn locateFetchedEmsdk(allocator: std.mem.Allocator, build_dir: []const u8) !?[]u
         if (readEmsdkDepHash(allocator, build_dir)) |hash| {
             defer allocator.free(hash);
             const cand = try std.fs.path.join(allocator, &.{ root, hash });
-            if (try isEmsdkDir(cand)) return cand;
+            if (try isEmsdkDir(allocator, cand)) return cand;
             allocator.free(cand);
             return null;
         }
@@ -240,13 +240,13 @@ fn isSafeCacheHash(hash: []const u8) bool {
 /// True when `cand` is a fetched emsdk checkout — a dir that contains BOTH the
 /// `emsdk` launcher and `emsdk.py` (the emsdk-repo signature, so a same-named
 /// dir from another package can't false-match). Never errors.
-fn isEmsdkDir(cand: []const u8) !bool {
+fn isEmsdkDir(allocator: std.mem.Allocator, cand: []const u8) !bool {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    const launcher = try std.fs.path.join(std.heap.page_allocator, &.{ cand, emsdk_cache.emsdk_launcher_name });
-    defer std.heap.page_allocator.free(launcher);
-    const emsdk_py = try std.fs.path.join(std.heap.page_allocator, &.{ cand, "emsdk.py" });
-    defer std.heap.page_allocator.free(emsdk_py);
+    const launcher = try std.fs.path.join(allocator, &.{ cand, emsdk_cache.emsdk_launcher_name });
+    defer allocator.free(launcher);
+    const emsdk_py = try std.fs.path.join(allocator, &.{ cand, "emsdk.py" });
+    defer allocator.free(emsdk_py);
     if (std.meta.isError(cwd.access(io, launcher, .{}))) return false;
     if (std.meta.isError(cwd.access(io, emsdk_py, .{}))) return false;
     return true;
@@ -263,7 +263,7 @@ fn findEmsdkUnder(allocator: std.mem.Allocator, root: []const u8) !?[]u8 {
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         const cand = try std.fs.path.join(allocator, &.{ root, entry.name });
-        if (try isEmsdkDir(cand)) return cand;
+        if (try isEmsdkDir(allocator, cand)) return cand;
         allocator.free(cand);
     }
     return null;
