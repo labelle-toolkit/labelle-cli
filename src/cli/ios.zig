@@ -341,8 +341,63 @@ fn printIosHelp() void {
     , .{});
 }
 
+/// Detect the known iOS-simulator ARM NEON/SIMD compile failure (labelle-cli#4, #5).
+///
+/// The `aarch64-ios-simulator` target compiles ARM SIMD (NEON) intrinsics that
+/// require CPU features the simulator toolchain does not enable, producing
+/// `zig cc`/clang errors like:
+///
+///   always_inline function 'vdupq_n_u64' requires target feature 'altnzcv',
+///   but would be inlined into function ... compiled without support for 'altnzcv'
+///
+/// The durable fix lives in the plugins that compile ARM SIMD — they must select
+/// their scalar fallback for the simulator triple (`os == .ios and abi ==
+/// .simulator`), e.g. Box2D's `BOX2D_DISABLE_SIMD` and Clay's non-NEON hash path.
+/// The CLI cannot influence those C compiles directly (it only invokes `zig build`
+/// on the generated project), so it recognises this failure signature and points
+/// the user at the fix instead of dumping a wall of intrinsic errors.
+///
+/// Returns true when `stderr` carries the feature-mismatch signature paired with a
+/// NEON marker (so a generic "requires target feature" is not mistaken for this).
+fn isSimdFeatureBuildError(stderr: []const u8) bool {
+    if (std.mem.indexOf(u8, stderr, "requires target feature") == null) return false;
+    const neon_markers = [_][]const u8{
+        "altnzcv", // ARMv8.5 FEAT_FlagM2 — the feature the intrinsics demand
+        "vdupq_n_", "vld1", "vst1", "vmulq_", "vaddq_", // common NEON intrinsics
+        "arm_neon.h", "neon", "NEON",
+    };
+    for (neon_markers) |marker| {
+        if (std.mem.indexOf(u8, stderr, marker) != null) return true;
+    }
+    return false;
+}
+
+/// Print an actionable hint for the iOS-simulator NEON/SIMD build failure.
+fn printSimdBuildHint() void {
+    std.debug.print(
+        \\
+        \\labelle: this looks like the iOS-simulator ARM NEON/SIMD compile failure
+        \\  (labelle-cli#4 / #5). The aarch64-ios-simulator target compiles NEON
+        \\  intrinsics that its toolchain does not enable.
+        \\
+        \\  A plugin that compiles ARM SIMD must fall back to scalar for the
+        \\  simulator triple (os == .ios and abi == .simulator). In the plugin's
+        \\  build.zig, gate its SIMD-disable on that target:
+        \\
+        \\    Box2D: add `BOX2D_DISABLE_SIMD=1` (like the existing emscripten branch)
+        \\    Clay:  compile the non-NEON hash path
+        \\
+        \\  Building for a physical device (`labelle ios build --device`) avoids
+        \\  this, as does upgrading the toolchain past the 0.15.2-era clang bug.
+        \\
+    , .{});
+}
+
 /// Build the iOS target (simulator or device).
 fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, release: bool) !void {
+    // Simulator is the default target; `--device` switches to the physical-device
+    // arm64 build. The NEON/SIMD failure below only affects the simulator triple.
+    const simulator = !device;
     const target_label: []const u8 = if (device) "iOS device (arm64)" else "iOS simulator (arm64)";
     const config_label: []const u8 = if (release) "Release" else "Debug";
     std.debug.print("labelle: building for {s} ({s})...\n", .{ target_label, config_label });
@@ -374,6 +429,7 @@ fn iosBuild(allocator: std.mem.Allocator, target_dir: []const u8, device: bool, 
     switch (result.term) {
         .exited => |code| if (code != 0) {
             std.debug.print("labelle: build failed:\n{s}\n", .{result.stderr});
+            if (simulator and isSimdFeatureBuildError(result.stderr)) printSimdBuildHint();
             return error.BuildFailed;
         },
         else => {
@@ -736,4 +792,38 @@ fn generateLaunchScreen(allocator: std.mem.Allocator, app_name: []const u8) ![]c
         \\</document>
         \\
     , .{app_name});
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "isSimdFeatureBuildError: detects the altnzcv NEON signature" {
+    const stderr =
+        \\clay.h:1449:21: error: always_inline function 'vdupq_n_u64' requires target feature 'altnzcv',
+        \\but would be inlined into function 'Clay__HashData' that is compiled without support for 'altnzcv'
+    ;
+    try std.testing.expect(isSimdFeatureBuildError(stderr));
+}
+
+test "isSimdFeatureBuildError: detects the box2d vdupq_n_f32 signature" {
+    const stderr =
+        \\error: always_inline function 'vdupq_n_f32' requires target feature 'altnzcv',
+        \\but would be inlined into function that is compiled without support for 'altnzcv'
+    ;
+    try std.testing.expect(isSimdFeatureBuildError(stderr));
+}
+
+test "isSimdFeatureBuildError: ignores unrelated feature-mismatch errors" {
+    // A "requires target feature" error with no NEON marker must not trip the hint.
+    const stderr =
+        \\error: always_inline function 'foo' requires target feature 'avx512f',
+        \\but would be inlined into function 'bar' that is compiled without support for 'avx512f'
+    ;
+    try std.testing.expect(!isSimdFeatureBuildError(stderr));
+}
+
+test "isSimdFeatureBuildError: ignores ordinary build failures" {
+    const stderr = "error: unable to find 'game.zig'\n";
+    try std.testing.expect(!isSimdFeatureBuildError(stderr));
 }
