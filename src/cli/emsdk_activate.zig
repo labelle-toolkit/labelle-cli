@@ -142,7 +142,10 @@ fn isActivated(io: std.Io, cwd: std.Io.Dir, emcc_path: []const u8, marker_path: 
 /// Searches, in order:
 ///   1. `<build_dir>/zig-pkg/` — the project-local vendored package dir the
 ///      assembler-generated build uses.
-///   2. `<zig-global-cache>/p/` — the shared package cache fallback.
+///   2. `<zig-global-cache>/p/<hash>/` — the shared package cache, resolved
+///      PRECISELY from the emsdk dep hash in the target's generated
+///      `build.zig.zon` (labelle-cli#294), falling back to a heuristic scan
+///      only when that metadata can't be read.
 /// Returns the first match (heap-owned; caller frees), or null when none is
 /// found (not fetched yet / unusual layout). Never errors on a missing dir.
 fn locateFetchedEmsdk(allocator: std.mem.Allocator, build_dir: []const u8) !?[]u8 {
@@ -155,16 +158,29 @@ fn locateFetchedEmsdk(allocator: std.mem.Allocator, build_dir: []const u8) !?[]u
         defer allocator.free(gc);
         const root = try std.fs.path.join(allocator, &.{ gc, "p" });
         defer allocator.free(root);
+
+        // Precise resolution (labelle-cli#294): the emsdk dep's `.hash` in the
+        // target's generated build.zig.zon IS exactly the `<gc>/p/<hash>/`
+        // package-cache subdir name, so we can point at the SAME checkout the
+        // build's `b.dependency("emsdk")` link step resolves — deterministically,
+        // instead of guessing the first emsdk-shaped dir. If the hash is known
+        // but its dir isn't a (fully-fetched) emsdk checkout, we return null
+        // rather than heuristically activating a DIFFERENT, wrong checkout.
+        if (readEmsdkDepHash(allocator, build_dir)) |hash| {
+            defer allocator.free(hash);
+            const cand = try std.fs.path.join(allocator, &.{ root, hash });
+            if (try isEmsdkDir(allocator, cand)) return cand;
+            allocator.free(cand);
+            return null;
+        }
+
+        // Metadata unreadable (no build.zig.zon / older assembler layout / no
+        // emsdk dep entry): last-resort heuristic pick of the first emsdk-shaped
+        // dir under the global cache — could be an older/unrelated checkout, so
+        // warn loudly. (F4 mitigation, retained for the metadata-missing case.)
         if (try findEmsdkUnder(allocator, root)) |p| {
-            // Heuristic fallback: this is the FIRST emsdk-shaped dir under the
-            // global cache, not necessarily the one THIS target's generated
-            // build.zig.zon references (could be an older/unrelated checkout).
-            // Project-local zig-pkg/ (searched above) is what the generated
-            // build + studio acceptance actually use, so this only bites
-            // unusual layouts — warn loudly. Precise match tracked in
-            // labelle-cli#294. (F4)
             std.debug.print(
-                "labelle: no project-local emsdk under <build_dir>/zig-pkg; falling back to a heuristic pick from the global package cache ({s}) — if the wasm build activates the wrong emsdk, see labelle-cli#294\n",
+                "labelle: could not read the emsdk dep hash from <build_dir>/build.zig.zon; falling back to a heuristic pick from the global package cache ({s}) — if the wasm build activates the wrong emsdk, see labelle-cli#294\n",
                 .{p},
             );
             return p;
@@ -173,9 +189,70 @@ fn locateFetchedEmsdk(allocator: std.mem.Allocator, build_dir: []const u8) !?[]u
     return null;
 }
 
-/// Scan the immediate subdirs of `root` for an emsdk checkout — a dir that
-/// contains BOTH the `emsdk` launcher and `emsdk.py` (the emsdk-repo signature,
-/// so a same-named dir from another package can't false-match). Returns the
+/// Read the `emsdk` dependency's package `.hash` from the target's generated
+/// `<build_dir>/build.zig.zon`. That hash is exactly the `<gc>/p/<hash>/`
+/// package-cache subdir name, so it resolves the fetched checkout precisely
+/// (labelle-cli#294). Returns a heap-owned hash (caller frees), or null when
+/// the file/dep/hash is absent, unparsable, or not a safe single path
+/// component. Best-effort: never errors (the caller falls back).
+fn readEmsdkDepHash(allocator: std.mem.Allocator, build_dir: []const u8) ?[]u8 {
+    @setEvalBranchQuota(10000);
+    const zon_path = std.fs.path.join(allocator, &.{ build_dir, "build.zig.zon" }) catch return null;
+    defer allocator.free(zon_path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), zon_path, allocator, .limited(1 << 20)) catch return null;
+    defer allocator.free(raw);
+    const raw_z = allocator.dupeZ(u8, raw) catch return null;
+    defer allocator.free(raw_z);
+
+    // Partial shape: `ignore_unknown_fields` skips every other manifest field
+    // (name, version, fingerprint, paths) and every non-emsdk dependency, as
+    // well as the emsdk dep's own `.url`/`.lazy` — we want only `.hash`.
+    const ZonShape = struct {
+        dependencies: ?struct {
+            emsdk: ?struct { hash: []const u8 = "" } = null,
+        } = null,
+    };
+    const parsed = std.zon.parse.fromSliceAlloc(ZonShape, allocator, raw_z, null, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer std.zon.parse.free(allocator, parsed);
+
+    const deps = parsed.dependencies orelse return null;
+    const emsdk = deps.emsdk orelse return null;
+    if (!isSafeCacheHash(emsdk.hash)) return null;
+    return allocator.dupe(u8, emsdk.hash) catch return null;
+}
+
+/// A Zig package hash is a single path component drawn from the multihash
+/// base64url alphabet (`[A-Za-z0-9_-]`). Reject anything else so a hostile or
+/// malformed build.zig.zon can't turn `<gc>/p/<hash>` into a traversal
+/// (`../…`) or an absolute path. Empty is rejected.
+fn isSafeCacheHash(hash: []const u8) bool {
+    if (hash.len == 0) return false;
+    for (hash) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// True when `cand` is a fetched emsdk checkout — a dir that contains BOTH the
+/// `emsdk` launcher and `emsdk.py` (the emsdk-repo signature, so a same-named
+/// dir from another package can't false-match). Never errors.
+fn isEmsdkDir(allocator: std.mem.Allocator, cand: []const u8) !bool {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const launcher = try std.fs.path.join(allocator, &.{ cand, emsdk_cache.emsdk_launcher_name });
+    defer allocator.free(launcher);
+    const emsdk_py = try std.fs.path.join(allocator, &.{ cand, "emsdk.py" });
+    defer allocator.free(emsdk_py);
+    if (std.meta.isError(cwd.access(io, launcher, .{}))) return false;
+    if (std.meta.isError(cwd.access(io, emsdk_py, .{}))) return false;
+    return true;
+}
+
+/// Scan the immediate subdirs of `root` for an emsdk checkout. Returns the
 /// first match (heap-owned), or null. A missing/unopenable `root` yields null.
 fn findEmsdkUnder(allocator: std.mem.Allocator, root: []const u8) !?[]u8 {
     const io = config.globalIo();
@@ -186,13 +263,7 @@ fn findEmsdkUnder(allocator: std.mem.Allocator, root: []const u8) !?[]u8 {
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         const cand = try std.fs.path.join(allocator, &.{ root, entry.name });
-        const launcher = try std.fs.path.join(allocator, &.{ cand, emsdk_cache.emsdk_launcher_name });
-        defer allocator.free(launcher);
-        const emsdk_py = try std.fs.path.join(allocator, &.{ cand, "emsdk.py" });
-        defer allocator.free(emsdk_py);
-        const has_launcher = !std.meta.isError(cwd.access(io, launcher, .{}));
-        const has_py = !std.meta.isError(cwd.access(io, emsdk_py, .{}));
-        if (has_launcher and has_py) return cand;
+        if (try isEmsdkDir(allocator, cand)) return cand;
         allocator.free(cand);
     }
     return null;
@@ -302,6 +373,51 @@ fn stageFetchedEmsdkPkg(alloc: std.mem.Allocator, build_dir: []const u8) ![]u8 {
     defer alloc.free(py);
     try cwd.writeFile(io, .{ .sub_path = py, .data = "# emsdk\n" });
     return pkg;
+}
+
+/// Stage an emsdk-shaped checkout (launcher + `emsdk.py`) directly at `pkg`.
+/// Used to place a fetched emsdk under `<gc>/p/<hash>/` for the precise
+/// global-cache resolution tests (labelle-cli#294).
+fn stageEmsdkAt(alloc: std.mem.Allocator, pkg: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, pkg);
+    const launcher = try std.fs.path.join(alloc, &.{ pkg, emsdk_cache.emsdk_launcher_name });
+    defer alloc.free(launcher);
+    try cwd.writeFile(io, .{ .sub_path = launcher, .data = "#!/bin/sh\n" });
+    const py = try std.fs.path.join(alloc, &.{ pkg, "emsdk.py" });
+    defer alloc.free(py);
+    try cwd.writeFile(io, .{ .sub_path = py, .data = "# emsdk\n" });
+}
+
+/// Write a minimal assembler-shaped `build.zig.zon` under `build_dir` whose
+/// `emsdk` dependency carries `hash`, mirroring what the generated wasm target
+/// emits. Includes decoy fields/deps so the parse exercises
+/// `ignore_unknown_fields`.
+fn writeTargetZon(alloc: std.mem.Allocator, build_dir: []const u8, hash: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, build_dir);
+    const zon = try std.fmt.allocPrint(alloc,
+        \\.{{
+        \\    .name = .labelle_target,
+        \\    .version = "0.0.0",
+        \\    .fingerprint = 0x1234abcd,
+        \\    .dependencies = .{{
+        \\        .@"labelle-core" = .{{ .path = "../deps/labelle-core" }},
+        \\        .emsdk = .{{
+        \\            .url = "git+https://github.com/emscripten-core/emsdk#4.0.9",
+        \\            .hash = "{s}",
+        \\        }},
+        \\    }},
+        \\    .paths = .{{""}},
+        \\}}
+        \\
+    , .{hash});
+    defer alloc.free(zon);
+    const zon_path = try std.fs.path.join(alloc, &.{ build_dir, "build.zig.zon" });
+    defer alloc.free(zon_path);
+    try cwd.writeFile(io, .{ .sub_path = zon_path, .data = zon });
 }
 
 test "activateFetchedEmsdk activates the fetched zig-package emsdk in place, idempotently" {
@@ -479,4 +595,165 @@ test "activateFetchedEmsdk re-activates a half-activated checkout (emcc present,
     activateFetchedEmsdk(alloc, build_dir, DEFAULT_EMSDK_VERSION);
     try testing.expect(!StepRecorder.saw_install);
     try testing.expect(!StepRecorder.saw_activate);
+}
+
+test "readEmsdkDepHash extracts the emsdk dep hash from the target build.zig.zon (#294)" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    const build_dir = try std.fs.path.join(alloc, &.{ root, "target" });
+    defer alloc.free(build_dir);
+
+    const want = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ";
+    try writeTargetZon(alloc, build_dir, want);
+
+    const got = readEmsdkDepHash(alloc, build_dir) orelse return error.NoHash;
+    defer alloc.free(got);
+    try testing.expectEqualStrings(want, got);
+
+    // No build.zig.zon at all → null (caller falls back to the heuristic).
+    const missing_dir = try std.fs.path.join(alloc, &.{ root, "no-zon" });
+    defer alloc.free(missing_dir);
+    try std.Io.Dir.cwd().createDirPath(io, missing_dir);
+    try testing.expect(readEmsdkDepHash(alloc, missing_dir) == null);
+}
+
+test "isSafeCacheHash accepts multihash names and rejects traversal (#294)" {
+    try testing.expect(isSafeCacheHash("N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ"));
+    try testing.expect(!isSafeCacheHash(""));
+    try testing.expect(!isSafeCacheHash("../../etc/passwd"));
+    try testing.expect(!isSafeCacheHash("has/slash"));
+    try testing.expect(!isSafeCacheHash("has.dot"));
+}
+
+test "activateFetchedEmsdk resolves the EXACT global-cache dir from the dep hash, not the first emsdk-shaped dir (#294)" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+    StepRecorder.reset();
+    emsdk_toolchain.setExecOverrideForTest(StepRecorder.exec);
+    defer emsdk_toolchain.setExecOverrideForTest(null);
+
+    // build_dir has NO project-local zig-pkg/, forcing the global-cache path.
+    const build_dir = try std.fs.path.join(alloc, &.{ root, "target" });
+    defer alloc.free(build_dir);
+
+    const p_root = try std.fs.path.join(alloc, &.{ root, zig_cache.GLOBAL_CACHE_SUBDIR, "p" });
+    defer alloc.free(p_root);
+
+    // A DECOY emsdk checkout that would win a first-match heuristic scan (its
+    // name sorts before the real hash), plus the CORRECT checkout named by the
+    // dep hash. The precise fix must pick the latter.
+    const decoy = try std.fs.path.join(alloc, &.{ p_root, "AAAA-decoy-emsdk" });
+    defer alloc.free(decoy);
+    try stageEmsdkAt(alloc, decoy);
+
+    const want_hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ";
+    const correct = try std.fs.path.join(alloc, &.{ p_root, want_hash });
+    defer alloc.free(correct);
+    try stageEmsdkAt(alloc, correct);
+
+    try writeTargetZon(alloc, build_dir, want_hash);
+
+    activateFetchedEmsdk(alloc, build_dir, DEFAULT_EMSDK_VERSION);
+    try testing.expect(StepRecorder.saw_install);
+    try testing.expect(StepRecorder.saw_activate);
+
+    // Activation ran IN the hash-named dir (StepRecorder writes emcc under the
+    // activated pkg), and NOT in the decoy.
+    const correct_emcc = try std.fs.path.join(alloc, &.{ correct, emsdk_cache.emcc_relpath });
+    defer alloc.free(correct_emcc);
+    try std.Io.Dir.cwd().access(io, correct_emcc, .{});
+
+    const decoy_emcc = try std.fs.path.join(alloc, &.{ decoy, emsdk_cache.emcc_relpath });
+    defer alloc.free(decoy_emcc);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, decoy_emcc, .{}));
+}
+
+test "activateFetchedEmsdk does NOT heuristically activate a wrong checkout when the hash dir is absent (#294)" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+    StepRecorder.reset();
+    emsdk_toolchain.setExecOverrideForTest(StepRecorder.exec);
+    defer emsdk_toolchain.setExecOverrideForTest(null);
+
+    const build_dir = try std.fs.path.join(alloc, &.{ root, "target" });
+    defer alloc.free(build_dir);
+
+    const p_root = try std.fs.path.join(alloc, &.{ root, zig_cache.GLOBAL_CACHE_SUBDIR, "p" });
+    defer alloc.free(p_root);
+
+    // Only a DECOY (wrong) checkout is present; the dep-hash dir is absent.
+    const decoy = try std.fs.path.join(alloc, &.{ p_root, "AAAA-decoy-emsdk" });
+    defer alloc.free(decoy);
+    try stageEmsdkAt(alloc, decoy);
+
+    // The zon names a hash whose cache dir was never fetched.
+    try writeTargetZon(alloc, build_dir, "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ");
+
+    // Metadata WAS read (hash known) → we must NOT fall back to the decoy.
+    activateFetchedEmsdk(alloc, build_dir, DEFAULT_EMSDK_VERSION);
+    try testing.expect(!StepRecorder.saw_install);
+    try testing.expect(!StepRecorder.saw_activate);
+
+    const decoy_emcc = try std.fs.path.join(alloc, &.{ decoy, emsdk_cache.emcc_relpath });
+    defer alloc.free(decoy_emcc);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, decoy_emcc, .{}));
+}
+
+test "activateFetchedEmsdk falls back to the heuristic when no build.zig.zon metadata is present (#294)" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+    StepRecorder.reset();
+    emsdk_toolchain.setExecOverrideForTest(StepRecorder.exec);
+    defer emsdk_toolchain.setExecOverrideForTest(null);
+
+    // build_dir exists but has neither zig-pkg/ NOR a build.zig.zon.
+    const build_dir = try std.fs.path.join(alloc, &.{ root, "target" });
+    defer alloc.free(build_dir);
+    try std.Io.Dir.cwd().createDirPath(io, build_dir);
+
+    const p_root = try std.fs.path.join(alloc, &.{ root, zig_cache.GLOBAL_CACHE_SUBDIR, "p" });
+    defer alloc.free(p_root);
+    const only = try std.fs.path.join(alloc, &.{ p_root, "N-V-someemsdk" });
+    defer alloc.free(only);
+    try stageEmsdkAt(alloc, only);
+
+    // No dep-hash metadata to read → last-resort heuristic pick still activates
+    // the single emsdk-shaped dir (the retained F4 fallback).
+    activateFetchedEmsdk(alloc, build_dir, DEFAULT_EMSDK_VERSION);
+    try testing.expect(StepRecorder.saw_install);
+    try testing.expect(StepRecorder.saw_activate);
+
+    const only_emcc = try std.fs.path.join(alloc, &.{ only, emsdk_cache.emcc_relpath });
+    defer alloc.free(only_emcc);
+    try std.Io.Dir.cwd().access(io, only_emcc, .{});
 }
