@@ -18,6 +18,7 @@
 ///   labelle test [dir] [--verbose]      — run inline `test` blocks across the project source tree
 ///   labelle check [dir]                 — lint packs for §6 convention violations (Packs RFC)
 const std = @import("std");
+const builtin = @import("builtin");
 const project_config = @import("cli/project_config.zig");
 
 // Submodules
@@ -1853,11 +1854,18 @@ pub fn main(proc_init: std.process.Init) !void {
             // before and after the rename ships. Run it by a target_dir-
             // relative path so the game's cwd stays `target_dir` (saves land
             // where `zig build run` put them). Mirrors the --docker path.
+            // Probe with the platform executable suffix: on Windows the
+            // assembler emits `<name>.exe`, so a suffix-less probe never
+            // matches and would wrongly fall back to the legacy `game` name,
+            // then fail to launch with FileNotFound (cli#309).
+            const exe_suffix = if (builtin.os.tag == .windows) ".exe" else "";
             const sanitized = try util.sanitizeExeName(allocator, parsed.name);
             defer allocator.free(sanitized);
-            const sanitized_full = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", sanitized });
+            const sanitized_exe = try std.fmt.allocPrint(allocator, "{s}{s}", .{ sanitized, exe_suffix });
+            defer allocator.free(sanitized_exe);
+            const sanitized_full = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin", sanitized_exe });
             defer allocator.free(sanitized_full);
-            const exe_basename: []const u8 = if (util.fileExists(sanitized_full)) sanitized else "game";
+            const exe_basename: []const u8 = if (util.fileExists(sanitized_full)) sanitized_exe else "game" ++ exe_suffix;
             const rel_bin = try std.fs.path.join(allocator, &.{ "zig-out", "bin", exe_basename });
             defer allocator.free(rel_bin);
             var run_args: std.ArrayList([]const u8) = .empty;
