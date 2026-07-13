@@ -35,6 +35,85 @@ const Check = struct {
     required: bool = true,
 };
 
+// ── `--json` capability report (labelle-studio ToolchainGate contract) ──
+// Mirrors the zod schema in labelle-studio/src/services/doctor.ts:
+//   { capabilities: [ { id, required, ok, items: [ { id, name, ok, fixable,
+//     size_mb, action, detail, hint } ] } ] }
+// `?[]const u8` serializes to JSON `null` when absent; `std.json.Stringify`
+// emits `[]const u8` fields as strings and produces compact single-line
+// output (which is what the studio's line-based extractor looks for).
+
+const JsonItem = struct {
+    id: []const u8,
+    name: []const u8,
+    ok: bool,
+    fixable: bool,
+    size_mb: u32,
+    action: ?[]const u8,
+    detail: ?[]const u8,
+    hint: ?[]const u8,
+};
+
+const JsonCapability = struct {
+    id: []const u8,
+    required: bool,
+    ok: bool,
+    items: []const JsonItem,
+};
+
+const JsonReport = struct {
+    capabilities: []const JsonCapability,
+};
+
+/// Serialize the wasm-toolchain capability (zig + emsdk/emcc) as the studio's
+/// capability JSON on stdout. Items are non-fixable (no `install toolchain`
+/// command exists yet); the studio treats a capability whose every item is
+/// `ok || !fixable` as usable, so this reports status without gating.
+fn emitJsonReport(zig_check: Check, emsdk_check: Check) !void {
+    var out_buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(config.globalIo(), &out_buf);
+    try writeJsonReport(&w.interface, zig_check, emsdk_check);
+    try w.interface.flush();
+}
+
+/// Serialize the capability report to `w` (split out for testing). Emits a
+/// single compact JSON line + trailing newline.
+fn writeJsonReport(w: *std.Io.Writer, zig_check: Check, emsdk_check: Check) !void {
+    const items = [_]JsonItem{
+        .{
+            .id = "zig",
+            .name = "Zig toolchain",
+            .ok = zig_check.ok,
+            .fixable = false,
+            .size_mb = 0,
+            .action = null,
+            .detail = zig_check.detail,
+            .hint = zig_check.hint,
+        },
+        .{
+            .id = "python",
+            .name = "Python (wasm: emsdk + emcc)",
+            .ok = emsdk_check.ok,
+            .fixable = false,
+            .size_mb = 0,
+            .action = null,
+            .detail = emsdk_check.detail,
+            .hint = emsdk_check.hint,
+        },
+    };
+    const caps = [_]JsonCapability{
+        .{
+            .id = "wasm",
+            .required = true,
+            .ok = zig_check.ok and emsdk_check.ok,
+            .items = &items,
+        },
+    };
+    const report = JsonReport{ .capabilities = &caps };
+    try std.json.Stringify.value(report, .{}, w);
+    try w.writeByte('\n');
+}
+
 pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
@@ -42,11 +121,17 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     var project_dir: []const u8 = ".";
     var do_fix = false;
+    var as_json = false;
     for (cmd_args) |arg| {
         if (std.mem.eql(u8, arg, "--fix")) {
             do_fix = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            // Machine-readable capability report for labelle-studio's
+            // ToolchainGate (`doctor_check` in src-tauri/src/lib.rs). Emits a
+            // single-line `{"capabilities":[…]}` and nothing else.
+            as_json = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("labelle doctor: unknown option '{s}'\n  usage: labelle doctor [dir] [--fix]\n", .{arg});
+            std.debug.print("labelle doctor: unknown option '{s}'\n  usage: labelle doctor [dir] [--fix] [--json]\n", .{arg});
             return error.InvalidArgument;
         } else {
             project_dir = arg;
@@ -76,10 +161,24 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     };
     const needs_sdl = needs_sdl_render or needs_sdl_gamepad;
 
+    const zig_check = checkZig(arena, project_dir);
+    const emsdk_check = checkEmsdk(arena, project_dir);
+
+    // `--json`: emit the studio's capability report from the two toolchain
+    // checks and stop — no human report, no SDL provisioning. The wasm
+    // capability is what labelle-studio's ToolchainGate consumes; its items
+    // are marked non-fixable because the CLI has no `install toolchain`
+    // command yet (the studio gate treats non-fixable items as satisfied, so
+    // it renders status without offering a broken install button).
+    if (as_json) {
+        try emitJsonReport(zig_check, emsdk_check);
+        return;
+    }
+
     var checks: std.ArrayList(Check) = .empty;
 
-    try checks.append(arena, checkZig(arena, project_dir));
-    try checks.append(arena, checkEmsdk(arena, project_dir));
+    try checks.append(arena, zig_check);
+    try checks.append(arena, emsdk_check);
 
     if (needs_sdl) {
         var lib = checkSdl2Lib(arena);
@@ -374,3 +473,50 @@ fn onPath(arena: std.mem.Allocator, filename: []const u8) ?[]const u8 {
 fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
     return sdl_provision.findCachedLibDir(arena);
 }
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+/// The `--json` capability report is a cross-repo contract with
+/// labelle-studio's ToolchainGate (src/services/doctor.ts zod schema). Pin
+/// its shape so a drift breaks CI here, not the studio at runtime.
+pub const JsonReportSpec = struct {
+    test "doctor --json emits a wasm capability with zig+python items" {
+        const testing = std.testing;
+        var buf: [2048]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        // zig ok, emsdk NOT ok → capability ok must be their AND (false).
+        const zig_check = Check{ .name = "Zig toolchain", .ok = true, .detail = "managed zig 0.16.0" };
+        const emsdk_check = Check{ .name = "emsdk", .ok = false, .hint = "not activated" };
+        try writeJsonReport(&w, zig_check, emsdk_check);
+        const line = w.buffered();
+
+        // Exactly one line (the studio extractor is line-based).
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer parsed.deinit();
+        const caps = parsed.value.object.get("capabilities").?.array;
+        try testing.expectEqual(@as(usize, 1), caps.items.len);
+
+        const wasm = caps.items[0].object;
+        try testing.expectEqualStrings("wasm", wasm.get("id").?.string);
+        try testing.expectEqual(true, wasm.get("required").?.bool);
+        try testing.expectEqual(false, wasm.get("ok").?.bool); // true AND false
+
+        const items = wasm.get("items").?.array;
+        try testing.expectEqual(@as(usize, 2), items.items.len);
+
+        const zig_item = items.items[0].object;
+        try testing.expectEqualStrings("zig", zig_item.get("id").?.string);
+        try testing.expectEqual(true, zig_item.get("ok").?.bool);
+        try testing.expectEqual(false, zig_item.get("fixable").?.bool);
+        try testing.expectEqualStrings("managed zig 0.16.0", zig_item.get("detail").?.string);
+        try testing.expectEqual(std.json.Value.null, std.meta.activeTag(zig_item.get("hint").?));
+
+        const py_item = items.items[1].object;
+        try testing.expectEqualStrings("python", py_item.get("id").?.string);
+        try testing.expectEqual(false, py_item.get("ok").?.bool);
+        try testing.expectEqual(false, py_item.get("fixable").?.bool);
+        try testing.expectEqualStrings("not activated", py_item.get("hint").?.string);
+    }
+};

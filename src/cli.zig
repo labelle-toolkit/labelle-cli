@@ -489,6 +489,11 @@ pub const ProgressReporterPipelineSpec = progress.ReporterPipelineSpec;
 pub const ZigProgressPacketDecodingSpec = @import("cli/zig_progress.zig").PacketDecodingSpec;
 pub const StatusFormatHumanSpec = status_mod.FormatHumanSpec;
 
+// Surface the doctor `--json` capability-report spec so `zspec.runAll(@This())`
+// walks into it — it pins the cross-repo contract with labelle-studio's
+// ToolchainGate (src/services/doctor.ts).
+pub const DoctorJsonReportSpec = doctor.JsonReportSpec;
+
 pub const PipelineResolveExportOutputSpec = pipeline.ResolveExportOutputSpec;
 
 /// Regression tests for `ProjectConfig.normalizeInitialPrefab()` — the
