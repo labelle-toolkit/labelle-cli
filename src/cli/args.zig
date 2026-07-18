@@ -153,7 +153,9 @@ pub const ParsedArgs = struct {
     // profile a windowed run too.
     profile: bool = false,
     // `--progress=<mode>` (cli#284): how build/run progress is surfaced on
-    // the terminal — `human` (default; spinner on TTY stderr), `json`
+    // the terminal — `human` (default; spinner during compile/link plus
+    // slow "still working" heartbeat lines during resolve/generate, on TTY
+    // stderr), `json`
     // (NDJSON records on stdout for studio/CI), or `off`. The live status
     // file `.labelle/<target>/.build-progress.json` is written in every
     // mode (that's what `labelle status` reads).
