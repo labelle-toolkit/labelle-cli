@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const config = @import("../cli/config.zig");
+const project_config = @import("../cli/project_config.zig");
 const asm_cache = @import("../cli/asm_cache.zig");
 const util = @import("../cli/util.zig");
 const convert = @import("convert.zig");
@@ -38,12 +39,18 @@ fn parseQuality(s: []const u8) ?convert.Quality {
 /// the ASTC header). Returns false if it's missing/short/unreadable so the
 /// caller re-encodes. (Quality isn't recoverable from the header — a `--quality`
 /// change still needs a clean rebuild; block is the format-determining param.)
-fn existingBlockMatches(allocator: std.mem.Allocator, out: []const u8, block: convert.BlockSize) bool {
-    // 64 MiB covers any 4K atlas even at 4x4 (8 bpp); we only need the header.
-    const data = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), out, allocator, .limited(64 * 1024 * 1024)) catch return false;
-    if (data.len < 16) return false;
+/// Reads only the 16-byte header — not the whole blob (CodeRabbit on #316: the
+/// old readFileAlloc buffered up to 64 MiB per cached atlas into the command
+/// arena, accumulating until exit).
+fn existingBlockMatches(out: []const u8, block: convert.BlockSize) bool {
+    const io = config.globalIo();
+    const f = std.Io.Dir.cwd().openFile(io, out, .{}) catch return false;
+    defer f.close(io);
+    var header: [16]u8 = undefined;
+    const n = f.readPositionalAll(io, &header, 0) catch return false;
+    if (n < 16) return false;
     const d = block.dims();
-    return data[4] == d.x and data[5] == d.y;
+    return header[4] == d.x and header[5] == d.y;
 }
 
 pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -121,50 +128,127 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     const astcenc = try astcenc_bin.ensure(allocator, cache_root, astcenc_bin.DEFAULT_VERSION);
     defer allocator.free(astcenc);
 
-    var converted: usize = 0;
-    var cached: usize = 0;
-    var failed: usize = 0;
+    var tally = Tally{};
 
     for (cfg.resources) |res| {
         if (res.kind() != .atlas) continue;
+        convertAtlas(allocator, astcenc, dir, res.texture, opts, &tally);
+    }
 
-        const src = try std.fs.path.join(allocator, &.{ dir, res.texture });
-        defer allocator.free(src);
-        const out = try convert.outputPath(allocator, src);
-        defer allocator.free(out);
-
-        // Up-to-date only if the output is newer than the source AND was
-        // encoded at the requested block size — otherwise a `--block` change
-        // would silently keep the stale format (the mtime alone can't see it).
-        if (!convert.needsReencode(Stat, src, out) and existingBlockMatches(allocator, out, opts.block)) {
-            cached += 1;
-            continue;
-        }
-
-        const args = try convert.buildArgs(allocator, astcenc, src, out, opts);
-        defer allocator.free(args);
-        const r = util.runCmd(allocator, args) catch {
-            std.debug.print("labelle astc: failed to run astcenc on {s}\n", .{src});
-            failed += 1;
-            continue;
-        };
-        defer allocator.free(r.stdout);
-        defer allocator.free(r.stderr);
-        const ok = switch (r.term) {
-            .exited => |c| c == 0,
-            else => false,
-        };
-        if (ok) {
-            std.debug.print("  {s} -> {s} ({s})\n", .{ src, out, opts.block.arg() });
-            converted += 1;
-        } else {
-            std.debug.print("labelle astc: astcenc failed on {s}\n{s}\n", .{ src, r.stderr });
-            failed += 1;
+    // Pack/plugin-shipped atlases (labelle-cli#315, asset-plugins P1/P2): packs
+    // and local plugins can declare their own `.resources` (pack.labelle /
+    // plugin.labelle) — convert those atlases too, or a compressed target
+    // silently ships them as embedded PNG while the game's own atlases ride
+    // ASTC (the invariant is: a resource behaves identically whether declared
+    // by the game or by a pack). In-tree/local dirs only: a REMOTE plugin's
+    // sources aren't materialized when this step runs (pre-generate), so its
+    // atlases still ride the PNG fallback — a documented limitation.
+    for (cfg.plugins) |dep| {
+        if (!dep.isLocal()) continue;
+        // `resolve` (not `join`): an absolute `local:/…` path must be
+        // preserved, not appended under the project dir — matches the plugin
+        // resolution in cli/plugins.zig (codex review on #316).
+        const pack_dir = try std.fs.path.resolve(allocator, &.{ dir, dep.localPath() });
+        defer allocator.free(pack_dir);
+        for ([_][]const u8{ "pack.labelle", "plugin.labelle" }) |manifest| {
+            const resources = readDeclaredResources(allocator, pack_dir, manifest) orelse continue;
+            for (resources) |res| {
+                if (res.kind() != .atlas) continue;
+                convertAtlas(allocator, astcenc, pack_dir, res.texture, opts, &tally);
+            }
         }
     }
 
-    std.debug.print("labelle astc: {d} converted, {d} up-to-date, {d} failed\n", .{ converted, cached, failed });
-    if (failed > 0) return error.AstcConversionFailed;
+    std.debug.print("labelle astc: {d} converted, {d} up-to-date, {d} failed\n", .{ tally.converted, tally.cached, tally.failed });
+    if (tally.failed > 0) return error.AstcConversionFailed;
+}
+
+const Tally = struct {
+    converted: usize = 0,
+    cached: usize = 0,
+    failed: usize = 0,
+};
+
+/// Convert one atlas texture (path relative to `base_dir`) to its co-located
+/// `.astc` sibling, honouring the mtime + block-size cache. Shared by the
+/// game-resource and pack/plugin-resource loops.
+fn convertAtlas(
+    allocator: std.mem.Allocator,
+    astcenc: []const u8,
+    base_dir: []const u8,
+    texture: []const u8,
+    opts: convert.Options,
+    tally: *Tally,
+) void {
+    const src = std.fs.path.join(allocator, &.{ base_dir, texture }) catch {
+        tally.failed += 1;
+        return;
+    };
+    defer allocator.free(src);
+    const out = convert.outputPath(allocator, src) catch {
+        tally.failed += 1;
+        return;
+    };
+    defer allocator.free(out);
+
+    // Up-to-date only if the output is newer than the source AND was
+    // encoded at the requested block size — otherwise a `--block` change
+    // would silently keep the stale format (the mtime alone can't see it).
+    if (!convert.needsReencode(Stat, src, out) and existingBlockMatches(out, opts.block)) {
+        tally.cached += 1;
+        return;
+    }
+
+    const args = convert.buildArgs(allocator, astcenc, src, out, opts) catch {
+        tally.failed += 1;
+        return;
+    };
+    defer allocator.free(args);
+    const r = util.runCmd(allocator, args) catch {
+        std.debug.print("labelle astc: failed to run astcenc on {s}\n", .{src});
+        tally.failed += 1;
+        return;
+    };
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    const ok = switch (r.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (ok) {
+        std.debug.print("  {s} -> {s} ({s})\n", .{ src, out, opts.block.arg() });
+        tally.converted += 1;
+    } else {
+        std.debug.print("labelle astc: astcenc failed on {s}\n{s}\n", .{ src, r.stderr });
+        tally.failed += 1;
+    }
+}
+
+/// The `.resources` a pack/plugin manifest declares (asset-plugins P1/P2), or
+/// null when the manifest doesn't exist, doesn't parse, or declares none.
+/// Mirrors `readProjectConfigImpl`'s lenient posture (`ignore_unknown_fields`:
+/// the assembler owns these schemas; the CLI reads just the one field it needs).
+fn readDeclaredResources(
+    allocator: std.mem.Allocator,
+    pack_dir: []const u8,
+    manifest: []const u8,
+) ?[]const project_config.ResourceDef {
+    const ManifestResources = struct {
+        resources: []const project_config.ResourceDef = &.{},
+    };
+    const path = std.fs.path.join(allocator, &.{ pack_dir, manifest }) catch return null;
+    defer allocator.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, allocator, .limited(1024 * 1024)) catch return null;
+    defer allocator.free(raw);
+    const source = allocator.dupeZ(u8, raw) catch return null;
+    const parsed = std.zon.parse.fromSliceAlloc(ManifestResources, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        std.debug.print("labelle astc: could not parse {s} — skipping its resources\n", .{path});
+        return null;
+    };
+    if (parsed.resources.len == 0) return null;
+    return parsed.resources;
 }
 
 fn usageErr(msg: []const u8) error{InvalidArgs} {
