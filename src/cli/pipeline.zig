@@ -305,8 +305,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
 
     // One event source, three access modes: NDJSON on stdout
     // (`--progress=json`), the atomically-rewritten status file (all
-    // modes; read by `labelle status` + studio), and a terminal indicator
-    // on TTY stderr (default human mode — a spinner while `zig build`
+    // modes; read by `labelle status` + studio), and a live indicator on
+    // stderr (default human mode — a TTY-only spinner while `zig build`
     // runs, "still working" heartbeat lines while the assembler child
     // owns stderr during resolve/generate, cli#321). Enabled for the
     // commands that run the shared build pipeline; `labelle generate` and

@@ -12,11 +12,13 @@
 //!     atomically rewritten (temp + rename) with the CURRENT record so any
 //!     unrelated process can read build state mid-flight (`labelle status`,
 //!     studio's fs bridge). Written in ALL modes.
-//!   - the default human mode — a live terminal indicator on TTY stderr:
-//!     a single-line spinner during the otherwise-silent `zig build`
-//!     compile/link gap, and a slow-cadence "still working" heartbeat
-//!     line during the child-owned resolve/generate phases (cli#321), so
-//!     a cold-cache build shows proof of life through every long phase.
+//!   - the default human mode — a live indicator on stderr: a single-line
+//!     spinner during the otherwise-silent `zig build` compile/link gap
+//!     (TTY only — \r rewriting is meaningless in a pipe), and
+//!     slow-cadence "still working" heartbeat lines during the
+//!     child-owned resolve/generate phases (cli#321) — plain
+//!     newline-terminated lines, pipe-safe, so a cold CI build log shows
+//!     proof of life too.
 //!
 //! The compile-phase step/total/detail granularity comes from Zig's native
 //! `std.Progress` IPC (see `zig_progress.zig`); this module is the pure
@@ -89,13 +91,14 @@ pub const Record = struct {
 };
 
 /// How the CLI surfaces progress. Parsed from `--progress=<mode>`.
-///   human — default; terminal indicator on TTY stderr (spinner during
-///           compile/link, heartbeat lines during resolve/generate),
-///           nothing when piped.
-///   json  — NDJSON records on stdout, no terminal indicator. Pure NDJSON
+///   human — default; indicator on stderr: a spinner during compile/link
+///           (TTY only), plus "still working" heartbeat lines during
+///           resolve/generate (TTY and pipes alike — they are plain
+///           newline-terminated lines, safe in a CI log).
+///   json  — NDJSON records on stdout, no human-mode output. Pure NDJSON
 ///           on stdout is a `build`-only guarantee: `run` shares the
 ///           stream with the game's own stdout (cli#320 — see module doc).
-///   off   — no terminal output at all.
+///   off   — no progress output at all.
 /// The status file is written in every mode.
 pub const Mode = enum { human, json, off };
 
@@ -150,7 +153,9 @@ pub fn encodeHeartbeatLine(buf: []u8, phase: Phase, elapsed_ms: u64) []const u8 
         else => "working", // defensive; only resolve/generate are drawn
     };
     var w = std.Io.Writer.fixed(buf);
-    w.print("labelle: still {s} ({d}s)", .{ verb, elapsed_ms / 1000 }) catch {};
+    // The longest render is ~60 bytes ("resolving packages" + a u64 in
+    // seconds); callers pass a 96-byte buffer, so this cannot truncate.
+    w.print("labelle: still {s} ({d}s)", .{ verb, elapsed_ms / 1000 }) catch unreachable;
     return w.buffered();
 }
 
@@ -493,7 +498,7 @@ pub const Reporter = struct {
             self.file_ever_written = true;
         }
 
-        if (self.mode == .human and self.stderr_is_tty) {
+        if (self.mode == .human) {
             if (force or elapsed >= self.last_spin_ms + spinner_throttle_ms) {
                 self.drawTerminalIndicatorLocked(elapsed);
                 self.last_spin_ms = elapsed;
@@ -512,15 +517,19 @@ pub const Reporter = struct {
         w.interface.flush() catch return;
     }
 
-    /// Human-mode terminal indicator on TTY stderr. The shape depends on
-    /// who owns the terminal in the current phase:
+    /// Human-mode indicator on stderr. The shape depends on who owns the
+    /// terminal in the current phase — and on whether stderr is a TTY:
     ///   - compile/link: a single-line spinner — the `zig build` child
     ///     relays progress over IPC and stays terminal-quiet until the
-    ///     end, so rewriting one line with \r is safe.
+    ///     end, so rewriting one line with \r is safe. TTY only: \r
+    ///     rewriting is meaningless in a pipe.
     ///   - resolve/generate: the assembler child inherits stderr and logs
     ///     as it fetches/generates, so a \r-rewriting line would fight its
     ///     output — instead a plain "still working" heartbeat line is
-    ///     appended at a slow cadence (cli#321).
+    ///     appended at a slow cadence (cli#321). Newline-terminated plain
+    ///     text, so it is emitted whether or not stderr is a TTY: a CI
+    ///     log of a cold build is exactly where "still generating (300s)"
+    ///     matters most, and one line per 10s is negligible there.
     ///   - anything else (run, terminal states): the foreground child owns
     ///     the screen; the indicator stays out of the way.
     /// No ANSI escapes anywhere: the spinner is cleared by overwriting
@@ -529,7 +538,9 @@ pub const Reporter = struct {
     fn drawTerminalIndicatorLocked(self: *Reporter, elapsed: u64) void {
         const phase = self.machine.current orelse return;
         switch (phase) {
-            .compile, .link => self.drawSpinnerLocked(elapsed, phase),
+            .compile, .link => {
+                if (self.stderr_is_tty) self.drawSpinnerLocked(elapsed, phase);
+            },
             .resolve, .generate => self.drawHeartbeatLocked(elapsed, phase),
             else => self.clearSpinnerLocked(),
         }
