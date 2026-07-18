@@ -16,6 +16,7 @@ const assembler = @import("assembler.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const emsdk_activate = @import("emsdk_activate.zig");
+const python_provision = @import("python_provision.zig");
 const bake_mod = @import("bake.zig");
 const docker = @import("docker.zig");
 const serve = @import("serve.zig");
@@ -464,6 +465,20 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // idempotent; on failure the build still surfaces the clear #492 guidance.
     // The PINNED version keeps activation deterministic.
     if (!parsed_args.docker and parsed.platform == .wasm) {
+        // Python preflight (cli#291): emsdk activation and emcc itself (an
+        // `env python3` script) both need a working interpreter. Fail fast
+        // with the exact fix instead of dying deep inside emsdk activation
+        // with an unrelated-looking error. `autoWireEnv` first: it puts a
+        // previously-provisioned managed Python on this process's PATH (and
+        // wires the TLS bundle on Windows), which is what makes the
+        // availability probe — and the activation below — see it.
+        python_provision.autoWireEnv(allocator);
+        if (!python_provision.isAvailable(allocator)) {
+            std.debug.print("labelle: wasm builds need Python 3 (emsdk activation + emcc) and none was found.\n" ++
+                "  fix: labelle install python   (managed, ~25 MB into ~/.labelle/python)\n" ++
+                "  or install Python 3 yourself and ensure `python3` is on PATH.\n", .{});
+            return error.BuildFailed;
+        }
         const resolved_emsdk = try emsdk_toolchain.resolveRequiredVersion(allocator, project_dir);
         defer allocator.free(resolved_emsdk.version);
         emsdk_activate.activateFetchedEmsdk(allocator, target_dir, resolved_emsdk.version);

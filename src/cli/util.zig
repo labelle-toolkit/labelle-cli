@@ -11,6 +11,30 @@ pub fn dirExists(path: []const u8) bool {
     return stat.kind == .directory;
 }
 
+/// True if `data`'s SHA-256 equals the lowercase-hex `expected` (64 chars).
+/// Pure — verifies provisioned-toolchain downloads before use.
+pub fn sha256Matches(data: []const u8, expected_hex: []const u8) bool {
+    if (expected_hex.len != 64) return false;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hexchars = "0123456789abcdef";
+    var hex: [64]u8 = undefined;
+    for (digest, 0..) |b, i| {
+        hex[i * 2] = hexchars[b >> 4];
+        hex[i * 2 + 1] = hexchars[b & 0x0f];
+    }
+    return std.mem.eql(u8, &hex, expected_hex);
+}
+
+test "sha256Matches verifies known vectors" {
+    // SHA-256("abc") and SHA-256("")
+    try std.testing.expect(sha256Matches("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    try std.testing.expect(sha256Matches("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    // wrong digest and wrong length both reject
+    try std.testing.expect(!sha256Matches("abc", "0000000000000000000000000000000000000000000000000000000000000000"));
+    try std.testing.expect(!sha256Matches("abc", "abcd"));
+}
+
 /// Get a platform-aware temporary file path.
 pub fn getTempFilePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     const builtin = @import("builtin");

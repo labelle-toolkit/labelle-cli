@@ -1,0 +1,118 @@
+# Provision-from-zero validation for the managed build toolchain (cli#291).
+#
+# The unit suite can't catch what breaks on a clean machine: download URLs
+# rotting, checksums drifting, extraction quirks (Windows bsdtar vs GNU tar),
+# PATH/env wiring. These jobs exercise the REAL provisioning commands
+# (`labelle install zig` / `install python`) from a bare runner on the two
+# platforms the managed toolchain targets, plus the doctor --json contract
+# the studio's ToolchainGate consumes.
+#
+# The full wasm build (heavy: ~1 GB emsdk + a cold compile) is opt-in via
+# workflow_dispatch — not on every PR.
+name: Toolchain provisioning
+
+on:
+  pull_request:
+    paths:
+      - 'src/cli/python_provision.zig'
+      - 'src/cli/zig_toolchain.zig'
+      - 'src/cli/emsdk_*.zig'
+      - 'src/cli/doctor.zig'
+      - 'src/cli/install.zig'
+      - '.github/workflows/toolchain.yml'
+  workflow_dispatch:
+    inputs:
+      run_wasm_build:
+        description: 'Also run the full from-zero wasm build (heavy)'
+        type: boolean
+        default: false
+
+# Least-privilege token: these jobs only read the repo (zizmor, PR #291 review).
+permissions:
+  contents: read
+
+jobs:
+  provision-from-zero:
+    name: Provision toolchain from zero (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Bounded: toolchain downloads through slow mirrors must fail, not hang
+    # for the runner's multi-hour default (PR #291 review).
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Nothing here pushes back; don't persist the injected git
+          # credentials into the workspace (zizmor, PR #291 review).
+          persist-credentials: false
+
+      # Zig is needed once, to BUILD the CLI under test — the managed-Zig
+      # provisioning below is exercised through that CLI, not this install.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build CLI
+        shell: bash
+        run: zig build
+
+      - name: Provision managed Zig from zero
+        shell: bash
+        run: |
+          set -e
+          VERSION=$(./zig-out/bin/labelle install zig 2>&1 | grep -oE 'example: labelle install zig [0-9][^ ]*' | awk '{print $NF}')
+          echo "paired default zig: $VERSION"
+          ./zig-out/bin/labelle install zig "$VERSION"
+
+      - name: Provision managed Python from zero
+        shell: bash
+        run: ./zig-out/bin/labelle install python
+
+      - name: doctor --json reports python ok + fixable contract
+        shell: bash
+        run: |
+          set -e
+          ./zig-out/bin/labelle doctor --json | tee doctor.json
+          python3 - <<'PYEOF'
+          import json
+          report = json.load(open('doctor.json'))
+          caps = {c['id']: c for c in report['capabilities']}
+          items = {i['id']: i for i in caps['wasm']['items']}
+          assert items['python']['ok'], f"python item not ok after provisioning: {items['python']}"
+          assert items['python']['fixable'], "python item must be fixable on managed platforms"
+          assert items['python']['action'] == 'labelle install python', items['python']['action']
+          print('doctor contract ok:', items['python'])
+          PYEOF
+
+  wasm-build:
+    name: Full from-zero wasm build (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' && inputs.run_wasm_build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build CLI
+        shell: bash
+        run: zig build
+      - name: Init a fresh project and build wasm from zero
+        shell: bash
+        run: |
+          set -e
+          ./zig-out/bin/labelle install python
+          mkdir wasm-smoke && cd wasm-smoke
+          ../zig-out/bin/labelle init wasm_game --backend=raylib --ecs=zig_ecs
+          cd wasm_game
+          ../../zig-out/bin/labelle build --platform=wasm
+          test -f .labelle/raylib_wasm/zig-out/htmlout/wasm_game.wasm || ls -R .labelle/*wasm* | head -40

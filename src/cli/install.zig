@@ -3,6 +3,7 @@ const assembler = @import("assembler.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
+const python_provision = @import("python_provision.zig");
 
 /// Fetch and cache packages without modifying any project.
 ///
@@ -33,6 +34,24 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
             return error.MissingArgument;
         }
         return zig_toolchain.cmdInstallZig(allocator, cmd_args[1]);
+    }
+
+    // `labelle install python [version]` — CLI bootstrap (cli#291). Download +
+    // verify + extract a managed python-build-standalone into
+    // `~/.labelle/python/`. The version is PINNED (per-platform checksums are
+    // baked in), so unlike zig/emsdk the argument is optional and only
+    // accepted when it matches the pin — arbitrary versions have no verified
+    // checksum to install against.
+    if (cmd_args.len >= 1 and std.mem.eql(u8, cmd_args[0], "python")) {
+        if (cmd_args.len >= 2 and !std.mem.eql(u8, cmd_args[1], python_provision.PY_VERSION)) {
+            std.debug.print("labelle install python: only the pinned version {s} is supported (checksums are baked per release)\n", .{python_provision.PY_VERSION});
+            return error.InvalidArgument;
+        }
+        return switch (python_provision.provisionPython(allocator)) {
+            .ready => {},
+            .guided => {},
+            .failed => error.ProvisionFailed,
+        };
     }
 
     // `labelle install emsdk <version>` — CLI bootstrap (cli#283). Fetch +
