@@ -79,6 +79,9 @@ fn interpreterPath(a: std.mem.Allocator, py_dir: []const u8) ?[]u8 {
 }
 
 /// The provisioned interpreter if it exists on disk, else null. Caller owns.
+/// Existence-only by design (cheap; called from PATH wiring on every build) —
+/// availability/doctor verdicts go through `managedPythonOk`, which actually
+/// RUNS it, so a half-extracted install can't fake readiness (PR #291 review).
 pub fn findPythonExe(a: std.mem.Allocator) ?[]const u8 {
     const dir = pythonDir(a) catch return null;
     defer a.free(dir);
@@ -86,6 +89,19 @@ pub fn findPythonExe(a: std.mem.Allocator) ?[]const u8 {
     if (util.fileExists(exe)) return exe;
     a.free(exe);
     return null;
+}
+
+/// True if the managed interpreter exists AND runs (`--version` exit 0).
+/// The validated form of `findPythonExe` for verdict paths (doctor, the wasm
+/// preflight): a partial extract that left the binary behind reports NOT ok
+/// here, steering the user to `labelle install python`, whose provisioner
+/// detects the broken install and reprovisions.
+pub fn managedPythonOk(gpa: std.mem.Allocator) bool {
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const exe = findPythonExe(a) orelse return false;
+    return runOk(a, &.{ exe, "--version" });
 }
 
 /// True if a system Python usable by the wasm toolchain runs (exit 0).
@@ -112,10 +128,7 @@ pub fn systemPythonOk(gpa: std.mem.Allocator) bool {
 /// `python`/`python3` on PATH. Lets the wasm build fail fast with an
 /// actionable message instead of dying deep in emsdk activation.
 pub fn isAvailable(gpa: std.mem.Allocator) bool {
-    var arena_inst = std.heap.ArenaAllocator.init(gpa);
-    defer arena_inst.deinit();
-    const a = arena_inst.allocator();
-    if (findPythonExe(a) != null) return true;
+    if (managedPythonOk(gpa)) return true;
     return systemPythonOk(gpa);
 }
 

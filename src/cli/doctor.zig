@@ -326,7 +326,10 @@ fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
 /// python_provision.systemPythonOk mirrors activation exactly). Reported
 /// independently of the emsdk check since cli#291 (it used to proxy emsdk).
 fn checkPython(arena: std.mem.Allocator) Check {
-    if (python_provision.findPythonExe(arena)) |exe| {
+    // `managedPythonOk` RUNS the interpreter (--version), so a half-extracted
+    // install reports not-ok instead of faking readiness (PR #291 review).
+    if (python_provision.managedPythonOk(arena)) {
+        const exe = python_provision.findPythonExe(arena) orelse unreachable;
         return .{ .name = "Python (wasm)", .ok = true, .detail = std.fmt.allocPrint(arena, "managed: {s}", .{exe}) catch "managed" };
     }
     if (python_provision.systemPythonOk(arena)) {

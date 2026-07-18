@@ -63,7 +63,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          VERSION=$(./zig-out/bin/labelle install zig 2>&1 | grep -oE 'example: labelle install zig [0-9][^ ]*' | awk '{print $NF}')
+          # Read the paired default straight from the source constant —
+          # scraping it from the CLI's missing-argument usage output exits
+          # nonzero by design and trips `set -e` (first CI run of this job).
+          VERSION=$(grep -oE 'DEFAULT_ZIG_VERSION = "[^"]+"' src/cli/zig_toolchain.zig | cut -d'"' -f2)
           echo "paired default zig: $VERSION"
           ./zig-out/bin/labelle install zig "$VERSION"
 
