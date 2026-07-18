@@ -39,12 +39,18 @@ fn parseQuality(s: []const u8) ?convert.Quality {
 /// the ASTC header). Returns false if it's missing/short/unreadable so the
 /// caller re-encodes. (Quality isn't recoverable from the header — a `--quality`
 /// change still needs a clean rebuild; block is the format-determining param.)
-fn existingBlockMatches(allocator: std.mem.Allocator, out: []const u8, block: convert.BlockSize) bool {
-    // 64 MiB covers any 4K atlas even at 4x4 (8 bpp); we only need the header.
-    const data = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), out, allocator, .limited(64 * 1024 * 1024)) catch return false;
-    if (data.len < 16) return false;
+/// Reads only the 16-byte header — not the whole blob (CodeRabbit on #316: the
+/// old readFileAlloc buffered up to 64 MiB per cached atlas into the command
+/// arena, accumulating until exit).
+fn existingBlockMatches(out: []const u8, block: convert.BlockSize) bool {
+    const io = config.globalIo();
+    const f = std.Io.Dir.cwd().openFile(io, out, .{}) catch return false;
+    defer f.close(io);
+    var header: [16]u8 = undefined;
+    const n = f.readPositionalAll(io, &header, 0) catch return false;
+    if (n < 16) return false;
     const d = block.dims();
-    return data[4] == d.x and data[5] == d.y;
+    return header[4] == d.x and header[5] == d.y;
 }
 
 pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -185,7 +191,7 @@ fn convertAtlas(
     // Up-to-date only if the output is newer than the source AND was
     // encoded at the requested block size — otherwise a `--block` change
     // would silently keep the stale format (the mtime alone can't see it).
-    if (!convert.needsReencode(Stat, src, out) and existingBlockMatches(allocator, out, opts.block)) {
+    if (!convert.needsReencode(Stat, src, out) and existingBlockMatches(out, opts.block)) {
         tally.cached += 1;
         return;
     }
