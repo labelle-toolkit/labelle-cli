@@ -145,7 +145,10 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // atlases still ride the PNG fallback — a documented limitation.
     for (cfg.plugins) |dep| {
         if (!dep.isLocal()) continue;
-        const pack_dir = try std.fs.path.join(allocator, &.{ dir, dep.localPath() });
+        // `resolve` (not `join`): an absolute `local:/…` path must be
+        // preserved, not appended under the project dir — matches the plugin
+        // resolution in cli/plugins.zig (codex review on #316).
+        const pack_dir = try std.fs.path.resolve(allocator, &.{ dir, dep.localPath() });
         defer allocator.free(pack_dir);
         for ([_][]const u8{ "pack.labelle", "plugin.labelle" }) |manifest| {
             const resources = readDeclaredResources(allocator, pack_dir, manifest) orelse continue;
