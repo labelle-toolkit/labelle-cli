@@ -202,10 +202,20 @@ fn readStatusFile(a: Allocator, status_path: []const u8) !StatusSnapshot {
     defer a.free(raw);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
-    const obj = parsed.value.object;
+    // Defensive: the poller reads this file concurrently with the
+    // build's atomic rewrites — a malformed record must surface as an
+    // error (the poller retries) rather than panic the test process.
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidStatusRecord,
+    };
+    const phase = switch (obj.get("phase") orelse return error.InvalidStatusRecord) {
+        .string => |s| s,
+        else => return error.InvalidStatusRecord,
+    };
     return .{
-        .phase = try a.dupe(u8, obj.get("phase").?.string),
-        .exit_code = switch (obj.get("exit_code").?) {
+        .phase = try a.dupe(u8, phase),
+        .exit_code = switch (obj.get("exit_code") orelse return error.InvalidStatusRecord) {
             .integer => |n| n,
             else => null,
         },
@@ -402,9 +412,21 @@ test "progress feed e2e: real build --progress=json, concurrent status file, fai
 
     var child = try spawnBuild(project_dir, cli_bin, happy_ndjson);
     const poller_thread = try std.Thread.spawn(.{}, Poller.run, .{&poller});
+    // If anything below fails before the orderly stop+join, stop and
+    // join the poller here — an orphaned thread would keep polling with
+    // a dangling pointer to the stack `poller`. The flag prevents a
+    // double-join when a later assertion fails after the orderly join.
+    var poller_joined = false;
+    errdefer {
+        if (!poller_joined) {
+            poller.stop.store(true, .release);
+            poller_thread.join();
+        }
+    }
     const term = try child.wait(io);
     poller.stop.store(true, .release);
     poller_thread.join();
+    poller_joined = true;
 
     const happy_code = termExitCode(term) orelse {
         std.debug.print("happy-path build terminated abnormally: {any}\n", .{term});
