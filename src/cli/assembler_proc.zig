@@ -357,7 +357,17 @@ fn spawnAndWait(
             // marks any active build-status file `failed` — a bare
             // process-exit would skip the errdefer that does that and
             // leave the status file claiming the build is still alive.
-            progress.fatalExit(code);
+            // The detail names the delegated stage (cli#318) so feed
+            // consumers learn e.g. "assembler generate failed"; stderr is
+            // inherited (not captured), so the child's own diagnostic line
+            // is not available here without log scraping.
+            var detail_buf: [progress.max_detail_len]u8 = undefined;
+            const detail = std.fmt.bufPrint(
+                &detail_buf,
+                "assembler {s} failed",
+                .{subcommand},
+            ) catch "assembler failed";
+            progress.fatalExit(code, detail);
         },
         else => {
             std.debug.print("labelle: assembler '{s}' terminated abnormally\n", .{exe_path});
