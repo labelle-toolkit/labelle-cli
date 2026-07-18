@@ -3,6 +3,11 @@
 //! One event source, three access modes:
 //!   - `--progress=json` — one NDJSON record per line on **stdout** for
 //!     programmatic consumers (labelle-studio's `spawn_build`, CI).
+//!     Stream contract (cli#320): pure NDJSON on stdout is guaranteed
+//!     for `build` ONLY. `labelle run` spawns the game with inherited
+//!     stdout, so during the run phase the game's own log lines share
+//!     the stream — a strict NDJSON consumer must skip non-JSON lines
+//!     or read the status file instead.
 //!   - a live status file `.labelle/<target>/.build-progress.json`,
 //!     atomically rewritten (temp + rename) with the CURRENT record so any
 //!     unrelated process can read build state mid-flight (`labelle status`,
@@ -71,7 +76,9 @@ pub const Record = struct {
 
 /// How the CLI surfaces progress. Parsed from `--progress=<mode>`.
 ///   human — default; terminal spinner on TTY stderr, nothing when piped.
-///   json  — NDJSON records on stdout, no spinner.
+///   json  — NDJSON records on stdout, no spinner. Pure NDJSON on stdout
+///           is a `build`-only guarantee: `run` shares the stream with
+///           the game's own stdout (cli#320 — see module doc).
 ///   off   — no terminal output at all.
 /// The status file is written in every mode.
 pub const Mode = enum { human, json, off };

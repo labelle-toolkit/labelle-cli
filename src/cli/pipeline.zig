@@ -171,6 +171,19 @@ fn absTargetHitsProject(allocator: std.mem.Allocator, norm: []const u8, project_
         std.fs.path.isSep(proj_abs[norm.len]);
 }
 
+/// cli#320: in `--progress=json` mode a desktop `run` spawns the game
+/// with inherited stdout, so the game's own log lines share the stream
+/// with the NDJSON progress records — pure NDJSON on stdout is a
+/// `build`-only guarantee. Say so once, on stderr, at the run-phase
+/// seam (the two call sites below are mutually exclusive branches, so
+/// the note prints exactly once per invocation). No-op when no reporter
+/// is active — without one there is no NDJSON stream to interleave with.
+fn noteRunSharesStdout(reporter: ?*progress.Reporter) void {
+    const r = reporter orelse return;
+    if (r.mode != .json) return;
+    std.debug.print("labelle: note: during `run`, game output shares stdout with NDJSON progress records\n", .{});
+}
+
 /// Run the project-scoped pipeline: read project.labelle, then
 /// generate -> build -> run (or the docker / wasm / ios / android
 /// variant selected by `parsed_args`). Dispatch of the standalone
@@ -765,6 +778,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             try run_args.append(allocator, bin_path);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
             if (reporter) |r| r.beginPhase(.run, exe_name);
+            noteRunSharesStdout(reporter);
             const run_result = try runner.runZigInheritWithEnv(allocator, project_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
@@ -821,6 +835,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             try run_args.append(allocator, rel_bin);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
             if (reporter) |r| r.beginPhase(.run, exe_basename);
+            noteRunSharesStdout(reporter);
             const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
