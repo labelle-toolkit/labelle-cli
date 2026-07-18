@@ -1,11 +1,14 @@
 //! Parser for Zig's native `std.Progress` IPC wire format (labelle-cli#284).
 //!
 //! When a child is spawned with `ZIG_PROGRESS=<fd>` in its environment,
-//! `std.Progress.start` inside that child (i.e. inside `zig build` and,
-//! transitively, the compiler processes it spawns) writes progress-tree
-//! snapshots to that fd instead of rendering to the terminal. This module
-//! decodes those snapshots so the CLI gets *real* compile step counts and
-//! the current unit name — no log-line scraping.
+//! `std.Progress.start` inside that child writes progress-tree snapshots
+//! to that fd instead of rendering to the terminal. This module decodes
+//! those snapshots so the CLI gets *real* compile step counts and the
+//! current unit name — no log-line scraping. Caveat (labelle-cli#317):
+//! the `zig build` frontend does not forward the pipe to the build runner
+//! it spawns, so in practice only the frontend's own nodes arrive —
+//! transitively-decoded "steps" data awaits ziglang/zig#24722 (see
+//! `runner.zig` for the full mechanism).
 //!
 //! Wire format (verified against `lib/std/Progress.zig` of Zig 0.16.0 —
 //! `serialize`/`writeIpc` on the sending side, `Ipc.Data.findLastPacket`
@@ -27,7 +30,8 @@
 //! node whose `completed_count` is a file-descriptor slot, not a count —
 //! such nodes are skipped.
 //!
-//! Tree shape produced by `zig build` (lib/compiler/build_runner.zig):
+//! Tree shape the build runner produces (lib/compiler/build_runner.zig;
+//! not currently relayed by the frontend — see above):
 //! node 0 is the root (empty name); a child named "steps" carries
 //! `completed/estimated = finished/total build steps` — that is the N/M a
 //! consumer wants. The deepest named node is the current activity (e.g. a

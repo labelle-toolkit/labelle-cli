@@ -309,18 +309,37 @@ pub fn runZigInheritWithEnv(
 // `zig build` child and pump the decoded snapshots into a
 // `progress.Reporter` (NDJSON / status file / spinner).
 //
-// What actually flows (empirical, Zig 0.16.0): a *compiler* process
-// (`zig build-exe`) streams its full node tree — "Semantic Analysis",
-// "Code Generation", "Linking" with real counts. The `zig build`
-// *frontend*, however, only streams its own nodes ("Compile Build
-// Script"); it hands the build runner a separate `-Z` integration handle
-// and does not fold the runner's steps/compile subtree into its
-// ZIG_PROGRESS packets. So today the feed gets live node names +
-// keepalives from the frontend, while `step`/`total` stay null for `zig
-// build`. `zig_progress.Parser` already decodes the full multi-node
-// format (incl. the runner's "steps" node — unit-tested against
-// synthesized packets), so richer data lights up without code changes if
-// a future Zig relays it.
+// What actually flows (empirical, Zig 0.16.0; labelle-cli#317): a
+// *compiler* process (`zig build-exe`) streams its full node tree —
+// "Semantic Analysis", "Code Generation", "Linking" with real counts.
+// The `zig build` *frontend* streams only its own subtree ("Compile
+// Build Script" + the build-runner compile nodes) and only while that
+// compile runs. Measured with ZIG_PROGRESS piped to a packet dumper:
+// cold `zig build` → 55 packets, all frontend build-script compile;
+// warm-cache `zig build` → 0 packets; `--verbose` changes nothing;
+// `zig build-exe` → full tree (control). Nothing from the build
+// runner's execution phase — its "steps" N/M node, per-step compiles —
+// ever reaches the fd, so `step`/`total` stay null for `zig build`.
+//
+// Root cause (Zig 0.16.0 sources): the frontend spawns the build
+// runner with a plain `std.process.Child` and no `progress_node`
+// (src/main.zig in ziglang/zig — not part of the shipped lib/), and
+// every std spawn without a `progress_node` *deletes* ZIG_PROGRESS
+// from the child's env block: `Io.Threaded` passes
+// `zig_progress_fd = -1` to `Environ.Map.createPosixBlock`, which maps
+// an existing key to `.delete` (lib/std/Io/Threaded.zig,
+// lib/std/process/Environ.zig). The runner therefore renders its steps
+// tree to the inherited terminal only. (`-Z<16 hex>` on the runner is
+// NOT a progress handle — it's the tmp-file nonce for lazy-dependency
+// results; see lib/compiler/build_runner.zig's arg loop.) std.Progress
+// itself already supports transitive relay — `serialize` grafts a
+// child's IPC packets into the parent's tree (lib/std/Progress.zig) —
+// the frontend just doesn't use it for this spawn. Tracked upstream as
+// https://github.com/ziglang/zig/issues/24722 (open bug) with fix PR
+// https://github.com/ziglang/zig/pull/24733 (open). `zig_progress.Parser`
+// already decodes the full multi-node format (incl. the runner's
+// "steps" node — unit-tested against synthesized packets), so richer
+// data lights up without code changes once a fixed Zig lands.
 //
 // Why the `/usr/bin/env ZIG_PROGRESS=<fd>` argv wrapper instead of putting
 // the var in `environ_map`: `std.process.spawn` actively *strips* a
