@@ -168,9 +168,12 @@ var active_reporter: ?*Reporter = null;
 
 /// Mark the active build `failed` (if a reporter is active) and terminate
 /// the process with `code`. Drop-in replacement for `std.process.exit` in
-/// code reachable from the build pipeline.
-pub fn fatalExit(code: u8) noreturn {
-    if (active_reporter) |r| r.failIfActive(code);
+/// code reachable from the build pipeline. `detail` names the failing stage
+/// (e.g. "assembler generate failed") so the terminal record tells feed
+/// consumers WHY the build died, not just THAT it did (cli#318) — pass a
+/// precise per-call-site label, never the bare "error".
+pub fn fatalExit(code: u8, detail: []const u8) noreturn {
+    if (active_reporter) |r| r.failIfActive(code, detail);
     std.process.exit(code);
 }
 
@@ -339,11 +342,29 @@ pub const Reporter = struct {
 
     /// errdefer hook: mark `failed` unless a terminal record was already
     /// emitted. Keeps the status file truthful on any early-error path.
-    pub fn failIfActive(self: *Reporter, exit_code: u8) void {
+    /// `detail` names the failing stage (cli#318); it lands verbatim in the
+    /// terminal record, so pass a stage label a consumer can render.
+    pub fn failIfActive(self: *Reporter, exit_code: u8, detail: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         const terminal = self.machine.isTerminal();
         self.mutex.unlock(self.io);
-        if (!terminal) self.finishFailed(exit_code, "error");
+        if (!terminal) self.finishFailed(exit_code, detail);
+    }
+
+    /// Catch-all errdefer variant: mark `failed` with a detail composed
+    /// from the LIVE phase ("generate failed", "resolve failed", …). The
+    /// terminal record's own `phase` field flips to "failed", so without
+    /// this the stage that was active when the error returned would be
+    /// lost to feed consumers (cli#318 / PR #325 review).
+    pub fn failActiveStage(self: *Reporter, exit_code: u8) void {
+        self.mutex.lockUncancelable(self.io);
+        const terminal = self.machine.isTerminal();
+        const stage: []const u8 = if (self.machine.current) |c| @tagName(c) else "build";
+        self.mutex.unlock(self.io);
+        if (terminal) return;
+        var buf: [max_detail_len]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "{s} failed", .{stage}) catch "build failed";
+        self.finishFailed(exit_code, detail);
     }
 
     fn finishWith(self: *Reporter, phase: Phase, exit_code: u8, detail: []const u8) void {
@@ -752,13 +773,100 @@ pub const ReporterPipelineSpec = struct {
         defer parsed.deinit();
         try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
         try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 2));
+        // cli#318: the terminal record names the failing stage so a feed
+        // consumer learns WHY the build died, not just THAT it did.
+        try std.testing.expectEqualStrings("zig build failed", parsed.value.object.get("detail").?.string);
 
         // failIfActive after an explicit terminal record is a no-op.
-        rep.failIfActive(9);
+        rep.failIfActive(9, "late");
         const raw2 = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
         defer allocator.free(raw2);
         const parsed2 = try std.json.parseFromSlice(std.json.Value, allocator, raw2, .{});
         defer parsed2.deinit();
         try expect.equal(parsed2.value.object.get("exit_code").?.integer, @as(i64, 2));
+        try std.testing.expectEqualStrings("zig build failed", parsed2.value.object.get("detail").?.string);
+    }
+
+    test "failIfActive ends a live build failed with the caller's stage label" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        // The cli#318 contract: an early-error path (errdefer / fatalExit)
+        // must surface its stage label in the terminal record — never the
+        // bare "error" the pre-#318 code wrote.
+        rep.beginPhase(.generate, "assembler generate");
+        rep.failIfActive(1, "assembler generate failed");
+
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
+        try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 1));
+        try std.testing.expectEqualStrings("assembler generate failed", parsed.value.object.get("detail").?.string);
+    }
+
+    test "failActiveStage composes the detail from the live phase" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        // The catch-all errdefer path (pipeline.zig): the terminal record's
+        // phase flips to "failed", so the detail must carry the stage that
+        // was live when the error returned (cli#318 / PR #325 review).
+        rep.beginPhase(.resolve, "");
+        rep.beginPhase(.generate, "assembler generate");
+        rep.failActiveStage(1);
+
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
+        try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 1));
+        try std.testing.expectEqualStrings("generate failed", parsed.value.object.get("detail").?.string);
+    }
+
+    test "failActiveStage before any phase falls back to a build label" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        rep.failActiveStage(1);
+
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
+        try std.testing.expectEqualStrings("build failed", parsed.value.object.get("detail").?.string);
     }
 };
