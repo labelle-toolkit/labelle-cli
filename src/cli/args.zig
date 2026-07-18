@@ -152,8 +152,10 @@ pub const ParsedArgs = struct {
     // `std.log.scoped(.profiler)`). Independent of `--headless` — you can
     // profile a windowed run too.
     profile: bool = false,
-    // `--progress=<mode>` (cli#284): how build/run progress is surfaced on
-    // the terminal — `human` (default; spinner on TTY stderr), `json`
+    // `--progress=<mode>` (cli#284): how build/run progress is surfaced —
+    // `human` (default; spinner during compile/link on TTY stderr, plus
+    // slow "still working" heartbeat lines during resolve/generate on
+    // stderr whether piped or not), `json`
     // (NDJSON records on stdout for studio/CI), or `off`. The live status
     // file `.labelle/<target>/.build-progress.json` is written in every
     // mode (that's what `labelle status` reads).

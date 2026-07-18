@@ -12,8 +12,13 @@
 //!     atomically rewritten (temp + rename) with the CURRENT record so any
 //!     unrelated process can read build state mid-flight (`labelle status`,
 //!     studio's fs bridge). Written in ALL modes.
-//!   - the default human mode — a single-line terminal spinner during the
-//!     otherwise-silent `zig build` compile/link gap (TTY stderr only).
+//!   - the default human mode — a live indicator on stderr: a single-line
+//!     spinner during the otherwise-silent `zig build` compile/link gap
+//!     (TTY only — \r rewriting is meaningless in a pipe), and
+//!     slow-cadence "still working" heartbeat lines during the
+//!     child-owned resolve/generate phases (cli#321) — plain
+//!     newline-terminated lines, pipe-safe, so a cold CI build log shows
+//!     proof of life too.
 //!
 //! The compile-phase step/total/detail granularity comes from Zig's native
 //! `std.Progress` IPC (see `zig_progress.zig`); this module is the pure
@@ -86,11 +91,14 @@ pub const Record = struct {
 };
 
 /// How the CLI surfaces progress. Parsed from `--progress=<mode>`.
-///   human — default; terminal spinner on TTY stderr, nothing when piped.
-///   json  — NDJSON records on stdout, no spinner. Pure NDJSON on stdout
-///           is a `build`-only guarantee: `run` shares the stream with
-///           the game's own stdout (cli#320 — see module doc).
-///   off   — no terminal output at all.
+///   human — default; indicator on stderr: a spinner during compile/link
+///           (TTY only), plus "still working" heartbeat lines during
+///           resolve/generate (TTY and pipes alike — they are plain
+///           newline-terminated lines, safe in a CI log).
+///   json  — NDJSON records on stdout, no human-mode output. Pure NDJSON
+///           on stdout is a `build`-only guarantee: `run` shares the
+///           stream with the game's own stdout (cli#320 — see module doc).
+///   off   — no progress output at all.
 /// The status file is written in every mode.
 pub const Mode = enum { human, json, off };
 
@@ -134,6 +142,23 @@ pub fn encodeRecord(buf: []u8, rec: Record) error{WriteFailed}![]const u8 {
     return w.buffered();
 }
 
+/// Render one resolve/generate heartbeat line (no trailing newline), e.g.
+/// `labelle: still generating (12s)`. The clock is total build elapsed —
+/// the same one the spinner shows — so the user watches a single growing
+/// timer across all phases. Pure; unit-tested.
+pub fn encodeHeartbeatLine(buf: []u8, phase: Phase, elapsed_ms: u64) []const u8 {
+    const verb: []const u8 = switch (phase) {
+        .resolve => "resolving packages",
+        .generate => "generating",
+        else => "working", // defensive; only resolve/generate are drawn
+    };
+    var w = std.Io.Writer.fixed(buf);
+    // The longest render is ~60 bytes ("resolving packages" + a u64 in
+    // seconds); callers pass a 96-byte buffer, so this cannot truncate.
+    w.print("labelle: still {s} ({d}s)", .{ verb, elapsed_ms / 1000 }) catch unreachable;
+    return w.buffered();
+}
+
 /// Atomically publish `bytes` at `final_path`: write `tmp_path` fully, then
 /// rename over the destination. A concurrent reader sees either the previous
 /// complete JSON document or the new one — never a torn write.
@@ -163,6 +188,12 @@ const file_throttle_ms: u64 = 250;
 const json_change_throttle_ms: u64 = 200;
 const json_heartbeat_ms: u64 = 1000;
 const spinner_throttle_ms: u64 = 100;
+/// Cadence of the resolve/generate "still working" heartbeat line (cli#321).
+/// Slow on purpose: the assembler child also logs on the shared stderr, so
+/// this only needs to prove aliveness — one line every 10s — not to animate.
+/// The first line lands a full period after phase entry, so a fast
+/// (warm-cache) phase prints nothing at all.
+const heartbeat_line_period_ms: u64 = 10_000;
 /// Keepalive ticker period: refreshes `elapsed_ms`/`updated_at_ms` while a
 /// child (assembler, zig, game) owns the foreground, so an out-of-band
 /// reader can distinguish "working" from "dead" in every phase.
@@ -218,6 +249,10 @@ pub const Reporter = struct {
     json_ever_written: bool = false,
     spinner_frame: usize = 0,
     spinner_visible_len: usize = 0,
+    /// Next `elapsed_ms` at which a resolve/generate heartbeat line is due.
+    /// Reset to one full period past the phase's start on every phase entry
+    /// (see `beginPhase`), so each phase gets its own grace period.
+    next_heartbeat_ms: u64 = heartbeat_line_period_ms,
 
     ticker: ?std.Thread = null,
     ticker_stop: std.Io.Event = .unset,
@@ -294,6 +329,10 @@ pub const Reporter = struct {
         self.step = null;
         self.total = null;
         self.setDetailLocked(detail);
+        // Give the new phase a full heartbeat grace period before the
+        // first "still working" line: a fast (warm-cache) phase stays
+        // silent, and only a genuinely slow one emits.
+        self.next_heartbeat_ms = self.elapsedMs() + heartbeat_line_period_ms;
         self.emitLocked(true, true);
     }
 
@@ -323,7 +362,8 @@ pub const Reporter = struct {
     }
 
     /// Periodic tick while a child is running and no packet arrived —
-    /// refreshes `elapsed_ms`/spinner so "alive but quiet" is visible.
+    /// refreshes `elapsed_ms`/spinner and paces the resolve/generate
+    /// heartbeat lines, so "alive but quiet" is visible in every phase.
     pub fn heartbeat(self: *Reporter) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -458,9 +498,9 @@ pub const Reporter = struct {
             self.file_ever_written = true;
         }
 
-        if (self.mode == .human and self.stderr_is_tty) {
+        if (self.mode == .human) {
             if (force or elapsed >= self.last_spin_ms + spinner_throttle_ms) {
-                self.drawSpinnerLocked(elapsed);
+                self.drawTerminalIndicatorLocked(elapsed);
                 self.last_spin_ms = elapsed;
             }
         }
@@ -477,16 +517,51 @@ pub const Reporter = struct {
         w.interface.flush() catch return;
     }
 
-    /// Single-line spinner on TTY stderr. Only during compile/link — in the
-    /// other phases a child process (assembler, game) owns the terminal and
-    /// a rewriting line would fight its output. No ANSI escapes: the line is
-    /// cleared by overwriting with spaces, so it renders anywhere.
-    fn drawSpinnerLocked(self: *Reporter, elapsed: u64) void {
+    /// Human-mode indicator on stderr. The shape depends on who owns the
+    /// terminal in the current phase — and on whether stderr is a TTY:
+    ///   - compile/link: a single-line spinner — the `zig build` child
+    ///     relays progress over IPC and stays terminal-quiet until the
+    ///     end, so rewriting one line with \r is safe. TTY only: \r
+    ///     rewriting is meaningless in a pipe.
+    ///   - resolve/generate: the assembler child inherits stderr and logs
+    ///     as it fetches/generates, so a \r-rewriting line would fight its
+    ///     output — instead a plain "still working" heartbeat line is
+    ///     appended at a slow cadence (cli#321). Newline-terminated plain
+    ///     text, so it is emitted whether or not stderr is a TTY: a CI
+    ///     log of a cold build is exactly where "still generating (300s)"
+    ///     matters most, and one line per 10s is negligible there.
+    ///   - anything else (run, terminal states): the foreground child owns
+    ///     the screen; the indicator stays out of the way.
+    /// No ANSI escapes anywhere: the spinner is cleared by overwriting
+    /// with spaces and heartbeats are plain lines, so both render in any
+    /// terminal.
+    fn drawTerminalIndicatorLocked(self: *Reporter, elapsed: u64) void {
         const phase = self.machine.current orelse return;
-        if (phase != .compile and phase != .link) {
-            self.clearSpinnerLocked();
-            return;
+        switch (phase) {
+            .compile, .link => {
+                if (self.stderr_is_tty) self.drawSpinnerLocked(elapsed, phase);
+            },
+            .resolve, .generate => self.drawHeartbeatLocked(elapsed, phase),
+            else => self.clearSpinnerLocked(),
         }
+    }
+
+    /// Append one "still working" line when the per-phase cadence is due.
+    /// A plain newline-terminated print (no \r): it interleaves cleanly
+    /// with the assembler child's inherited-stderr log lines instead of
+    /// rewriting over them.
+    fn drawHeartbeatLocked(self: *Reporter, elapsed: u64, phase: Phase) void {
+        if (elapsed < self.next_heartbeat_ms) return;
+        self.next_heartbeat_ms = elapsed + heartbeat_line_period_ms;
+        var buf: [96]u8 = undefined;
+        std.debug.print("{s}\n", .{encodeHeartbeatLine(&buf, phase, elapsed)});
+    }
+
+    /// Single-line spinner on TTY stderr, compile/link only (see
+    /// `drawTerminalIndicatorLocked` for the other phases). No ANSI
+    /// escapes: the line is cleared by overwriting with spaces, so it
+    /// renders anywhere.
+    fn drawSpinnerLocked(self: *Reporter, elapsed: u64, phase: Phase) void {
         var line_buf: [160]u8 = undefined;
         var w = std.Io.Writer.fixed(&line_buf);
         const frame = spinner_frames[self.spinner_frame % spinner_frames.len];
@@ -664,6 +739,28 @@ pub const NdjsonEncodingSpec = struct {
         defer parsed.deinit();
         try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
         try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 1));
+    }
+};
+
+pub const HeartbeatLineSpec = struct {
+    test "resolve heartbeat names the package work and whole seconds" {
+        var buf: [96]u8 = undefined;
+        const line = encodeHeartbeatLine(&buf, .resolve, 12_345);
+        try std.testing.expectEqualStrings("labelle: still resolving packages (12s)", line);
+        // One line: no embedded newline (the printer appends it).
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    }
+
+    test "generate heartbeat reads as the issue's example" {
+        var buf: [96]u8 = undefined;
+        const line = encodeHeartbeatLine(&buf, .generate, 12_000);
+        try std.testing.expectEqualStrings("labelle: still generating (12s)", line);
+    }
+
+    test "phases without a heartbeat verb fall back to a generic label" {
+        var buf: [96]u8 = undefined;
+        const line = encodeHeartbeatLine(&buf, .run, 61_000);
+        try std.testing.expectEqualStrings("labelle: still working (61s)", line);
     }
 };
 
