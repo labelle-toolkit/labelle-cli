@@ -19,6 +19,17 @@
 //!     "step":int?, "total":int?, "percent":float?,
 //!     "detail":"...", "elapsed_ms":int,
 //!     "exit_code":int?, "updated_at_ms":int }
+//!
+//! Granularity today (labelle-cli#317): for `zig build` the `step`/`total`/
+//! `percent` fields are always null — Zig's frontend does not relay the
+//! build runner's steps tree to the ZIG_PROGRESS pipe (mechanism and
+//! evidence in `runner.zig`), so consumers get phase + liveness + the
+//! frontend's own node names, never "N/M steps". Tracked upstream at
+//! https://github.com/ziglang/zig/issues/24722 (fix PR
+//! https://github.com/ziglang/zig/pull/24733): the schema, the parser,
+//! and this module need no changes when it lands — counts start flowing
+//! on their own. Consumers (labelle-studio#28) should treat the three
+//! fields as phase-only until then.
 
 const std = @import("std");
 const builtin = @import("builtin");
