@@ -20,6 +20,8 @@ pub fn printHelp() void {
         \\  targets              List available build targets
         \\  install [pkg] [ver]  Fetch packages into cache
         \\  install assembler <ver>  Download and cache an assembler binary
+        \\  install <zig|emsdk> <ver>  Provision a managed build toolchain into ~/.labelle
+        \\  install python       Provision managed Python for wasm builds (pinned version, ~25 MB)
         \\  assembler list       List cached assembler versions
         \\  upgrade [dir] [pkg] [ver] [--check] [--json]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all); `--check` reports pins vs latest WITHOUT writing (exit 2 = updates available), `--json` emits a machine-readable report (implies --check)
         \\  update [ver] [--no-path] [--check] [--json]  Update the labelle CLI itself; `--check` reports installed vs latest WITHOUT installing (exit 2 = update available), `--json` emits a machine-readable report (implies --check)
