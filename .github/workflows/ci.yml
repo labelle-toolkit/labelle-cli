@@ -309,6 +309,29 @@ jobs:
           cd .labelle/raylib_desktop
           zig build
 
+      # Released-path smoke (labelle-cli#322): init with NO local overrides —
+      # the exact cold-user path. Resolves DEFAULT_ASSEMBLER_VERSION from
+      # GitHub releases and scaffolds that binary's curated package pins, then
+      # generates and builds against the RELEASED tarballs. This is the guard
+      # the local-override test above cannot provide: it fails if the paired
+      # default rots (the 0.40.0 constant sat stale for months, scaffolding
+      # projects with no .y_axis and tag-stamped pins that the current
+      # assembler line refuses to build) or if the curated set stops being
+      # mutually compatible.
+      - name: Released-path init smoke (no local overrides)
+        run: |
+          set -e
+          unset LABELLE_ASSEMBLER
+          mkdir -p test-projects-released && cd test-projects-released
+          ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs
+          echo "── scaffolded project.labelle ──"
+          cat cold_game/project.labelle
+          grep -Eq '\.y_axis[[:space:]]*=' cold_game/project.labelle || { echo "FAIL: scaffold missing .y_axis"; exit 1; }
+          cd cold_game
+          ../../labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/raylib_desktop
+          zig build
+
       - name: Plugin manifest system test
         run: |
           set -e
