@@ -306,11 +306,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     defer if (reporter) |r| r.deinit();
     // Any error path from here on marks the status file `failed`, so an
     // out-of-band reader never sees a live phase for a dead build. The
-    // catch-all detail names the pipeline; the record's own `phase` field
-    // says which stage was live when the error returned (cli#318).
+    // catch-all detail is composed from the live phase ("generate
+    // failed", …) so the terminal record still names the stage that was
+    // active — the record's own `phase` field flips to "failed" (cli#318).
     // (Pipeline code that terminates via process-exit instead of an error
     // return goes through `progress.fatalExit`, which does the same.)
-    errdefer if (reporter) |r| r.failIfActive(1, "build pipeline failed");
+    errdefer if (reporter) |r| r.failActiveStage(1);
     if (reporter) |r| {
         // Registers the fatalExit hook + starts the keepalive ticker that
         // refreshes elapsed/updated timestamps while child processes own

@@ -344,6 +344,22 @@ pub const Reporter = struct {
         if (!terminal) self.finishFailed(exit_code, detail);
     }
 
+    /// Catch-all errdefer variant: mark `failed` with a detail composed
+    /// from the LIVE phase ("generate failed", "resolve failed", …). The
+    /// terminal record's own `phase` field flips to "failed", so without
+    /// this the stage that was active when the error returned would be
+    /// lost to feed consumers (cli#318 / PR #325 review).
+    pub fn failActiveStage(self: *Reporter, exit_code: u8) void {
+        self.mutex.lockUncancelable(self.io);
+        const terminal = self.machine.isTerminal();
+        const stage: []const u8 = if (self.machine.current) |c| @tagName(c) else "build";
+        self.mutex.unlock(self.io);
+        if (terminal) return;
+        var buf: [max_detail_len]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "{s} failed", .{stage}) catch "build failed";
+        self.finishFailed(exit_code, detail);
+    }
+
     fn finishWith(self: *Reporter, phase: Phase, exit_code: u8, detail: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -791,5 +807,59 @@ pub const ReporterPipelineSpec = struct {
         try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
         try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 1));
         try std.testing.expectEqualStrings("assembler generate failed", parsed.value.object.get("detail").?.string);
+    }
+
+    test "failActiveStage composes the detail from the live phase" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        // The catch-all errdefer path (pipeline.zig): the terminal record's
+        // phase flips to "failed", so the detail must carry the stage that
+        // was live when the error returned (cli#318 / PR #325 review).
+        rep.beginPhase(.resolve, "");
+        rep.beginPhase(.generate, "assembler generate");
+        rep.failActiveStage(1);
+
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
+        try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 1));
+        try std.testing.expectEqualStrings("generate failed", parsed.value.object.get("detail").?.string);
+    }
+
+    test "failActiveStage before any phase falls back to a build label" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        rep.failActiveStage(1);
+
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
+        try std.testing.expectEqualStrings("build failed", parsed.value.object.get("detail").?.string);
     }
 };
