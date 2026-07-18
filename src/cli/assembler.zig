@@ -18,10 +18,14 @@ const std = @import("std");
 /// the CLI's `assembler_proc` harness understands.
 ///
 /// Must be >= the first release carrying the assembler subcommands the
-/// CLI delegates (`install`/`clean`/`upgrade`/`init`). Bumped from the
-/// obsolete `0.8.0` (generate-only) to the 0.31.0 line that ships them —
-/// keep this in lockstep with the assembler release.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.40.0";
+/// CLI delegates (`install`/`clean`/`upgrade`/`init`), and >= 0.92.0 so
+/// `init` scaffolds carry `.y_axis` + real curated package pins instead
+/// of tag-stamped nonsense (labelle-cli#322 / assembler#629 — 0.40.0 sat
+/// here untouched for months and every fresh `labelle init` scaffolded a
+/// project the current assembler line refuses to build). The
+/// released-path smoke test in ci.yml (init with NO local overrides →
+/// generate → build) fails if this constant rots again.
+pub const DEFAULT_ASSEMBLER_VERSION = "0.92.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");
