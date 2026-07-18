@@ -326,7 +326,7 @@ jobs:
           ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs
           echo "── scaffolded project.labelle ──"
           cat cold_game/project.labelle
-          grep -q '\.y_axis = ' cold_game/project.labelle || { echo "FAIL: scaffold missing .y_axis"; exit 1; }
+          grep -Eq '\.y_axis[[:space:]]*=' cold_game/project.labelle || { echo "FAIL: scaffold missing .y_axis"; exit 1; }
           cd cold_game
           ../../labelle-cli/zig-out/bin/labelle generate
           cd .labelle/raylib_desktop

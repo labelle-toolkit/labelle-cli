@@ -366,8 +366,10 @@ test "pickTarget guards assembler_version downgrade" {
     // "0.40.0" == the then-default, which only passed by coincidence and
     // broke the moment the stale constant was bumped — labelle-cli#322.)
     try testing.expectEqualStrings("99.0.0", pickTarget("assembler_version", "99.0.0", assembler.DEFAULT_ASSEMBLER_VERSION, false));
-    // An OLDER pin is moved forward to the paired default.
-    try testing.expectEqualStrings(assembler.DEFAULT_ASSEMBLER_VERSION, pickTarget("assembler_version", "0.40.0", assembler.DEFAULT_ASSEMBLER_VERSION, false));
+    // An OLDER pin is moved forward to the paired default. ("0.0.0" — a
+    // clearly-minimal sentinel, not a real historical version that could
+    // read as meaningful.)
+    try testing.expectEqualStrings(assembler.DEFAULT_ASSEMBLER_VERSION, pickTarget("assembler_version", "0.0.0", assembler.DEFAULT_ASSEMBLER_VERSION, false));
 }
 
 test "parseUpgradeArgs strips --check and reports report-only mode" {
