@@ -64,6 +64,29 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
 
+    // ── Progress-feed subprocess e2e (cli#319) ───────────────────────
+    // Spawns the REAL built CLI (`zig-out/bin/labelle build
+    // --progress=json`) on a scaffolded fixture and asserts the NDJSON
+    // feed contract, the live status file from a concurrent process, and
+    // the forced-compile-failure variant. NOT part of `zig build test`:
+    // it needs sibling checkouts (labelle-core/-engine/-gfx/-assembler)
+    // and a built assembler binary, so it is opt-in via env — the test
+    // skips unless LABELLE_E2E_DEPS and LABELLE_ASSEMBLER are set (see
+    // the header of test/progress_e2e.zig). CI runs it in the dedicated
+    // `progress-e2e` job. Depends on the install step so the binary
+    // under test is always fresh.
+    const progress_e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/progress_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_progress_e2e = b.addRunArtifact(progress_e2e_tests);
+    const e2e_step = b.step("test-e2e", "Run the progress-feed subprocess e2e (opt-in: needs LABELLE_E2E_DEPS + LABELLE_ASSEMBLER)");
+    e2e_step.dependOn(b.getInstallStep());
+    e2e_step.dependOn(&run_progress_e2e.step);
+
     // Build-time ASTC conversion core (assembler#340). `src/astc/convert.zig`
     // is pure command/path/cache logic (std-only), so it runs standalone on the
     // host — independent of the full CLI module graph.

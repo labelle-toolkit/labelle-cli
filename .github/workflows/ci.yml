@@ -500,3 +500,79 @@ jobs:
           # trap cleanup restores the original manifest, deletes the
           # temporary fake-other-plugin/plugin.labelle, and wipes artifacts
           echo "plugin-manifest system test: all cases passed"
+
+  progress-e2e:
+    name: Progress Feed E2E (cli#319)
+    runs-on: ubuntu-latest
+    env:
+      LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+      LABELLE_E2E_DEPS: ${{ github.workspace }}
+
+    # Subprocess-level e2e for the `build --progress=json` feed: spawns
+    # the real built CLI on a scaffolded fixture (zig build test-e2e,
+    # test/progress_e2e.zig). The fixture pins core/engine/gfx/cli/
+    # assembler as `local:` versions (same pattern as the
+    # versions-integration job), so no GitHub-release package fetching
+    # happens at test time; backend deps (raylib-zig) still come from
+    # zig's package manager, exactly as in versions-integration.
+    steps:
+      - name: Checkout labelle-cli
+        uses: actions/checkout@v4
+        with:
+          path: labelle-cli
+
+      - name: Checkout sibling dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          ref: main
+          path: labelle-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          ref: main
+          path: labelle-engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          ref: main
+          path: labelle-gfx
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-assembler
+          ref: main
+          path: labelle-assembler
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Native libs the generated raylib desktop game compiles against
+      # (same set as the versions-integration job).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev libsdl2-dev
+
+      - name: Build CLI
+        run: cd labelle-cli && zig build
+
+      - name: Build assembler
+        run: cd labelle-assembler && zig build
+
+      # Generous timeout: a cold raylib build is ~1 min on a warm zig
+      # cache, several minutes cold — plus the forced-failure rebuild.
+      - name: Run progress-feed subprocess e2e
+        timeout-minutes: 30
+        run: |
+          cd labelle-cli
+          # LABELLE_ZIG points the CLI's managed-toolchain resolver at
+          # the setup-zig install so no ziglang.org download happens.
+          LABELLE_ZIG="$(command -v zig)" zig build test-e2e --summary all
