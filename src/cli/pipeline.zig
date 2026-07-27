@@ -764,7 +764,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
                     const sec_str = try std.fmt.bufPrint(&sec_buf, "{d:.3}", .{sec_f64});
                     try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_AFTER_SEC", .value = sec_str });
                 }
-                std.debug.print("labelle: screenshot will be written to '{s}'\n", .{path});
+                // Deliberately "requested", not "will be written to": the
+                // backend picks the real filename and may not honor this path
+                // (labelle-bgfx#57 appends its own `.tga`). The authoritative
+                // line is `reportScreenshotOutcome` after the run.
+                std.debug.print("labelle: screenshot requested: '{s}'\n", .{path});
             }
             // For a non-docker run, fold the ZIG_*_CACHE_DIR vars in too so
             // both the build and run children share the managed cache. For a
@@ -804,6 +808,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
+            // --docker runs the binary with the project dir as cwd.
+            if (parsed_args.screenshot_path) |path| reportScreenshotOutcome(allocator, path, project_dir);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record.
             if (reporter) |r| r.finishDone(run_result);
@@ -861,11 +867,59 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
+            // The game runs with `.labelle/<target>/` as cwd, so that — not the
+            // user's shell cwd — is what a relative screenshot path resolves against.
+            if (parsed_args.screenshot_path) |path| reportScreenshotOutcome(allocator, path, target_dir);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record.
             if (reporter) |r| r.finishDone(run_result);
         }
     }
+}
+
+/// Extensions a backend may append to the requested screenshot path instead of
+/// honoring it verbatim. bgfx writes TGA and appends `.tga` to whatever it is
+/// given, so `--screenshot=shot.png` lands at `shot.png.tga` (labelle-bgfx#57).
+const screenshot_suffixes = [_][]const u8{ ".tga", ".png", ".bmp" };
+
+/// Report where the screenshot ACTUALLY landed, after the game has exited.
+///
+/// The CLI only forwards `LABELLE_SCREENSHOT_PATH`; the backend owns the real
+/// filename and the CLI never verified the result, so a capture written to a
+/// different path read as "no screenshot was produced" — the misreading this
+/// function exists to prevent.
+///
+/// `run_cwd` is the directory the game ran in, which is NOT the user's cwd on
+/// the normal path (the game runs in `.labelle/<target>/` so its saves land
+/// where `zig build run` put them). A relative `--screenshot=shot.png` is
+/// therefore resolved by the game against `run_cwd`, so that is where to look
+/// and what to print — an unqualified relative path would send the user to the
+/// wrong directory.
+fn reportScreenshotOutcome(allocator: std.mem.Allocator, requested: []const u8, run_cwd: []const u8) void {
+    const resolved: []const u8 = if (std.fs.path.isAbsolute(requested))
+        allocator.dupe(u8, requested) catch return
+    else
+        std.fs.path.join(allocator, &.{ run_cwd, requested }) catch return;
+    defer allocator.free(resolved);
+
+    if (util.fileExists(resolved)) {
+        std.debug.print("labelle: screenshot written to '{s}'\n", .{resolved});
+        return;
+    }
+
+    for (screenshot_suffixes) |suffix| {
+        const candidate = std.fmt.allocPrint(allocator, "{s}{s}", .{ resolved, suffix }) catch continue;
+        defer allocator.free(candidate);
+        if (!util.fileExists(candidate)) continue;
+        std.debug.print("labelle: screenshot written to '{s}'\n", .{candidate});
+        std.debug.print("  note: the backend appended '{s}' — the requested path '{s}' does not exist\n", .{ suffix, resolved });
+        return;
+    }
+
+    std.debug.print("labelle: warning: no screenshot was written (looked for '{s}'", .{resolved});
+    for (screenshot_suffixes) |suffix| std.debug.print(", '{s}{s}'", .{ resolved, suffix });
+    std.debug.print(")\n", .{});
+    std.debug.print("  hint: capture needs a native surface on some backends — a headless bgfx device has no backbuffer to read back\n\n", .{});
 }
 
 pub const ResolveExportOutputSpec = struct {
