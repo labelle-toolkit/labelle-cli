@@ -736,6 +736,16 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         // --profile surfaces as LABELLE_PROFILE=1, enabling the engine's
         // built-in frame profiler. Independent of --headless.
         const has_profile_env = parsed_args.profile;
+        // Fingerprint every path the capture could land at BEFORE the game
+        // runs, so the post-run report can tell a file this run wrote from one
+        // an earlier run left behind. The game's cwd — what a relative path
+        // resolves against — is the project dir under --docker and the target
+        // dir otherwise.
+        const screenshot_probe: ?ScreenshotProbe = if (parsed_args.screenshot_path) |path|
+            ScreenshotProbe.init(allocator, path, if (parsed_args.docker) project_dir else target_dir)
+        else
+            null;
+        defer if (screenshot_probe) |p| p.deinit(allocator);
         if (has_scene_env or has_screenshot_env or has_headless_env or has_profile_env) {
             var extras: std.ArrayList(runner.EnvKV) = .empty;
             defer extras.deinit(allocator);
@@ -767,7 +777,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
                 // Deliberately "requested", not "will be written to": the
                 // backend picks the real filename and may not honor this path
                 // (labelle-bgfx#57 appends its own `.tga`). The authoritative
-                // line is `reportScreenshotOutcome` after the run.
+                // line is `ScreenshotProbe.report` after the run.
                 std.debug.print("labelle: screenshot requested: '{s}'\n", .{path});
             }
             // For a non-docker run, fold the ZIG_*_CACHE_DIR vars in too so
@@ -808,8 +818,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
-            // --docker runs the binary with the project dir as cwd.
-            if (parsed_args.screenshot_path) |path| reportScreenshotOutcome(allocator, path, project_dir);
+            if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record.
             if (reporter) |r| r.finishDone(run_result);
@@ -867,9 +876,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             if (run_result != 0) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
             }
-            // The game runs with `.labelle/<target>/` as cwd, so that — not the
-            // user's shell cwd — is what a relative screenshot path resolves against.
-            if (parsed_args.screenshot_path) |path| reportScreenshotOutcome(allocator, path, target_dir);
+            if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record.
             if (reporter) |r| r.finishDone(run_result);
@@ -882,45 +889,104 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
 /// given, so `--screenshot=shot.png` lands at `shot.png.tga` (labelle-bgfx#57).
 const screenshot_suffixes = [_][]const u8{ ".tga", ".png", ".bmp" };
 
-/// Report where the screenshot ACTUALLY landed, after the game has exited.
+/// Pre-run fingerprint of one candidate path. Existence alone is not enough to
+/// claim "this run wrote it" — a file left by an EARLIER run would be reported
+/// as a fresh capture even when the current one failed, and a stale file at the
+/// exact requested path would mask a newly written suffixed one. So compare
+/// size+mtime across the run and treat only a created-or-changed file as ours.
+const FileStamp = struct {
+    existed: bool = false,
+    size: u64 = 0,
+    mtime_ns: i128 = 0,
+
+    fn take(path: []const u8) FileStamp {
+        const st = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch return .{};
+        return .{ .existed = true, .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+    }
+
+    /// True when `after` represents a file this run created or rewrote.
+    fn changed(before: FileStamp, after: FileStamp) bool {
+        if (!after.existed) return false;
+        if (!before.existed) return true;
+        return before.size != after.size or before.mtime_ns != after.mtime_ns;
+    }
+};
+
+/// Where a screenshot might land, fingerprinted before the game runs.
 ///
 /// The CLI only forwards `LABELLE_SCREENSHOT_PATH`; the backend owns the real
 /// filename and the CLI never verified the result, so a capture written to a
 /// different path read as "no screenshot was produced" — the misreading this
-/// function exists to prevent.
+/// exists to prevent.
 ///
-/// `run_cwd` is the directory the game ran in, which is NOT the user's cwd on
-/// the normal path (the game runs in `.labelle/<target>/` so its saves land
-/// where `zig build run` put them). A relative `--screenshot=shot.png` is
-/// therefore resolved by the game against `run_cwd`, so that is where to look
-/// and what to print — an unqualified relative path would send the user to the
-/// wrong directory.
-fn reportScreenshotOutcome(allocator: std.mem.Allocator, requested: []const u8, run_cwd: []const u8) void {
-    const resolved: []const u8 = if (std.fs.path.isAbsolute(requested))
-        allocator.dupe(u8, requested) catch return
-    else
-        std.fs.path.join(allocator, &.{ run_cwd, requested }) catch return;
-    defer allocator.free(resolved);
+/// `run_cwd` is the directory the game runs in, which is NOT the user's cwd:
+/// normally `.labelle/<target>/` (so saves land where `zig build run` put
+/// them), but `project_dir` under `--docker`. A relative `--screenshot=shot.png`
+/// is resolved by the game against that cwd, so that is where to look and what
+/// to print — an unqualified relative path would send the user to the wrong
+/// directory.
+const ScreenshotProbe = struct {
+    /// Path as the user typed it.
+    requested: []const u8,
+    /// `requested` resolved against the game's cwd (owned).
+    resolved: []const u8,
+    /// Index 0 is `resolved`; the rest follow `screenshot_suffixes`.
+    before: [1 + screenshot_suffixes.len]FileStamp = @splat(.{}),
 
-    if (util.fileExists(resolved)) {
-        std.debug.print("labelle: screenshot written to '{s}'\n", .{resolved});
-        return;
+    fn init(allocator: std.mem.Allocator, requested: []const u8, run_cwd: []const u8) ?ScreenshotProbe {
+        const resolved: []const u8 = if (std.fs.path.isAbsolute(requested))
+            allocator.dupe(u8, requested) catch return null
+        else
+            std.fs.path.join(allocator, &.{ run_cwd, requested }) catch return null;
+
+        var probe: ScreenshotProbe = .{ .requested = requested, .resolved = resolved };
+        for (0..probe.before.len) |i| {
+            const path = probe.candidatePath(allocator, i) orelse continue;
+            defer allocator.free(path);
+            probe.before[i] = FileStamp.take(path);
+        }
+        return probe;
     }
 
-    for (screenshot_suffixes) |suffix| {
-        const candidate = std.fmt.allocPrint(allocator, "{s}{s}", .{ resolved, suffix }) catch continue;
-        defer allocator.free(candidate);
-        if (!util.fileExists(candidate)) continue;
-        std.debug.print("labelle: screenshot written to '{s}'\n", .{candidate});
-        std.debug.print("  note: the backend appended '{s}' — the requested path '{s}' does not exist\n", .{ suffix, resolved });
-        return;
+    fn deinit(self: ScreenshotProbe, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolved);
     }
 
-    std.debug.print("labelle: warning: no screenshot was written (looked for '{s}'", .{resolved});
-    for (screenshot_suffixes) |suffix| std.debug.print(", '{s}{s}'", .{ resolved, suffix });
-    std.debug.print(")\n", .{});
-    std.debug.print("  hint: capture needs a native surface on some backends — a headless bgfx device has no backbuffer to read back\n\n", .{});
-}
+    /// Candidate `i`: 0 is the resolved path itself, then one per suffix.
+    fn candidatePath(self: ScreenshotProbe, allocator: std.mem.Allocator, i: usize) ?[]u8 {
+        if (i == 0) return allocator.dupe(u8, self.resolved) catch null;
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ self.resolved, screenshot_suffixes[i - 1] }) catch null;
+    }
+
+    /// Report where the screenshot ACTUALLY landed, after the game has exited.
+    fn report(self: ScreenshotProbe, allocator: std.mem.Allocator) void {
+        var stale_exact = false;
+        for (0..self.before.len) |i| {
+            const path = self.candidatePath(allocator, i) orelse continue;
+            defer allocator.free(path);
+            const after = FileStamp.take(path);
+            if (!FileStamp.changed(self.before[i], after)) {
+                // Pre-existing and untouched. Worth calling out only for the
+                // exact path, where its presence is actively misleading.
+                if (i == 0 and after.existed) stale_exact = true;
+                continue;
+            }
+            std.debug.print("labelle: screenshot written to '{s}'\n", .{path});
+            if (i != 0) {
+                std.debug.print("  note: the backend appended '{s}' — the requested path '{s}' was not written\n", .{ screenshot_suffixes[i - 1], self.resolved });
+            }
+            return;
+        }
+
+        std.debug.print("labelle: warning: no screenshot was written (looked for '{s}'", .{self.resolved});
+        for (screenshot_suffixes) |suffix| std.debug.print(", '{s}{s}'", .{ self.resolved, suffix });
+        std.debug.print(")\n", .{});
+        if (stale_exact) {
+            std.debug.print("  note: '{s}' exists but is unchanged — it is left over from an earlier run, not this one\n", .{self.resolved});
+        }
+        std.debug.print("  hint: capture needs a native surface on some backends — a headless bgfx device has no backbuffer to read back\n\n", .{});
+    }
+};
 
 pub const ResolveExportOutputSpec = struct {
     // The export dir is wiped on every run, so a destructive `--output`
