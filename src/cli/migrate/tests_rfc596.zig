@@ -360,6 +360,23 @@ pub const LiftGuardSpec = struct {
         try std.testing.expect(items[1].object.get("Position") != null);
     }
 
+    test "escaped uppercase key (\\u0050osition) is treated as PascalCase — parity with the parsed audit view" {
+        // codex P2 round 2 on cli#339: the audit classifies keys from the
+        // parsed tree (escapes decoded), so the byte-level guard must
+        // decode a leading \\uXXXX before refusing, or the audit reports
+        // a lift the migrator never performs.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "[\n" ++
+            "    { \"prefab\": \"worker\", \"overrides\": { \"\\u0050osition\": { \"x\": 1 } } }\n" ++
+            "]\n";
+        var counts = FileCounts{};
+        const out = try applyAllFullCounts(arena.allocator(), src, "main", &counts);
+        try std.testing.expectEqual(@as(usize, 1), counts.overrides_lifts);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\"") == null);
+    }
+
     test "cli#337 regression: deleteTopLevelKey keeps a collapsed closer intact" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();

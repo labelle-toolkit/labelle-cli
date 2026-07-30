@@ -498,6 +498,26 @@ pub const WrapperSpec = struct {
 /// (cli#338). Lifting is therefore only semantics-preserving when the
 /// wrapper's contents are all PascalCase; otherwise the wrapper is the
 /// REQUIRED shape and must be left alone.
+/// First-character PascalCase test on RAW string bytes, decoding a
+/// leading `\uXXXX` escape first. The audit classifies keys from the
+/// PARSED tree (escapes already decoded), so a byte-level check that
+/// saw the backslash of `"\u0050osition"` and refused would leave the
+/// audit reporting a lift the migrator never performs — breaking the
+/// audit↔migrate 1:1 mapping (codex P2 round 2 on cli#339). `\uXXXX`
+/// is the only JSON escape that can encode A–Z; every other escape
+/// (`\n`, `\"`, `\\`, …) cannot, so those refuse as before.
+fn keyStartsUppercase(key: []const u8) bool {
+    if (key.len == 0) return false;
+    if (key[0] == '\\') {
+        if (key.len >= 6 and (key[1] == 'u' or key[1] == 'U')) {
+            const cp = std.fmt.parseInt(u21, key[2..6], 16) catch return false;
+            return cp >= 'A' and cp <= 'Z';
+        }
+        return false;
+    }
+    return key[0] >= 'A' and key[0] <= 'Z';
+}
+
 pub fn innerKeysAllPascal(src: []const u8, v_start: usize, v_end_one_past: usize) bool {
     var i = v_start + 1; // past the `{`
     const end = v_end_one_past - 1; // the closing `}`
@@ -509,7 +529,7 @@ pub fn innerKeysAllPascal(src: []const u8, v_start: usize, v_end_one_past: usize
         const k_start = i;
         const k_end = findStringEnd(src, k_start);
         const key = src[k_start + 1 .. k_end - 1];
-        if (key.len == 0 or key[0] < 'A' or key[0] > 'Z') return false;
+        if (!keyStartsUppercase(key)) return false;
         var j = skipWsAndComments(src, k_end);
         if (j >= end or src[j] != ':') return false;
         j += 1;
