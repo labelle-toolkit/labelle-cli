@@ -198,7 +198,10 @@ pub fn writeHumanPackages(w: *std.Io.Writer, dir: []const u8, packages: []const 
         }
     }
     if (behind == 0) {
-        try w.writeAll("no pins behind this CLI's compatible set\n");
+        // "comparable" — unchecked pins (no tracked latest) are excluded
+        // from the statement and reported in their own note below
+        // (coderabbit on cli#339).
+        try w.writeAll("no comparable pins are behind this CLI's compatible set\n");
     } else {
         try w.print("{d} pin(s) behind the compatible set bundled with this CLI — run `labelle upgrade all` to apply it\n", .{behind});
     }
