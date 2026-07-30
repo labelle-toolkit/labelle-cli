@@ -275,6 +275,13 @@ pub const ProjectConfig = struct {
     gfx_version: []const u8 = GFX_VERSION,
     labelle_version: []const u8 = CLI_VERSION,
 
+    /// The graphics backend package (e.g. bgfx), pinned like a plugin.
+    /// The assembler is the primary consumer; the CLI parses it so
+    /// `upgrade --check` can REPORT the pin instead of silently omitting
+    /// it from the version report (cli#336). Shape matches `PluginDep`
+    /// (`.name` / `.repo` / `.version`).
+    backend_package: ?PluginDep = null,
+
     /// Explicit initial prefab name. RFC #560 / issue #565 (unify scenes
     /// and prefabs) renamed `.initial_scene` to `.initial_prefab`. The
     /// legacy `.initial_scene` field below is still accepted for backward

@@ -175,6 +175,9 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
 ///   - core/engine/gfx → versions.zon (`project_config.*_VERSION`)
 ///   - labelle         → this CLI's own version (`CLI_VERSION`)
 ///   - assembler       → `DEFAULT_ASSEMBLER_VERSION`
+///   - backend_package → unknown (not in the bundled set); the pin is still
+///                       reported — omitting it hid required coordinated
+///                       gfx+bgfx bumps (cli#336).
 ///   - plugins         → unknown (the CLI has no plugin-latest registry); the
 ///                       pin is still reported so studio can display it.
 ///
@@ -193,6 +196,19 @@ fn cmdUpgradeCheck(
     try packages.append(allocator, update_check.packageStatus("core", cfg.core_version, project_config.CORE_VERSION));
     try packages.append(allocator, update_check.packageStatus("engine", cfg.engine_version, project_config.ENGINE_VERSION));
     try packages.append(allocator, update_check.packageStatus("gfx", cfg.gfx_version, project_config.GFX_VERSION));
+    // The backend package (bgfx et al.) has no entry in the bundled
+    // compatible set, but its pin MUST still appear in the report —
+    // silently omitting it hid a required coordinated bump when gfx
+    // crossed a backend-contract boundary (cli#336).
+    if (cfg.backend_package) |bp| {
+        const pinned: ?[]const u8 = if (bp.version.len > 0) bp.version else null;
+        var status = update_check.packageStatus(bp.name, pinned, null);
+        status.@"error" = if (bp.isLocal())
+            update_check.err_local_override
+        else
+            update_check.err_backend_untracked;
+        try packages.append(allocator, status);
+    }
     try packages.append(allocator, update_check.packageStatus("labelle", cfg.labelle_version, project_config.CLI_VERSION));
     try packages.append(allocator, update_check.packageStatus("assembler", cfg.assembler_version, assembler.DEFAULT_ASSEMBLER_VERSION));
     for (cfg.plugins) |p| {

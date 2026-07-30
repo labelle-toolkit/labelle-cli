@@ -3,7 +3,7 @@
     // packages version on INDEPENDENT minor trains (the assembler unifies them
     // onto the project's core at build time), so these minors differ by design.
     // Bump to the latest releases as they're cut + CI-verified together.
-    .core = "1.26.0",
-    .engine = "2.5.0",
-    .gfx = "1.28.1",
+    .core = "1.27.0",
+    .engine = "2.10.0",
+    .gfx = "1.28.5",
 }

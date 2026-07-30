@@ -39,6 +39,10 @@ pub const err_unknown_latest = "no known latest version for this package";
 pub const err_local_override = "local path override — not version-comparable";
 /// The CLI-latest fetch failed (curl missing / network / HTTP error).
 pub const err_offline = "could not reach the release server";
+/// A `backend_package` pin (e.g. bgfx): the CLI's bundled compatible set
+/// does not track backend packages, so the pin is reported but cannot be
+/// compared (cli#336 — previously it was silently omitted altogether).
+pub const err_backend_untracked = "backend package — latest not tracked by this CLI; check the repo's tags";
 
 /// Running CLI binary vs the newest published release. Emitted under "cli".
 pub const CliStatus = struct {
@@ -173,7 +177,7 @@ pub fn writeHumanPackages(w: *std.Io.Writer, dir: []const u8, packages: []const 
         const pinned = p.pinned orelse "(unset)";
         if (p.update_available) {
             updates += 1;
-            try w.print("  {s}: {s} -> {s}  (update available)\n", .{ p.name, pinned, p.latest.? });
+            try w.print("  {s}: {s} -> {s}  (behind this CLI's compatible set)\n", .{ p.name, pinned, p.latest.? });
         } else if (!p.checked) {
             try w.print("  {s}: {s}  ({s})\n", .{ p.name, pinned, p.@"error" orelse "not checked" });
         } else {
@@ -181,10 +185,13 @@ pub fn writeHumanPackages(w: *std.Io.Writer, dir: []const u8, packages: []const 
         }
     }
     if (updates == 0) {
-        try w.writeAll("all pins up to date\n");
+        try w.writeAll("all pins match this CLI's compatible set\n");
     } else {
-        try w.print("{d} update(s) available — run `labelle upgrade all` to apply\n", .{updates});
+        try w.print("{d} pin(s) behind the compatible set bundled with this CLI — run `labelle upgrade all` to apply it\n", .{updates});
     }
+    // The set is frozen at CLI build time (versions.zon), NOT a live
+    // "latest" query — newer tags may exist upstream (cli#336).
+    try w.writeAll("note: targets are this CLI release's tested set; newer package tags may exist\n");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
