@@ -60,6 +60,9 @@ pub const CLI_VERSION = @import("build_options").cli_version;
 pub const CORE_VERSION = @import("build_options").core_version;
 pub const ENGINE_VERSION = @import("build_options").engine_version;
 pub const GFX_VERSION = @import("build_options").gfx_version;
+/// The bgfx backend package version paired with GFX_VERSION — the two
+/// cross a shared backend contract and must be bumped together.
+pub const BGFX_VERSION = @import("build_options").bgfx_version;
 
 /// A plugin dependency declared in project.labelle.
 pub const PluginDep = struct {
@@ -274,6 +277,13 @@ pub const ProjectConfig = struct {
     engine_version: []const u8 = ENGINE_VERSION,
     gfx_version: []const u8 = GFX_VERSION,
     labelle_version: []const u8 = CLI_VERSION,
+
+    /// The graphics backend package (e.g. bgfx), pinned like a plugin.
+    /// The assembler is the primary consumer; the CLI parses it so
+    /// `upgrade --check` can REPORT the pin instead of silently omitting
+    /// it from the version report (cli#336). Shape matches `PluginDep`
+    /// (`.name` / `.repo` / `.version`).
+    backend_package: ?PluginDep = null,
 
     /// Explicit initial prefab name. RFC #560 / issue #565 (unify scenes
     /// and prefabs) renamed `.initial_scene` to `.initial_prefab`. The

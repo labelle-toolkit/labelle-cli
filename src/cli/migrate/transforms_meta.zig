@@ -77,6 +77,16 @@ pub fn moveNameToMeta(arena: std.mem.Allocator, src: []const u8, has_meta: bool)
 pub fn isEntityShapeKey(key: []const u8) bool {
     if (key.len == 0) return false;
     if (std.mem.eql(u8, key, "prefab")) return true;
+    // A `components:` (or reference `overrides:`) block marks the file's
+    // top level as a root ENTITY, exactly like a PascalCase component
+    // key. Before cli#338 this case never reached the meta/collapse
+    // passes (the wrapper had already been lifted to PascalCase keys);
+    // now that the wrapper is preserved, failing to recognize it here
+    // would let `moveOneDirectiveToMeta` relocate the root entity's
+    // components into `meta:` — destroying them just as thoroughly as
+    // the lift did.
+    if (std.mem.eql(u8, key, "components")) return true;
+    if (std.mem.eql(u8, key, "overrides")) return true;
     const c = key[0];
     return c >= 'A' and c <= 'Z';
 }

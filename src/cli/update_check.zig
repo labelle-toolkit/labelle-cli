@@ -39,6 +39,10 @@ pub const err_unknown_latest = "no known latest version for this package";
 pub const err_local_override = "local path override — not version-comparable";
 /// The CLI-latest fetch failed (curl missing / network / HTTP error).
 pub const err_offline = "could not reach the release server";
+/// A `backend_package` pin (e.g. bgfx): the CLI's bundled compatible set
+/// does not track backend packages, so the pin is reported but cannot be
+/// compared (cli#336 — previously it was silently omitted altogether).
+pub const err_backend_untracked = "backend package — latest not tracked by this CLI; check the repo's tags";
 
 /// Running CLI binary vs the newest published release. Emitted under "cli".
 pub const CliStatus = struct {
@@ -168,23 +172,48 @@ pub fn writeHumanCli(w: *std.Io.Writer, cli: CliStatus) !void {
 /// Human-readable pin report (`upgrade --check`, no `--json`).
 pub fn writeHumanPackages(w: *std.Io.Writer, dir: []const u8, packages: []const PackageStatus) !void {
     try w.print("labelle: checking project pins in '{s}'...\n", .{dir});
-    var updates: usize = 0;
+    // Three buckets, tracked separately so the summary never claims a
+    // blanket "match" that per-package lines contradict (codex P2 on
+    // cli#339): `behind` (upgrade available), `unchecked` (no tracked
+    // latest / local override — never compared), and `ahead` (pin newer
+    // than the set — the downgrade guard keeps it).
+    var behind: usize = 0;
+    var unchecked: usize = 0;
+    var ahead: usize = 0;
     for (packages) |p| {
         const pinned = p.pinned orelse "(unset)";
         if (p.update_available) {
-            updates += 1;
-            try w.print("  {s}: {s} -> {s}  (update available)\n", .{ p.name, pinned, p.latest.? });
+            behind += 1;
+            try w.print("  {s}: {s} -> {s}  (behind this CLI's compatible set)\n", .{ p.name, pinned, p.latest.? });
         } else if (!p.checked) {
+            unchecked += 1;
             try w.print("  {s}: {s}  ({s})\n", .{ p.name, pinned, p.@"error" orelse "not checked" });
+        } else if (p.pinned != null and p.latest != null and
+            util.parseVersion(p.pinned.?) > util.parseVersion(p.latest.?))
+        {
+            ahead += 1;
+            try w.print("  {s}: {s}  (ahead of the set's {s}; kept)\n", .{ p.name, pinned, p.latest.? });
         } else {
-            try w.print("  {s}: {s}  up to date\n", .{ p.name, pinned });
+            try w.print("  {s}: {s}  matches the set\n", .{ p.name, pinned });
         }
     }
-    if (updates == 0) {
-        try w.writeAll("all pins up to date\n");
+    if (behind == 0) {
+        // "comparable" — unchecked pins (no tracked latest) are excluded
+        // from the statement and reported in their own note below
+        // (coderabbit on cli#339).
+        try w.writeAll("no comparable pins are behind this CLI's compatible set\n");
     } else {
-        try w.print("{d} update(s) available — run `labelle upgrade all` to apply\n", .{updates});
+        try w.print("{d} pin(s) behind the compatible set bundled with this CLI — run `labelle upgrade all` to apply it\n", .{behind});
     }
+    if (ahead > 0) {
+        try w.print("note: {d} pin(s) are ahead of the set (the downgrade guard keeps them)\n", .{ahead});
+    }
+    if (unchecked > 0) {
+        try w.print("note: {d} pin(s) have no tracked latest and were not compared\n", .{unchecked});
+    }
+    // The set is frozen at CLI build time (versions.zon), NOT a live
+    // "latest" query — newer tags may exist upstream (cli#336).
+    try w.writeAll("note: targets are this CLI release's tested set; newer package tags may exist\n");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

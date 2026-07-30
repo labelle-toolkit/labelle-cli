@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "core_version", versions.core);
     options.addOption([]const u8, "engine_version", versions.engine);
     options.addOption([]const u8, "gfx_version", versions.gfx);
+    options.addOption([]const u8, "bgfx_version", versions.bgfx);
     const build_options_mod = options.createModule();
 
     const gen_exe = b.addExecutable(.{
