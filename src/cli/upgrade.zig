@@ -467,6 +467,24 @@ test "replaceBackendVersion: hand-formatted spacing inside the struct still matc
     try testing.expect(std.mem.indexOf(u8, out, ".name = \"fsm\", .repo = \"r2\", .version = \"0.13.3\"") != null);
 }
 
+test "replaceBackendVersion returns null on exotic-but-valid ZON (newline before =) — the gfx gate's trigger" {
+    // codex round 3 / coderabbit on cli#339: when the matcher cannot
+    // locate the backend `.version` field, `upgrade all` must keep gfx
+    // at the current pin instead of writing a split gfx/bgfx upgrade.
+    // The gate keys off this null; pin the trigger so a future matcher
+    // change that starts returning non-null here consciously re-visits
+    // the gating logic too.
+    const src = try testing.allocator.dupe(u8,
+        \\.{
+        \\    .backend_package = .{ .name = "bgfx", .repo = "r", .version
+        \\        = "0.13.3" },
+        \\}
+    );
+    defer testing.allocator.free(src);
+    const out = try replaceBackendVersion(testing.allocator, src, "0.13.3", "0.13.5");
+    try testing.expect(out == null);
+}
+
 test "parseUpgradeArgs strips --force and keeps positionals" {
     var parsed = try parseUpgradeArgs(testing.allocator, &.{ "all", "--force" });
     defer parsed.deinit(testing.allocator);
