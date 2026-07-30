@@ -235,14 +235,25 @@ fn migrateFile(
         .xrefs = xrefs,
         .rel_path = rel_path,
     };
-    const out = try transformBytes(arena, raw, parsed.value, ctx, &counts);
+    // A transform failure is contained to THIS file: the pipeline
+    // re-parses its own spliced buffer between passes, so an error here
+    // means a transform produced invalid output. Report the file (the
+    // old `try` aborted the whole project with no path — cli#337) and
+    // leave it untouched; the on-disk bytes were never modified.
+    const out = transformBytes(arena, raw, parsed.value, ctx, &counts) catch |err| {
+        std.debug.print(
+            "labelle migrate unified: could not transform '{s}': {s} (file left unmodified)\n",
+            .{ rel_path, @errorName(err) },
+        );
+        summary.parse_errors += 1;
+        return;
+    };
 
     summary.entities_renames += counts.entities_renames;
     summary.components_renames += counts.components_renames;
     summary.assets_deletes += counts.assets_deletes;
     summary.root_wrappers_lifted += counts.root_wrappers_lifted;
     summary.overrides_lifts += counts.overrides_lifts;
-    summary.components_lifts += counts.components_lifts;
     summary.file_as_array_collapses += counts.file_as_array_collapses;
     summary.name_field_drops += counts.name_field_drops;
     summary.name_field_divergent_drops += counts.name_field_divergent_drops;

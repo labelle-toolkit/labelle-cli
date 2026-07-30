@@ -8,7 +8,7 @@
 /// them in place so projects can move to the canonical flat form
 /// without hand-edits across hundreds of files.
 ///
-/// The nine transforms (idempotent — running twice on the same file
+/// The transforms (idempotent — running twice on the same file
 /// produces no further changes):
 ///
 ///   1. **`legacy_entities`** — top-level `"entities"` key. Rename to
@@ -29,12 +29,15 @@
 ///
 ///   5. **`legacy_overrides_wrapper`** (RFC #596) — `"overrides": {...}`
 ///      on a prefab reference. Lift the inner PascalCase keys to be
-///      direct siblings of `"prefab"`.
+///      direct siblings of `"prefab"` — ONLY when every inner key is
+///      PascalCase; a lowercase (pack-namespaced) key is only read
+///      inside the wrapper, so those wrappers are left alone (cli#338).
 ///
-///   6. **`legacy_components_wrapper`** (RFC #596) — `"components":
-///      {...}` on an INLINE entity (no `"prefab"` sibling). Lift the
-///      inner PascalCase keys to the entity's top level. Distinguished
-///      from transform 2 by the absence of `prefab`.
+///   6. **REMOVED (cli#338).** The `components:` wrapper on an INLINE
+///      entity is a canonical engine 2.x shape — the engine's case-
+///      convention rule only reads PascalCase flat keys as components,
+///      so pack-namespaced (lowercase) keys exist ONLY inside the
+///      wrapper. Lifting them made the engine silently drop them.
 ///
 ///   7. **`legacy_name_field`** (RFC #596) — top-level `"name": "X"`.
 ///      If X matches the file's basename it is dropped (the engine now
@@ -113,7 +116,8 @@ const usage =
     \\
     \\  RFC #596 (flatten wrappers + bundle shape):
     \\    5. "overrides": { X, Y } on a prefab ref → X, Y as siblings
-    \\    6. "components": { X, Y } inline entity → X, Y as siblings
+    \\       (only when every key is PascalCase — lowercase pack-
+    \\       namespaced keys are only read inside the wrapper, cli#338)
     \\    7. top-level "name": "X" matching basename → dropped
     \\       top-level "name": "X" differing → meta.name = "X"
     \\    8. file-level directives (initial_state, scripts, include) →
@@ -239,9 +243,9 @@ pub const MixedFileSpec = tests.MixedFileSpec;
 const tests_rfc596 = @import("migrate/tests_rfc596.zig");
 
 pub const TransformLiftOverridesSpec = tests_rfc596.TransformLiftOverridesSpec;
-pub const TransformLiftComponentsSpec = tests_rfc596.TransformLiftComponentsSpec;
+pub const InlineComponentsPreservedSpec = tests_rfc596.InlineComponentsPreservedSpec;
 pub const TransformNameFieldSpec = tests_rfc596.TransformNameFieldSpec;
-pub const PrefabGuardConsistencySpec = tests_rfc596.PrefabGuardConsistencySpec;
+pub const LiftGuardSpec = tests_rfc596.LiftGuardSpec;
 pub const TransformFileAsArraySpec = tests_rfc596.TransformFileAsArraySpec;
 pub const TransformDirectivesToMetaHeaderSpec = tests_rfc596.TransformDirectivesToMetaHeaderSpec;
 pub const Rfc596IdempotencySpec = tests_rfc596.Rfc596IdempotencySpec;

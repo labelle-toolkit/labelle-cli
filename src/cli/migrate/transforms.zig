@@ -6,8 +6,9 @@
 //   B — rename a top-level key ("entities" → "children")
 //   C — lift `"root": { ... }` wrapper to top level
 //   D — rename `"components"` → `"overrides"` on prefab refs
-//   E — lift `overrides` wrapper on prefab refs (RFC #596)
-//   F — lift inline `components` wrapper (RFC #596)
+//   E — lift `overrides` wrapper on prefab refs (RFC #596) — only when
+//       every inner key is PascalCase (cli#338)
+//   F — REMOVED (cli#338): inline `components` wrapper is canonical
 //
 // All functions operate on raw JSONC bytes and rely on the JSONC scanner
 // primitives in `scanner.zig`. The RFC #596 meta/directive transforms
@@ -21,6 +22,42 @@ const findStringEnd = scanner.findStringEnd;
 const skipValue = scanner.skipValue;
 const skipContainer = scanner.skipContainer;
 const skipWsAndComments = scanner.skipWsAndComments;
+
+// ─────────────────────────────────────────────────────────────────────
+// Shared line-tail probe
+// ─────────────────────────────────────────────────────────────────────
+
+/// True when everything from `from` to the next `\n` (or EOF) is
+/// whitespace, optionally followed by a `//` line comment. Used by the
+/// delete/drop splicers to decide whether "extend the cut to end of
+/// line" is safe: on files that collapse closers onto the entry's last
+/// line (`... }}` / `... }}}`), the remainder of the line carries LIVE
+/// structure (the enclosing object's `}`), and eating it truncates the
+/// file — the cli#337 `UnexpectedEndOfInput` project-abort.
+fn lineTailIsBlankOrComment(src: []const u8, from: usize) bool {
+    var i = from;
+    while (i < src.len and src[i] != '\n') : (i += 1) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\r') continue;
+        // A trailing `//` comment belongs to the deleted entry's line;
+        // eating it along with the entry is fine.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') return true;
+        return false;
+    }
+    return true;
+}
+
+/// Extend `cut_end` through the end of the current line — but ONLY when
+/// the line's tail is blank/comment (see `lineTailIsBlankOrComment`).
+/// Otherwise the cut stops where the entry's bytes stop, leaving the
+/// rest of the line (e.g. a collapsed closing brace) intact.
+fn extendCutToEol(src: []const u8, cut_end: usize) usize {
+    if (!lineTailIsBlankOrComment(src, cut_end)) return cut_end;
+    var e = cut_end;
+    while (e < src.len and src[e] != '\n') e += 1;
+    if (e < src.len and src[e] == '\n') e += 1;
+    return e;
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Transform A — delete a top-level key (used for "assets")
@@ -45,11 +82,8 @@ pub fn deleteTopLevelKey(arena: std.mem.Allocator, src: []const u8, key: []const
 
     if (loc.comma_after) |c| {
         // Has trailing comma — eat from line start through end-of-line
-        // after the comma.
-        cut_end = c + 1;
-        // Extend to end-of-line so we delete the entire visual line.
-        while (cut_end < src.len and src[cut_end] != '\n') cut_end += 1;
-        if (cut_end < src.len and src[cut_end] == '\n') cut_end += 1;
+        // after the comma (line-tail permitting; see `extendCutToEol`).
+        cut_end = extendCutToEol(src, c + 1);
     } else {
         // Last entry — rewind cut_start to *before* the preceding `,`
         // so the previous sibling no longer has a trailing comma.
@@ -102,9 +136,7 @@ pub fn deleteTopLevelKey(arena: std.mem.Allocator, src: []const u8, key: []const
             }
             break; // no preceding comma — this is the only key
         }
-        // Extend cut_end to end-of-line.
-        while (cut_end < src.len and src[cut_end] != '\n') cut_end += 1;
-        if (cut_end < src.len and src[cut_end] == '\n') cut_end += 1;
+        cut_end = extendCutToEol(src, cut_end);
     }
 
     var out: std.ArrayList(u8) = .empty;
@@ -413,23 +445,17 @@ pub fn liftOneOverridesBlock(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Transform F (RFC #596) — lift inline `components` wrapper
+// Transform F — REMOVED (cli#338)
 // ─────────────────────────────────────────────────────────────────────
-
-/// `{components: {X, Y}, ...}` → `{X, Y, ...}`. Matches objects that
-/// have a `components` key but NOT a `prefab` sibling — that case is
-/// handled by transform 4 (which renames it to `overrides`) and then by
-/// transform 5 (which lifts the `overrides` block). The "no prefab"
-/// filter prevents this pass from re-lifting what transform 5 already
-/// took care of.
-pub fn liftOneComponentsBlock(
-    arena: std.mem.Allocator,
-    src: []const u8,
-    parsed_value: std.json.Value,
-) !?[]u8 {
-    if (!treeHasInlineComponentsWrapper(parsed_value)) return null;
-    return findAndLiftWrapper(arena, src, .{ .wrapper = "components", .require_sibling_prefab = false });
-}
+//
+// The inline `components:` wrapper (`{components: {...}}` on an entity
+// WITHOUT a `prefab` sibling) is a canonical engine 2.x shape, not
+// legacy. The engine's case-convention rule only recognizes PascalCase
+// flat keys as components; pack-namespaced (lowercase) keys such as
+// `rooms__Room` are ONLY recognized inside the wrapper. Lifting them
+// flat made the engine silently drop the components at load time.
+// Engine v2.0 removed `components` on prefab REFERENCES only (see
+// transform B / `renameOneComponentsOnRef`).
 
 pub fn treeHasWrapperOnRef(value: std.json.Value, wrapper: []const u8) bool {
     switch (value) {
@@ -458,43 +484,43 @@ pub fn treeHasWrapperOnRef(value: std.json.Value, wrapper: []const u8) bool {
     return false;
 }
 
-pub fn treeHasInlineComponentsWrapper(value: std.json.Value) bool {
-    switch (value) {
-        .object => |obj| {
-            // A `prefab:` sibling only counts as a prefab-ref when it is a
-            // string — matching both `treeHasWrapperOnRef` above and the
-            // byte scanner `objectHasWrapper` (which keys off
-            // `prefab_is_string`). A malformed non-string `prefab` must
-            // NOT suppress the inline-components lift, or the tree gate and
-            // the byte scanner would disagree.
-            const has_prefab = blk: {
-                const v = obj.get("prefab") orelse break :blk false;
-                break :blk v == .string;
-            };
-            if (!has_prefab) {
-                if (obj.get("components")) |cv| {
-                    if (cv == .object) return true;
-                }
-            }
-            var it = obj.iterator();
-            while (it.next()) |kv| {
-                if (treeHasInlineComponentsWrapper(kv.value_ptr.*)) return true;
-            }
-        },
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (treeHasInlineComponentsWrapper(item)) return true;
-            }
-        },
-        else => {},
-    }
-    return false;
-}
-
 pub const WrapperSpec = struct {
     wrapper: []const u8,
     require_sibling_prefab: bool,
 };
+
+/// True when every direct key of the object literal at [v_start, v_end)
+/// is PascalCase (first byte A–Z). The engine's case-convention rule
+/// (RFC #596 / engine `isPascalCase`) treats ONLY uppercase-first flat
+/// keys as components — a lowercase key (pack-namespaced names like
+/// `rooms__Room`, `industry__Storage`) lifted out of its wrapper is
+/// reclassified as *structural* and **silently dropped** at load time
+/// (cli#338). Lifting is therefore only semantics-preserving when the
+/// wrapper's contents are all PascalCase; otherwise the wrapper is the
+/// REQUIRED shape and must be left alone.
+pub fn innerKeysAllPascal(src: []const u8, v_start: usize, v_end_one_past: usize) bool {
+    var i = v_start + 1; // past the `{`
+    const end = v_end_one_past - 1; // the closing `}`
+    while (i < end) {
+        i = skipWsAndComments(src, i);
+        if (i >= end) break;
+        if (src[i] == '}') break;
+        if (src[i] != '"') return false; // malformed — refuse the lift
+        const k_start = i;
+        const k_end = findStringEnd(src, k_start);
+        const key = src[k_start + 1 .. k_end - 1];
+        if (key.len == 0 or key[0] < 'A' or key[0] > 'Z') return false;
+        var j = skipWsAndComments(src, k_end);
+        if (j >= end or src[j] != ':') return false;
+        j += 1;
+        j = skipWsAndComments(src, j);
+        const val_end = skipValue(src, j);
+        var k = skipWsAndComments(src, val_end);
+        if (k < end and src[k] == ',') k += 1;
+        i = k;
+    }
+    return true;
+}
 
 /// Byte-level walker shared by transforms 5 (overrides) and 6 (inline
 /// components). Locate the first object literal `{ ... }` whose direct
@@ -564,7 +590,14 @@ pub fn objectHasWrapper(src: []const u8, start_brace: usize, end_one_past: usize
             // Wrapper must be object-valued and non-empty for a lift to
             // produce siblings. An empty object `{}` still triggers a
             // lift — the splice removes the wrapper line entirely.
-            if (v_start < src.len and src[v_start] == '{') {
+            // Lift ONLY when every inner key is PascalCase: lowercase
+            // (pack-namespaced) keys are only recognized inside the
+            // wrapper, so lifting them silently drops the components at
+            // engine load (cli#338). Non-liftable wrappers are simply
+            // left in place — they're a valid engine 2.x shape.
+            if (v_start < src.len and src[v_start] == '{' and
+                innerKeysAllPascal(src, v_start, v_end))
+            {
                 wrapper_pos = k_start;
             }
         }
@@ -743,11 +776,11 @@ pub fn spliceDropEntry(
     var cut_end: usize = v_end;
     if (comma_after) |c| {
         // There's a trailing comma after the wrapper. Eat it (and the
-        // rest of the line if we're in line-based mode).
+        // rest of the line if we're in line-based mode — but only when
+        // the tail is blank/comment; collapsed closers must survive).
         cut_end = c + 1;
         if (has_leading_newline) {
-            while (cut_end < src.len and src[cut_end] != '\n') cut_end += 1;
-            if (cut_end < src.len and src[cut_end] == '\n') cut_end += 1;
+            cut_end = extendCutToEol(src, cut_end);
         }
     } else {
         // No trailing comma — wrapper is the LAST entry. Rewind past
@@ -765,8 +798,7 @@ pub fn spliceDropEntry(
             break;
         }
         if (has_leading_newline) {
-            while (cut_end < src.len and src[cut_end] != '\n') cut_end += 1;
-            if (cut_end < src.len and src[cut_end] == '\n') cut_end += 1;
+            cut_end = extendCutToEol(src, cut_end);
         }
     }
 

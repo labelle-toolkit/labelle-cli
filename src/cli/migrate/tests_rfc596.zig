@@ -113,11 +113,11 @@ pub const TransformLiftOverridesSpec = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────
-// RFC #596 — Transform 6: lift inline `components` block
+// Transform 6 removed (cli#338) — inline `components` wrappers preserved
 // ─────────────────────────────────────────────────────────────────────
 
-pub const TransformLiftComponentsSpec = struct {
-    test "single-line inline components" {
+pub const InlineComponentsPreservedSpec = struct {
+    test "single-line inline components wrapper is left untouched" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const src =
@@ -125,50 +125,33 @@ pub const TransformLiftComponentsSpec = struct {
             "    { \"components\": { \"BuildIntent\": { \"room_type\": \"stair_room\" } } }\n" ++
             "]\n";
         const out = try applyAllArenaFull(&arena, src, "main");
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"components\"") == null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"BuildIntent\"") != null);
-        const stripped = try stripJsoncToJson(arena.allocator(), out);
-        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
-        defer parsed.deinit();
-        const entry = parsed.value.array.items[0].object;
-        try std.testing.expect(entry.get("components") == null);
-        try std.testing.expect(entry.get("BuildIntent") != null);
+        try std.testing.expectEqualStrings(src, out);
     }
 
-    test "multi-line inline components with multiple PascalCase keys" {
+    test "pack-namespaced (lowercase) component keys stay inside the wrapper" {
+        // THE cli#338 case: `rooms__Room` lifted flat is silently dropped
+        // by the engine's case-convention rule. The wrapper must survive.
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const src =
             "{\n" ++
-            "    \"components\": {\n" ++
-            "        \"Workstation\": { \"kind\": \"kitchen\" },\n" ++
-            "        \"Image\": { \"sprite\": \"kitchen\" },\n" ++
-            "        \"Position\": { \"x\": 100, \"y\": 50 }\n" ++
-            "    }\n" ++
+            "    \"children\": [ { \"Position\": { \"x\": 0 } } ],\n" ++
+            "    \"components\": { \"rooms__Room\": { \"room_type\": \"wc\" } }\n" ++
             "}\n";
-        // Use a basename other than "main" so transform 7+8 don't apply.
-        const out = try applyAllArenaFull(&arena, src, "no_collapse_basename_xyz");
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"components\"") == null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"Workstation\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"Image\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\"") != null);
+        var counts = FileCounts{};
+        const out = try applyAllFullCounts(arena.allocator(), src, "wc", &counts);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"components\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"rooms__Room\"") != null);
+        // The wrapper is not counted as an edit of any kind.
         const stripped = try stripJsoncToJson(arena.allocator(), out);
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
-        const obj = parsed.value.object;
-        try std.testing.expect(obj.get("components") == null);
-        try std.testing.expect(obj.get("Workstation") != null);
-        try std.testing.expect(obj.get("Image") != null);
-        try std.testing.expect(obj.get("Position") != null);
+        try std.testing.expect(parsed.value == .object or parsed.value == .array);
     }
 
-    test "components NOT lifted when prefab sibling exists (pass 4 + 5 handle it)" {
+    test "components on a prefab REF is still renamed+lifted when PascalCase (passes 4+5)" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        // This is the legacy "components-on-ref" case: pass 4 renames
-        // `components` to `overrides`, then pass 5 lifts that. The
-        // result should not have either `components` OR `overrides`,
-        // and Position should be a direct sibling of prefab.
         const src =
             "[\n" ++
             "    { \"prefab\": \"x\", \"components\": { \"Position\": { \"x\": 1 } } }\n" ++
@@ -184,42 +167,25 @@ pub const TransformLiftComponentsSpec = struct {
         try std.testing.expect(entry.get("Position") != null);
     }
 
-    test "deep-nested inline components (storages array) lifted recursively" {
+    test "cli#337 regression: collapsed closing braces survive the full pipeline" {
+        // The exact shape that used to abort the whole project with
+        // UnexpectedEndOfInput: an inline components wrapper on a file
+        // whose final line collapses the closers (`}}`). The pipeline
+        // must leave the file valid (and, post-cli#338, untouched).
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        // Mimics the butcher_workstation shape: outer inline components,
-        // inner storage entries each with their own inline components.
         const src =
             "{\n" ++
-            "    \"components\": {\n" ++
-            "        \"Workstation\": {\n" ++
-            "            \"storages\": [\n" ++
-            "                { \"components\": { \"Position\": { \"x\": -62 }, \"Eis\": {} } },\n" ++
-            "                { \"components\": { \"Position\": { \"x\": -34 }, \"Eis\": {} } }\n" ++
-            "            ]\n" ++
-            "        }\n" ++
-            "    }\n" ++
-            "}\n";
-        const out = try applyAllArenaFull(&arena, src, "no_collapse_xyz");
-        // No more `components` wrappers anywhere.
-        try std.testing.expect(std.mem.indexOf(u8, out, "\"components\"") == null);
+            "    \"children\": [ { \"Position\": { \"x\": 0, \"y\": 0 } } ],\n" ++
+            "    \"components\": { \"rooms__Room\": { \"room_type\": \"x\" } }}\n";
+        const out = try applyAllArenaFull(&arena, src, "f");
         const stripped = try stripJsoncToJson(arena.allocator(), out);
         var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
-        const obj = parsed.value.object;
-        try std.testing.expect(obj.get("Workstation") != null);
-        const storages = obj.get("Workstation").?.object.get("storages").?.array;
-        for (storages.items) |slot| {
-            try std.testing.expect(slot.object.get("components") == null);
-            try std.testing.expect(slot.object.get("Position") != null);
-            try std.testing.expect(slot.object.get("Eis") != null);
-        }
+        try std.testing.expect(parsed.value == .object);
+        try std.testing.expect(parsed.value.object.get("components") != null);
     }
 };
-
-// ─────────────────────────────────────────────────────────────────────
-// RFC #596 — Transform 7: top-level `name:` → `meta.name` or drop
-// ─────────────────────────────────────────────────────────────────────
 
 pub const TransformNameFieldSpec = struct {
     test "name matching basename is dropped" {
@@ -341,41 +307,74 @@ pub const TransformNameFieldSpec = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────
-// RFC #596 — prefab-guard consistency (cli #241 item 6)
+// cli#338 — PascalCase-only lift guard on the overrides wrapper
 // ─────────────────────────────────────────────────────────────────────
 
-pub const PrefabGuardConsistencySpec = struct {
-    fn treeSays(json_src: []const u8) !bool {
+pub const LiftGuardSpec = struct {
+    test "overrides wrapper with a lowercase key is NOT lifted" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_src, .{});
+        const src =
+            "[\n" ++
+            "    { \"prefab\": \"carcase\", \"overrides\": { \"Position\": { \"x\": 0 }, \"rooms__ShipCarcase\": { \"cols\": 5 } } }\n" ++
+            "]\n";
+        var counts = FileCounts{};
+        const out = try applyAllFullCounts(arena.allocator(), src, "main", &counts);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"rooms__ShipCarcase\"") != null);
+        try std.testing.expectEqual(@as(usize, 0), counts.overrides_lifts);
+    }
+
+    test "all-PascalCase overrides wrapper is still lifted" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "[\n" ++
+            "    { \"prefab\": \"worker\", \"overrides\": { \"Position\": { \"x\": 1 } } }\n" ++
+            "]\n";
+        var counts = FileCounts{};
+        const out = try applyAllFullCounts(arena.allocator(), src, "main", &counts);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\"") != null);
+        try std.testing.expectEqual(@as(usize, 1), counts.overrides_lifts);
+    }
+
+    test "mixed file: lowercase-keyed wrapper skipped, PascalCase sibling lifted" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const src =
+            "[\n" ++
+            "    { \"prefab\": \"carcase\", \"overrides\": { \"rooms__ShipCarcase\": { \"cols\": 5 } } },\n" ++
+            "    { \"prefab\": \"worker\", \"overrides\": { \"Position\": { \"x\": 1 } } }\n" ++
+            "]\n";
+        var counts = FileCounts{};
+        const out = try applyAllFullCounts(arena.allocator(), src, "main", &counts);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"rooms__ShipCarcase\"") != null);
+        try std.testing.expectEqual(@as(usize, 1), counts.overrides_lifts);
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
         defer parsed.deinit();
-        return transforms.treeHasInlineComponentsWrapper(parsed.value);
+        const items = parsed.value.array.items;
+        try std.testing.expect(items[0].object.get("overrides") != null);
+        try std.testing.expect(items[1].object.get("overrides") == null);
+        try std.testing.expect(items[1].object.get("Position") != null);
     }
 
-    test "string prefab sibling suppresses the inline-components gate" {
-        // A real prefab ref carrying a `components:` object is handled by
-        // the overrides pass — the inline-components gate must skip it.
-        try std.testing.expect(!try treeSays(
-            "{ \"prefab\": \"x\", \"components\": { \"Position\": {} } }",
-        ));
-    }
-
-    test "no prefab sibling — inline-components gate fires" {
-        try std.testing.expect(try treeSays(
-            "{ \"components\": { \"Position\": {} } }",
-        ));
-    }
-
-    test "non-string prefab does NOT suppress the gate (matches byte scanner)" {
-        // Regression for cli #241 item 6: the tree gate previously treated
-        // ANY `prefab` key as a prefab ref, while the byte scanner only
-        // keys off a STRING prefab. A malformed non-string `prefab` must
-        // therefore NOT suppress the inline-components lift, so both paths
-        // agree.
-        try std.testing.expect(try treeSays(
-            "{ \"prefab\": 123, \"components\": { \"Position\": {} } }",
-        ));
+    test "cli#337 regression: deleteTopLevelKey keeps a collapsed closer intact" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // Last-entry delete where the file closer shares the value line.
+        const src =
+            "{\n" ++
+            "    \"children\": [],\n" ++
+            "    \"assets\": { \"a\": 1 }}\n";
+        const out = transforms.deleteTopLevelKey(arena.allocator(), src, "assets").?;
+        const stripped = try stripJsoncToJson(arena.allocator(), out);
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), stripped, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        try std.testing.expect(parsed.value.object.get("assets") == null);
+        try std.testing.expect(parsed.value.object.get("children") != null);
     }
 };
 
@@ -783,8 +782,10 @@ pub const Rfc596MixedFileSpec = struct {
         try std.testing.expect(first.get("components") == null);
         try std.testing.expect(first.get("overrides") == null);
         const second = parsed.value.array.items[1].object;
-        try std.testing.expect(second.get("BuildIntent") != null);
-        try std.testing.expect(second.get("components") == null);
+        // Post-cli#338: the inline `components:` wrapper is canonical and
+        // survives the pipeline — BuildIntent stays inside it.
+        try std.testing.expect(second.get("components") != null);
+        try std.testing.expect(second.get("components").?.object.get("BuildIntent") != null);
     }
 
     test "comments at every legal position survive end-to-end" {

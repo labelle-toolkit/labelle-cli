@@ -162,7 +162,6 @@ const Finding = union(enum) {
     legacy_assets: LegacyAssetsFinding,
     legacy_root_wrapper: LegacyRootWrapperFinding,
     legacy_overrides_wrapper: LegacyOverridesWrapperFinding,
-    legacy_components_wrapper: LegacyComponentsWrapperFinding,
     legacy_file_object_no_root: LegacyFileObjectNoRootFinding,
     legacy_name_field: LegacyNameFieldFinding,
 };
@@ -247,16 +246,12 @@ const LegacyOverridesWrapperFinding = struct {
     prefab_ref: []const u8,
 };
 
-/// (3f) `"components"` wrapper on an inline entity (RFC #596, Axis 2).
-/// An inline entity is an object with `components` but no `prefab`;
-/// the wrapper disappears under the case-convention rule. Distinct
-/// from `legacy_components_on_ref`, which fires when `prefab` is also
-/// present.
-const LegacyComponentsWrapperFinding = struct {
-    file: []const u8,
-    /// JSON-pointer to the offending inline-entity object.
-    json_pointer: []const u8,
-};
+// (3f) REMOVED (cli#338). The `components:` wrapper on an INLINE
+// entity is a canonical engine 2.x shape, not legacy: the engine's
+// case-convention rule only treats PascalCase flat keys as components,
+// so pack-namespaced (lowercase) keys like `rooms__Room` exist ONLY
+// inside the wrapper. Engine v2.0 removed `components` on prefab
+// REFERENCES only (`legacy_components_on_ref`, 3b).
 
 /// (3g) File-level object with no real root entity (RFC #596, Axis 3).
 /// Fires when the file's top-level value is an Object that carries no
@@ -327,7 +322,6 @@ const Report = struct {
         var n_legacy_assets: usize = 0;
         var n_legacy_root: usize = 0;
         var n_legacy_overrides_wrap: usize = 0;
-        var n_legacy_components_wrap: usize = 0;
         var n_legacy_file_no_root: usize = 0;
         var n_legacy_name: usize = 0;
         for (self.findings.items) |f| switch (f) {
@@ -338,7 +332,6 @@ const Report = struct {
             .legacy_assets => n_legacy_assets += 1,
             .legacy_root_wrapper => n_legacy_root += 1,
             .legacy_overrides_wrapper => n_legacy_overrides_wrap += 1,
-            .legacy_components_wrapper => n_legacy_components_wrap += 1,
             .legacy_file_object_no_root => n_legacy_file_no_root += 1,
             .legacy_name_field => n_legacy_name += 1,
         };
@@ -436,26 +429,16 @@ const Report = struct {
 
         if (n_legacy_overrides_wrap > 0) {
             std.debug.print("─── Legacy \"overrides\" wrapper ({d}) ───\n", .{n_legacy_overrides_wrap});
-            std.debug.print("  [unified-format] legacy \"overrides\" wrapper: lift its\n", .{});
-            std.debug.print("  contents to sibling PascalCase keys on the prefab reference\n", .{});
-            std.debug.print("  (RFC #596). Engine v2.0 will remove the wrapper.\n\n", .{});
+            std.debug.print("  [unified-format] \"overrides\" wrapper whose keys are all\n", .{});
+            std.debug.print("  PascalCase: can be lifted to sibling keys on the prefab\n", .{});
+            std.debug.print("  reference (RFC #596). Both shapes load in engine 2.x; the\n", .{});
+            std.debug.print("  flat form is the forward-canonical one. Wrappers holding\n", .{});
+            std.debug.print("  lowercase (pack-namespaced) keys are NOT flagged — those\n", .{});
+            std.debug.print("  keys are only recognized inside the wrapper (cli#338).\n\n", .{});
             for (self.findings.items) |f| switch (f) {
                 .legacy_overrides_wrapper => |lo| {
                     std.debug.print("  {s}  (at {s})\n", .{ lo.file, lo.json_pointer });
                     std.debug.print("    prefab: \"{s}\"\n\n", .{lo.prefab_ref});
-                },
-                else => {},
-            };
-        }
-
-        if (n_legacy_components_wrap > 0) {
-            std.debug.print("─── Legacy \"components\" wrapper on inline entity ({d}) ───\n", .{n_legacy_components_wrap});
-            std.debug.print("  [unified-format] legacy \"components\" wrapper on inline\n", .{});
-            std.debug.print("  entity: lift its contents to sibling PascalCase keys\n", .{});
-            std.debug.print("  (RFC #596). Engine v2.0 will remove the wrapper.\n\n", .{});
-            for (self.findings.items) |f| switch (f) {
-                .legacy_components_wrapper => |lc| {
-                    std.debug.print("  {s}  (at {s})\n\n", .{ lc.file, lc.json_pointer });
                 },
                 else => {},
             };
@@ -714,15 +697,12 @@ fn inspectFile(
     var path_buf2: std.ArrayList(u8) = .empty;
     try walkLegacyComponentsOnRef(arena, parsed.value, rel_path, &path_buf2, report);
 
-    // RFC #596 Axis 2 walks: `overrides` wrapper on references and
-    // `components` wrapper on inline entities. Both are tree walks
-    // over the same parsed value; kept as separate walkers to keep
-    // each detection rule isolated and testable.
+    // RFC #596 Axis 2 walk: `overrides` wrapper on references. The
+    // inline `components` wrapper is deliberately NOT walked — it is a
+    // canonical engine 2.x shape and the only one that can carry
+    // pack-namespaced (lowercase) component keys (cli#338).
     var path_buf3: std.ArrayList(u8) = .empty;
     try walkLegacyOverridesWrapper(arena, parsed.value, rel_path, &path_buf3, report);
-
-    var path_buf4: std.ArrayList(u8) = .empty;
-    try walkLegacyComponentsWrapper(arena, parsed.value, rel_path, &path_buf4, report);
 }
 
 /// True iff `key` looks like a PascalCase component name — the first
@@ -938,8 +918,23 @@ fn walkLegacyOverridesWrapper(
     switch (value) {
         .object => |obj| {
             const prefab_v = obj.get("prefab");
-            const has_overrides = obj.get("overrides") != null;
-            if (prefab_v != null and prefab_v.? == .string and has_overrides) {
+            // Flag only wrappers the migrator can actually lift: object-
+            // valued AND every inner key PascalCase. A wrapper holding a
+            // lowercase (pack-namespaced) key is the REQUIRED shape —
+            // lifted flat, the engine's case-convention rule reclassifies
+            // the key as structural and silently drops the component
+            // (cli#338). Keeps the audit↔migrate count mapping 1:1.
+            const liftable = blk: {
+                const ov = obj.get("overrides") orelse break :blk false;
+                if (ov != .object) break :blk false;
+                var oit = ov.object.iterator();
+                while (oit.next()) |okv| {
+                    const k = okv.key_ptr.*;
+                    if (k.len == 0 or k[0] < 'A' or k[0] > 'Z') break :blk false;
+                }
+                break :blk true;
+            };
+            if (prefab_v != null and prefab_v.? == .string and liftable) {
                 const ptr = if (path_buf.items.len == 0)
                     try arena.dupe(u8, "/")
                 else
@@ -968,72 +963,6 @@ fn walkLegacyOverridesWrapper(
                 const idx = std.fmt.bufPrint(&buf, "/{d}", .{i}) catch unreachable;
                 try path_buf.appendSlice(arena, idx);
                 try walkLegacyOverridesWrapper(arena, item, file, path_buf, report);
-            }
-        },
-        else => {},
-    }
-}
-
-/// Recursive walker for RFC #596 Axis 2: flag any object carrying
-/// `"components"` but NO `"prefab"` — i.e. an inline entity with the
-/// now-legacy `components:` wrapper. The wrapper disappears under the
-/// case-convention rule (PascalCase keys directly on the entity object).
-///
-/// Crucially: when both `prefab` AND `components` are present, the
-/// finding falls to `walkLegacyComponentsOnRef` (the older reference
-/// synonym) — we explicitly skip those entries here so the two
-/// walkers never double-count the same key. The `legacy_overrides_wrapper`
-/// walker is orthogonal: a reference with `prefab` + `overrides` +
-/// `components` will surface BOTH `legacy_overrides_wrapper` and
-/// `legacy_components_on_ref`, but never `legacy_components_wrapper`.
-fn walkLegacyComponentsWrapper(
-    arena: std.mem.Allocator,
-    value: std.json.Value,
-    file: []const u8,
-    path_buf: *std.ArrayList(u8),
-    report: *Report,
-) error{OutOfMemory}!void {
-    switch (value) {
-        .object => |obj| {
-            const has_components = obj.get("components") != null;
-            // A `prefab:` sibling only marks this entry as a reference
-            // (handled by `walkLegacyComponentsOnRef`, which requires a
-            // STRING prefab) when the prefab value IS a string. A
-            // malformed non-string `prefab` must NOT suppress the inline-
-            // components-wrapper finding — otherwise the dry-run audit
-            // count would diverge from what `migrate` actually lifts,
-            // whose `treeHasInlineComponentsWrapper` / byte scanner also
-            // key off a string prefab (cli #241 item 6).
-            const prefab_v = obj.get("prefab");
-            const has_prefab = prefab_v != null and prefab_v.? == .string;
-            if (has_components and !has_prefab) {
-                const ptr = if (path_buf.items.len == 0)
-                    try arena.dupe(u8, "/")
-                else
-                    try arena.dupe(u8, path_buf.items);
-                try report.add(.{ .legacy_components_wrapper = .{
-                    .file = file,
-                    .json_pointer = ptr,
-                } });
-            }
-
-            var it = obj.iterator();
-            while (it.next()) |kv| {
-                const saved = path_buf.items.len;
-                defer path_buf.shrinkRetainingCapacity(saved);
-                try path_buf.append(arena, '/');
-                try appendJsonPointerToken(arena, path_buf, kv.key_ptr.*);
-                try walkLegacyComponentsWrapper(arena, kv.value_ptr.*, file, path_buf, report);
-            }
-        },
-        .array => |arr| {
-            for (arr.items, 0..) |item, i| {
-                const saved = path_buf.items.len;
-                defer path_buf.shrinkRetainingCapacity(saved);
-                var buf: [32]u8 = undefined;
-                const idx = std.fmt.bufPrint(&buf, "/{d}", .{i}) catch unreachable;
-                try path_buf.appendSlice(arena, idx);
-                try walkLegacyComponentsWrapper(arena, item, file, path_buf, report);
             }
         },
         else => {},
@@ -1580,19 +1509,14 @@ pub const RunAuditOnSpec = struct {
             defer freeAuditResult(result);
 
             var found: ?LegacyComponentsOnRefFinding = null;
-            var n_cwrap: usize = 0;
             for (result.report.findings.items) |f| switch (f) {
                 .legacy_components_on_ref => |lc| found = lc,
-                .legacy_components_wrapper => n_cwrap += 1,
                 else => {},
             };
             try std.testing.expect(found != null);
             try std.testing.expectEqualStrings("worker", found.?.prefab_ref);
             try std.testing.expect(!found.?.overrides_also_present);
             try std.testing.expect(std.mem.indexOf(u8, found.?.json_pointer, "/0") != null);
-            // Must NOT double-count as legacy_components_wrapper (the
-            // entry has `prefab`, so the inline-wrapper walker skips it).
-            try expect.equal(n_cwrap, @as(usize, 0));
         }
 
         test "prefab + components + overrides flags both keys on one entry" {
@@ -1626,27 +1550,25 @@ pub const RunAuditOnSpec = struct {
             try expect.equal(n_overrides_wrap, @as(usize, 1));
         }
 
-        test "components on an INLINE entry (no prefab) fires legacy_components_wrapper, not legacy_components_on_ref" {
-            // Inline `components:` is the RFC #596 Axis 2 wrapper —
-            // distinct from the older `prefab` + `components` synonym.
+        test "components on an INLINE entry (no prefab) is NOT flagged — canonical engine 2.x shape (cli#338)" {
+            // Inline `components:` is how pack-namespaced (lowercase)
+            // component keys are carried; the engine only reads them
+            // inside the wrapper, so it must never be audited as legacy.
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc",
-                \\[ { "components": { "Position": { "x": 0, "y": 0 } } } ]
+                \\[ { "components": { "Position": { "x": 0, "y": 0 }, "rooms__Room": { "room_type": "wc" } } } ]
             );
 
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
 
             var n_on_ref: usize = 0;
-            var n_wrapper: usize = 0;
             for (result.report.findings.items) |f| switch (f) {
                 .legacy_components_on_ref => n_on_ref += 1,
-                .legacy_components_wrapper => n_wrapper += 1,
                 else => {},
             };
             try expect.equal(n_on_ref, @as(usize, 0));
-            try expect.equal(n_wrapper, @as(usize, 1));
         }
 
         test "§B2 and legacy-components-on-ref can co-fire on the same entry" {
@@ -1793,7 +1715,6 @@ pub const RunAuditOnSpec = struct {
             var n_components_on_ref: usize = 0;
             var n_root: usize = 0;
             var n_overrides_wrap: usize = 0;
-            var n_components_wrap: usize = 0;
             var n_file_no_root: usize = 0;
             var n_name: usize = 0;
             var name_matches: bool = false;
@@ -1803,7 +1724,6 @@ pub const RunAuditOnSpec = struct {
                 .legacy_components_on_ref => n_components_on_ref += 1,
                 .legacy_root_wrapper => n_root += 1,
                 .legacy_overrides_wrapper => n_overrides_wrap += 1,
-                .legacy_components_wrapper => n_components_wrap += 1,
                 .legacy_file_object_no_root => n_file_no_root += 1,
                 .legacy_name_field => |ln| {
                     n_name += 1;
@@ -1818,10 +1738,8 @@ pub const RunAuditOnSpec = struct {
             try expect.equal(n_root, @as(usize, 1));
             // One `prefab + overrides` reference (the first entry).
             try expect.equal(n_overrides_wrap, @as(usize, 1));
-            // One inline `components:` wrapper (the third entry — no
-            // `prefab`). The second entry has `components` AND
-            // `prefab`, so it's `legacy_components_on_ref` only.
-            try expect.equal(n_components_wrap, @as(usize, 1));
+            // The third entry's inline `components:` wrapper is NOT a
+            // finding — it is the canonical engine 2.x shape (cli#338).
             // Top-level object has no PascalCase keys and has
             // `entities:` — file-as-array migration target.
             try expect.equal(n_file_no_root, @as(usize, 1));
@@ -2120,26 +2038,23 @@ pub const RunAuditOnSpec = struct {
         }
     };
 
-    pub const legacy_components_wrapper = struct {
-        test "inline entity with components: wrapper fires (RFC #596 Axis 2)" {
+    // The `legacy_components_wrapper` spec namespace is gone with the
+    // finding itself (cli#338): an inline entity's `components:` wrapper
+    // is the canonical engine 2.x shape (and the ONLY shape that carries
+    // pack-namespaced lowercase component keys), so the audit must never
+    // flag it and the migrator must never lift it.
+    pub const inline_components_is_canonical = struct {
+        test "inline entity with components: wrapper fires nothing (cli#338)" {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc",
-                \\[ { "components": { "Position": { "x": 0, "y": 0 } } } ]
+                \\[ { "components": { "Position": { "x": 0, "y": 0 }, "rooms__Room": { "room_type": "wc" } } } ]
             );
 
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
 
-            var n_wrapper: usize = 0;
-            var n_on_ref: usize = 0;
-            for (result.report.findings.items) |f| switch (f) {
-                .legacy_components_wrapper => n_wrapper += 1,
-                .legacy_components_on_ref => n_on_ref += 1,
-                else => {},
-            };
-            try expect.equal(n_wrapper, @as(usize, 1));
-            try expect.equal(n_on_ref, @as(usize, 0));
+            try expect.equal(result.report.findings.items.len, @as(usize, 0));
         }
 
         test "RFC #596 flat-PascalCase inline entity fires nothing" {
@@ -2155,72 +2070,52 @@ pub const RunAuditOnSpec = struct {
             try expect.equal(result.report.findings.items.len, @as(usize, 0));
         }
 
-        test "prefab + components is legacy_components_on_ref, NOT legacy_components_wrapper" {
-            // Edge: this is the disambiguation the detection rule
-            // exists for. An entry with both `prefab` and `components`
-            // is the older synonym (predates RFC #560's `overrides`
-            // rename) — `legacy_components_on_ref`. The new
-            // `legacy_components_wrapper` walker must skip it.
+        test "overrides wrapper with a lowercase (pack-namespaced) key is NOT flagged (cli#338)" {
+            // Lifting `rooms__ShipCarcase` flat would make the engine
+            // silently drop it (case-convention rule) — the wrapper is
+            // required, so the audit must not report it as legacy.
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc",
-                \\[ { "prefab": "worker", "components": { "Position": { "x": 0, "y": 0 } } } ]
+                \\[ { "prefab": "rooms__ship_carcase", "overrides": { "Position": { "x": 0, "y": 0 }, "rooms__ShipCarcase": { "cols": 5 } } } ]
             );
 
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
 
-            var n_wrapper: usize = 0;
-            var n_on_ref: usize = 0;
+            var n_overrides_wrap: usize = 0;
             for (result.report.findings.items) |f| switch (f) {
-                .legacy_components_wrapper => n_wrapper += 1,
-                .legacy_components_on_ref => n_on_ref += 1,
+                .legacy_overrides_wrapper => n_overrides_wrap += 1,
                 else => {},
             };
-            try expect.equal(n_wrapper, @as(usize, 0));
-            try expect.equal(n_on_ref, @as(usize, 1));
+            try expect.equal(n_overrides_wrap, @as(usize, 0));
         }
 
-        test "malformed non-string prefab: dry-run audit count matches apply count (cli #241)" {
-            // codex P2 on cli #304: a malformed `{ "prefab": <non-string>,
-            // "components": {...} }` is NOT a real prefab ref. The migrator
-            // treats it as an inline-components entity and LIFTS it, so the
-            // dry-run audit must ALSO flag it (as legacy_components_wrapper)
-            // — otherwise `migrate --dry-run` reports fewer edits than
-            // `migrate` applies. This test pins the two counts together.
+        test "all-PascalCase overrides wrapper still flagged, and migrate lifts it (counts stay 1:1)" {
             const src =
-                \\[ { "prefab": 123, "components": { "Position": { "x": 0, "y": 0 } } } ]
+                \\[ { "prefab": "worker", "overrides": { "Position": { "x": 1, "y": 2 } } } ]
             ;
-
-            // Audit (dry-run) side.
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();
             try p.write("scenes/main.jsonc", src);
             const result = try runAuditForTest(&p);
             defer freeAuditResult(result);
 
-            var audit_wrapper: usize = 0;
-            var audit_on_ref: usize = 0;
+            var audit_wrap: usize = 0;
             for (result.report.findings.items) |f| switch (f) {
-                .legacy_components_wrapper => audit_wrapper += 1,
-                .legacy_components_on_ref => audit_on_ref += 1,
+                .legacy_overrides_wrapper => audit_wrap += 1,
                 else => {},
             };
-            // Non-string prefab does not count as a ref-wrapper.
-            try expect.equal(audit_on_ref, @as(usize, 0));
-            try expect.equal(audit_wrapper, @as(usize, 1));
+            try expect.equal(audit_wrap, @as(usize, 1));
 
-            // Apply side — run the real migrate transform pipeline.
             const migrate_helpers = @import("migrate/tests_helpers.zig");
             const migrate_pipeline = @import("migrate/pipeline.zig");
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena.deinit();
             var counts = migrate_pipeline.FileCounts{};
             _ = try migrate_helpers.applyAllFullCounts(arena.allocator(), src, "main", &counts);
-            try expect.equal(counts.components_lifts, @as(usize, 1));
-
-            // The audit dry-run wrapper count matches what apply lifts.
-            try expect.equal(audit_wrapper, counts.components_lifts);
+            try expect.equal(counts.overrides_lifts, @as(usize, 1));
+            try expect.equal(audit_wrap, counts.overrides_lifts);
         }
     };
 

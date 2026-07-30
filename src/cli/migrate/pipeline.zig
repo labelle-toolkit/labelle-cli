@@ -26,7 +26,9 @@ const stripJsoncToJson = scanner.stripJsoncToJson;
 ///   audit.legacy_assets            ↔ summary.assets_deletes
 ///   audit.legacy_root_wrapper      ↔ summary.root_wrappers_lifted
 ///   audit.legacy_overrides_wrapper ↔ summary.overrides_lifts
-///   audit.legacy_components_wrapper ↔ summary.components_lifts
+///   (the inline-`components` wrapper is NOT audited or lifted — it is
+///    a canonical engine 2.x shape; see cli#338 and pass 6's removal
+///    note in `transformBytes`)
 ///   audit.legacy_file_object_no_root ↔ summary.file_as_array_collapses
 ///   audit.legacy_name_field         ↔ summary.name_field_drops + summary.name_field_divergent_drops + summary.name_field_meta_moves
 pub const Summary = struct {
@@ -39,7 +41,6 @@ pub const Summary = struct {
     root_wrappers_lifted: usize = 0,
     // RFC #596 transforms.
     overrides_lifts: usize = 0,
-    components_lifts: usize = 0,
     file_as_array_collapses: usize = 0,
     name_field_drops: usize = 0,
     name_field_divergent_drops: usize = 0,
@@ -81,11 +82,6 @@ pub const Summary = struct {
         std.debug.print("  {d} 'overrides' wrapper{s} {s}\n", .{
             self.overrides_lifts,
             if (self.overrides_lifts == 1) "" else "s",
-            lifted,
-        });
-        std.debug.print("  {d} 'components' wrapper{s} {s}\n", .{
-            self.components_lifts,
-            if (self.components_lifts == 1) "" else "s",
             lifted,
         });
         std.debug.print("  {d} file{s} {s} to bundle array\n", .{
@@ -132,7 +128,6 @@ pub const FileCounts = struct {
     assets_deletes: usize = 0,
     root_wrappers_lifted: usize = 0,
     overrides_lifts: usize = 0,
-    components_lifts: usize = 0,
     file_as_array_collapses: usize = 0,
     name_field_drops: usize = 0,
     name_field_divergent_drops: usize = 0,
@@ -146,7 +141,6 @@ pub const FileCounts = struct {
             self.assets_deletes +
             self.root_wrappers_lifted +
             self.overrides_lifts +
-            self.components_lifts +
             self.file_as_array_collapses +
             self.name_field_drops +
             self.name_field_divergent_drops +
@@ -296,22 +290,14 @@ pub fn transformBytes(
         break;
     }
 
-    // Pass 6 — RFC #596: lift inline `components` block (`{components:
-    // {X, Y}, ...}` → `{X, Y, ...}`). Targets objects WITHOUT a sibling
-    // `prefab` key (pass 4 already renamed those, so by the time we get
-    // here the only remaining `components` keys are inline-mode ones).
-    while (true) {
-        const stripped = try stripJsoncToJson(arena, current);
-        var parsed = try std.json.parseFromSlice(std.json.Value, arena, stripped, .{});
-        defer parsed.deinit();
-        const edited = transforms.liftOneComponentsBlock(arena, current, parsed.value) catch null;
-        if (edited) |out| {
-            current = out;
-            counts.components_lifts += 1;
-            continue;
-        }
-        break;
-    }
+    // Pass 6 — REMOVED (cli#338). The inline `components:` wrapper is a
+    // CANONICAL engine 2.x shape, not legacy: the engine's case-
+    // convention rule only recognizes PascalCase flat keys as
+    // components, so pack-namespaced (lowercase) keys like `rooms__Room`
+    // exist ONLY inside the wrapper — lifting them flat made the engine
+    // silently drop them at load. The wrapper on inline entities is
+    // left untouched; only prefab REFERENCES had their `components`
+    // removed in engine v2.0 (pass 4 renames those to `overrides`).
 
     // Pass 7 — RFC #596: top-level `name:` → `meta.name` or drop. Runs
     // BEFORE pass 8 (file-as-array collapse) — once the wrapping object
