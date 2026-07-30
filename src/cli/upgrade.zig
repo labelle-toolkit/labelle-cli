@@ -138,6 +138,21 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
             break :blk assembler.DEFAULT_ASSEMBLER_VERSION;
         };
 
+        // gfx and the bgfx backend share a backend contract (PostPass,
+        // gfx 1.27+): advancing one without the other produces a project
+        // that no longer builds. Bump the backend pin together with gfx
+        // (codex P1 on cli#339). Non-bgfx or local-override backends are
+        // skipped with a note — the set only tracks bgfx.
+        if (cfg.backend_package) |bp| {
+            if (std.mem.eql(u8, bp.name, "bgfx") and bp.version.len > 0 and !bp.isLocal()) {
+                const bgfx_target = pickTarget("backend_package.version", bp.version, project_config.BGFX_VERSION, force);
+                content = try replaceBackendVersion(allocator, content, bp.version, bgfx_target);
+                std.debug.print("labelle: backend package bgfx -> {s} (paired with gfx {s})\n", .{ bgfx_target, gfx_target });
+            } else if (bp.version.len > 0) {
+                std.debug.print("labelle: note: backend package '{s}' is not in the compatible set — pin left at {s}\n", .{ bp.name, bp.version });
+            }
+        }
+
         // Report the versions actually applied — these may differ from
         // the compatible set above when the downgrade guard kept a
         // newer pin in place.
@@ -202,12 +217,18 @@ fn cmdUpgradeCheck(
     // crossed a backend-contract boundary (cli#336).
     if (cfg.backend_package) |bp| {
         const pinned: ?[]const u8 = if (bp.version.len > 0) bp.version else null;
-        var status = update_check.packageStatus(bp.name, pinned, null);
-        status.@"error" = if (bp.isLocal())
-            update_check.err_local_override
-        else
-            update_check.err_backend_untracked;
-        try packages.append(allocator, status);
+        // bgfx is part of the compatible set (paired with gfx across the
+        // shared backend contract); other backends have no tracked latest.
+        if (std.mem.eql(u8, bp.name, "bgfx")) {
+            try packages.append(allocator, update_check.packageStatus(bp.name, pinned, project_config.BGFX_VERSION));
+        } else {
+            var status = update_check.packageStatus(bp.name, pinned, null);
+            status.@"error" = if (bp.isLocal())
+                update_check.err_local_override
+            else
+                update_check.err_backend_untracked;
+            try packages.append(allocator, status);
+        }
     }
     try packages.append(allocator, update_check.packageStatus("labelle", cfg.labelle_version, project_config.CLI_VERSION));
     try packages.append(allocator, update_check.packageStatus("assembler", cfg.assembler_version, assembler.DEFAULT_ASSEMBLER_VERSION));
@@ -268,6 +289,28 @@ fn pickTarget(field_name: []const u8, current: []const u8, target: []const u8, f
     return target;
 }
 
+/// Replace `.version = "<old>"` INSIDE the `.backend_package = .{...}`
+/// struct only. A whole-file `replaceVersionField(".version", ...)` would
+/// also hit plugin pins that share the same field name; anchoring the
+/// search at the `.backend_package` key keeps the edit scoped.
+fn replaceBackendVersion(allocator: std.mem.Allocator, old_content: []u8, old_value: []const u8, new_value: []const u8) ![]u8 {
+    errdefer allocator.free(old_content);
+    const anchor = std.mem.indexOf(u8, old_content, ".backend_package") orelse return old_content;
+    const search = try std.fmt.allocPrint(allocator, ".version = \"{s}\"", .{old_value});
+    defer allocator.free(search);
+    const rel = std.mem.indexOf(u8, old_content[anchor..], search) orelse return old_content;
+    const idx = anchor + rel;
+    const replace = try std.fmt.allocPrint(allocator, ".version = \"{s}\"", .{new_value});
+    defer allocator.free(replace);
+    var result: std.ArrayList(u8) = .empty;
+    try result.appendSlice(allocator, old_content[0..idx]);
+    try result.appendSlice(allocator, replace);
+    try result.appendSlice(allocator, old_content[idx + search.len ..]);
+    const owned = try result.toOwnedSlice(allocator);
+    allocator.free(old_content);
+    return owned;
+}
+
 fn replaceAndFree(allocator: std.mem.Allocator, old_content: []u8, field_name: []const u8, old_value: []const u8, new_value: []const u8) ![]u8 {
     errdefer allocator.free(old_content);
     const result = try replaceVersionField(allocator, old_content, field_name, old_value, new_value);
@@ -318,6 +361,25 @@ fn insertBeforeClosingBrace(allocator: std.mem.Allocator, old_content: []u8, fie
 // ── Tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "replaceBackendVersion edits only the backend_package pin, not plugin pins" {
+    // A bare `.version = "x"` search would also hit plugin pins that
+    // share the field name; the anchor keeps the edit scoped (codex P1
+    // on cli#339: `upgrade all` must move bgfx together with gfx).
+    const src = try testing.allocator.dupe(u8,
+        \\.{
+        \\    .backend_package = .{ .name = "bgfx", .repo = "r", .version = "0.13.3" },
+        \\    .plugins = .{
+        \\        .{ .name = "fsm", .repo = "r2", .version = "0.13.3" },
+        \\    },
+        \\}
+    );
+    const out = try replaceBackendVersion(testing.allocator, src, "0.13.3", "0.13.5");
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, ".name = \"bgfx\", .repo = \"r\", .version = \"0.13.5\"") != null);
+    // The plugin pin with the same version string is untouched.
+    try testing.expect(std.mem.indexOf(u8, out, ".name = \"fsm\", .repo = \"r2\", .version = \"0.13.3\"") != null);
+}
 
 test "parseUpgradeArgs strips --force and keeps positionals" {
     var parsed = try parseUpgradeArgs(testing.allocator, &.{ "all", "--force" });

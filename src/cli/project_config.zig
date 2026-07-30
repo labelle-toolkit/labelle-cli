@@ -60,6 +60,9 @@ pub const CLI_VERSION = @import("build_options").cli_version;
 pub const CORE_VERSION = @import("build_options").core_version;
 pub const ENGINE_VERSION = @import("build_options").engine_version;
 pub const GFX_VERSION = @import("build_options").gfx_version;
+/// The bgfx backend package version paired with GFX_VERSION — the two
+/// cross a shared backend contract and must be bumped together.
+pub const BGFX_VERSION = @import("build_options").bgfx_version;
 
 /// A plugin dependency declared in project.labelle.
 pub const PluginDep = struct {

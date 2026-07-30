@@ -39,10 +39,12 @@
 ///          wrapper is redundant in the flat form; its contents
 ///          should be lifted to the file's top level.
 ///       e. `"overrides"` wrapper on a prefab reference (RFC #596) —
-///          contents should be lifted to sibling PascalCase keys on
-///          the reference entry.
-///       f. `"components"` wrapper on an inline entity (RFC #596) —
-///          contents should be lifted to sibling PascalCase keys.
+///          contents can be lifted to sibling PascalCase keys on the
+///          reference entry. Flagged only when EVERY inner key is
+///          PascalCase — lowercase (pack-namespaced) keys are only
+///          recognized inside the wrapper (cli#338).
+///       f. (removed, cli#338) the `"components"` wrapper on an inline
+///          entity is canonical engine 2.x syntax and is never flagged.
 ///       g. File-level object with no real root entity (RFC #596) —
 ///          a top-level object that only carries `name`/`children`/
 ///          legacy keys with no PascalCase components should become
@@ -75,12 +77,13 @@ const usage =
     \\Walks <dir>/scenes/ and <dir>/prefabs/ and reports:
     \\  1. Effective-name collisions across the merged namespace.
     \\  2. §B2 violations — `prefab` + `children` on the same entry.
-    \\  3. Legacy unified-format patterns slated for removal in
-    \\     engine #592 / #594 / #596 (top-level "entities",
+    \\  3. Legacy unified-format patterns (top-level "entities",
     \\     "components" on a prefab reference, top-level "assets",
-    \\     redundant top-level "root" wrapper, "overrides" wrapper,
-    \\     "components" wrapper on inline entity, file-as-object with
-    \\     no root, top-level "name" field).
+    \\     redundant top-level "root" wrapper, liftable all-PascalCase
+    \\     "overrides" wrapper, file-as-object with no root, top-level
+    \\     "name" field). NOTE: the "components" wrapper on an INLINE
+    \\     entity is canonical engine 2.x syntax — it is NOT flagged
+    \\     and must not be lifted (cli#338).
     \\
     \\Exits 0 if clean, 1 if findings, 2 on IO error.
     \\
@@ -671,15 +674,28 @@ fn inspectFile(
         const has_children = file_obj.get("children") != null;
         const has_entities_key = file_obj.get("entities") != null;
         if (has_children or has_entities_key) {
-            var any_pascal = false;
+            // Root-entity markers mirror the migrator's `isEntityShapeKey`
+            // (transforms_meta.zig): a canonical `components:` wrapper (or
+            // `overrides:`/`prefab:`) at the file top level marks a single
+            // root ENTITY exactly like a PascalCase component key does.
+            // Flagging such a file as a no-root bundle would be a false,
+            // unfixable finding — the migrator (correctly) refuses to
+            // collapse it, and the audit↔migrate count mapping breaks
+            // (codex P2 on cli#339).
+            var any_entity_marker = false;
             var it = file_obj.iterator();
             while (it.next()) |kv| {
-                if (isPascalCaseKey(kv.key_ptr.*)) {
-                    any_pascal = true;
+                const k = kv.key_ptr.*;
+                if (isPascalCaseKey(k) or
+                    std.mem.eql(u8, k, "components") or
+                    std.mem.eql(u8, k, "overrides") or
+                    std.mem.eql(u8, k, "prefab"))
+                {
+                    any_entity_marker = true;
                     break;
                 }
             }
-            if (!any_pascal) {
+            if (!any_entity_marker) {
                 try report.add(.{ .legacy_file_object_no_root = .{
                     .file = rel_path,
                     .json_pointer = try arena.dupe(u8, "/"),
@@ -2120,6 +2136,32 @@ pub const RunAuditOnSpec = struct {
     };
 
     pub const legacy_file_object_no_root = struct {
+        test "components-root file does NOT fire (codex P2 on cli#339)" {
+            // `{ children, components }` is a single ROOT ENTITY — the
+            // canonical wrapper marks entity content exactly like a
+            // PascalCase key. The migrator refuses to collapse it
+            // (isEntityShapeKey), so the audit must not flag it either;
+            // otherwise the finding is false and unfixable.
+            var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
+            defer p.deinit();
+            try p.write("prefabs/maintenance.jsonc",
+                \\{
+                \\    "children": [ { "Position": { "x": 0, "y": 0 } } ],
+                \\    "components": { "rooms__Room": { "room_type": "maintenance" } }
+                \\}
+            );
+
+            const result = try runAuditForTest(&p);
+            defer freeAuditResult(result);
+
+            var n: usize = 0;
+            for (result.report.findings.items) |f| switch (f) {
+                .legacy_file_object_no_root => n += 1,
+                else => {},
+            };
+            try expect.equal(n, @as(usize, 0));
+        }
+
         test "{ children: [...] } with no PascalCase fires" {
             var p = TmpProject{ .tmp = std.testing.tmpDir(.{}) };
             defer p.deinit();

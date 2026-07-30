@@ -172,22 +172,41 @@ pub fn writeHumanCli(w: *std.Io.Writer, cli: CliStatus) !void {
 /// Human-readable pin report (`upgrade --check`, no `--json`).
 pub fn writeHumanPackages(w: *std.Io.Writer, dir: []const u8, packages: []const PackageStatus) !void {
     try w.print("labelle: checking project pins in '{s}'...\n", .{dir});
-    var updates: usize = 0;
+    // Three buckets, tracked separately so the summary never claims a
+    // blanket "match" that per-package lines contradict (codex P2 on
+    // cli#339): `behind` (upgrade available), `unchecked` (no tracked
+    // latest / local override — never compared), and `ahead` (pin newer
+    // than the set — the downgrade guard keeps it).
+    var behind: usize = 0;
+    var unchecked: usize = 0;
+    var ahead: usize = 0;
     for (packages) |p| {
         const pinned = p.pinned orelse "(unset)";
         if (p.update_available) {
-            updates += 1;
+            behind += 1;
             try w.print("  {s}: {s} -> {s}  (behind this CLI's compatible set)\n", .{ p.name, pinned, p.latest.? });
         } else if (!p.checked) {
+            unchecked += 1;
             try w.print("  {s}: {s}  ({s})\n", .{ p.name, pinned, p.@"error" orelse "not checked" });
+        } else if (p.pinned != null and p.latest != null and
+            util.parseVersion(p.pinned.?) > util.parseVersion(p.latest.?))
+        {
+            ahead += 1;
+            try w.print("  {s}: {s}  (ahead of the set's {s}; kept)\n", .{ p.name, pinned, p.latest.? });
         } else {
-            try w.print("  {s}: {s}  up to date\n", .{ p.name, pinned });
+            try w.print("  {s}: {s}  matches the set\n", .{ p.name, pinned });
         }
     }
-    if (updates == 0) {
-        try w.writeAll("all pins match this CLI's compatible set\n");
+    if (behind == 0) {
+        try w.writeAll("no pins behind this CLI's compatible set\n");
     } else {
-        try w.print("{d} pin(s) behind the compatible set bundled with this CLI — run `labelle upgrade all` to apply it\n", .{updates});
+        try w.print("{d} pin(s) behind the compatible set bundled with this CLI — run `labelle upgrade all` to apply it\n", .{behind});
+    }
+    if (ahead > 0) {
+        try w.print("note: {d} pin(s) are ahead of the set (the downgrade guard keeps them)\n", .{ahead});
+    }
+    if (unchecked > 0) {
+        try w.print("note: {d} pin(s) have no tracked latest and were not compared\n", .{unchecked});
     }
     // The set is frozen at CLI build time (versions.zon), NOT a live
     // "latest" query — newer tags may exist upstream (cli#336).
