@@ -116,26 +116,57 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
         // older than the current pin, skip it (and warn) unless --force.
         const core_target = pickTarget("core_version", cfg.core_version, project_config.CORE_VERSION, force);
         const engine_target = pickTarget("engine_version", cfg.engine_version, project_config.ENGINE_VERSION, force);
-        // gfx and bgfx share a backend contract and must move TOGETHER.
-        // A local bgfx checkout cannot be bumped by this command, so
-        // advancing gfx anyway would recreate the broken pairing this
-        // guard exists for — keep gfx at the current pin and require a
-        // coordinated manual upgrade (codex P1 round 2 on cli#339).
-        // `--force` overrides, for a dev who knows the local checkout
-        // already satisfies the newer contract.
+        // gfx and bgfx share a backend contract (PostPass, gfx 1.27+)
+        // and must move TOGETHER — advancing one without the other
+        // produces a project that no longer builds. The backend bump is
+        // therefore attempted FIRST and its outcome gates the gfx bump
+        // (codex P1 rounds 2+3 on cli#339):
+        //   - local bgfx checkout   → cannot be bumped here: keep gfx.
+        //   - pinned bgfx, rewrite
+        //     failed (exotic ZON)   → keep gfx; nothing was written yet,
+        //                             so the pairing stays coherent.
+        //   - pinned bgfx, rewritten→ gfx moves with it.
+        //   - no/other backend     → gfx moves (nothing to pair with).
+        // `--force` overrides the gate in all cases.
         const backend_is_local_bgfx = if (cfg.backend_package) |bp|
             std.mem.eql(u8, bp.name, "bgfx") and bp.isLocal()
         else
             false;
+
+        var bgfx_bumped: ?[]const u8 = null; // set when the pin was rewritten
+        var bgfx_gate_blocks_gfx = backend_is_local_bgfx;
+        if (cfg.backend_package) |bp| {
+            if (std.mem.eql(u8, bp.name, "bgfx") and bp.version.len > 0 and !bp.isLocal()) {
+                const bgfx_target = pickTarget("backend_package.version", bp.version, project_config.BGFX_VERSION, force);
+                if (try replaceBackendVersion(allocator, content, bp.version, bgfx_target)) |updated| {
+                    content = updated;
+                    bgfx_bumped = bgfx_target;
+                } else {
+                    // Valid-but-exotic ZON the matcher does not handle
+                    // (e.g. a newline or comment between `.version` and
+                    // `=`). gfx must NOT advance past a backend we could
+                    // not move.
+                    bgfx_gate_blocks_gfx = true;
+                    std.debug.print("labelle: warning: could not locate backend_package .version in project.labelle — bgfx pin NOT updated (set it to {s} manually)\n", .{bgfx_target});
+                }
+            } else if (bp.version.len > 0 and !std.mem.eql(u8, bp.name, "bgfx")) {
+                std.debug.print("labelle: note: backend package '{s}' is not in the compatible set — pin left at {s}\n", .{ bp.name, bp.version });
+            }
+        }
+
         const gfx_would_move = !std.mem.eql(u8, cfg.gfx_version, project_config.GFX_VERSION);
-        const gfx_target = if (backend_is_local_bgfx and !force and gfx_would_move) blk: {
+        const gfx_target = if (bgfx_gate_blocks_gfx and !force and gfx_would_move) blk: {
+            const why: []const u8 = if (backend_is_local_bgfx) "is a local override" else "could not be updated";
             std.debug.print(
-                "labelle: warning: backend_package bgfx is a local override — keeping gfx at {s} (gfx {s} requires a matching bgfx; upgrade both manually, or pass --force)\n",
-                .{ cfg.gfx_version, project_config.GFX_VERSION },
+                "labelle: warning: backend_package bgfx {s} — keeping gfx at {s} (gfx {s} requires a matching bgfx; upgrade both manually, or pass --force)\n",
+                .{ why, cfg.gfx_version, project_config.GFX_VERSION },
             );
             break :blk cfg.gfx_version;
         } else pickTarget("gfx_version", cfg.gfx_version, project_config.GFX_VERSION, force);
         const cli_target = pickTarget("labelle_version", cfg.labelle_version, project_config.CLI_VERSION, force);
+        if (bgfx_bumped) |t| {
+            std.debug.print("labelle: backend package bgfx -> {s} (paired with gfx {s})\n", .{ t, gfx_target });
+        }
 
         content = try replaceAndFree(allocator, content, "core_version", cfg.core_version, core_target);
         content = try replaceAndFree(allocator, content, "engine_version", cfg.engine_version, engine_target);
@@ -155,25 +186,6 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
             content = try insertBeforeClosingBrace(allocator, content, "assembler_version", assembler.DEFAULT_ASSEMBLER_VERSION);
             break :blk assembler.DEFAULT_ASSEMBLER_VERSION;
         };
-
-        // gfx and the bgfx backend share a backend contract (PostPass,
-        // gfx 1.27+): advancing one without the other produces a project
-        // that no longer builds. Bump the backend pin together with gfx
-        // (codex P1 on cli#339). Non-bgfx or local-override backends are
-        // skipped with a note — the set only tracks bgfx.
-        if (cfg.backend_package) |bp| {
-            if (std.mem.eql(u8, bp.name, "bgfx") and bp.version.len > 0 and !bp.isLocal()) {
-                const bgfx_target = pickTarget("backend_package.version", bp.version, project_config.BGFX_VERSION, force);
-                if (try replaceBackendVersion(allocator, content, bp.version, bgfx_target)) |updated| {
-                    content = updated;
-                    std.debug.print("labelle: backend package bgfx -> {s} (paired with gfx {s})\n", .{ bgfx_target, gfx_target });
-                } else {
-                    std.debug.print("labelle: warning: could not locate backend_package .version in project.labelle — bgfx pin NOT updated; set it to {s} manually (paired with gfx {s})\n", .{ bgfx_target, gfx_target });
-                }
-            } else if (bp.version.len > 0) {
-                std.debug.print("labelle: note: backend package '{s}' is not in the compatible set — pin left at {s}\n", .{ bp.name, bp.version });
-            }
-        }
 
         // Report the versions actually applied — these may differ from
         // the compatible set above when the downgrade guard kept a
