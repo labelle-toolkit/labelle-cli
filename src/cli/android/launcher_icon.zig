@@ -400,12 +400,21 @@ fn gradientRgba(allocator: std.mem.Allocator, w: usize, h: usize) ![]u8 {
     return px;
 }
 
+/// Assert `r.path` equals `parts` joined — built with `std.fs.path.join`
+/// rather than a literal so these tests hold on Windows, where the
+/// separator is `\` and a hardcoded `/` expectation would fail.
+fn expectResolvedPath(a: std.mem.Allocator, r: Resolved, parts: []const []const u8) !void {
+    const want = try std.fs.path.join(a, parts);
+    defer a.free(want);
+    try testing.expectEqualStrings(want, r.path);
+}
+
 test "resolve prefers a non-empty app_icon, joined against the project root" {
     const a = testing.allocator;
     const r = try resolve(a, "/proj", "/proj/.labelle/bgfx_android", "art/icon.png");
     defer r.deinit(a);
     try testing.expectEqual(Source.custom, r.source);
-    try testing.expectEqualStrings("/proj/art/icon.png", r.path);
+    try expectResolvedPath(a, r, &.{ "/proj", "art/icon.png" });
 }
 
 test "resolve falls back to the assembler default when app_icon is null" {
@@ -413,7 +422,7 @@ test "resolve falls back to the assembler default when app_icon is null" {
     const r = try resolve(a, "/proj", "/proj/.labelle/bgfx_android", null);
     defer r.deinit(a);
     try testing.expectEqual(Source.default, r.source);
-    try testing.expectEqualStrings("/proj/.labelle/bgfx_android/default_icon.png", r.path);
+    try expectResolvedPath(a, r, &.{ "/proj/.labelle/bgfx_android", default_icon_name });
 }
 
 test "resolve treats an empty app_icon as unset (matches the assembler)" {
@@ -421,7 +430,7 @@ test "resolve treats an empty app_icon as unset (matches the assembler)" {
     const r = try resolve(a, "/proj", "/tgt", "");
     defer r.deinit(a);
     try testing.expectEqual(Source.default, r.source);
-    try testing.expectEqualStrings("/tgt/default_icon.png", r.path);
+    try expectResolvedPath(a, r, &.{ "/tgt", default_icon_name });
 }
 
 test "resampleBox averages the whole footprint rather than point sampling" {
