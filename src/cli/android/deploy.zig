@@ -29,6 +29,7 @@ pub const DeployOpts = struct {
 /// `gh` CLI.
 pub fn cmdDeploy(
     allocator: std.mem.Allocator,
+    project_dir: []const u8,
     target_dir: []const u8,
     cfg: project_config.ProjectConfig,
     opts: DeployOpts,
@@ -59,6 +60,7 @@ pub fn cmdDeploy(
 
     const apk_path = try android.buildAndPackage(
         allocator,
+        project_dir,
         target_dir,
         cfg,
         opts.release_mode,

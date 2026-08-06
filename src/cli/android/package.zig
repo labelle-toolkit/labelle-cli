@@ -9,6 +9,7 @@ const project_config = @import("../project_config.zig");
 const asm_cache = @import("../asm_cache.zig");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
+const launcher_icon = @import("launcher_icon.zig");
 
 const ProjectConfig = project_config.ProjectConfig;
 const AndroidConfig = project_config.AndroidConfig;
@@ -35,6 +36,7 @@ const ResolvedSigning = struct {
 /// Used by `labelle android build` when `--all-abis` is not set.
 pub fn packageApk(
     allocator: std.mem.Allocator,
+    project_dir: []const u8,
     target_dir: []const u8,
     cfg: ProjectConfig,
     emulator: bool,
@@ -44,7 +46,7 @@ pub fn packageApk(
     const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_path);
     const abis = [_]StagedAbi{.{ .abi_dir = abi_dir, .so_path = so_path }};
-    return packageApkWithAbis(allocator, target_dir, cfg, abis[0..], signing);
+    return packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis[0..], signing);
 }
 
 /// Package a signed APK from one or more built `libgame.so` entries.
@@ -57,8 +59,12 @@ pub fn packageApk(
 /// fanned out into `apk-staging/lib/<abi_dir>/libgame.so` before
 /// `buildApk` runs. A single-element slice produces a single-arch
 /// APK; multi-element slices produce a fat APK.
+///
+/// `project_dir` is the source project root — needed because
+/// `.app_icon` in `project.labelle` is relative to it (cli#340).
 pub fn packageApkWithAbis(
     allocator: std.mem.Allocator,
+    project_dir: []const u8,
     target_dir: []const u8,
     cfg: ProjectConfig,
     abis: []const StagedAbi,
@@ -101,10 +107,16 @@ pub fn packageApkWithAbis(
         try std.Io.Dir.cwd().copyFile(abi.so_path, std.Io.Dir.cwd(), staged_so, config.globalIo(), .{});
     }
 
+    // Stage the launcher icon into `res/mipmap-*/ic_launcher.png`
+    // (cli#340). Runs BEFORE the manifest is written: `android:icon`
+    // may only reference `@mipmap/ic_launcher` if that resource actually
+    // exists, otherwise aapt fails to link it.
+    const has_launcher_icon = try launcher_icon.stage(allocator, staging_dir, project_dir, target_dir, cfg.app_icon);
+
     // Generate AndroidManifest.xml
     const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, "AndroidManifest.xml" });
     defer allocator.free(manifest_path);
-    const manifest = try generateAndroidManifest(allocator, package_name, app_name, android_cfg);
+    const manifest = try generateAndroidManifest(allocator, package_name, app_name, android_cfg, has_launcher_icon);
     defer allocator.free(manifest);
     try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = manifest_path, .data = manifest });
 
@@ -193,24 +205,39 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
     defer allocator.free(aligned_apk);
 
     // Package with aapt.
-    // Pass -A for assets and -M for the manifest but do NOT pass the full
-    // staging_dir as a positional argument — aapt would scan it, find another
-    // AndroidManifest.xml, and report "Duplicate file".
+    // Pass -A for assets, -S for compiled resources and -M for the
+    // manifest, but do NOT pass the full staging_dir as a positional
+    // argument — aapt would scan it, find another AndroidManifest.xml,
+    // and report "Duplicate file". Every input therefore has to arrive
+    // through its own flag.
     std.debug.print("labelle: packaging APK...\n", .{});
     const assets_dir = try std.fs.path.join(allocator, &.{ staging_dir, "assets" });
     defer allocator.free(assets_dir);
+    const res_dir = try std.fs.path.join(allocator, &.{ staging_dir, launcher_icon.res_subdir });
+    defer allocator.free(res_dir);
     {
-        const aapt_args: []const []const u8 = blk: {
-            const base = &[_][]const u8{ aapt, "package", "-f", "-M", manifest_path, "-I", android_jar, "-F", unsigned_apk };
-            // Only pass -A if the assets directory actually exists.
-            if (std.Io.Dir.cwd().access(config.globalIo(), assets_dir, .{})) |_| {
-                break :blk try std.mem.concat(allocator, []const u8, &.{ base, &.{ "-A", assets_dir } });
-            } else |_| {
-                break :blk try allocator.dupe([]const u8, base);
-            }
-        };
-        defer allocator.free(aapt_args);
-        const result = util.runCmd(allocator, aapt_args) catch |err| {
+        var aapt_args: std.ArrayList([]const u8) = .empty;
+        defer aapt_args.deinit(allocator);
+        try aapt_args.appendSlice(allocator, &.{ aapt, "package", "-f", "-M", manifest_path, "-I", android_jar, "-F", unsigned_apk });
+        // Only pass -A if the assets directory actually exists.
+        if (std.Io.Dir.cwd().access(config.globalIo(), assets_dir, .{})) |_| {
+            try aapt_args.appendSlice(allocator, &.{ "-A", assets_dir });
+        } else |_| {}
+        // `res/` holds the launcher-icon mipmaps (cli#340) and exists
+        // only when `launcher_icon.stage` had an icon to write. Passing
+        // -S is also what makes the APK carry a `resources.arsc` at all
+        // — hence the `-0 arsc` below.
+        if (std.Io.Dir.cwd().access(config.globalIo(), res_dir, .{})) |_| {
+            try aapt_args.appendSlice(allocator, &.{ "-S", res_dir });
+            // Apps targeting API 30+ are rejected at install time with
+            // INSTALL_PARSE_FAILED_RESOURCES_ARSC_COMPRESSED if
+            // resources.arsc is deflated, and `zipalign` can only align
+            // stored entries. aapt v1 happens to store our (tiny) table
+            // already — `-0 arsc` makes that a guarantee rather than a
+            // size-dependent accident as the resource table grows.
+            try aapt_args.appendSlice(allocator, &.{ "-0", "arsc" });
+        } else |_| {}
+        const result = util.runCmd(allocator, aapt_args.items) catch |err| {
             std.debug.print("labelle: aapt package failed: {}\n", .{err});
             return err;
         };
@@ -356,7 +383,20 @@ fn buildApk(allocator: std.mem.Allocator, staging_dir: []const u8, apk_path: []c
 }
 
 /// Generate AndroidManifest.xml for NativeActivity.
-fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u8, app_name: []const u8, cfg: AndroidConfig) ![]u8 {
+///
+/// `has_launcher_icon` says whether `launcher_icon.stage` wrote
+/// `res/mipmap-*/ic_launcher.png` into the staging tree. The attribute
+/// is emitted only when it did — `android:icon` pointing at a resource
+/// that isn't in the APK is an aapt link error, and the resource is
+/// absent for projects generated by an assembler older than the one
+/// that ships `default_icon.png`.
+fn generateAndroidManifest(
+    allocator: std.mem.Allocator,
+    package_name: []const u8,
+    app_name: []const u8,
+    cfg: AndroidConfig,
+    has_launcher_icon: bool,
+) ![]u8 {
     const orientation = switch (cfg.orientation) {
         .portrait => "portrait",
         .landscape => "landscape",
@@ -365,12 +405,22 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
 
     // Immersive mode: launch fullscreen with the status bar + title bar
     // hidden via the built-in `Theme.NoTitleBar.Fullscreen` framework
-    // theme. This is a framework resource — it needs no custom APK
-    // resources (the APK stays resource-free, `android:hasCode="false"`).
+    // theme. That's a framework resource, so it costs the APK nothing.
     // Note: this hides the status bar only, NOT the navigation bar;
     // immersive-sticky nav-bar hiding needs runtime JNI work (follow-up).
     const theme_attr: []const u8 = if (cfg.immersive_mode)
         "\n            android:theme=\"@android:style/Theme.NoTitleBar.Fullscreen\""
+    else
+        "";
+
+    // Launcher icon (cli#340). Until this landed the APK carried NO
+    // custom resources at all and every game shipped with the stock
+    // Android robot; the mipmaps staged by `launcher_icon.zig` are the
+    // first (and so far only) compiled resources in the APK, which is
+    // why `buildApk` now hands aapt a `-S <staging>/res`.
+    // `android:hasCode="false"` is unaffected — resources are not code.
+    const icon_attr: []const u8 = if (has_launcher_icon)
+        " android:icon=\"" ++ launcher_icon.icon_resource_ref ++ "\""
     else
         "";
 
@@ -385,7 +435,7 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         \\    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
         \\    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
         \\
-        \\    <application android:hasCode="false" android:label="{s}">
+        \\    <application android:hasCode="false" android:label="{s}"{s}>
         \\        <activity android:name="android.app.NativeActivity"
         \\            android:configChanges="orientation|keyboardHidden|screenSize"
         \\            android:screenOrientation="{s}"{s}
@@ -399,13 +449,13 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
         \\    </application>
         \\</manifest>
         \\
-    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, orientation, theme_attr });
+    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, icon_attr, orientation, theme_attr });
 }
 
 test "generateAndroidManifest omits theme attribute when immersive_mode is false" {
     const allocator = std.testing.allocator;
     const cfg = AndroidConfig{ .immersive_mode = false };
-    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg, false);
     defer allocator.free(xml);
     try std.testing.expect(std.mem.indexOf(u8, xml, "android:theme=") == null);
 }
@@ -413,7 +463,7 @@ test "generateAndroidManifest omits theme attribute when immersive_mode is false
 test "generateAndroidManifest adds NoTitleBar.Fullscreen theme when immersive_mode is true" {
     const allocator = std.testing.allocator;
     const cfg = AndroidConfig{ .immersive_mode = true };
-    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg, false);
     defer allocator.free(xml);
     try std.testing.expect(std.mem.indexOf(u8, xml, "android:theme=\"@android:style/Theme.NoTitleBar.Fullscreen\"") != null);
     // Theme attribute belongs to the <activity> element, before its close `>`.
@@ -431,9 +481,37 @@ test "generateAndroidManifest adds NoTitleBar.Fullscreen theme when immersive_mo
 test "generateAndroidManifest advertises the gamepad as an optional feature" {
     const allocator = std.testing.allocator;
     const cfg = AndroidConfig{};
-    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg, false);
     defer allocator.free(xml);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<uses-feature android:name=\"android.hardware.gamepad\" android:required=\"false\" />") != null);
+}
+
+test "generateAndroidManifest points <application> at the staged launcher icon" {
+    const allocator = std.testing.allocator;
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", AndroidConfig{}, true);
+    defer allocator.free(xml);
+
+    // The attribute must sit on <application>, not on <activity>: an
+    // activity-level icon shows in the task switcher but leaves the
+    // launcher itself on the stock robot — the exact bug cli#340 fixes.
+    const app_start = std.mem.indexOf(u8, xml, "<application") orelse
+        return std.testing.expect(false);
+    const app_open_end = std.mem.indexOfPos(u8, xml, app_start, ">") orelse
+        return std.testing.expect(false);
+    const icon_idx = std.mem.indexOf(u8, xml, "android:icon=\"@mipmap/ic_launcher\"") orelse
+        return std.testing.expect(false);
+    try std.testing.expect(icon_idx > app_start and icon_idx < app_open_end);
+}
+
+test "generateAndroidManifest omits android:icon when no icon was staged" {
+    const allocator = std.testing.allocator;
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", AndroidConfig{}, false);
+    defer allocator.free(xml);
+    // Referencing @mipmap/ic_launcher without the resource present is an
+    // aapt link failure, so the un-staged case must stay attribute-free.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:icon=") == null);
+    // hasCode stays false either way — resources are not code.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:hasCode=\"false\"") != null);
 }
 
 /// Find ANDROID_HOME.

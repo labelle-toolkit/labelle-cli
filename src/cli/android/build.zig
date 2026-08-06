@@ -166,6 +166,7 @@ pub fn androidBuild(allocator: std.mem.Allocator, target_dir: []const u8, emulat
 /// identical to a regular build.
 pub fn buildAndPackage(
     allocator: std.mem.Allocator,
+    project_dir: []const u8,
     target_dir: []const u8,
     cfg: project_config.ProjectConfig,
     release_mode: ReleaseMode,
@@ -181,9 +182,9 @@ pub fn buildAndPackage(
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
-        return package.packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
+        return package.packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis, signing);
     } else {
         try androidBuild(allocator, target_dir, emulator, release_mode);
-        return package.packageApk(allocator, target_dir, cfg, emulator, signing);
+        return package.packageApk(allocator, project_dir, target_dir, cfg, emulator, signing);
     }
 }

@@ -111,6 +111,7 @@ pub fn handleAndroid(
     allocator: std.mem.Allocator,
     extra_args: []const []const u8,
     cfg: project_config.ProjectConfig,
+    project_dir: []const u8,
     target_dir: []const u8,
 ) !void {
     var subcmd: ?[]const u8 = null;
@@ -186,7 +187,7 @@ pub fn handleAndroid(
     };
 
     if (std.mem.eql(u8, cmd, "build")) {
-        const apk_path = try build_mod.buildAndPackage(allocator, target_dir, cfg, release_mode, all_abis, emulator, signing);
+        const apk_path = try build_mod.buildAndPackage(allocator, project_dir, target_dir, cfg, release_mode, all_abis, emulator, signing);
         defer allocator.free(apk_path);
         std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
     } else if (std.mem.eql(u8, cmd, "run")) {
@@ -194,13 +195,13 @@ pub fn handleAndroid(
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
             const abis = try build_mod.buildAllAbis(arena.allocator(), target_dir, release_mode);
-            try run_mod.deployToDeviceWithAbis(allocator, target_dir, cfg, abis, signing);
+            try run_mod.deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis, signing);
         } else {
             try build_mod.androidBuild(allocator, target_dir, emulator, release_mode);
-            try run_mod.deployToDevice(allocator, target_dir, cfg, emulator, signing);
+            try run_mod.deployToDevice(allocator, project_dir, target_dir, cfg, emulator, signing);
         }
     } else if (std.mem.eql(u8, cmd, "deploy")) {
-        try deploy_mod.cmdDeploy(allocator, target_dir, cfg, .{
+        try deploy_mod.cmdDeploy(allocator, project_dir, target_dir, cfg, .{
             .tag = deploy_tag,
             .channel = deploy_channel,
             .notes_file = deploy_notes_file,
