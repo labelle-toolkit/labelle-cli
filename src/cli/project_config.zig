@@ -302,6 +302,18 @@ pub const ProjectConfig = struct {
     /// auto-run `labelle astc` before generating; the assembler does the
     /// catalog `.png → .astc` swap). Default `.png` everywhere.
     asset_compression: AssetCompression = .{},
+    /// App icon — a PNG path relative to the PROJECT ROOT. The assembler
+    /// owns this field (`labelle-assembler` `src/config.zig` /
+    /// `src/app_icon.zig`); the CLI mirrors it because packaging is a CLI
+    /// job: `android/launcher_icon.zig` turns it into the APK's
+    /// `res/mipmap-*/ic_launcher.png` (labelle-cli#340).
+    ///
+    /// `null` or `""` both mean "unset" — the assembler then writes its
+    /// bundled default to `<target_dir>/default_icon.png` and packaging
+    /// picks that up instead. Do NOT read this field directly; go through
+    /// `android/launcher_icon.zig`'s `resolve`, which is the single home
+    /// of that precedence.
+    app_icon: ?[]const u8 = null,
     /// When true, the window is created hidden (headless CI).
     hidden: bool = false,
     /// Plugins — each declares its repo and version.

@@ -15,13 +15,13 @@ const StagedAbi = android.StagedAbi;
 /// Package APK and deploy to device/emulator via ADB. Single-arch
 /// entry point — picks the ABI from `emulator` + host arch, then
 /// delegates to `deployToDeviceWithAbis`.
-pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg: project_config.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
+pub fn deployToDevice(allocator: std.mem.Allocator, project_dir: []const u8, target_dir: []const u8, cfg: project_config.ProjectConfig, emulator: bool, signing: SigningConfig) !void {
     const abi_dir = package.hostAbiDir(emulator);
     const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_path);
 
     const abis = [_]StagedAbi{.{ .abi_dir = abi_dir, .so_path = so_path }};
-    try deployToDeviceWithAbis(allocator, target_dir, cfg, abis[0..], signing);
+    try deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis[0..], signing);
 }
 
 /// Shared staging / packaging / install / launch pipeline used by
@@ -31,12 +31,13 @@ pub fn deployToDevice(allocator: std.mem.Allocator, target_dir: []const u8, cfg:
 /// connected device with ADB and launches the NativeActivity.
 pub fn deployToDeviceWithAbis(
     allocator: std.mem.Allocator,
+    project_dir: []const u8,
     target_dir: []const u8,
     cfg: project_config.ProjectConfig,
     abis: []const StagedAbi,
     signing: SigningConfig,
 ) !void {
-    const apk_path = try package.packageApkWithAbis(allocator, target_dir, cfg, abis, signing);
+    const apk_path = try package.packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis, signing);
     defer allocator.free(apk_path);
 
     const package_name = try package.resolvePackageName(allocator, cfg);

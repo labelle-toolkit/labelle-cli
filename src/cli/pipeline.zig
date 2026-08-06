@@ -512,7 +512,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
 
     // `labelle android` subcommand — handles its own build/run
     if (command == .android_cmd) {
-        return android.handleAndroid(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
+        return android.handleAndroid(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, project_dir, target_dir);
     }
 
     // Warn if --target is used without --docker (it has no effect otherwise)
@@ -621,7 +621,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         // a bare `.so`. Package it into a signed APK so the artifact is
         // installable — backend-agnostic, so it covers sokol and bgfx alike.
         if (parsed.platform == .android) {
-            const apk_path = try android.packageApk(allocator, target_dir, parsed, false, .{});
+            const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{});
             defer allocator.free(apk_path);
             std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
         }
@@ -692,7 +692,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         // Android: deploy to device/emulator
         if (reporter) |r| r.beginPhase(.run, "deploying to Android");
         std.debug.print("labelle: deploying to Android...\n", .{});
-        try android.deployToDevice(allocator, target_dir, parsed, false, .{});
+        try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{});
         if (reporter) |r| r.finishDone(0);
     } else {
         if (timeout_ns) |t| {
