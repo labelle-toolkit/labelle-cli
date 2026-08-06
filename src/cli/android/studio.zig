@@ -252,6 +252,7 @@ fn generateStudioManifest(
     const orientation = switch (cfg.orientation) {
         .portrait => "portrait",
         .landscape => "landscape",
+        .sensor_landscape => "sensorLandscape",
         .all => "unspecified",
     };
 
@@ -342,6 +343,10 @@ test "generateStudioManifest honours orientation and immersive_mode" {
     defer allocator.free(portrait);
     try std.testing.expect(std.mem.indexOf(u8, portrait, "android:screenOrientation=\"portrait\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, portrait, "android:theme=") == null);
+
+    const sensor = try generateStudioManifest(allocator, "T", .{ .orientation = .sensor_landscape });
+    defer allocator.free(sensor);
+    try std.testing.expect(std.mem.indexOf(u8, sensor, "android:screenOrientation=\"sensorLandscape\"") != null);
 
     const immersive = try generateStudioManifest(allocator, "T", .{ .immersive_mode = true });
     defer allocator.free(immersive);

@@ -360,6 +360,7 @@ fn generateAndroidManifest(allocator: std.mem.Allocator, package_name: []const u
     const orientation = switch (cfg.orientation) {
         .portrait => "portrait",
         .landscape => "landscape",
+        .sensor_landscape => "sensorLandscape",
         .all => "unspecified",
     };
 
@@ -426,6 +427,14 @@ test "generateAndroidManifest adds NoTitleBar.Fullscreen theme when immersive_mo
     const theme_idx = std.mem.indexOf(u8, xml, "android:theme=") orelse
         return std.testing.expect(false);
     try std.testing.expect(theme_idx > activity_start and theme_idx < activity_open_end);
+}
+
+test "generateAndroidManifest maps sensor_landscape to sensorLandscape" {
+    const allocator = std.testing.allocator;
+    const cfg = AndroidConfig{ .orientation = .sensor_landscape };
+    const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", cfg);
+    defer allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:screenOrientation=\"sensorLandscape\"") != null);
 }
 
 test "generateAndroidManifest advertises the gamepad as an optional feature" {

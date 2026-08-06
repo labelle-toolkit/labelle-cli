@@ -91,7 +91,7 @@ pub const PluginDep = struct {
 
 // ── iOS Configuration ──────────────────────────────────────────────
 
-pub const Orientation = enum { portrait, landscape, all };
+pub const Orientation = enum { portrait, landscape, sensor_landscape, all };
 
 pub const IosConfig = struct {
     app_name: []const u8 = "",

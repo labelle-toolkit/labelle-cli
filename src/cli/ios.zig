@@ -200,7 +200,10 @@ fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_na
         \\        <string>UIInterfaceOrientationPortrait</string>
         \\    </array>
         ,
-        .landscape =>
+        // iOS has no single-direction landscape lock in practice; both
+        // values allow either landscape direction (Android is where they
+        // differ: "landscape" locks one direction, "sensorLandscape" both).
+        .landscape, .sensor_landscape =>
         \\    <array>
         \\        <string>UIInterfaceOrientationLandscapeLeft</string>
         \\        <string>UIInterfaceOrientationLandscapeRight</string>
