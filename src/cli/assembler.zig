@@ -25,7 +25,7 @@ const std = @import("std");
 /// project the current assembler line refuses to build). The
 /// released-path smoke test in ci.yml (init with NO local overrides →
 /// generate → build) fails if this constant rots again.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.97.1";
+pub const DEFAULT_ASSEMBLER_VERSION = "0.99.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");
