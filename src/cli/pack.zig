@@ -30,11 +30,17 @@ fn rendererIgnoresTrim(pinned: []const u8) bool {
 /// offsets. Best-effort: `labelle pack` is usable outside a project, so an
 /// unreadable `project.labelle` (or an unpinned gfx) skips the check rather
 /// than failing the pack.
-fn warnIfRendererIgnoresTrim(allocator: std.mem.Allocator) void {
+fn warnIfRendererIgnoresTrim(gpa: std.mem.Allocator) void {
+    // Arena for the parsed config, matching `cmdAstc`: the ZON parse
+    // allocates a string per field and this function only needs one of
+    // them, so a single arena free beats tracking them individually.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
     // `gfx_version` is never null — it defaults to the CLI's own paired
     // version when project.labelle omits the pin, which is the right proxy
     // for "what this project will build against".
-    const cfg = config.readProjectConfigQuiet(allocator, ".") catch return;
+    const cfg = config.readProjectConfigQuiet(arena.allocator(), ".") catch return;
     const pinned = cfg.gfx_version;
     if (!rendererIgnoresTrim(pinned)) return;
     std.debug.print(
