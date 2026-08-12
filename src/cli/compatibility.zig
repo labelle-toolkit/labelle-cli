@@ -123,6 +123,10 @@ pub const Version = struct {
     major: u32,
     minor: u32,
     patch: u32,
+    /// A `-suffix` was present. Only whether, not which: ordering release
+    /// candidates against each other is not something any gate here needs,
+    /// but ordering them below their own release is.
+    prerelease: bool = false,
 
     /// True when `self` is older than `other`. Patch is included because a
     /// fix can ship as a patch release, and a gate that stopped at the minor
@@ -130,7 +134,13 @@ pub const Version = struct {
     pub fn olderThan(self: Version, other: Version) bool {
         if (self.major != other.major) return self.major < other.major;
         if (self.minor != other.minor) return self.minor < other.minor;
-        return self.patch < other.patch;
+        if (self.patch != other.patch) return self.patch < other.patch;
+        // Same numbers: per semver a prerelease PRECEDES its release, so
+        // `1.30.1-rc1` is older than `1.30.1`. Treating them as equal let a
+        // release candidate of the fix release satisfy a gate the candidate
+        // does not actually satisfy. Build metadata (`+…`) carries no
+        // precedence and is not recorded.
+        return self.prerelease and !other.prerelease;
     }
 };
 
@@ -140,6 +150,7 @@ pub const Version = struct {
 pub fn parseVersion(version: []const u8) Version {
     var parts: [3]u32 = .{ 0, 0, 0 };
     var part_idx: u8 = 0;
+    var prerelease = false;
 
     for (version) |c| {
         // A prerelease or build suffix ends the numeric version. Without
@@ -147,7 +158,11 @@ pub fn parseVersion(version: []const u8) Version {
         // as 1.30.1 — so a gate looking for "1.30.1 or newer" accepted a
         // release candidate that PREDATES 1.30.0, silently suppressing the
         // very warning it exists to give.
-        if (c == '-' or c == '+') break;
+        if (c == '-') {
+            prerelease = true;
+            break;
+        }
+        if (c == '+') break;
         if (c == '.') {
             part_idx += 1;
             if (part_idx >= 3) break;
@@ -156,7 +171,7 @@ pub fn parseVersion(version: []const u8) Version {
         }
     }
 
-    return .{ .major = parts[0], .minor = parts[1], .patch = parts[2] };
+    return .{ .major = parts[0], .minor = parts[1], .patch = parts[2], .prerelease = prerelease };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -211,5 +226,9 @@ test "parseVersion: a prerelease or build suffix does not bleed into the patch" 
     try std.testing.expectEqual(@as(u32, 0), parseVersion("1.30.0+1").patch);
     try std.testing.expectEqual(@as(u32, 30), parseVersion("1.30.0-rc1").minor);
     try std.testing.expect(parseVersion("1.30.0-rc1").olderThan(parseVersion("1.30.1")));
-    try std.testing.expect(parseVersion("1.30.1-rc1").olderThan(parseVersion("1.30.1")) == false);
+    // A prerelease of the fix release does NOT carry the fix.
+    try std.testing.expect(parseVersion("1.30.1-rc1").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("1.30.1").olderThan(parseVersion("1.30.1-rc1")));
+    // Build metadata has no precedence: 1.30.1+build is still 1.30.1.
+    try std.testing.expect(!parseVersion("1.30.1+build7").olderThan(parseVersion("1.30.1")));
 }
