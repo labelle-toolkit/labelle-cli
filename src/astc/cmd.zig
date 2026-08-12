@@ -109,7 +109,11 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     const caps: convert.BackendCaps = switch (cfg.backend) {
         .sokol => .sokol_4x4_only,
         .raylib => .raylib_4x4_8x8,
-        .bgfx, .wgpu => .full,
+        // bgfx uploads any block it can name and validates none of them, so
+        // an unsupported one renders garbage with no error at all — verified
+        // on device with 6x6. See `BackendCaps.bgfx_4x4_8x8`.
+        .bgfx => .bgfx_4x4_8x8,
+        .wgpu => .full,
         // sdl/null aren't ASTC upload targets; the gfx seam falls back to PNG
         // decode if they ever see a compressed blob, so leave block unconstrained.
         .sdl, .null => .full,
@@ -180,7 +184,12 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
                 "({s} vs {s}) — pin the same block on both\n",
             .{ clash.first, clash.second, clash.out, clash.first_block.arg(), clash.second_block.arg() },
         );
-        return error.InvalidArgs;
+        // A DISTINCT error, not `InvalidArgs`: the build pipeline treats a
+        // failed conversion as non-fatal (it falls back to the source PNG),
+        // which would let this rejection be logged and ignored — and worse,
+        // a stale `.astc` from an earlier build would then be swapped in for
+        // BOTH resources. A misconfiguration has to stop the build.
+        return error.ConflictingAstcBlocks;
     }
 
     for (atlases.items) |job| {
@@ -505,4 +514,22 @@ test "conflictingBlockPin: distinct textures never clash" {
         .{ .name = "b", .base_dir = "/p", .texture = "b.png", .opts = .{ .block = .@"8x8" } },
     };
     try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
+}
+
+test "BackendCaps: bgfx rejects blocks it cannot actually upload" {
+    // bgfx names every ASTC block in a `TextureFormat` but validates none
+    // against the runtime, so an unsupported one renders garbage with a clean
+    // log — measured on an Adreno 610 with 6x6. Only the two blocks verified
+    // on hardware are accepted.
+    const caps: convert.BackendCaps = .bgfx_4x4_8x8;
+    try std.testing.expect(caps.supports(.@"4x4"));
+    try std.testing.expect(caps.supports(.@"8x8"));
+    try std.testing.expect(!caps.supports(.@"6x6"));
+    try std.testing.expect(!caps.supports(.@"5x5"));
+    try std.testing.expect(!caps.supports(.@"12x12"));
+    // And an atlas pinning one of those is dropped to the default rather than
+    // baked into an unloadable file.
+    const base = convert.Options{ .block = .@"8x8" };
+    const opts = resourceOpts(atlasPinning(.@"6x6"), base, false, caps);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", opts.block);
 }

@@ -209,7 +209,13 @@ jobs:
           set -uo pipefail
           # Resolves the whole dependency tree from scratch inside a container,
           # so it is the most exposed step in CI to a transient tarball failure.
-          attempt() {
+          # Body is a SUBSHELL so each attempt starts from the workspace: the
+          # chain `cd`s, and a failure used to leave the shell inside the
+          # scratch dir, so the next attempt nested another one and resolved
+          # ../labelle-cli from the wrong place — the retries could not
+          # actually recover. Still &&-chained: bash ignores `set -e` for a
+          # function invoked as an `if` condition.
+          attempt() (
             rm -rf test-docker &&
             mkdir -p test-docker && cd test-docker &&
             ../labelle-cli/zig-out/bin/labelle init docker_test \
@@ -223,7 +229,7 @@ jobs:
             ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm &&
             test -f .labelle/raylib_wasm/zig-out/web/game.wasm &&
             echo "Docker WASM build produced game.wasm"
-          }
+          )
           # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
           # Actions runners for far longer than a few quick attempts: the same
           # URLs served fine from a laptop while three attempts inside 90s all
@@ -322,7 +328,13 @@ jobs:
       - name: Init, generate, and build a project
         run: |
           set -uo pipefail
-          attempt() {
+          # Body is a SUBSHELL so each attempt starts from the workspace: the
+          # chain `cd`s, and a failure used to leave the shell inside the
+          # scratch dir, so the next attempt nested another one and resolved
+          # ../labelle-cli from the wrong place — the retries could not
+          # actually recover. Still &&-chained: bash ignores `set -e` for a
+          # function invoked as an `if` condition.
+          attempt() (
             rm -rf test-projects &&
             mkdir -p test-projects && cd test-projects &&
             ../labelle-cli/zig-out/bin/labelle init test_game --backend=raylib --ecs=zig_ecs \
@@ -335,7 +347,7 @@ jobs:
             ../../labelle-cli/zig-out/bin/labelle generate &&
             cd .labelle/raylib_desktop &&
             zig build
-          }
+          )
           # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
           # Actions runners for far longer than a few quick attempts: the same
           # URLs served fine from a laptop while three attempts inside 90s all
@@ -370,7 +382,13 @@ jobs:
           # Network-bound BY DESIGN: it resolves the paired assembler and the
           # curated pins from GitHub releases, which is the pin-rot guard. So
           # this is the most flake-prone step here and must never be cached.
-          attempt() {
+          # Body is a SUBSHELL so each attempt starts from the workspace: the
+          # chain `cd`s, and a failure used to leave the shell inside the
+          # scratch dir, so the next attempt nested another one and resolved
+          # ../labelle-cli from the wrong place — the retries could not
+          # actually recover. Still &&-chained: bash ignores `set -e` for a
+          # function invoked as an `if` condition.
+          attempt() (
             rm -rf test-projects-released &&
             mkdir -p test-projects-released && cd test-projects-released &&
             ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs &&
@@ -381,7 +399,7 @@ jobs:
             ../../labelle-cli/zig-out/bin/labelle generate &&
             cd .labelle/raylib_desktop &&
             zig build
-          }
+          )
           # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
           # Actions runners for far longer than a few quick attempts: the same
           # URLs served fine from a laptop while three attempts inside 90s all
