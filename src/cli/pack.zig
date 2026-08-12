@@ -10,6 +10,7 @@ const std = @import("std");
 const texpack = @import("../texpack/texpack.zig");
 const config = @import("config.zig");
 const compatibility = @import("compatibility.zig");
+const project_config = @import("project_config.zig");
 
 /// First labelle-gfx minor train whose renderer APPLIES trim offsets
 /// (`SourceRect.pivotOrigin`). Below it, a trimmed atlas draws every frame
@@ -20,7 +21,13 @@ const TRIM_AWARE_GFX_MAJOR: u32 = 1;
 const TRIM_AWARE_GFX_MINOR: u32 = 31;
 
 /// True when `pinned` is a gfx release that predates trim-offset support.
+///
+/// A `local:` pin has no semver train to compare — it parses as 0.0, which
+/// would read as "ancient" and warn on every pack. A local checkout is the
+/// one case where the developer knows what they are building against, so
+/// say nothing rather than cry wolf.
 fn rendererIgnoresTrim(pinned: []const u8) bool {
+    if (project_config.isLocalVersion(pinned)) return false;
     const v = compatibility.parseVersion(pinned);
     return v.major < TRIM_AWARE_GFX_MAJOR or
         (v.major == TRIM_AWARE_GFX_MAJOR and v.minor < TRIM_AWARE_GFX_MINOR);
@@ -158,6 +165,12 @@ test "rendererIgnoresTrim: gfx trains before the fix are flagged" {
     try std.testing.expect(rendererIgnoresTrim("1.30.0"));
     try std.testing.expect(rendererIgnoresTrim("1.28.5"));
     try std.testing.expect(rendererIgnoresTrim("0.9.0"));
+}
+
+test "rendererIgnoresTrim: a local gfx checkout is never flagged" {
+    // `local:` has no semver train; parsing it yields 0.0, which would warn
+    // on every pack against a local gfx that may well carry the fix.
+    try std.testing.expect(!rendererIgnoresTrim("local:../labelle-gfx"));
 }
 
 test "rendererIgnoresTrim: the fix train and later are fine" {
