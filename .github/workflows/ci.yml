@@ -206,18 +206,32 @@ jobs:
         env:
           LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
         run: |
-          mkdir -p test-docker && cd test-docker
-          ../labelle-cli/zig-out/bin/labelle init docker_test \
-            --backend=raylib --ecs=zig_ecs \
-            --core-version="local:../../labelle-core" \
-            --engine-version="local:../../labelle-engine" \
-            --gfx-version="local:../../labelle-gfx" \
-            --labelle-version="local:../../labelle-cli" \
-            --assembler-version="local:../../labelle-assembler"
-          cd docker_test
-          ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm
-          test -f .labelle/raylib_wasm/zig-out/web/game.wasm
-          echo "Docker WASM build produced game.wasm"
+          set -euo pipefail
+          # Resolves the whole dependency tree from scratch inside a
+          # container, so it is the most exposed step in CI to a transient
+          # tarball 503 / HttpConnectionClosing.
+          attempt() {
+            rm -rf test-docker
+            mkdir -p test-docker && cd test-docker
+            ../labelle-cli/zig-out/bin/labelle init docker_test \
+              --backend=raylib --ecs=zig_ecs \
+              --core-version="local:../../labelle-core" \
+              --engine-version="local:../../labelle-engine" \
+              --gfx-version="local:../../labelle-gfx" \
+              --labelle-version="local:../../labelle-cli" \
+              --assembler-version="local:../../labelle-assembler"
+            cd docker_test
+            ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm
+            test -f .labelle/raylib_wasm/zig-out/web/game.wasm
+            echo "Docker WASM build produced game.wasm"
+          }
+          for i in 1 2 3; do
+            if (attempt); then exit 0; fi
+            echo "::warning::attempt $i failed (usually a dependency fetch); retrying"
+            sleep $((i * 30))
+          done
+          echo "::error::still failing after 3 attempts"
+          exit 1
 
   versions-integration:
     name: Versions Integration Test
@@ -297,17 +311,34 @@ jobs:
 
       - name: Init, generate, and build a project
         run: |
-          mkdir -p test-projects && cd test-projects
-          ../labelle-cli/zig-out/bin/labelle init test_game --backend=raylib --ecs=zig_ecs \
-            --core-version="local:../../labelle-core" \
-            --engine-version="local:../../labelle-engine" \
-            --gfx-version="local:../../labelle-gfx" \
-            --labelle-version="local:../../labelle-cli" \
-            --assembler-version="local:../../labelle-assembler"
-          cd test_game
-          ../../labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
+          set -euo pipefail
+          # GitHub intermittently 503s and drops connections on dependency
+          # tarballs, and this step resolves a dozen of them. A single
+          # transient fetch failure should not fail CI: retry the whole
+          # attempt with backoff. Deliberately NOT a dependency cache —
+          # the released-path smoke below exists to catch pin rot, which a
+          # cache would hide.
+          attempt() {
+            rm -rf test-projects
+            mkdir -p test-projects && cd test-projects
+            ../labelle-cli/zig-out/bin/labelle init test_game --backend=raylib --ecs=zig_ecs \
+              --core-version="local:../../labelle-core" \
+              --engine-version="local:../../labelle-engine" \
+              --gfx-version="local:../../labelle-gfx" \
+              --labelle-version="local:../../labelle-cli" \
+              --assembler-version="local:../../labelle-assembler"
+            cd test_game
+            ../../labelle-cli/zig-out/bin/labelle generate
+            cd .labelle/raylib_desktop
+            zig build
+          }
+          for i in 1 2 3; do
+            if (attempt); then exit 0; fi
+            echo "::warning::attempt $i failed (usually a dependency fetch); retrying"
+            sleep $((i * 30))
+          done
+          echo "::error::still failing after 3 attempts"
+          exit 1
 
       # Released-path smoke (labelle-cli#322): init with NO local overrides —
       # the exact cold-user path. Resolves DEFAULT_ASSEMBLER_VERSION from
@@ -320,17 +351,30 @@ jobs:
       # mutually compatible.
       - name: Released-path init smoke (no local overrides)
         run: |
-          set -e
+          set -euo pipefail
           unset LABELLE_ASSEMBLER
-          mkdir -p test-projects-released && cd test-projects-released
-          ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs
-          echo "── scaffolded project.labelle ──"
-          cat cold_game/project.labelle
-          grep -Eq '\.y_axis[[:space:]]*=' cold_game/project.labelle || { echo "FAIL: scaffold missing .y_axis"; exit 1; }
-          cd cold_game
-          ../../labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
+          # This path is network-bound BY DESIGN (it resolves the paired
+          # assembler and the curated pins from GitHub releases), so it is the
+          # most flake-prone step here and the one that must never be cached.
+          attempt() {
+            rm -rf test-projects-released
+            mkdir -p test-projects-released && cd test-projects-released
+            ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs
+            echo "── scaffolded project.labelle ──"
+            cat cold_game/project.labelle
+            grep -Eq '\.y_axis[[:space:]]*=' cold_game/project.labelle || { echo "FAIL: scaffold missing .y_axis"; return 1; }
+            cd cold_game
+            ../../labelle-cli/zig-out/bin/labelle generate
+            cd .labelle/raylib_desktop
+            zig build
+          }
+          for i in 1 2 3; do
+            if (attempt); then exit 0; fi
+            echo "::warning::attempt $i failed (usually a dependency fetch); retrying"
+            sleep $((i * 30))
+          done
+          echo "::error::still failing after 3 attempts"
+          exit 1
 
       - name: Plugin manifest system test
         run: |
