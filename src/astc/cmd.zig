@@ -374,14 +374,22 @@ fn conflictingBlockPin(allocator: std.mem.Allocator, jobs: []const AtlasJob) !?B
 
         const gop = try seen.getOrPut(allocator, out);
         if (gop.found_existing) {
+            // This job's `out` duplicates a key the table already owns, so
+            // it has to go — but only AFTER the clash copy is safely made.
+            // Freeing first left the `errdefer` above armed across the
+            // `dupe`, so an allocation failure there freed `out` twice.
+            if (gop.value_ptr.block != job.opts.block) {
+                const owned = try allocator.dupe(u8, gop.key_ptr.*);
+                allocator.free(out);
+                return .{
+                    .out = owned,
+                    .first = gop.value_ptr.name,
+                    .second = job.name,
+                    .first_block = gop.value_ptr.block,
+                    .second_block = job.opts.block,
+                };
+            }
             allocator.free(out);
-            if (gop.value_ptr.block != job.opts.block) return .{
-                .out = try allocator.dupe(u8, gop.key_ptr.*),
-                .first = gop.value_ptr.name,
-                .second = job.name,
-                .first_block = gop.value_ptr.block,
-                .second_block = job.opts.block,
-            };
             continue;
         }
         gop.value_ptr.* = .{ .name = job.name, .block = job.opts.block };
