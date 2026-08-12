@@ -33,21 +33,41 @@ fn rendererIgnoresTrim(pinned: []const u8) bool {
         (v.major == TRIM_AWARE_GFX_MAJOR and v.minor < TRIM_AWARE_GFX_MINOR);
 }
 
+/// The nearest directory at or above `start` holding a `project.labelle`,
+/// or null if there is none. `labelle pack` takes an arbitrary input path,
+/// so the owning project is the one the SPRITES belong to — not whatever
+/// happens to sit in the shell's cwd. Reading the wrong project's gfx pin
+/// is worse than reading none: it can wave through a trimmed atlas that
+/// the actual target's older renderer will position incorrectly.
+fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 {
+    const io = config.globalIo();
+    var dir: []const u8 = std.fs.path.resolve(arena, &.{input_dir}) catch return null;
+    while (true) {
+        const probe = std.fs.path.join(arena, &.{ dir, "project.labelle" }) catch return null;
+        if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| return dir else |_| {}
+        const parent = std.fs.path.dirname(dir) orelse return null;
+        if (parent.len == dir.len) return null;
+        dir = parent;
+    }
+}
+
 /// Warn when `--trim` is used in a project pinned to a gfx that ignores trim
-/// offsets. Best-effort: `labelle pack` is usable outside a project, so an
-/// unreadable `project.labelle` (or an unpinned gfx) skips the check rather
-/// than failing the pack.
-fn warnIfRendererIgnoresTrim(gpa: std.mem.Allocator) void {
+/// offsets. Best-effort: `labelle pack` is usable outside a project, so no
+/// discoverable `project.labelle` (or an unreadable one) skips the check
+/// rather than failing the pack.
+fn warnIfRendererIgnoresTrim(gpa: std.mem.Allocator, input_dir: []const u8) void {
     // Arena for the parsed config, matching `cmdAstc`: the ZON parse
     // allocates a string per field and this function only needs one of
     // them, so a single arena free beats tracking them individually.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
+    const root = findProjectRoot(arena.allocator(), input_dir) orelse return;
+
     // `gfx_version` is never null — it defaults to the CLI's own paired
     // version when project.labelle omits the pin, which is the right proxy
     // for "what this project will build against".
-    const cfg = config.readProjectConfigQuiet(arena.allocator(), ".") catch return;
+    const cfg = config.readProjectConfigQuiet(arena.allocator(), root) catch return;
     const pinned = cfg.gfx_version;
     if (!rendererIgnoresTrim(pinned)) return;
     std.debug.print(
@@ -114,7 +134,7 @@ pub fn cmdPack(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     const name = name_opt orelse std.fs.path.basename(in_trimmed);
     const out_dir = out_dir_opt orelse (std.fs.path.dirname(in_trimmed) orelse ".");
 
-    if (trim) warnIfRendererIgnoresTrim(allocator);
+    if (trim) warnIfRendererIgnoresTrim(allocator, in);
 
     const result = texpack.packDir(allocator, config.globalIo(), in, out_dir, name, .{
         .padding = padding,

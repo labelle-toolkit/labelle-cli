@@ -134,6 +134,20 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
 
     var tally = Tally{};
 
+    // Two resources may legitimately share one texture (different JSON
+    // views of the same sheet), but they cannot ask for different blocks:
+    // the `.astc` output path is derived from the texture, so the second
+    // conversion overwrites the first and one resource silently ships at a
+    // block it did not ask for. Refuse instead of picking a winner.
+    if (try conflictingBlockPin(allocator, cfg.resources, opts, block_explicit, caps)) |clash| {
+        std.debug.print(
+            "labelle astc: atlases '{s}' and '{s}' share texture '{s}' but pin different blocks " ++
+                "({s} vs {s}) — they compile to one .astc, so pin the same block on both\n",
+            .{ clash.first, clash.second, clash.texture, clash.first_block.arg(), clash.second_block.arg() },
+        );
+        return error.InvalidArgs;
+    }
+
     for (cfg.resources) |res| {
         if (res.kind() != .atlas) continue;
         convertAtlas(allocator, astcenc, dir, res.texture, resourceOpts(res, opts, block_explicit, caps), &tally);
@@ -296,6 +310,50 @@ test "parseQuality maps presets and rejects junk" {
     try std.testing.expect(parseQuality("turbo") == null);
 }
 
+/// Two atlas resources that share a texture but resolve to different ASTC
+/// blocks — the pair whose outputs would clobber each other.
+const BlockClash = struct {
+    texture: []const u8,
+    first: []const u8,
+    second: []const u8,
+    first_block: convert.BlockSize,
+    second_block: convert.BlockSize,
+};
+
+/// The first pair of atlas resources sharing a texture with disagreeing
+/// effective blocks, or null when every shared texture agrees.
+///
+/// Compares the RESOLVED block (after precedence), not the raw pin: two
+/// resources whose pins differ but which both fall back to the backend
+/// default produce identical output and are fine.
+fn conflictingBlockPin(
+    allocator: std.mem.Allocator,
+    resources: []const project_config.ResourceDef,
+    base: convert.Options,
+    block_explicit: bool,
+    caps: convert.BackendCaps,
+) !?BlockClash {
+    var seen: std.StringHashMapUnmanaged(struct { name: []const u8, block: convert.BlockSize }) = .empty;
+    defer seen.deinit(allocator);
+    for (resources) |res| {
+        if (res.kind() != .atlas) continue;
+        const block = resourceOpts(res, base, block_explicit, caps).block;
+        const gop = try seen.getOrPut(allocator, res.texture);
+        if (gop.found_existing) {
+            if (gop.value_ptr.block != block) return .{
+                .texture = res.texture,
+                .first = gop.value_ptr.name,
+                .second = res.name,
+                .first_block = gop.value_ptr.block,
+                .second_block = block,
+            };
+            continue;
+        }
+        gop.value_ptr.* = .{ .name = res.name, .block = block };
+    }
+    return null;
+}
+
 /// An atlas resource pinning `block`, for the precedence tests.
 fn atlasPinning(block: ?convert.BlockSize) project_config.ResourceDef {
     return .{
@@ -339,4 +397,49 @@ test "resourceOpts: quality and other options are carried through unchanged" {
     const base = convert.Options{ .block = .@"8x8", .quality = .thorough };
     const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, .full);
     try std.testing.expectEqual(convert.Quality.thorough, opts.quality);
+}
+
+test "conflictingBlockPin: same texture with different blocks is rejected" {
+    // Both compile to one `.astc`, so the second conversion would
+    // overwrite the first and one atlas would silently ship at the wrong
+    // block — the failure this guard exists to prevent.
+    const base = convert.Options{ .block = .@"8x8" };
+    const resources = [_]project_config.ResourceDef{
+        .{ .name = "sheet_a", .json = "a.json", .texture = "shared.png", .astc_block = .@"4x4" },
+        .{ .name = "sheet_b", .json = "b.json", .texture = "shared.png", .astc_block = .@"8x8" },
+    };
+    const clash = (try conflictingBlockPin(std.testing.allocator, &resources, base, false, .full)).?;
+    try std.testing.expectEqualStrings("shared.png", clash.texture);
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", clash.first_block);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", clash.second_block);
+}
+
+test "conflictingBlockPin: same texture with the same effective block is fine" {
+    // Sharing a texture is legitimate (two JSON views of one sheet). Only
+    // DISAGREEMENT is a problem — and the comparison is on the resolved
+    // block, so differing pins that both fall back to the same default
+    // are not a clash either.
+    const base = convert.Options{ .block = .@"8x8" };
+    const agree = [_]project_config.ResourceDef{
+        .{ .name = "a", .json = "a.json", .texture = "shared.png", .astc_block = .@"4x4" },
+        .{ .name = "b", .json = "b.json", .texture = "shared.png", .astc_block = .@"4x4" },
+    };
+    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &agree, base, false, .full)) == null);
+
+    // An explicit --block overrides every pin, so even disagreeing pins
+    // resolve to one block and must not be rejected.
+    const overridden = [_]project_config.ResourceDef{
+        .{ .name = "a", .json = "a.json", .texture = "shared.png", .astc_block = .@"4x4" },
+        .{ .name = "b", .json = "b.json", .texture = "shared.png", .astc_block = .@"6x6" },
+    };
+    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &overridden, base, true, .full)) == null);
+}
+
+test "conflictingBlockPin: distinct textures never clash" {
+    const base = convert.Options{ .block = .@"8x8" };
+    const resources = [_]project_config.ResourceDef{
+        .{ .name = "a", .json = "a.json", .texture = "a.png", .astc_block = .@"4x4" },
+        .{ .name = "b", .json = "b.json", .texture = "b.png", .astc_block = .@"8x8" },
+    };
+    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &resources, base, false, .full)) == null);
 }

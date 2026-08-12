@@ -358,25 +358,74 @@ fn packAll(allocator: std.mem.Allocator, sprites: []Sprite, opts: Options) !Shee
 /// a partial run, so the winning size is always re-packed last — the
 /// caller blits from `placed` and must not see a rejected layout.
 fn shrink(allocator: std.mem.Allocator, sprites: []Sprite, from: SheetSize, padding: i32) !SheetSize {
-    var best = from;
-    while (true) {
-        if (best.h > 1 and try tryPack(allocator, sprites, best.w, @divExact(best.h, 2), padding)) {
-            best.h = @divExact(best.h, 2);
-            continue;
-        }
-        if (best.w > 1 and try tryPack(allocator, sprites, @divExact(best.w, 2), best.h, padding)) {
-            best.w = @divExact(best.w, 2);
-            continue;
-        }
-        break;
-    }
-    // Restore the winning layout. UNCONDITIONAL: the loop always exits on
-    // a REJECTED attempt, so `sprites[i].placed` holds a partial layout
-    // even when nothing shrank. Kept out of an `assert` so the re-pack
-    // still runs in release builds, where asserts compile away.
+    // Both axis orders, smallest area wins. A single greedy order is not
+    // just suboptimal, it can be 2x off: halving one axis may block a
+    // halving of the other that would have gone further. Three sprites of
+    // 8x11, 2x6 and 7x14 at padding 0 stall at 32x16 going height-first,
+    // while width-first reaches 8x32 — the same sprites in half the
+    // texture. Neither order dominates, so try both.
+    const by_height = try shrinkGreedy(allocator, sprites, from, padding, .height);
+    const by_width = try shrinkGreedy(allocator, sprites, from, padding, .width);
+    const best = if (area(by_width) < area(by_height)) by_width else by_height;
+
+    // Restore the winning layout. UNCONDITIONAL: each greedy pass ends on
+    // a REJECTED attempt, and the loser ran last, so `sprites[i].placed`
+    // never holds the winner's layout at this point. Kept out of an
+    // `assert` so the re-pack still runs in release builds, where asserts
+    // compile away.
     const refit = try tryPack(allocator, sprites, best.w, best.h, padding);
     if (!refit) return Error.AtlasTooLarge;
     return best;
+}
+
+fn area(s: SheetSize) i64 {
+    return @as(i64, s.w) * @as(i64, s.h);
+}
+
+/// Halve `first` for as long as the sprites fit, then the other axis,
+/// repeating until neither budges.
+fn shrinkGreedy(
+    allocator: std.mem.Allocator,
+    sprites: []Sprite,
+    from: SheetSize,
+    padding: i32,
+    first: enum { width, height },
+) !SheetSize {
+    var best = from;
+    while (true) {
+        const halved_first = switch (first) {
+            .height => try halve(allocator, sprites, &best, .height, padding),
+            .width => try halve(allocator, sprites, &best, .width, padding),
+        };
+        if (halved_first) continue;
+        const halved_other = switch (first) {
+            .height => try halve(allocator, sprites, &best, .width, padding),
+            .width => try halve(allocator, sprites, &best, .height, padding),
+        };
+        if (!halved_other) break;
+    }
+    return best;
+}
+
+/// Try halving one axis of `size`. Returns whether it stuck.
+fn halve(
+    allocator: std.mem.Allocator,
+    sprites: []Sprite,
+    size: *SheetSize,
+    axis: enum { width, height },
+    padding: i32,
+) !bool {
+    const dim = switch (axis) {
+        .width => size.w,
+        .height => size.h,
+    };
+    if (dim <= 1) return false;
+    const smaller = @divExact(dim, 2);
+    const w = if (axis == .width) smaller else size.w;
+    const h = if (axis == .height) smaller else size.h;
+    if (!try tryPack(allocator, sprites, w, h, padding)) return false;
+    size.* = .{ .w = w, .h = h };
+    return true;
 }
 
 /// Attempt to place all sprites into a `sheet_w`×`sheet_h` sheet. The
@@ -678,6 +727,43 @@ pub const Trimming = struct {
 };
 
 pub const NonSquareSheets = struct {
+    test "the shrink search beats a single greedy axis order" {
+        // Codex's counterexample on #349: halving height first stalls at
+        // 32x16, while width-first fits the same three sprites in 8x32 —
+        // half the texture. Whichever order the search prefers, it must
+        // not return the larger of the two.
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const cwd = std.Io.Dir.cwd();
+        const work = ".zig-cache/texpack-shrink-order";
+        cwd.deleteTree(io, work) catch {};
+        try cwd.createDirPath(io, work);
+        defer cwd.deleteTree(io, work) catch {};
+
+        const fixtures = [_]struct { name: []const u8, w: i32, h: i32 }{
+            .{ .name = "a.png", .w = 8, .h = 11 },
+            .{ .name = "b.png", .w = 2, .h = 6 },
+            .{ .name = "c.png", .w = 7, .h = 14 },
+        };
+        for (fixtures) |fx| {
+            const png = try encodeSolidPng(allocator, fx.w, fx.h, .{ 255, 0, 0, 255 });
+            defer allocator.free(png);
+            const path = try std.fs.path.join(allocator, &.{ work, fx.name });
+            defer allocator.free(path);
+            try cwd.writeFile(io, .{ .sub_path = path, .data = png });
+        }
+
+        const result = try packDir(allocator, io, work, work, "sheet", .{ .padding = 0 });
+        defer result.deinit(allocator);
+
+        // 32x16 = 512 is what the height-first-only greedy returned.
+        const sheet_area = @as(i64, result.sheet_w) * @as(i64, result.sheet_h);
+        try expect.toBeTrue(sheet_area <= 256);
+    }
+
     test "a wide sprite set packs into a non-square sheet" {
         // Square-only sizing quantises to 4x the area. These four 64x8
         // strips need 256x8; the old packer rounded to 64x64. Halving the
