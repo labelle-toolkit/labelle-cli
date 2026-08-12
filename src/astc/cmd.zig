@@ -134,47 +134,57 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
 
     var tally = Tally{};
 
-    // Two resources may legitimately share one texture (different JSON
-    // views of the same sheet), but they cannot ask for different blocks:
-    // the `.astc` output path is derived from the texture, so the second
-    // conversion overwrites the first and one resource silently ships at a
-    // block it did not ask for. Refuse instead of picking a winner.
-    if (try conflictingBlockPin(allocator, cfg.resources, opts, block_explicit, caps)) |clash| {
-        std.debug.print(
-            "labelle astc: atlases '{s}' and '{s}' share texture '{s}' but pin different blocks " ++
-                "({s} vs {s}) — they compile to one .astc, so pin the same block on both\n",
-            .{ clash.first, clash.second, clash.texture, clash.first_block.arg(), clash.second_block.arg() },
-        );
-        return error.InvalidArgs;
-    }
-
+    // Collect EVERY atlas before converting any, so the clash check below
+    // sees the whole set. The game's own resources and a pack's are equally
+    // able to collide, and two manifests in one pack directory can collide
+    // with each other, so a per-source check would leave holes.
+    //
+    // Pack/plugin-shipped atlases (labelle-cli#315, asset-plugins P1/P2):
+    // packs and local plugins can declare their own `.resources`
+    // (pack.labelle / plugin.labelle) — convert those too, or a compressed
+    // target silently ships them as embedded PNG while the game's own
+    // atlases ride ASTC (the invariant is: a resource behaves identically
+    // whether declared by the game or by a pack). In-tree/local dirs only:
+    // a REMOTE plugin's sources aren't materialized when this step runs
+    // (pre-generate), so its atlases still ride the PNG fallback — a
+    // documented limitation.
+    var atlases: std.ArrayList(AtlasJob) = .empty;
+    defer atlases.deinit(allocator);
     for (cfg.resources) |res| {
         if (res.kind() != .atlas) continue;
-        convertAtlas(allocator, astcenc, dir, res.texture, resourceOpts(res, opts, block_explicit, caps), &tally);
+        try atlases.append(allocator, .{ .name = res.name, .base_dir = dir, .texture = res.texture, .opts = resourceOpts(res, opts, block_explicit, caps) });
     }
-
-    // Pack/plugin-shipped atlases (labelle-cli#315, asset-plugins P1/P2): packs
-    // and local plugins can declare their own `.resources` (pack.labelle /
-    // plugin.labelle) — convert those atlases too, or a compressed target
-    // silently ships them as embedded PNG while the game's own atlases ride
-    // ASTC (the invariant is: a resource behaves identically whether declared
-    // by the game or by a pack). In-tree/local dirs only: a REMOTE plugin's
-    // sources aren't materialized when this step runs (pre-generate), so its
-    // atlases still ride the PNG fallback — a documented limitation.
     for (cfg.plugins) |dep| {
         if (!dep.isLocal()) continue;
         // `resolve` (not `join`): an absolute `local:/…` path must be
         // preserved, not appended under the project dir — matches the plugin
         // resolution in cli/plugins.zig (codex review on #316).
         const pack_dir = try std.fs.path.resolve(allocator, &.{ dir, dep.localPath() });
-        defer allocator.free(pack_dir);
         for ([_][]const u8{ "pack.labelle", "plugin.labelle" }) |manifest| {
             const resources = readDeclaredResources(allocator, pack_dir, manifest) orelse continue;
             for (resources) |res| {
                 if (res.kind() != .atlas) continue;
-                convertAtlas(allocator, astcenc, pack_dir, res.texture, resourceOpts(res, opts, block_explicit, caps), &tally);
+                try atlases.append(allocator, .{ .name = res.name, .base_dir = pack_dir, .texture = res.texture, .opts = resourceOpts(res, opts, block_explicit, caps) });
             }
         }
+    }
+
+    // Two atlases may legitimately share one texture (different JSON views
+    // of the same sheet), but they cannot ask for different blocks: they
+    // compile to ONE `.astc`, so the second conversion overwrites the first
+    // and one resource silently ships at a block it did not ask for. Refuse
+    // instead of picking a winner.
+    if (try conflictingBlockPin(allocator, atlases.items)) |clash| {
+        std.debug.print(
+            "labelle astc: atlases '{s}' and '{s}' both compile to '{s}' but pin different blocks " ++
+                "({s} vs {s}) — pin the same block on both\n",
+            .{ clash.first, clash.second, clash.out, clash.first_block.arg(), clash.second_block.arg() },
+        );
+        return error.InvalidArgs;
+    }
+
+    for (atlases.items) |job| {
+        convertAtlas(allocator, astcenc, job.base_dir, job.texture, job.opts, &tally);
     }
 
     std.debug.print("labelle astc: {d} converted, {d} up-to-date, {d} failed\n", .{ tally.converted, tally.cached, tally.failed });
@@ -310,46 +320,71 @@ test "parseQuality maps presets and rejects junk" {
     try std.testing.expect(parseQuality("turbo") == null);
 }
 
-/// Two atlas resources that share a texture but resolve to different ASTC
-/// blocks — the pair whose outputs would clobber each other.
-const BlockClash = struct {
+/// One atlas queued for conversion, from any source (the game's
+/// `project.labelle` or a local pack/plugin manifest).
+const AtlasJob = struct {
+    name: []const u8,
+    /// Directory `texture` is relative to — the project dir, or the pack's.
+    base_dir: []const u8,
     texture: []const u8,
+    opts: convert.Options,
+};
+
+/// Two queued atlases that compile to the same `.astc` but disagree on the
+/// block — the pair whose outputs would clobber each other.
+///
+/// `out` is OWNED by the caller: the detector frees its key table on the way
+/// out, so handing back a pointer into it would dangle (it printed as
+/// garbage before this was an owned copy). `first`/`second` are borrowed
+/// resource names, which outlive the call.
+const BlockClash = struct {
+    out: []u8,
     first: []const u8,
     second: []const u8,
     first_block: convert.BlockSize,
     second_block: convert.BlockSize,
 };
 
-/// The first pair of atlas resources sharing a texture with disagreeing
-/// effective blocks, or null when every shared texture agrees.
+/// The first pair of atlases writing one `.astc` with disagreeing blocks,
+/// or null when every shared output agrees.
+///
+/// Keyed on the RESOLVED OUTPUT PATH, not on the declared texture string:
+/// `shared.png` and `./shared.png` are different strings addressing the
+/// same file, and two packs can reach the same texture by different
+/// relative paths. The output path is what actually collides, so it is the
+/// only correct key.
 ///
 /// Compares the RESOLVED block (after precedence), not the raw pin: two
 /// resources whose pins differ but which both fall back to the backend
 /// default produce identical output and are fine.
-fn conflictingBlockPin(
-    allocator: std.mem.Allocator,
-    resources: []const project_config.ResourceDef,
-    base: convert.Options,
-    block_explicit: bool,
-    caps: convert.BackendCaps,
-) !?BlockClash {
+fn conflictingBlockPin(allocator: std.mem.Allocator, jobs: []const AtlasJob) !?BlockClash {
     var seen: std.StringHashMapUnmanaged(struct { name: []const u8, block: convert.BlockSize }) = .empty;
-    defer seen.deinit(allocator);
-    for (resources) |res| {
-        if (res.kind() != .atlas) continue;
-        const block = resourceOpts(res, base, block_explicit, caps).block;
-        const gop = try seen.getOrPut(allocator, res.texture);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        seen.deinit(allocator);
+    }
+    for (jobs) |job| {
+        const src = try std.fs.path.join(allocator, &.{ job.base_dir, job.texture });
+        defer allocator.free(src);
+        const resolved = try std.fs.path.resolve(allocator, &.{src});
+        defer allocator.free(resolved);
+        const out = try convert.outputPath(allocator, resolved);
+        errdefer allocator.free(out);
+
+        const gop = try seen.getOrPut(allocator, out);
         if (gop.found_existing) {
-            if (gop.value_ptr.block != block) return .{
-                .texture = res.texture,
+            allocator.free(out);
+            if (gop.value_ptr.block != job.opts.block) return .{
+                .out = try allocator.dupe(u8, gop.key_ptr.*),
                 .first = gop.value_ptr.name,
-                .second = res.name,
+                .second = job.name,
                 .first_block = gop.value_ptr.block,
-                .second_block = block,
+                .second_block = job.opts.block,
             };
             continue;
         }
-        gop.value_ptr.* = .{ .name = res.name, .block = block };
+        gop.value_ptr.* = .{ .name = job.name, .block = job.opts.block };
     }
     return null;
 }
@@ -403,43 +438,63 @@ test "conflictingBlockPin: same texture with different blocks is rejected" {
     // Both compile to one `.astc`, so the second conversion would
     // overwrite the first and one atlas would silently ship at the wrong
     // block — the failure this guard exists to prevent.
-    const base = convert.Options{ .block = .@"8x8" };
-    const resources = [_]project_config.ResourceDef{
-        .{ .name = "sheet_a", .json = "a.json", .texture = "shared.png", .astc_block = .@"4x4" },
-        .{ .name = "sheet_b", .json = "b.json", .texture = "shared.png", .astc_block = .@"8x8" },
+    const jobs = [_]AtlasJob{
+        .{ .name = "sheet_a", .base_dir = "/p", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "sheet_b", .base_dir = "/p", .texture = "shared.png", .opts = .{ .block = .@"8x8" } },
     };
-    const clash = (try conflictingBlockPin(std.testing.allocator, &resources, base, false, .full)).?;
-    try std.testing.expectEqualStrings("shared.png", clash.texture);
+    const clash = (try conflictingBlockPin(std.testing.allocator, &jobs)).?;
+    defer std.testing.allocator.free(clash.out);
+    try std.testing.expectEqualStrings("sheet_a", clash.first);
+    try std.testing.expectEqualStrings("sheet_b", clash.second);
     try std.testing.expectEqual(convert.BlockSize.@"4x4", clash.first_block);
     try std.testing.expectEqual(convert.BlockSize.@"8x8", clash.second_block);
 }
 
-test "conflictingBlockPin: same texture with the same effective block is fine" {
-    // Sharing a texture is legitimate (two JSON views of one sheet). Only
-    // DISAGREEMENT is a problem — and the comparison is on the resolved
-    // block, so differing pins that both fall back to the same default
-    // are not a clash either.
-    const base = convert.Options{ .block = .@"8x8" };
-    const agree = [_]project_config.ResourceDef{
-        .{ .name = "a", .json = "a.json", .texture = "shared.png", .astc_block = .@"4x4" },
-        .{ .name = "b", .json = "b.json", .texture = "shared.png", .astc_block = .@"4x4" },
+test "conflictingBlockPin: path aliases for one file still clash" {
+    // `shared.png` and `./shared.png` are different strings addressing the
+    // same file. Keying on the raw texture string let their pins overwrite
+    // each other silently; the key is the resolved OUTPUT path.
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = "/p", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "b", .base_dir = "/p", .texture = "./shared.png", .opts = .{ .block = .@"8x8" } },
     };
-    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &agree, base, false, .full)) == null);
+    if (try conflictingBlockPin(std.testing.allocator, &jobs)) |c| std.testing.allocator.free(c.out) else return error.TestExpectedClash;
 
-    // An explicit --block overrides every pin, so even disagreeing pins
-    // resolve to one block and must not be rejected.
-    const overridden = [_]project_config.ResourceDef{
-        .{ .name = "a", .json = "a.json", .texture = "shared.png", .astc_block = .@"4x4" },
-        .{ .name = "b", .json = "b.json", .texture = "shared.png", .astc_block = .@"6x6" },
+    // Same file reached from different base dirs, via a relative hop.
+    const across = [_]AtlasJob{
+        .{ .name = "game", .base_dir = "/p", .texture = "assets/x.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "pack", .base_dir = "/p/packs/sky", .texture = "../../assets/x.png", .opts = .{ .block = .@"8x8" } },
     };
-    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &overridden, base, true, .full)) == null);
+    if (try conflictingBlockPin(std.testing.allocator, &across)) |c| std.testing.allocator.free(c.out) else return error.TestExpectedClash;
+}
+
+test "conflictingBlockPin: a pack manifest's own atlases are checked too" {
+    // The clash check used to run only over the game's resources, so two
+    // atlases inside one pack (or across pack.labelle and plugin.labelle in
+    // the same directory) could clobber each other unnoticed.
+    const jobs = [_]AtlasJob{
+        .{ .name = "sky__a", .base_dir = "/p/packs/sky", .texture = "assets/bg.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "sky__b", .base_dir = "/p/packs/sky", .texture = "assets/bg.png", .opts = .{ .block = .@"6x6" } },
+    };
+    const clash = (try conflictingBlockPin(std.testing.allocator, &jobs)).?;
+    defer std.testing.allocator.free(clash.out);
+    try std.testing.expectEqualStrings("sky__a", clash.first);
+}
+
+test "conflictingBlockPin: same output with the same block is fine" {
+    // Sharing a texture is legitimate (two JSON views of one sheet). Only
+    // DISAGREEMENT is a problem.
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = "/p", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "b", .base_dir = "/p", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
+    };
+    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
 }
 
 test "conflictingBlockPin: distinct textures never clash" {
-    const base = convert.Options{ .block = .@"8x8" };
-    const resources = [_]project_config.ResourceDef{
-        .{ .name = "a", .json = "a.json", .texture = "a.png", .astc_block = .@"4x4" },
-        .{ .name = "b", .json = "b.json", .texture = "b.png", .astc_block = .@"8x8" },
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = "/p", .texture = "a.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "b", .base_dir = "/p", .texture = "b.png", .opts = .{ .block = .@"8x8" } },
     };
-    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &resources, base, false, .full)) == null);
+    try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
 }
