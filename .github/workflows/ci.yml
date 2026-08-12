@@ -225,12 +225,16 @@ jobs:
             test -f .labelle/raylib_wasm/zig-out/web/game.wasm
             echo "Docker WASM build produced game.wasm"
           }
-          for i in 1 2 3; do
+          # Backoff spans ~9 minutes in total. 30s was not enough: GitHub's
+          # tarball throttling of Actions runners lasted well past three
+          # quick attempts, while the same URLs served fine from a laptop.
+          for delay in 60 180 300 0; do
             if (attempt); then exit 0; fi
-            echo "::warning::attempt $i failed (usually a dependency fetch); retrying"
-            sleep $((i * 30))
+            if [ "$delay" -eq 0 ]; then break; fi
+            echo "::warning::attempt failed (usually a dependency fetch); retrying in ${delay}s"
+            sleep "$delay"
           done
-          echo "::error::still failing after 3 attempts"
+          echo "::error::still failing after 4 attempts over ~9 minutes"
           exit 1
 
   versions-integration:
@@ -332,12 +336,16 @@ jobs:
             cd .labelle/raylib_desktop
             zig build
           }
-          for i in 1 2 3; do
+          # Backoff spans ~9 minutes in total. 30s was not enough: GitHub's
+          # tarball throttling of Actions runners lasted well past three
+          # quick attempts, while the same URLs served fine from a laptop.
+          for delay in 60 180 300 0; do
             if (attempt); then exit 0; fi
-            echo "::warning::attempt $i failed (usually a dependency fetch); retrying"
-            sleep $((i * 30))
+            if [ "$delay" -eq 0 ]; then break; fi
+            echo "::warning::attempt failed (usually a dependency fetch); retrying in ${delay}s"
+            sleep "$delay"
           done
-          echo "::error::still failing after 3 attempts"
+          echo "::error::still failing after 4 attempts over ~9 minutes"
           exit 1
 
       # Released-path smoke (labelle-cli#322): init with NO local overrides —
@@ -368,12 +376,16 @@ jobs:
             cd .labelle/raylib_desktop
             zig build
           }
-          for i in 1 2 3; do
+          # Backoff spans ~9 minutes in total. 30s was not enough: GitHub's
+          # tarball throttling of Actions runners lasted well past three
+          # quick attempts, while the same URLs served fine from a laptop.
+          for delay in 60 180 300 0; do
             if (attempt); then exit 0; fi
-            echo "::warning::attempt $i failed (usually a dependency fetch); retrying"
-            sleep $((i * 30))
+            if [ "$delay" -eq 0 ]; then break; fi
+            echo "::warning::attempt failed (usually a dependency fetch); retrying in ${delay}s"
+            sleep "$delay"
           done
-          echo "::error::still failing after 3 attempts"
+          echo "::error::still failing after 4 attempts over ~9 minutes"
           exit 1
 
       - name: Plugin manifest system test
