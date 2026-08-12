@@ -35,7 +35,33 @@ fn rendererIgnoresTrim(pinned: []const u8) bool {
     return compatibility.parseVersion(pinned).olderThan(TRIM_AWARE_GFX);
 }
 
-/// The nearest directory at or above `start` holding a `project.labelle`,
+/// Every directory to check for a `project.labelle`, nearest first: the
+/// input, then each ancestor.
+///
+/// Split from the probing so the walk is testable without a filesystem or a
+/// working-directory change. It needs to be: the subtle half is the tail.
+/// A RELATIVE input bottoms out BEFORE the working directory itself —
+/// `dirname("assets")` is null — so `assets/raw/ship` never reaches `.`
+/// unless it is appended explicitly. That is the commonest invocation of
+/// all (`labelle pack assets/raw/x` from the project root), and omitting it
+/// made the lookup return null everywhere, silently disabling the --trim
+/// warning. A silent guard is worse than no guard: it reads as "checked".
+fn candidateRoots(arena: std.mem.Allocator, input_dir: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var dir: []const u8 = input_dir;
+    while (true) {
+        try out.append(arena, dir);
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (parent.len == 0 or parent.len == dir.len) break;
+        dir = parent;
+    }
+    // The cwd, for relative inputs only — an absolute input's ancestors are
+    // already complete, and `.` would be an unrelated directory.
+    if (!std.fs.path.isAbsolute(input_dir)) try out.append(arena, ".");
+    return out.items;
+}
+
+/// The nearest directory at or above `input_dir` holding a `project.labelle`,
 /// or null if there is none. `labelle pack` takes an arbitrary input path,
 /// so the owning project is the one the SPRITES belong to — not whatever
 /// happens to sit in the shell's cwd. Reading the wrong project's gfx pin
@@ -43,21 +69,10 @@ fn rendererIgnoresTrim(pinned: []const u8) bool {
 /// the actual target's older renderer will position incorrectly.
 fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 {
     const io = config.globalIo();
-    var dir: []const u8 = input_dir;
-    while (true) {
+    const candidates = candidateRoots(arena, input_dir) catch return null;
+    for (candidates) |dir| {
         const probe = std.fs.path.join(arena, &.{ dir, "project.labelle" }) catch return null;
         if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| return dir else |_| {}
-        const parent = std.fs.path.dirname(dir) orelse break;
-        if (parent.len == 0 or parent.len == dir.len) break;
-        dir = parent;
-    }
-    // A RELATIVE input bottoms out BEFORE the working directory itself:
-    // `dirname("assets")` is null, so walking up from `assets/raw/ship`
-    // never probes `.`. That is the commonest invocation of all — running
-    // `labelle pack assets/raw/x` from the project root — and missing it
-    // made this return null everywhere, silently disabling the warning.
-    if (!std.fs.path.isAbsolute(input_dir)) {
-        if (std.Io.Dir.cwd().statFile(io, "project.labelle", .{})) |_| return "." else |_| {}
     }
     return null;
 }
@@ -278,4 +293,41 @@ test "the trim guard reads the gfx pin from the discovered project" {
     const cfg = try config.readProjectConfigQuiet(a, found);
     try std.testing.expectEqualStrings("1.30.0", cfg.gfx_version);
     try std.testing.expect(rendererIgnoresTrim(cfg.gfx_version));
+}
+
+test "candidateRoots: a relative input ends at the CWD" {
+    // The regression that silently disabled the --trim warning: walking up
+    // from `assets/raw/ship` stops at `assets`, so `.` must be appended or
+    // a project sitting in the working directory is never found — which is
+    // where it sits for the commonest invocation of all.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try candidateRoots(a, "assets/raw/ship");
+    const want = [_][]const u8{ "assets/raw/ship", "assets/raw", "assets", "." };
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+
+    // A single-segment relative input is the tightest case: its only
+    // ancestor IS the cwd.
+    const one = try candidateRoots(a, "assets");
+    try std.testing.expectEqual(@as(usize, 2), one.len);
+    try std.testing.expectEqualStrings("assets", one[0]);
+    try std.testing.expectEqualStrings(".", one[1]);
+}
+
+test "candidateRoots: an absolute input walks to the root and stops" {
+    // No `.` for absolute inputs — the ancestor chain is already complete,
+    // and the working directory would be an unrelated project.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try candidateRoots(a, "/games/fp/assets/raw");
+    try std.testing.expectEqualStrings("/games/fp/assets/raw", got[0]);
+    try std.testing.expectEqualStrings("/games/fp/assets", got[1]);
+    try std.testing.expectEqualStrings("/games/fp", got[2]);
+    try std.testing.expectEqualStrings("/games", got[3]);
+    for (got) |g| try std.testing.expect(!std.mem.eql(u8, g, "."));
 }
