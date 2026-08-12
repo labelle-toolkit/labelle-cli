@@ -20,6 +20,10 @@ const usage =
     \\Converts each atlas texture declared in project.labelle to a co-located
     \\<name>.astc (GPU-native, zero runtime decode). Default block 8x8, quality fast.
     \\
+    \\An individual atlas can pin its own block in project.labelle
+    \\(`.astc_block = .@"4x4"` on the resource); an explicit --block here
+    \\overrides every such pin.
+    \\
 ;
 
 /// Filesystem mtime probe for the re-encode cache decision (injected into the
@@ -132,7 +136,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
 
     for (cfg.resources) |res| {
         if (res.kind() != .atlas) continue;
-        convertAtlas(allocator, astcenc, dir, res.texture, opts, &tally);
+        convertAtlas(allocator, astcenc, dir, res.texture, resourceOpts(res, opts, block_explicit, caps), &tally);
     }
 
     // Pack/plugin-shipped atlases (labelle-cli#315, asset-plugins P1/P2): packs
@@ -154,7 +158,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             const resources = readDeclaredResources(allocator, pack_dir, manifest) orelse continue;
             for (resources) |res| {
                 if (res.kind() != .atlas) continue;
-                convertAtlas(allocator, astcenc, pack_dir, res.texture, opts, &tally);
+                convertAtlas(allocator, astcenc, pack_dir, res.texture, resourceOpts(res, opts, block_explicit, caps), &tally);
             }
         }
     }
@@ -168,6 +172,36 @@ const Tally = struct {
     cached: usize = 0,
     failed: usize = 0,
 };
+
+/// Per-resource conversion options: the command-wide `base` with this
+/// atlas's own `astc_block` applied.
+///
+/// Precedence is explicit-flag → per-atlas → backend default. An explicit
+/// `--block` is a manual override of the whole run (you asked for this
+/// block, you get it everywhere), so it beats the manifest; without it,
+/// an atlas that pinned a block gets it. A pinned block the backend
+/// cannot upload is DROPPED with a warning rather than failing the build:
+/// unlike the flag case there is no interactive user to correct, and a
+/// silently unloadable atlas leaves the game stuck on the loading scene.
+fn resourceOpts(
+    res: project_config.ResourceDef,
+    base: convert.Options,
+    block_explicit: bool,
+    caps: convert.BackendCaps,
+) convert.Options {
+    if (block_explicit) return base;
+    const pinned = res.astc_block orelse return base;
+    if (!caps.supports(pinned)) {
+        std.debug.print(
+            "labelle astc: atlas '{s}' pins ASTC {s}, which this backend cannot upload — using {s}\n",
+            .{ res.name, pinned.arg(), base.block.arg() },
+        );
+        return base;
+    }
+    var opts = base;
+    opts.block = pinned;
+    return opts;
+}
 
 /// Convert one atlas texture (path relative to `base_dir`) to its co-located
 /// `.astc` sibling, honouring the mtime + block-size cache. Shared by the
@@ -260,4 +294,49 @@ test "parseQuality maps presets and rejects junk" {
     try std.testing.expectEqual(convert.Quality.fast, parseQuality("fast").?);
     try std.testing.expectEqual(convert.Quality.thorough, parseQuality("thorough").?);
     try std.testing.expect(parseQuality("turbo") == null);
+}
+
+/// An atlas resource pinning `block`, for the precedence tests.
+fn atlasPinning(block: ?convert.BlockSize) project_config.ResourceDef {
+    return .{
+        .name = "characters",
+        .json = "assets/characters.json",
+        .texture = "assets/characters.png",
+        .astc_block = block,
+    };
+}
+
+test "resourceOpts: an atlas without a pin keeps the run-wide block" {
+    const base = convert.Options{ .block = .@"8x8" };
+    const opts = resourceOpts(atlasPinning(null), base, false, .full);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", opts.block);
+}
+
+test "resourceOpts: a pinned block wins over the backend default" {
+    // The whole point of the knob: characters at 4x4 while the rest of
+    // the project stays on the 8x8 default.
+    const base = convert.Options{ .block = .@"8x8" };
+    const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, .full);
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", opts.block);
+}
+
+test "resourceOpts: an explicit --block overrides every pin" {
+    const base = convert.Options{ .block = .@"6x6" };
+    const opts = resourceOpts(atlasPinning(.@"4x4"), base, true, .full);
+    try std.testing.expectEqual(convert.BlockSize.@"6x6", opts.block);
+}
+
+test "resourceOpts: a pin the backend cannot upload degrades to the default" {
+    // sokol loads 4x4 only. A pin it can't upload must NOT be baked: the
+    // atlas would parse and then fail to upload, stranding the game on
+    // the loading scene. Fall back rather than ship a dud.
+    const base = convert.Options{ .block = .@"4x4" };
+    const opts = resourceOpts(atlasPinning(.@"8x8"), base, false, .sokol_4x4_only);
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", opts.block);
+}
+
+test "resourceOpts: quality and other options are carried through unchanged" {
+    const base = convert.Options{ .block = .@"8x8", .quality = .thorough };
+    const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, .full);
+    try std.testing.expectEqual(convert.Quality.thorough, opts.quality);
 }
