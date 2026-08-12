@@ -20,6 +20,14 @@ pub const Options = struct {
     padding: i32 = 2,
     /// Hard cap on each sheet dimension. Packing fails past this.
     max_size: i32 = 4096,
+    /// Crop each sprite's fully-transparent margin before packing, and
+    /// record the crop in the sidecar (`trimmed` + `spriteSourceSize`)
+    /// so the renderer can put the pixels back where the artist drew
+    /// them. Off by default: it is only lossless against a renderer that
+    /// APPLIES those offsets — labelle-gfx did not until the trim-offset
+    /// fix, and against an older one a trimmed sheet silently re-centres
+    /// every frame on its own silhouette.
+    trim: bool = false,
 };
 
 pub const Result = struct {
@@ -47,12 +55,68 @@ pub const Error = error{
 const Sprite = struct {
     /// Source filename, used verbatim as the atlas JSON key. Owned.
     name: []u8,
+    /// The rect that actually lands in the sheet — the trimmed size under
+    /// `Options.trim`, the full canvas otherwise.
     w: i32,
     h: i32,
-    /// stb-allocated RGBA pixels — freed via `stbi_image_free`.
+    /// The authored canvas size (the sidecar's `sourceSize`). Equal to
+    /// `w`/`h` when nothing was cropped.
+    src_w: i32,
+    src_h: i32,
+    /// Where `w`×`h` sits inside that canvas (the sidecar's
+    /// `spriteSourceSize.x/y`). Zero when nothing was cropped.
+    off_x: i32 = 0,
+    off_y: i32 = 0,
+    /// stb-allocated RGBA pixels of the FULL `src_w`×`src_h` canvas —
+    /// freed via `stbi_image_free`. Trimming changes which sub-rect gets
+    /// blitted, never the decoded buffer.
     pixels: [*c]u8,
     placed: maxrects.Rect = undefined,
+
+    fn trimmed(self: Sprite) bool {
+        return self.w != self.src_w or self.h != self.src_h;
+    }
 };
+
+/// A sprite's placed rect within its authored canvas — the trim result.
+const TrimRect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// The opaque bounds of an RGBA image: the smallest rect containing every
+/// pixel with a non-zero alpha.
+///
+/// A fully transparent sprite has no such rect. Rather than emit a 0×0
+/// frame — which would divide by zero in UV computation and give the
+/// packer a degenerate rect — it keeps a single pixel at the origin. The
+/// sprite stays invisible either way; this just keeps every downstream
+/// consumer dealing in positive extents.
+fn opaqueBounds(pixels: [*c]const u8, w: i32, h: i32) TrimRect {
+    const uw: usize = @intCast(w);
+    const uh: usize = @intCast(h);
+    var min_x: usize = uw;
+    var min_y: usize = uh;
+    var max_x: usize = 0;
+    var max_y: usize = 0;
+    var found = false;
+    var y: usize = 0;
+    while (y < uh) : (y += 1) {
+        var x: usize = 0;
+        while (x < uw) : (x += 1) {
+            if (pixels[(y * uw + x) * 4 + 3] == 0) continue;
+            found = true;
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+    }
+    if (!found) return .{ .x = 0, .y = 0, .w = 1, .h = 1 };
+    return .{
+        .x = @intCast(min_x),
+        .y = @intCast(min_y),
+        .w = @intCast(max_x - min_x + 1),
+        .h = @intCast(max_y - min_y + 1),
+    };
+}
 
 /// Pack every PNG in `input_dir` into an atlas written to `out_dir` as
 /// `<name>.atlas.png` + `<name>.atlas.json`.
@@ -64,7 +128,7 @@ pub fn packDir(
     name: []const u8,
     opts: Options,
 ) !Result {
-    var sprites = try decodeFolder(allocator, io, input_dir);
+    var sprites = try decodeFolder(allocator, io, input_dir, opts.trim);
     defer {
         // Free the stb pixels + names before the list buffer — once
         // `deinit` runs, `sprites.items` is undefined.
@@ -92,7 +156,17 @@ pub fn packDir(
     var frames = try allocator.alloc(atlas_json.Frame, sprites.items.len);
     defer allocator.free(frames);
     for (sprites.items, 0..) |s, i| {
-        frames[i] = .{ .name = s.name, .x = s.placed.x, .y = s.placed.y, .w = s.w, .h = s.h };
+        frames[i] = .{
+            .name = s.name,
+            .x = s.placed.x,
+            .y = s.placed.y,
+            .w = s.w,
+            .h = s.h,
+            .src_w = s.src_w,
+            .src_h = s.src_h,
+            .off_x = s.off_x,
+            .off_y = s.off_y,
+        };
     }
     const json_bytes = try atlas_json.emit(allocator, frames, sheet.w, sheet.h, png_name);
     defer allocator.free(json_bytes);
@@ -144,13 +218,14 @@ fn decodeFolder(
     allocator: std.mem.Allocator,
     io: std.Io,
     input_dir: []const u8,
+    trim: bool,
 ) !std.ArrayList(Sprite) {
     var sprites: std.ArrayList(Sprite) = .empty;
     errdefer {
         freeSprites(allocator, sprites.items);
         sprites.deinit(allocator);
     }
-    try scanInto(allocator, io, input_dir, "", &sprites);
+    try scanInto(allocator, io, input_dir, "", trim, &sprites);
     return sprites;
 }
 
@@ -161,6 +236,7 @@ fn scanInto(
     io: std.Io,
     input_dir: []const u8,
     rel: []const u8,
+    trim: bool,
     sprites: *std.ArrayList(Sprite),
 ) !void {
     const dir_path = if (rel.len == 0)
@@ -182,7 +258,7 @@ fn scanInto(
         errdefer allocator.free(rel_key);
 
         if (entry.kind == .directory) {
-            try scanInto(allocator, io, input_dir, rel_key, sprites);
+            try scanInto(allocator, io, input_dir, rel_key, trim, sprites);
             allocator.free(rel_key);
             continue;
         }
@@ -206,11 +282,23 @@ fn scanInto(
         if (pixels == null or w <= 0 or h <= 0) return Error.DecodeFailed;
         errdefer c.stbi_image_free(pixels);
 
+        // Trimming is decided here, at decode, so the packer only ever
+        // sees the rect it will place — the sheet-size search and the
+        // blit both read `w`/`h` and need them already cropped.
+        const bounds: TrimRect = if (trim)
+            opaqueBounds(pixels, @intCast(w), @intCast(h))
+        else
+            .{ .x = 0, .y = 0, .w = @intCast(w), .h = @intCast(h) };
+
         // `rel_key` ownership transfers to the Sprite on success.
         try sprites.append(allocator, .{
             .name = rel_key,
-            .w = @intCast(w),
-            .h = @intCast(h),
+            .w = bounds.w,
+            .h = bounds.h,
+            .src_w = @intCast(w),
+            .src_h = @intCast(h),
+            .off_x = bounds.x,
+            .off_y = bounds.y,
             .pixels = pixels,
         });
     }
@@ -218,8 +306,16 @@ fn scanInto(
 
 const SheetSize = struct { w: i32, h: i32 };
 
-/// Find the smallest square power-of-two sheet that fits every sprite,
-/// recording each sprite's placement in `sprites[i].placed`.
+/// Find the smallest power-of-two sheet that fits every sprite, recording
+/// each sprite's placement in `sprites[i].placed`.
+///
+/// Squares are tried first (the cheap search), then each axis is halved
+/// for as long as the sprites still fit. Halving matters because square-
+/// only sizing quantises to 4x the area: a sheet needing 2.1M px of
+/// sprites can only round up to 2048x2048 (4.19M) when 2048x1024 (2.10M)
+/// would hold it — a doubling of texture memory for nothing. Non-square
+/// power-of-two sheets are what TexturePacker already emitted and what
+/// the engine's atlas loader has always read via `meta.size`.
 ///
 /// Padding sits *between* sprites, never at the outer sheet edges, so a
 /// single N×N sprite still fits an N×N max-size sheet. We model this by
@@ -247,20 +343,49 @@ fn packAll(allocator: std.mem.Allocator, sprites: []Sprite, opts: Options) !Shee
     }
 
     while (size <= opts.max_size) : (size *= 2) {
-        if (try tryPack(allocator, sprites, size, opts.padding)) {
-            return .{ .w = size, .h = size };
+        if (try tryPack(allocator, sprites, size, size, opts.padding)) {
+            return shrink(allocator, sprites, .{ .w = size, .h = size }, opts.padding);
         }
     }
     return Error.AtlasTooLarge;
 }
 
-/// Attempt to place all sprites into a `size`×`size` sheet. The packing
-/// bin is grown by `padding` on each axis so trailing inter-sprite gaps
-/// of edge sprites land in the margin rather than shrinking usable area.
-/// On success every `sprites[i].placed` holds the sprite's rect; on
-/// failure the caller retries with a larger bin.
-fn tryPack(allocator: std.mem.Allocator, sprites: []Sprite, size: i32, padding: i32) !bool {
-    var packer = try maxrects.Packer.init(allocator, size + padding, size + padding);
+/// Halve either axis of an already-fitting sheet for as long as the
+/// sprites still fit, smaller axis first so the result is as square as the
+/// content allows.
+///
+/// A failed `tryPack` leaves `sprites[i].placed` holding the placements of
+/// a partial run, so the winning size is always re-packed last — the
+/// caller blits from `placed` and must not see a rejected layout.
+fn shrink(allocator: std.mem.Allocator, sprites: []Sprite, from: SheetSize, padding: i32) !SheetSize {
+    var best = from;
+    while (true) {
+        if (best.h > 1 and try tryPack(allocator, sprites, best.w, @divExact(best.h, 2), padding)) {
+            best.h = @divExact(best.h, 2);
+            continue;
+        }
+        if (best.w > 1 and try tryPack(allocator, sprites, @divExact(best.w, 2), best.h, padding)) {
+            best.w = @divExact(best.w, 2);
+            continue;
+        }
+        break;
+    }
+    // Restore the winning layout. UNCONDITIONAL: the loop always exits on
+    // a REJECTED attempt, so `sprites[i].placed` holds a partial layout
+    // even when nothing shrank. Kept out of an `assert` so the re-pack
+    // still runs in release builds, where asserts compile away.
+    const refit = try tryPack(allocator, sprites, best.w, best.h, padding);
+    if (!refit) return Error.AtlasTooLarge;
+    return best;
+}
+
+/// Attempt to place all sprites into a `sheet_w`×`sheet_h` sheet. The
+/// packing bin is grown by `padding` on each axis so trailing
+/// inter-sprite gaps of edge sprites land in the margin rather than
+/// shrinking usable area. On success every `sprites[i].placed` holds the
+/// sprite's rect; on failure the caller retries with a different bin.
+fn tryPack(allocator: std.mem.Allocator, sprites: []Sprite, sheet_w: i32, sheet_h: i32, padding: i32) !bool {
+    var packer = try maxrects.Packer.init(allocator, sheet_w + padding, sheet_h + padding);
     defer packer.deinit();
 
     for (sprites) |*s| {
@@ -268,7 +393,7 @@ fn tryPack(allocator: std.mem.Allocator, sprites: []Sprite, size: i32, padding: 
         // The sprite occupies only `w`×`h`; the extra `padding` is the
         // gap to its right/bottom neighbour. Reject placements whose
         // sprite body would spill past the actual sheet edge.
-        if (slot.x + s.w > size or slot.y + s.h > size) return false;
+        if (slot.x + s.w > sheet_w or slot.y + s.h > sheet_h) return false;
         s.placed = .{ .x = slot.x, .y = slot.y, .w = s.w, .h = s.h };
     }
     return true;
@@ -292,10 +417,16 @@ fn renderSheetPng(
         const sph: usize = @intCast(s.h);
         const dx: usize = @intCast(s.placed.x);
         const dy: usize = @intCast(s.placed.y);
+        // The decoded buffer is always the FULL canvas, so the source
+        // stride is `src_w` and each row starts at the trim offset. With
+        // no trimming these collapse to `spw` and 0.
+        const src_stride: usize = @intCast(s.src_w);
+        const ox: usize = @intCast(s.off_x);
+        const oy: usize = @intCast(s.off_y);
         var row: usize = 0;
         while (row < sph) : (row += 1) {
             const dst = ((dy + row) * sw + dx) * 4;
-            const src = row * spw * 4;
+            const src = ((oy + row) * src_stride + ox) * 4;
             @memcpy(sheet[dst .. dst + spw * 4], s.pixels[src .. src + spw * 4]);
         }
     }
@@ -357,6 +488,239 @@ fn encodeSolidPng(allocator: std.mem.Allocator, w: i32, h: i32, rgba: [4]u8) ![]
     if (ok == 0 or sink.failed) return error.EncodeFailed;
     return sink.list.toOwnedSlice(allocator);
 }
+
+/// Encode a `canvas_w`×`canvas_h` transparent RGBA image with one opaque
+/// `rect_w`×`rect_h` block at (`off_x`, `off_y`) — a sprite with a
+/// transparent margin for the trimmer to find (test fixture).
+fn encodePaddedPng(
+    allocator: std.mem.Allocator,
+    canvas_w: i32,
+    canvas_h: i32,
+    off_x: i32,
+    off_y: i32,
+    rect_w: i32,
+    rect_h: i32,
+    rgba: [4]u8,
+) ![]u8 {
+    const cw: usize = @intCast(canvas_w);
+    const ch: usize = @intCast(canvas_h);
+    const px = try allocator.alloc(u8, cw * ch * 4);
+    defer allocator.free(px);
+    @memset(px, 0);
+    var y: usize = @intCast(off_y);
+    while (y < @as(usize, @intCast(off_y + rect_h))) : (y += 1) {
+        var x: usize = @intCast(off_x);
+        while (x < @as(usize, @intCast(off_x + rect_w))) : (x += 1) {
+            const i = (y * cw + x) * 4;
+            px[i + 0] = rgba[0];
+            px[i + 1] = rgba[1];
+            px[i + 2] = rgba[2];
+            px[i + 3] = rgba[3];
+        }
+    }
+    var sink: PngSink = .{ .list = .empty, .allocator = allocator };
+    errdefer sink.list.deinit(allocator);
+    const ok = c.stbi_write_png_to_func(pngWrite, &sink, canvas_w, canvas_h, 4, px.ptr, canvas_w * 4);
+    if (ok == 0 or sink.failed) return error.EncodeFailed;
+    return sink.list.toOwnedSlice(allocator);
+}
+
+pub const Trimming = struct {
+    /// Write one padded fixture into a scratch dir and pack it.
+    /// `sub` keeps concurrent specs off each other's directories.
+    fn packOne(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        sub: []const u8,
+        png: []const u8,
+        opts: Options,
+    ) !struct { result: Result, work: []const u8 } {
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, sub) catch {};
+        try cwd.createDirPath(io, sub);
+        const path = try std.fs.path.join(allocator, &.{ sub, "pad.png" });
+        defer allocator.free(path);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = png });
+        return .{ .result = try packDir(allocator, io, sub, sub, "sheet", opts), .work = sub };
+    }
+
+    test "--trim crops the transparent margin and records where it was" {
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+
+        // 40x30 canvas, opaque 10x8 block at (12, 9).
+        const png = try encodePaddedPng(allocator, 40, 30, 12, 9, 10, 8, .{ 255, 0, 0, 255 });
+        defer allocator.free(png);
+        const work = ".zig-cache/texpack-trim";
+        const packed_result = try packOne(allocator, io, work, png, .{ .trim = true });
+        defer packed_result.result.deinit(allocator);
+        defer cwd.deleteTree(io, work) catch {};
+
+        const json = try cwd.readFileAlloc(io, packed_result.result.json_path, allocator, .limited(1 << 20));
+        defer allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        const f = parsed.value.object.get("frames").?.object.get("pad.png").?.object;
+
+        // The sheet holds only the opaque block...
+        const frame = f.get("frame").?.object;
+        try expect.equal(frame.get("w").?.integer, @as(i64, 10));
+        try expect.equal(frame.get("h").?.integer, @as(i64, 8));
+        // ...and the sidecar remembers the canvas it came out of, so the
+        // renderer can put it back. Without these three the crop is a
+        // silent position change, not a storage optimisation.
+        try expect.toBeTrue(f.get("trimmed").?.bool);
+        const sss = f.get("spriteSourceSize").?.object;
+        try expect.equal(sss.get("x").?.integer, @as(i64, 12));
+        try expect.equal(sss.get("y").?.integer, @as(i64, 9));
+        const src = f.get("sourceSize").?.object;
+        try expect.equal(src.get("w").?.integer, @as(i64, 40));
+        try expect.equal(src.get("h").?.integer, @as(i64, 30));
+    }
+
+    test "--trim blits the cropped sub-rect, not the canvas corner" {
+        // The blit reads from the FULL decoded canvas at the trim offset.
+        // Getting that stride/offset wrong yields a sheet of transparent
+        // pixels that no JSON assertion would catch.
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+
+        const png = try encodePaddedPng(allocator, 40, 30, 12, 9, 10, 8, .{ 255, 0, 0, 255 });
+        defer allocator.free(png);
+        const work = ".zig-cache/texpack-trim-blit";
+        const packed_result = try packOne(allocator, io, work, png, .{ .trim = true });
+        defer packed_result.result.deinit(allocator);
+        defer cwd.deleteTree(io, work) catch {};
+
+        const png_bytes = try cwd.readFileAlloc(io, packed_result.result.png_path, allocator, .limited(1 << 24));
+        defer allocator.free(png_bytes);
+        var dw: c_int = 0;
+        var dh: c_int = 0;
+        var dch: c_int = 0;
+        const pixels = c.stbi_load_from_memory(png_bytes.ptr, @intCast(png_bytes.len), &dw, &dh, &dch, 4);
+        try expect.notToBeNull(pixels);
+        defer c.stbi_image_free(pixels);
+
+        // Every pixel of the packed 10x8 rect is the opaque red block.
+        const sw: usize = @intCast(dw);
+        var y: usize = 0;
+        var opaque_count: usize = 0;
+        while (y < 8) : (y += 1) {
+            var x: usize = 0;
+            while (x < 10) : (x += 1) {
+                const i = (y * sw + x) * 4;
+                try expect.equal(pixels[i + 0], @as(u8, 255));
+                try expect.equal(pixels[i + 3], @as(u8, 255));
+                opaque_count += 1;
+            }
+        }
+        try expect.equal(opaque_count, @as(usize, 80));
+    }
+
+    test "trimming is off by default — the canvas is packed whole" {
+        // The regression guard for every existing caller: without the
+        // flag, a padded sprite keeps its margin and its zero offsets.
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+
+        const png = try encodePaddedPng(allocator, 40, 30, 12, 9, 10, 8, .{ 255, 0, 0, 255 });
+        defer allocator.free(png);
+        const work = ".zig-cache/texpack-notrim";
+        const packed_result = try packOne(allocator, io, work, png, .{});
+        defer packed_result.result.deinit(allocator);
+        defer cwd.deleteTree(io, work) catch {};
+
+        const json = try cwd.readFileAlloc(io, packed_result.result.json_path, allocator, .limited(1 << 20));
+        defer allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        const f = parsed.value.object.get("frames").?.object.get("pad.png").?.object;
+
+        try expect.equal(f.get("frame").?.object.get("w").?.integer, @as(i64, 40));
+        try expect.toBeFalse(f.get("trimmed").?.bool);
+        try expect.equal(f.get("spriteSourceSize").?.object.get("x").?.integer, @as(i64, 0));
+        try expect.equal(f.get("sourceSize").?.object.get("w").?.integer, @as(i64, 40));
+    }
+
+    test "a fully transparent sprite keeps a 1x1 frame instead of 0x0" {
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+
+        // No opaque pixel anywhere: a 0x0 crop would divide by zero in UV
+        // computation downstream.
+        const png = try encodePaddedPng(allocator, 16, 16, 0, 0, 0, 0, .{ 0, 0, 0, 0 });
+        defer allocator.free(png);
+        const work = ".zig-cache/texpack-empty";
+        const packed_result = try packOne(allocator, io, work, png, .{ .trim = true });
+        defer packed_result.result.deinit(allocator);
+        defer cwd.deleteTree(io, work) catch {};
+
+        const json = try cwd.readFileAlloc(io, packed_result.result.json_path, allocator, .limited(1 << 20));
+        defer allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        const frame = parsed.value.object.get("frames").?.object.get("pad.png").?.object.get("frame").?.object;
+        try expect.equal(frame.get("w").?.integer, @as(i64, 1));
+        try expect.equal(frame.get("h").?.integer, @as(i64, 1));
+    }
+};
+
+pub const NonSquareSheets = struct {
+    test "a wide sprite set packs into a non-square sheet" {
+        // Square-only sizing quantises to 4x the area. These four 64x8
+        // strips need 256x8; the old packer rounded to 64x64. Halving the
+        // unused axis is what keeps a mostly-flat atlas from paying for
+        // empty rows of texture memory.
+        const allocator = std.testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const cwd = std.Io.Dir.cwd();
+        const work = ".zig-cache/texpack-nonsquare";
+        cwd.deleteTree(io, work) catch {};
+        try cwd.createDirPath(io, work);
+        defer cwd.deleteTree(io, work) catch {};
+
+        for (0..4) |i| {
+            const png = try encodeSolidPng(allocator, 64, 8, .{ 255, 0, 0, 255 });
+            defer allocator.free(png);
+            const name = try std.fmt.allocPrint(allocator, "strip{d}.png", .{i});
+            defer allocator.free(name);
+            const path = try std.fs.path.join(allocator, &.{ work, name });
+            defer allocator.free(path);
+            try cwd.writeFile(io, .{ .sub_path = path, .data = png });
+        }
+
+        const result = try packDir(allocator, io, work, work, "sheet", .{ .padding = 0 });
+        defer result.deinit(allocator);
+        try expect.toBeTrue(result.sheet_h < result.sheet_w);
+        // And the placements survived the shrink search: a rejected
+        // attempt must not leave its partial layout behind.
+        const json = try cwd.readFileAlloc(io, result.json_path, allocator, .limited(1 << 20));
+        defer allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        var it = parsed.value.object.get("frames").?.object.iterator();
+        while (it.next()) |entry| {
+            const f = entry.value_ptr.object.get("frame").?.object;
+            try expect.toBeTrue(f.get("x").?.integer + f.get("w").?.integer <= result.sheet_w);
+            try expect.toBeTrue(f.get("y").?.integer + f.get("h").?.integer <= result.sheet_h);
+        }
+    }
+};
 
 pub const PackDir = struct {
     test "packs a folder into a valid atlas pair" {

@@ -118,8 +118,10 @@ fn depCompatWarn(dep_version: []const u8, core_major: u32) bool {
     return parseVersion(dep_version).major != core_major;
 }
 
-/// Parse a semver string into its major/minor components.
-fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
+/// Parse a semver string into its major/minor components. Public so other
+/// commands can gate a feature on a package's minor train (e.g. `pack
+/// --trim` needs a gfx that applies trim offsets).
+pub fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
     var parts: [3]u32 = .{ 0, 0, 0 };
     var part_idx: u8 = 0;
 

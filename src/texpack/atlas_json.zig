@@ -13,11 +13,35 @@ pub const Frame = struct {
     y: i32,
     w: i32,
     h: i32,
+    /// The authored canvas size (`sourceSize`). Defaults to the packed
+    /// size, i.e. nothing was cropped.
+    src_w: i32 = 0,
+    src_h: i32 = 0,
+    /// Where the packed rect sits inside that canvas
+    /// (`spriteSourceSize.x/y`).
+    off_x: i32 = 0,
+    off_y: i32 = 0,
+
+    fn canvasW(self: Frame) i32 {
+        return if (self.src_w > 0) self.src_w else self.w;
+    }
+
+    fn canvasH(self: Frame) i32 {
+        return if (self.src_h > 0) self.src_h else self.h;
+    }
+
+    /// TexturePacker's `trimmed` flag: true when the packed rect is
+    /// smaller than the canvas it came from.
+    fn isTrimmed(self: Frame) bool {
+        return self.w != self.canvasW() or self.h != self.canvasH();
+    }
 };
 
-/// Serialize `frames` into TexturePacker JSON-hash text. No trimming or
-/// rotation in v1, so `sourceSize` == `frame` size and the offsets are
-/// zero. Caller owns the returned slice.
+/// Serialize `frames` into TexturePacker JSON-hash text. No rotation, so
+/// `rotated` is always false; a frame that left `src_*`/`off_*` at their
+/// defaults is untrimmed and emits `sourceSize` == `frame` size with zero
+/// offsets, exactly as before trimming existed. Caller owns the returned
+/// slice.
 pub fn emit(
     allocator: std.mem.Allocator,
     frames: []const Frame,
@@ -39,12 +63,12 @@ pub fn emit(
             .{ f.x, f.y, f.w, f.h },
         );
         try w.writeAll("      \"rotated\": false,\n");
-        try w.writeAll("      \"trimmed\": false,\n");
+        try w.print("      \"trimmed\": {s},\n", .{if (f.isTrimmed()) "true" else "false"});
         try w.print(
-            "      \"spriteSourceSize\": {{ \"x\": 0, \"y\": 0, \"w\": {d}, \"h\": {d} }},\n",
-            .{ f.w, f.h },
+            "      \"spriteSourceSize\": {{ \"x\": {d}, \"y\": {d}, \"w\": {d}, \"h\": {d} }},\n",
+            .{ f.off_x, f.off_y, f.w, f.h },
         );
-        try w.print("      \"sourceSize\": {{ \"w\": {d}, \"h\": {d} }},\n", .{ f.w, f.h });
+        try w.print("      \"sourceSize\": {{ \"w\": {d}, \"h\": {d} }},\n", .{ f.canvasW(), f.canvasH() });
         try w.writeAll("      \"pivot\": { \"x\": 0.5, \"y\": 0.5 }\n");
         try w.writeAll(if (i + 1 < frames.len) "    },\n" else "    }\n");
     }
