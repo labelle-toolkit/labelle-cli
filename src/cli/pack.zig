@@ -55,10 +55,34 @@ fn candidateRoots(arena: std.mem.Allocator, input_dir: []const u8) ![]const []co
         if (parent.len == 0 or parent.len == dir.len) break;
         dir = parent;
     }
-    // The cwd, for relative inputs only — an absolute input's ancestors are
-    // already complete, and `.` would be an unrelated directory.
-    if (!std.fs.path.isAbsolute(input_dir)) try out.append(arena, ".");
+    // The cwd, but ONLY when it is genuinely an ancestor of the input: for a
+    // relative path that never climbs above it. An absolute input's
+    // ancestors are already complete, and an input that escapes upward
+    // (`../orphan/assets`) belongs to a different project — probing `.`
+    // there would hand it this project's gfx pin, which is exactly the
+    // wrong-project reading this lookup exists to avoid.
+    if (!std.fs.path.isAbsolute(input_dir) and !escapesCwd(input_dir)) {
+        try out.append(arena, ".");
+    }
     return out.items;
+}
+
+/// Whether a relative path climbs above the working directory. Lexical on
+/// purpose — `a/../b` stays inside, `../b` does not, and no filesystem
+/// access is needed to tell them apart.
+fn escapesCwd(rel: []const u8) bool {
+    var depth: i32 = 0;
+    var it = std.mem.tokenizeScalar(u8, rel, '/');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            depth -= 1;
+            if (depth < 0) return true;
+            continue;
+        }
+        depth += 1;
+    }
+    return false;
 }
 
 /// The nearest directory at or above `input_dir` holding a `project.labelle`,
@@ -330,4 +354,30 @@ test "candidateRoots: an absolute input walks to the root and stops" {
     try std.testing.expectEqualStrings("/games/fp", got[2]);
     try std.testing.expectEqualStrings("/games", got[3]);
     for (got) |g| try std.testing.expect(!std.mem.eql(u8, g, "."));
+}
+
+test "candidateRoots: an input that climbs above the CWD does not use it" {
+    // `labelle pack ../orphan/assets --trim` must not read THIS project's
+    // gfx pin: those sprites belong to a different project, and answering
+    // from the wrong one is the failure this lookup exists to prevent.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try candidateRoots(a, "../orphan/assets");
+    for (got) |g| try std.testing.expect(!std.mem.eql(u8, g, "."));
+
+    // A path that dips and comes back stays inside, so the cwd is still a
+    // legitimate ancestor.
+    const inside = try candidateRoots(a, "assets/../assets/raw");
+    try std.testing.expectEqualStrings(".", inside[inside.len - 1]);
+}
+
+test "escapesCwd: only a net-upward path escapes" {
+    try std.testing.expect(escapesCwd(".."));
+    try std.testing.expect(escapesCwd("../orphan/assets"));
+    try std.testing.expect(escapesCwd("a/../../b"));
+    try std.testing.expect(!escapesCwd("assets/raw"));
+    try std.testing.expect(!escapesCwd("./assets"));
+    try std.testing.expect(!escapesCwd("a/../b"));
 }

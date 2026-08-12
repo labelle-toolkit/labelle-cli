@@ -142,6 +142,12 @@ pub fn parseVersion(version: []const u8) Version {
     var part_idx: u8 = 0;
 
     for (version) |c| {
+        // A prerelease or build suffix ends the numeric version. Without
+        // this, `1.30.0-rc1` folded the suffix digit into the patch and read
+        // as 1.30.1 — so a gate looking for "1.30.1 or newer" accepted a
+        // release candidate that PREDATES 1.30.0, silently suppressing the
+        // very warning it exists to give.
+        if (c == '-' or c == '+') break;
         if (c == '.') {
             part_idx += 1;
             if (part_idx >= 3) break;
@@ -195,4 +201,15 @@ test "parseVersion: patch is parsed and ordering compares it" {
     // Major and minor still dominate.
     try std.testing.expect(parseVersion("1.29.9").olderThan(parseVersion("1.30.1")));
     try std.testing.expect(!parseVersion("2.0.0").olderThan(parseVersion("1.30.1")));
+}
+
+test "parseVersion: a prerelease or build suffix does not bleed into the patch" {
+    // `1.30.0-rc1` used to parse as 1.30.1 — the suffix digit folded into
+    // the patch — so a gate for "1.30.1 or newer" accepted a candidate that
+    // predates 1.30.0 and went quiet exactly when it should warn.
+    try std.testing.expectEqual(@as(u32, 0), parseVersion("1.30.0-rc1").patch);
+    try std.testing.expectEqual(@as(u32, 0), parseVersion("1.30.0+1").patch);
+    try std.testing.expectEqual(@as(u32, 30), parseVersion("1.30.0-rc1").minor);
+    try std.testing.expect(parseVersion("1.30.0-rc1").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(parseVersion("1.30.1-rc1").olderThan(parseVersion("1.30.1")) == false);
 }
