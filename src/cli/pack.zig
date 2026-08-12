@@ -12,13 +12,17 @@ const config = @import("config.zig");
 const compatibility = @import("compatibility.zig");
 const project_config = @import("project_config.zig");
 
-/// First labelle-gfx minor train whose renderer APPLIES trim offsets
+/// First labelle-gfx release whose renderer APPLIES trim offsets
 /// (`SourceRect.pivotOrigin`). Below it, a trimmed atlas draws every frame
 /// centred on its own silhouette instead of on the canvas the artist
 /// authored — a silent per-frame position error, with nothing logged and
-/// nothing failing. Must match the release that actually ships the fix.
-const TRIM_AWARE_GFX_MAJOR: u32 = 1;
-const TRIM_AWARE_GFX_MINOR: u32 = 31;
+/// nothing failing.
+///
+/// The fix ships as a PATCH on the 1.30 line, so this has to be compared
+/// down to the patch: 1.30.0 ignores trim offsets and 1.30.1 applies them,
+/// and a gate that stopped at the minor could not tell them apart. Keep in
+/// step with the actual release.
+const TRIM_AWARE_GFX: compatibility.Version = .{ .major = 1, .minor = 30, .patch = 1 };
 
 /// True when `pinned` is a gfx release that predates trim-offset support.
 ///
@@ -28,9 +32,7 @@ const TRIM_AWARE_GFX_MINOR: u32 = 31;
 /// say nothing rather than cry wolf.
 fn rendererIgnoresTrim(pinned: []const u8) bool {
     if (project_config.isLocalVersion(pinned)) return false;
-    const v = compatibility.parseVersion(pinned);
-    return v.major < TRIM_AWARE_GFX_MAJOR or
-        (v.major == TRIM_AWARE_GFX_MAJOR and v.minor < TRIM_AWARE_GFX_MINOR);
+    return compatibility.parseVersion(pinned).olderThan(TRIM_AWARE_GFX);
 }
 
 /// The nearest directory at or above `start` holding a `project.labelle`,
@@ -41,14 +43,23 @@ fn rendererIgnoresTrim(pinned: []const u8) bool {
 /// the actual target's older renderer will position incorrectly.
 fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 {
     const io = config.globalIo();
-    var dir: []const u8 = std.fs.path.resolve(arena, &.{input_dir}) catch return null;
+    var dir: []const u8 = input_dir;
     while (true) {
         const probe = std.fs.path.join(arena, &.{ dir, "project.labelle" }) catch return null;
         if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| return dir else |_| {}
-        const parent = std.fs.path.dirname(dir) orelse return null;
-        if (parent.len == dir.len) return null;
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (parent.len == 0 or parent.len == dir.len) break;
         dir = parent;
     }
+    // A RELATIVE input bottoms out BEFORE the working directory itself:
+    // `dirname("assets")` is null, so walking up from `assets/raw/ship`
+    // never probes `.`. That is the commonest invocation of all — running
+    // `labelle pack assets/raw/x` from the project root — and missing it
+    // made this return null everywhere, silently disabling the warning.
+    if (!std.fs.path.isAbsolute(input_dir)) {
+        if (std.Io.Dir.cwd().statFile(io, "project.labelle", .{})) |_| return "." else |_| {}
+    }
+    return null;
 }
 
 /// Warn when `--trim` is used in a project pinned to a gfx that ignores trim
@@ -72,11 +83,11 @@ fn warnIfRendererIgnoresTrim(gpa: std.mem.Allocator, input_dir: []const u8) void
     if (!rendererIgnoresTrim(pinned)) return;
     std.debug.print(
         \\labelle pack: WARNING — this project pins labelle-gfx {s}, which does NOT
-        \\  apply trim offsets (needs {d}.{d}+). A trimmed atlas will render with every
+        \\  apply trim offsets (needs {d}.{d}.{d}+). A trimmed atlas will render with every
         \\  frame centred on its own silhouette, shifting sprites frame to frame. Bump
         \\  the gfx pin, or pack without --trim.
         \\
-    , .{ pinned, TRIM_AWARE_GFX_MAJOR, TRIM_AWARE_GFX_MINOR });
+    , .{ pinned, TRIM_AWARE_GFX.major, TRIM_AWARE_GFX.minor, TRIM_AWARE_GFX.patch });
 }
 
 const usage =
@@ -86,7 +97,7 @@ const usage =
     \\      --padding <n>    gap between sprites in px (default: 2)
     \\      --max-size <n>   max sheet dimension in px (default: 4096)
     \\      --trim           crop transparent margins (needs a renderer that
-    \\                       applies trim offsets — labelle-gfx 1.31+)
+    \\                       applies trim offsets — labelle-gfx 1.30.1+)
     \\
 ;
 
@@ -179,12 +190,21 @@ fn usageErr2(msg: []const u8, arg: []const u8) error{InvalidArgs} {
     return error.InvalidArgs;
 }
 
-test "rendererIgnoresTrim: gfx trains before the fix are flagged" {
+test "rendererIgnoresTrim: releases before the fix are flagged" {
     // The whole point of the warning: on these, `--trim` produces an atlas
     // that renders subtly wrong with no error anywhere.
     try std.testing.expect(rendererIgnoresTrim("1.30.0"));
     try std.testing.expect(rendererIgnoresTrim("1.28.5"));
     try std.testing.expect(rendererIgnoresTrim("0.9.0"));
+}
+
+test "rendererIgnoresTrim: the fix is a PATCH, so the patch must be compared" {
+    // 1.30.0 and 1.30.1 differ only in the patch. A major/minor-only gate
+    // read them as identical and waved 1.30.0 through — silently producing
+    // the exact defect --trim is guarded against.
+    try std.testing.expect(rendererIgnoresTrim("1.30.0"));
+    try std.testing.expect(!rendererIgnoresTrim("1.30.1"));
+    try std.testing.expect(!rendererIgnoresTrim("1.30.2"));
 }
 
 test "rendererIgnoresTrim: a local gfx checkout is never flagged" {
@@ -193,9 +213,69 @@ test "rendererIgnoresTrim: a local gfx checkout is never flagged" {
     try std.testing.expect(!rendererIgnoresTrim("local:../labelle-gfx"));
 }
 
-test "rendererIgnoresTrim: the fix train and later are fine" {
+test "rendererIgnoresTrim: later releases are fine" {
     try std.testing.expect(!rendererIgnoresTrim("1.31.0"));
     try std.testing.expect(!rendererIgnoresTrim("1.32.1"));
     // A future major carries the fix forward.
     try std.testing.expect(!rendererIgnoresTrim("2.0.0"));
+}
+
+test "findProjectRoot: walks up from the input dir to the owning project" {
+    // Regression guard: this returned null for every input at one point,
+    // which silently disabled the --trim warning everywhere. A guard that
+    // never fires is worse than no guard, because it reads as "checked".
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const root = ".zig-cache/findroot-probe";
+    const nested = root ++ "/assets/raw/ship";
+    cwd.deleteTree(io, root) catch {};
+    try cwd.createDirPath(io, nested);
+    defer cwd.deleteTree(io, root) catch {};
+    try cwd.writeFile(io, .{ .sub_path = root ++ "/project.labelle", .data = ".{ .name = \"x\" }\n" });
+
+    // From the project dir itself, and from several levels below it.
+    const from_root = findProjectRoot(a, root) orelse return error.TestExpectedProjectRoot;
+    try std.testing.expect(std.mem.endsWith(u8, from_root, "findroot-probe"));
+    const from_nested = findProjectRoot(a, nested) orelse return error.TestExpectedProjectRoot;
+    try std.testing.expect(std.mem.endsWith(u8, from_nested, "findroot-probe"));
+
+    // A directory with no project.labelle above it yields null rather than
+    // reading someone else's project.
+    const orphan = ".zig-cache/findroot-orphan";
+    cwd.deleteTree(io, orphan) catch {};
+    try cwd.createDirPath(io, orphan);
+    defer cwd.deleteTree(io, orphan) catch {};
+    try std.testing.expect(findProjectRoot(a, orphan) == null);
+}
+
+test "the trim guard reads the gfx pin from the discovered project" {
+    // Pins the whole chain: discover the root from a nested input, parse the
+    // config there, and read `gfx_version` out of it. Each link worked in
+    // isolation while the guard as a whole silently did nothing.
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const root = ".zig-cache/trimguard-probe";
+    const nested = root ++ "/assets/raw/ship";
+    cwd.deleteTree(io, root) catch {};
+    try cwd.createDirPath(io, nested);
+    defer cwd.deleteTree(io, root) catch {};
+    try cwd.writeFile(io, .{
+        .sub_path = root ++ "/project.labelle",
+        .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+
+    const found = findProjectRoot(a, nested) orelse return error.TestExpectedProjectRoot;
+    const cfg = try config.readProjectConfigQuiet(a, found);
+    try std.testing.expectEqualStrings("1.30.0", cfg.gfx_version);
+    try std.testing.expect(rendererIgnoresTrim(cfg.gfx_version));
 }

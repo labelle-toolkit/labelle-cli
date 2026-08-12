@@ -118,10 +118,26 @@ fn depCompatWarn(dep_version: []const u8, core_major: u32) bool {
     return parseVersion(dep_version).major != core_major;
 }
 
-/// Parse a semver string into its major/minor components. Public so other
-/// commands can gate a feature on a package's minor train (e.g. `pack
-/// --trim` needs a gfx that applies trim offsets).
-pub fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
+/// A parsed semver, comparable as a whole.
+pub const Version = struct {
+    major: u32,
+    minor: u32,
+    patch: u32,
+
+    /// True when `self` is older than `other`. Patch is included because a
+    /// fix can ship as a patch release, and a gate that stopped at the minor
+    /// could not tell the release carrying it from the one before it.
+    pub fn olderThan(self: Version, other: Version) bool {
+        if (self.major != other.major) return self.major < other.major;
+        if (self.minor != other.minor) return self.minor < other.minor;
+        return self.patch < other.patch;
+    }
+};
+
+/// Parse a semver string. Public so other commands can gate a feature on a
+/// package version (e.g. `pack --trim` needs a gfx that applies trim
+/// offsets).
+pub fn parseVersion(version: []const u8) Version {
     var parts: [3]u32 = .{ 0, 0, 0 };
     var part_idx: u8 = 0;
 
@@ -134,7 +150,7 @@ pub fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
         }
     }
 
-    return .{ .major = parts[0], .minor = parts[1] };
+    return .{ .major = parts[0], .minor = parts[1], .patch = parts[2] };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -164,4 +180,19 @@ test "plugins are never judged against core (issue #230, #332)" {
     // packages, and it is not reachable from the plugin loop.
     try std.testing.expect(@TypeOf(depCompatWarn) == fn ([]const u8, u32) bool);
     try std.testing.expect(!@hasDecl(@This(), "pluginCompatWarn"));
+}
+
+test "parseVersion: patch is parsed and ordering compares it" {
+    const v = parseVersion("1.30.1");
+    try std.testing.expectEqual(@as(u32, 1), v.major);
+    try std.testing.expectEqual(@as(u32, 30), v.minor);
+    try std.testing.expectEqual(@as(u32, 1), v.patch);
+
+    // A fix shipped as a patch is only detectable if patch is compared.
+    try std.testing.expect(parseVersion("1.30.0").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("1.30.1").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("1.30.2").olderThan(parseVersion("1.30.1")));
+    // Major and minor still dominate.
+    try std.testing.expect(parseVersion("1.29.9").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("2.0.0").olderThan(parseVersion("1.30.1")));
 }
