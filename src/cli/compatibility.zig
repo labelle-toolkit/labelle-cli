@@ -118,12 +118,51 @@ fn depCompatWarn(dep_version: []const u8, core_major: u32) bool {
     return parseVersion(dep_version).major != core_major;
 }
 
-/// Parse a semver string into its major/minor components.
-fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
+/// A parsed semver, comparable as a whole.
+pub const Version = struct {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    /// A `-suffix` was present. Only whether, not which: ordering release
+    /// candidates against each other is not something any gate here needs,
+    /// but ordering them below their own release is.
+    prerelease: bool = false,
+
+    /// True when `self` is older than `other`. Patch is included because a
+    /// fix can ship as a patch release, and a gate that stopped at the minor
+    /// could not tell the release carrying it from the one before it.
+    pub fn olderThan(self: Version, other: Version) bool {
+        if (self.major != other.major) return self.major < other.major;
+        if (self.minor != other.minor) return self.minor < other.minor;
+        if (self.patch != other.patch) return self.patch < other.patch;
+        // Same numbers: per semver a prerelease PRECEDES its release, so
+        // `1.30.1-rc1` is older than `1.30.1`. Treating them as equal let a
+        // release candidate of the fix release satisfy a gate the candidate
+        // does not actually satisfy. Build metadata (`+…`) carries no
+        // precedence and is not recorded.
+        return self.prerelease and !other.prerelease;
+    }
+};
+
+/// Parse a semver string. Public so other commands can gate a feature on a
+/// package version (e.g. `pack --trim` needs a gfx that applies trim
+/// offsets).
+pub fn parseVersion(version: []const u8) Version {
     var parts: [3]u32 = .{ 0, 0, 0 };
     var part_idx: u8 = 0;
+    var prerelease = false;
 
     for (version) |c| {
+        // A prerelease or build suffix ends the numeric version. Without
+        // this, `1.30.0-rc1` folded the suffix digit into the patch and read
+        // as 1.30.1 — so a gate looking for "1.30.1 or newer" accepted a
+        // release candidate that PREDATES 1.30.0, silently suppressing the
+        // very warning it exists to give.
+        if (c == '-') {
+            prerelease = true;
+            break;
+        }
+        if (c == '+') break;
         if (c == '.') {
             part_idx += 1;
             if (part_idx >= 3) break;
@@ -132,7 +171,7 @@ fn parseVersion(version: []const u8) struct { major: u32, minor: u32 } {
         }
     }
 
-    return .{ .major = parts[0], .minor = parts[1] };
+    return .{ .major = parts[0], .minor = parts[1], .patch = parts[2], .prerelease = prerelease };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -162,4 +201,34 @@ test "plugins are never judged against core (issue #230, #332)" {
     // packages, and it is not reachable from the plugin loop.
     try std.testing.expect(@TypeOf(depCompatWarn) == fn ([]const u8, u32) bool);
     try std.testing.expect(!@hasDecl(@This(), "pluginCompatWarn"));
+}
+
+test "parseVersion: patch is parsed and ordering compares it" {
+    const v = parseVersion("1.30.1");
+    try std.testing.expectEqual(@as(u32, 1), v.major);
+    try std.testing.expectEqual(@as(u32, 30), v.minor);
+    try std.testing.expectEqual(@as(u32, 1), v.patch);
+
+    // A fix shipped as a patch is only detectable if patch is compared.
+    try std.testing.expect(parseVersion("1.30.0").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("1.30.1").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("1.30.2").olderThan(parseVersion("1.30.1")));
+    // Major and minor still dominate.
+    try std.testing.expect(parseVersion("1.29.9").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("2.0.0").olderThan(parseVersion("1.30.1")));
+}
+
+test "parseVersion: a prerelease or build suffix does not bleed into the patch" {
+    // `1.30.0-rc1` used to parse as 1.30.1 — the suffix digit folded into
+    // the patch — so a gate for "1.30.1 or newer" accepted a candidate that
+    // predates 1.30.0 and went quiet exactly when it should warn.
+    try std.testing.expectEqual(@as(u32, 0), parseVersion("1.30.0-rc1").patch);
+    try std.testing.expectEqual(@as(u32, 0), parseVersion("1.30.0+1").patch);
+    try std.testing.expectEqual(@as(u32, 30), parseVersion("1.30.0-rc1").minor);
+    try std.testing.expect(parseVersion("1.30.0-rc1").olderThan(parseVersion("1.30.1")));
+    // A prerelease of the fix release does NOT carry the fix.
+    try std.testing.expect(parseVersion("1.30.1-rc1").olderThan(parseVersion("1.30.1")));
+    try std.testing.expect(!parseVersion("1.30.1").olderThan(parseVersion("1.30.1-rc1")));
+    // Build metadata has no precedence: 1.30.1+build is still 1.30.1.
+    try std.testing.expect(!parseVersion("1.30.1+build7").olderThan(parseVersion("1.30.1")));
 }

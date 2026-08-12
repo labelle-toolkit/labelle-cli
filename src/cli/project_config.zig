@@ -24,6 +24,10 @@
 
 const std = @import("std");
 
+/// `BlockSize` lives with the conversion core; the schema only names it so
+/// a resource can pin its own block. Pure type — no I/O pulled in.
+const astc = @import("../astc/convert.zig");
+
 /// Graphics / windowing backend selection. `null` is a headless backend.
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
@@ -171,6 +175,19 @@ pub const ResourceDef = struct {
 
     /// Eager (`false`) vs lazy (`true`) decode; `null` lets the assembler pick.
     lazy: ?bool = null,
+
+    /// Per-atlas ASTC block size, overriding the backend default for THIS
+    /// atlas only. Ignored unless the target platform actually compresses
+    /// (`asset_compression`), and ignored on sound/font resources.
+    ///
+    /// Block size trades fidelity against memory at a fixed 128 bits per
+    /// block: `8x8` is 2 bpp, `4x4` is 8 bpp — 4x the memory for 4x the
+    /// bits per pixel. One global setting cannot serve both kinds of
+    /// atlas in a real project: character and UI sheets carry 1px
+    /// outlines and small glyphs that 8x8 visibly mangles, while a large
+    /// room/background sheet is mostly flat and survives 8x8 fine while
+    /// being the biggest VRAM line item. Hence per-atlas.
+    astc_block: ?astc.BlockSize = null,
 
     /// Classify which kind of asset this resource declares.
     pub fn kind(self: ResourceDef) ResourceKind {

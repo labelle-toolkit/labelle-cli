@@ -206,18 +206,48 @@ jobs:
         env:
           LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
         run: |
-          mkdir -p test-docker && cd test-docker
-          ../labelle-cli/zig-out/bin/labelle init docker_test \
-            --backend=raylib --ecs=zig_ecs \
-            --core-version="local:../../labelle-core" \
-            --engine-version="local:../../labelle-engine" \
-            --gfx-version="local:../../labelle-gfx" \
-            --labelle-version="local:../../labelle-cli" \
-            --assembler-version="local:../../labelle-assembler"
-          cd docker_test
-          ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm
-          test -f .labelle/raylib_wasm/zig-out/web/game.wasm
-          echo "Docker WASM build produced game.wasm"
+          set -uo pipefail
+          # Resolves the whole dependency tree from scratch inside a container,
+          # so it is the most exposed step in CI to a transient tarball failure.
+          # Body is a SUBSHELL so each attempt starts from the workspace: the
+          # chain `cd`s, and a failure used to leave the shell inside the
+          # scratch dir, so the next attempt nested another one and resolved
+          # ../labelle-cli from the wrong place — the retries could not
+          # actually recover. Still &&-chained: bash ignores `set -e` for a
+          # function invoked as an `if` condition.
+          attempt() (
+            rm -rf test-docker &&
+            mkdir -p test-docker && cd test-docker &&
+            ../labelle-cli/zig-out/bin/labelle init docker_test \
+              --backend=raylib --ecs=zig_ecs \
+              --core-version="local:../../labelle-core" \
+              --engine-version="local:../../labelle-engine" \
+              --gfx-version="local:../../labelle-gfx" \
+              --labelle-version="local:../../labelle-cli" \
+              --assembler-version="local:../../labelle-assembler" &&
+            cd docker_test &&
+            ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm &&
+            test -f .labelle/raylib_wasm/zig-out/web/game.wasm &&
+            echo "Docker WASM build produced game.wasm"
+          )
+          # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
+          # Actions runners for far longer than a few quick attempts: the same
+          # URLs served fine from a laptop while three attempts inside 90s all
+          # failed, each on a different dependency.
+          #
+          # The body is &&-chained on purpose. Bash IGNORES `set -e` inside a
+          # function invoked as an `if` condition — and inside nested subshells
+          # there too — so an early failure would fall through to the last
+          # command and report SUCCESS. Verified both shapes; only explicit
+          # chaining is reliable here.
+          for delay in 60 180 300 0; do
+            if attempt; then exit 0; fi
+            if [ "$delay" -eq 0 ]; then break; fi
+            echo "::warning::attempt failed (usually a dependency fetch); retrying in ${delay}s"
+            sleep "$delay"
+          done
+          echo "::error::still failing after 4 attempts over ~9 minutes"
+          exit 1
 
   versions-integration:
     name: Versions Integration Test
@@ -297,18 +327,45 @@ jobs:
 
       - name: Init, generate, and build a project
         run: |
-          mkdir -p test-projects && cd test-projects
-          ../labelle-cli/zig-out/bin/labelle init test_game --backend=raylib --ecs=zig_ecs \
-            --core-version="local:../../labelle-core" \
-            --engine-version="local:../../labelle-engine" \
-            --gfx-version="local:../../labelle-gfx" \
-            --labelle-version="local:../../labelle-cli" \
-            --assembler-version="local:../../labelle-assembler"
-          cd test_game
-          ../../labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
-
+          set -uo pipefail
+          # Body is a SUBSHELL so each attempt starts from the workspace: the
+          # chain `cd`s, and a failure used to leave the shell inside the
+          # scratch dir, so the next attempt nested another one and resolved
+          # ../labelle-cli from the wrong place — the retries could not
+          # actually recover. Still &&-chained: bash ignores `set -e` for a
+          # function invoked as an `if` condition.
+          attempt() (
+            rm -rf test-projects &&
+            mkdir -p test-projects && cd test-projects &&
+            ../labelle-cli/zig-out/bin/labelle init test_game --backend=raylib --ecs=zig_ecs \
+              --core-version="local:../../labelle-core" \
+              --engine-version="local:../../labelle-engine" \
+              --gfx-version="local:../../labelle-gfx" \
+              --labelle-version="local:../../labelle-cli" \
+              --assembler-version="local:../../labelle-assembler" &&
+            cd test_game &&
+            ../../labelle-cli/zig-out/bin/labelle generate &&
+            cd .labelle/raylib_desktop &&
+            zig build
+          )
+          # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
+          # Actions runners for far longer than a few quick attempts: the same
+          # URLs served fine from a laptop while three attempts inside 90s all
+          # failed, each on a different dependency.
+          #
+          # The body is &&-chained on purpose. Bash IGNORES `set -e` inside a
+          # function invoked as an `if` condition — and inside nested subshells
+          # there too — so an early failure would fall through to the last
+          # command and report SUCCESS. Verified both shapes; only explicit
+          # chaining is reliable here.
+          for delay in 60 180 300 0; do
+            if attempt; then exit 0; fi
+            if [ "$delay" -eq 0 ]; then break; fi
+            echo "::warning::attempt failed (usually a dependency fetch); retrying in ${delay}s"
+            sleep "$delay"
+          done
+          echo "::error::still failing after 4 attempts over ~9 minutes"
+          exit 1
       # Released-path smoke (labelle-cli#322): init with NO local overrides —
       # the exact cold-user path. Resolves DEFAULT_ASSEMBLER_VERSION from
       # GitHub releases and scaffolds that binary's curated package pins, then
@@ -320,18 +377,47 @@ jobs:
       # mutually compatible.
       - name: Released-path init smoke (no local overrides)
         run: |
-          set -e
+          set -uo pipefail
           unset LABELLE_ASSEMBLER
-          mkdir -p test-projects-released && cd test-projects-released
-          ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs
-          echo "── scaffolded project.labelle ──"
-          cat cold_game/project.labelle
-          grep -Eq '\.y_axis[[:space:]]*=' cold_game/project.labelle || { echo "FAIL: scaffold missing .y_axis"; exit 1; }
-          cd cold_game
-          ../../labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
-
+          # Network-bound BY DESIGN: it resolves the paired assembler and the
+          # curated pins from GitHub releases, which is the pin-rot guard. So
+          # this is the most flake-prone step here and must never be cached.
+          # Body is a SUBSHELL so each attempt starts from the workspace: the
+          # chain `cd`s, and a failure used to leave the shell inside the
+          # scratch dir, so the next attempt nested another one and resolved
+          # ../labelle-cli from the wrong place — the retries could not
+          # actually recover. Still &&-chained: bash ignores `set -e` for a
+          # function invoked as an `if` condition.
+          attempt() (
+            rm -rf test-projects-released &&
+            mkdir -p test-projects-released && cd test-projects-released &&
+            ../labelle-cli/zig-out/bin/labelle init cold_game --backend=raylib --ecs=zig_ecs &&
+            echo "── scaffolded project.labelle ──" &&
+            cat cold_game/project.labelle &&
+            grep -Eq '\.y_axis[[:space:]]*=' cold_game/project.labelle &&
+            cd cold_game &&
+            ../../labelle-cli/zig-out/bin/labelle generate &&
+            cd .labelle/raylib_desktop &&
+            zig build
+          )
+          # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
+          # Actions runners for far longer than a few quick attempts: the same
+          # URLs served fine from a laptop while three attempts inside 90s all
+          # failed, each on a different dependency.
+          #
+          # The body is &&-chained on purpose. Bash IGNORES `set -e` inside a
+          # function invoked as an `if` condition — and inside nested subshells
+          # there too — so an early failure would fall through to the last
+          # command and report SUCCESS. Verified both shapes; only explicit
+          # chaining is reliable here.
+          for delay in 60 180 300 0; do
+            if attempt; then exit 0; fi
+            if [ "$delay" -eq 0 ]; then break; fi
+            echo "::warning::attempt failed (usually a dependency fetch); retrying in ${delay}s"
+            sleep "$delay"
+          done
+          echo "::error::still failing after 4 attempts over ~9 minutes"
+          exit 1
       - name: Plugin manifest system test
         run: |
           set -e

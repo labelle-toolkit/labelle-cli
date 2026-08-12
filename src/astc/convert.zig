@@ -60,13 +60,23 @@ pub const BlockSize = enum {
 pub const BackendCaps = enum {
     sokol_4x4_only,
     raylib_4x4_8x8,
+    /// bgfx maps the whole ASTC LDR set to a `TextureFormat`, but mapping is
+    /// not uploading: it never checks the RUNTIME's format capabilities, so an
+    /// unsupported block produces no error and renders garbage. Measured on a
+    /// Samsung SM-T505 (Adreno 610, GLES 3.2): a 6x6 atlas drew every sprite
+    /// as a cyan/black checkerboard with a completely clean log, while 4x4 and
+    /// 8x8 in the same build were perfect. Until bgfx fails loudly on a block
+    /// it cannot sample (labelle-bgfx#76), only the two blocks verified on
+    /// hardware are offered — a build error beats silent garbage on a player's
+    /// device.
+    bgfx_4x4_8x8,
     full,
 
     /// Can this backend's runtime upload `block` as-is?
     pub fn supports(self: BackendCaps, block: BlockSize) bool {
         return switch (self) {
             .sokol_4x4_only => block == .@"4x4",
-            .raylib_4x4_8x8 => block == .@"4x4" or block == .@"8x8",
+            .raylib_4x4_8x8, .bgfx_4x4_8x8 => block == .@"4x4" or block == .@"8x8",
             .full => true,
         };
     }

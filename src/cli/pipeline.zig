@@ -374,9 +374,23 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // before the assembler steps (it only needs project.labelle + the PNGs +
     // astcenc). Non-fatal — on any failure the assembler finds no sibling and
     // falls back to the source PNG, so the build still succeeds.
+    //
+    // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
+    // compile to one `.astc` with disagreeing block pins; falling back would
+    // hand BOTH of them whatever `.astc` is on disk — including a STALE one
+    // from an earlier build, which is worse than no atlas because it looks
+    // like it worked. So a config error stops the build, while a conversion
+    // failure still degrades to PNG.
     if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-        astc_cmd.cmdAstc(allocator, &.{project_dir}) catch |err| {
-            std.debug.print("labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n", .{@errorName(err)});
+        astc_cmd.cmdAstc(allocator, &.{project_dir}) catch |err| switch (err) {
+            error.ConflictingAstcBlocks => progress.fatalExit(
+                1,
+                "conflicting .astc_block pins compile to one .astc — see the error above",
+            ),
+            else => std.debug.print(
+                "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
+                .{@errorName(err)},
+            ),
         };
     }
 
