@@ -198,6 +198,19 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // Read and parse project.labelle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    // Stale-CLI gate (#353), BEFORE the project parse: refuse to build a
+    // project whose lock was written by a NEWER CLI —
+    // `ignore_unknown_fields` means this binary would silently skip
+    // config it doesn't know (the incident: per-atlas `.astc_block`
+    // ignored → every atlas encoded at the old global block size,
+    // visibly mangled art, zero errors). Running first also means a
+    // newer project whose MIRRORED fields changed shape gets this
+    // actionable message instead of a bare parse error. `upgrade` is
+    // exempt: it is the way out of this error.
+    if (command != .upgrade_cmd) {
+        lockfile.enforceCliNotStale(allocator, project_dir) catch std.process.exit(1);
+    }
+
     var parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             config.printNoProjectError(project_dir);

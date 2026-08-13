@@ -11,6 +11,7 @@ const config = @import("../cli/config.zig");
 const project_config = @import("../cli/project_config.zig");
 const asm_cache = @import("../cli/asm_cache.zig");
 const util = @import("../cli/util.zig");
+const lockfile = @import("../cli/lockfile.zig");
 const convert = @import("convert.zig");
 const astcenc_bin = @import("astcenc_bin.zig");
 
@@ -95,6 +96,13 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             dir = arg;
         }
     }
+
+    // Stale-CLI gate (#353): the standalone `labelle astc` is dispatched
+    // before pipeline.run's gate, and ASTC encoding is exactly the
+    // operation a stale binary silently mis-performs (per-atlas
+    // `.astc_block` skipped → global block size → mangled art) — so it
+    // enforces the lock itself.
+    lockfile.enforceCliNotStale(allocator, dir) catch std.process.exit(1);
 
     const cfg = config.readProjectConfigQuiet(allocator, dir) catch {
         std.debug.print("labelle astc: could not read project.labelle in '{s}'\n", .{dir});
