@@ -426,16 +426,32 @@ pub fn isLockNewer(lock_version: []const u8, current_version: []const u8) bool {
     return std.SemanticVersion.order(lock_v, cur_v) == .gt;
 }
 
-/// Extract `.cli_version = "X"` from a labelle.lock's bytes. Plain scan,
-/// not a zon parse: the file is CLI-generated and the line shape is
-/// stable (`writeLockFile` above); a scan can't be broken by resolved-set
-/// fields this CLI version doesn't know.
+/// Extract the TOP-LEVEL `.cli_version = "X"` from a labelle.lock's
+/// bytes. A line-wise scan with brace-depth tracking, not a zon parse: the
+/// file is CLI-generated and the line shape is stable (`writeLockFile`
+/// above), and a scan can't be broken by resolved-set fields this CLI
+/// version doesn't know. Depth anchoring + comment skipping keep a
+/// `.cli_version` inside a comment, string, or nested unknown field from
+/// tripping a false stale-CLI refusal.
 pub fn lockCliVersion(lock_bytes: []const u8) ?[]const u8 {
     const key = ".cli_version = \"";
-    const start = (std.mem.indexOf(u8, lock_bytes, key) orelse return null) + key.len;
-    const end = std.mem.indexOfScalarPos(u8, lock_bytes, start, '"') orelse return null;
-    if (end <= start) return null;
-    return lock_bytes[start..end];
+    var depth: usize = 0;
+    var lines = std.mem.splitScalar(u8, lock_bytes, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "//")) continue;
+        if (depth == 1 and std.mem.startsWith(u8, trimmed, key)) {
+            const rest = trimmed[key.len..];
+            const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+            if (end == 0) return null;
+            return rest[0..end];
+        }
+        for (trimmed) |c| {
+            if (c == '{') depth += 1;
+            if (c == '}') depth -|= 1;
+        }
+    }
+    return null;
 }
 
 /// The guard against a stale binary silently mis-building a modern
@@ -446,13 +462,24 @@ pub fn lockCliVersion(lock_bytes: []const u8) ?[]const u8 {
 /// the old global block size. No error anywhere, visibly broken art.
 ///
 /// Returns `error.StaleCli` after printing an actionable message.
-/// `LABELLE_ALLOW_OLDER_CLI=1` downgrades it to a warning — the escape
-/// hatch for deliberately building with an older CLI. A missing or
-/// unparseable lock never trips the gate.
+/// `LABELLE_ALLOW_OLDER_CLI=1` (exactly "1") downgrades it to a warning —
+/// the escape hatch for deliberately building with an older CLI. A missing
+/// lock or one without a parseable version never trips the gate; a lock
+/// that EXISTS but cannot be read fails closed — an unverifiable lock is
+/// not a verified one.
 pub fn enforceCliNotStale(allocator: std.mem.Allocator, project_dir: []const u8) error{StaleCli}!void {
     const lock_path = std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" }) catch return;
     defer allocator.free(lock_path);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), lock_path, allocator, .limited(1024 * 1024)) catch return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), lock_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return, // no lock, nothing to verify against
+        else => {
+            std.debug.print(
+                "labelle: could not read labelle.lock ({t}) — refusing to build against an unverifiable lock; fix or delete the file\n",
+                .{err},
+            );
+            return error.StaleCli;
+        },
+    };
     defer allocator.free(bytes);
 
     const lock_version = lockCliVersion(bytes) orelse return;
@@ -460,7 +487,7 @@ pub fn enforceCliNotStale(allocator: std.mem.Allocator, project_dir: []const u8)
 
     const override: ?[]u8 = config.globalEnviron().getAlloc(allocator, "LABELLE_ALLOW_OLDER_CLI") catch null;
     defer if (override) |o| allocator.free(o);
-    if (override != null and override.?.len > 0) {
+    if (override != null and std.mem.eql(u8, override.?, "1")) {
         std.debug.print(
             "labelle: warning: labelle.lock was written by labelle v{s}, this binary is v{s} — proceeding because LABELLE_ALLOW_OLDER_CLI is set\n",
             .{ lock_version, project_config.CLI_VERSION },
@@ -500,4 +527,30 @@ test "lockCliVersion: extracts the stamped version" {
     ;
     try std.testing.expectEqualStrings("1.61.1", lockCliVersion(lock).?);
     try std.testing.expect(lockCliVersion("no version here") == null);
+}
+
+test "lockCliVersion: only the top-level field counts" {
+    // A comment and a NESTED unknown field both carry decoys; the real
+    // stamp is the depth-1 line.
+    const lock =
+        \\// the old stamp was .cli_version = "9.9.9", ignore it
+        \\.{
+        \\    .resolved = .{
+        \\        .future_thing = .{ .cli_version = "8.8.8" },
+        \\    },
+        \\    .cli_version = "1.61.1",
+        \\}
+    ;
+    try std.testing.expectEqualStrings("1.61.1", lockCliVersion(lock).?);
+
+    // Decoys alone (comment + nested) must not produce a version at all.
+    const decoys_only =
+        \\// .cli_version = "9.9.9"
+        \\.{
+        \\    .resolved = .{
+        \\        .future_thing = .{ .cli_version = "8.8.8" },
+        \\    },
+        \\}
+    ;
+    try std.testing.expect(lockCliVersion(decoys_only) == null);
 }
