@@ -140,6 +140,12 @@ fn transcode(allocator: std.mem.Allocator, src_path: []const u8, to: Format) App
     var w: c_int = 0;
     var h: c_int = 0;
     var ch: c_int = 0;
+    // stb takes the buffer length as a `c_int`. A capture bigger than that
+    // is not decodable by this library at all, and an unchecked `@intCast`
+    // would PANIC on it — killing the CLI outright, when the contract of
+    // this whole path is that any failure falls back to reporting the
+    // backend's own file so the capture is never lost.
+    if (src.len > std.math.maxInt(c_int)) return error.DecodeFailed;
     const raw = c.stbi_load_from_memory(@ptrCast(src.ptr), @intCast(src.len), &w, &h, &ch, 4);
     if (raw == null) return error.DecodeFailed;
     defer c.stbi_image_free(raw);
@@ -162,23 +168,39 @@ pub fn encode(allocator: std.mem.Allocator, px: [*]const u8, w: c_int, h: c_int,
         // screenshot asked for as `.jpg` is wanted small, not archival.
         .jpg => c.stbi_write_jpg_to_func(sinkWrite, &sink, w, h, 4, px, 90),
     };
-    if (ok == 0 or sink.failed) return error.EncodeFailed;
+    // The sink's own failure is the more specific one and is checked first:
+    // stb reports only "did not write", so folding an allocation failure
+    // into `EncodeFailed` would make `ScreenshotProbe.reconcile` — which
+    // prints `@errorName(err)` — blame the encoder for an out-of-memory.
+    if (sink.err) |e| return e;
+    if (ok == 0) return error.EncodeFailed;
     return sink.list.toOwnedSlice(allocator);
 }
 
 /// Collects stb_image_write's output chunks (mirrors `texpack`'s PngSink).
+///
+/// `err` carries the callback's failure out rather than a bare flag: the
+/// only way a chunk can fail is the allocator, and the caller can report
+/// that far more usefully than "encode failed".
 const Sink = struct {
     list: std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    failed: bool = false,
+    err: ?SinkError = null,
 };
+
+/// What `sinkWrite` can fail with. A C callback cannot return an error, so
+/// it is parked on the `Sink` and re-raised by `encode`.
+const SinkError = error{OutOfMemory};
 
 fn sinkWrite(ctx: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.c) void {
     const sink: *Sink = @ptrCast(@alignCast(ctx.?));
-    if (sink.failed or size <= 0) return;
+    // Stop at the first failure. Once a chunk is missing the buffer is
+    // already an incomplete image; continuing would append later chunks
+    // over the hole and produce a file that looks whole and is not.
+    if (sink.err != null or size <= 0) return;
     const bytes: [*]const u8 = @ptrCast(data.?);
-    sink.list.appendSlice(sink.allocator, bytes[0..@intCast(size)]) catch {
-        sink.failed = true;
+    sink.list.appendSlice(sink.allocator, bytes[0..@intCast(size)]) catch |e| {
+        sink.err = e;
     };
 }
 
@@ -264,6 +286,47 @@ pub const PlanSpec = struct {
         // stb is compiled without the JPEG decoder, so a hypothetical
         // `.jpg`-appending backend must not be promised a conversion.
         try std.testing.expectEqual(Plan.keep, plan("/tmp/shot.png", "/tmp/shot.png.jpg"));
+    }
+};
+
+/// The encode path's failure reporting. `reconcile` prints `@errorName` of
+/// whatever comes back, so the error has to name the real cause.
+pub const EncodeSpec = struct {
+    const w = 4;
+    const h = 3;
+
+    fn pixels() [w * h * 4]u8 {
+        var px: [w * h * 4]u8 = undefined;
+        for (0..w * h) |i| {
+            px[i * 4 + 0] = 200;
+            px[i * 4 + 1] = 100;
+            px[i * 4 + 2] = 50;
+            px[i * 4 + 3] = 255;
+        }
+        return px;
+    }
+
+    test "a sink allocation failure surfaces as OutOfMemory, not EncodeFailed" {
+        // stb only ever reports "did not write", so an OOM inside the write
+        // callback used to be flattened into `EncodeFailed` and reported to
+        // the user as an encoder fault.
+        const px = pixels();
+        for ([_]Format{ .png, .bmp, .tga, .jpg }) |fmt| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            try std.testing.expectError(
+                error.OutOfMemory,
+                encode(failing.allocator(), &px, w, h, fmt),
+            );
+        }
+    }
+
+    test "an encode that can allocate still succeeds" {
+        // The guard above must not have made the happy path fallible.
+        const a = std.testing.allocator;
+        const px = pixels();
+        const out = try encode(a, &px, w, h, .png);
+        defer a.free(out);
+        try std.testing.expect(std.mem.startsWith(u8, out, "\x89PNG\r\n\x1a\n"));
     }
 };
 
