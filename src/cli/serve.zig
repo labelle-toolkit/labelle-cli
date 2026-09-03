@@ -406,6 +406,24 @@ pub const WatchConfig = struct {
     /// Consecutive stable polls required before firing a rebuild — debounces
     /// a burst of saves into a single build. Minimum 1.
     quiet_polls: u32 = 2,
+    /// Files the rebuild itself WRITES into the watched tree: the declared
+    /// `.outputs` of the project's `.prebuild` steps (cli#355), as paths
+    /// rooted the same way the walk builds them — see `watchIgnorePath`.
+    ///
+    /// They are excluded from the signature entirely, the same way
+    /// `.labelle/` already is. Folding them in made a hook's own
+    /// regeneration look like a fresh edit: `applied` is the signature
+    /// captured BEFORE the rebuild callback, so the next poll saw the
+    /// hook's write as a new change and ran a SECOND full
+    /// generate/compile/browser-reload for it.
+    ///
+    /// Excluding rather than re-snapshotting after the callback is
+    /// deliberate: a re-snapshot would also swallow a source file the
+    /// user saved DURING the rebuild, which is a silently dropped edit —
+    /// strictly worse than a redundant one. A declared output is a
+    /// generated target, not a source; the input that produces it is
+    /// still watched, so a real change still fires exactly one rebuild.
+    ignore_files: []const []const u8 = &.{},
 };
 
 /// Shared state between the watcher thread and the serve loop. `version`
@@ -461,6 +479,31 @@ fn skipWatchDir(name: []const u8) bool {
     return false;
 }
 
+/// Root a project-relative declared path (a `.prebuild` `.outputs` entry)
+/// the same way `computeSignature`'s walk builds its paths, so the two can
+/// be compared as plain strings. `resolve` collapses a leading `./` and
+/// any `..` first — pure path math, no filesystem access — so
+/// `"./assets/out.png"` and `"assets/out.png"` both match the walked
+/// `<watch_dir>/assets/out.png`. Caller owns the result.
+pub fn watchIgnorePath(
+    allocator: std.mem.Allocator,
+    watch_dir: []const u8,
+    rel: []const u8,
+) ![]const u8 {
+    const norm = try std.fs.path.resolve(allocator, &.{rel});
+    defer allocator.free(norm);
+    return std.fs.path.join(allocator, &.{ watch_dir, norm });
+}
+
+/// True when a walked file path is one of the rebuild's own declared
+/// outputs and must not contribute to the signature.
+fn skipWatchFile(path: []const u8, ignore_files: []const []const u8) bool {
+    for (ignore_files) |ig| {
+        if (std.mem.eql(u8, path, ig)) return true;
+    }
+    return false;
+}
+
 /// Accumulate `dir_path`'s tree signature into `sig`. Best-effort: an
 /// unreadable dir/file is skipped rather than fatal (a transient rename
 /// mid-scan just shows up as a change on the next poll). Recurses into
@@ -469,6 +512,7 @@ fn computeSignature(
     io: std.Io,
     allocator: std.mem.Allocator,
     dir_path: []const u8,
+    ignore_files: []const []const u8,
     sig: *TreeSignature,
 ) void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
@@ -480,10 +524,11 @@ fn computeSignature(
             if (skipWatchDir(entry.name)) continue;
             const sub = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(sub);
-            computeSignature(io, allocator, sub, sig);
+            computeSignature(io, allocator, sub, ignore_files, sig);
         } else if (entry.kind == .file) {
             const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(fpath);
+            if (skipWatchFile(fpath, ignore_files)) continue;
             const st = std.Io.Dir.cwd().statFile(io, fpath, .{}) catch continue;
             sig.mix(fpath, st.size, st.mtime.nanoseconds);
         }
@@ -523,7 +568,7 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
     // `applied` = signature of the last (attempted) build. `last` = signature
     // seen on the previous poll — used to detect a burst still in flight.
     var applied = TreeSignature{};
-    computeSignature(io, scan_arena.allocator(), cfg.watch_dir, &applied);
+    computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &applied);
     _ = scan_arena.reset(.retain_capacity);
     var last = applied;
     var stable_polls: u32 = 0;
@@ -535,7 +580,7 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
         if (state.stop.load(.acquire)) return;
 
         var sig = TreeSignature{};
-        computeSignature(io, scan_arena.allocator(), cfg.watch_dir, &sig);
+        computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &sig);
         _ = scan_arena.reset(.retain_capacity);
 
         if (!sig.eql(last)) {
@@ -897,13 +942,13 @@ test "computeSignature: changes on add, edit, and remove" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "one" });
 
     var base = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &base);
+    computeSignature(io, alloc, dir_path, &.{}, &base);
     try std.testing.expectEqual(@as(u64, 1), base.file_count);
 
     // Add a file → count + digest change.
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "twelve!" });
     var after_add = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &after_add);
+    computeSignature(io, alloc, dir_path, &.{}, &after_add);
     try std.testing.expect(!base.eql(after_add));
     try std.testing.expectEqual(@as(u64, 2), after_add.file_count);
 
@@ -914,14 +959,14 @@ test "computeSignature: changes on add, edit, and remove" {
     // coalesced on Windows).
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "twelve!-longer" });
     var after_edit = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &after_edit);
+    computeSignature(io, alloc, dir_path, &.{}, &after_edit);
     try std.testing.expectEqual(after_add.file_count, after_edit.file_count);
     try std.testing.expect(!after_add.eql(after_edit));
 
     // Remove a file → back down to one entry, different from every prior sig.
     try tmp.dir.deleteFile(io, "b.txt");
     var after_rm = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &after_rm);
+    computeSignature(io, alloc, dir_path, &.{}, &after_rm);
     try std.testing.expectEqual(@as(u64, 1), after_rm.file_count);
     try std.testing.expect(!after_rm.eql(after_add));
 }
@@ -966,14 +1011,14 @@ test "computeSignature: a same-size in-place edit triggers a rebuild" {
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "bbbb" });
 
     var applied = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &applied);
+    computeSignature(io, alloc, dir_path, &.{}, &applied);
 
     // Same 4-byte length, different content → only the mtime moves. On
     // macOS/Linux the write bumps the file's mtime to a distinguishable
     // value, so the (path,size,mtime) digest flips.
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "AAAA" });
     var now = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &now);
+    computeSignature(io, alloc, dir_path, &.{}, &now);
 
     try std.testing.expectEqual(applied.file_count, now.file_count);
     try std.testing.expect(!applied.eql(now));
@@ -992,13 +1037,13 @@ test "computeSignature: skips .labelle build-output dir (no self-trigger)" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "scene.zon", .data = "source" });
     var before = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &before);
+    computeSignature(io, alloc, dir_path, &.{}, &before);
 
     // Simulate a rebuild writing into .labelle/ — the signature must not move.
     try tmp.dir.createDirPath(io, ".labelle/raylib_wasm");
     try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/raylib_wasm/out.wasm", .data = "artifact" });
     var after = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &after);
+    computeSignature(io, alloc, dir_path, &.{}, &after);
     try std.testing.expect(before.eql(after));
 }
 
@@ -1067,4 +1112,77 @@ test "handleConnection: without --watch, HTML is served untouched and the endpoi
     // No watcher → no injected client script.
     try std.testing.expect(std.mem.indexOf(u8, resp, "__labelle_livereload") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "plain") != null);
+}
+
+// The watch-mode double rebuild (cli#355 review round 2): a prebuild hook
+// regenerates a non-hidden output, `watchLoop` records the signature it
+// captured BEFORE the callback, and the next poll sees the hook's own
+// write as a fresh change — a second full generate/compile/browser-reload
+// for a step that is now up to date.
+test "computeSignature: a declared prebuild output does not move the signature" {
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = buf[0..try tmp.dir.realPath(io, &buf)];
+    const alloc = std.testing.allocator;
+
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game.zig", .data = "const a = 1;" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/out.png", .data = "v1" });
+
+    const ignored = try watchIgnorePath(alloc, dir_path, "assets/out.png");
+    defer alloc.free(ignored);
+    const ignore_files = [_][]const u8{ignored};
+
+    var before = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &ignore_files, &before);
+
+    // The hook regenerates its declared output — a different size AND a
+    // later mtime, which is what the naive signature keyed on.
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/out.png", .data = "v2-regenerated" });
+
+    var after = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &ignore_files, &after);
+    try std.testing.expect(before.eql(after));
+
+    // ...while an edit to a watched SOURCE still fires.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game.zig", .data = "const a = 2222;" });
+    var edited = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &ignore_files, &edited);
+    try std.testing.expect(!before.eql(edited));
+    // And without the exclusion the regeneration DOES move it — the bug.
+    var unfiltered_before = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &.{}, &unfiltered_before);
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/out.png", .data = "v3-regenerated-again" });
+    var unfiltered_after = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &.{}, &unfiltered_after);
+    try std.testing.expect(!unfiltered_before.eql(unfiltered_after));
+}
+
+test "watchIgnorePath: roots a declared output the way the walk builds paths" {
+    // POSIX-only: the expected strings spell the separator. The behavior
+    // under test (a leading `./` must still match the walked path) is
+    // separator-agnostic, and the tree-level test above covers it on
+    // every platform.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    const plain = try watchIgnorePath(alloc, "/proj", "assets/out.png");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("/proj/assets/out.png", plain);
+
+    // A leading `./` in the declaration must still match the walked path.
+    const dotted = try watchIgnorePath(alloc, "/proj", "./assets/out.png");
+    defer alloc.free(dotted);
+    try std.testing.expectEqualStrings("/proj/assets/out.png", dotted);
+}
+
+test "skipWatchFile: matches only the declared outputs" {
+    const ignore_files = [_][]const u8{ "/proj/assets/out.png", "/proj/scripts/table.zig" };
+    try std.testing.expect(skipWatchFile("/proj/assets/out.png", &ignore_files));
+    try std.testing.expect(skipWatchFile("/proj/scripts/table.zig", &ignore_files));
+    try std.testing.expect(!skipWatchFile("/proj/assets/out.json", &ignore_files));
+    try std.testing.expect(!skipWatchFile("/proj/game.zig", &ignore_files));
+    try std.testing.expect(!skipWatchFile("/proj/assets/out.png", &.{}));
 }

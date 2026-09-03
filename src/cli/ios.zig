@@ -267,9 +267,33 @@ fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_na
 // labelle ios subcommand
 // ============================================================================
 
+/// True when this invocation can only ever PRINT USAGE — no subcommand at
+/// all, a `help`/`--help`/`-h` subcommand, or a `--help`/`-h` anywhere in
+/// the arguments (`labelle ios build --help`).
+///
+/// `cli.zig` calls this BEFORE `pipeline.run` (cli#355): reaching
+/// `handleIos` through the pipeline means the project's declared
+/// `.prebuild` commands and a full generate+build have already run merely
+/// to print usage. The first version of that interception only inspected
+/// the FIRST extra argument, so `labelle ios build --help` still took the
+/// long way round — and built. `handleIos` consults the same predicate so
+/// the two can't drift.
+///
+/// Pure, so the matrix is unit-testable without spawning anything.
+pub fn wantsHelpOnly(args: []const []const u8) bool {
+    if (args.len == 0) return true;
+    // The bare word `help` is a subcommand, so it counts only in the
+    // subcommand slot; `--help`/`-h` count anywhere.
+    if (std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+    }
+    return false;
+}
+
 /// Handle `labelle ios <subcommand>` — build, xcode, run for iOS.
 pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, cfg: project_config.ProjectConfig, target_dir: []const u8) !void {
-    if (args.len == 0) {
+    if (wantsHelpOnly(args)) {
         printIosHelp();
         return;
     }
@@ -303,15 +327,18 @@ pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, cfg: pr
             try iosBuild(allocator, target_dir, false, false);
             try deployToSimulator(allocator, target_dir, cfg);
         }
-    } else if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h")) {
-        printIosHelp();
     } else {
         std.debug.print("labelle ios: unknown command '{s}'\n\n", .{subcmd});
         printIosHelp();
     }
 }
 
-fn printIosHelp() void {
+/// `labelle ios` usage. Public because `cli.zig` intercepts the
+/// help/no-subcommand invocations BEFORE the build pipeline runs — see
+/// the note there (cli#355): reaching this through `pipeline.run` meant
+/// asking for usage first executed the project's declared `.prebuild`
+/// commands and a full generate+build.
+pub fn printIosHelp() void {
     std.debug.print(
         \\iOS Commands
         \\
@@ -826,4 +853,29 @@ test "isSimdFeatureBuildError: ignores unrelated feature-mismatch errors" {
 test "isSimdFeatureBuildError: ignores ordinary build failures" {
     const stderr = "error: unable to find 'game.zig'\n";
     try std.testing.expect(!isSimdFeatureBuildError(stderr));
+}
+
+test "wantsHelpOnly: no subcommand at all" {
+    try std.testing.expect(wantsHelpOnly(&.{}));
+}
+
+test "wantsHelpOnly: explicit help forms" {
+    try std.testing.expect(wantsHelpOnly(&.{"help"}));
+    try std.testing.expect(wantsHelpOnly(&.{"--help"}));
+    try std.testing.expect(wantsHelpOnly(&.{"-h"}));
+}
+
+// The positional blind spot: the first interception only looked at
+// args[0], so this asked for usage and got a full generate+build instead.
+test "wantsHelpOnly: a help flag AFTER a subcommand still only prints usage" {
+    try std.testing.expect(wantsHelpOnly(&.{ "build", "--help" }));
+    try std.testing.expect(wantsHelpOnly(&.{ "run", "-h" }));
+    try std.testing.expect(wantsHelpOnly(&.{ "xcode", "--team-id=ABC", "--help" }));
+}
+
+test "wantsHelpOnly: real work is not intercepted" {
+    try std.testing.expect(!wantsHelpOnly(&.{"build"}));
+    try std.testing.expect(!wantsHelpOnly(&.{ "build", "--device", "--release" }));
+    try std.testing.expect(!wantsHelpOnly(&.{ "xcode", "--team-id=ABC" }));
+    try std.testing.expect(!wantsHelpOnly(&.{"run"}));
 }
