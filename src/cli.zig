@@ -398,10 +398,9 @@ pub fn main(proc_init: std.process.Init) !void {
         else => {},
     }
 
-    // `labelle android doctor` and `labelle android help` are
-    // standalone — they don't need a project.labelle. Intercept here
-    // so running them from any directory works without the "No
-    // project.labelle found" bail below.
+    // `labelle android doctor` is standalone — it doesn't need a
+    // project.labelle. Intercept here so running it from any directory
+    // works without the "No project.labelle found" bail below.
     //
     // Doctor still *uses* the project's android config when available
     // so the probe targets the right `target_sdk_version`. The read
@@ -426,25 +425,25 @@ pub fn main(proc_init: std.process.Init) !void {
             };
             return;
         }
-        if (std.mem.eql(u8, first, "help") or std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
-            return android.printHelp();
-        }
     }
 
-    // Same interception for `labelle ios` (cli#355). `handleIos` prints
-    // usage for `--help`/`-h`/no subcommand, but it is only reached at the
+    // Help-only invocations of `android`/`ios` must not enter the build
+    // pipeline (cli#355). Both handlers print usage for a missing
+    // subcommand and for `--help`/`-h`, but they are only reached at the
     // END of `pipeline.run` — so merely asking for usage first executed
-    // the project's declared `.prebuild` commands and a whole
-    // generate+build. Informational invocations must not run project
-    // commands, and they don't need a project.labelle either.
-    if (command == .ios_cmd) {
-        const wants_help = parsed_args.extra_count == 0 or blk: {
-            const first = parsed_args.extra_args[0];
-            break :blk std.mem.eql(u8, first, "help") or
-                std.mem.eql(u8, first, "--help") or
-                std.mem.eql(u8, first, "-h");
-        };
-        if (wants_help) return ios.printIosHelp();
+    // the project's declared `.prebuild` commands plus a whole
+    // generate+build. They don't need a project.labelle either.
+    //
+    // The predicate lives beside each handler's own parse loop
+    // (`android.wantsHelpOnly`, `ios.wantsHelpOnly`) and covers EVERY
+    // help form, not just a token in the first extra-argument position:
+    // `labelle android`, `labelle android build --help` and
+    // `labelle ios build --help` all reached the pipeline before.
+    if (command == .android_cmd and android.wantsHelpOnly(parsed_args.extra_args[0..parsed_args.extra_count])) {
+        return android.printHelp();
+    }
+    if (command == .ios_cmd and ios.wantsHelpOnly(parsed_args.extra_args[0..parsed_args.extra_count])) {
+        return ios.printIosHelp();
     }
 
     return pipeline.run(allocator, parsed_args);

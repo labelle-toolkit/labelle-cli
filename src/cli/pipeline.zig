@@ -73,10 +73,14 @@ const WasmRebuildCtx = struct {
         // 0. Re-run the declared prebuild steps, ahead of generation just
         //    as the initial pipeline does. Steps that declare `.inputs` +
         //    `.outputs` are skipped while fresh, so the common watch
-        //    iteration costs a few stats. A step that declares NEITHER
-        //    runs on every rebuild by design; if such a step also writes
-        //    into the watched tree it will retrigger the watcher, so
-        //    declare `.inputs`/`.outputs` for generators used under
+        //    iteration costs a few stats — and their declared `.outputs`
+        //    are excluded from the watch signature (`ignore_files` at the
+        //    `serveAndOpen` call below), so the run that DOES regenerate
+        //    them no longer looks like a fresh edit on the next poll.
+        //    A step that declares no `.outputs` runs on every rebuild by
+        //    design and is not excluded from anything; if such a step
+        //    also writes into the watched tree it retriggers the watcher
+        //    in a loop, so declare `.outputs` for generators used under
         //    `--watch`.
         prebuild.runAll(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
@@ -785,10 +789,35 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
                         .fatal_on_step_failure = false,
                     },
                 };
+                // The hooks' declared `.outputs` are excluded from the
+                // watch signature (cli#355): the rebuild callback writes
+                // them, and `watchLoop` records the signature captured
+                // BEFORE the callback, so folding them in made the hook's
+                // own regeneration look like a fresh edit and fired a
+                // second full generate/compile/reload. Same reasoning as
+                // the `.labelle/` skip. Best-effort — a path that can't
+                // be joined is simply not excluded (a redundant rebuild,
+                // never a missed one).
+                var ignore_files: std.ArrayList([]const u8) = .empty;
+                defer {
+                    for (ignore_files.items) |f| allocator.free(f);
+                    ignore_files.deinit(allocator);
+                }
+                for (parsed.prebuild) |step| {
+                    for (step.outputs) |rel| {
+                        const p = serve.watchIgnorePath(allocator, project_dir, rel) catch continue;
+                        ignore_files.append(allocator, p) catch {
+                            allocator.free(p);
+                            continue;
+                        };
+                    }
+                }
+
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
                     .watch_dir = project_dir,
                     .rebuild_fn = WasmRebuildCtx.rebuild,
                     .rebuild_ctx = &rebuild_ctx,
+                    .ignore_files = ignore_files.items,
                 });
             } else {
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);

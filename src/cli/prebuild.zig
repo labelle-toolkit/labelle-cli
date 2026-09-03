@@ -28,6 +28,21 @@
 //! emit an atlas the project declares in `.resources`, a script the game
 //! compiles against, or both.
 //!
+//! ## Freshness: files AND recipe
+//!
+//! A step that declares both `.inputs` and `.outputs` is skipped while it
+//! is up to date. "Up to date" has two halves, because either one alone
+//! silently reuses a stale artifact:
+//!
+//! 1. **The files** — `make`'s rule on the declared paths' mtimes
+//!    (`Scan`). Everything ambiguous (under-declared, missing path, stat
+//!    failure) resolves to "run".
+//! 2. **The recipe** — a fingerprint of `.run` + `.inputs`, persisted in
+//!    `.labelle/prebuild-recipes` keyed by the step's output set
+//!    (`RecipeStore`). Editing `.run` in `project.labelle` moves no mtime,
+//!    so without this the new command was skipped as "up to date" while
+//!    the build consumed what the OLD command produced.
+//!
 //! ## Trust posture — auditability, not sandboxing
 //!
 //! This executes commands named in a config file. That is deliberate and
@@ -210,6 +225,213 @@ fn mtimeNs(allocator: std.mem.Allocator, project_dir: []const u8, rel: []const u
     return @as(i128, st.mtime.nanoseconds);
 }
 
+// ── Recipe fingerprint (the `.run` declaration itself) ────────────────
+
+/// `Scan` can only see the DECLARED FILES. It cannot see the command, so
+/// with `.inputs`/`.outputs` declared, editing `.run` in `project.labelle`
+/// — adding a generator flag that changes the output format, say — moved
+/// no mtime and the step was skipped as "up to date" while the build
+/// consumed the artifact the OLD command produced. That is exactly the
+/// silent-staleness failure this whole feature exists to kill, arriving
+/// through the freshness check instead of through a missing declaration.
+///
+/// The fix is `make`'s own answer to the same hole (`.RECIPEPREREQ` /
+/// ninja's `command` field in `.ninja_log`): persist a fingerprint of the
+/// recipe next to the build output and treat a change to it as staleness.
+///
+/// Persisted under the project's `.labelle/` — the CLI's existing
+/// project-local scratch dir (build targets, the live build-status file).
+/// It is already git-ignored, `labelle clean` (a global package-cache
+/// command) does not touch it, and `serve.skipWatchDir` skips every
+/// dot-directory, so writing here can never retrigger `wasm serve
+/// --watch`.
+pub const state_dir_name = ".labelle";
+pub const state_file_name = "prebuild-recipes";
+
+const state_header =
+    "# labelle prebuild recipe fingerprints (cli#355) — generated, safe to delete\n" ++
+    "# <outputs-key> <recipe-hash>; a recipe change forces the step to re-run\n";
+
+/// Fold a list of strings into `h`, length-delimited so `{ "ab", "c" }`
+/// and `{ "a", "bc" }` cannot collide.
+fn hashList(h: *std.hash.Wyhash, list: []const []const u8) void {
+    for (list) |s| {
+        h.update(std.mem.asBytes(&@as(u64, s.len)));
+        h.update(s);
+    }
+}
+
+/// WHAT the step produces — its identity in the store, so re-ordering the
+/// `.prebuild` block does not invalidate anything. Commutative (a
+/// wrapping sum of per-path hashes) so re-ordering `.outputs` isn't a
+/// change either; a sum rather than an XOR because XOR would cancel a
+/// path declared twice down to the empty key.
+pub fn outputsKey(step: Step) u64 {
+    var key: u64 = 0;
+    for (step.outputs) |o| {
+        var h = std.hash.Wyhash.init(0x0b1e);
+        h.update(o);
+        key +%= h.final();
+    }
+    return key;
+}
+
+/// HOW it produces them: the argv, plus the declared `.inputs` (the rest
+/// of the declaration that says what the outputs are derived FROM —
+/// adding an input the tool now reads is a recipe change too). Order is
+/// significant here: `.run` is an argv.
+pub fn recipeHash(step: Step) u64 {
+    var h = std.hash.Wyhash.init(0x5c1e);
+    hashList(&h, step.run);
+    h.update("\x00inputs\x00");
+    hashList(&h, step.inputs);
+    return h.final();
+}
+
+/// The full freshness rule: a step is skipped only when its declared
+/// files are current AND the command that produced them is the command
+/// declared today. `recorded` is the fingerprint persisted the last time
+/// this output set was actually produced — `null` (no record: first build
+/// after adopting this, a wiped `.labelle/`, an unreadable state file)
+/// resolves to NOT fresh, matching the rest of this module: every
+/// ambiguous case runs, because a wrongly skipped step reintroduces the
+/// silent-stale bug while a wrongly re-run step only costs time.
+pub fn isFresh(scan: Scan, recorded: ?u64, current: u64) bool {
+    if (scan.verdict() != .fresh) return false;
+    const seen = recorded orelse return false;
+    return seen == current;
+}
+
+/// True when a step participates in freshness at all. A step missing
+/// either half of the declaration always runs, so it needs no record.
+pub fn isTracked(step: Step) bool {
+    return step.inputs.len > 0 and step.outputs.len > 0;
+}
+
+/// The persisted recipe fingerprints, keyed by output set. A short list,
+/// not a map: there are as many entries as tracked steps (one or two in
+/// practice), and a list keeps the file's line order stable across writes.
+pub const RecipeStore = struct {
+    pub const Entry = struct { key: u64, recipe: u64 };
+
+    entries: std.ArrayList(Entry) = .empty,
+
+    pub fn deinit(self: *RecipeStore, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+    }
+
+    /// The fingerprint recorded for this output set, or null when the
+    /// outputs have never been produced under a recorded recipe.
+    pub fn recordedFor(self: RecipeStore, key: u64) ?u64 {
+        for (self.entries.items) |e| {
+            if (e.key == key) return e.recipe;
+        }
+        return null;
+    }
+
+    /// Note that `key`'s outputs were just produced by `recipe`. An OOM
+    /// here is swallowed on purpose: the only consequence of a missing
+    /// record is that the step runs again next build.
+    pub fn record(self: *RecipeStore, allocator: std.mem.Allocator, key: u64, recipe: u64) void {
+        for (self.entries.items) |*e| {
+            if (e.key == key) {
+                e.recipe = recipe;
+                return;
+            }
+        }
+        self.entries.append(allocator, .{ .key = key, .recipe = recipe }) catch {};
+    }
+
+    /// Drop entries whose output set no longer matches a tracked declared
+    /// step, so the file can't grow without bound as `.prebuild` evolves.
+    pub fn prune(self: *RecipeStore, steps: []const Step) void {
+        var kept: usize = 0;
+        outer: for (self.entries.items) |e| {
+            for (steps) |s| {
+                if (!isTracked(s)) continue;
+                if (outputsKey(s) == e.key) {
+                    self.entries.items[kept] = e;
+                    kept += 1;
+                    continue :outer;
+                }
+            }
+        }
+        self.entries.shrinkRetainingCapacity(kept);
+    }
+
+    /// Parse the on-disk text. Pure and total: a malformed line is
+    /// skipped rather than fatal — a corrupt state file must degrade to
+    /// "re-run the step", never to a failed build.
+    pub fn parse(allocator: std.mem.Allocator, text: []const u8) RecipeStore {
+        var self: RecipeStore = .{};
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const key = std.fmt.parseInt(u64, line[0..sp], 16) catch continue;
+            const recipe = std.fmt.parseInt(u64, std.mem.trim(u8, line[sp + 1 ..], " \t"), 16) catch continue;
+            self.record(allocator, key, recipe);
+        }
+        return self;
+    }
+
+    /// Serialize to the on-disk text. Pure; caller owns the result.
+    pub fn render(self: RecipeStore, allocator: std.mem.Allocator) ![]u8 {
+        var aw = std.Io.Writer.Allocating.init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+        try w.writeAll(state_header);
+        for (self.entries.items) |e| {
+            try w.print("{x:0>16} {x:0>16}\n", .{ e.key, e.recipe });
+        }
+        return aw.toOwnedSlice();
+    }
+
+    /// Read the project's store. Never fails: a missing, unreadable or
+    /// corrupt file yields an EMPTY store, which makes every tracked step
+    /// stale — the conservative direction.
+    pub fn load(allocator: std.mem.Allocator, project_dir: []const u8) RecipeStore {
+        const path = statePath(allocator, project_dir) catch return .{};
+        defer allocator.free(path);
+        const raw = std.Io.Dir.cwd().readFileAlloc(
+            config.globalIo(),
+            path,
+            allocator,
+            .limited(256 * 1024),
+        ) catch return .{};
+        defer allocator.free(raw);
+        return parse(allocator, raw);
+    }
+
+    /// Persist the store. Best-effort — a project dir that can't be
+    /// written just means every tracked step re-runs on every build (the
+    /// pre-#355 behavior), so this reports and moves on rather than
+    /// failing a build whose steps have already succeeded.
+    pub fn save(self: RecipeStore, allocator: std.mem.Allocator, project_dir: []const u8) void {
+        const io = config.globalIo();
+        const dir = std.fs.path.join(allocator, &.{ project_dir, state_dir_name }) catch return;
+        defer allocator.free(dir);
+        const path = statePath(allocator, project_dir) catch return;
+        defer allocator.free(path);
+        const text = self.render(allocator) catch return;
+        defer allocator.free(text);
+
+        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch |err| {
+            std.debug.print(
+                "labelle: warning: could not write '{s}' ({s})\n" ++
+                    "  prebuild steps that declare .inputs/.outputs will re-run on every build.\n",
+                .{ path, @errorName(err) },
+            );
+        };
+    }
+};
+
+fn statePath(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ project_dir, state_dir_name, state_file_name });
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 
 /// Render argv for a log/error line: space-joined, each element that is
@@ -343,6 +565,14 @@ fn validateAll(steps: []const Step) Error!void {
 /// anywhere fails the build before the first spawn, so an invalid
 /// manifest can never leave partial side effects behind.
 ///
+/// A step that declares both `.inputs` and `.outputs` is skipped only
+/// when BOTH halves of freshness hold: the declared files' mtimes are
+/// current (`Scan`) AND the recipe that produced them is the recipe
+/// declared today (`RecipeStore`, persisted under `.labelle/`). Editing
+/// `.run` alone moves no mtime, so without the second half the new
+/// command was silently skipped and the artifact built by the OLD one was
+/// consumed.
+///
 /// A non-zero exit terminates the CLI with the child's EXACT exit code
 /// (via `progress.fatalExit`, which first marks the live build-status
 /// file `failed`), after printing which step failed and why. This mirrors
@@ -377,6 +607,12 @@ pub fn runAll(
     // mutated the project.
     try validateAll(steps);
 
+    // The recipe half of the freshness key. Loaded once; rewritten after
+    // each tracked step that actually ran, so a step whose command
+    // succeeded is not re-run just because a LATER step failed the build.
+    var store = RecipeStore.load(allocator, project_dir);
+    defer store.deinit(allocator);
+
     for (steps, 0..) |step, i| {
         // Tracked as an optional rather than by comparing the rendered
         // text to the placeholder: a project may legitimately declare
@@ -386,7 +622,17 @@ pub fn runAll(
         defer if (rendered_owned) |r| allocator.free(r);
         const rendered: []const u8 = rendered_owned orelse "<command>";
 
-        if (scanStep(allocator, project_dir, step).verdict() == .fresh) {
+        // Freshness has two halves — the declared files' mtimes, and the
+        // declaration that produced them. An untracked step (missing
+        // `.inputs` or `.outputs`) has neither and always runs.
+        const tracked = isTracked(step);
+        const key = if (tracked) outputsKey(step) else 0;
+        const recipe = if (tracked) recipeHash(step) else 0;
+        if (tracked and isFresh(
+            scanStep(allocator, project_dir, step),
+            store.recordedFor(key),
+            recipe,
+        )) {
             std.debug.print(
                 "  prebuild [{d}/{d}] up to date, skipping: {s}\n",
                 .{ i + 1, steps.len, rendered },
@@ -407,6 +653,15 @@ pub fn runAll(
             if (!opts.fatal_on_step_failure) return error.PrebuildStepFailed;
             var detail_buf: [progress.max_detail_len]u8 = undefined;
             progress.fatalExit(code, failureDetail(&detail_buf, i, steps.len));
+        }
+
+        // Record what produced these outputs, immediately: a later step
+        // may `fatalExit` out of this loop, and a step that genuinely
+        // succeeded should not be re-run because of that.
+        if (tracked) {
+            store.record(allocator, key, recipe);
+            store.prune(steps);
+            store.save(allocator, project_dir);
         }
     }
 }
@@ -574,6 +829,246 @@ pub const ScanStepSpec = struct {
                 .outputs = &.{"out.txt"},
             });
             try std.testing.expectEqual(Staleness.unknown, s.verdict());
+        }
+    };
+};
+
+/// The second half of the freshness key: the RECIPE. `Scan` sees only the
+/// declared files, so editing `.run` moved no mtime and the step was
+/// skipped as "up to date" while the build consumed the artifact the old
+/// command produced — the silent-staleness failure this feature exists to
+/// kill, arriving through the freshness check itself.
+pub const RecipeFingerprintSpec = struct {
+    pub const hashing = struct {
+        test "the same declaration hashes the same" {
+            const a: Step = .{ .run = &.{ "gen", "--fast" }, .inputs = &.{"a.txt"}, .outputs = &.{"o.png"} };
+            try std.testing.expectEqual(recipeHash(a), recipeHash(a));
+        }
+
+        test "a changed flag changes the recipe hash" {
+            const before: Step = .{ .run = &.{ "gen", "--fast" }, .inputs = &.{"a.txt"}, .outputs = &.{"o.png"} };
+            const after: Step = .{ .run = &.{ "gen", "--fast", "--rgba" }, .inputs = &.{"a.txt"}, .outputs = &.{"o.png"} };
+            try expect.toBeTrue(recipeHash(before) != recipeHash(after));
+        }
+
+        test "argv element boundaries matter" {
+            const a: Step = .{ .run = &.{ "ab", "c" } };
+            const b: Step = .{ .run = &.{ "a", "bc" } };
+            try expect.toBeTrue(recipeHash(a) != recipeHash(b));
+        }
+
+        test "adding a declared input is a recipe change" {
+            const a: Step = .{ .run = &.{"gen"}, .inputs = &.{"a.txt"}, .outputs = &.{"o.png"} };
+            const b: Step = .{ .run = &.{"gen"}, .inputs = &.{ "a.txt", "gen.py" }, .outputs = &.{"o.png"} };
+            try expect.toBeTrue(recipeHash(a) != recipeHash(b));
+        }
+
+        test "the outputs key identifies the step, order-independently" {
+            const a: Step = .{ .run = &.{"gen"}, .outputs = &.{ "o.png", "o.json" } };
+            const b: Step = .{ .run = &.{"other"}, .outputs = &.{ "o.json", "o.png" } };
+            try std.testing.expectEqual(outputsKey(a), outputsKey(b));
+        }
+
+        test "a different output set is a different key" {
+            const a: Step = .{ .run = &.{"gen"}, .outputs = &.{"o.png"} };
+            const b: Step = .{ .run = &.{"gen"}, .outputs = &.{"p.png"} };
+            try expect.toBeTrue(outputsKey(a) != outputsKey(b));
+        }
+
+        test "a path declared twice does not cancel out to the empty key" {
+            const dup: Step = .{ .run = &.{"gen"}, .outputs = &.{ "o.png", "o.png" } };
+            try expect.toBeTrue(outputsKey(dup) != outputsKey(.{ .run = &.{"gen"} }));
+        }
+    };
+
+    /// The pure decision. Every ambiguous case must resolve to "run".
+    pub const decision = struct {
+        const current = Scan{
+            .has_inputs = true,
+            .has_outputs = true,
+            .newest_input_ns = 100,
+            .oldest_output_ns = 200,
+        };
+
+        test "current files plus a matching recipe is fresh" {
+            try expect.toBeTrue(isFresh(current, 7, 7));
+        }
+
+        test "current files but a CHANGED recipe is not fresh" {
+            try expect.toBeFalse(isFresh(current, 7, 8));
+        }
+
+        test "no recorded recipe is not fresh" {
+            try expect.toBeFalse(isFresh(current, null, 7));
+        }
+
+        test "a matching recipe cannot rescue stale files" {
+            const stale = Scan{
+                .has_inputs = true,
+                .has_outputs = true,
+                .newest_input_ns = 300,
+                .oldest_output_ns = 200,
+            };
+            try expect.toBeFalse(isFresh(stale, 7, 7));
+        }
+
+        test "only steps declaring both halves are tracked" {
+            try expect.toBeTrue(isTracked(.{ .run = &.{"g"}, .inputs = &.{"i"}, .outputs = &.{"o"} }));
+            try expect.toBeFalse(isTracked(.{ .run = &.{"g"}, .inputs = &.{"i"} }));
+            try expect.toBeFalse(isTracked(.{ .run = &.{"g"}, .outputs = &.{"o"} }));
+            try expect.toBeFalse(isTracked(.{ .run = &.{"g"} }));
+        }
+    };
+
+    /// The store's text format. Total: a corrupt file must degrade to
+    /// "re-run", never to a failed build.
+    pub const store_format = struct {
+        test "render then parse round-trips" {
+            var store: RecipeStore = .{};
+            defer store.deinit(std.testing.allocator);
+            store.record(std.testing.allocator, 0xdead, 0xbeef);
+            store.record(std.testing.allocator, 1, 2);
+
+            const text = try store.render(std.testing.allocator);
+            defer std.testing.allocator.free(text);
+
+            var back = RecipeStore.parse(std.testing.allocator, text);
+            defer back.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(?u64, 0xbeef), back.recordedFor(0xdead));
+            try std.testing.expectEqual(@as(?u64, 2), back.recordedFor(1));
+            try std.testing.expectEqual(@as(?u64, null), back.recordedFor(3));
+        }
+
+        test "recording the same key twice overwrites rather than appends" {
+            var store: RecipeStore = .{};
+            defer store.deinit(std.testing.allocator);
+            store.record(std.testing.allocator, 5, 1);
+            store.record(std.testing.allocator, 5, 2);
+            try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+            try std.testing.expectEqual(@as(?u64, 2), store.recordedFor(5));
+        }
+
+        test "garbage lines are skipped, not fatal" {
+            var store = RecipeStore.parse(std.testing.allocator,
+                \\# a comment
+                \\not hex at all
+                \\zzzz 1
+                \\
+                \\000000000000000a 000000000000000b
+                \\
+            );
+            defer store.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+            try std.testing.expectEqual(@as(?u64, 0xb), store.recordedFor(0xa));
+        }
+
+        test "prune drops entries no declared step produces" {
+            var store: RecipeStore = .{};
+            defer store.deinit(std.testing.allocator);
+            const kept: Step = .{ .run = &.{"g"}, .inputs = &.{"i"}, .outputs = &.{"o"} };
+            store.record(std.testing.allocator, outputsKey(kept), 1);
+            store.record(std.testing.allocator, 0xdeadbeef, 2);
+
+            store.prune(&.{kept});
+            try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+            try std.testing.expectEqual(@as(?u64, 1), store.recordedFor(outputsKey(kept)));
+        }
+
+        test "a missing state file loads as an empty store" {
+            var store = RecipeStore.load(std.testing.allocator, "/no/such/project/dir");
+            defer store.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+        }
+    };
+
+    /// The regression itself, end to end: same files, same mtimes, only
+    /// `.run` edited. POSIX only.
+    pub const end_to_end = struct {
+        test "changing .run alone forces a re-run" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            try tmp.dir.writeFile(io, .{ .sub_path = "src.txt", .data = "in" });
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+            // Run 1: produces `gen.txt` with the "v1" recipe.
+            try runAll(std.testing.allocator, root, &.{.{
+                .run = &.{ "/bin/sh", "-c", "printf v1 > gen.txt" },
+                .inputs = &.{"src.txt"},
+                .outputs = &.{"gen.txt"},
+            }}, .{});
+            {
+                const got = try tmp.dir.readFileAlloc(io, "gen.txt", std.testing.allocator, .limited(64));
+                defer std.testing.allocator.free(got);
+                try std.testing.expectEqualStrings("v1", got);
+            }
+
+            // Run 2: SAME declared files, all mtimes untouched, only the
+            // command changed. Before the recipe fingerprint this was
+            // skipped as "up to date" and the build consumed `v1`.
+            try runAll(std.testing.allocator, root, &.{.{
+                .run = &.{ "/bin/sh", "-c", "printf v2 > gen.txt" },
+                .inputs = &.{"src.txt"},
+                .outputs = &.{"gen.txt"},
+            }}, .{});
+            {
+                const got = try tmp.dir.readFileAlloc(io, "gen.txt", std.testing.allocator, .limited(64));
+                defer std.testing.allocator.free(got);
+                try std.testing.expectEqualStrings("v2", got);
+            }
+
+            // Run 3: back to the v2 recipe, nothing else touched — the
+            // recorded fingerprint now matches, so it is skipped again.
+            try tmp.dir.writeFile(io, .{ .sub_path = "gen.txt", .data = "sentinel" });
+            try runAll(std.testing.allocator, root, &.{.{
+                .run = &.{ "/bin/sh", "-c", "printf v2 > gen.txt" },
+                .inputs = &.{"src.txt"},
+                .outputs = &.{"gen.txt"},
+            }}, .{});
+            const got = try tmp.dir.readFileAlloc(io, "gen.txt", std.testing.allocator, .limited(64));
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualStrings("sentinel", got);
+        }
+
+        test "the fingerprint is persisted under .labelle/" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            try tmp.dir.writeFile(io, .{ .sub_path = "src.txt", .data = "in" });
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+            const step: Step = .{
+                .run = &.{ "/bin/sh", "-c", "printf out > gen.txt" },
+                .inputs = &.{"src.txt"},
+                .outputs = &.{"gen.txt"},
+            };
+            try runAll(std.testing.allocator, root, &.{step}, .{});
+
+            var store = RecipeStore.load(std.testing.allocator, root);
+            defer store.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(?u64, recipeHash(step)), store.recordedFor(outputsKey(step)));
+        }
+
+        test "an untracked step writes no state file" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+            try runAll(std.testing.allocator, root, &.{.{
+                .run = &.{ "/bin/sh", "-c", "printf ok > ran.txt" },
+            }}, .{});
+
+            try std.testing.expectError(
+                error.FileNotFound,
+                tmp.dir.statFile(io, ".labelle/" ++ state_file_name, .{}),
+            );
         }
     };
 };
@@ -768,27 +1263,37 @@ pub const RunAllSpec = struct {
             try std.testing.expectEqualStrings("abc", data);
         }
 
-        test "a step whose outputs are current is skipped" {
+        // Freshness now needs BOTH halves — current mtimes and a recorded
+        // recipe — so the skip only happens on a SECOND run, once the
+        // first has recorded what produced `gen.txt`. Run 1 proves the
+        // conservative default (no record = run), run 2 the skip.
+        test "a step whose outputs are current is skipped on the next run" {
             if (builtin.os.tag == .windows) return error.SkipZigTest;
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
             const io = config.globalIo();
             try tmp.dir.writeFile(io, .{ .sub_path = "src.txt", .data = "in" });
-            try tmp.dir.writeFile(io, .{ .sub_path = "gen.txt", .data = "out" });
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const root = buf[0..try tmp.dir.realPath(io, &buf)];
 
-            try runAll(std.testing.allocator, root, &.{.{
-                .run = &.{ "/bin/sh", "-c", "printf ran > ran.txt" },
+            const step: Step = .{
+                .run = &.{ "/bin/sh", "-c", "printf out > gen.txt; printf a >> ran.txt" },
                 .inputs = &.{"src.txt"},
                 .outputs = &.{"gen.txt"},
-            }}, .{});
+            };
 
-            // The step must NOT have run: `gen.txt` is newer than `src.txt`.
-            try std.testing.expectError(
-                error.FileNotFound,
-                tmp.dir.statFile(io, "ran.txt", .{}),
-            );
+            // Run 1: no output yet, and no recorded recipe — must run.
+            try runAll(std.testing.allocator, root, &.{step}, .{});
+            const first = try tmp.dir.readFileAlloc(io, "ran.txt", std.testing.allocator, .limited(64));
+            defer std.testing.allocator.free(first);
+            try std.testing.expectEqualStrings("a", first);
+
+            // Run 2: `gen.txt` is newer than `src.txt` AND the recipe is
+            // unchanged — must be skipped, so `ran.txt` does not grow.
+            try runAll(std.testing.allocator, root, &.{step}, .{});
+            const second = try tmp.dir.readFileAlloc(io, "ran.txt", std.testing.allocator, .limited(64));
+            defer std.testing.allocator.free(second);
+            try std.testing.expectEqualStrings("a", second);
         }
 
         test "a step with no inputs/outputs runs unconditionally" {

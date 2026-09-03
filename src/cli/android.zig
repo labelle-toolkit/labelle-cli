@@ -106,6 +106,65 @@ pub const AbiArch = enum {
     }
 };
 
+/// Long flags whose VALUE is the following token. Mirrors the `takeValue`
+/// calls in `handleAndroid` — `wantsHelpOnly` has to skip those values or
+/// `labelle android --channel beta` would look like the subcommand
+/// `beta`. Kept beside the parse loop so the two stay in step; an entry
+/// missing here only costs a missed help interception (today's behavior),
+/// never a spurious one.
+const value_flags = [_][]const u8{
+    "--keystore",
+    "--keystore-pass",
+    "--key-alias",
+    "--key-pass",
+    "--tag",
+    "--channel",
+    "--notes-file",
+};
+
+fn isValueFlag(arg: []const u8) bool {
+    for (value_flags) |f| {
+        if (std.mem.eql(u8, arg, f)) return true;
+    }
+    return false;
+}
+
+/// True when this invocation can only ever PRINT USAGE — no subcommand at
+/// all, a `help` subcommand, or a `--help`/`-h` anywhere in the arguments.
+/// Exactly the set `handleAndroid` answers with `printHelp`.
+///
+/// `cli.zig` calls this BEFORE `pipeline.run` (cli#355). Reaching
+/// `handleAndroid` through the pipeline means the project's declared
+/// `.prebuild` commands — and a whole generate+build — have already run
+/// merely to print usage. The previous interception only looked at the
+/// FIRST extra argument, so `labelle android` (no subcommand) and
+/// `labelle android build --help` still went the long way round.
+///
+/// Pure, so the whole matrix is unit-testable without spawning anything.
+pub fn wantsHelpOnly(extra_args: []const []const u8) bool {
+    var has_subcmd = false;
+    var i: usize = 0;
+    while (i < extra_args.len) : (i += 1) {
+        const arg = extra_args[i];
+        // `--help`/`-h` are recognised in ANY position, matching the
+        // parse loop. The bare word `help` is a SUBCOMMAND, so it only
+        // counts in the subcommand slot — `labelle android build help`
+        // builds, exactly as it does today.
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (isValueFlag(arg) and i + 1 < extra_args.len and
+            !std.mem.startsWith(u8, extra_args[i + 1], "-"))
+        {
+            i += 1; // the flag's value — never a subcommand
+            continue;
+        }
+        if (!std.mem.startsWith(u8, arg, "-") and !has_subcmd) {
+            has_subcmd = true;
+            if (std.mem.eql(u8, arg, "help")) return true;
+        }
+    }
+    return !has_subcmd;
+}
+
 /// Handle `labelle android <subcommand>` dispatch.
 pub fn handleAndroid(
     allocator: std.mem.Allocator,
@@ -281,4 +340,45 @@ pub fn printHelp() void {
         \\  flow automatically.
         \\
     , .{});
+}
+
+// --- Tests ---
+
+// Every form below reached `pipeline.run` before cli#355's second review
+// round — running the project's declared `.prebuild` commands and a full
+// generate+build merely to print usage.
+test "wantsHelpOnly: no subcommand at all" {
+    try std.testing.expect(wantsHelpOnly(&.{}));
+}
+
+test "wantsHelpOnly: flags but no subcommand" {
+    try std.testing.expect(wantsHelpOnly(&.{"--emulator"}));
+    try std.testing.expect(wantsHelpOnly(&.{ "--release", "--all-abis" }));
+}
+
+test "wantsHelpOnly: a value flag's value is not a subcommand" {
+    try std.testing.expect(wantsHelpOnly(&.{ "--channel", "beta" }));
+    try std.testing.expect(wantsHelpOnly(&.{ "--keystore", "k.jks", "--keystore-pass", "p" }));
+}
+
+test "wantsHelpOnly: explicit help forms" {
+    try std.testing.expect(wantsHelpOnly(&.{"help"}));
+    try std.testing.expect(wantsHelpOnly(&.{"--help"}));
+    try std.testing.expect(wantsHelpOnly(&.{"-h"}));
+}
+
+test "wantsHelpOnly: a help flag AFTER a subcommand still only prints usage" {
+    try std.testing.expect(wantsHelpOnly(&.{ "build", "--help" }));
+    try std.testing.expect(wantsHelpOnly(&.{ "run", "-h" }));
+    try std.testing.expect(wantsHelpOnly(&.{ "deploy", "--channel", "beta", "--help" }));
+}
+
+test "wantsHelpOnly: real work is not intercepted" {
+    try std.testing.expect(!wantsHelpOnly(&.{"build"}));
+    try std.testing.expect(!wantsHelpOnly(&.{ "run", "--emulator" }));
+    try std.testing.expect(!wantsHelpOnly(&.{"doctor"}));
+    try std.testing.expect(!wantsHelpOnly(&.{ "deploy", "--tag", "v1", "--channel", "beta" }));
+    // `help` is a SUBCOMMAND word, so it only counts in the subcommand
+    // slot — `android build help` builds, exactly as `handleAndroid` does.
+    try std.testing.expect(!wantsHelpOnly(&.{ "build", "help" }));
 }

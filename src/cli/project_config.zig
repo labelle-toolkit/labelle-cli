@@ -260,8 +260,15 @@ pub const PrebuildStep = struct {
     /// staleness bug this feature exists to kill.
     inputs: []const []const u8 = &.{},
     /// Files the step writes, relative to the project root. The step is
-    /// skipped when every output exists and is at least as new as every
-    /// input.
+    /// skipped when every output exists, is at least as new as every
+    /// input, AND was produced by the `.run` declared today — the CLI
+    /// fingerprints the recipe into `.labelle/prebuild-recipes`, so
+    /// editing `.run` alone (which moves no mtime) forces a re-run
+    /// instead of silently reusing the artifact the old command made.
+    ///
+    /// Under `wasm serve --watch` these paths are also excluded from the
+    /// watched tree: the hook writes them, so counting them as source
+    /// edits fired a second, redundant rebuild+reload.
     outputs: []const []const u8 = &.{},
 };
 
