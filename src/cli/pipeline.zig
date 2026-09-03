@@ -662,7 +662,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         }
         const app_path = try bundle.createFromBuild(allocator, project_dir, target_dir, parsed, parsed_args.bundle_output);
         defer allocator.free(app_path);
-        std.debug.print("  open \"{s}\"\n", .{app_path});
+        // `createFromBuild` already printed the plain path. The paste-able
+        // hint is single-quoted so a `"`, `$VAR` or backtick in a project
+        // title stays literal instead of expanding in the user's shell.
+        const quoted = try bundle.shellSingleQuote(allocator, app_path);
+        defer allocator.free(quoted);
+        std.debug.print("  open {s}\n", .{quoted});
         if (reporter) |r| r.finishDone(0);
         return;
     }

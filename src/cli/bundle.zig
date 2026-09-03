@@ -198,17 +198,170 @@ pub fn isSafeBundleDirName(dir_name: []const u8) bool {
     return true;
 }
 
-/// `CFBundleVersion` from the project version. The build-version key
-/// is restricted to dotted integers (`1.2.3`), while
-/// `CFBundleShortVersionString` tolerates the full semver the project
-/// wrote — so take the leading `[0-9.]` run (`1.2.3-beta+5` → `1.2.3`)
-/// and fall back to `1` when there is none. Pure slice into `version`.
-pub fn bundleVersion(version: []const u8) []const u8 {
+/// Normalize the project version for BOTH plist version keys.
+///
+/// Apple requires `CFBundleShortVersionString` (the marketing version)
+/// and `CFBundleVersion` (the build number) to be period-separated
+/// integers, at most three components — a raw semver `1.2.3-beta` or
+/// `2.0.0+build.7` fails distribution validation. So keep the leading
+/// run of `digits(.digits)*` up to three components and drop prerelease
+/// / build metadata: `1.2.3-beta` → `1.2.3`, `1.2.3.4` → `1.2.3`,
+/// `2.` → `2`. Nothing usable (`""`, `v2`) → `1.0`. Pure slice into
+/// `version` (or the literal fallback).
+pub fn plistVersion(version: []const u8) []const u8 {
     var end: usize = 0;
-    while (end < version.len and ((version[end] >= '0' and version[end] <= '9') or version[end] == '.')) : (end += 1) {}
-    // Strip a trailing dot so "1." doesn't become an odd build number.
-    while (end > 0 and version[end - 1] == '.') : (end -= 1) {}
-    return if (end == 0) "1" else version[0..end];
+    var components: u8 = 0;
+    while (components < 3) {
+        var i = end;
+        if (components > 0) {
+            if (i >= version.len or version[i] != '.') break;
+            i += 1;
+        }
+        const digits_start = i;
+        while (i < version.len and std.ascii.isDigit(version[i])) : (i += 1) {}
+        if (i == digits_start) break;
+        end = i;
+        components += 1;
+    }
+    return if (components == 0) "1.0" else version[0..end];
+}
+
+/// Bytes that make a title "unusable" when they are all it contains:
+/// whitespace and dots (a dots-only name is hidden in Finder; a blank
+/// one is an empty Dock label). Shared by the bundle dir name and the
+/// plist display names so the two can never disagree about what the
+/// title is.
+const title_strip = std.ascii.whitespace ++ [_]u8{'.'};
+
+/// `CFBundleName` / `CFBundleDisplayName`: the trimmed `.title` when
+/// anything usable remains, else the project `.name`, else `game` —
+/// the SAME usable-title rule `bundleDirName` applies (Codex on #362:
+/// a length-only check let a dots-only title through to a blank Dock
+/// label while the bundle itself was sensibly named after `.name`).
+/// Pure slice into one of the inputs (or the literal fallback).
+pub fn displayName(title: []const u8, name: []const u8) []const u8 {
+    const t = std.mem.trim(u8, title, &title_strip);
+    if (t.len > 0) return t;
+    const n = std.mem.trim(u8, name, &title_strip);
+    return if (n.len > 0) n else "game";
+}
+
+/// Quote `s` as ONE POSIX shell word: wrap in single quotes, and turn
+/// each embedded `'` into `'\''` (close, escaped quote, reopen). Inside
+/// single quotes nothing else is special, so `"`, `$`, backticks and
+/// spaces in a bundle path are literal — a double-quoted hint would let
+/// a `$VAR` or `$(…)` in a project title expand when pasted (Codex on
+/// #362). Caller owns the slice.
+pub fn shellSingleQuote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '\'');
+    for (s) |ch| {
+        if (ch == '\'') {
+            try buf.appendSlice(allocator, "'\\''");
+        } else {
+            try buf.append(allocator, ch);
+        }
+    }
+    try buf.append(allocator, '\'');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// The exe name the generated `build.zig` declares: the `.name = "…"` of
+/// its `addExecutable(.{ … })` call, which the assembler emits BEFORE
+/// `.root_module` (the module's `.imports` carry their own `.name`
+/// fields, so the search stops at `.root_module` rather than risk
+/// picking up `"labelle-core"`). Null when the file has no executable,
+/// the field is not where expected, or the value is not a bare file
+/// name — the caller then falls back to probing. Pure slice into
+/// `source`.
+pub fn exeNameFromBuildZig(source: []const u8) ?[]const u8 {
+    const call = std.mem.indexOf(u8, source, "addExecutable(") orelse return null;
+    const rest = source[call..];
+    const limit = std.mem.indexOf(u8, rest, ".root_module") orelse rest.len;
+    const key = std.mem.indexOf(u8, rest[0..limit], ".name = \"") orelse return null;
+    const start = key + ".name = \"".len;
+    const close = std.mem.indexOfScalarPos(u8, rest, start, '"') orelse return null;
+    const name = rest[start..close];
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null) return null;
+    return name;
+}
+
+/// The built desktop executable: `name` (what `CFBundleExecutable` gets)
+/// and its `path` under `<target>/zig-out/bin/`. Both owned.
+pub const ResolvedExe = struct {
+    name: []u8,
+    path: []u8,
+
+    pub fn deinit(self: ResolvedExe, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.path);
+    }
+};
+
+/// Find the exe the CURRENT build produced.
+///
+/// The assembler names the desktop exe after the sanitized project
+/// (labelle-assembler#362); older generated `build.zig` emit `game`.
+/// The obvious "sanitized if it exists, else `game`" probe (what the
+/// `labelle run` spawn site does) has a hole Codex flagged on #362: a
+/// project pinned to an older assembler REBUILDS `game`, but a stale
+/// sanitized-name binary from an earlier build still sits in `bin/` and
+/// wins, so the bundle silently ships an outdated game — precisely in
+/// the legacy scenario the fallback exists for.
+///
+/// So decide by the build that just ran: read the target dir's
+/// `build.zig` and take the exe it declares when that file exists. Only
+/// when that fails (unreadable/unparseable build.zig, or it names
+/// something the build didn't produce) fall back to probing the two
+/// candidates, and then prefer the MOST RECENTLY MODIFIED one — the one
+/// the build just wrote.
+pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, project_name: []const u8) !ResolvedExe {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
+    defer allocator.free(bin_dir);
+
+    // 1. What the generated build.zig says.
+    const build_zig = try std.fs.path.join(allocator, &.{ target_dir, "build.zig" });
+    defer allocator.free(build_zig);
+    if (cwd.readFileAlloc(io, build_zig, allocator, .limited(8 * 1024 * 1024))) |source| {
+        defer allocator.free(source);
+        if (exeNameFromBuildZig(source)) |declared| {
+            const path = try std.fs.path.join(allocator, &.{ bin_dir, declared });
+            errdefer allocator.free(path);
+            if (util.fileExists(path)) {
+                return .{ .name = try allocator.dupe(u8, declared), .path = path };
+            }
+            allocator.free(path);
+        }
+    } else |_| {}
+
+    // 2. Fallback: newest existing candidate.
+    const sanitized = try util.sanitizeExeName(allocator, project_name);
+    defer allocator.free(sanitized);
+    const candidates = [_][]const u8{ sanitized, "game" };
+    var best: ?ResolvedExe = null;
+    errdefer if (best) |b| b.deinit(allocator);
+    var best_mtime: i96 = 0;
+    for (candidates) |cand| {
+        const path = try std.fs.path.join(allocator, &.{ bin_dir, cand });
+        const st = cwd.statFile(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        if (best == null or st.mtime.nanoseconds > best_mtime) {
+            if (best) |b| b.deinit(allocator);
+            best = .{ .name = try allocator.dupe(u8, cand), .path = path };
+            best_mtime = st.mtime.nanoseconds;
+        } else {
+            allocator.free(path);
+        }
+    }
+    return best orelse {
+        std.debug.print("labelle bundle: built executable not found in {s} (looked for '{s}' and 'game')\n", .{ bin_dir, sanitized });
+        return error.BinaryNotFound;
+    };
 }
 
 /// Escape the five XML specials so a title like `Rock & Roll` produces
@@ -553,22 +706,12 @@ pub fn createFromBuild(
         }
     }
 
-    // 2. Locate the exe the generated build.zig produced. Same probe as
-    //    the `labelle run` spawn site: sanitized project name first
-    //    (labelle-assembler#362), legacy `game` as the fallback.
-    const sanitized = try util.sanitizeExeName(allocator, cfg.name);
-    defer allocator.free(sanitized);
-    const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
-    defer allocator.free(bin_dir);
-    const sanitized_full = try std.fs.path.join(allocator, &.{ bin_dir, sanitized });
-    defer allocator.free(sanitized_full);
-    const exe_name: []const u8 = if (util.fileExists(sanitized_full)) sanitized else "game";
-    const exe_src = try std.fs.path.join(allocator, &.{ bin_dir, exe_name });
-    defer allocator.free(exe_src);
-    if (!util.fileExists(exe_src)) {
-        std.debug.print("labelle bundle: built executable not found at {s}\n", .{exe_src});
-        return error.BinaryNotFound;
-    }
+    // 2. Locate the exe the CURRENT build produced (see `resolveBuiltExe`
+    //    for why this is not a plain existence probe).
+    const exe = try resolveBuiltExe(allocator, target_dir, cfg.name);
+    defer exe.deinit(allocator);
+    const exe_name: []const u8 = exe.name;
+    const exe_src: []const u8 = exe.path;
 
     // 3. Paths. Only `<out>/<Title>.app` is ever created or removed under
     //    the user's chosen directory — nothing else there is touched.
@@ -582,15 +725,15 @@ pub fn createFromBuild(
     //    will land; the .icns itself is built right after.
     const bundle_id = try deriveBundleId(allocator, cfg.name);
     defer allocator.free(bundle_id);
-    const display: []const u8 = if (cfg.title.len > 0) cfg.title else cfg.name;
+    const display = displayName(cfg.title, cfg.name);
     const has_icon = maybe_img != null;
     const plist = try renderInfoPlist(allocator, .{
         .bundle_id = bundle_id,
         .name = display,
         .display_name = display,
         .executable = exe_name,
-        .short_version = cfg.version,
-        .build_version = bundleVersion(cfg.version),
+        .short_version = plistVersion(cfg.version),
+        .build_version = plistVersion(cfg.version),
         .icon_file = if (has_icon) icon_file_key else null,
     });
     defer allocator.free(plist);
@@ -809,12 +952,64 @@ test "createFromBuild touches nothing under <out> except <Title>.app (Codex on #
     try testing.expect(util.fileExists(other_app));
 }
 
-test "bundleVersion keeps the dotted-integer prefix and falls back to 1" {
-    try testing.expectEqualStrings("0.1.0", bundleVersion("0.1.0"));
-    try testing.expectEqualStrings("1.2.3", bundleVersion("1.2.3-beta+5"));
-    try testing.expectEqualStrings("2", bundleVersion("2."));
-    try testing.expectEqualStrings("1", bundleVersion(""));
-    try testing.expectEqualStrings("1", bundleVersion("v2"));
+test "plistVersion keeps up to three integer components and falls back to 1.0" {
+    try testing.expectEqualStrings("0.1.0", plistVersion("0.1.0"));
+    try testing.expectEqualStrings("1.2.3", plistVersion("1.2.3-beta"));
+    try testing.expectEqualStrings("2.0.0", plistVersion("2.0.0+build.7"));
+    try testing.expectEqualStrings("1.2.3", plistVersion("1.2.3-beta+5"));
+    try testing.expectEqualStrings("1.2.3", plistVersion("1.2.3.4"));
+    try testing.expectEqualStrings("2", plistVersion("2."));
+    try testing.expectEqualStrings("1.0", plistVersion(""));
+    try testing.expectEqualStrings("1.0", plistVersion("v2"));
+    try testing.expectEqualStrings("1.0", plistVersion(".5"));
+}
+
+test "displayName shares bundleDirName's usable-title rule" {
+    try testing.expectEqualStrings("Flying Platform", displayName("Flying Platform", "flying_platform"));
+    try testing.expectEqualStrings("Trim Me", displayName("  Trim Me. ", "x"));
+    // Dots/whitespace-only title: NOT a blank Dock label — the project name.
+    try testing.expectEqualStrings("my_game", displayName("...", "my_game"));
+    try testing.expectEqualStrings("my_game", displayName(" \t ", "my_game"));
+    try testing.expectEqualStrings("game", displayName("", ""));
+}
+
+test "shellSingleQuote yields one literal POSIX word" {
+    const a = testing.allocator;
+    const plain = try shellSingleQuote(a, "/tmp/My Game.app");
+    defer a.free(plain);
+    try testing.expectEqualStrings("'/tmp/My Game.app'", plain);
+    const nasty = try shellSingleQuote(a, "it's $HOME `x` \"q\"");
+    defer a.free(nasty);
+    try testing.expectEqualStrings("'it'\\''s $HOME `x` \"q\"'", nasty);
+    const empty = try shellSingleQuote(a, "");
+    defer a.free(empty);
+    try testing.expectEqualStrings("''", empty);
+}
+
+test "exeNameFromBuildZig reads the addExecutable name and ignores import names" {
+    const generated =
+        \\    const exe = b.addExecutable(.{
+        \\        .name = "flying_platform",
+        \\        .root_module = b.createModule(.{
+        \\            .imports = &.{
+        \\                .{ .name = "labelle-core", .module = core_mod },
+        \\            },
+        \\        }),
+        \\    });
+    ;
+    try testing.expectEqualStrings("flying_platform", exeNameFromBuildZig(generated).?);
+    // No executable at all (a lib-only / tests build.zig).
+    try testing.expect(exeNameFromBuildZig("const lib = b.addLibrary(.{ .name = \"x\" });") == null);
+    // `.root_module` first: the only `.name` in reach is an import's — refuse.
+    const inverted =
+        \\    const exe = b.addExecutable(.{
+        \\        .root_module = b.createModule(.{ .imports = &.{ .{ .name = "labelle-core", .module = m } } }),
+        \\        .name = "game",
+        \\    });
+    ;
+    try testing.expect(exeNameFromBuildZig(inverted) == null);
+    // A path is not a file name.
+    try testing.expect(exeNameFromBuildZig("b.addExecutable(.{ .name = \"../x\", .root_module = m })") == null);
 }
 
 test "renderInfoPlist emits every required key and escapes XML specials" {
@@ -1026,6 +1221,93 @@ fn bundleFixture(a: std.mem.Allocator, work: []const u8, exe: []const u8) !void 
     try cwd.writeFile(io, .{ .sub_path = exe_path, .data = "ELF-ish" });
 }
 
+/// Set a file's mtime to an explicit instant so ordering in tests does
+/// not depend on filesystem timestamp granularity.
+fn setMtime(path: []const u8, nanoseconds: i96) !void {
+    const io = config.globalIo();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = nanoseconds } } });
+}
+
+test "resolveBuiltExe prefers the exe the generated build.zig declares, even if a stale one is newer" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-exe-declared";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    // A second, NEWER candidate that the current build.zig does not name.
+    const legacy = try std.fs.path.join(a, &.{ target, "zig-out", "bin", "game" });
+    defer a.free(legacy);
+    try cwd.writeFile(io, .{ .sub_path = legacy, .data = "stale legacy" });
+    const named = try std.fs.path.join(a, &.{ target, "zig-out", "bin", "my_game" });
+    defer a.free(named);
+    try setMtime(named, 1_000_000_000_000_000_000);
+    try setMtime(legacy, 1_000_000_000_000_000_000 + 100 * std.time.ns_per_s);
+    const build_zig = try std.fs.path.join(a, &.{ target, "build.zig" });
+    defer a.free(build_zig);
+    try cwd.writeFile(io, .{ .sub_path = build_zig, .data = "const exe = b.addExecutable(.{ .name = \"my_game\", .root_module = m });" });
+
+    const exe = try resolveBuiltExe(a, target, "my_game");
+    defer exe.deinit(a);
+    try testing.expectEqualStrings("my_game", exe.name);
+    try testing.expectEqualStrings(named, exe.path);
+}
+
+test "resolveBuiltExe falls back to the most recently modified candidate (Codex on #362)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-exe-newest";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    const legacy = try std.fs.path.join(a, &.{ target, "zig-out", "bin", "game" });
+    defer a.free(legacy);
+    try cwd.writeFile(io, .{ .sub_path = legacy, .data = "fresh legacy build" });
+    const named = try std.fs.path.join(a, &.{ target, "zig-out", "bin", "my_game" });
+    defer a.free(named);
+    // The legacy-assembler scenario: `my_game` is a leftover from an earlier
+    // build, `game` is what the build that just ran wrote. No build.zig to
+    // consult (or one naming a binary that isn't there) → newest wins.
+    try setMtime(named, 1_000_000_000_000_000_000);
+    try setMtime(legacy, 1_000_000_000_000_000_000 + 100 * std.time.ns_per_s);
+
+    const exe = try resolveBuiltExe(a, target, "my_game");
+    defer exe.deinit(a);
+    try testing.expectEqualStrings("game", exe.name);
+
+    // build.zig names something the build never produced → same fallback.
+    const build_zig = try std.fs.path.join(a, &.{ target, "build.zig" });
+    defer a.free(build_zig);
+    try cwd.writeFile(io, .{ .sub_path = build_zig, .data = "b.addExecutable(.{ .name = \"renamed\", .root_module = m })" });
+    const exe2 = try resolveBuiltExe(a, target, "my_game");
+    defer exe2.deinit(a);
+    try testing.expectEqualStrings("game", exe2.name);
+
+    // And the reverse ordering picks the sanitized name.
+    try setMtime(named, 1_000_000_000_000_000_000 + 200 * std.time.ns_per_s);
+    cwd.deleteFile(io, build_zig) catch {};
+    const exe3 = try resolveBuiltExe(a, target, "my_game");
+    defer exe3.deinit(a);
+    try testing.expectEqualStrings("my_game", exe3.name);
+}
+
+test "resolveBuiltExe errors when no candidate exists" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-exe-none";
+    cwd.deleteTree(io, work) catch {};
+    defer cwd.deleteTree(io, work) catch {};
+    try cwd.createDirPath(io, work);
+    try testing.expectError(error.BinaryNotFound, resolveBuiltExe(a, work, "my_game"));
+}
+
 test "createFromBuild fails loudly on a missing custom icon before writing anything" {
     const a = testing.allocator;
     const io = config.globalIo();
@@ -1083,6 +1365,33 @@ test "createFromBuild without any icon still produces a launchable bundle whose 
     const icns = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", icns_name });
     defer a.free(icns);
     try testing.expect(!util.fileExists(icns));
+}
+
+test "createFromBuild gives a dots-only title the project name as its Dock label and normalizes the version" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-dots-title";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "...", .version = "1.2.3-beta" };
+    const bundle = try createFromBuild(a, work, target, cfg, null);
+    defer a.free(bundle);
+    try testing.expect(std.mem.endsWith(u8, bundle, "my_game.app"));
+
+    const plist_path = try std.fs.path.join(a, &.{ bundle, "Contents", "Info.plist" });
+    defer a.free(plist_path);
+    const plist = try cwd.readFileAlloc(io, plist_path, a, .unlimited);
+    defer a.free(plist);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleDisplayName</key>\n    <string>my_game</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleName</key>\n    <string>my_game</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>1.2.3</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.2.3</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "beta") == null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>...</string>") == null);
 }
 
 test "createFromBuild falls back to the legacy `game` exe name" {
