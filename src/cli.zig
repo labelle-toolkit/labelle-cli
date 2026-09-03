@@ -431,6 +431,22 @@ pub fn main(proc_init: std.process.Init) !void {
         }
     }
 
+    // Same interception for `labelle ios` (cli#355). `handleIos` prints
+    // usage for `--help`/`-h`/no subcommand, but it is only reached at the
+    // END of `pipeline.run` — so merely asking for usage first executed
+    // the project's declared `.prebuild` commands and a whole
+    // generate+build. Informational invocations must not run project
+    // commands, and they don't need a project.labelle either.
+    if (command == .ios_cmd) {
+        const wants_help = parsed_args.extra_count == 0 or blk: {
+            const first = parsed_args.extra_args[0];
+            break :blk std.mem.eql(u8, first, "help") or
+                std.mem.eql(u8, first, "--help") or
+                std.mem.eql(u8, first, "-h");
+        };
+        if (wants_help) return ios.printIosHelp();
+    }
+
     return pipeline.run(allocator, parsed_args);
 }
 

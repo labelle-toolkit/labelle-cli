@@ -49,14 +49,39 @@ const WasmRebuildCtx = struct {
     target_dir: []const u8,
     zig_args: []const []const u8,
     zig_env: ?*const std.process.Environ.Map,
+    /// The project's declared `.prebuild` steps (cli#355), borrowed from
+    /// the parse arena. A watched rebuild must re-run them: they are what
+    /// turn an edited `.tsx`/generator into the atlas or `.zig` table the
+    /// regeneration below then reads, so skipping them would serve a
+    /// "successful" rebuild made of STALE generated assets — the exact
+    /// silent-staleness bug the hook exists to kill.
+    prebuild_steps: []const prebuild.Step,
+    /// Options for those steps. `fatal_on_step_failure = false` here: a
+    /// failing step in watch mode must report and keep the server alive,
+    /// like a failing `generate` or `zig build` already does — not exit
+    /// the process out from under the serve loop.
+    prebuild_opts: prebuild.Options,
 
-    /// Re-run generate → fixFingerprints → `zig build`. Returns true only
-    /// on a clean rebuild; on any failure it prints the error (keeping the
-    /// server alive) and returns false so the browser is NOT reloaded onto
-    /// a broken build.
+    /// Re-run prebuild → generate → fixFingerprints → `zig build`. Returns
+    /// true only on a clean rebuild; on any failure it prints the error
+    /// (keeping the server alive) and returns false so the browser is NOT
+    /// reloaded onto a broken build.
     fn rebuild(ctx_ptr: *anyopaque) bool {
         const self: *WasmRebuildCtx = @ptrCast(@alignCast(ctx_ptr));
         const a = self.allocator;
+
+        // 0. Re-run the declared prebuild steps, ahead of generation just
+        //    as the initial pipeline does. Steps that declare `.inputs` +
+        //    `.outputs` are skipped while fresh, so the common watch
+        //    iteration costs a few stats. A step that declares NEITHER
+        //    runs on every rebuild by design; if such a step also writes
+        //    into the watched tree it will retrigger the watcher, so
+        //    declare `.inputs`/`.outputs` for generators used under
+        //    `--watch`.
+        prebuild.runAll(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
+            std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
+            return false;
+        };
 
         // 1. Regenerate — scene/prefab/script *structure* (new files, added
         //    components) can change, not just @embedFile'd content.
@@ -753,6 +778,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
                     .target_dir = target_dir,
                     .zig_args = zig_args.items,
                     .zig_env = zig_env_ptr,
+                    .prebuild_steps = parsed.prebuild,
+                    .prebuild_opts = .{
+                        .route_stdout_to_stderr = parsed_args.progress_mode == .json,
+                        // Keep the serve loop alive on a failing step.
+                        .fatal_on_step_failure = false,
+                    },
                 };
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
                     .watch_dir = project_dir,

@@ -311,7 +311,12 @@ pub fn handleIos(allocator: std.mem.Allocator, args: []const []const u8, cfg: pr
     }
 }
 
-fn printIosHelp() void {
+/// `labelle ios` usage. Public because `cli.zig` intercepts the
+/// help/no-subcommand invocations BEFORE the build pipeline runs — see
+/// the note there (cli#355): reaching this through `pipeline.run` meant
+/// asking for usage first executed the project's declared `.prebuild`
+/// commands and a full generate+build.
+pub fn printIosHelp() void {
     std.debug.print(
         \\iOS Commands
         \\

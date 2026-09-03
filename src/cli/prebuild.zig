@@ -16,7 +16,7 @@
 //! .prebuild = .{
 //!     .{
 //!         .run = .{ "python3", "tools/gen_tiles.py" },
-//!         .inputs = .{ "tools/OverworldTileset.tsx" },
+//!         .inputs = .{ "tools/gen_tiles.py", "tools/OverworldTileset.tsx" },
 //!         .outputs = .{ "assets/out.png", "assets/out.json" },
 //!     },
 //! },
@@ -84,6 +84,11 @@ pub const Error = error{
     /// exec bit, killed by a signal. Distinct from "ran and exited
     /// non-zero", which proxies the child's exact exit code instead.
     PrebuildSpawnFailed,
+    /// A step ran and exited non-zero, in a caller that asked NOT to be
+    /// terminated (`Options.fatal_on_step_failure = false` — the
+    /// `wasm serve --watch` rebuild, which must keep the server alive).
+    /// The default, process-exiting path never returns this.
+    PrebuildStepFailed,
 };
 
 /// Kill switch: set to anything but empty/`0` to skip every prebuild step.
@@ -95,6 +100,12 @@ pub const Options = struct {
     /// `--progress=json`: give the child our stderr as its stdout so the
     /// NDJSON feed on stdout stays pure (module doc).
     route_stdout_to_stderr: bool = false,
+    /// Whether a non-zero step terminates the process with the child's
+    /// exact exit code (the build pipeline's contract) or merely returns
+    /// `error.PrebuildStepFailed`. The `wasm serve --watch` rebuild sets
+    /// this false: a failed step there must report and keep the server
+    /// alive, exactly like a failed `generate` or `zig build` does.
+    fatal_on_step_failure: bool = true,
 };
 
 // ── Validation ───────────────────────────────────────────────────────
@@ -201,9 +212,12 @@ fn mtimeNs(allocator: std.mem.Allocator, project_dir: []const u8, rel: []const u
 
 // ── Rendering ────────────────────────────────────────────────────────
 
-/// Render argv for a log/error line: space-joined, each element that
-/// contains a space or a quote wrapped in double quotes. Display only —
-/// nothing is ever re-parsed from this. Caller owns the result.
+/// Render argv for a log/error line: space-joined, each element that is
+/// empty or contains a space, tab or quote wrapped in double quotes, with
+/// any embedded `"` backslash-escaped so the quoting stays balanced (an
+/// unescaped inner quote produced log lines a reader cannot split back
+/// into arguments). Display only — nothing is ever re-parsed from this.
+/// Caller owns the result.
 pub fn renderArgv(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -211,9 +225,18 @@ pub fn renderArgv(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 
         if (i != 0) try out.append(allocator, ' ');
         const needs_quotes = a.len == 0 or
             std.mem.indexOfAny(u8, a, " \t\"") != null;
-        if (needs_quotes) try out.append(allocator, '"');
-        try out.appendSlice(allocator, a);
-        if (needs_quotes) try out.append(allocator, '"');
+        if (!needs_quotes) {
+            try out.appendSlice(allocator, a);
+            continue;
+        }
+        try out.append(allocator, '"');
+        for (a) |c| {
+            // Only `"` is escaped: a backslash is left alone so Windows
+            // paths (`C:\tools\gen.exe`) render as the user wrote them.
+            if (c == '"') try out.append(allocator, '\\');
+            try out.append(allocator, c);
+        }
+        try out.append(allocator, '"');
     }
     return out.toOwnedSlice(allocator);
 }
@@ -264,8 +287,9 @@ pub fn runStep(
         .stdout = child_stdout,
         .stderr = .inherit,
     }) catch |err| {
-        const rendered = renderArgv(allocator, step.run) catch "";
-        defer if (rendered.len > 0) allocator.free(rendered);
+        const owned = renderArgv(allocator, step.run) catch null;
+        defer if (owned) |o| allocator.free(o);
+        const rendered: []const u8 = owned orelse "<command>";
         std.debug.print(
             "labelle: prebuild could not launch '{s}' ({s})\n" ++
                 "  cwd: {s}\n" ++
@@ -282,12 +306,31 @@ pub fn runStep(
     return switch (term) {
         .exited => |code| code,
         else => blk: {
-            const rendered = renderArgv(allocator, step.run) catch "";
-            defer if (rendered.len > 0) allocator.free(rendered);
+            const owned = renderArgv(allocator, step.run) catch null;
+            defer if (owned) |o| allocator.free(o);
+            const rendered: []const u8 = owned orelse "<command>";
             std.debug.print("labelle: prebuild step '{s}' terminated abnormally\n", .{rendered});
             break :blk error.PrebuildSpawnFailed;
         },
     };
+}
+
+/// Structural check on EVERY step, before any of them runs. Split out of
+/// `runAll` so a malformed entry anywhere in the list is fatal before the
+/// first process is spawned: validating inside the execution loop meant a
+/// manifest like `{ valid mutating step, .run = .{} }` regenerated project
+/// files and only then failed, leaving half-applied side effects behind
+/// from a structurally invalid manifest.
+fn validateAll(steps: []const Step) Error!void {
+    for (steps, 0..) |step, i| {
+        const bad = validate(step) orelse continue;
+        std.debug.print(
+            "labelle: project.labelle .prebuild step {d}/{d} is invalid:\n  {s}\n" ++
+                "  no prebuild step was run.\n",
+            .{ i + 1, steps.len, invalidReason(bad) },
+        );
+        return error.InvalidPrebuildStep;
+    }
 }
 
 /// Run every declared step, in order, before generation.
@@ -296,11 +339,18 @@ pub fn runStep(
 /// nothing and touched no file — the default path is byte-identical to
 /// before this feature existed.
 ///
+/// EVERY step is validated first (`validateAll`); a malformed entry
+/// anywhere fails the build before the first spawn, so an invalid
+/// manifest can never leave partial side effects behind.
+///
 /// A non-zero exit terminates the CLI with the child's EXACT exit code
 /// (via `progress.fatalExit`, which first marks the live build-status
 /// file `failed`), after printing which step failed and why. This mirrors
 /// `assembler_proc.spawnAndWait`: collapsing every distinct tool failure
 /// to a single status 1 makes the CLI a lying proxy for the step it ran.
+/// Callers that must survive a failure (`wasm serve --watch`) pass
+/// `Options.fatal_on_step_failure = false` and get
+/// `error.PrebuildStepFailed` instead.
 pub fn runAll(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
@@ -309,6 +359,10 @@ pub fn runAll(
 ) Error!void {
     if (steps.len == 0) return;
 
+    // The kill switch wins over validation: it exists to run a build with
+    // NO step executed at all (inspecting an untrusted project, or CI that
+    // regenerates out of band), and nothing here can misfire once no step
+    // will run.
     if (skipRequested(allocator)) {
         std.debug.print(
             "labelle: skipping {d} prebuild step(s) — {s} is set.\n" ++
@@ -318,17 +372,19 @@ pub fn runAll(
         return;
     }
 
-    for (steps, 0..) |step, i| {
-        if (validate(step)) |bad| {
-            std.debug.print(
-                "labelle: project.labelle .prebuild step {d}/{d} is invalid:\n  {s}\n",
-                .{ i + 1, steps.len, invalidReason(bad) },
-            );
-            return error.InvalidPrebuildStep;
-        }
+    // Whole-slice validation BEFORE the execution loop: a malformed step
+    // at index N must not be discovered after steps 0..N-1 already
+    // mutated the project.
+    try validateAll(steps);
 
-        const rendered = renderArgv(allocator, step.run) catch "<command>";
-        defer if (!std.mem.eql(u8, rendered, "<command>")) allocator.free(rendered);
+    for (steps, 0..) |step, i| {
+        // Tracked as an optional rather than by comparing the rendered
+        // text to the placeholder: a project may legitimately declare
+        // `.run = .{"<command>"}`, and a contents check would then skip
+        // the free.
+        const rendered_owned = renderArgv(allocator, step.run) catch null;
+        defer if (rendered_owned) |r| allocator.free(r);
+        const rendered: []const u8 = rendered_owned orelse "<command>";
 
         if (scanStep(allocator, project_dir, step).verdict() == .fresh) {
             std.debug.print(
@@ -348,6 +404,7 @@ pub fn runAll(
                     "  declared in project.labelle `.prebuild`\n",
                 .{ i + 1, steps.len, code, rendered, project_dir },
             );
+            if (!opts.fatal_on_step_failure) return error.PrebuildStepFailed;
             var detail_buf: [progress.max_detail_len]u8 = undefined;
             progress.fatalExit(code, failureDetail(&detail_buf, i, steps.len));
         }
@@ -533,6 +590,24 @@ pub const RenderArgvSpec = struct {
             const got = try renderArgv(std.testing.allocator, &.{ "cp", "my file.txt", "b" });
             defer std.testing.allocator.free(got);
             try std.testing.expectEqualStrings("cp \"my file.txt\" b", got);
+        }
+
+        test "escapes an embedded double quote so the quoting stays balanced" {
+            const got = try renderArgv(std.testing.allocator, &.{ "echo", "say \"hi\"" });
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualStrings("echo \"say \\\"hi\\\"\"", got);
+        }
+
+        test "an argument that is only a quote round-trips readably" {
+            const got = try renderArgv(std.testing.allocator, &.{ "x", "\"" });
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualStrings("x \"\\\"\"", got);
+        }
+
+        test "a backslash is left alone (Windows paths render as written)" {
+            const got = try renderArgv(std.testing.allocator, &.{ "run", "C:\\a b\\gen.exe" });
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualStrings("run \"C:\\a b\\gen.exe\"", got);
         }
 
         test "renders an empty argv as an empty string" {
@@ -747,6 +822,94 @@ pub const RunAllSpec = struct {
                 &.{.{ .run = &.{} }},
                 .{},
             ));
+        }
+
+        // The regression the whole-slice `validateAll` pass exists for:
+        // validating inside the execution loop let step 1 mutate the
+        // project before step 2 was found to be malformed.
+        test "a malformed LATER step stops the valid first step from running" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+            try std.testing.expectError(error.InvalidPrebuildStep, runAll(
+                std.testing.allocator,
+                root,
+                &.{
+                    .{ .run = &.{ "/bin/sh", "-c", "printf ran > first.txt" } },
+                    .{ .run = &.{} },
+                },
+                .{},
+            ));
+
+            // The mutating first step must NOT have run.
+            try std.testing.expectError(
+                error.FileNotFound,
+                tmp.dir.statFile(io, "first.txt", .{}),
+            );
+        }
+
+        test "an empty argv[0] in a later step is caught the same way" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+            try std.testing.expectError(error.InvalidPrebuildStep, runAll(
+                std.testing.allocator,
+                root,
+                &.{
+                    .{ .run = &.{ "/bin/sh", "-c", "printf ran > first.txt" } },
+                    .{ .run = &.{ "", "x" } },
+                },
+                .{},
+            ));
+            try std.testing.expectError(
+                error.FileNotFound,
+                tmp.dir.statFile(io, "first.txt", .{}),
+            );
+        }
+    };
+
+    /// `wasm serve --watch` re-runs the steps on every watched rebuild and
+    /// must survive a failing one — the server stays up and the browser is
+    /// not reloaded onto a stale bundle.
+    pub const non_fatal_mode = struct {
+        test "a failing step returns an error instead of exiting the process" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(config.globalIo(), &buf)];
+
+            try std.testing.expectError(error.PrebuildStepFailed, runAll(
+                std.testing.allocator,
+                root,
+                &.{.{ .run = &.{ "/bin/sh", "-c", "exit 7" } }},
+                .{ .fatal_on_step_failure = false },
+            ));
+        }
+
+        test "a succeeding step still runs normally in non-fatal mode" {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+            try runAll(std.testing.allocator, root, &.{.{
+                .run = &.{ "/bin/sh", "-c", "printf ok > watched.txt" },
+            }}, .{ .fatal_on_step_failure = false });
+
+            const data = try tmp.dir.readFileAlloc(io, "watched.txt", std.testing.allocator, .limited(64));
+            defer std.testing.allocator.free(data);
+            try std.testing.expectEqualStrings("ok", data);
         }
     };
 };

@@ -228,7 +228,7 @@ pub const ResourceDef = struct {
 /// .prebuild = .{
 ///     .{
 ///         .run = .{ "python3", "tools/gen_tiles.py" },
-///         .inputs = .{ "tools/OverworldTileset.tsx" },
+///         .inputs = .{ "tools/gen_tiles.py", "tools/OverworldTileset.tsx" },
 ///         .outputs = .{ "assets/out.png", "scripts/tiles_data.zig" },
 ///     },
 /// },
@@ -252,6 +252,12 @@ pub const PrebuildStep = struct {
     /// Source files the step reads, relative to the project root. Used
     /// only for the mtime staleness check — declaring neither `.inputs`
     /// nor `.outputs` means the step runs on every build.
+    ///
+    /// Declare the GENERATOR ITSELF here too, not just the data it reads:
+    /// freshness compares exactly these paths against `.outputs`, so a
+    /// script left out of `.inputs` can be edited and the step will still
+    /// be skipped as up to date, silently keeping the old output — the
+    /// staleness bug this feature exists to kill.
     inputs: []const []const u8 = &.{},
     /// Files the step writes, relative to the project root. The step is
     /// skipped when every output exists and is at least as new as every
