@@ -29,6 +29,7 @@ const astc_cmd = @import("../astc/cmd.zig");
 const sdl_provision = @import("sdl_provision.zig");
 const bundle = @import("bundle.zig");
 const args_mod = @import("args.zig");
+const screenshot_format = @import("screenshot_format.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const resolveAndroidBackend = args_mod.resolveAndroidBackend;
@@ -945,6 +946,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
 /// Extensions a backend may append to the requested screenshot path instead of
 /// honoring it verbatim. bgfx writes TGA and appends `.tga` to whatever it is
 /// given, so `--screenshot=shot.png` lands at `shot.png.tga` (labelle-bgfx#57).
+///
+/// The append itself lives in the backend, out of this repo's reach — so once
+/// the run is over `ScreenshotProbe.report` finishes the job here instead,
+/// re-encoding the capture into the requested format and dropping the
+/// doubly-named intermediate (cli#356, `screenshot_format.zig`). Every entry
+/// must stay decodable by the vendored stb build (`stb_image_impl.c`).
 const screenshot_suffixes = [_][]const u8{ ".tga", ".png", ".bmp" };
 
 /// Pre-run fingerprint of one candidate path. Existence alone is not enough to
@@ -1029,10 +1036,7 @@ const ScreenshotProbe = struct {
                 if (i == 0 and after.existed) stale_exact = true;
                 continue;
             }
-            std.debug.print("labelle: screenshot written to '{s}'\n", .{path});
-            if (i != 0) {
-                std.debug.print("  note: the backend appended '{s}' — the requested path '{s}' was not written\n", .{ screenshot_suffixes[i - 1], self.resolved });
-            }
+            self.reconcile(allocator, path);
             return;
         }
 
@@ -1043,6 +1047,129 @@ const ScreenshotProbe = struct {
             std.debug.print("  note: '{s}' exists but is unchanged — it is left over from an earlier run, not this one\n", .{self.resolved});
         }
         std.debug.print("  hint: capture needs a native surface on some backends — a headless bgfx device has no backbuffer to read back\n\n", .{});
+    }
+
+    /// The capture landed at `written`. Put it on the requested path when
+    /// the CLI can (cli#356) — a same-format move, or a decode/re-encode
+    /// through the vendored stb — then print where the file REALLY is.
+    ///
+    /// Every branch prints exactly one `screenshot written to` line naming
+    /// the path that now holds the capture, so the line stays the
+    /// authoritative one a script can parse.
+    fn reconcile(self: ScreenshotProbe, allocator: std.mem.Allocator, written: []const u8) void {
+        const plan = screenshot_format.plan(self.resolved, written);
+        switch (plan) {
+            .honored => std.debug.print("labelle: screenshot written to '{s}'\n", .{written}),
+            .keep => {
+                std.debug.print("labelle: screenshot written to '{s}'\n", .{written});
+                if (screenshot_format.formatFromPath(self.resolved) == null) {
+                    std.debug.print("  note: the backend appended its own extension — '{s}' names no image format, so the capture was left as written\n", .{self.resolved});
+                } else {
+                    std.debug.print("  note: the backend wrote a format this CLI cannot decode — the requested path '{s}' was not written\n", .{self.resolved});
+                }
+            },
+            .move, .transcode => {
+                screenshot_format.apply(allocator, plan, self.resolved, written) catch |err| {
+                    // The capture still exists where the backend put it, so
+                    // report THAT path — the old pre-#356 behaviour, which is
+                    // the honest fallback when the conversion cannot happen.
+                    std.debug.print("labelle: screenshot written to '{s}'\n", .{written});
+                    std.debug.print("  note: the backend did not honor '{s}' and the CLI could not rewrite it ({s})\n", .{ self.resolved, @errorName(err) });
+                    return;
+                };
+                std.debug.print("labelle: screenshot written to '{s}'\n", .{self.resolved});
+                switch (plan) {
+                    .move => std.debug.print("  note: the backend wrote '{s}'; moved onto the requested path\n", .{written}),
+                    .transcode => |t| std.debug.print("  note: the backend wrote {s} to '{s}'; re-encoded as {s} at the requested path\n", .{ t.from.label(), written, t.to.label() }),
+                    else => unreachable,
+                }
+            },
+        }
+    }
+};
+
+/// The post-run screenshot report end to end (cli#356): a backend that
+/// appended its own extension is reconciled onto the requested path.
+///
+/// Drives the REAL `ScreenshotProbe` — pre-run fingerprint, suffix scan,
+/// change detection, reconcile — rather than `screenshot_format` alone, so
+/// the wiring between them is covered too. `report` prints to stderr, so
+/// the `labelle: screenshot written to ...` lines in the test log are the
+/// actual user-facing output.
+pub const ScreenshotProbeSpec = struct {
+    /// `ScreenshotProbe` resolves relative paths against the game's cwd and
+    /// then works from the process cwd, and `std.testing.tmpDir` creates its
+    /// directory under a cwd-relative `.zig-cache/tmp/`, so a cwd-relative
+    /// `run_cwd` addresses exactly the files the tmp dir holds.
+    fn runCwd(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
+        return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    }
+
+    test "a .png request the backend answered with .png.tga lands as a PNG" {
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const run_cwd = try runCwd(a, tmp);
+        defer a.free(run_cwd);
+
+        // Fingerprint BEFORE the "run", exactly as the pipeline does.
+        const probe = ScreenshotProbe.init(a, "shot.png", run_cwd).?;
+        defer probe.deinit(a);
+
+        // The "backend" writes TGA under the doubly-wrong name.
+        try screenshot_format.writeTestFixture(a, tmp.dir, "shot.png.tga", .tga);
+
+        probe.report(a);
+
+        const out = try tmp.dir.readFileAlloc(io, "shot.png", a, .unlimited);
+        defer a.free(out);
+        try std.testing.expect(std.mem.startsWith(u8, out, "\x89PNG\r\n\x1a\n"));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "shot.png.tga", .{}));
+    }
+
+    test "a capture left over from an earlier run is not reconciled" {
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const run_cwd = try runCwd(a, tmp);
+        defer a.free(run_cwd);
+
+        // Stale file exists BEFORE the probe fingerprints it, and the "run"
+        // writes nothing. Touching it would turn a failed capture into a
+        // report of a screenshot this run never took.
+        try screenshot_format.writeTestFixture(a, tmp.dir, "shot.png.tga", .tga);
+        const probe = ScreenshotProbe.init(a, "shot.png", run_cwd).?;
+        defer probe.deinit(a);
+
+        probe.report(a);
+
+        _ = try tmp.dir.statFile(io, "shot.png.tga", .{});
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "shot.png", .{}));
+    }
+
+    test "an extension-less request is left where the backend put it" {
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const run_cwd = try runCwd(a, tmp);
+        defer a.free(run_cwd);
+
+        const probe = ScreenshotProbe.init(a, "shot", run_cwd).?;
+        defer probe.deinit(a);
+
+        try screenshot_format.writeTestFixture(a, tmp.dir, "shot.tga", .tga);
+
+        probe.report(a);
+
+        // Nothing was asked for, so `shot.tga` is the better name of the two.
+        _ = try tmp.dir.statFile(io, "shot.tga", .{});
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "shot", .{}));
     }
 };
 
