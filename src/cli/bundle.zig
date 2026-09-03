@@ -809,7 +809,22 @@ pub const StageReport = struct {
 /// with its permissions; symlinks are FOLLOWED — a file link becomes a
 /// real file, a directory link is descended — because a relative link
 /// copied verbatim would dangle inside the bundle (the very failure this
-/// fixes). A dangling source link is skipped with a warning.
+/// fixes). A dangling source link is skipped with a warning; any other
+/// stat failure propagates (see `resolveProbedKind`).
+///
+/// Two kinds of directory link are NOT followed, each skipped with a
+/// warning that names the link (Codex on #366): one whose canonical
+/// target lies in the bundle output — `assets/generated -> ../dist` with
+/// `--output dist` would otherwise walk into the `.app` being filled and
+/// die at the depth cap after the previous bundle was wiped — and one
+/// that points at an ancestor of itself (`assets/loop -> .`), a cycle.
+/// "Bundle output" is `<out>` itself, except when `<out>` is an ancestor
+/// of `assets/` (`--output .`) where only `<out>/<Title>.app` is
+/// off-limits — a link to a sibling of `assets/` is a real asset there.
+/// `checkAssetsOverlap` stays the pre-flight for the two ROOTS; this is
+/// the per-entry guard for what links can reach. As a last net every
+/// directory's canonical path is checked against the bundle before
+/// descending, whatever route led to it.
 ///
 /// Everything is copied. The project has no manifest that separates
 /// `@embedFile`d assets from runtime-streamed ones (the atlases here are
@@ -817,15 +832,47 @@ pub const StageReport = struct {
 /// file is a broken game while a redundant one is disk — correctness
 /// beats size. A manifest-driven trim is a follow-up.
 pub fn stageAssets(allocator: std.mem.Allocator, project_dir: []const u8, bundle_dir: []const u8) !?StageReport {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
     const src = try std.fs.path.join(allocator, &.{ project_dir, assets_dir_name });
     defer allocator.free(src);
     if (!util.dirExists(src)) return null;
     const dst = try std.fs.path.join(allocator, &.{ bundle_dir, "Contents", "Resources", assets_dir_name });
     defer allocator.free(dst);
-    var report = StageReport{};
-    try copyTreeFollowingLinks(allocator, src, dst, 0, &report);
-    return report;
+
+    // Canonical roots, computed once and threaded through the walk.
+    const src_real = try cwd.realPathFileAlloc(io, src, allocator);
+    defer allocator.free(src_real);
+    const out_dir = std.fs.path.dirname(bundle_dir) orelse ".";
+    const out_real = try cwd.realPathFileAlloc(io, out_dir, allocator);
+    defer allocator.free(out_real);
+    const bundle_real = try std.fs.path.join(allocator, &.{ out_real, std.fs.path.basename(bundle_dir) });
+    defer allocator.free(bundle_real);
+
+    var ctx = StageCtx{
+        .allocator = allocator,
+        .io = io,
+        .cwd = cwd,
+        .bundle_real = bundle_real,
+        .forbidden_root = if (pathIsWithin(src_real, out_real)) bundle_real else out_real,
+    };
+    try copyTreeFollowingLinks(&ctx, src, src_real, dst, 0);
+    return ctx.report;
 }
+
+/// Per-walk state for `copyTreeFollowingLinks`, so the canonical roots are
+/// resolved once rather than per entry.
+const StageCtx = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    /// Canonical `<out>/<Title>.app`. No directory below it is ever descended.
+    bundle_real: []const u8,
+    /// Canonical root a directory LINK may not resolve into: `<out>`, or
+    /// `bundle_real` when `<out>` is an ancestor of `assets/` itself.
+    forbidden_root: []const u8,
+    report: StageReport = .{},
+};
 
 /// Entry kinds the directory listing cannot be trusted on: a symlink
 /// (we copy what it points at) and `.unknown` (the filesystem gave no
@@ -848,19 +895,38 @@ pub fn resolveProbedKind(probe: anyerror!std.Io.File.Kind) anyerror!?std.Io.File
     return kind;
 }
 
+/// Why a directory reached through a link is not descended. Pure decision
+/// over canonical paths so it is unit-testable without a filesystem.
+pub const LinkVerdict = enum { follow, into_output, cycle };
+
+/// `target_real` is the link's canonical target, `dir_real` the canonical
+/// directory the link sits in. A target inside the forbidden output root
+/// can never be a real asset (the bundle must not contain itself); a
+/// target that is `dir_real` or an ancestor of it is a cycle the walk
+/// would otherwise unroll until the depth cap.
+pub fn linkVerdict(target_real: []const u8, dir_real: []const u8, forbidden_root: []const u8) LinkVerdict {
+    if (pathIsWithin(target_real, forbidden_root)) return .into_output;
+    if (pathIsWithin(dir_real, target_real)) return .cycle;
+    return .follow;
+}
+
+/// `src_real` is the canonical path of `src`; a real (non-link) child
+/// directory's canonical path is then just `src_real/<name>`, so only
+/// links and `.unknown` entries pay for a `realPath`.
 fn copyTreeFollowingLinks(
-    allocator: std.mem.Allocator,
+    ctx: *StageCtx,
     src: []const u8,
+    src_real: []const u8,
     dst: []const u8,
     depth: u32,
-    report: *StageReport,
 ) !void {
     if (depth > max_stage_depth) {
         std.debug.print("labelle bundle: assets/ nests deeper than {d} levels at '{s}' — symlink cycle?\n", .{ max_stage_depth, src });
         return error.AssetTreeTooDeep;
     }
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const cwd = ctx.cwd;
     try cwd.createDirPath(io, dst);
 
     var dir = try cwd.openDir(io, src, .{ .iterate = true });
@@ -878,7 +944,8 @@ fn copyTreeFollowingLinks(
         // links, so a MISSING target is the one skippable outcome; any
         // other failure (permissions, I/O) propagates so `createFromBuild`
         // tears the half-built bundle down (Codex/CodeRabbit on #366).
-        const kind: std.Io.File.Kind = if (needsStat(entry.kind)) blk: {
+        const via_link = needsStat(entry.kind);
+        const kind: std.Io.File.Kind = if (via_link) blk: {
             const probe: anyerror!std.Io.File.Kind = if (cwd.statFile(io, src_sub, .{})) |st| st.kind else |err| err;
             break :blk (try resolveProbedKind(probe)) orelse {
                 std.debug.print("labelle bundle: skipping dangling symlink '{s}' in assets/\n", .{src_sub});
@@ -887,12 +954,38 @@ fn copyTreeFollowingLinks(
         } else entry.kind;
 
         switch (kind) {
-            .directory => try copyTreeFollowingLinks(allocator, src_sub, dst_sub, depth + 1, report),
+            .directory => {
+                // `realPathFileAlloc` hands back a `[:0]u8` whose allocation
+                // is len+1; it must be freed under that type or the
+                // allocator sees a size mismatch (see assembler.zig).
+                const real_z: ?[:0]u8 = if (via_link) try cwd.realPathFileAlloc(io, src_sub, allocator) else null;
+                defer if (real_z) |z| allocator.free(z);
+                const joined: ?[]u8 = if (via_link) null else try std.fs.path.join(allocator, &.{ src_real, entry.name });
+                defer if (joined) |j| allocator.free(j);
+                const child_real: []const u8 = if (real_z) |z| z else joined.?;
+                if (via_link) switch (linkVerdict(child_real, src_real, ctx.forbidden_root)) {
+                    .follow => {},
+                    .into_output => {
+                        std.debug.print("labelle bundle: skipping '{s}' -> '{s}': it resolves into the bundle output, which cannot be an asset\n", .{ src_sub, child_real });
+                        continue;
+                    },
+                    .cycle => {
+                        std.debug.print("labelle bundle: skipping '{s}' -> '{s}': symlink cycle (points at an ancestor of itself)\n", .{ src_sub, child_real });
+                        continue;
+                    },
+                };
+                // Last net for any route that lands in the bundle itself.
+                if (pathIsWithin(child_real, ctx.bundle_real)) {
+                    std.debug.print("labelle bundle: skipping '{s}': it is the bundle being built\n", .{src_sub});
+                    continue;
+                }
+                try copyTreeFollowingLinks(ctx, src_sub, child_real, dst_sub, depth + 1);
+            },
             .file => {
                 try cwd.copyFile(src_sub, cwd, dst_sub, io, .{});
-                report.files += 1;
+                ctx.report.files += 1;
                 const st = cwd.statFile(io, dst_sub, .{}) catch continue;
-                report.bytes += st.size;
+                ctx.report.bytes += st.size;
             },
             else => {},
         }
@@ -1954,6 +2047,130 @@ test "createFromBuild refuses a project whose assets/ lies under <out>/<Title>.a
     const staged = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "intro.mp4" });
     defer a.free(staged);
     try testing.expect(util.fileExists(staged));
+}
+
+test "linkVerdict: into the output root → skip, ancestor of itself → cycle, elsewhere → follow (#366)" {
+    try testing.expectEqual(LinkVerdict.into_output, linkVerdict("/p/dist", "/p/assets", "/p/dist"));
+    try testing.expectEqual(LinkVerdict.into_output, linkVerdict("/p/dist/My Game.app/Contents", "/p/assets", "/p/dist"));
+    try testing.expectEqual(LinkVerdict.follow, linkVerdict("/p/dist-old", "/p/assets", "/p/dist"));
+    try testing.expectEqual(LinkVerdict.cycle, linkVerdict("/p/assets", "/p/assets", "/p/dist"));
+    try testing.expectEqual(LinkVerdict.cycle, linkVerdict("/p", "/p/assets/a", "/p/dist"));
+    try testing.expectEqual(LinkVerdict.follow, linkVerdict("/p/assets/b", "/p/assets/a", "/p/dist"));
+    try testing.expectEqual(LinkVerdict.follow, linkVerdict("/p/shared", "/p/assets", "/p/dist"));
+}
+
+test "createFromBuild skips a directory link that resolves into <out> and still replaces the stale bundle (#366)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-link-into-out";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    try assetsFixture(a, work);
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    // <out> = <work>/dist already holds a previous bundle …
+    const stale = try std.fs.path.join(a, &.{ work, "dist", "My Game.app", "Contents", "stale" });
+    defer a.free(stale);
+    try cwd.createDirPath(io, std.fs.path.dirname(stale).?);
+    try cwd.writeFile(io, .{ .sub_path = stale, .data = "old" });
+    // … and assets/generated points at it.
+    const generated = try std.fs.path.join(a, &.{ work, "assets", "generated" });
+    defer a.free(generated);
+    try cwd.symLink(io, "../dist", generated, .{ .is_directory = true });
+
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    defer a.free(bundle);
+    try testing.expect(!util.fileExists(stale));
+    const staged_root = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets" });
+    defer a.free(staged_root);
+    const staged_generated = try std.fs.path.join(a, &.{ staged_root, "generated" });
+    defer a.free(staged_generated);
+    try testing.expect(!util.dirExists(staged_generated));
+    try testing.expect(!util.fileExists(staged_generated));
+    const staged_intro = try std.fs.path.join(a, &.{ staged_root, "intro.mp4" });
+    defer a.free(staged_intro);
+    try testing.expect(util.fileExists(staged_intro));
+    // intro, alias (dereferenced), video/ — the link contributed nothing.
+    try testing.expectEqual(@as(usize, 3), try countEntries(staged_root));
+}
+
+test "stageAssets follows a directory link to a sibling outside <out>, also when <out> is the project root (#366)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-link-sibling";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    try assetsFixture(a, work);
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    const extra = try std.fs.path.join(a, &.{ work, "shared", "extra.txt" });
+    defer a.free(extra);
+    try cwd.createDirPath(io, std.fs.path.dirname(extra).?);
+    try cwd.writeFile(io, .{ .sub_path = extra, .data = "shared art" });
+    const shared_link = try std.fs.path.join(a, &.{ work, "assets", "shared" });
+    defer a.free(shared_link);
+    try cwd.symLink(io, "../shared", shared_link, .{ .is_directory = true });
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+
+    // `--output dist`: <out> is not an ancestor of assets/, the sibling is fine.
+    {
+        const bundle = try createFromBuild(a, work, target, cfg, "dist");
+        defer a.free(bundle);
+        const got = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "shared", "extra.txt" });
+        defer a.free(got);
+        const bytes = try cwd.readFileAlloc(io, got, a, .unlimited);
+        defer a.free(bytes);
+        try testing.expectEqualStrings("shared art", bytes);
+    }
+    // `--output .`: <out> IS an ancestor of assets/ — the whole project is
+    // under it, so only the `.app` itself is off-limits and the sibling
+    // link must still be followed (no over-refusal).
+    {
+        const bundle = try createFromBuild(a, work, target, cfg, ".");
+        defer a.free(bundle);
+        const got = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "shared", "extra.txt" });
+        defer a.free(got);
+        try testing.expect(util.fileExists(got));
+    }
+}
+
+test "stageAssets skips a symlink cycle inside assets/ with the link named, instead of hitting the depth cap (#366)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-link-cycle";
+    cwd.deleteTree(io, work) catch {};
+    defer cwd.deleteTree(io, work) catch {};
+    try cwd.createDirPath(io, work);
+    try assetsFixture(a, work);
+    // assets/loop -> . and assets/video/up -> .. : both point at an ancestor.
+    const loop = try std.fs.path.join(a, &.{ work, "assets", "loop" });
+    defer a.free(loop);
+    try cwd.symLink(io, ".", loop, .{ .is_directory = true });
+    const up = try std.fs.path.join(a, &.{ work, "assets", "video", "up" });
+    defer a.free(up);
+    try cwd.symLink(io, "..", up, .{ .is_directory = true });
+    const out = try std.fs.path.join(a, &.{ work, "dist" });
+    defer a.free(out);
+    try cwd.createDirPath(io, out);
+    const bundle = try std.fs.path.join(a, &.{ out, "Fixture.app" });
+    defer a.free(bundle);
+
+    const report = (try stageAssets(a, work, bundle)) orelse return error.TestUnexpectedResult;
+    // Exactly the fixture's files: intro, alias, video/cut/outro.
+    try testing.expectEqual(@as(usize, 3), report.files);
+    const staged_loop = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "loop" });
+    defer a.free(staged_loop);
+    try testing.expect(!util.dirExists(staged_loop));
+    const staged_up = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "video", "up" });
+    defer a.free(staged_up);
+    try testing.expect(!util.dirExists(staged_up));
 }
 
 test "createFromBuild: CFBundleExecutable names the launcher, the launcher execs <exe>-bin, assets/ rides along (cli#364)" {
