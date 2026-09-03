@@ -30,7 +30,8 @@
 //! → degrade to "no icon" if absent). The `.icns` is produced the way
 //! Apple documents it: write an `AppIcon.iconset/` holding the ten
 //! standard PNGs (16…512 at @1x/@2x, i.e. 16…1024 px) and run
-//! `iconutil -c icns`. Sizes at or below the master use the same box
+//! `iconutil -c icns` (the iconset is scratch under `~/.labelle/tmp/`,
+//! never under the output dir). Sizes at or below the master use the same box
 //! filter as Android; sizes ABOVE it use nearest-neighbour so a
 //! pixel-art master (flying-platform: 576×576 on a 24-px grid) is not
 //! blurred into the 1024 slot. 1024 is not a multiple of 24, so a 1152
@@ -50,15 +51,16 @@ const config = @import("config.zig");
 const util = @import("util.zig");
 const project_config = @import("project_config.zig");
 const app_icon = @import("app_icon.zig");
+const asm_cache = @import("asm_cache.zig");
 
 /// `CFBundleIconFile` value. macOS resolves it to
 /// `Contents/Resources/<value>.icns` (extension optional in the plist;
 /// we keep it off, matching Xcode's default).
 pub const icon_file_key = "AppIcon";
 pub const icns_name = icon_file_key ++ ".icns";
-/// Scratch dir `iconutil` reads; MUST end in `.iconset` or iconutil
-/// refuses it. Lives next to the bundle and is removed once the `.icns`
-/// exists.
+/// Conventional iconset dir name; only used by tests as a fixture name.
+/// The real scratch dir is `makeScratchIconset`'s uniquely-suffixed path
+/// in CLI-owned storage, never a fixed name under the output dir.
 pub const iconset_dir_name = icon_file_key ++ ".iconset";
 
 /// Oldest macOS the bundle claims to run on. Big Sur is the first
@@ -137,32 +139,63 @@ pub fn deriveBundleId(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-/// `<Title>.app`. The bundle is a DIRECTORY, so the title must be a
-/// legal single path component: `/` is the separator and `:` is the
-/// legacy HFS separator Finder still displays as `/` — both become
-/// `-`. Falls back to `.name` when the title has nothing usable, so
-/// there is always a bundle to `open`. Caller owns the slice.
+/// Append `raw` to `buf` as a single legal path component: `/` is the
+/// separator, `\` is one on Windows (and confuses Finder), `:` is the
+/// legacy HFS separator Finder still displays as `/` — all become `-`;
+/// control bytes are dropped. Everything else (spaces, unicode,
+/// punctuation) is fine on APFS. Leading/trailing spaces and dots are
+/// then trimmed: a name of only those is invisible or hidden in Finder,
+/// and a leading `..` is how `<out>/../x.app` would escape `<out>`.
+/// Returns false when nothing usable survived (buf is left empty).
+fn appendComponent(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const u8) !bool {
+    const start = buf.items.len;
+    for (raw) |ch| {
+        if (ch < 0x20 or ch == 0x7f) continue;
+        try buf.append(allocator, if (ch == '/' or ch == '\\' or ch == ':') '-' else ch);
+    }
+    const trimmed = std.mem.trim(u8, buf.items[start..], " .");
+    if (trimmed.len == 0) {
+        buf.items.len = start;
+        return false;
+    }
+    if (trimmed.len != buf.items.len - start) {
+        std.mem.copyForwards(u8, buf.items[start .. start + trimmed.len], trimmed);
+        buf.items.len = start + trimmed.len;
+    }
+    return true;
+}
+
+/// `<Title>.app`. The bundle is a DIRECTORY that `layoutBundle` deletes
+/// and recreates, so the name MUST be one legal path component — see
+/// `appendComponent`. Falls back to `.name` when the title has nothing
+/// usable, and the fallback goes through the SAME sanitizer (Codex on
+/// #362: a raw `.name` of `../Saved` produced `<out>/../Saved.app` and
+/// the deleteTree that followed would have destroyed a sibling app).
+/// Last resort is `game`, so there is always a bundle to `open`. Caller
+/// owns the slice; the result always satisfies `isSafeBundleDirName`.
 pub fn bundleDirName(allocator: std.mem.Allocator, title: []const u8, name: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    for (title) |ch| {
-        // Control bytes have no business in a file name; everything else
-        // (spaces, unicode, punctuation) is fine on APFS.
-        if (ch < 0x20 or ch == 0x7f) continue;
-        try buf.append(allocator, if (ch == '/' or ch == ':') '-' else ch);
-    }
-    // A name of only spaces/dots is technically legal but invisible or
-    // hidden in Finder; treat it as empty.
-    const trimmed = std.mem.trim(u8, buf.items, " .");
-    if (trimmed.len == 0) {
-        buf.clearRetainingCapacity();
-        try buf.appendSlice(allocator, if (name.len > 0) name else "game");
-    } else if (trimmed.len != buf.items.len) {
-        std.mem.copyForwards(u8, buf.items[0..trimmed.len], trimmed);
-        buf.items.len = trimmed.len;
+    if (!try appendComponent(allocator, &buf, title)) {
+        if (!try appendComponent(allocator, &buf, name)) {
+            try buf.appendSlice(allocator, "game");
+        }
     }
     try buf.appendSlice(allocator, ".app");
     return buf.toOwnedSlice(allocator);
+}
+
+/// Belt and braces for the delete in `layoutBundle`: true only for a
+/// bare `<something>.app` component — no separators, no `.`/`..`, not
+/// hidden, not the bare extension. Anything else could point the
+/// recursive delete outside `<out>`, so it is refused.
+pub fn isSafeBundleDirName(dir_name: []const u8) bool {
+    if (dir_name.len <= ".app".len) return false;
+    if (!std.mem.endsWith(u8, dir_name, ".app")) return false;
+    if (dir_name[0] == '.') return false;
+    if (std.mem.indexOfAny(u8, dir_name, "/\\:") != null) return false;
+    if (std.mem.indexOfAny(u8, dir_name, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f") != null) return false;
+    return true;
 }
 
 /// `CFBundleVersion` from the project version. The build-version key
@@ -385,24 +418,38 @@ pub fn resolveOutputDir(
     return std.fs.path.join(allocator, &.{ target_dir, "zig-out" });
 }
 
-/// Lay the bundle skeleton down: dirs, the exe copy, `Info.plist`,
-/// `PkgInfo`. Wipes any previous bundle at `bundle_dir` first so a
-/// renamed exe or a removed icon can't leave stale files behind.
-/// Filesystem-only (no Apple tools), so it is unit-tested everywhere.
+/// Lay the bundle skeleton down at `<out_dir>/<dir_name>`: dirs, the
+/// exe copy, `Info.plist`, `PkgInfo`. Wipes any previous bundle there
+/// first so a renamed exe or a removed icon can't leave stale files
+/// behind. Filesystem-only (no Apple tools), so it is unit-tested
+/// everywhere.
+///
+/// The wipe is the ONLY recursive delete `labelle bundle` performs under
+/// a user-chosen directory, so it is guarded twice: `bundleDirName`
+/// only ever produces a safe component, and this refuses
+/// (`error.UnsafeBundleName`) any `dir_name` that is not a bare
+/// `<x>.app` — a caller bug can then not turn into `rm -rf <out>/..`.
 ///
 /// `copyFile` with default options copies the source's permissions, so
 /// the exec bit survives without a `chmod` spawn (`ios.zig` predates
-/// that option and still shells out).
+/// that option and still shells out). Returns the caller-owned bundle path.
 pub fn layoutBundle(
     allocator: std.mem.Allocator,
-    bundle_dir: []const u8,
+    out_dir: []const u8,
+    dir_name: []const u8,
     exe_src: []const u8,
     exe_name: []const u8,
     plist: []const u8,
-) !void {
+) ![]u8 {
+    if (!isSafeBundleDirName(dir_name)) {
+        std.debug.print("labelle bundle: refusing to replace '{s}' — not a plain <name>.app component\n", .{dir_name});
+        return error.UnsafeBundleName;
+    }
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
+    const bundle_dir = try std.fs.path.join(allocator, &.{ out_dir, dir_name });
+    errdefer allocator.free(bundle_dir);
     cwd.deleteTree(io, bundle_dir) catch {};
 
     const macos_dir = try std.fs.path.join(allocator, &.{ bundle_dir, "Contents", "MacOS" });
@@ -426,6 +473,52 @@ pub fn layoutBundle(
     const pkginfo_path = try std.fs.path.join(allocator, &.{ bundle_dir, "Contents", "PkgInfo" });
     defer allocator.free(pkginfo_path);
     try cwd.writeFile(io, .{ .sub_path = pkginfo_path, .data = "APPL????" });
+
+    return bundle_dir;
+}
+
+/// Create a fresh, uniquely named `<cache-root>/tmp/AppIcon-<n>.iconset`
+/// for `iconutil` to read (the suffix must be `.iconset` or iconutil
+/// refuses it). Caller owns the returned path AND the directory: remove
+/// it with `deleteTree` on every exit path.
+///
+/// It lives in CLI-owned storage (`~/.labelle/`, or `LABELLE_HOME` —
+/// the same tree as the assembler/zig caches) and NOT under `<out>`:
+/// `AppIcon.iconset` is the conventional name for a developer's own
+/// source iconset and `--output` may be the project root, so a fixed
+/// scratch path there would have deleted real assets (Codex on #362).
+/// Uniqueness follows the `zig_toolchain` staging idiom — 0.16 has no
+/// `std.crypto.random`, so a PRNG seeded from a stack address mixed with
+/// the path; collisions between concurrent bundles are what the suffix
+/// guards against, not adversaries.
+pub fn makeScratchIconset(allocator: std.mem.Allocator) ![]u8 {
+    const root = try asm_cache.getCacheRoot(allocator);
+    defer allocator.free(root);
+    const tmp_root = try std.fs.path.join(allocator, &.{ root, "tmp" });
+    defer allocator.free(tmp_root);
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, tmp_root);
+
+    var prng = std.Random.DefaultPrng.init(@intFromPtr(&tmp_root) ^ std.hash.Wyhash.hash(0, tmp_root));
+    var attempt: u8 = 0;
+    while (attempt < 8) : (attempt += 1) {
+        const name = try std.fmt.allocPrint(allocator, "{s}-{x}.iconset", .{ icon_file_key, prng.random().int(u64) });
+        defer allocator.free(name);
+        const path = try std.fs.path.join(allocator, &.{ tmp_root, name });
+        errdefer allocator.free(path);
+        // createDir (not createDirPath) so an existing dir is an error and
+        // we never adopt — let alone later delete — someone else's tree.
+        cwd.createDir(io, path, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => return err,
+        };
+        return path;
+    }
+    return error.ScratchDirCollision;
 }
 
 /// Post-build entry point called from `pipeline.zig` once `zig build`
@@ -477,17 +570,16 @@ pub fn createFromBuild(
         return error.BinaryNotFound;
     }
 
-    // 3. Paths.
+    // 3. Paths. Only `<out>/<Title>.app` is ever created or removed under
+    //    the user's chosen directory — nothing else there is touched.
     const out_dir = try resolveOutputDir(allocator, project_dir, target_dir, output_override);
     defer allocator.free(out_dir);
     try cwd.createDirPath(io, out_dir);
     const dir_name = try bundleDirName(allocator, cfg.title, cfg.name);
     defer allocator.free(dir_name);
-    const bundle_dir = try std.fs.path.join(allocator, &.{ out_dir, dir_name });
-    errdefer allocator.free(bundle_dir);
 
-    // 4. Skeleton + exe. The plist is written with a placeholder icon
-    //    decision below; render it after we know whether the .icns landed.
+    // 4. Skeleton + exe. The plist is rendered knowing whether an icon
+    //    will land; the .icns itself is built right after.
     const bundle_id = try deriveBundleId(allocator, cfg.name);
     defer allocator.free(bundle_id);
     const display: []const u8 = if (cfg.title.len > 0) cfg.title else cfg.name;
@@ -502,19 +594,19 @@ pub fn createFromBuild(
         .icon_file = if (has_icon) icon_file_key else null,
     });
     defer allocator.free(plist);
-    try layoutBundle(allocator, bundle_dir, exe_src, exe_name, plist);
+    const bundle_dir = try layoutBundle(allocator, out_dir, dir_name, exe_src, exe_name, plist);
+    errdefer allocator.free(bundle_dir);
     // A bundle whose plist names an `.icns` that never landed shows the
     // broken-document glyph — worse than no bundle. If anything below
     // fails, take the skeleton down with it.
     errdefer cwd.deleteTree(io, bundle_dir) catch {};
 
-    // 5. Icon → iconset → icns. The iconset is scratch: written beside
-    //    the bundle (not inside it — a stray dir in Contents/ would ship),
-    //    removed once iconutil has consumed it, including on failure.
+    // 5. Icon → iconset → icns. The iconset is scratch in CLI-owned temp
+    //    storage (see `makeScratchIconset` for why not under `<out>`),
+    //    removed once iconutil has consumed it, on success and on error.
     if (maybe_img) |img| {
-        const iconset_dir = try std.fs.path.join(allocator, &.{ out_dir, iconset_dir_name });
+        const iconset_dir = try makeScratchIconset(allocator);
         defer allocator.free(iconset_dir);
-        cwd.deleteTree(io, iconset_dir) catch {};
         defer cwd.deleteTree(io, iconset_dir) catch {};
         try writeIconset(allocator, iconset_dir, img.pixels, img.width, img.height);
 
@@ -572,6 +664,149 @@ test "bundleDirName uses the title, sanitizes path separators, falls back to nam
     const nothing = try bundleDirName(a, "", "");
     defer a.free(nothing);
     try testing.expectEqualStrings("game.app", nothing);
+}
+
+test "bundleDirName sanitizes the .name fallback exactly like the title (Codex on #362)" {
+    const a = testing.allocator;
+    // Empty title, traversal-shaped name: must NOT become `<out>/../Saved.app`.
+    const traversal = try bundleDirName(a, "", "../Saved");
+    defer a.free(traversal);
+    try testing.expectEqualStrings("-Saved.app", traversal);
+    try testing.expect(isSafeBundleDirName(traversal));
+
+    const dots = try bundleDirName(a, " . ", "..");
+    defer a.free(dots);
+    try testing.expectEqualStrings("game.app", dots);
+
+    const backslash = try bundleDirName(a, "", "a\\b");
+    defer a.free(backslash);
+    try testing.expectEqualStrings("a-b.app", backslash);
+
+    // Every output — from title, from name, or the last resort — passes
+    // the guard `layoutBundle` applies before its recursive delete.
+    const from_title = try bundleDirName(a, "Rock/Roll: Live", "x");
+    defer a.free(from_title);
+    try testing.expect(isSafeBundleDirName(from_title));
+}
+
+test "isSafeBundleDirName accepts only a bare <name>.app component" {
+    try testing.expect(isSafeBundleDirName("Flying Platform.app"));
+    try testing.expect(isSafeBundleDirName("game.app"));
+    try testing.expect(isSafeBundleDirName("-Saved.app"));
+    try testing.expect(!isSafeBundleDirName("../Saved.app"));
+    try testing.expect(!isSafeBundleDirName("..\\Saved.app"));
+    try testing.expect(!isSafeBundleDirName("a/b.app"));
+    try testing.expect(!isSafeBundleDirName("a:b.app"));
+    try testing.expect(!isSafeBundleDirName(".hidden.app"));
+    try testing.expect(!isSafeBundleDirName(".app"));
+    try testing.expect(!isSafeBundleDirName("noext"));
+    try testing.expect(!isSafeBundleDirName(""));
+    try testing.expect(!isSafeBundleDirName("bad\nname.app"));
+}
+
+test "layoutBundle refuses to delete anything that is not <name>.app inside out_dir" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const work = ".zig-cache/bundle-layout-refuse";
+    cwd.deleteTree(io, work) catch {};
+    defer cwd.deleteTree(io, work) catch {};
+    // `<work>/out` is the output dir; `<work>/Saved.app` is an unrelated
+    // sibling that a traversal-shaped name would have pointed the wipe at.
+    const out = try std.fs.path.join(a, &.{ work, "out" });
+    defer a.free(out);
+    try cwd.createDirPath(io, out);
+    const sibling = try std.fs.path.join(a, &.{ work, "Saved.app", "keep.txt" });
+    defer a.free(sibling);
+    const sibling_dir = std.fs.path.dirname(sibling).?;
+    try cwd.createDirPath(io, sibling_dir);
+    try cwd.writeFile(io, .{ .sub_path = sibling, .data = "precious" });
+    const exe_src = try std.fs.path.join(a, &.{ work, "exe" });
+    defer a.free(exe_src);
+    try cwd.writeFile(io, .{ .sub_path = exe_src, .data = "bin" });
+
+    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, "../Saved.app", exe_src, "exe", "<plist/>"));
+    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, "Saved", exe_src, "exe", "<plist/>"));
+    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, ".app", exe_src, "exe", "<plist/>"));
+    try testing.expect(util.fileExists(sibling));
+}
+
+test "makeScratchIconset lives under the CLI cache root, is unique, and ends in .iconset" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const root = ".zig-cache/bundle-scratch-root";
+    cwd.deleteTree(io, root) catch {};
+    defer cwd.deleteTree(io, root) catch {};
+    // Tests can't see env vars (empty environ under `zig build test`), so
+    // pin the cache root the way the other cache modules' tests do.
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+
+    const first = try makeScratchIconset(a);
+    defer a.free(first);
+    const second = try makeScratchIconset(a);
+    defer a.free(second);
+
+    const tmp_root = try std.fs.path.join(a, &.{ root, "tmp" });
+    defer a.free(tmp_root);
+    const tmp_prefix = try std.fs.path.join(a, &.{ tmp_root, icon_file_key ++ "-" });
+    defer a.free(tmp_prefix);
+    try testing.expect(std.mem.startsWith(u8, first, tmp_prefix));
+    try testing.expect(std.mem.endsWith(u8, first, ".iconset"));
+    try testing.expect(util.dirExists(first));
+    try testing.expect(util.dirExists(second));
+    try testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "createFromBuild touches nothing under <out> except <Title>.app (Codex on #362)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-out-untouched";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+
+    // `<out>` already holds a developer's own source iconset (the fixed
+    // scratch path used to deleteTree exactly this), an unrelated file, a
+    // DIFFERENT app bundle, and a stale copy of ours with a stray file.
+    const out = try std.fs.path.join(a, &.{ work, "dist" });
+    defer a.free(out);
+    const dev_iconset = try std.fs.path.join(a, &.{ out, iconset_dir_name, "icon_16x16.png" });
+    defer a.free(dev_iconset);
+    try cwd.createDirPath(io, std.fs.path.dirname(dev_iconset).?);
+    try cwd.writeFile(io, .{ .sub_path = dev_iconset, .data = "dev's own" });
+    const other_file = try std.fs.path.join(a, &.{ out, "notes.txt" });
+    defer a.free(other_file);
+    try cwd.writeFile(io, .{ .sub_path = other_file, .data = "keep" });
+    const other_app = try std.fs.path.join(a, &.{ out, "Other.app", "Contents", "Info.plist" });
+    defer a.free(other_app);
+    try cwd.createDirPath(io, std.fs.path.dirname(other_app).?);
+    try cwd.writeFile(io, .{ .sub_path = other_app, .data = "other" });
+    const stale_stray = try std.fs.path.join(a, &.{ out, "My Game.app", "stray" });
+    defer a.free(stale_stray);
+    try cwd.createDirPath(io, std.fs.path.dirname(stale_stray).?);
+    try cwd.writeFile(io, .{ .sub_path = stale_stray, .data = "stale" });
+
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    defer a.free(bundle);
+
+    // Ours was replaced wholesale...
+    try testing.expect(!util.fileExists(stale_stray));
+    const exe = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game" });
+    defer a.free(exe);
+    try testing.expect(util.fileExists(exe));
+    // ...and everything else in <out> is exactly as it was.
+    const dev_bytes = try cwd.readFileAlloc(io, dev_iconset, a, .unlimited);
+    defer a.free(dev_bytes);
+    try testing.expectEqualStrings("dev's own", dev_bytes);
+    try testing.expect(util.fileExists(other_file));
+    try testing.expect(util.fileExists(other_app));
 }
 
 test "bundleVersion keeps the dotted-integer prefix and falls back to 1" {
@@ -737,17 +972,19 @@ test "layoutBundle writes Contents/{MacOS/<exe>,Info.plist,PkgInfo,Resources/} a
     defer a.free(exe_src);
     try cwd.writeFile(io, .{ .sub_path = exe_src, .data = "#!/bin/sh\necho hi\n" });
 
-    const bundle = try std.fs.path.join(a, &.{ work, "My Game.app" });
-    defer a.free(bundle);
+    const want_bundle = try std.fs.path.join(a, &.{ work, "My Game.app" });
+    defer a.free(want_bundle);
     // A stale file from a "previous" bundle with a different exe name.
-    const stale_dir = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS" });
+    const stale_dir = try std.fs.path.join(a, &.{ want_bundle, "Contents", "MacOS" });
     defer a.free(stale_dir);
     try cwd.createDirPath(io, stale_dir);
     const stale = try std.fs.path.join(a, &.{ stale_dir, "game" });
     defer a.free(stale);
     try cwd.writeFile(io, .{ .sub_path = stale, .data = "old" });
 
-    try layoutBundle(a, bundle, exe_src, "my_game", "<plist/>");
+    const bundle = try layoutBundle(a, work, "My Game.app", exe_src, "my_game", "<plist/>");
+    defer a.free(bundle);
+    try testing.expectEqualStrings(want_bundle, bundle);
 
     const exe_dst = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game" });
     defer a.free(exe_dst);

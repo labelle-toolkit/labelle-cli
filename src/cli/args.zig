@@ -200,15 +200,21 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
             if (consumed) continue;
         } else return null;
         if (std.mem.startsWith(u8, arg, "--output=") or std.mem.eql(u8, arg, "--output")) {
-            const val = if (std.mem.eql(u8, arg, "--output"))
+            const separate_value = std.mem.eql(u8, arg, "--output");
+            const val = if (separate_value)
                 (args.next() orelse {
                     std.debug.print("labelle bundle: --output requires a value (e.g. --output ./dist)\n", .{});
                     return null;
                 })
             else
                 arg["--output=".len..];
-            if (val.len == 0) {
-                std.debug.print("labelle bundle: --output requires a non-empty directory\n", .{});
+            // A following flag is NOT the directory: `--output --progress=json`
+            // would otherwise create a directory literally named
+            // `--progress=json` and silently drop the progress flag. A
+            // directory that really starts with `--` can still be given as
+            // `--output=--weird`.
+            if (val.len == 0 or (separate_value and std.mem.startsWith(u8, val, "--"))) {
+                std.debug.print("labelle bundle: --output requires a value (e.g. --output ./dist)\n", .{});
                 return null;
             }
             result.output = val;

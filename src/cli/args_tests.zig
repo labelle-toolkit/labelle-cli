@@ -931,6 +931,21 @@ pub const ParseBundleArgsSpec = struct {
             defer iter.deinit();
             try std.testing.expect(parseBundleArgs(&iter) == null);
         }
+
+        test "a following flag is not swallowed as the --output value" {
+            // CodeRabbit on #362: `--output --progress=json` used to create a
+            // dir literally named `--progress=json` and drop the flag.
+            var iter = testIter("--output --progress=json");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "--output=--weird still allows a directory that starts with --" {
+            var iter = testIter("--output=--weird");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("--weird", result.output.?);
+        }
     };
 
     pub const progress_flag = struct {
