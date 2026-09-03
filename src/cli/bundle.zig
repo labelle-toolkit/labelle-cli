@@ -226,6 +226,52 @@ pub fn plistVersion(version: []const u8) []const u8 {
     return if (components == 0) "1.0" else version[0..end];
 }
 
+/// `CFBundleVersion` — the BUILD number, distinct from the marketing
+/// version: Apple only requires it to be period-separated integers with
+/// a POSITIVE first component (and monotonic across releases), not to
+/// equal `CFBundleShortVersionString`. A pre-1.0 project — `0.1.0` is
+/// the `ProjectConfig` default and what flying-platform ships — would
+/// fail validation with a leading zero (Codex on #362), so when the
+/// marketing major is 0 the build number is written as `1.<minor>.<patch>`
+/// (`0.1.0` → `1.1.0`, `0.0.7` → `1.0.7`); a positive major passes
+/// through unchanged (`2.3.4` → `2.3.4`). Deterministic and documented
+/// rather than clever: the value is only ever compared against itself
+/// across builds of the same project. Caller owns the slice.
+pub fn buildVersion(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
+    const marketing = plistVersion(version);
+    const first_end = std.mem.indexOfScalar(u8, marketing, '.') orelse marketing.len;
+    const first = marketing[0..first_end];
+    // `plistVersion` guarantees `first` is a non-empty digit run.
+    var all_zero = true;
+    for (first) |ch| {
+        if (ch != '0') all_zero = false;
+    }
+    if (!all_zero) return allocator.dupe(u8, marketing);
+    return std.fmt.allocPrint(allocator, "1{s}", .{marketing[first_end..]});
+}
+
+/// Validate `s` as UTF-8 and strip the code points XML 1.0 forbids in
+/// character data — C0 controls other than TAB/LF/CR, and U+FFFE/U+FFFF
+/// — so a ZON escape like `\x01` in a title can't produce an
+/// `Info.plist` that is not well-formed (Codex on #362: escaping the
+/// five markup characters alone is not enough). Returns null for
+/// invalid UTF-8 (the caller decides between fallback and error); the
+/// returned slice is owned by the caller. Surrogates never appear in
+/// valid UTF-8, so they need no separate check.
+pub fn sanitizePlistString(allocator: std.mem.Allocator, s: []const u8) !?[]u8 {
+    const view = std.unicode.Utf8View.init(s) catch return null;
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |slice| {
+        const cp = std.unicode.utf8Decode(slice) catch return null;
+        const forbidden = (cp < 0x20 and cp != '\t' and cp != '\n' and cp != '\r') or cp == 0xFFFE or cp == 0xFFFF;
+        if (forbidden) continue;
+        try buf.appendSlice(allocator, slice);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
 /// Bytes that make a title "unusable" when they are all it contains:
 /// whitespace and dots (a dots-only name is hidden in Finder; a blank
 /// one is an empty Dock label). Shared by the bundle dir name and the
@@ -364,9 +410,16 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     };
 }
 
-/// Escape the five XML specials so a title like `Rock & Roll` produces
-/// a plist `plutil -lint` accepts. Caller owns the slice.
-pub fn escapeXml(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+/// Turn `s` into well-formed plist text: validate/sanitize it first
+/// (`sanitizePlistString` — invalid UTF-8 is `error.InvalidBundleMetadata`
+/// here because by this point the caller has already applied its
+/// fallbacks), THEN escape the five markup specials so a title like
+/// `Rock & Roll` produces a plist `plutil -lint` accepts. Every string
+/// `renderInfoPlist` writes goes through this, so no field can smuggle a
+/// forbidden byte in. Caller owns the slice.
+pub fn escapeXml(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const s = (try sanitizePlistString(allocator, raw)) orelse return error.InvalidBundleMetadata;
+    defer allocator.free(s);
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     for (s) |ch| {
@@ -718,14 +771,29 @@ pub fn createFromBuild(
     const out_dir = try resolveOutputDir(allocator, project_dir, target_dir, output_override);
     defer allocator.free(out_dir);
     try cwd.createDirPath(io, out_dir);
-    const dir_name = try bundleDirName(allocator, cfg.title, cfg.name);
+    // Metadata hygiene (Codex on #362): the plist must be well-formed XML
+    // and the label must agree with the file name. A title that is not
+    // valid UTF-8 is treated as unusable — it falls back to `.name`, for
+    // BOTH the bundle dir and the Dock label — while a `.name` that is
+    // not valid UTF-8 has nowhere left to fall back to and is an error.
+    const safe_title_opt = try sanitizePlistString(allocator, cfg.title);
+    defer if (safe_title_opt) |t| allocator.free(t);
+    const safe_title: []const u8 = safe_title_opt orelse "";
+    const safe_name = (try sanitizePlistString(allocator, cfg.name)) orelse {
+        std.debug.print("labelle bundle: project .name is not valid UTF-8 — cannot name the bundle\n", .{});
+        return error.InvalidBundleMetadata;
+    };
+    defer allocator.free(safe_name);
+    const dir_name = try bundleDirName(allocator, safe_title, safe_name);
     defer allocator.free(dir_name);
 
     // 4. Skeleton + exe. The plist is rendered knowing whether an icon
     //    will land; the .icns itself is built right after.
     const bundle_id = try deriveBundleId(allocator, cfg.name);
     defer allocator.free(bundle_id);
-    const display = displayName(cfg.title, cfg.name);
+    const display = displayName(safe_title, safe_name);
+    const build_ver = try buildVersion(allocator, cfg.version);
+    defer allocator.free(build_ver);
     const has_icon = maybe_img != null;
     const plist = try renderInfoPlist(allocator, .{
         .bundle_id = bundle_id,
@@ -733,7 +801,7 @@ pub fn createFromBuild(
         .display_name = display,
         .executable = exe_name,
         .short_version = plistVersion(cfg.version),
-        .build_version = plistVersion(cfg.version),
+        .build_version = build_ver,
         .icon_file = if (has_icon) icon_file_key else null,
     });
     defer allocator.free(plist);
@@ -962,6 +1030,68 @@ test "plistVersion keeps up to three integer components and falls back to 1.0" {
     try testing.expectEqualStrings("1.0", plistVersion(""));
     try testing.expectEqualStrings("1.0", plistVersion("v2"));
     try testing.expectEqualStrings("1.0", plistVersion(".5"));
+}
+
+test "buildVersion gives CFBundleVersion a positive first component, leaves the rest alone" {
+    const a = testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "0.1.0", "1.1.0" },
+        .{ "0.0.7", "1.0.7" },
+        .{ "0", "1" },
+        .{ "00.2", "1.2" },
+        .{ "2.3.4", "2.3.4" },
+        .{ "1.2.3-beta", "1.2.3" },
+        .{ "", "1.0" },
+    };
+    for (cases) |c| {
+        const got = try buildVersion(a, c[0]);
+        defer a.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+    // The marketing version is untouched: 0.1.0 stays 0.1.0 there.
+    try testing.expectEqualStrings("0.1.0", plistVersion("0.1.0"));
+}
+
+test "sanitizePlistString drops XML-forbidden code points and rejects invalid UTF-8" {
+    const a = testing.allocator;
+    const ctrl = (try sanitizePlistString(a, "a\x01b\x7fc\td\n")).?;
+    defer a.free(ctrl);
+    // \x01 gone; DEL, TAB and LF are legal XML chars and stay.
+    try testing.expectEqualStrings("ab\x7fc\td\n", ctrl);
+    const nonchar = (try sanitizePlistString(a, "x\u{FFFE}y\u{FFFF}z\u{FFFD}")).?;
+    defer a.free(nonchar);
+    try testing.expectEqualStrings("xyz\u{FFFD}", nonchar);
+    const unicode = (try sanitizePlistString(a, "Vol\u{E9} \u{1F600}")).?;
+    defer a.free(unicode);
+    try testing.expectEqualStrings("Vol\u{E9} \u{1F600}", unicode);
+    try testing.expect((try sanitizePlistString(a, "Fl\xffying")) == null);
+    try testing.expect((try sanitizePlistString(a, "\xc3")) == null); // truncated sequence
+}
+
+test "renderInfoPlist strips forbidden bytes from every field and rejects invalid UTF-8" {
+    const a = testing.allocator;
+    const plist = try renderInfoPlist(a, .{
+        .bundle_id = "com.labelle.x",
+        .name = "Bad\x01Title",
+        .display_name = "Bad\x01Title",
+        .executable = "x\x02",
+        .short_version = "1.0",
+        .build_version = "1.0",
+    });
+    defer a.free(plist);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>BadTitle</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<string>x</string>") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, plist, 0x01) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, plist, 0x02) == null);
+
+    try testing.expectError(error.InvalidBundleMetadata, renderInfoPlist(a, .{
+        .bundle_id = "com.labelle.x",
+        .name = "Fl\xffying",
+        .display_name = "Fl\xffying",
+        .executable = "x",
+        .short_version = "1.0",
+        .build_version = "1.0",
+    }));
 }
 
 test "displayName shares bundleDirName's usable-title rule" {
@@ -1392,6 +1522,80 @@ test "createFromBuild gives a dots-only title the project name as its Dock label
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.2.3</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "beta") == null);
     try testing.expect(std.mem.indexOf(u8, plist, "<string>...</string>") == null);
+}
+
+/// Run `createFromBuild` on a fresh fixture and return the rendered plist.
+fn plistFor(a: std.mem.Allocator, work: []const u8, cfg: project_config.ProjectConfig, bundle_out: *[]u8) ![]u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    try bundleFixture(a, work, "my_game");
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    const bundle = try createFromBuild(a, work, target, cfg, null);
+    errdefer a.free(bundle);
+    const plist_path = try std.fs.path.join(a, &.{ bundle, "Contents", "Info.plist" });
+    defer a.free(plist_path);
+    bundle_out.* = bundle;
+    return cwd.readFileAlloc(io, plist_path, a, .unlimited);
+}
+
+test "createFromBuild: a control byte in the title is dropped from the plist and the file name" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-ctrl-title";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My\x01 Game" }, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    try testing.expect(std.mem.endsWith(u8, bundle, "My Game.app"));
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleDisplayName</key>\n    <string>My Game</string>") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, plist, 0x01) == null);
+}
+
+test "createFromBuild: an invalid-UTF-8 title falls back to the project name for label AND file name" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-utf8-title";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "Fl\xffying" }, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    try testing.expect(std.mem.endsWith(u8, bundle, "my_game.app"));
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleDisplayName</key>\n    <string>my_game</string>") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, plist, 0xff) == null);
+}
+
+test "createFromBuild: an invalid-UTF-8 project name is a hard error" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-utf8-name";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    // The exe fixture is `my_game`; sanitizeExeName drops the bad byte so
+    // the probe still finds it — the metadata check must fail FIRST.
+    try testing.expectError(error.InvalidBundleMetadata, createFromBuild(a, work, target, .{ .name = "my_game\xff", .title = "" }, null));
+}
+
+test "createFromBuild writes a positive CFBundleVersion for a 0.x project" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-zero-major";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    // `.version` left at the ProjectConfig default, 0.1.0 — flying-platform's case.
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game" }, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.1.0</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.1.0</string>") != null);
 }
 
 test "createFromBuild falls back to the legacy `game` exe name" {

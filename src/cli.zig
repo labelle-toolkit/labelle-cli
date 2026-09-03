@@ -151,7 +151,12 @@ pub fn main(proc_init: std.process.Init) !void {
                 std.process.exit(1);
             }
             parsed_args.command = .bundle_cmd;
-            const result = parseBundleArgs(&args) orelse return;
+            // A usage error must exit NON-ZERO so automation can't mistake
+            // `labelle bundle --bogus` for a built bundle (Codex on #362).
+            // The parser has already printed the diagnostic. (The older
+            // parsers above still `return` with exit 0 — pre-existing, left
+            // alone here; candidate for a separate cleanup.)
+            const result = parseBundleArgs(&args) orelse return error.InvalidArguments;
             parsed_args.project_dir = result.dir;
             parsed_args.optimize_override = result.optimize;
             parsed_args.bundle_output = result.output;
