@@ -13,45 +13,16 @@ pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
         progress.fatalExit(1, "compatibility check failed: wasm requires a raylib, sokol, or bgfx backend");
     }
 
-    const is_local = project_config.isLocalVersion;
-    var warnings: u8 = 0;
+    const warnings = compatWarnings(cfg, true);
 
-    // core / engine / gfx / cli version on INDEPENDENT minor trains (e.g. core
-    // 1.21, engine 1.65, gfx 1.19 are all current + mutually compatible). The
-    // assembler unifies every package onto the project's core at build time (the
-    // "core diamond"), so source-compatibility — not matching minors — is what
-    // matters. Only a MAJOR-version divergence is a real break (a 2.x package
-    // against a 1.x core), so that's all we warn on. The curated tested set lives
-    // in `versions.zon` (what `labelle upgrade all` targets); a per-package
-    // declared-core check (read each package's own core pin) is the planned
-    // stronger follow-up.
-    const core_major = if (!is_local(cfg.core_version)) parseVersion(cfg.core_version).major else null;
-
-    const Dep = struct { name: []const u8, version: []const u8 };
-    const deps = [_]Dep{
-        .{ .name = "engine", .version = cfg.engine_version },
-        .{ .name = "gfx", .version = cfg.gfx_version },
-        .{ .name = "cli", .version = cfg.labelle_version },
-    };
-    if (core_major) |cmaj| {
-        for (deps) |d| {
-            if (is_local(d.version)) continue;
-            if (depCompatWarn(d.version, cmaj)) {
-                std.debug.print("labelle: warning: {s} {s} may be incompatible with core {s}\n", .{ d.name, d.version, cfg.core_version });
-                std.debug.print("  major versions should match (minor versions are independent across packages)\n", .{});
-                std.debug.print("  hint: run `labelle upgrade all`\n\n", .{});
-                warnings += 1;
-            }
-        }
-    }
-
-    // Plugins are deliberately NOT checked against core here. Unlike the
-    // core-diamond packages above — which share core's major by construction —
-    // a plugin versions on its own train, so its major encodes nothing about
-    // which core it targets: `pathfinder` 4.0.2 supports core 1.24.1 exactly as
-    // `fsm` 0.5.0 does. Comparing the two majors produced only false positives
+    // Plugins are deliberately NOT checked against core here. A plugin
+    // versions on its own train, so its major encodes nothing about which core
+    // it targets: `pathfinder` 4.0.2 supports core 1.24.1 exactly as `fsm`
+    // 0.5.0 does. Comparing the two majors produced only false positives
     // (#230 carved out 0.x plugins; 4.x plugins were the same bug from the
     // other side), so the heuristic is gone rather than special-cased again.
+    // (#357 established that the core-diamond packages are no different in
+    // this respect — see `compatWarnings`.)
     //
     // The real signal is a core range declared by the plugin itself in
     // `plugin.labelle`; wiring that up needs this check to run after dependency
@@ -103,19 +74,76 @@ fn validateStates(states: []const []const u8) void {
     }
 }
 
-/// Decide whether a core-diamond package (engine / gfx / cli) should emit a
-/// compat warning against the given core MAJOR version.
+/// One core-diamond pin paired with the version this CLI was built and tested
+/// against (`versions.zon`, surfaced as `project_config.*_VERSION`).
+const DiamondPin = struct {
+    name: []const u8,
+    /// What `project.labelle` pins.
+    pinned: []const u8,
+    /// What this CLI's curated tested set targets for the SAME package.
+    curated: []const u8,
+};
+
+/// The core-diamond packages, each paired with its OWN curated version.
 ///
-/// These packages each version on their own MINOR train (core 1.21, engine
-/// 1.65 and gfx 1.19 are all current and mutually compatible), and the
-/// assembler unifies them onto the project's core at build time. So only a
-/// MAJOR divergence — a 2.x package against a 1.x core — is a real break.
+/// #357: they are deliberately not compared to each other. core, engine, gfx
+/// and cli release on independent trains and their major numbers were never
+/// meant to track each other — labelle-core has never published a 2.x, while
+/// labelle-engine went 2.0.0 for a break in its own scene loader (engine#592,
+/// "legacy unified-format aliases removed") that says nothing about core.
+/// engine 2.13.0's own `build.zig.zon` declares `labelle-core >= v1.27.0`, so
+/// a 2.x engine on a 1.x core is the SUPPORTED pairing, not a skew.
+fn coreDiamond(cfg: project_config.ProjectConfig) [4]DiamondPin {
+    return .{
+        .{ .name = "core", .pinned = cfg.core_version, .curated = project_config.CORE_VERSION },
+        .{ .name = "engine", .pinned = cfg.engine_version, .curated = project_config.ENGINE_VERSION },
+        .{ .name = "gfx", .pinned = cfg.gfx_version, .curated = project_config.GFX_VERSION },
+        .{ .name = "cli", .pinned = cfg.labelle_version, .curated = project_config.CLI_VERSION },
+    };
+}
+
+/// Count (and, when `emit`, report) core-diamond compatibility warnings.
 ///
-/// Plugins deliberately do not go through this: they version on trains of their
-/// own and are not part of the core diamond. See the note in
-/// `validateCompatibility` and #332.
-fn depCompatWarn(dep_version: []const u8, core_major: u32) bool {
-    return parseVersion(dep_version).major != core_major;
+/// The rule this encodes — see `coreDiamond` for why the old cross-package
+/// one was wrong — is PER PACKAGE: a package's major bump is a breaking change
+/// in that package alone, so the real skew signal is a pin sitting BELOW the
+/// major line this CLI was built and tested against for that same package
+/// (e.g. an engine 1.x pin against a CLI whose tested engine is 2.x: that
+/// project predates engine#592 and will not load a current scene file).
+///
+/// A pin ABOVE the curated major deliberately does not warn. `versions.zon`
+/// lags every fresh package release by construction, so warning there would
+/// fire on early adopters and on any CLI that is merely a release behind —
+/// exactly the cry-wolf #357 is about — and `upgrade all`, the only hint the
+/// check can give, would move them backwards. Being behind the packages is a
+/// CLI-update problem, and `labelle update` already reports it.
+///
+/// The stronger, exact signal is a core range declared by each package itself;
+/// that needs post-resolution manifests on disk and is tracked in #332.
+fn compatWarnings(cfg: project_config.ProjectConfig, comptime emit: bool) u8 {
+    var warnings: u8 = 0;
+    for (coreDiamond(cfg)) |d| {
+        // `local:<path>` / `@<path>` dev overrides are not version-comparable.
+        if (project_config.isLocalVersion(d.pinned) or project_config.isLocalVersion(d.curated)) continue;
+        if (!depCompatWarn(d.pinned, d.curated)) continue;
+        warnings += 1;
+        if (emit) {
+            std.debug.print("labelle: warning: {s} {s} is behind this CLI's tested {s} line ({s})\n", .{ d.name, d.pinned, d.name, d.curated });
+            std.debug.print("  a major bump is a breaking change within that package alone — core, engine,\n", .{});
+            std.debug.print("  gfx and cli version independently and their majors are not meant to match\n", .{});
+            std.debug.print("  hint: run `labelle upgrade all`\n\n", .{});
+        }
+    }
+    return warnings;
+}
+
+/// Decide whether a core-diamond package should emit a compat warning: true
+/// when `pinned` is on an OLDER major line than `curated` — the curated
+/// version being this CLI's tested pin for that SAME package, never another
+/// package's. See `compatWarnings` for the policy and `coreDiamond` for the
+/// evidence behind it (#357).
+fn depCompatWarn(pinned: []const u8, curated: []const u8) bool {
+    return parseVersion(pinned).major < parseVersion(curated).major;
 }
 
 /// A parsed semver, comparable as a whole.
@@ -176,17 +204,80 @@ pub fn parseVersion(version: []const u8) Version {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "depCompatWarn: same major — no warning regardless of minor (independent minors)" {
-    // A minor mismatch is not a warning: core 1.21 + engine 1.65 are both
-    // major 1 → compatible under independent versioning.
-    try std.testing.expect(!depCompatWarn("1.14.0", 1));
-    try std.testing.expect(!depCompatWarn("1.65.0", 1));
-    try std.testing.expect(!depCompatWarn("1.0.0", 1));
+test "depCompatWarn: same major line — no warning regardless of minor" {
+    // A minor mismatch inside a package's own major line is never a warning:
+    // engine 2.5.0 against a tested engine 2.12.2 is fine.
+    try std.testing.expect(!depCompatWarn("2.5.0", "2.12.2"));
+    try std.testing.expect(!depCompatWarn("1.14.0", "1.28.0"));
+    try std.testing.expect(!depCompatWarn("1.28.0", "1.28.0"));
 }
 
-test "depCompatWarn: major mismatch warns" {
-    try std.testing.expect(depCompatWarn("2.0.0", 1));
-    try std.testing.expect(depCompatWarn("1.0.0", 2));
+test "depCompatWarn: a package is only ever judged against its OWN curated line (#357)" {
+    // The bug: engine's major was compared to CORE's major. labelle-core has
+    // never published a 2.x and labelle-engine has been on 2.x since v2.0.0
+    // (an engine-local scene-loader break, engine#592), so a 1.x core with a
+    // 2.x engine — the CLI's own `versions.zon` set, the assembler's `init`
+    // defaults, and the flagship flying-platform-labelle all pair exactly
+    // that — is the SUPPORTED combination and must stay silent.
+    try std.testing.expect(!depCompatWarn("2.13.0", "2.12.2"));
+    try std.testing.expect(!depCompatWarn("2.11.0", "2.12.2"));
+}
+
+test "depCompatWarn: a pin below its own curated major still warns (genuine skew)" {
+    // An engine 1.x pin against a tested engine 2.x IS a real break: that
+    // project predates engine#592 and will not load a current scene file.
+    try std.testing.expect(depCompatWarn("1.65.0", "2.12.2"));
+    try std.testing.expect(depCompatWarn("0.9.0", "1.28.0"));
+}
+
+test "depCompatWarn: a pin ahead of the curated major does not warn" {
+    // `versions.zon` lags every fresh release by construction, so warning
+    // here would fire on early adopters and on any CLI a release behind —
+    // and `upgrade all` would move them backwards. That is a `labelle update`
+    // concern, not a project compatibility one.
+    try std.testing.expect(!depCompatWarn("3.0.0", "2.12.2"));
+}
+
+test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
+    // Regression guard for the whole point of the ticket: a fresh project
+    // must not warn on its own scaffolding. `ProjectConfig`'s version-field
+    // defaults ARE the curated set from `versions.zon` — what `upgrade all`
+    // writes and what `init` scaffolds tracks — so a default config standing
+    // in for a fresh scaffold must produce ZERO warnings whatever those
+    // versions later become.
+    const scaffolded = project_config.ProjectConfig{ .name = "my_game" };
+    try std.testing.expectEqual(@as(u8, 0), compatWarnings(scaffolded, false));
+
+    // And the exact pins from the #357 reproduction (CLI 1.60.1 + assembler
+    // 0.93.1), which warned on every single build.
+    const reported = project_config.ProjectConfig{
+        .name = "my_game",
+        .core_version = "1.26.0",
+        .engine_version = "2.5.0",
+        .gfx_version = "1.28.1",
+        .labelle_version = "1.57.0",
+    };
+    try std.testing.expectEqual(@as(u8, 0), compatWarnings(reported, false));
+
+    // …as does the flagship game's set (core 1.28.0 + engine 2.13.0).
+    const flagship = project_config.ProjectConfig{
+        .name = "flying_platform",
+        .core_version = "1.28.0",
+        .engine_version = "2.13.0",
+        .gfx_version = "1.30.2",
+        .labelle_version = "1.60.1",
+    };
+    try std.testing.expectEqual(@as(u8, 0), compatWarnings(flagship, false));
+}
+
+test "compatWarnings: a genuinely stale pin is still caught, local overrides are not judged" {
+    // A pre-2.0 engine against this CLI's 2.x tested line is real skew.
+    const stale = project_config.ProjectConfig{ .name = "old", .engine_version = "1.65.0" };
+    try std.testing.expectEqual(@as(u8, 1), compatWarnings(stale, false));
+
+    // A `local:` dev override is not version-comparable and must be skipped.
+    const local = project_config.ProjectConfig{ .name = "dev", .engine_version = "local:../labelle-engine" };
+    try std.testing.expectEqual(@as(u8, 0), compatWarnings(local, false));
 }
 
 test "plugins are never judged against core (issue #230, #332)" {
@@ -197,9 +288,10 @@ test "plugins are never judged against core (issue #230, #332)" {
     // predicate to call here; if one is ever reintroduced, this test's premise
     // (and the note in validateCompatibility) is what it has to contradict.
     //
-    // Guard the shape instead: the only compat predicate is for core-diamond
-    // packages, and it is not reachable from the plugin loop.
-    try std.testing.expect(@TypeOf(depCompatWarn) == fn ([]const u8, u32) bool);
+    // Guard the shape instead: the only compat predicate compares a pin to
+    // its own package's curated version, and it is not reachable from the
+    // plugin loop.
+    try std.testing.expect(@TypeOf(depCompatWarn) == fn ([]const u8, []const u8) bool);
     try std.testing.expect(!@hasDecl(@This(), "pluginCompatWarn"));
 }
 
