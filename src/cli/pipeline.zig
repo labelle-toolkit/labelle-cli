@@ -1208,9 +1208,15 @@ pub const CollectPrebuildIgnorePathsSpec = struct {
             defer free(a, &got);
 
             try std.testing.expectEqual(@as(usize, 2), got.items.len);
-            // Build the expectations with `join` rather than hardcoding '/'
-            // so the assertion holds on Windows too.
-            const png = try std.fs.path.join(a, &.{ "/proj", "assets/out.png" });
+            // Build the expectation with the SAME resolver the collector
+            // uses. Re-implementing the join here (even via `std.fs.path.join`)
+            // is not host-portable: `join` inserts the native separator
+            // between its arguments but leaves the '/' inside a relative
+            // path alone, so on Windows it yields `/proj\assets/out.png`
+            // while `watchIgnorePath` normalises to `/proj\assets\out.png`.
+            // This spec's subject is WHICH outputs are excluded, not how a
+            // path is spelled — that belongs to `watchIgnorePath`'s own tests.
+            const png = try serve.watchIgnorePath(a, "/proj", "assets/out.png");
             defer a.free(png);
             try std.testing.expectEqualStrings(png, got.items[0]);
         }
