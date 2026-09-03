@@ -1161,6 +1161,11 @@ test "computeSignature: a declared prebuild output does not move the signature" 
 }
 
 test "watchIgnorePath: roots a declared output the way the walk builds paths" {
+    // POSIX-only: the expected strings spell the separator. The behavior
+    // under test (a leading `./` must still match the walked path) is
+    // separator-agnostic, and the tree-level test above covers it on
+    // every platform.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     const plain = try watchIgnorePath(alloc, "/proj", "assets/out.png");
