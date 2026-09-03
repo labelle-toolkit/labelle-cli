@@ -2,7 +2,7 @@
 ///
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path> (raylib picks PNG/BMP by extension); `--` forwards trailing args to the game
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] — generate + build (no run)
 ///   labelle bundle [dir] [--optimize=MODE] [--output dir] — generate + build the desktop target, then wrap the exe in a macOS `<Title>.app` with Info.plist + AppIcon.icns (macOS only, cli#359)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
@@ -518,6 +518,21 @@ pub const StatusFormatHumanSpec = status_mod.FormatHumanSpec;
 pub const DoctorJsonReportSpec = doctor.JsonReportSpec;
 
 pub const PipelineResolveExportOutputSpec = pipeline.ResolveExportOutputSpec;
+
+// Surface the screenshot output-format specs (cli#356) so
+// `zspec.runAll(@This())` walks into the extension parser, the
+// requested-vs-written plan, the encoder's OOM reporting, and the
+// on-disk re-encode. `screenshot_format.zig` has no file-level
+// `test { runAll(@This()) }` of its own, and `screenshot_format_mod`
+// below is private, so a spec that is not re-exported HERE is never
+// analyzed and its tests silently never run — which is exactly what
+// happened to `EncodeSpec` when it was added.
+const screenshot_format_mod = @import("cli/screenshot_format.zig");
+pub const ScreenshotFormatFromPathSpec = screenshot_format_mod.FormatFromPathSpec;
+pub const ScreenshotFormatPlanSpec = screenshot_format_mod.PlanSpec;
+pub const ScreenshotFormatEncodeSpec = screenshot_format_mod.EncodeSpec;
+pub const ScreenshotFormatApplySpec = screenshot_format_mod.ApplySpec;
+pub const PipelineScreenshotProbeSpec = pipeline.ScreenshotProbeSpec;
 
 /// Regression tests for `ProjectConfig.normalizeInitialPrefab()` — the
 /// legacy `.initial_scene` → `.initial_prefab` alias promotion introduced

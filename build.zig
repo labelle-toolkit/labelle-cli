@@ -101,11 +101,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(astc_tests).step);
 }
 
-/// Compile the vendored stb implementation (PNG decode + encode) and
-/// put its headers on the include path. Two consumers `@cImport` those
-/// headers: `src/cli/bake.zig` (decode, for the PNG→LRGBA prebake) and
-/// `src/texpack/` (decode + encode, for `labelle pack`). A single `.c`
-/// provides one definition of the symbols for both.
+/// Compile the vendored stb implementation (PNG/TGA/BMP decode, and
+/// PNG/BMP/TGA/JPEG encode) and put its headers on the include path.
+/// Three consumers `@cImport` those headers: `src/cli/bake.zig` (decode,
+/// for the PNG→LRGBA prebake), `src/texpack/` (decode + encode, for
+/// `labelle pack`), and `src/cli/screenshot_format.zig` (decode + encode,
+/// to re-encode a `--screenshot` capture into the requested format —
+/// cli#356). A single `.c` provides one definition of the symbols for all.
 fn wireStb(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFile(.{
         .file = b.path("src/cli/stb_image_impl.c"),
