@@ -121,6 +121,48 @@ const WasmRebuildCtx = struct {
     }
 };
 
+/// The watcher's `ignore_files` set for `wasm serve --watch`: the absolute
+/// paths of every declared prebuild `.outputs` entry, anchored at
+/// `project_dir`. Caller owns the list and every slice in it.
+///
+/// Excluding them is what stops the rebuild callback from tripping its own
+/// watcher (cli#355): `watchLoop` records the signature captured BEFORE the
+/// callback runs, so a hook's regeneration of `assets/out.png` otherwise
+/// looked like a fresh edit on the next poll and fired a second full
+/// generate/compile/reload. Same reasoning as the `.labelle/` skip.
+///
+/// `hooks_enabled` is the `LABELLE_NO_PREBUILD` kill switch, and the reason
+/// it is a parameter rather than an assumption. With hooks off, the rebuild
+/// callback writes none of these files, so the self-trigger cannot happen —
+/// while excluding them anyway broke a documented use of the switch:
+/// regenerating those outputs OUT OF BAND (in CI, or by hand) never reached
+/// the watch signature, so the browser kept serving the previous build until
+/// some unrelated watched file happened to change (cli#361 review). With
+/// hooks off, the outputs are ordinary externally managed inputs and belong
+/// in the watch set, so the set comes back empty.
+///
+/// Best-effort: a path that can't be joined is simply not excluded — that
+/// costs a redundant rebuild, never a missed one.
+fn collectPrebuildIgnorePaths(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    steps: []const prebuild.Step,
+    hooks_enabled: bool,
+) std.ArrayList([]const u8) {
+    var out: std.ArrayList([]const u8) = .empty;
+    if (!hooks_enabled) return out;
+    for (steps) |step| {
+        for (step.outputs) |rel| {
+            const p = serve.watchIgnorePath(allocator, project_dir, rel) catch continue;
+            out.append(allocator, p) catch {
+                allocator.free(p);
+                continue;
+            };
+        }
+    }
+    return out;
+}
+
 /// Resolve the `wasm export --output` value to a path the packager can
 /// use. Absolute paths pass through; a relative path is anchored to the
 /// project dir so `labelle wasm export ../game --output release` writes
@@ -410,6 +452,33 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // A non-zero step exits the CLI with the child's exact code from
     // inside `runAll` (via `progress.fatalExit`, which marks the status
     // file `failed` first), mirroring the assembler delegation.
+    //
+    // A hook is very often a Python program — `.run = .{ "python3",
+    // "tools/gen_tiles.py", ... }` is this feature's documented example. On a
+    // machine whose only interpreter is the CLI-managed one (`labelle install
+    // python`), that interpreter reaches PATH solely through
+    // `python_provision.autoWireEnv`, which used to run far below inside the
+    // wasm-only block — i.e. AFTER the hooks had already failed to spawn
+    // (cli#361 review). Wire it HERE, ahead of the first spawn, so the
+    // documented generator works on every platform and not just after a wasm
+    // build has got that far.
+    //
+    // Gated on hooks that will actually run, so the no-`.prebuild` path stays
+    // byte-identical (no cache stat, no "using provisioned Python" line) and
+    // `LABELLE_NO_PREBUILD=1` stays fully inert. Idempotent and cheap: the
+    // wasm block below still calls it for projects with no hooks, and a
+    // second call returns early once the dir is on PATH.
+    //
+    // Nothing else a hook could reasonably need is wired later. The managed
+    // Zig toolchain is spawned by absolute path and never joins PATH at all;
+    // emsdk activation exists for the emcc link step and pulling it above the
+    // hooks would force a toolchain fetch on every build; and
+    // `sdl_provision.autoWireEnv` (just below) sets a Windows link/runtime
+    // variable consumed by `zig build`, not a tool a generator spawns.
+    if (parsed.prebuild.len > 0 and !prebuild.skipRequested(allocator)) {
+        python_provision.autoWireEnv(allocator);
+    }
+
     try prebuild.runAll(allocator, project_dir, parsed.prebuild, .{
         .route_stdout_to_stderr = parsed_args.progress_mode == .json,
     });
@@ -789,28 +858,20 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
                         .fatal_on_step_failure = false,
                     },
                 };
-                // The hooks' declared `.outputs` are excluded from the
-                // watch signature (cli#355): the rebuild callback writes
-                // them, and `watchLoop` records the signature captured
-                // BEFORE the callback, so folding them in made the hook's
-                // own regeneration look like a fresh edit and fired a
-                // second full generate/compile/reload. Same reasoning as
-                // the `.labelle/` skip. Best-effort — a path that can't
-                // be joined is simply not excluded (a redundant rebuild,
-                // never a missed one).
-                var ignore_files: std.ArrayList([]const u8) = .empty;
+                // The hooks' declared `.outputs` are excluded from the watch
+                // signature so the rebuild callback can't trip its own
+                // watcher — but ONLY while the hooks actually run, so the
+                // kill switch doesn't hide out-of-band regeneration from the
+                // watcher. See `collectPrebuildIgnorePaths`.
+                var ignore_files = collectPrebuildIgnorePaths(
+                    allocator,
+                    project_dir,
+                    parsed.prebuild,
+                    !prebuild.skipRequested(allocator),
+                );
                 defer {
                     for (ignore_files.items) |f| allocator.free(f);
                     ignore_files.deinit(allocator);
-                }
-                for (parsed.prebuild) |step| {
-                    for (step.outputs) |rel| {
-                        const p = serve.watchIgnorePath(allocator, project_dir, rel) catch continue;
-                        ignore_files.append(allocator, p) catch {
-                            allocator.free(p);
-                            continue;
-                        };
-                    }
                 }
 
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
@@ -1127,6 +1188,53 @@ const ScreenshotProbe = struct {
         }
         std.debug.print("  hint: capture needs a native surface on some backends — a headless bgfx device has no backbuffer to read back\n\n", .{});
     }
+};
+
+pub const CollectPrebuildIgnorePathsSpec = struct {
+    const steps: []const prebuild.Step = &.{
+        .{ .run = &.{ "python3", "tools/gen.py" }, .outputs = &.{ "assets/out.png", "src/table.zig" } },
+        .{ .run = &.{"./tools/nothing.sh"} }, // declares no outputs
+    };
+
+    fn free(a: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+        for (list.items) |f| a.free(f);
+        list.deinit(a);
+    }
+
+    pub const hooks_enabled = struct {
+        test "every declared output is excluded from the watch signature" {
+            const a = std.testing.allocator;
+            var got = collectPrebuildIgnorePaths(a, "/proj", steps, true);
+            defer free(a, &got);
+
+            try std.testing.expectEqual(@as(usize, 2), got.items.len);
+            // Build the expectations with `join` rather than hardcoding '/'
+            // so the assertion holds on Windows too.
+            const png = try std.fs.path.join(a, &.{ "/proj", "assets/out.png" });
+            defer a.free(png);
+            try std.testing.expectEqualStrings(png, got.items[0]);
+        }
+
+        test "a step that declares no outputs contributes nothing" {
+            const a = std.testing.allocator;
+            var got = collectPrebuildIgnorePaths(a, "/proj", steps[1..], true);
+            defer free(a, &got);
+            try std.testing.expectEqual(@as(usize, 0), got.items.len);
+        }
+    };
+
+    // cli#361 review: with `LABELLE_NO_PREBUILD=1` the rebuild callback never
+    // writes these files, so excluding them only hid an out-of-band
+    // regeneration — a documented use of the kill switch — from the watcher,
+    // leaving the browser on a stale build.
+    pub const hooks_disabled = struct {
+        test "the kill switch leaves declared outputs in the watch set" {
+            const a = std.testing.allocator;
+            var got = collectPrebuildIgnorePaths(a, "/proj", steps, false);
+            defer free(a, &got);
+            try std.testing.expectEqual(@as(usize, 0), got.items.len);
+        }
+    };
 };
 
 pub const ResolveExportOutputSpec = struct {

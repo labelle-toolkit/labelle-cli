@@ -374,6 +374,29 @@ pub fn main(proc_init: std.process.Init) !void {
     const command = parsed_args.command;
     const project_dir = parsed_args.project_dir;
 
+    // ── Help resolution — BEFORE any dispatch ────────────────────────
+    //
+    // A usage request must never reach a handler that DOES something.
+    // This is the one place that decides "this invocation can only print
+    // usage", and it sits above EVERY dispatch below it: the standalone
+    // switch, the `android doctor` fast path, and `pipeline.run`. Any
+    // fast path added later lands underneath it by construction, so the
+    // bug cannot recur at a new site.
+    //
+    // That ordering is the whole point. This same blind spot was fixed
+    // three times at three different sites during cli#355 review — first
+    // `labelle android --help`, then `labelle android build --help` and
+    // the iOS forms — and each fix was a check placed after some earlier
+    // `return`. `labelle android doctor --help` was the fourth: the
+    // doctor fast path returned before the help predicate was ever
+    // consulted, so asking for usage probed the Android toolchain and
+    // exited 1 when the SDK was missing (cli#361 review). Hoisting the
+    // decision above the fast paths retires the pattern instead of
+    // patching a fourth site.
+    if (helpOnlyPrinter(command, parsed_args.extra_args[0..parsed_args.extra_count])) |printUsage| {
+        return printUsage();
+    }
+
     // Standalone commands (no project.labelle needed)
     switch (command) {
         .help_cmd => return help.printHelp(),
@@ -427,29 +450,90 @@ pub fn main(proc_init: std.process.Init) !void {
         }
     }
 
-    // Help-only invocations of `android`/`ios` must not enter the build
-    // pipeline (cli#355). Both handlers print usage for a missing
-    // subcommand and for `--help`/`-h`, but they are only reached at the
-    // END of `pipeline.run` — so merely asking for usage first executed
-    // the project's declared `.prebuild` commands plus a whole
-    // generate+build. They don't need a project.labelle either.
-    //
-    // The predicate lives beside each handler's own parse loop
-    // (`android.wantsHelpOnly`, `ios.wantsHelpOnly`) and covers EVERY
-    // help form, not just a token in the first extra-argument position:
-    // `labelle android`, `labelle android build --help` and
-    // `labelle ios build --help` all reached the pipeline before.
-    if (command == .android_cmd and android.wantsHelpOnly(parsed_args.extra_args[0..parsed_args.extra_count])) {
-        return android.printHelp();
-    }
-    if (command == .ios_cmd and ios.wantsHelpOnly(parsed_args.extra_args[0..parsed_args.extra_count])) {
-        return ios.printIosHelp();
-    }
-
     return pipeline.run(allocator, parsed_args);
 }
 
+/// The usage printer for an invocation that can ONLY print usage, or null
+/// when it asks for real work. Pure and total: the single decision point
+/// `main` consults before any dispatch, so a new fast path cannot be
+/// ordered ahead of it.
+///
+/// Help-only invocations of `android`/`ios` must not enter the build
+/// pipeline (cli#355). Both handlers print usage for a missing subcommand
+/// and for `--help`/`-h`, but they are only reached at the END of
+/// `pipeline.run` — so merely asking for usage executed the project's
+/// declared `.prebuild` commands plus a whole generate+build. Nor must
+/// they reach the `android doctor` fast path, which probes the Android
+/// toolchain and exits 1 when it is incomplete (cli#361). Neither needs a
+/// project.labelle.
+///
+/// The per-command predicates live beside each handler's own parse loop
+/// (`android.wantsHelpOnly`, `ios.wantsHelpOnly`) so the two stay in step,
+/// and cover EVERY help form — not just a token in the first
+/// extra-argument position: `labelle android`, `labelle android build
+/// --help`, `labelle android doctor --help` and `labelle ios build --help`
+/// all did work before printing usage at some point in this feature's
+/// history.
+///
+/// Commands whose handler is already a pure printer, or which parse their
+/// own `--help` before doing anything, are absent by design: this is for
+/// commands whose help would otherwise be reached only after work.
+fn helpOnlyPrinter(command: args_mod.Command, extra_args: []const []const u8) ?*const fn () void {
+    return switch (command) {
+        .android_cmd => if (android.wantsHelpOnly(extra_args)) &android.printHelp else null,
+        .ios_cmd => if (ios.wantsHelpOnly(extra_args)) &ios.printIosHelp else null,
+        else => null,
+    };
+}
+
 // --- Tests ---
+
+/// `main` consults `helpOnlyPrinter` before EVERY dispatch, so these cases
+/// pin the whole "a usage request does no work" contract in one place —
+/// including `android doctor --help`, which used to be swallowed by the
+/// doctor fast path and probe the Android toolchain (cli#361 review).
+pub const HelpOnlyPrinterSpec = struct {
+    pub const resolves_to_usage = struct {
+        test "android doctor --help prints usage instead of probing" {
+            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{ "doctor", "--help" }) != null);
+        }
+
+        test "android doctor -h prints usage instead of probing" {
+            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{ "doctor", "-h" }) != null);
+        }
+
+        test "android with no subcommand prints usage" {
+            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{}) != null);
+        }
+
+        test "android build --help prints usage" {
+            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{ "build", "--help" }) != null);
+        }
+
+        test "ios build --help prints usage" {
+            try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{ "build", "--help" }) != null);
+        }
+    };
+
+    pub const falls_through_to_work = struct {
+        test "android doctor without a help token still runs the doctor" {
+            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{"doctor"}) == null);
+        }
+
+        test "android build without a help token still builds" {
+            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{"build"}) == null);
+        }
+
+        test "ios run without a help token still runs" {
+            try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{"run"}) == null);
+        }
+
+        test "commands with no help-only form are never intercepted" {
+            try std.testing.expect(helpOnlyPrinter(.build, &.{"--help"}) == null);
+            try std.testing.expect(helpOnlyPrinter(.doctor_cmd, &.{"--help"}) == null);
+        }
+    };
+};
 
 const expect = @import("zspec").expect;
 
@@ -533,6 +617,7 @@ pub const StatusFormatHumanSpec = status_mod.FormatHumanSpec;
 pub const DoctorJsonReportSpec = doctor.JsonReportSpec;
 
 pub const PipelineResolveExportOutputSpec = pipeline.ResolveExportOutputSpec;
+pub const PipelineCollectPrebuildIgnorePathsSpec = pipeline.CollectPrebuildIgnorePathsSpec;
 
 // Surface the `.prebuild` hook specs (cli#355) so `zspec.runAll(@This())`
 // walks into them: step validation, the mtime staleness rule, argv
