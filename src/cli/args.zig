@@ -12,7 +12,7 @@ const export_mod = @import("export.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
 
-pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd };
+pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -160,7 +160,78 @@ pub const ParsedArgs = struct {
     // file `.labelle/<target>/.build-progress.json` is written in every
     // mode (that's what `labelle status` reads).
     progress_mode: progress.Mode = .human,
+    // `labelle bundle --output <dir>` (cli#359): where the macOS `.app`
+    // lands. `null` = the target dir's `zig-out/`, beside `bin/`. A
+    // relative path anchors to the project dir (same rule as `wasm
+    // export --output`); see `bundle.resolveOutputDir`.
+    bundle_output: ?[]const u8 = null,
 };
+
+/// Parsed `bundle` flags (cli#359). Returned by `parseBundleArgs`; `null`
+/// signals a parse error (the helper has already printed a message).
+pub const BundleArgs = struct {
+    dir: []const u8 = ".",
+    optimize: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    progress_mode: progress.Mode = .human,
+};
+
+/// Parse the flags of `labelle bundle [dir] [--optimize=<mode>]
+/// [--output <dir>] [--progress=<m>]`. Deliberately NARROWER than
+/// `build`'s parser: no `--platform` (a `.app` is desktop-only — the
+/// pipeline forces `.desktop`), no `--docker` (the bundle wraps a host
+/// exe; a container-built one may not even be a Mach-O), no `--scene`
+/// (that is a run-time env var, and `bundle` does not run the game).
+/// `--zig` is accepted like everywhere else so a pinned toolchain still
+/// works. `args` is `anytype` so tests can drive it with an in-memory
+/// `Args.IteratorGeneral`, mirroring `parseWasmExportArgs`.
+pub fn parseBundleArgs(args: anytype) ?BundleArgs {
+    var result = BundleArgs{};
+    var dir_set = false;
+
+    while (args.next()) |arg| {
+        if (parseOptimizeFlag(arg, &result.optimize, "bundle")) |consumed| {
+            if (consumed) continue;
+        } else return null;
+        if (parseProgressFlag(arg, &result.progress_mode, "bundle")) |consumed| {
+            if (consumed) continue;
+        } else return null;
+        if (parseToolchainFlag(arg, args)) |consumed| {
+            if (consumed) continue;
+        } else return null;
+        if (std.mem.startsWith(u8, arg, "--output=") or std.mem.eql(u8, arg, "--output")) {
+            const separate_value = std.mem.eql(u8, arg, "--output");
+            const val = if (separate_value)
+                (args.next() orelse {
+                    std.debug.print("labelle bundle: --output requires a value (e.g. --output ./dist)\n", .{});
+                    return null;
+                })
+            else
+                arg["--output=".len..];
+            // A following flag is NOT the directory: `--output --progress=json`
+            // would otherwise create a directory literally named
+            // `--progress=json` and silently drop the progress flag. A
+            // directory that really starts with `--` can still be given as
+            // `--output=--weird`.
+            if (val.len == 0 or (separate_value and std.mem.startsWith(u8, val, "--"))) {
+                std.debug.print("labelle bundle: --output requires a value (e.g. --output ./dist)\n", .{});
+                return null;
+            }
+            result.output = val;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("labelle bundle: unknown flag '{s}'\n", .{arg});
+            return null;
+        } else {
+            if (dir_set) {
+                std.debug.print("labelle bundle: unexpected argument '{s}'\n", .{arg});
+                return null;
+            }
+            result.dir = arg;
+            dir_set = true;
+        }
+    }
+    return result;
+}
 
 /// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
 /// signals a parse error (the helper has already printed a message).
