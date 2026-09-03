@@ -521,10 +521,16 @@ pub const PipelineResolveExportOutputSpec = pipeline.ResolveExportOutputSpec;
 
 // Surface the screenshot output-format specs (cli#356) so
 // `zspec.runAll(@This())` walks into the extension parser, the
-// requested-vs-written plan, and the on-disk re-encode.
+// requested-vs-written plan, the encoder's OOM reporting, and the
+// on-disk re-encode. `screenshot_format.zig` has no file-level
+// `test { runAll(@This()) }` of its own, and `screenshot_format_mod`
+// below is private, so a spec that is not re-exported HERE is never
+// analyzed and its tests silently never run — which is exactly what
+// happened to `EncodeSpec` when it was added.
 const screenshot_format_mod = @import("cli/screenshot_format.zig");
 pub const ScreenshotFormatFromPathSpec = screenshot_format_mod.FormatFromPathSpec;
 pub const ScreenshotFormatPlanSpec = screenshot_format_mod.PlanSpec;
+pub const ScreenshotFormatEncodeSpec = screenshot_format_mod.EncodeSpec;
 pub const ScreenshotFormatApplySpec = screenshot_format_mod.ApplySpec;
 pub const PipelineScreenshotProbeSpec = pipeline.ScreenshotProbeSpec;
 

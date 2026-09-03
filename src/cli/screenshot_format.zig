@@ -328,6 +328,24 @@ pub const EncodeSpec = struct {
         defer a.free(out);
         try std.testing.expect(std.mem.startsWith(u8, out, "\x89PNG\r\n\x1a\n"));
     }
+
+    test "every writable format encodes without tripping the C UB sanitizer" {
+        // The JPEG writer is the one path `labelle pack` never exercised,
+        // so this PR was the first caller to reach it: upstream stb v1.16
+        // shifts its bit accumulator through the sign bit of an `int`, and
+        // Zig's C UB sanitizer — on in Debug AND in the ReleaseSafe mode
+        // releases are built with — turns that into a SIGTRAP with no
+        // message. See the LOCAL PATCH note in `stb_image_write.h`.
+        const a = std.testing.allocator;
+        const px = pixels();
+        const magic = [_][]const u8{ "\x89PNG\r\n\x1a\n", "BM", "", "\xff\xd8\xff" };
+        for ([_]Format{ .png, .bmp, .tga, .jpg }, magic) |fmt, m| {
+            const out = try encode(a, &px, w, h, fmt);
+            defer a.free(out);
+            try std.testing.expect(out.len > 0);
+            try std.testing.expect(std.mem.startsWith(u8, out, m));
+        }
+    }
 };
 
 /// End-to-end: a real TGA on disk comes back as a real PNG at the
