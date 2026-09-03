@@ -135,7 +135,7 @@ pub const CodepointRange = struct {
 /// Bake-time parameters for a font resource.
 pub const FontBakeParams = struct {
     pixel_height: f32 = 16,
-    ranges: []const CodepointRange = &.{ .{ .first = 0x20, .last = 0x7F } },
+    ranges: []const CodepointRange = &.{.{ .first = 0x20, .last = 0x7F }},
     atlas_width: u32 = 512,
     atlas_height: u32 = 512,
 };
@@ -219,13 +219,24 @@ pub const ResourceDef = struct {
 };
 
 /// Returns true if a version string is a local path override.
+///
+/// BOTH dev-override spellings count: `local:<path>` and the shorthand
+/// `@<path>`, exactly as `PluginDep.isLocal` reads a plugin's `repo`. Missing
+/// the `@` form here made every caller treat `@../labelle-engine` as a
+/// semver, where it parses as 0.0.0 — so the compat check read a developer's
+/// sibling checkout as "behind the curated major" and warned on every build
+/// (#357), and `pack --trim` read it as a pre-1.30.1 gfx.
 pub fn isLocalVersion(version: []const u8) bool {
-    return std.mem.startsWith(u8, version, "local:");
+    return std.mem.startsWith(u8, version, "local:") or
+        std.mem.startsWith(u8, version, "@");
 }
 
-/// Returns the path portion of a "local:..." version string.
+/// Returns the path portion of a local override version string, for either
+/// spelling accepted by `isLocalVersion`.
 pub fn localVersionPath(version: []const u8) []const u8 {
-    return version["local:".len..];
+    if (std.mem.startsWith(u8, version, "local:")) return version["local:".len..];
+    if (std.mem.startsWith(u8, version, "@")) return version["@".len..];
+    return version;
 }
 
 // ── GUI Plugin System ────────────────────────────────────────────────

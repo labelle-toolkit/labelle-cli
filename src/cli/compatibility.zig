@@ -280,6 +280,45 @@ test "compatWarnings: a genuinely stale pin is still caught, local overrides are
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(local, false));
 }
 
+test "compatWarnings: BOTH dev-override spellings are skipped, not just `local:`" {
+    // The `@<path>` shorthand is the same dev override as `local:<path>` —
+    // `PluginDep.isLocal` has always read both — but the skip here called an
+    // `isLocalVersion` that knew only `local:`. So `@../labelle-engine`
+    // parsed as 0.0.0 and warned as "behind" the curated major: the exact
+    // cry-wolf this PR exists to stop, wearing a different prefix.
+    for ([_][]const u8{ "local:../labelle-engine", "@../labelle-engine", "@libs/labelle-engine" }) |pin| {
+        const cfg = project_config.ProjectConfig{ .name = "dev", .engine_version = pin };
+        try std.testing.expectEqual(@as(u8, 0), compatWarnings(cfg, false));
+    }
+
+    // Every core-diamond slot honours it, not just engine.
+    const all_local = project_config.ProjectConfig{
+        .name = "dev",
+        .core_version = "@../labelle-core",
+        .engine_version = "@../labelle-engine",
+        .gfx_version = "@../labelle-gfx",
+        .labelle_version = "@../labelle-cli",
+    };
+    try std.testing.expectEqual(@as(u8, 0), compatWarnings(all_local, false));
+
+    // And the skip stays narrow: a real stale pin alongside an override is
+    // still reported, so this does not become a blanket mute.
+    const mixed = project_config.ProjectConfig{
+        .name = "dev",
+        .core_version = "@../labelle-core",
+        .engine_version = "1.65.0",
+    };
+    try std.testing.expectEqual(@as(u8, 1), compatWarnings(mixed, false));
+}
+
+test "isLocalVersion recognises both override spellings (#357)" {
+    try std.testing.expect(project_config.isLocalVersion("local:../labelle-engine"));
+    try std.testing.expect(project_config.isLocalVersion("@../labelle-engine"));
+    try std.testing.expect(!project_config.isLocalVersion("2.13.0"));
+    try std.testing.expectEqualStrings("../labelle-engine", project_config.localVersionPath("local:../labelle-engine"));
+    try std.testing.expectEqualStrings("../labelle-engine", project_config.localVersionPath("@../labelle-engine"));
+}
+
 test "plugins are never judged against core (issue #230, #332)" {
     // Regression guard: plugin versions live on independent trains, so their
     // major says nothing about which core they target. `pathfinder` 4.0.2 on a
