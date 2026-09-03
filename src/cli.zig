@@ -4,6 +4,7 @@
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
 ///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path> (raylib picks PNG/BMP by extension); `--` forwards trailing args to the game
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] — generate + build (no run)
+///   labelle bundle [dir] [--optimize=MODE] [--output dir] — generate + build the desktop target, then wrap the exe in a macOS `<Title>.app` with Info.plist + AppIcon.icns (macOS only, cli#359)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
 ///   labelle wasm export [dir] [--output dir] [--zip] [--platform itch|github-pages] [--no-build] — build + package a deployment-ready WASM dir
@@ -57,7 +58,7 @@ const check = @import("cli/check.zig");
 const plugins = @import("cli/plugins.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
-
+const bundle = @import("cli/bundle.zig");
 
 // Argument parsing lives in cli/args.zig (extracted so neither file
 // exceeds ~1000 lines). Alias the decls main/dispatch reference so their
@@ -69,6 +70,7 @@ const parseDirAndScene = args_mod.parseDirAndScene;
 const parseRunArgs = args_mod.parseRunArgs;
 const parseWasmServeArgs = args_mod.parseWasmServeArgs;
 const parseWasmExportArgs = args_mod.parseWasmExportArgs;
+const parseBundleArgs = args_mod.parseBundleArgs;
 const collectExtraArgs = args_mod.collectExtraArgs;
 const appendExtraArg = args_mod.appendExtraArg;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
@@ -137,6 +139,22 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.docker = result.docker_build;
             parsed_args.docker_target = result.docker_target;
             parsed_args.bake = result.bake;
+            parsed_args.progress_mode = result.progress_mode;
+        } else if (std.mem.eql(u8, first, "bundle")) {
+            // `labelle bundle` (cli#359): generate + build the desktop
+            // target, then wrap the exe in a macOS `.app`. Host-gated
+            // HERE, before the project is even read, so a Linux/Windows
+            // user gets the one-line refusal instead of a multi-minute
+            // build followed by a failure.
+            if (!bundle.hostSupported()) {
+                bundle.printUnsupported();
+                std.process.exit(1);
+            }
+            parsed_args.command = .bundle_cmd;
+            const result = parseBundleArgs(&args) orelse return;
+            parsed_args.project_dir = result.dir;
+            parsed_args.optimize_override = result.optimize;
+            parsed_args.bundle_output = result.output;
             parsed_args.progress_mode = result.progress_mode;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
@@ -419,7 +437,6 @@ test {
     @import("zspec").runAll(@This());
 }
 
-
 // Surface the argument-parser spec namespaces (in cli/args_tests.zig).
 const args_tests_mod = @import("cli/args_tests.zig");
 pub const ArgsParseSceneArgSpec = args_tests_mod.ParseSceneArg;
@@ -433,6 +450,7 @@ pub const ArgsParseRunArgsPassthroughSpec = args_tests_mod.ParseRunArgsPassthrou
 pub const ArgsParseHeadlessFlagsSpec = args_tests_mod.ParseHeadlessFlagsSpec;
 pub const ArgsParseWasmServeArgsSpec = args_tests_mod.ParseWasmServeArgsSpec;
 pub const ArgsParseWasmExportArgsSpec = args_tests_mod.ParseWasmExportArgsSpec;
+pub const ArgsParseBundleArgsSpec = args_tests_mod.ParseBundleArgsSpec;
 pub const ArgsAppendRunForwardedArgsSpec = args_tests_mod.AppendRunForwardedArgsSpec;
 
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;

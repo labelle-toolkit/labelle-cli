@@ -27,6 +27,7 @@ const util = @import("util.zig");
 const progress = @import("progress.zig");
 const astc_cmd = @import("../astc/cmd.zig");
 const sdl_provision = @import("sdl_provision.zig");
+const bundle = @import("bundle.zig");
 const args_mod = @import("args.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
@@ -245,6 +246,14 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         parsed.platform = .android;
     }
 
+    // `labelle bundle` (cli#359) wraps a DESKTOP exe in a macOS `.app`;
+    // a project whose `.platform` says otherwise still gets its desktop
+    // target built and bundled (the parser accepts no `--platform`).
+    if (command == .bundle_cmd and parsed.platform != .desktop) {
+        std.debug.print("labelle bundle: project platform is '{s}'; bundling the desktop target instead\n", .{@tagName(parsed.platform)});
+        parsed.platform = .desktop;
+    }
+
     // Resolve the backend for ANY android-targeting invocation —
     // `labelle android`, `labelle run --platform=android`, or
     // `labelle build --platform=android` all land here. The backend is
@@ -329,7 +338,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // behavior instead of blocking the build.
     var reporter_storage: progress.Reporter = undefined;
     const reporter: ?*progress.Reporter = blk: {
-        if (command != .build and command != .run and command != .wasm_cmd) break :blk null;
+        if (command != .build and command != .run and command != .wasm_cmd and command != .bundle_cmd) break :blk null;
         reporter_storage = progress.Reporter.init(allocator, config.globalIo(), parsed_args.progress_mode, target_dir) catch break :blk null;
         break :blk &reporter_storage;
     };
@@ -639,6 +648,23 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
         defer allocator.free(bin_dir);
         sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
+    }
+
+    // `labelle bundle` (cli#359): the exe is built; wrap it. Packaging
+    // runs AFTER the compile, so keep the progress feed open across it
+    // (a `run` phase, as `wasm export` does) and only mark `done` once
+    // the `.app` is on disk — a `--progress=json` consumer must not see
+    // `done` before the artifact exists.
+    if (command == .bundle_cmd) {
+        if (reporter) |r| {
+            r.beginPhase(.run, "packaging macOS bundle");
+            r.clearSpinner();
+        }
+        const app_path = try bundle.createFromBuild(allocator, project_dir, target_dir, parsed, parsed_args.bundle_output);
+        defer allocator.free(app_path);
+        std.debug.print("  open \"{s}\"\n", .{app_path});
+        if (reporter) |r| r.finishDone(0);
+        return;
     }
 
     if (command == .build) {

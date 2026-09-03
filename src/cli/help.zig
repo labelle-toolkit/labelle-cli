@@ -14,6 +14,7 @@ pub fn printHelp() void {
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
         \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>]  Generate + build the project (`--progress=json` streams NDJSON progress records on stdout; modes: human, json, off)
         \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>] [--screenshot=<path> [--after=<dur>]] [--headless] [--uncapped] [--ticks=<N>] [--profile] [-- <args>...]  Generate + build + run (default; `--screenshot` captures one frame — the backend owns the final filename and may append its own extension (bgfx writes TGA), so trust the `screenshot written to` line printed after the run, not the requested path; a RELATIVE path resolves against the game's cwd — `.labelle/<target>/`, or the project dir under `--docker` — not your shell's; `--headless` runs windowless, `--uncapped` removes the frame sleep, `--ticks=<N>` exits after N frames — last two imply `--headless`; `--profile` enables the engine frame profiler (per-script/per-plugin ms to the log); `--` forwards trailing args to the game; `--progress=json` streams NDJSON progress records on stdout, but pure NDJSON is guaranteed for `build` ONLY — during `run` the game's own stdout shares the stream, so consumers must skip non-JSON lines or read .labelle/<target>/.build-progress.json instead)
+        \\  bundle [dir] [--optimize=<mode>] [--output <dir>] [--progress=<m>]  Generate + build the desktop target, then wrap the exe in a macOS `<Title>.app` (Info.plist + AppIcon.icns from `.app_icon`, so the Dock/Finder show the project icon; default output `.labelle/<backend>_desktop/zig-out/`; macOS only — see cli#359)
         \\  status [dir] [--json]  Print the current/last build progress from .labelle/<target>/.build-progress.json (works from a second shell while a build runs)
         \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]  Build the WASM target, serve it locally (default port 8080), open the browser (`--watch` rebuilds + live-reloads on source changes)
         \\  wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]  Build the WASM target and package a deployment-ready dir (default ./release; `--zip` archives it; `--platform` adds host-specific touches; best-effort `wasm-opt -O3`)
@@ -60,6 +61,8 @@ pub fn printHelp() void {
         \\  labelle wasm export --output ./release --zip
         \\  labelle wasm export --platform github-pages
         \\  labelle build --optimize=ReleaseFast
+        \\  labelle bundle
+        \\  labelle bundle --optimize=ReleaseFast --output ./dist
         \\  labelle build ../my-game
         \\  labelle build --docker
         \\  labelle build --docker --target=x86_64-windows

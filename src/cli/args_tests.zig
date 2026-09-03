@@ -22,6 +22,7 @@ const parseOptimizeFlag = args.parseOptimizeFlag;
 const parseRunArgs = args.parseRunArgs;
 const parseWasmServeArgs = args.parseWasmServeArgs;
 const parseWasmExportArgs = args.parseWasmExportArgs;
+const parseBundleArgs = args.parseBundleArgs;
 const appendExtraArg = args.appendExtraArg;
 const appendRunForwardedArgs = args.appendRunForwardedArgs;
 const resolveAndroidBackend = args.resolveAndroidBackend;
@@ -832,7 +833,6 @@ pub const ParseWasmExportArgsSpec = struct {
     };
 };
 
-
 pub const AppendRunForwardedArgsSpec = struct {
     test "skips separator when there are no forwarded args" {
         var argv: std.ArrayList([]const u8) = .empty;
@@ -856,4 +856,109 @@ pub const AppendRunForwardedArgsSpec = struct {
         try std.testing.expectEqualStrings("--preview-mode", argv.items[1]);
         try std.testing.expectEqualStrings("127.0.0.1:54321", argv.items[2]);
     }
+};
+
+/// `labelle bundle` flag parser (cli#359). Narrower than `build` on
+/// purpose — see `parseBundleArgs` for why `--platform`/`--docker`/
+/// `--scene` are rejected rather than ignored.
+pub const ParseBundleArgsSpec = struct {
+    pub const defaults = struct {
+        test "no args yields cwd project, no optimize, no output override" {
+            var iter = testIter("");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings(".", result.dir);
+            try std.testing.expect(result.optimize == null);
+            try std.testing.expect(result.output == null);
+            try expect.equal(result.progress_mode, progress.Mode.human);
+        }
+    };
+
+    pub const positional_dir = struct {
+        test "a bare token is the project dir" {
+            var iter = testIter("../my-game");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("../my-game", result.dir);
+        }
+
+        test "a second bare token is rejected" {
+            var iter = testIter("a b");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+    };
+
+    pub const optimize_flag = struct {
+        test "--optimize=ReleaseFast is recorded" {
+            var iter = testIter("--optimize=ReleaseFast");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("ReleaseFast", result.optimize.?);
+        }
+
+        test "unknown optimize mode is rejected" {
+            var iter = testIter("--optimize=Fast");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+    };
+
+    pub const output_flag = struct {
+        test "--output=./dist sets the output dir" {
+            var iter = testIter("--output=./dist");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("./dist", result.output.?);
+        }
+
+        test "--output ./dist (space form) sets the output dir and keeps a trailing project dir" {
+            var iter = testIter("--output ./dist ../game");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("./dist", result.output.?);
+            try std.testing.expectEqualStrings("../game", result.dir);
+        }
+
+        test "empty --output value is rejected" {
+            var iter = testIter("--output=");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "bare --output with no value is rejected" {
+            var iter = testIter("--output");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+    };
+
+    pub const progress_flag = struct {
+        test "--progress=json is recorded" {
+            var iter = testIter("--progress=json");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try expect.equal(result.progress_mode, progress.Mode.json);
+        }
+    };
+
+    pub const rejected_flags = struct {
+        test "--platform is not a bundle flag (desktop only)" {
+            var iter = testIter("--platform=wasm");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "--docker is not a bundle flag" {
+            var iter = testIter("--docker");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "any unknown -- flag is rejected" {
+            var iter = testIter("--bogus");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+    };
 };
