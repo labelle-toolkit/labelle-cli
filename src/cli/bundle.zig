@@ -15,13 +15,41 @@
 //!       Contents/
 //!         Info.plist                  CFBundle* keys, see `renderInfoPlist`
 //!         PkgInfo                     "APPL????" (legacy Finder hint)
-//!         MacOS/<exe>                 copy of zig-out/bin/<exe>, mode preserved
+//!         MacOS/<exe>                 POSIX sh launcher, see `renderLauncher`
+//!         MacOS/<exe>-bin             copy of zig-out/bin/<exe>, mode preserved
 //!         Resources/AppIcon.icns      from the resolved icon PNG, via iconutil
+//!         Resources/assets/           copy of the project's `assets/` tree
 //!
 //! `<out>` defaults to the target dir's `zig-out/` (next to `bin/`), or
 //! `--output <dir>`. The exe keeps the name the generated build.zig
 //! produced (`util.sanitizeExeName(project.name)`, labelle-assembler#362)
 //! so `CFBundleExecutable` and `pgrep -f <name>` agree with `labelle run`.
+//!
+//! ## Runtime layout (cli#364)
+//!
+//! A `.app` launched by LaunchServices (Finder, Dock, `open`) starts with
+//! cwd `/`. The generated game still resolves some runtime files RELATIVE
+//! TO CWD: labelle-bgfx streams video from `assets/<name>` (it is not
+//! `@embedFile`d), the engine's save/load mixin writes save files to a
+//! cwd-relative path, and games write `saves/` / `snapshots/` the same
+//! way (flying-platform-labelle#773). `labelle run` hides all of this by
+//! spawning the exe with cwd = the generated target dir, where the
+//! assembler left `assets -> ../../assets` (and `scenes/`, `prefabs/`, …)
+//! as relative symlinks into the project. Scenes and prefabs are
+//! unconditionally embedded (`addEmbeddedSceneSource` /
+//! `addEmbeddedPrefab`, engine 2.x) so only `assets/` needs to travel.
+//!
+//! The bundle reproduces that layout: `assets/` is copied into
+//! `Contents/Resources/` and `CFBundleExecutable` names a two-line
+//! `sh` launcher that `cd`s into `Contents/Resources` and `exec`s the
+//! real Mach-O beside it (`<exe>-bin`). LaunchServices is fine with a
+//! script executable; AppKit still finds the bundle from the Mach-O's
+//! path, so the Dock icon and name are unaffected. No engine change is
+//! needed — once the engine grows an asset root (`LABELLE_ASSET_ROOT`-
+//! style, issue #364 option 2) the script can go away. The launcher also
+//! exports `LABELLE_DATA_DIR` (a per-user writable dir) so the game can
+//! stop writing saves next to a read-only installed bundle once it
+//! adopts the variable; it does NOT do so yet (#773).
 //!
 //! ## Icon
 //!
@@ -62,6 +90,21 @@ pub const icns_name = icon_file_key ++ ".icns";
 /// The real scratch dir is `makeScratchIconset`'s uniquely-suffixed path
 /// in CLI-owned storage, never a fixed name under the output dir.
 pub const iconset_dir_name = icon_file_key ++ ".iconset";
+
+/// Suffix of the real Mach-O inside `Contents/MacOS/`; `<exe>` itself is
+/// the launcher script (cli#364, see the module doc).
+pub const bin_suffix = "-bin";
+/// Env var the launcher exports for writable per-user data. The game does
+/// not read it yet (flying-platform-labelle#773); exported so it can.
+pub const data_dir_env = "LABELLE_DATA_DIR";
+/// Project subtree staged into `Contents/Resources/` — the one tree the
+/// game reads from disk at runtime (streamed video; see module doc).
+pub const assets_dir_name = "assets";
+/// Bound on directory nesting while staging `assets/`. Symlinked
+/// directories are FOLLOWED (a shared-art link must land as real files or
+/// it dangles inside the bundle), so a link cycle would recurse forever;
+/// any real asset tree is far shallower than this.
+pub const max_stage_depth: u32 = 32;
 
 /// Oldest macOS the bundle claims to run on. Big Sur is the first
 /// release with the current Dock/Launchpad icon pipeline and the oldest
@@ -624,11 +667,167 @@ pub fn resolveOutputDir(
     return std.fs.path.join(allocator, &.{ target_dir, "zig-out" });
 }
 
+/// Name of the real Mach-O beside the launcher: `<exe>-bin`. Caller owns.
+pub fn binName(allocator: std.mem.Allocator, exe_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ exe_name, bin_suffix });
+}
+
+/// Render the `Contents/MacOS/<exe>` launcher script (cli#364).
+///
+/// Why a script and not a chdir in the game: LaunchServices starts every
+/// `.app` with cwd `/`, and the game resolves streamed video, saves and
+/// snapshots relative to cwd (see the module doc). `labelle run` gives it
+/// cwd = target dir where `assets/` is a symlink into the project; the
+/// launcher gives it cwd = `Contents/Resources` where `assets/` was
+/// staged. That reproduces the working layout with zero engine/assembler
+/// changes and keeps `pgrep -f <exe>` working (the Mach-O is `<exe>-bin`).
+/// When the engine grows an asset root the script becomes redundant.
+///
+/// It also (a) exports `LABELLE_DATA_DIR` = `~/Library/Application
+/// Support/<bundle-id>` and creates it — an installed bundle is read-only
+/// so saves must not land beside the assets; the game has to start
+/// honouring it (flying-platform-labelle#773), this only makes the target
+/// available — and (b) appends the Homebrew prefixes to `PATH`: apps get
+/// the launchd default `/usr/bin:/bin:/usr/sbin:/sbin`, and labelle-bgfx's
+/// desktop video path shells out to `ffmpeg`/`ffprobe` via `popen`, so a
+/// Finder launch would otherwise fail to play video that a terminal
+/// launch plays (ffmpeg is a system dependency, not shipped in the app).
+///
+/// `exe_name` is single-quoted so a name with spaces or shell specials
+/// stays one word; `bundle_id` is `[A-Za-z0-9-.]` by construction
+/// (`deriveBundleId`) but is quoted the same way. Caller owns the slice.
+pub fn renderLauncher(allocator: std.mem.Allocator, exe_name: []const u8, bundle_id: []const u8) ![]u8 {
+    const bin = try binName(allocator, exe_name);
+    defer allocator.free(bin);
+    const bin_q = try shellSingleQuote(allocator, bin);
+    defer allocator.free(bin_q);
+    const id_q = try shellSingleQuote(allocator, bundle_id);
+    defer allocator.free(id_q);
+
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll(
+        \\#!/bin/sh
+        \\# Launcher generated by `labelle bundle` (labelle-cli#364) -- do not edit.
+        \\#
+        \\# LaunchServices (Finder, Dock, `open`) starts a .app with cwd "/", but the
+        \\# game resolves some runtime files RELATIVE TO CWD -- streamed video under
+        \\# assets/, saves/, snapshots/ -- exactly as `labelle run` does from the
+        \\# generated target dir, where assets/ is a symlink into the project. This
+        \\# script re-creates that layout: cwd = Contents/Resources (where `labelle
+        \\# bundle` staged assets/), then exec the real Mach-O beside this script.
+        \\# A future engine-side asset root (LABELLE_ASSET_ROOT-style) would let the
+        \\# game resolve against the bundle itself and retire this script.
+        \\here=$(cd "$(dirname "$0")" && pwd)
+        \\
+        \\# Writable per-user data. An installed bundle (/Applications) is read-only,
+        \\# so saves/snapshots must NOT land next to the assets. The game does not
+        \\# honour this yet (flying-platform-labelle#773) -- it is exported so it can.
+        \\if [ -n "$HOME" ]; then
+        \\
+    );
+    try w.print("    {s}=\"$HOME/Library/Application Support\"/{s}\n", .{ data_dir_env, id_q });
+    try w.print("    mkdir -p \"${s}\" 2>/dev/null\n", .{data_dir_env});
+    try w.print("    export {s}\n", .{data_dir_env});
+    try w.writeAll(
+        \\fi
+        \\
+        \\# LaunchServices hands apps a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
+        \\# The bgfx desktop video path shells out to ffmpeg/ffprobe, which Homebrew
+        \\# installs under /opt/homebrew/bin or /usr/local/bin -- append them so a
+        \\# Finder launch finds the same tools a terminal launch does.
+        \\PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+        \\export PATH
+        \\
+        \\
+    );
+    try w.print("cd \"$here/../Resources\" && exec \"$here\"/{s} \"$@\"\n", .{bin_q});
+    return aw.toOwnedSlice();
+}
+
+/// What `stageAssets` copied, for the summary line.
+pub const StageReport = struct {
+    files: usize = 0,
+    bytes: u64 = 0,
+};
+
+/// Copy `<project_dir>/assets/` into `<bundle_dir>/Contents/Resources/assets/`
+/// (cli#364). Returns null when the project has no `assets/` (a legal
+/// project; nothing to stage). Every regular file is copied byte for byte
+/// with its permissions; symlinks are FOLLOWED — a file link becomes a
+/// real file, a directory link is descended — because a relative link
+/// copied verbatim would dangle inside the bundle (the very failure this
+/// fixes). A dangling source link is skipped with a warning.
+///
+/// Everything is copied. The project has no manifest that separates
+/// `@embedFile`d assets from runtime-streamed ones (the atlases here are
+/// embedded twice over, on FP ~35 MB in total), and a wrongly skipped
+/// file is a broken game while a redundant one is disk — correctness
+/// beats size. A manifest-driven trim is a follow-up.
+pub fn stageAssets(allocator: std.mem.Allocator, project_dir: []const u8, bundle_dir: []const u8) !?StageReport {
+    const src = try std.fs.path.join(allocator, &.{ project_dir, assets_dir_name });
+    defer allocator.free(src);
+    if (!util.dirExists(src)) return null;
+    const dst = try std.fs.path.join(allocator, &.{ bundle_dir, "Contents", "Resources", assets_dir_name });
+    defer allocator.free(dst);
+    var report = StageReport{};
+    try copyTreeFollowingLinks(allocator, src, dst, 0, &report);
+    return report;
+}
+
+fn copyTreeFollowingLinks(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    dst: []const u8,
+    depth: u32,
+    report: *StageReport,
+) !void {
+    if (depth > max_stage_depth) {
+        std.debug.print("labelle bundle: assets/ nests deeper than {d} levels at '{s}' — symlink cycle?\n", .{ max_stage_depth, src });
+        return error.AssetTreeTooDeep;
+    }
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, dst);
+
+    var dir = try cwd.openDir(io, src, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const src_sub = try std.fs.path.join(allocator, &.{ src, entry.name });
+        defer allocator.free(src_sub);
+        const dst_sub = try std.fs.path.join(allocator, &.{ dst, entry.name });
+        defer allocator.free(dst_sub);
+
+        // Resolve a symlink to what it points at; `statFile` follows links
+        // by default, so a dangling one surfaces as an error here.
+        const kind: std.Io.File.Kind = if (entry.kind == .sym_link) blk: {
+            const st = cwd.statFile(io, src_sub, .{}) catch |err| {
+                std.debug.print("labelle bundle: skipping dangling symlink '{s}' in assets/ ({s})\n", .{ src_sub, @errorName(err) });
+                continue;
+            };
+            break :blk st.kind;
+        } else entry.kind;
+
+        switch (kind) {
+            .directory => try copyTreeFollowingLinks(allocator, src_sub, dst_sub, depth + 1, report),
+            .file => {
+                try cwd.copyFile(src_sub, cwd, dst_sub, io, .{});
+                report.files += 1;
+                const st = cwd.statFile(io, dst_sub, .{}) catch continue;
+                report.bytes += st.size;
+            },
+            else => {},
+        }
+    }
+}
+
 /// Lay the bundle skeleton down at `<out_dir>/<dir_name>`: dirs, the
-/// exe copy, `Info.plist`, `PkgInfo`. Wipes any previous bundle there
-/// first so a renamed exe or a removed icon can't leave stale files
-/// behind. Filesystem-only (no Apple tools), so it is unit-tested
-/// everywhere.
+/// launcher, the exe copy, `Info.plist`, `PkgInfo`. Wipes any previous
+/// bundle there first so a renamed exe or a removed icon can't leave
+/// stale files behind. Filesystem-only (no Apple tools), so it is
+/// unit-tested everywhere.
 ///
 /// The wipe is the ONLY recursive delete `labelle bundle` performs under
 /// a user-chosen directory, so it is guarded twice: `bundleDirName`
@@ -636,15 +835,19 @@ pub fn resolveOutputDir(
 /// (`error.UnsafeBundleName`) any `dir_name` that is not a bare
 /// `<x>.app` — a caller bug can then not turn into `rm -rf <out>/..`.
 ///
-/// `copyFile` with default options copies the source's permissions, so
-/// the exec bit survives without a `chmod` spawn (`ios.zig` predates
-/// that option and still shells out). Returns the caller-owned bundle path.
+/// `MacOS/<exe_name>` receives `launcher` (mode 0755; the plist's
+/// `CFBundleExecutable` names it) and the built exe lands beside it as
+/// `MacOS/<exe_name>-bin` (cli#364). `copyFile` with default options
+/// copies the source's permissions, so the exec bit survives without a
+/// `chmod` spawn (`ios.zig` predates that option and still shells out).
+/// Returns the caller-owned bundle path.
 pub fn layoutBundle(
     allocator: std.mem.Allocator,
     out_dir: []const u8,
     dir_name: []const u8,
     exe_src: []const u8,
     exe_name: []const u8,
+    launcher: []const u8,
     plist: []const u8,
 ) ![]u8 {
     if (!isSafeBundleDirName(dir_name)) {
@@ -665,9 +868,19 @@ pub fn layoutBundle(
     defer allocator.free(resources_dir);
     try cwd.createDirPath(io, resources_dir);
 
-    const exe_dst = try std.fs.path.join(allocator, &.{ macos_dir, exe_name });
+    const bin = try binName(allocator, exe_name);
+    defer allocator.free(bin);
+    const exe_dst = try std.fs.path.join(allocator, &.{ macos_dir, bin });
     defer allocator.free(exe_dst);
     try cwd.copyFile(exe_src, cwd, exe_dst, io, .{});
+
+    // The launcher must be executable or LaunchServices reports the app
+    // as damaged. Windows has no mode bits (and no `.fromMode`); the
+    // bundle is never launched there, only laid out by tests.
+    const launcher_dst = try std.fs.path.join(allocator, &.{ macos_dir, exe_name });
+    defer allocator.free(launcher_dst);
+    const launcher_flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows) .{} else .{ .permissions = .fromMode(0o755) };
+    try cwd.writeFile(io, .{ .sub_path = launcher_dst, .data = launcher, .flags = launcher_flags });
 
     const plist_path = try std.fs.path.join(allocator, &.{ bundle_dir, "Contents", "Info.plist" });
     defer allocator.free(plist_path);
@@ -805,12 +1018,24 @@ pub fn createFromBuild(
         .icon_file = if (has_icon) icon_file_key else null,
     });
     defer allocator.free(plist);
-    const bundle_dir = try layoutBundle(allocator, out_dir, dir_name, exe_src, exe_name, plist);
+    const launcher = try renderLauncher(allocator, exe_name, bundle_id);
+    defer allocator.free(launcher);
+    const bundle_dir = try layoutBundle(allocator, out_dir, dir_name, exe_src, exe_name, launcher, plist);
     errdefer allocator.free(bundle_dir);
     // A bundle whose plist names an `.icns` that never landed shows the
-    // broken-document glyph — worse than no bundle. If anything below
+    // broken-document glyph — worse than no bundle, and one missing half
+    // its assets is the bug this fixes (cli#364). If anything below
     // fails, take the skeleton down with it.
     errdefer cwd.deleteTree(io, bundle_dir) catch {};
+
+    // 4b. Runtime-read project files (cli#364): `assets/` → Resources/,
+    //     the tree the launcher makes cwd. Read the project's, not the
+    //     target dir's — there it is a symlink back into the project.
+    if (try stageAssets(allocator, project_dir, bundle_dir)) |staged| {
+        std.debug.print("labelle: staged {s}/ into Contents/Resources ({d} files, {d} KiB)\n", .{ assets_dir_name, staged.files, staged.bytes / 1024 });
+    } else {
+        std.debug.print("labelle: project has no {s}/ — nothing to stage into Contents/Resources\n", .{assets_dir_name});
+    }
 
     // 5. Icon → iconset → icns. The iconset is scratch in CLI-owned temp
     //    storage (see `makeScratchIconset` for why not under `<out>`),
@@ -937,9 +1162,9 @@ test "layoutBundle refuses to delete anything that is not <name>.app inside out_
     defer a.free(exe_src);
     try cwd.writeFile(io, .{ .sub_path = exe_src, .data = "bin" });
 
-    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, "../Saved.app", exe_src, "exe", "<plist/>"));
-    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, "Saved", exe_src, "exe", "<plist/>"));
-    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, ".app", exe_src, "exe", "<plist/>"));
+    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, "../Saved.app", exe_src, "exe", "#!/bin/sh\n", "<plist/>"));
+    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, "Saved", exe_src, "exe", "#!/bin/sh\n", "<plist/>"));
+    try testing.expectError(error.UnsafeBundleName, layoutBundle(a, out, ".app", exe_src, "exe", "#!/bin/sh\n", "<plist/>"));
     try testing.expect(util.fileExists(sibling));
 }
 
@@ -1307,11 +1532,23 @@ test "layoutBundle writes Contents/{MacOS/<exe>,Info.plist,PkgInfo,Resources/} a
     defer a.free(stale);
     try cwd.writeFile(io, .{ .sub_path = stale, .data = "old" });
 
-    const bundle = try layoutBundle(a, work, "My Game.app", exe_src, "my_game", "<plist/>");
+    const bundle = try layoutBundle(a, work, "My Game.app", exe_src, "my_game", "#!/bin/sh\nexec launcher\n", "<plist/>");
     defer a.free(bundle);
     try testing.expectEqualStrings(want_bundle, bundle);
 
-    const exe_dst = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game" });
+    // `MacOS/<exe>` is the launcher; the built exe sits beside it as
+    // `<exe>-bin` (cli#364).
+    const launcher_dst = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game" });
+    defer a.free(launcher_dst);
+    const launcher = try cwd.readFileAlloc(io, launcher_dst, a, .unlimited);
+    defer a.free(launcher);
+    try testing.expectEqualStrings("#!/bin/sh\nexec launcher\n", launcher);
+    if (builtin.os.tag != .windows) {
+        const st = try cwd.statFile(io, launcher_dst, .{});
+        try testing.expect(st.permissions.toMode() & 0o111 == 0o111);
+    }
+
+    const exe_dst = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game-bin" });
     defer a.free(exe_dst);
     const copied = try cwd.readFileAlloc(io, exe_dst, a, .unlimited);
     defer a.free(copied);
@@ -1358,6 +1595,228 @@ fn setMtime(path: []const u8, nanoseconds: i96) !void {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
     try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = nanoseconds } } });
+}
+
+/// Lay a small `assets/` tree under `<work>/assets`: a top-level file, a
+/// nested one, and (POSIX only — Windows CI has no symlink privilege) a
+/// file symlink plus a dangling one. Returns nothing; callers know the
+/// names.
+fn assetsFixture(a: std.mem.Allocator, work: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const assets = try std.fs.path.join(a, &.{ work, "assets" });
+    defer a.free(assets);
+    const nested = try std.fs.path.join(a, &.{ assets, "video", "cut" });
+    defer a.free(nested);
+    try cwd.createDirPath(io, nested);
+    const top = try std.fs.path.join(a, &.{ assets, "intro.mp4" });
+    defer a.free(top);
+    try cwd.writeFile(io, .{ .sub_path = top, .data = "\x00\x00\x00\x1cftypisom-intro" });
+    const deep = try std.fs.path.join(a, &.{ nested, "outro.mp4" });
+    defer a.free(deep);
+    try cwd.writeFile(io, .{ .sub_path = deep, .data = "outro-bytes" });
+    if (builtin.os.tag != .windows) {
+        const link = try std.fs.path.join(a, &.{ assets, "alias.mp4" });
+        defer a.free(link);
+        try cwd.symLink(io, "intro.mp4", link, .{});
+        const dangling = try std.fs.path.join(a, &.{ assets, "gone.mp4" });
+        defer a.free(dangling);
+        try cwd.symLink(io, "does-not-exist.mp4", dangling, .{});
+    }
+}
+
+/// Count the entries of a directory (files, dirs and links alike).
+fn countEntries(path: []const u8) !usize {
+    const io = config.globalIo();
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |_| n += 1;
+    return n;
+}
+
+test "renderLauncher: cd into Resources, export LABELLE_DATA_DIR, exec <exe>-bin (cli#364)" {
+    const a = testing.allocator;
+    const script = try renderLauncher(a, "my_game", "com.labelle.my-game");
+    defer a.free(script);
+    try testing.expectEqualStrings(
+        \\#!/bin/sh
+        \\# Launcher generated by `labelle bundle` (labelle-cli#364) -- do not edit.
+        \\#
+        \\# LaunchServices (Finder, Dock, `open`) starts a .app with cwd "/", but the
+        \\# game resolves some runtime files RELATIVE TO CWD -- streamed video under
+        \\# assets/, saves/, snapshots/ -- exactly as `labelle run` does from the
+        \\# generated target dir, where assets/ is a symlink into the project. This
+        \\# script re-creates that layout: cwd = Contents/Resources (where `labelle
+        \\# bundle` staged assets/), then exec the real Mach-O beside this script.
+        \\# A future engine-side asset root (LABELLE_ASSET_ROOT-style) would let the
+        \\# game resolve against the bundle itself and retire this script.
+        \\here=$(cd "$(dirname "$0")" && pwd)
+        \\
+        \\# Writable per-user data. An installed bundle (/Applications) is read-only,
+        \\# so saves/snapshots must NOT land next to the assets. The game does not
+        \\# honour this yet (flying-platform-labelle#773) -- it is exported so it can.
+        \\if [ -n "$HOME" ]; then
+        \\    LABELLE_DATA_DIR="$HOME/Library/Application Support"/'com.labelle.my-game'
+        \\    mkdir -p "$LABELLE_DATA_DIR" 2>/dev/null
+        \\    export LABELLE_DATA_DIR
+        \\fi
+        \\
+        \\# LaunchServices hands apps a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
+        \\# The bgfx desktop video path shells out to ffmpeg/ffprobe, which Homebrew
+        \\# installs under /opt/homebrew/bin or /usr/local/bin -- append them so a
+        \\# Finder launch finds the same tools a terminal launch does.
+        \\PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+        \\export PATH
+        \\
+        \\cd "$here/../Resources" && exec "$here"/'my_game-bin' "$@"
+        \\
+    , script);
+}
+
+test "renderLauncher single-quotes an exe name with spaces or a quote so it stays one word" {
+    const a = testing.allocator;
+    const spaced = try renderLauncher(a, "my game", "com.labelle.my-game");
+    defer a.free(spaced);
+    try testing.expect(std.mem.indexOf(u8, spaced, "exec \"$here\"/'my game-bin' \"$@\"") != null);
+
+    const quoted = try renderLauncher(a, "it's", "com.labelle.its");
+    defer a.free(quoted);
+    // `'\''` is the POSIX way to embed a single quote in a single-quoted word.
+    try testing.expect(std.mem.indexOf(u8, quoted, "exec \"$here\"/'it'\\''s-bin' \"$@\"") != null);
+    // The bin name is derived through one helper so the script and the
+    // file `layoutBundle` writes can never disagree.
+    const bin = try binName(a, "it's");
+    defer a.free(bin);
+    try testing.expectEqualStrings("it's-bin", bin);
+}
+
+test "stageAssets copies assets/ into Contents/Resources byte for byte, following links, leaving none dangling" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-stage-assets";
+    cwd.deleteTree(io, work) catch {};
+    defer cwd.deleteTree(io, work) catch {};
+    try cwd.createDirPath(io, work);
+    try assetsFixture(a, work);
+    const bundle = try std.fs.path.join(a, &.{ work, "Fixture.app" });
+    defer a.free(bundle);
+
+    const report = (try stageAssets(a, work, bundle)) orelse return error.TestUnexpectedResult;
+    const posix = builtin.os.tag != .windows;
+    // intro + nested outro (+ the alias, dereferenced, on POSIX); the
+    // dangling link is skipped, never reproduced.
+    try testing.expectEqual(@as(usize, if (posix) 3 else 2), report.files);
+    const intro_len: u64 = "\x00\x00\x00\x1cftypisom-intro".len;
+    try testing.expectEqual(intro_len * (if (posix) 2 else 1) + "outro-bytes".len, report.bytes);
+
+    const staged_root = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets" });
+    defer a.free(staged_root);
+    const intro = try std.fs.path.join(a, &.{ staged_root, "intro.mp4" });
+    defer a.free(intro);
+    const intro_bytes = try cwd.readFileAlloc(io, intro, a, .unlimited);
+    defer a.free(intro_bytes);
+    try testing.expectEqualStrings("\x00\x00\x00\x1cftypisom-intro", intro_bytes);
+    const outro = try std.fs.path.join(a, &.{ staged_root, "video", "cut", "outro.mp4" });
+    defer a.free(outro);
+    const outro_bytes = try cwd.readFileAlloc(io, outro, a, .unlimited);
+    defer a.free(outro_bytes);
+    try testing.expectEqualStrings("outro-bytes", outro_bytes);
+    try testing.expectEqual(@as(usize, if (posix) 3 else 2), try countEntries(staged_root));
+
+    if (posix) {
+        // The alias is a REAL file in the bundle (a relative link would
+        // resolve against the bundle and dangle) …
+        const alias = try std.fs.path.join(a, &.{ staged_root, "alias.mp4" });
+        defer a.free(alias);
+        const alias_st = try cwd.statFile(io, alias, .{ .follow_symlinks = false });
+        try testing.expectEqual(std.Io.File.Kind.file, alias_st.kind);
+        const alias_bytes = try cwd.readFileAlloc(io, alias, a, .unlimited);
+        defer a.free(alias_bytes);
+        try testing.expectEqualStrings("\x00\x00\x00\x1cftypisom-intro", alias_bytes);
+        // … and the dangling source link has no counterpart at all.
+        const gone = try std.fs.path.join(a, &.{ staged_root, "gone.mp4" });
+        defer a.free(gone);
+        try testing.expectError(error.FileNotFound, cwd.statFile(io, gone, .{ .follow_symlinks = false }));
+    }
+}
+
+test "stageAssets is a no-op (null) for a project without assets/" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-stage-none";
+    cwd.deleteTree(io, work) catch {};
+    defer cwd.deleteTree(io, work) catch {};
+    try cwd.createDirPath(io, work);
+    const bundle = try std.fs.path.join(a, &.{ work, "Fixture.app" });
+    defer a.free(bundle);
+    try testing.expect((try stageAssets(a, work, bundle)) == null);
+    const resources_assets = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets" });
+    defer a.free(resources_assets);
+    try testing.expect(!util.dirExists(resources_assets));
+}
+
+test "createFromBuild: CFBundleExecutable names the launcher, the launcher execs <exe>-bin, assets/ rides along (cli#364)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-self-contained";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    try assetsFixture(a, work);
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    const project_assets = try std.fs.path.join(a, &.{ work, "assets" });
+    defer a.free(project_assets);
+    const project_entries_before = try countEntries(work);
+    const assets_entries_before = try countEntries(project_assets);
+
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    defer a.free(bundle);
+
+    // Plist → launcher → Mach-O chain.
+    const plist_path = try std.fs.path.join(a, &.{ bundle, "Contents", "Info.plist" });
+    defer a.free(plist_path);
+    const plist = try cwd.readFileAlloc(io, plist_path, a, .unlimited);
+    defer a.free(plist);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleExecutable</key>\n    <string>my_game</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "my_game-bin") == null);
+
+    const launcher_path = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game" });
+    defer a.free(launcher_path);
+    const launcher = try cwd.readFileAlloc(io, launcher_path, a, .unlimited);
+    defer a.free(launcher);
+    try testing.expect(std.mem.startsWith(u8, launcher, "#!/bin/sh\n"));
+    try testing.expect(std.mem.indexOf(u8, launcher, "cd \"$here/../Resources\" && exec \"$here\"/'my_game-bin' \"$@\"\n") != null);
+    try testing.expect(std.mem.indexOf(u8, launcher, "LABELLE_DATA_DIR=\"$HOME/Library/Application Support\"/'com.labelle.my-game'") != null);
+
+    const bin_path = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "my_game-bin" });
+    defer a.free(bin_path);
+    const bin = try cwd.readFileAlloc(io, bin_path, a, .unlimited);
+    defer a.free(bin);
+    try testing.expectEqualStrings("ELF-ish", bin);
+
+    // Resources/assets mirrors the project's tree where the launcher's cwd lands.
+    const staged_intro = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "intro.mp4" });
+    defer a.free(staged_intro);
+    try testing.expect(util.fileExists(staged_intro));
+    const staged_outro = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "video", "cut", "outro.mp4" });
+    defer a.free(staged_outro);
+    try testing.expect(util.fileExists(staged_outro));
+
+    // The project itself is untouched: same entries at its root and in
+    // its assets/ (nothing was moved, hardlinked into, or written there).
+    try testing.expectEqual(project_entries_before + 1, try countEntries(work)); // +1: the `dist` output dir we asked for
+    try testing.expectEqual(assets_entries_before, try countEntries(project_assets));
+    const src_intro = try std.fs.path.join(a, &.{ project_assets, "intro.mp4" });
+    defer a.free(src_intro);
+    const src_intro_bytes = try cwd.readFileAlloc(io, src_intro, a, .unlimited);
+    defer a.free(src_intro_bytes);
+    try testing.expectEqualStrings("\x00\x00\x00\x1cftypisom-intro", src_intro_bytes);
 }
 
 test "resolveBuiltExe prefers the exe the generated build.zig declares, even if a stale one is newer" {
