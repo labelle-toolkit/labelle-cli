@@ -667,6 +667,57 @@ pub fn resolveOutputDir(
     return std.fs.path.join(allocator, &.{ target_dir, "zig-out" });
 }
 
+/// `child` is `parent` itself or lies below it. A plain prefix test is not
+/// enough: `assets-dist` starts with `assets` but is a sibling, so the
+/// match must end at a path separator (or `parent` must already end in one,
+/// e.g. a filesystem root).
+pub fn pathIsWithin(child: []const u8, parent: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    if (parent.len > 0 and std.fs.path.isSep(parent[parent.len - 1])) return true;
+    return std.fs.path.isSep(child[parent.len]);
+}
+
+/// Refuse an output placement that would make the assets copy feed on
+/// itself (Codex on #366). `--output assets/dist` puts `<Title>.app` INSIDE
+/// `<project>/assets/`, so `stageAssets` would descend into the bundle it
+/// is filling and fail with `AssetTreeTooDeep` — after `layoutBundle` had
+/// already wiped the previous bundle. The inverse — the project's `assets/`
+/// living under `<out>/<Title>.app` — would have that wipe delete the
+/// project's assets. Both are compared as REAL paths (symlinks resolved;
+/// `out_dir` exists by the time this runs, `assets/` may not — then there
+/// is nothing to overlap) with the separator-aware `pathIsWithin`, and
+/// the check runs BEFORE anything is deleted.
+pub fn checkAssetsOverlap(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    out_dir: []const u8,
+    dir_name: []const u8,
+) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const assets = try std.fs.path.join(allocator, &.{ project_dir, assets_dir_name });
+    defer allocator.free(assets);
+    const assets_real = cwd.realPathFileAlloc(io, assets, allocator) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer allocator.free(assets_real);
+    const out_real = try cwd.realPathFileAlloc(io, out_dir, allocator);
+    defer allocator.free(out_real);
+
+    if (pathIsWithin(out_real, assets_real)) {
+        std.debug.print("labelle bundle: --output '{s}' is inside the project's {s}/ — the bundle would copy itself into itself\n  choose a directory outside {s}/, e.g. --output ./dist\n", .{ out_dir, assets_dir_name, assets_dir_name });
+        return error.OutputInsideAssets;
+    }
+    const bundle_real = try std.fs.path.join(allocator, &.{ out_real, dir_name });
+    defer allocator.free(bundle_real);
+    if (pathIsWithin(assets_real, bundle_real)) {
+        std.debug.print("labelle bundle: the project's {s}/ lies inside '{s}', which the bundle step replaces — refusing\n", .{ assets_dir_name, bundle_real });
+        return error.AssetsInsideBundle;
+    }
+}
+
 /// Name of the real Mach-O beside the launcher: `<exe>-bin`. Caller owns.
 pub fn binName(allocator: std.mem.Allocator, exe_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ exe_name, bin_suffix });
@@ -776,6 +827,27 @@ pub fn stageAssets(allocator: std.mem.Allocator, project_dir: []const u8, bundle
     return report;
 }
 
+/// Entry kinds the directory listing cannot be trusted on: a symlink
+/// (we copy what it points at) and `.unknown` (the filesystem gave no
+/// type). Both go through a follow-`statFile` before dispatch.
+pub fn needsStat(kind: std.Io.File.Kind) bool {
+    return kind == .sym_link or kind == .unknown;
+}
+
+/// Classify the outcome of that follow-stat. `null` = the target does not
+/// exist (a dangling link: skip it, nothing to copy). Every other error is
+/// returned as-is: an unreadable or unmountable target is not "nothing to
+/// copy", it is a bundle we cannot complete, and the caller's `errdefer`
+/// must get to remove it. Kept separate from the I/O so the policy is
+/// unit-testable with injected errors.
+pub fn resolveProbedKind(probe: anyerror!std.Io.File.Kind) anyerror!?std.Io.File.Kind {
+    const kind = probe catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return kind;
+}
+
 fn copyTreeFollowingLinks(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -800,14 +872,18 @@ fn copyTreeFollowingLinks(
         const dst_sub = try std.fs.path.join(allocator, &.{ dst, entry.name });
         defer allocator.free(dst_sub);
 
-        // Resolve a symlink to what it points at; `statFile` follows links
-        // by default, so a dangling one surfaces as an error here.
-        const kind: std.Io.File.Kind = if (entry.kind == .sym_link) blk: {
-            const st = cwd.statFile(io, src_sub, .{}) catch |err| {
-                std.debug.print("labelle bundle: skipping dangling symlink '{s}' in assets/ ({s})\n", .{ src_sub, @errorName(err) });
+        // A symlink is resolved to what it points at, and so is `.unknown`
+        // (NFS/SMB/FUSE enumerations may report no type at all — dropping
+        // those would silently ship a partial tree). `statFile` follows
+        // links, so a MISSING target is the one skippable outcome; any
+        // other failure (permissions, I/O) propagates so `createFromBuild`
+        // tears the half-built bundle down (Codex/CodeRabbit on #366).
+        const kind: std.Io.File.Kind = if (needsStat(entry.kind)) blk: {
+            const probe: anyerror!std.Io.File.Kind = if (cwd.statFile(io, src_sub, .{})) |st| st.kind else |err| err;
+            break :blk (try resolveProbedKind(probe)) orelse {
+                std.debug.print("labelle bundle: skipping dangling symlink '{s}' in assets/\n", .{src_sub});
                 continue;
             };
-            break :blk st.kind;
         } else entry.kind;
 
         switch (kind) {
@@ -999,6 +1075,9 @@ pub fn createFromBuild(
     defer allocator.free(safe_name);
     const dir_name = try bundleDirName(allocator, safe_title, safe_name);
     defer allocator.free(dir_name);
+    // Before anything is wiped: the assets copy must not overlap the
+    // bundle in either direction (cli#364 staging, Codex on #366).
+    try checkAssetsOverlap(allocator, project_dir, out_dir, dir_name);
 
     // 4. Skeleton + exe. The plist is rendered knowing whether an icon
     //    will land; the .icns itself is built right after.
@@ -1757,6 +1836,124 @@ test "stageAssets is a no-op (null) for a project without assets/" {
     const resources_assets = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets" });
     defer a.free(resources_assets);
     try testing.expect(!util.dirExists(resources_assets));
+}
+
+test "resolveProbedKind: only a missing target is a skippable dangling link; other stat errors propagate (#366)" {
+    // `.sym_link` and `.unknown` both need the follow-stat; real kinds don't.
+    try testing.expect(needsStat(.sym_link));
+    try testing.expect(needsStat(.unknown));
+    try testing.expect(!needsStat(.file));
+    try testing.expect(!needsStat(.directory));
+
+    // Dangling → null (skip). Anything else → the error, verbatim.
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try resolveProbedKind(error.FileNotFound));
+    try testing.expectError(error.AccessDenied, resolveProbedKind(error.AccessDenied));
+    try testing.expectError(error.InputOutput, resolveProbedKind(error.InputOutput));
+    try testing.expectError(error.NotDir, resolveProbedKind(error.NotDir));
+    // A resolved `.unknown`/link dispatches on the REAL kind.
+    try testing.expectEqual(@as(?std.Io.File.Kind, .directory), try resolveProbedKind(.directory));
+    try testing.expectEqual(@as(?std.Io.File.Kind, .file), try resolveProbedKind(.file));
+}
+
+test "stageAssets fails (does not skip) on a symlink whose target is unreadable (#366)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // root ignores mode bits, so the probe would succeed and prove nothing.
+    if (std.c.getuid() == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-stage-unreadable";
+    cwd.deleteTree(io, work) catch {};
+    try cwd.createDirPath(io, work);
+    const locked = try std.fs.path.join(a, &.{ work, "assets", "locked" });
+    defer a.free(locked);
+    try cwd.createDirPath(io, locked);
+    const inner = try std.fs.path.join(a, &.{ locked, "inner.txt" });
+    defer a.free(inner);
+    try cwd.writeFile(io, .{ .sub_path = inner, .data = "secret" });
+    const link = try std.fs.path.join(a, &.{ work, "assets", "peek.txt" });
+    defer a.free(link);
+    try cwd.symLink(io, "locked/inner.txt", link, .{});
+    // No search permission on the dir → stat through it is EACCES, not ENOENT.
+    try cwd.setFilePermissions(io, locked, .fromMode(0), .{});
+    defer {
+        cwd.setFilePermissions(io, locked, .fromMode(0o755), .{}) catch {};
+        cwd.deleteTree(io, work) catch {};
+    }
+    const bundle = try std.fs.path.join(a, &.{ work, "Fixture.app" });
+    defer a.free(bundle);
+    try testing.expectError(error.AccessDenied, stageAssets(a, work, bundle));
+}
+
+test "pathIsWithin matches only at a separator boundary" {
+    try testing.expect(pathIsWithin("/p/assets", "/p/assets"));
+    try testing.expect(pathIsWithin("/p/assets/dist", "/p/assets"));
+    try testing.expect(pathIsWithin("/p/assets/dist", "/p/assets/"));
+    try testing.expect(pathIsWithin("/p/assets", "/"));
+    try testing.expect(!pathIsWithin("/p/assets-dist", "/p/assets"));
+    try testing.expect(!pathIsWithin("/p/assets", "/p/assets/dist"));
+    try testing.expect(!pathIsWithin("/p/asset", "/p/assets"));
+}
+
+test "createFromBuild refuses --output inside assets/ before deleting anything (#366)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-out-in-assets";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    try assetsFixture(a, work);
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    // A previous bundle already sits there — it must survive the refusal.
+    const stale = try std.fs.path.join(a, &.{ work, "assets", "dist", "My Game.app", "Contents", "keep" });
+    defer a.free(stale);
+    try cwd.createDirPath(io, std.fs.path.dirname(stale).?);
+    try cwd.writeFile(io, .{ .sub_path = stale, .data = "still here" });
+
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+    const nested = try std.fs.path.join(a, &.{ "assets", "dist" });
+    defer a.free(nested);
+    try testing.expectError(error.OutputInsideAssets, createFromBuild(a, work, target, cfg, nested));
+    try testing.expect(util.fileExists(stale));
+    // `assets/` itself as the output is the same refusal.
+    try testing.expectError(error.OutputInsideAssets, createFromBuild(a, work, target, cfg, "assets"));
+    try testing.expect(util.fileExists(stale));
+}
+
+test "createFromBuild refuses a project whose assets/ lies under <out>/<Title>.app, allows a sibling `assets-dist` (#366)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-assets-in-bundle";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+
+    // Project rooted INSIDE the would-be bundle: <work>/dist/My Game.app/proj,
+    // `--output ../..` → <work>/dist → bundle = <work>/dist/My Game.app,
+    // which contains the project's assets/. Wiping it would eat them.
+    const proj = try std.fs.path.join(a, &.{ work, "dist", "My Game.app", "proj" });
+    defer a.free(proj);
+    try cwd.createDirPath(io, proj);
+    try assetsFixture(a, proj);
+    const up_two = try std.fs.path.join(a, &.{ "..", ".." });
+    defer a.free(up_two);
+    try testing.expectError(error.AssetsInsideBundle, createFromBuild(a, proj, target, cfg, up_two));
+    const src_intro = try std.fs.path.join(a, &.{ proj, "assets", "intro.mp4" });
+    defer a.free(src_intro);
+    try testing.expect(util.fileExists(src_intro));
+
+    // The prefix test respects the separator: `assets-dist` is a sibling
+    // of `assets`, not inside it — a legal output.
+    try assetsFixture(a, work);
+    const bundle = try createFromBuild(a, work, target, cfg, "assets-dist");
+    defer a.free(bundle);
+    const staged = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "intro.mp4" });
+    defer a.free(staged);
+    try testing.expect(util.fileExists(staged));
 }
 
 test "createFromBuild: CFBundleExecutable names the launcher, the launcher execs <exe>-bin, assets/ rides along (cli#364)" {
