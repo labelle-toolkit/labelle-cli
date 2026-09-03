@@ -218,6 +218,47 @@ pub const ResourceDef = struct {
     }
 };
 
+// ── Pre-build hooks (cli#355) ──────────────────────────────────────
+
+/// One `.prebuild` entry: a command the CLI runs — with the project root
+/// as cwd — BEFORE the assembler generates (see `cli/prebuild.zig` for
+/// execution, the trust posture and the `--progress=json` handling).
+///
+/// ```zon
+/// .prebuild = .{
+///     .{
+///         .run = .{ "python3", "tools/gen_tiles.py" },
+///         .inputs = .{ "tools/OverworldTileset.tsx" },
+///         .outputs = .{ "assets/out.png", "scripts/tiles_data.zig" },
+///     },
+/// },
+/// ```
+///
+/// OWNERSHIP CAVEAT — read before authoring this in a real project. The
+/// canonical `project.labelle` schema lives in `labelle-assembler`
+/// (`src/config.zig`), and the assembler parses the manifest with
+/// `ignore_unknown_fields = false` (`plugin_params.parseProjectConfig`).
+/// The CLI's mirror here is tolerant, so the CLI reads `.prebuild` fine —
+/// but until the assembler mirrors the field, `labelle-assembler generate`
+/// rejects the manifest with `error: unexpected field 'prebuild'`. The
+/// assembler-side companion change is a pure schema addition (an accepted,
+/// otherwise-unused field): execution stays CLI-side, because only the CLI
+/// orchestrates the build and can run a step before generation. See #355.
+pub const PrebuildStep = struct {
+    /// argv, executed verbatim: no shell, no env expansion, no globbing.
+    /// `argv[0]` is resolved on PATH, or taken as a path relative to the
+    /// project root.
+    run: []const []const u8 = &.{},
+    /// Source files the step reads, relative to the project root. Used
+    /// only for the mtime staleness check — declaring neither `.inputs`
+    /// nor `.outputs` means the step runs on every build.
+    inputs: []const []const u8 = &.{},
+    /// Files the step writes, relative to the project root. The step is
+    /// skipped when every output exists and is at least as new as every
+    /// input.
+    outputs: []const []const u8 = &.{},
+};
+
 /// Returns true if a version string is a local path override.
 ///
 /// BOTH dev-override spellings count: `local:<path>` and the shorthand
@@ -326,6 +367,13 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas / sound / font resources.
     resources: []const ResourceDef = &.{},
+    /// Commands run — in declared order, project root as cwd — before the
+    /// assembler generates, so a project can declare that a resource or a
+    /// script is GENERATED instead of hand-written (cli#355). Empty by
+    /// default: a project without `.prebuild` behaves exactly as before.
+    /// See `PrebuildStep` for the shape and the assembler-side ownership
+    /// caveat.
+    prebuild: []const PrebuildStep = &.{},
     /// Per-platform texture-compression selection (read by `build`/`run` to
     /// auto-run `labelle astc` before generating; the assembler does the
     /// catalog `.png → .astc` swap). Default `.png` everywhere.

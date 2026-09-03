@@ -17,6 +17,7 @@ const assembler_proc = @import("assembler_proc.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const emsdk_activate = @import("emsdk_activate.zig");
 const python_provision = @import("python_provision.zig");
+const prebuild = @import("prebuild.zig");
 const bake_mod = @import("bake.zig");
 const docker = @import("docker.zig");
 const serve = @import("serve.zig");
@@ -361,6 +362,28 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
 
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
+
+    // Pre-build hooks (#355). Runs on `generate` / `build` / `run` (and
+    // the ios/android/wasm flows, which all generate) — the first thing
+    // that touches the project after its config is validated, and ahead
+    // of EVERY generation input reader: the ASTC pre-pass, the `--bake`
+    // pre-pass, the assembler's cache populate and `generate`. That
+    // ordering is the point: a step may emit an atlas declared in
+    // `.resources` or a script the game compiles against, and all of
+    // those are read downstream.
+    //
+    // No-op — no print, no stat, no spawn — for a project with no
+    // `.prebuild`, so the default path is byte-identical to before.
+    //
+    // In `--progress=json` mode the child's stdout is routed to the CLI's
+    // stderr so the NDJSON stdout feed stays pure (cli#320); see
+    // `prebuild.zig`'s module doc for that and for the trust posture.
+    // A non-zero step exits the CLI with the child's exact code from
+    // inside `runAll` (via `progress.fatalExit`, which marks the status
+    // file `failed` first), mirroring the assembler delegation.
+    try prebuild.runAll(allocator, project_dir, parsed.prebuild, .{
+        .route_stdout_to_stderr = parsed_args.progress_mode == .json,
+    });
 
     // Auto-wire a cache-provisioned SDL2 (`labelle doctor --fix`) into the
     // build/run environment so desktop games that need it (raylib/sokol

@@ -519,6 +519,21 @@ pub const DoctorJsonReportSpec = doctor.JsonReportSpec;
 
 pub const PipelineResolveExportOutputSpec = pipeline.ResolveExportOutputSpec;
 
+// Surface the `.prebuild` hook specs (cli#355) so `zspec.runAll(@This())`
+// walks into them: step validation, the mtime staleness rule, argv
+// rendering, the no-shell/cwd/exit-code execution contract, and the
+// "a project without .prebuild is inert" guarantee.
+const prebuild_mod = @import("cli/prebuild.zig");
+pub const PrebuildValidateStepSpec = prebuild_mod.ValidateStepSpec;
+pub const PrebuildStalenessVerdictSpec = prebuild_mod.StalenessVerdictSpec;
+pub const PrebuildScanStepSpec = prebuild_mod.ScanStepSpec;
+pub const PrebuildRenderArgvSpec = prebuild_mod.RenderArgvSpec;
+pub const PrebuildFailureDetailSpec = prebuild_mod.FailureDetailSpec;
+pub const PrebuildNoPrebuildIsInertSpec = prebuild_mod.NoPrebuildIsInertSpec;
+pub const PrebuildRunStepSpec = prebuild_mod.RunStepSpec;
+pub const PrebuildRunAllSpec = prebuild_mod.RunAllSpec;
+pub const PrebuildParsePrebuildSpec = prebuild_mod.ParsePrebuildSpec;
+
 /// Regression tests for `ProjectConfig.normalizeInitialPrefab()` — the
 /// legacy `.initial_scene` → `.initial_prefab` alias promotion introduced
 /// in RFC #560 / issue #565.
