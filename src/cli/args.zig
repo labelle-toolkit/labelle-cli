@@ -167,9 +167,8 @@ pub const ParsedArgs = struct {
     // export --output`); see `bundle.resolveOutputDir`.
     bundle_output: ?[]const u8 = null,
     // `labelle bundle --build-number <n>` (cli#363): pins `CFBundleVersion`.
-    // Already validated by the parser; `null` = `.build_number` from
-    // project.labelle, else derived from `.version` — see
-    // `bundle.resolveBuildVersion`.
+    // Already validated by the parser; `null` = derived from `.version` —
+    // see `bundle.resolveBuildVersion`.
     bundle_build_number: ?[]const u8 = null,
 };
 
@@ -251,9 +250,9 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
             .value => |v| {
                 // Validated HERE, before the (minutes-long) build, not when
                 // the plist is rendered after it (cli#363). Same words as
-                // the project-field rejection in `bundle.resolveBuildVersion`.
-                bundle.validateBuildNumber(v) catch {
-                    bundle.printInvalidBuildNumber("--build-number", v);
+                // the re-check in `bundle.resolveBuildVersion`.
+                bundle.validateBuildNumber(v) catch |err| {
+                    bundle.printInvalidBuildNumber("--build-number", v, err);
                     return null;
                 };
                 result.build_number = v;

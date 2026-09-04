@@ -967,7 +967,7 @@ pub const ParseBundleArgsSpec = struct {
             try std.testing.expectEqualStrings("../game", result.dir);
         }
 
-        test "no --build-number leaves it null (project field / derived rule decide)" {
+        test "no --build-number leaves it null (the derived rule decides)" {
             var iter = testIter("--output ./dist");
             defer iter.deinit();
             const result = parseBundleArgs(&iter) orelse return error.TestFailed;
@@ -1020,6 +1020,28 @@ pub const ParseBundleArgsSpec = struct {
             var iter = testIter("--build-number=1.2.3.4");
             defer iter.deinit();
             try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a first component over 4 digits is rejected (Apple's limit)" {
+            var iter = testIter("--build-number=10000");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a second or third component over 2 digits is rejected (Apple's limit)" {
+            var iter = testIter("--build-number=1.100");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+            var iter2 = testIter("--build-number 1.2.100");
+            defer iter2.deinit();
+            try std.testing.expect(parseBundleArgs(&iter2) == null);
+        }
+
+        test "9999.99.99, the largest Apple accepts, is accepted" {
+            var iter = testIter("--build-number=9999.99.99");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("9999.99.99", result.build_number.?);
         }
     };
 

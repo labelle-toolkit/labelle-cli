@@ -276,13 +276,19 @@ fn plistVersionOrNull(version: []const u8) ?[]const u8 {
     return if (components == 0) null else version[0..end];
 }
 
+/// Apple's size limits for `CFBundleVersion` components (TN2420): the
+/// first may have up to four digits, the second and third up to two.
+pub const max_first_digits = 4;
+pub const max_other_digits = 2;
+
 /// `CFBundleVersion` — the BUILD number, which is NOT the marketing
 /// version. Apple only requires it to be period-separated integers (up
-/// to three) whose first component is POSITIVE, and to be HIGHER than
-/// the previous upload of the same app: App Store Connect / TestFlight
-/// reject a build whose `CFBundleVersion` does not exceed the last one.
-/// It never has to equal `CFBundleShortVersionString`, which stays the
-/// normalized marketing version (`plistVersion`).
+/// to three, within `max_first_digits`/`max_other_digits`) whose first
+/// component is POSITIVE, and to be HIGHER than the previous upload of
+/// the same app: App Store Connect / TestFlight reject a build whose
+/// `CFBundleVersion` does not exceed the last one. It never has to equal
+/// `CFBundleShortVersionString`, which stays the normalized marketing
+/// version (`plistVersion`).
 ///
 /// Derived rule: `<major+1>.<minor>.<patch>` of the normalized marketing
 /// version — `0.1.0` → `1.1.0`, `0.9.0` → `1.9.0`, `1.0.0` → `2.0.0`,
@@ -295,49 +301,84 @@ fn plistVersionOrNull(version: []const u8) ?[]const u8 {
 /// No usable version at all (`""`, `v2`) → `1.0`: below every real
 /// version's build number, so adding a `.version` later still goes UP.
 ///
-/// A project that wants its own counter (CI run number, commit count)
-/// overrides the rule — see `resolveBuildVersion` for the precedence.
-/// The increment is done on the digit string, so a major of any length
-/// cannot overflow. Caller owns the slice.
+/// A component past Apple's digit limit (a 150th minor, a 10000th
+/// major) is CLAMPED to its maximum (`0.150.3` → `1.99.3`) with a
+/// warning, so the plist is never invalid — but ordering is lost at
+/// that point, and a project there should pin `--build-number`. The
+/// increment is done on the digit string, so a major of any length
+/// cannot overflow. Caller owns the slice. See `resolveBuildVersion`
+/// for the override precedence.
 pub fn buildVersion(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
     const marketing = plistVersionOrNull(version) orelse return allocator.dupe(u8, "1.0");
-    const first_end = std.mem.indexOfScalar(u8, marketing, '.') orelse marketing.len;
-    // `plistVersionOrNull` guarantees a non-empty digit run; strip
-    // leading zeros so `00.2` counts as major 0 (→ `1.2`), not `001`.
-    const major = std.mem.trimStart(u8, marketing[0..first_end], "0");
-    const rest = marketing[first_end..];
-    // major + 1: all-nines (including the empty string for major 0)
-    // grows by one digit; otherwise bump the last non-9 and zero the tail.
-    const grows = std.mem.allEqual(u8, major, '9');
-    const bumped_len = major.len + @intFromBool(grows);
-    const out = try allocator.alloc(u8, bumped_len + rest.len);
-    if (grows) {
-        out[0] = '1';
-        @memset(out[1..bumped_len], '0');
-    } else {
-        @memcpy(out[0..major.len], major);
-        var k = major.len;
-        while (true) {
-            k -= 1;
-            if (out[k] == '9') {
-                out[k] = '0';
-            } else {
-                out[k] += 1;
-                break;
-            }
-        }
+    var parts = std.mem.splitScalar(u8, marketing, '.');
+    const bumped = try incrementDecimal(allocator, parts.next().?);
+    defer allocator.free(bumped);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var clamped = false;
+    try out.appendSlice(allocator, clampComponent(bumped, max_first_digits, &clamped));
+    while (parts.next()) |component| {
+        try out.append(allocator, '.');
+        try out.appendSlice(allocator, clampComponent(component, max_other_digits, &clamped));
     }
-    @memcpy(out[bumped_len..], rest);
-    return out;
+    if (clamped) {
+        std.debug.print(
+            "labelle bundle: warning: .version '{s}' exceeds Apple's CFBundleVersion digit limits ({d}/{d}/{d} digits per component) — build number clamped to {s}; pass --build-number to control it\n",
+            .{ version, max_first_digits, max_other_digits, max_other_digits, out.items },
+        );
+    }
+    return out.toOwnedSlice(allocator);
 }
 
-pub const BuildNumberError = error{InvalidBuildNumber};
+/// `digits` + 1 in decimal, on the digit string: leading zeros are
+/// dropped first (`00` → `1`, not `001`), all-nines grows by a digit.
+fn incrementDecimal(allocator: std.mem.Allocator, digits: []const u8) ![]u8 {
+    const significant = std.mem.trimStart(u8, digits, "0");
+    const grows = std.mem.allEqual(u8, significant, '9');
+    const out = try allocator.alloc(u8, significant.len + @intFromBool(grows));
+    if (grows) {
+        out[0] = '1';
+        @memset(out[1..], '0');
+        return out;
+    }
+    @memcpy(out, significant);
+    var k = out.len;
+    while (true) {
+        k -= 1;
+        if (out[k] == '9') {
+            out[k] = '0';
+        } else {
+            out[k] += 1;
+            return out;
+        }
+    }
+}
+
+/// One `CFBundleVersion` component, or its all-nines maximum when its
+/// significant digits exceed `max_digits`; `clamped` is set on the latter.
+fn clampComponent(component: []const u8, comptime max_digits: usize, clamped: *bool) []const u8 {
+    if (std.mem.trimStart(u8, component, "0").len <= max_digits) return component;
+    clamped.* = true;
+    return "9" ** max_digits;
+}
+
+/// Digit-length check of a validated component (`digits` is a non-empty
+/// digit run): leading zeros do not count, so `007` is one digit.
+fn componentFits(digits: []const u8, max_digits: usize) bool {
+    return std.mem.trimStart(u8, digits, "0").len <= max_digits;
+}
+
+pub const BuildNumberError = error{ InvalidBuildNumber, BuildNumberTooLarge };
 
 /// Accept exactly what Apple accepts for `CFBundleVersion`: one to three
 /// period-separated unsigned decimal integers with a positive first
-/// component — `42`, `1.2`, `1.2.3`. Rejects `""`, `0`, `0.1`, a sign,
-/// letters, an empty component (`1.2.`, `.1`, `1..2`) and a fourth
-/// component. Pure check, no diagnostic — callers name the source.
+/// component — `42`, `1.2`, `1.2.3` — within the digit limits
+/// (`9999.99.99` is the largest). `InvalidBuildNumber` for `""`, `0`,
+/// `0.1`, a sign, letters, an empty component (`1.2.`, `.1`, `1..2`) or a
+/// fourth component; `BuildNumberTooLarge` for `10000`, `1.100`,
+/// `1.2.100`. Pure check, no diagnostic — callers name the source via
+/// `printInvalidBuildNumber`.
 pub fn validateBuildNumber(s: []const u8) BuildNumberError!void {
     var components: u8 = 0;
     var i: usize = 0;
@@ -345,7 +386,9 @@ pub fn validateBuildNumber(s: []const u8) BuildNumberError!void {
         const start = i;
         while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {}
         if (i == start) return error.InvalidBuildNumber;
-        if (components == 0 and std.mem.allEqual(u8, s[start..i], '0')) return error.InvalidBuildNumber;
+        const digits = s[start..i];
+        if (components == 0 and std.mem.allEqual(u8, digits, '0')) return error.InvalidBuildNumber;
+        if (!componentFits(digits, if (components == 0) max_first_digits else max_other_digits)) return error.BuildNumberTooLarge;
         components += 1;
         if (i == s.len) return;
         if (s[i] != '.' or components == 3) return error.InvalidBuildNumber;
@@ -353,41 +396,47 @@ pub fn validateBuildNumber(s: []const u8) BuildNumberError!void {
     }
 }
 
-/// The `CFBundleVersion` actually written, by precedence: `labelle bundle
-/// --build-number <n>` (`flag`), then `.build_number` in `project.labelle`
-/// (`""` counts as unset, like `.app_icon`), then the derived rule in
-/// `buildVersion`. An explicit value is validated (`validateBuildNumber`)
-/// and passed through verbatim — it is the caller's counter, not ours —
-/// and a bad one is an error naming its source, not a silent fall-through
-/// to the derived rule that would upload the wrong build number. Caller
-/// owns the slice.
+/// The `CFBundleVersion` actually written: `labelle bundle --build-number
+/// <n>` (`flag`) when given, else the derived rule in `buildVersion` on
+/// the project's `.version`. An explicit value is validated
+/// (`validateBuildNumber`) and passed through verbatim — it is the
+/// caller's counter, not ours — and a bad one is an error naming its
+/// source, not a silent fall-through to the derived rule that would
+/// upload the wrong build number.
+///
+/// A `.build_number` field in `project.labelle` deliberately does NOT
+/// exist yet (Codex on #367): the pinned standalone assembler parses the
+/// manifest strictly and runs BEFORE packaging, so setting it would break
+/// generate/build/run for that project. It returns as the middle
+/// precedence level once labelle-assembler#686 ships and the CLI's
+/// assembler pin requires that version. Caller owns the slice.
 pub fn resolveBuildVersion(
     allocator: std.mem.Allocator,
-    cfg: project_config.ProjectConfig,
+    version: []const u8,
     flag: ?[]const u8,
 ) ![]u8 {
-    const chosen: struct { value: []const u8, source: []const u8 } = blk: {
-        if (flag) |n| break :blk .{ .value = n, .source = "--build-number" };
-        if (cfg.build_number) |n| {
-            if (n.len > 0) break :blk .{ .value = n, .source = "project.labelle .build_number" };
-        }
-        return buildVersion(allocator, cfg.version);
+    const n = flag orelse return buildVersion(allocator, version);
+    validateBuildNumber(n) catch |err| {
+        printInvalidBuildNumber("--build-number", n, err);
+        return err;
     };
-    validateBuildNumber(chosen.value) catch {
-        printInvalidBuildNumber(chosen.source, chosen.value);
-        return error.InvalidBuildNumber;
-    };
-    return allocator.dupe(u8, chosen.value);
+    return allocator.dupe(u8, n);
 }
 
 /// The one diagnostic for a rejected explicit build number, shared by the
-/// arg parser (`--build-number`) and `resolveBuildVersion` (project field)
-/// so both sources fail with the same words.
-pub fn printInvalidBuildNumber(source: []const u8, value: []const u8) void {
-    std.debug.print(
-        "labelle bundle: {s} '{s}' is not a valid CFBundleVersion — expected a positive integer or up to three period-separated integers with a positive first component (e.g. 42 or 1.2.3)\n",
-        .{ source, value },
-    );
+/// arg parser and `resolveBuildVersion` so both paths fail with the same
+/// words; `err` picks the shape complaint or the size limit.
+pub fn printInvalidBuildNumber(source: []const u8, value: []const u8, err: BuildNumberError) void {
+    switch (err) {
+        error.InvalidBuildNumber => std.debug.print(
+            "labelle bundle: {s} '{s}' is not a valid CFBundleVersion — expected a positive integer or up to three period-separated integers with a positive first component (e.g. 42 or 1.2.3)\n",
+            .{ source, value },
+        ),
+        error.BuildNumberTooLarge => std.debug.print(
+            "labelle bundle: {s} '{s}' exceeds Apple's CFBundleVersion limits — the first component may have at most {d} digits, the second and third at most {d} (largest is 9999.99.99)\n",
+            .{ source, value, max_first_digits, max_other_digits },
+        ),
+    }
 }
 
 /// Validate `s` as UTF-8 and strip the code points XML 1.0 forbids in
@@ -1240,9 +1289,8 @@ pub const Overrides = struct {
     /// dir — see `resolveOutputDir`.
     output: ?[]const u8 = null,
     /// `--build-number <n>` (cli#363): the `CFBundleVersion` to write,
-    /// already validated by the parser. `null` defers to `.build_number`
-    /// in project.labelle, then to the derived rule — see
-    /// `resolveBuildVersion`.
+    /// already validated by the parser. `null` = the derived rule on
+    /// `.version` — see `resolveBuildVersion`.
     build_number: ?[]const u8 = null,
 };
 
@@ -1264,10 +1312,10 @@ pub fn createFromBuild(
     const cwd = std.Io.Dir.cwd();
 
     // 0. Build number (cli#363). Resolved before anything else so a bad
-    //    `.build_number` in project.labelle fails here, not after a full
-    //    compile — the `--build-number` flag was already checked by the
-    //    arg parser, so this mostly guards the project field.
-    const build_ver = try resolveBuildVersion(allocator, cfg, overrides.build_number);
+    //    value fails here, before anything is written — the parser already
+    //    validated the flag, so this is a belt-and-braces re-check for
+    //    callers that bypass `parseBundleArgs`.
+    const build_ver = try resolveBuildVersion(allocator, cfg.version, overrides.build_number);
     defer allocator.free(build_ver);
 
     // 1. Icon (may legitimately be absent — older assembler, no default).
@@ -1592,6 +1640,13 @@ test "buildVersion shifts EVERY major by one: 0.9.0 → 1.9.0, 1.0.0 → 2.0.0 (
         // No usable version: the stand-in stays 1.0, below any real build.
         .{ "", "1.0" },
         .{ "v2", "1.0" },
+        // Apple's 4/2/2 digit limits: clamp, never an invalid plist (Codex on #367).
+        .{ "0.150.3", "1.99.3" },
+        .{ "1.2.100", "2.2.99" },
+        .{ "9999.0.0", "9999.0.0" },
+        .{ "12345.1.2", "9999.1.2" },
+        .{ "0.99.99", "1.99.99" },
+        .{ "0.007.0", "1.007.0" },
     };
     for (cases) |c| {
         const got = try buildVersion(a, c[0]);
@@ -1621,37 +1676,39 @@ test "buildVersion never goes DOWN along a release history that crosses 1.0 (the
 }
 
 test "validateBuildNumber accepts 1-3 integer components with a positive first one, rejects the rest" {
-    for ([_][]const u8{ "1", "42", "1.2", "1.2.3", "10.0.0", "7.00.0", "007" }) |ok| {
+    for ([_][]const u8{ "1", "42", "1.2", "1.2.3", "10.0.0", "7.00.0", "007", "9999.99.99", "00042.007" }) |ok| {
         try validateBuildNumber(ok);
     }
     for ([_][]const u8{ "", "0", "00", "0.1", "0.0.0", "-1", "+1", "abc", "1a", "1.2.", ".1", "1..2", "1.2.3.4", " 7", "7 ", "1.2.3-beta" }) |bad| {
         try testing.expectError(error.InvalidBuildNumber, validateBuildNumber(bad));
     }
+    // Apple's digit limits: 4 for the first component, 2 for the others.
+    for ([_][]const u8{ "10000", "1.100", "1.2.100", "99999.1", "1.2.3456" }) |big| {
+        try testing.expectError(error.BuildNumberTooLarge, validateBuildNumber(big));
+    }
 }
 
-test "resolveBuildVersion: --build-number beats .build_number beats the derived rule" {
+test "resolveBuildVersion: --build-number beats the derived rule; a bad flag is an error, not a fall-through" {
     const a = testing.allocator;
-    const derived_only = project_config.ProjectConfig{ .name = "g", .version = "0.9.0" };
-    const pinned = project_config.ProjectConfig{ .name = "g", .version = "0.9.0", .build_number = "7" };
-    const cases = [_]struct { cfg: project_config.ProjectConfig, flag: ?[]const u8, want: []const u8 }{
-        .{ .cfg = pinned, .flag = "42", .want = "42" },
-        .{ .cfg = pinned, .flag = null, .want = "7" },
-        .{ .cfg = derived_only, .flag = "1.2.3", .want = "1.2.3" },
-        .{ .cfg = derived_only, .flag = null, .want = "1.9.0" },
-        // `""` in project.labelle means unset, like `.app_icon`.
-        .{ .cfg = .{ .name = "g", .version = "0.9.0", .build_number = "" }, .flag = null, .want = "1.9.0" },
+    const cases = [_]struct { version: []const u8, flag: ?[]const u8, want: []const u8 }{
+        .{ .version = "0.9.0", .flag = "42", .want = "42" },
+        .{ .version = "0.9.0", .flag = "1.2.3", .want = "1.2.3" },
+        .{ .version = "0.9.0", .flag = null, .want = "1.9.0" },
+        .{ .version = "1.0.0", .flag = null, .want = "2.0.0" },
     };
     for (cases) |c| {
-        const got = try resolveBuildVersion(a, c.cfg, c.flag);
+        const got = try resolveBuildVersion(a, c.version, c.flag);
         defer a.free(got);
         try testing.expectEqualStrings(c.want, got);
     }
-    // A bad explicit value is an error, NOT a silent fall-through to the
-    // derived rule (that would upload the wrong build number).
-    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, pinned, "0"));
-    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, .{ .name = "g", .build_number = "abc" }, null));
-    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, .{ .name = "g", .build_number = "1.2." }, null));
-    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, .{ .name = "g", .build_number = "-1" }, null));
+    // A bad explicit value is an error (that would otherwise upload the
+    // wrong build number), with the size limit reported as its own error.
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "0"));
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "abc"));
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "1.2."));
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "-1"));
+    try testing.expectError(error.BuildNumberTooLarge, resolveBuildVersion(a, "0.9.0", "10000"));
+    try testing.expectError(error.BuildNumberTooLarge, resolveBuildVersion(a, "0.9.0", "1.100"));
 }
 
 test "sanitizePlistString drops XML-forbidden code points and rejects invalid UTF-8" {
@@ -2806,33 +2863,36 @@ test "createFromBuild: 1.0.0 gets CFBundleVersion 2.0.0, above every 0.x build (
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>2.0.0</string>") != null);
 }
 
-test "createFromBuild: --build-number beats .build_number, which beats the derived rule (cli#363)" {
+test "createFromBuild: --build-number beats the derived rule (cli#363)" {
     const a = testing.allocator;
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game", .version = "0.9.0", .build_number = "7" };
-    {
-        const work = ".zig-cache/bundle-build-number-flag";
-        defer cwd.deleteTree(io, work) catch {};
-        var bundle: []u8 = undefined;
-        const plist = try plistFor(a, work, cfg, .{ .build_number = "42" }, &bundle);
-        defer a.free(plist);
-        defer a.free(bundle);
-        try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.9.0</string>") != null);
-        try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>42</string>") != null);
-    }
-    {
-        const work = ".zig-cache/bundle-build-number-project";
-        defer cwd.deleteTree(io, work) catch {};
-        var bundle: []u8 = undefined;
-        const plist = try plistFor(a, work, cfg, .{}, &bundle);
-        defer a.free(plist);
-        defer a.free(bundle);
-        try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>7</string>") != null);
-    }
+    const work = ".zig-cache/bundle-build-number-flag";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game", .version = "0.9.0" }, .{ .build_number = "42" }, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.9.0</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>42</string>") != null);
 }
 
-test "createFromBuild rejects a bad project .build_number before writing anything (cli#363)" {
+test "createFromBuild: a .version past Apple's digit limits is clamped, not written invalid (cli#363)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-build-number-clamp";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game", .version = "0.150.3" }, .{}, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    // The marketing version is written as-is; only the build number is clamped.
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.150.3</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.99.3</string>") != null);
+}
+
+test "createFromBuild re-checks a --build-number that bypassed the parser, before writing anything (cli#363)" {
     const a = testing.allocator;
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -2842,10 +2902,9 @@ test "createFromBuild rejects a bad project .build_number before writing anythin
     const target = try std.fs.path.join(a, &.{ work, "target" });
     defer a.free(target);
 
-    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game", .build_number = "0" };
-    try testing.expectError(error.InvalidBuildNumber, createFromBuild(a, work, target, cfg, .{}));
-    // A flag that got past the parser somehow is checked again here.
-    try testing.expectError(error.InvalidBuildNumber, createFromBuild(a, work, target, .{ .name = "my_game", .title = "My Game" }, .{ .build_number = "1.2." }));
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+    try testing.expectError(error.InvalidBuildNumber, createFromBuild(a, work, target, cfg, .{ .build_number = "1.2." }));
+    try testing.expectError(error.BuildNumberTooLarge, createFromBuild(a, work, target, cfg, .{ .build_number = "10000" }));
 
     const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "My Game.app" });
     defer a.free(bundle);

@@ -403,22 +403,15 @@ pub const ProjectConfig = struct {
     /// `android/launcher_icon.zig`'s `resolve`, which is the single home
     /// of that precedence.
     app_icon: ?[]const u8 = null,
-    /// `CFBundleVersion` written by `labelle bundle` (cli#363): a positive
-    /// integer or up to three period-separated integers with a positive
-    /// first component — `"42"`, `"1.2.3"` — a STRING so a dotted value
-    /// survives ZON. `null` or `""` = unset: the build number is then
-    /// derived from `.version` as `<major+1>.<minor>.<patch>`, which is
-    /// monotonic under semver ordering (see `bundle.buildVersion` for why
-    /// the shift applies to EVERY major, not just 0). `labelle bundle
-    /// --build-number <n>` overrides both. Only distribution uploads care
-    /// — a local `.app` runs with any value.
-    ///
-    /// OWNERSHIP CAVEAT — same as `.prebuild`: the canonical schema lives in
-    /// `labelle-assembler` (`src/config.zig`), whose manifest parse is
-    /// strict, so until the assembler mirrors this field
-    /// `labelle-assembler generate` rejects a manifest that sets it. The
-    /// companion change is a pure schema addition; only the CLI reads it.
-    build_number: ?[]const u8 = null,
+    // NOTE (cli#363, Codex on #367): a `.build_number` field pinning the
+    // `CFBundleVersion` that `labelle bundle` writes is deliberately NOT
+    // declared here yet. The pinned standalone assembler parses the
+    // manifest strictly (`ignore_unknown_fields = false`) and `generate`
+    // runs BEFORE packaging, so declaring it in the CLI mirror alone would
+    // let a user add the field and get generate/build/run failures instead
+    // of a build number. It lands once labelle-assembler#686 ships and the
+    // CLI's assembler pin requires that version (so it can be gated on
+    // the resolved assembler). Until then: `labelle bundle --build-number`.
     /// When true, the window is created hidden (headless CI).
     hidden: bool = false,
     /// Plugins — each declares its repo and version.

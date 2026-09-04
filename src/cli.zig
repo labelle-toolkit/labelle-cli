@@ -4,7 +4,7 @@
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
 ///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] — generate + build (no run)
-///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] — generate + build the desktop target, then wrap the exe in a self-contained macOS `<Title>.app`: Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` / `.build_number` pins it (macOS only, cli#359/#364/#363)
+///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] — generate + build the desktop target, then wrap the exe in a self-contained macOS `<Title>.app`: Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it (macOS only, cli#359/#364/#363)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
 ///   labelle wasm export [dir] [--output dir] [--zip] [--platform itch|github-pages] [--no-build] — build + package a deployment-ready WASM dir
