@@ -403,6 +403,15 @@ pub const ProjectConfig = struct {
     /// `android/launcher_icon.zig`'s `resolve`, which is the single home
     /// of that precedence.
     app_icon: ?[]const u8 = null,
+    // NOTE (cli#363, Codex on #367): a `.build_number` field pinning the
+    // `CFBundleVersion` that `labelle bundle` writes is deliberately NOT
+    // declared here yet. The pinned standalone assembler parses the
+    // manifest strictly (`ignore_unknown_fields = false`) and `generate`
+    // runs BEFORE packaging, so declaring it in the CLI mirror alone would
+    // let a user add the field and get generate/build/run failures instead
+    // of a build number. It lands once labelle-assembler#686 ships and the
+    // CLI's assembler pin requires that version (so it can be gated on
+    // the resolved assembler). Until then: `labelle bundle --build-number`.
     /// When true, the window is created hidden (headless CI).
     hidden: bool = false,
     /// Plugins — each declares its repo and version.

@@ -782,7 +782,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             r.beginPhase(.run, "packaging macOS bundle");
             r.clearSpinner();
         }
-        const app_path = try bundle.createFromBuild(allocator, project_dir, target_dir, parsed, parsed_args.bundle_output);
+        const app_path = try bundle.createFromBuild(allocator, project_dir, target_dir, parsed, .{
+            .output = parsed_args.bundle_output,
+            .build_number = parsed_args.bundle_build_number,
+        });
         defer allocator.free(app_path);
         // `createFromBuild` already printed the plain path. The paste-able
         // hint is single-quoted so a `"`, `$VAR` or backtick in a project

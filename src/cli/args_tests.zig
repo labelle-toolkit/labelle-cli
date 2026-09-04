@@ -863,13 +863,14 @@ pub const AppendRunForwardedArgsSpec = struct {
 /// `--scene` are rejected rather than ignored.
 pub const ParseBundleArgsSpec = struct {
     pub const defaults = struct {
-        test "no args yields cwd project, no optimize, no output override" {
+        test "no args yields cwd project, no optimize, no output or build-number override" {
             var iter = testIter("");
             defer iter.deinit();
             const result = parseBundleArgs(&iter) orelse return error.TestFailed;
             try std.testing.expectEqualStrings(".", result.dir);
             try std.testing.expect(result.optimize == null);
             try std.testing.expect(result.output == null);
+            try std.testing.expect(result.build_number == null);
             try expect.equal(result.progress_mode, progress.Mode.human);
         }
     };
@@ -945,6 +946,102 @@ pub const ParseBundleArgsSpec = struct {
             defer iter.deinit();
             const result = parseBundleArgs(&iter) orelse return error.TestFailed;
             try std.testing.expectEqualStrings("--weird", result.output.?);
+        }
+    };
+
+    /// `--build-number <n>` (cli#363) mirrors `--output`'s value handling
+    /// and is validated at parse time so a typo fails before the build.
+    pub const build_number_flag = struct {
+        test "--build-number=42 pins the build number" {
+            var iter = testIter("--build-number=42");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("42", result.build_number.?);
+        }
+
+        test "--build-number 1.2.3 (space form) accepts a dotted value and keeps a trailing project dir" {
+            var iter = testIter("--build-number 1.2.3 ../game");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("1.2.3", result.build_number.?);
+            try std.testing.expectEqualStrings("../game", result.dir);
+        }
+
+        test "no --build-number leaves it null (the derived rule decides)" {
+            var iter = testIter("--output ./dist");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expect(result.build_number == null);
+        }
+
+        test "empty --build-number value is rejected" {
+            var iter = testIter("--build-number=");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "bare --build-number with no value is rejected" {
+            var iter = testIter("--build-number");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a following flag is not swallowed as the --build-number value" {
+            var iter = testIter("--build-number --progress=json");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "zero is rejected: Apple needs a positive first component" {
+            var iter = testIter("--build-number 0");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a negative value is rejected (not mistaken for a flag either)" {
+            var iter = testIter("--build-number -1");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "letters are rejected" {
+            var iter = testIter("--build-number=abc");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a trailing dot is rejected" {
+            var iter = testIter("--build-number=1.2.");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a fourth component is rejected" {
+            var iter = testIter("--build-number=1.2.3.4");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a first component over 4 digits is rejected (Apple's limit)" {
+            var iter = testIter("--build-number=10000");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a second or third component over 2 digits is rejected (Apple's limit)" {
+            var iter = testIter("--build-number=1.100");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+            var iter2 = testIter("--build-number 1.2.100");
+            defer iter2.deinit();
+            try std.testing.expect(parseBundleArgs(&iter2) == null);
+        }
+
+        test "9999.99.99, the largest Apple accepts, is accepted" {
+            var iter = testIter("--build-number=9999.99.99");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("9999.99.99", result.build_number.?);
         }
     };
 

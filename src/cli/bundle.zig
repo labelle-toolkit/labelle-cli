@@ -252,6 +252,13 @@ pub fn isSafeBundleDirName(dir_name: []const u8) bool {
 /// `2.` → `2`. Nothing usable (`""`, `v2`) → `1.0`. Pure slice into
 /// `version` (or the literal fallback).
 pub fn plistVersion(version: []const u8) []const u8 {
+    return plistVersionOrNull(version) orelse "1.0";
+}
+
+/// `plistVersion` without the fallback: null when `version` has no
+/// leading integer component at all, so `buildVersion` can tell a real
+/// `1.0` from the "no version" stand-in.
+fn plistVersionOrNull(version: []const u8) ?[]const u8 {
     var end: usize = 0;
     var components: u8 = 0;
     while (components < 3) {
@@ -266,31 +273,170 @@ pub fn plistVersion(version: []const u8) []const u8 {
         end = i;
         components += 1;
     }
-    return if (components == 0) "1.0" else version[0..end];
+    return if (components == 0) null else version[0..end];
 }
 
-/// `CFBundleVersion` — the BUILD number, distinct from the marketing
-/// version: Apple only requires it to be period-separated integers with
-/// a POSITIVE first component (and monotonic across releases), not to
-/// equal `CFBundleShortVersionString`. A pre-1.0 project — `0.1.0` is
-/// the `ProjectConfig` default and what flying-platform ships — would
-/// fail validation with a leading zero (Codex on #362), so when the
-/// marketing major is 0 the build number is written as `1.<minor>.<patch>`
-/// (`0.1.0` → `1.1.0`, `0.0.7` → `1.0.7`); a positive major passes
-/// through unchanged (`2.3.4` → `2.3.4`). Deterministic and documented
-/// rather than clever: the value is only ever compared against itself
-/// across builds of the same project. Caller owns the slice.
+/// Apple's size limits for `CFBundleVersion` components (TN2420): the
+/// first may have up to four digits, the second and third up to two.
+pub const max_first_digits = 4;
+pub const max_other_digits = 2;
+
+/// `CFBundleVersion` — the BUILD number, which is NOT the marketing
+/// version. Apple only requires it to be period-separated integers (up
+/// to three, within `max_first_digits`/`max_other_digits`) whose first
+/// component is POSITIVE, and to be HIGHER than the previous upload of
+/// the same app: App Store Connect / TestFlight reject a build whose
+/// `CFBundleVersion` does not exceed the last one. It never has to equal
+/// `CFBundleShortVersionString`, which stays the normalized marketing
+/// version (`plistVersion`).
+///
+/// Derived rule: `<major+1>.<minor>.<patch>` of the normalized marketing
+/// version — `0.1.0` → `1.1.0`, `0.9.0` → `1.9.0`, `1.0.0` → `2.0.0`,
+/// `2.3.4` → `3.3.4`. The shift applies to EVERY major, not just 0: the
+/// #362 fix bumped only a zero major, which mapped `0.9.0` → `1.9.0` and
+/// then `1.0.0` → `1.0.0` — a DECREASE across the 1.0 release that the
+/// store rejects (cli#363). A uniform shift orders build numbers exactly
+/// like the semver they came from, is deterministic, and needs no VCS.
+/// Prerelease / build metadata is dropped first (`1.2.3-beta` → `2.2.3`).
+/// No usable version at all (`""`, `v2`) → `1.0`: below every real
+/// version's build number, so adding a `.version` later still goes UP.
+///
+/// A component past Apple's digit limit (a 150th minor, a 10000th
+/// major) is CLAMPED to its maximum (`0.150.3` → `1.99.3`) with a
+/// warning, so the plist is never invalid — but ordering is lost at
+/// that point, and a project there should pin `--build-number`. The
+/// increment is done on the digit string, so a major of any length
+/// cannot overflow. Caller owns the slice. See `resolveBuildVersion`
+/// for the override precedence.
 pub fn buildVersion(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
-    const marketing = plistVersion(version);
-    const first_end = std.mem.indexOfScalar(u8, marketing, '.') orelse marketing.len;
-    const first = marketing[0..first_end];
-    // `plistVersion` guarantees `first` is a non-empty digit run.
-    var all_zero = true;
-    for (first) |ch| {
-        if (ch != '0') all_zero = false;
+    const marketing = plistVersionOrNull(version) orelse return allocator.dupe(u8, "1.0");
+    var parts = std.mem.splitScalar(u8, marketing, '.');
+    const bumped = try incrementDecimal(allocator, parts.next().?);
+    defer allocator.free(bumped);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var clamped = false;
+    try out.appendSlice(allocator, clampComponent(bumped, max_first_digits, &clamped));
+    while (parts.next()) |component| {
+        try out.append(allocator, '.');
+        try out.appendSlice(allocator, clampComponent(component, max_other_digits, &clamped));
     }
-    if (!all_zero) return allocator.dupe(u8, marketing);
-    return std.fmt.allocPrint(allocator, "1{s}", .{marketing[first_end..]});
+    if (clamped) {
+        std.debug.print(
+            "labelle bundle: warning: .version '{s}' exceeds Apple's CFBundleVersion digit limits ({d}/{d}/{d} digits per component) — build number clamped to {s}; pass --build-number to control it\n",
+            .{ version, max_first_digits, max_other_digits, max_other_digits, out.items },
+        );
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// `digits` + 1 in decimal, on the digit string: leading zeros are
+/// dropped first (`00` → `1`, not `001`), all-nines grows by a digit.
+fn incrementDecimal(allocator: std.mem.Allocator, digits: []const u8) ![]u8 {
+    const significant = std.mem.trimStart(u8, digits, "0");
+    const grows = std.mem.allEqual(u8, significant, '9');
+    const out = try allocator.alloc(u8, significant.len + @intFromBool(grows));
+    if (grows) {
+        out[0] = '1';
+        @memset(out[1..], '0');
+        return out;
+    }
+    @memcpy(out, significant);
+    var k = out.len;
+    while (true) {
+        k -= 1;
+        if (out[k] == '9') {
+            out[k] = '0';
+        } else {
+            out[k] += 1;
+            return out;
+        }
+    }
+}
+
+/// One `CFBundleVersion` component, or its all-nines maximum when its
+/// significant digits exceed `max_digits`; `clamped` is set on the latter.
+fn clampComponent(component: []const u8, comptime max_digits: usize, clamped: *bool) []const u8 {
+    if (std.mem.trimStart(u8, component, "0").len <= max_digits) return component;
+    clamped.* = true;
+    return "9" ** max_digits;
+}
+
+/// Digit-length check of a validated component (`digits` is a non-empty
+/// digit run): leading zeros do not count, so `007` is one digit.
+fn componentFits(digits: []const u8, max_digits: usize) bool {
+    return std.mem.trimStart(u8, digits, "0").len <= max_digits;
+}
+
+pub const BuildNumberError = error{ InvalidBuildNumber, BuildNumberTooLarge };
+
+/// Accept exactly what Apple accepts for `CFBundleVersion`: one to three
+/// period-separated unsigned decimal integers with a positive first
+/// component — `42`, `1.2`, `1.2.3` — within the digit limits
+/// (`9999.99.99` is the largest). `InvalidBuildNumber` for `""`, `0`,
+/// `0.1`, a sign, letters, an empty component (`1.2.`, `.1`, `1..2`) or a
+/// fourth component; `BuildNumberTooLarge` for `10000`, `1.100`,
+/// `1.2.100`. Pure check, no diagnostic — callers name the source via
+/// `printInvalidBuildNumber`.
+pub fn validateBuildNumber(s: []const u8) BuildNumberError!void {
+    var components: u8 = 0;
+    var i: usize = 0;
+    while (true) {
+        const start = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {}
+        if (i == start) return error.InvalidBuildNumber;
+        const digits = s[start..i];
+        if (components == 0 and std.mem.allEqual(u8, digits, '0')) return error.InvalidBuildNumber;
+        if (!componentFits(digits, if (components == 0) max_first_digits else max_other_digits)) return error.BuildNumberTooLarge;
+        components += 1;
+        if (i == s.len) return;
+        if (s[i] != '.' or components == 3) return error.InvalidBuildNumber;
+        i += 1;
+    }
+}
+
+/// The `CFBundleVersion` actually written: `labelle bundle --build-number
+/// <n>` (`flag`) when given, else the derived rule in `buildVersion` on
+/// the project's `.version`. An explicit value is validated
+/// (`validateBuildNumber`) and passed through verbatim — it is the
+/// caller's counter, not ours — and a bad one is an error naming its
+/// source, not a silent fall-through to the derived rule that would
+/// upload the wrong build number.
+///
+/// A `.build_number` field in `project.labelle` deliberately does NOT
+/// exist yet (Codex on #367): the pinned standalone assembler parses the
+/// manifest strictly and runs BEFORE packaging, so setting it would break
+/// generate/build/run for that project. It returns as the middle
+/// precedence level once labelle-assembler#686 ships and the CLI's
+/// assembler pin requires that version. Caller owns the slice.
+pub fn resolveBuildVersion(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    flag: ?[]const u8,
+) ![]u8 {
+    const n = flag orelse return buildVersion(allocator, version);
+    validateBuildNumber(n) catch |err| {
+        printInvalidBuildNumber("--build-number", n, err);
+        return err;
+    };
+    return allocator.dupe(u8, n);
+}
+
+/// The one diagnostic for a rejected explicit build number, shared by the
+/// arg parser and `resolveBuildVersion` so both paths fail with the same
+/// words; `err` picks the shape complaint or the size limit.
+pub fn printInvalidBuildNumber(source: []const u8, value: []const u8, err: BuildNumberError) void {
+    switch (err) {
+        error.InvalidBuildNumber => std.debug.print(
+            "labelle bundle: {s} '{s}' is not a valid CFBundleVersion — expected a positive integer or up to three period-separated integers with a positive first component (e.g. 42 or 1.2.3)\n",
+            .{ source, value },
+        ),
+        error.BuildNumberTooLarge => std.debug.print(
+            "labelle bundle: {s} '{s}' exceeds Apple's CFBundleVersion limits — the first component may have at most {d} digits, the second and third at most {d} (largest is 9999.99.99)\n",
+            .{ source, value, max_first_digits, max_other_digits },
+        ),
+    }
 }
 
 /// Validate `s` as UTF-8 and strip the code points XML 1.0 forbids in
@@ -1135,6 +1281,19 @@ pub fn makeScratchIconset(allocator: std.mem.Allocator) ![]u8 {
     return error.ScratchDirCollision;
 }
 
+/// Per-invocation knobs of `createFromBuild`, all optional; the flags of
+/// `labelle bundle` land here (`args.parseBundleArgs`).
+pub const Overrides = struct {
+    /// `--output <dir>` (cli#359): where `<Title>.app` lands. `null` = the
+    /// target dir's `zig-out/`; a relative path anchors to the project
+    /// dir — see `resolveOutputDir`.
+    output: ?[]const u8 = null,
+    /// `--build-number <n>` (cli#363): the `CFBundleVersion` to write,
+    /// already validated by the parser. `null` = the derived rule on
+    /// `.version` — see `resolveBuildVersion`.
+    build_number: ?[]const u8 = null,
+};
+
 /// Post-build entry point called from `pipeline.zig` once `zig build`
 /// has produced the desktop exe. Returns the caller-owned `.app` path.
 ///
@@ -1147,10 +1306,17 @@ pub fn createFromBuild(
     project_dir: []const u8,
     target_dir: []const u8,
     cfg: project_config.ProjectConfig,
-    output_override: ?[]const u8,
+    overrides: Overrides,
 ) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
+
+    // 0. Build number (cli#363). Resolved before anything else so a bad
+    //    value fails here, before anything is written — the parser already
+    //    validated the flag, so this is a belt-and-braces re-check for
+    //    callers that bypass `parseBundleArgs`.
+    const build_ver = try resolveBuildVersion(allocator, cfg.version, overrides.build_number);
+    defer allocator.free(build_ver);
 
     // 1. Icon (may legitimately be absent — older assembler, no default).
     const maybe_img = try app_icon.load(allocator, project_dir, target_dir, cfg.app_icon, .{
@@ -1176,7 +1342,7 @@ pub fn createFromBuild(
 
     // 3. Paths. Only `<out>/<Title>.app` is ever created or removed under
     //    the user's chosen directory — nothing else there is touched.
-    const out_dir = try resolveOutputDir(allocator, project_dir, target_dir, output_override);
+    const out_dir = try resolveOutputDir(allocator, project_dir, target_dir, overrides.output);
     defer allocator.free(out_dir);
     try cwd.createDirPath(io, out_dir);
     // Metadata hygiene (Codex on #362): the plist must be well-formed XML
@@ -1203,8 +1369,6 @@ pub fn createFromBuild(
     const bundle_id = try deriveBundleId(allocator, cfg.name);
     defer allocator.free(bundle_id);
     const display = displayName(safe_title, safe_name);
-    const build_ver = try buildVersion(allocator, cfg.version);
-    defer allocator.free(build_ver);
     const has_icon = maybe_img != null;
     const plist = try renderInfoPlist(allocator, .{
         .bundle_id = bundle_id,
@@ -1427,7 +1591,7 @@ test "createFromBuild touches nothing under <out> except <Title>.app (Codex on #
     try cwd.writeFile(io, .{ .sub_path = stale_stray, .data = "stale" });
 
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
-    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "dist" });
     defer a.free(bundle);
 
     // Ours was replaced wholesale...
@@ -1455,16 +1619,34 @@ test "plistVersion keeps up to three integer components and falls back to 1.0" {
     try testing.expectEqualStrings("1.0", plistVersion(".5"));
 }
 
-test "buildVersion gives CFBundleVersion a positive first component, leaves the rest alone" {
+test "buildVersion shifts EVERY major by one: 0.9.0 → 1.9.0, 1.0.0 → 2.0.0 (cli#363)" {
     const a = testing.allocator;
     const cases = [_][2][]const u8{
         .{ "0.1.0", "1.1.0" },
         .{ "0.0.7", "1.0.7" },
+        .{ "0.9.0", "1.9.0" },
+        .{ "1.0.0", "2.0.0" },
+        .{ "2.3.4", "3.3.4" },
+        .{ "9.0.0", "10.0.0" },
+        .{ "19.2", "20.2" },
+        .{ "99", "100" },
         .{ "0", "1" },
         .{ "00.2", "1.2" },
-        .{ "2.3.4", "2.3.4" },
-        .{ "1.2.3-beta", "1.2.3" },
+        // Prerelease / build metadata is stripped BEFORE the shift.
+        .{ "1.2.3-beta", "2.2.3" },
+        .{ "2.0.0+build.7", "3.0.0" },
+        .{ "1.2.3-beta+5", "2.2.3" },
+        .{ "1.2.3.4", "2.2.3" },
+        // No usable version: the stand-in stays 1.0, below any real build.
         .{ "", "1.0" },
+        .{ "v2", "1.0" },
+        // Apple's 4/2/2 digit limits: clamp, never an invalid plist (Codex on #367).
+        .{ "0.150.3", "1.99.3" },
+        .{ "1.2.100", "2.2.99" },
+        .{ "9999.0.0", "9999.0.0" },
+        .{ "12345.1.2", "9999.1.2" },
+        .{ "0.99.99", "1.99.99" },
+        .{ "0.007.0", "1.007.0" },
     };
     for (cases) |c| {
         const got = try buildVersion(a, c[0]);
@@ -1473,6 +1655,60 @@ test "buildVersion gives CFBundleVersion a positive first component, leaves the 
     }
     // The marketing version is untouched: 0.1.0 stays 0.1.0 there.
     try testing.expectEqualStrings("0.1.0", plistVersion("0.1.0"));
+    try testing.expectEqualStrings("1.0.0", plistVersion("1.0.0"));
+}
+
+test "buildVersion never goes DOWN along a release history that crosses 1.0 (the #363 regression)" {
+    const a = testing.allocator;
+    // The #362 rule produced 1.9.0 for 0.9.0 and then 1.0.0 for 1.0.0.
+    const history = [_][]const u8{ "", "0.1.0", "0.9.0", "0.10.0", "1.0.0", "1.0.1", "1.10.0", "2.0.0", "10.0.0" };
+    var prev: ?std.SemanticVersion = null;
+    for (history) |v| {
+        const got = try buildVersion(a, v);
+        defer a.free(got);
+        // `""` → `1.0` has two components; pad so SemanticVersion can order it.
+        const padded = if (std.mem.count(u8, got, ".") == 1) try std.fmt.allocPrint(a, "{s}.0", .{got}) else try a.dupe(u8, got);
+        defer a.free(padded);
+        const cur = try std.SemanticVersion.parse(padded);
+        if (prev) |p| try testing.expect(p.order(cur) == .lt);
+        prev = .{ .major = cur.major, .minor = cur.minor, .patch = cur.patch };
+    }
+}
+
+test "validateBuildNumber accepts 1-3 integer components with a positive first one, rejects the rest" {
+    for ([_][]const u8{ "1", "42", "1.2", "1.2.3", "10.0.0", "7.00.0", "007", "9999.99.99", "00042.007" }) |ok| {
+        try validateBuildNumber(ok);
+    }
+    for ([_][]const u8{ "", "0", "00", "0.1", "0.0.0", "-1", "+1", "abc", "1a", "1.2.", ".1", "1..2", "1.2.3.4", " 7", "7 ", "1.2.3-beta" }) |bad| {
+        try testing.expectError(error.InvalidBuildNumber, validateBuildNumber(bad));
+    }
+    // Apple's digit limits: 4 for the first component, 2 for the others.
+    for ([_][]const u8{ "10000", "1.100", "1.2.100", "99999.1", "1.2.3456" }) |big| {
+        try testing.expectError(error.BuildNumberTooLarge, validateBuildNumber(big));
+    }
+}
+
+test "resolveBuildVersion: --build-number beats the derived rule; a bad flag is an error, not a fall-through" {
+    const a = testing.allocator;
+    const cases = [_]struct { version: []const u8, flag: ?[]const u8, want: []const u8 }{
+        .{ .version = "0.9.0", .flag = "42", .want = "42" },
+        .{ .version = "0.9.0", .flag = "1.2.3", .want = "1.2.3" },
+        .{ .version = "0.9.0", .flag = null, .want = "1.9.0" },
+        .{ .version = "1.0.0", .flag = null, .want = "2.0.0" },
+    };
+    for (cases) |c| {
+        const got = try resolveBuildVersion(a, c.version, c.flag);
+        defer a.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+    // A bad explicit value is an error (that would otherwise upload the
+    // wrong build number), with the size limit reported as its own error.
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "0"));
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "abc"));
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "1.2."));
+    try testing.expectError(error.InvalidBuildNumber, resolveBuildVersion(a, "0.9.0", "-1"));
+    try testing.expectError(error.BuildNumberTooLarge, resolveBuildVersion(a, "0.9.0", "10000"));
+    try testing.expectError(error.BuildNumberTooLarge, resolveBuildVersion(a, "0.9.0", "1.100"));
 }
 
 test "sanitizePlistString drops XML-forbidden code points and rejects invalid UTF-8" {
@@ -2033,10 +2269,10 @@ test "createFromBuild refuses --output inside assets/ before deleting anything (
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
     const nested = try std.fs.path.join(a, &.{ "assets", "dist" });
     defer a.free(nested);
-    try testing.expectError(error.OutputInsideAssets, createFromBuild(a, work, target, cfg, nested));
+    try testing.expectError(error.OutputInsideAssets, createFromBuild(a, work, target, cfg, .{ .output = nested }));
     try testing.expect(util.fileExists(stale));
     // `assets/` itself as the output is the same refusal.
-    try testing.expectError(error.OutputInsideAssets, createFromBuild(a, work, target, cfg, "assets"));
+    try testing.expectError(error.OutputInsideAssets, createFromBuild(a, work, target, cfg, .{ .output = "assets" }));
     try testing.expect(util.fileExists(stale));
 }
 
@@ -2060,7 +2296,7 @@ test "createFromBuild refuses a project whose assets/ lies under <out>/<Title>.a
     try assetsFixture(a, proj);
     const up_two = try std.fs.path.join(a, &.{ "..", ".." });
     defer a.free(up_two);
-    try testing.expectError(error.AssetsInsideBundle, createFromBuild(a, proj, target, cfg, up_two));
+    try testing.expectError(error.AssetsInsideBundle, createFromBuild(a, proj, target, cfg, .{ .output = up_two }));
     const src_intro = try std.fs.path.join(a, &.{ proj, "assets", "intro.mp4" });
     defer a.free(src_intro);
     try testing.expect(util.fileExists(src_intro));
@@ -2068,7 +2304,7 @@ test "createFromBuild refuses a project whose assets/ lies under <out>/<Title>.a
     // The prefix test respects the separator: `assets-dist` is a sibling
     // of `assets`, not inside it — a legal output.
     try assetsFixture(a, work);
-    const bundle = try createFromBuild(a, work, target, cfg, "assets-dist");
+    const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "assets-dist" });
     defer a.free(bundle);
     const staged = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "intro.mp4" });
     defer a.free(staged);
@@ -2183,7 +2419,7 @@ test "stageAssets skips <out> reached by ordinary descent through a link to an A
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
     const out_rel = try std.fs.path.join(a, &.{ "shared", "dist" });
     defer a.free(out_rel);
-    const bundle = try createFromBuild(a, work, target, cfg, out_rel);
+    const bundle = try createFromBuild(a, work, target, cfg, .{ .output = out_rel });
     defer a.free(bundle);
     try testing.expect(!util.fileExists(stale));
     const staged_data = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "shared", "data.txt" });
@@ -2220,7 +2456,7 @@ test "createFromBuild skips a directory link that resolves into <out> and still 
     try cwd.symLink(io, "../dist", generated, .{ .is_directory = true });
 
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
-    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "dist" });
     defer a.free(bundle);
     try testing.expect(!util.fileExists(stale));
     const staged_root = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets" });
@@ -2258,7 +2494,7 @@ test "stageAssets follows a directory link to a sibling outside <out>, also when
 
     // `--output dist`: <out> is not an ancestor of assets/, the sibling is fine.
     {
-        const bundle = try createFromBuild(a, work, target, cfg, "dist");
+        const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "dist" });
         defer a.free(bundle);
         const got = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "shared", "extra.txt" });
         defer a.free(got);
@@ -2270,7 +2506,7 @@ test "stageAssets follows a directory link to a sibling outside <out>, also when
     // under it, so only the `.app` itself is off-limits and the sibling
     // link must still be followed (no over-refusal).
     {
-        const bundle = try createFromBuild(a, work, target, cfg, ".");
+        const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "." });
         defer a.free(bundle);
         const got = try std.fs.path.join(a, &.{ bundle, "Contents", "Resources", "assets", "shared", "extra.txt" });
         defer a.free(got);
@@ -2328,7 +2564,7 @@ test "createFromBuild: CFBundleExecutable names the launcher, the launcher execs
     const assets_entries_before = try countEntries(project_assets);
 
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
-    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "dist" });
     defer a.free(bundle);
 
     // Plist → launcher → Mach-O chain.
@@ -2461,7 +2697,7 @@ test "createFromBuild fails loudly on a missing custom icon before writing anyth
     defer a.free(target);
 
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game", .app_icon = "art/nope.png" };
-    try testing.expectError(error.AppIconNotFound, createFromBuild(a, work, target, cfg, null));
+    try testing.expectError(error.AppIconNotFound, createFromBuild(a, work, target, cfg, .{}));
 
     // Precedence: the custom path is fatal even though nothing else is
     // wrong — and no half-written bundle is left behind.
@@ -2484,7 +2720,7 @@ test "createFromBuild without any icon still produces a launchable bundle whose 
     // the "older assembler" case: degrade, don't fail. No iconutil spawn
     // happens on this path, which is what lets it run on Linux/Windows CI.
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game", .version = "2.0.1" };
-    const bundle = try createFromBuild(a, work, target, cfg, "dist");
+    const bundle = try createFromBuild(a, work, target, cfg, .{ .output = "dist" });
     defer a.free(bundle);
 
     const want = try std.fs.path.join(a, &.{ work, "dist", "My Game.app" });
@@ -2520,7 +2756,7 @@ test "createFromBuild gives a dots-only title the project name as its Dock label
     defer a.free(target);
 
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "...", .version = "1.2.3-beta" };
-    const bundle = try createFromBuild(a, work, target, cfg, null);
+    const bundle = try createFromBuild(a, work, target, cfg, .{});
     defer a.free(bundle);
     try testing.expect(std.mem.endsWith(u8, bundle, "my_game.app"));
 
@@ -2531,19 +2767,20 @@ test "createFromBuild gives a dots-only title the project name as its Dock label
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleDisplayName</key>\n    <string>my_game</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleName</key>\n    <string>my_game</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>1.2.3</string>") != null);
-    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.2.3</string>") != null);
+    // Build number = marketing with the major shifted by one (cli#363).
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>2.2.3</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "beta") == null);
     try testing.expect(std.mem.indexOf(u8, plist, "<string>...</string>") == null);
 }
 
 /// Run `createFromBuild` on a fresh fixture and return the rendered plist.
-fn plistFor(a: std.mem.Allocator, work: []const u8, cfg: project_config.ProjectConfig, bundle_out: *[]u8) ![]u8 {
+fn plistFor(a: std.mem.Allocator, work: []const u8, cfg: project_config.ProjectConfig, overrides: Overrides, bundle_out: *[]u8) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     try bundleFixture(a, work, "my_game");
     const target = try std.fs.path.join(a, &.{ work, "target" });
     defer a.free(target);
-    const bundle = try createFromBuild(a, work, target, cfg, null);
+    const bundle = try createFromBuild(a, work, target, cfg, overrides);
     errdefer a.free(bundle);
     const plist_path = try std.fs.path.join(a, &.{ bundle, "Contents", "Info.plist" });
     defer a.free(plist_path);
@@ -2558,7 +2795,7 @@ test "createFromBuild: a control byte in the title is dropped from the plist and
     const work = ".zig-cache/bundle-ctrl-title";
     defer cwd.deleteTree(io, work) catch {};
     var bundle: []u8 = undefined;
-    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My\x01 Game" }, &bundle);
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My\x01 Game" }, .{}, &bundle);
     defer a.free(plist);
     defer a.free(bundle);
     try testing.expect(std.mem.endsWith(u8, bundle, "My Game.app"));
@@ -2573,7 +2810,7 @@ test "createFromBuild: an invalid-UTF-8 title falls back to the project name for
     const work = ".zig-cache/bundle-utf8-title";
     defer cwd.deleteTree(io, work) catch {};
     var bundle: []u8 = undefined;
-    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "Fl\xffying" }, &bundle);
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "Fl\xffying" }, .{}, &bundle);
     defer a.free(plist);
     defer a.free(bundle);
     try testing.expect(std.mem.endsWith(u8, bundle, "my_game.app"));
@@ -2592,7 +2829,7 @@ test "createFromBuild: an invalid-UTF-8 project name is a hard error" {
     defer a.free(target);
     // The exe fixture is `my_game`; sanitizeExeName drops the bad byte so
     // the probe still finds it — the metadata check must fail FIRST.
-    try testing.expectError(error.InvalidBundleMetadata, createFromBuild(a, work, target, .{ .name = "my_game\xff", .title = "" }, null));
+    try testing.expectError(error.InvalidBundleMetadata, createFromBuild(a, work, target, .{ .name = "my_game\xff", .title = "" }, .{}));
 }
 
 test "createFromBuild writes a positive CFBundleVersion for a 0.x project" {
@@ -2603,11 +2840,75 @@ test "createFromBuild writes a positive CFBundleVersion for a 0.x project" {
     defer cwd.deleteTree(io, work) catch {};
     var bundle: []u8 = undefined;
     // `.version` left at the ProjectConfig default, 0.1.0 — flying-platform's case.
-    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game" }, &bundle);
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game" }, .{}, &bundle);
     defer a.free(plist);
     defer a.free(bundle);
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.1.0</string>") != null);
     try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.1.0</string>") != null);
+}
+
+test "createFromBuild: 1.0.0 gets CFBundleVersion 2.0.0, above every 0.x build (cli#363)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-one-major";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game", .version = "1.0.0" }, .{}, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    // Marketing version untouched; build number shifted, so the upload
+    // after a 0.9.0 (1.9.0) release is 2.0.0 — higher, as the store demands.
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>1.0.0</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>2.0.0</string>") != null);
+}
+
+test "createFromBuild: --build-number beats the derived rule (cli#363)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-build-number-flag";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game", .version = "0.9.0" }, .{ .build_number = "42" }, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.9.0</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>42</string>") != null);
+}
+
+test "createFromBuild: a .version past Apple's digit limits is clamped, not written invalid (cli#363)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-build-number-clamp";
+    defer cwd.deleteTree(io, work) catch {};
+    var bundle: []u8 = undefined;
+    const plist = try plistFor(a, work, .{ .name = "my_game", .title = "My Game", .version = "0.150.3" }, .{}, &bundle);
+    defer a.free(plist);
+    defer a.free(bundle);
+    // The marketing version is written as-is; only the build number is clamped.
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleShortVersionString</key>\n    <string>0.150.3</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleVersion</key>\n    <string>1.99.3</string>") != null);
+}
+
+test "createFromBuild re-checks a --build-number that bypassed the parser, before writing anything (cli#363)" {
+    const a = testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const work = ".zig-cache/bundle-bad-build-number";
+    try bundleFixture(a, work, "my_game");
+    defer cwd.deleteTree(io, work) catch {};
+    const target = try std.fs.path.join(a, &.{ work, "target" });
+    defer a.free(target);
+
+    const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
+    try testing.expectError(error.InvalidBuildNumber, createFromBuild(a, work, target, cfg, .{ .build_number = "1.2." }));
+    try testing.expectError(error.BuildNumberTooLarge, createFromBuild(a, work, target, cfg, .{ .build_number = "10000" }));
+
+    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "My Game.app" });
+    defer a.free(bundle);
+    try testing.expect(!util.dirExists(bundle));
 }
 
 test "createFromBuild falls back to the legacy `game` exe name" {
@@ -2621,7 +2922,7 @@ test "createFromBuild falls back to the legacy `game` exe name" {
     defer a.free(target);
 
     const cfg = project_config.ProjectConfig{ .name = "my_game", .title = "My Game" };
-    const bundle = try createFromBuild(a, work, target, cfg, null);
+    const bundle = try createFromBuild(a, work, target, cfg, .{});
     defer a.free(bundle);
 
     const exe = try std.fs.path.join(a, &.{ bundle, "Contents", "MacOS", "game" });
