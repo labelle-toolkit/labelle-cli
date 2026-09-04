@@ -190,7 +190,17 @@ fn walkDir(
                 // (`.worktrees/`, `vendor/`, `wt/`), which is exactly
                 // why `skip_dirs` never caught these.
                 if (isNestedCheckout(&sub)) {
-                    if (verbose) std.debug.print("  skip {s} (nested git checkout)\n", .{rel_buf.items});
+                    // Announce UNCONDITIONALLY, not just under
+                    // `--verbose`. #691 was exactly the failure mode
+                    // where `labelle test` printed a clean summary and
+                    // exited 0 while a library's tests never ran; a
+                    // prune that is only visible behind a flag
+                    // reintroduces a quieter version of that shape. A
+                    // submodule-vendored package is live build input
+                    // and is indistinguishable from a parked worktree
+                    // by the `.git` marker alone, so the user is the
+                    // one who has to notice.
+                    std.debug.print("  note: skipping {s} — nested git checkout (worktree/submodule); its tests are NOT run\n", .{rel_buf.items});
                     continue;
                 }
 
