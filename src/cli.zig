@@ -131,7 +131,13 @@ pub fn main(proc_init: std.process.Init) !void {
     if (first_arg) |first| {
         if (std.mem.eql(u8, first, "generate") or std.mem.eql(u8, first, "build")) {
             parsed_args.command = if (std.mem.eql(u8, first, "generate")) .generate else .build;
-            const result = parseDirAndScene(&args, first) orelse return;
+            // A usage error must exit NON-ZERO so a CI step cannot read a
+            // REJECTED command as a successful build — the same rule PR #362
+            // applied to `bundle`. The parser has already printed the
+            // diagnostic; this only sets the status. (The `run`/`wasm`/…
+            // parsers still `return` with exit 0 on a usage error —
+            // pre-existing, and a separate cleanup.)
+            const result = parseDirAndScene(&args, first) orelse return error.InvalidArguments;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.platform_override = result.platform;
