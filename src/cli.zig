@@ -579,6 +579,10 @@ pub const ArgsAppendRunForwardedArgsSpec = args_tests_mod.AppendRunForwardedArgs
 
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
 pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
+// The nested-git-checkout prune (labelle-cli#371): `labelle test` must
+// not descend into worktrees/submodules parked inside the project.
+pub const TestCmdNestedCheckoutSpec = test_cmd_mod.NestedCheckoutSpec;
+pub const TestCmdIsNestedCheckoutSpec = test_cmd_mod.IsNestedCheckoutSpec;
 
 // Surface the exe-name sanitizer's spec namespace (labelle-assembler#362)
 // so `zspec.runAll(@This())` walks into it.

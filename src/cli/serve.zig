@@ -495,6 +495,24 @@ pub fn watchIgnorePath(
     return std.fs.path.join(allocator, &.{ watch_dir, norm });
 }
 
+/// True when `dir_path` is the root of its own git checkout: a linked
+/// worktree, a submodule, or a nested clone.
+///
+/// Same marker probe as `labelle test`'s walker (#371): test for the
+/// *existence* of a `.git` entry, never its kind — `git worktree add`
+/// and submodules both write `.git` as a regular FILE holding a
+/// `gitdir:` pointer. `skipWatchDir`'s dot rule only catches a checkout
+/// whose own folder is dot-prefixed; a copy of the project parked under
+/// a plain name (`worktrees/`, `vendor/`, `branches/`) would otherwise
+/// fold thousands of unrelated files into the signature and make edits
+/// on another branch trigger rebuilds here.
+fn isNestedCheckout(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    const marker = std.fs.path.join(allocator, &.{ dir_path, ".git" }) catch return false;
+    defer allocator.free(marker);
+    std.Io.Dir.cwd().access(io, marker, .{}) catch return false;
+    return true;
+}
+
 /// True when a walked file path is one of the rebuild's own declared
 /// outputs and must not contribute to the signature.
 fn skipWatchFile(path: []const u8, ignore_files: []const []const u8) bool {
@@ -507,7 +525,8 @@ fn skipWatchFile(path: []const u8, ignore_files: []const []const u8) bool {
 /// Accumulate `dir_path`'s tree signature into `sig`. Best-effort: an
 /// unreadable dir/file is skipped rather than fatal (a transient rename
 /// mid-scan just shows up as a change on the next poll). Recurses into
-/// subdirectories except those `skipWatchDir` rejects.
+/// subdirectories except those `skipWatchDir` rejects and those that are
+/// nested git checkouts (#371).
 fn computeSignature(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -524,6 +543,7 @@ fn computeSignature(
             if (skipWatchDir(entry.name)) continue;
             const sub = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(sub);
+            if (isNestedCheckout(io, allocator, sub)) continue;
             computeSignature(io, allocator, sub, ignore_files, sig);
         } else if (entry.kind == .file) {
             const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
@@ -1185,4 +1205,79 @@ test "skipWatchFile: matches only the declared outputs" {
     try std.testing.expect(!skipWatchFile("/proj/assets/out.json", &ignore_files));
     try std.testing.expect(!skipWatchFile("/proj/game.zig", &ignore_files));
     try std.testing.expect(!skipWatchFile("/proj/assets/out.png", &.{}));
+}
+
+// #371: the same nested-checkout gap `labelle test` had. `skipWatchDir`'s
+// dot rule only hides a checkout whose own folder starts with a dot; a
+// worktree parked under a plain name folded a whole second copy of the
+// project into the signature, so edits on an unrelated branch fired
+// rebuilds here. The fixtures write the `.git` markers by hand (no `git`
+// invocation) so they run on the ubuntu and windows CI runners too.
+test "computeSignature: nested git checkouts are pruned, ordinary dirs are not" {
+    const io = config.globalIo();
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "game.zig", .data = "const a = 1;" });
+
+    var base = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &.{}, &base);
+    try std.testing.expectEqual(@as(u64, 1), base.file_count);
+
+    // A linked worktree: `.git` is a FILE holding a `gitdir:` pointer,
+    // so a kind check would miss it.
+    try tmp.dir.createDirPath(io, "verify-821/libs/ui_kit");
+    try tmp.dir.writeFile(io, .{ .sub_path = "verify-821/libs/ui_kit/root.zig", .data = "stale" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "verify-821/.git", .data = "gitdir: /somewhere\n" });
+
+    var with_worktree = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &.{}, &with_worktree);
+    try std.testing.expect(base.eql(with_worktree));
+
+    // A plain nested clone: `.git` is a DIRECTORY. Pruned too.
+    try tmp.dir.createDirPath(io, "vendor/other/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/other/main.zig", .data = "stale" });
+
+    var with_clone = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &.{}, &with_clone);
+    try std.testing.expect(base.eql(with_clone));
+
+    // ...but an ordinary directory that merely *looks* like a worktree
+    // parent still counts: the prune keys on the marker, not the name.
+    try tmp.dir.createDirPath(io, "worktrees");
+    try tmp.dir.writeFile(io, .{ .sub_path = "worktrees/helper.zig", .data = "real source" });
+
+    var with_plain_dir = TreeSignature{};
+    computeSignature(io, alloc, dir_path, &.{}, &with_plain_dir);
+    try std.testing.expect(!base.eql(with_plain_dir));
+    try std.testing.expectEqual(@as(u64, 2), with_plain_dir.file_count);
+}
+
+test "isNestedCheckout: keys on the .git marker's existence, not its kind" {
+    const io = config.globalIo();
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    try tmp.dir.createDirPath(io, "wt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = "gitdir: /elsewhere\n" });
+    try tmp.dir.createDirPath(io, "clone/.git");
+    try tmp.dir.createDirPath(io, "plain/src");
+
+    for ([_]struct { name: []const u8, want: bool }{
+        .{ .name = "wt", .want = true },
+        .{ .name = "clone", .want = true },
+        .{ .name = "plain", .want = false },
+    }) |case| {
+        const p = try std.fs.path.join(alloc, &.{ root, case.name });
+        defer alloc.free(p);
+        try std.testing.expectEqual(case.want, isNestedCheckout(io, alloc, p));
+    }
 }
