@@ -100,6 +100,12 @@ pub const PluginDep = struct {
 /// MIRRORED in labelle-assembler `src/config.zig` — `project.labelle` is
 /// parsed strictly there first, so both copies must learn a new value
 /// together or `generate` rejects the field before the CLI sees it (#341).
+///
+/// FLOOR: `sensor_landscape` needs an assembler that carries
+/// labelle-assembler#693. Until a release with it is pinned into
+/// `DEFAULT_ASSEMBLER_VERSION`, a project using the value must pin
+/// `assembler_version` (or set `LABELLE_ASSEMBLER`); on an older assembler
+/// `generate` fails with `unexpected enum literal 'sensor_landscape'`.
 pub const Orientation = enum {
     portrait,
     /// Android `"landscape"` — ONE landscape direction; a 180° flip does not
