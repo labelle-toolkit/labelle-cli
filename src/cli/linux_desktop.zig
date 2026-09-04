@@ -428,21 +428,33 @@ pub const CreateFromBuildSpec = struct {
             .description = "A colony sim",
         });
         defer allocator.free(entry_path);
+        // Path assertions go through the same realpath + separator rules the
+        // implementation uses, so this holds on Windows (backslashes, drive
+        // letters) as well as POSIX — the CI matrix runs all three.
         try std.testing.expect(std.fs.path.isAbsolute(entry_path));
-        try std.testing.expect(std.mem.endsWith(u8, entry_path, "/zig-out/game.desktop"));
+        try std.testing.expectEqualStrings("game.desktop", std.fs.path.basename(entry_path));
+        try std.testing.expectEqualStrings("zig-out", std.fs.path.basename(std.fs.path.dirname(entry_path).?));
+        const target_real = try cwd.realPathFileAlloc(io, target_dir, allocator);
+        defer allocator.free(target_real);
+        const exe_real = try cwd.realPathFileAlloc(io, exe_path, allocator);
+        defer allocator.free(exe_real);
 
         const text = try cwd.readFileAlloc(io, entry_path, allocator, .limited(1 << 16));
         defer allocator.free(text);
-        const want_exec = try std.fmt.allocPrint(allocator, "Exec={s}\n", .{exe_path});
+        // A Windows path carries backslashes, which the Exec grammar quotes
+        // and escapes — so compare against the escaper, not the raw path.
+        const exe_escaped = try escapeExecArg(allocator, exe_real);
+        defer allocator.free(exe_escaped);
+        const want_exec = try std.fmt.allocPrint(allocator, "Exec={s}\n", .{exe_escaped});
         defer allocator.free(want_exec);
         try std.testing.expect(std.mem.indexOf(u8, text, want_exec) != null);
-        const want_path = try std.fmt.allocPrint(allocator, "Path={s}\n", .{target_dir});
+        const want_path = try std.fmt.allocPrint(allocator, "Path={s}\n", .{target_real});
         defer allocator.free(want_path);
         try std.testing.expect(std.mem.indexOf(u8, text, want_path) != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "Name=Colony Ship\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "Comment=A colony sim\n") != null);
 
-        const icon_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "game.png" });
+        const icon_path = try std.fs.path.join(allocator, &.{ target_real, "zig-out", "game.png" });
         defer allocator.free(icon_path);
         const want_icon = try std.fmt.allocPrint(allocator, "Icon={s}\n", .{icon_path});
         defer allocator.free(want_icon);
