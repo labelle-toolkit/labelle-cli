@@ -11,6 +11,7 @@ const progress = @import("progress.zig");
 const export_mod = @import("export.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
+const bundle = @import("bundle.zig");
 
 pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
 
@@ -165,6 +166,11 @@ pub const ParsedArgs = struct {
     // relative path anchors to the project dir (same rule as `wasm
     // export --output`); see `bundle.resolveOutputDir`.
     bundle_output: ?[]const u8 = null,
+    // `labelle bundle --build-number <n>` (cli#363): pins `CFBundleVersion`.
+    // Already validated by the parser; `null` = `.build_number` from
+    // project.labelle, else derived from `.version` — see
+    // `bundle.resolveBuildVersion`.
+    bundle_build_number: ?[]const u8 = null,
 };
 
 /// Parsed `bundle` flags (cli#359). Returned by `parseBundleArgs`; `null`
@@ -173,11 +179,46 @@ pub const BundleArgs = struct {
     dir: []const u8 = ".",
     optimize: ?[]const u8 = null,
     output: ?[]const u8 = null,
+    build_number: ?[]const u8 = null,
     progress_mode: progress.Mode = .human,
 };
 
+/// Result of `parseBundleValueFlag`: `.skip` = not this flag.
+const ValueFlag = union(enum) { skip, value: []const u8 };
+
+/// One `--<name> <value>` / `--<name>=<value>` flag of `labelle bundle`.
+/// `.skip` when `arg` is not this flag, `.value` on a match, `null` on a
+/// usage error (already printed). A following flag is NOT the value:
+/// `--output --progress=json` would otherwise create a directory
+/// literally named `--progress=json` and silently drop the progress flag
+/// (CodeRabbit on #362). A value that really starts with `--` can still
+/// be given in the `=` form (`--output=--weird`).
+fn parseBundleValueFlag(
+    arg: []const u8,
+    args: anytype,
+    comptime name: []const u8,
+    comptime example: []const u8,
+) ?ValueFlag {
+    const bare = "--" ++ name;
+    const eq_form = bare ++ "=";
+    if (!std.mem.startsWith(u8, arg, eq_form) and !std.mem.eql(u8, arg, bare)) return .skip;
+    const separate_value = std.mem.eql(u8, arg, bare);
+    const val = if (separate_value)
+        (args.next() orelse {
+            std.debug.print("labelle bundle: {s} requires a value (e.g. {s})\n", .{ bare, example });
+            return null;
+        })
+    else
+        arg[eq_form.len..];
+    if (val.len == 0 or (separate_value and std.mem.startsWith(u8, val, "--"))) {
+        std.debug.print("labelle bundle: {s} requires a value (e.g. {s})\n", .{ bare, example });
+        return null;
+    }
+    return .{ .value = val };
+}
+
 /// Parse the flags of `labelle bundle [dir] [--optimize=<mode>]
-/// [--output <dir>] [--progress=<m>]`. Deliberately NARROWER than
+/// [--output <dir>] [--build-number <n>] [--progress=<m>]`. Deliberately NARROWER than
 /// `build`'s parser: no `--platform` (a `.app` is desktop-only — the
 /// pipeline forces `.desktop`), no `--docker` (the bundle wraps a host
 /// exe; a container-built one may not even be a Mach-O), no `--scene`
@@ -199,26 +240,28 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
         if (parseToolchainFlag(arg, args)) |consumed| {
             if (consumed) continue;
         } else return null;
-        if (std.mem.startsWith(u8, arg, "--output=") or std.mem.eql(u8, arg, "--output")) {
-            const separate_value = std.mem.eql(u8, arg, "--output");
-            const val = if (separate_value)
-                (args.next() orelse {
-                    std.debug.print("labelle bundle: --output requires a value (e.g. --output ./dist)\n", .{});
+        switch (parseBundleValueFlag(arg, args, "output", "--output ./dist") orelse return null) {
+            .value => |v| {
+                result.output = v;
+                continue;
+            },
+            .skip => {},
+        }
+        switch (parseBundleValueFlag(arg, args, "build-number", "--build-number 42") orelse return null) {
+            .value => |v| {
+                // Validated HERE, before the (minutes-long) build, not when
+                // the plist is rendered after it (cli#363). Same words as
+                // the project-field rejection in `bundle.resolveBuildVersion`.
+                bundle.validateBuildNumber(v) catch {
+                    bundle.printInvalidBuildNumber("--build-number", v);
                     return null;
-                })
-            else
-                arg["--output=".len..];
-            // A following flag is NOT the directory: `--output --progress=json`
-            // would otherwise create a directory literally named
-            // `--progress=json` and silently drop the progress flag. A
-            // directory that really starts with `--` can still be given as
-            // `--output=--weird`.
-            if (val.len == 0 or (separate_value and std.mem.startsWith(u8, val, "--"))) {
-                std.debug.print("labelle bundle: --output requires a value (e.g. --output ./dist)\n", .{});
-                return null;
-            }
-            result.output = val;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
+                };
+                result.build_number = v;
+                continue;
+            },
+            .skip => {},
+        }
+        if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("labelle bundle: unknown flag '{s}'\n", .{arg});
             return null;
         } else {

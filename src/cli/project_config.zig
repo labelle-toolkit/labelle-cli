@@ -403,6 +403,22 @@ pub const ProjectConfig = struct {
     /// `android/launcher_icon.zig`'s `resolve`, which is the single home
     /// of that precedence.
     app_icon: ?[]const u8 = null,
+    /// `CFBundleVersion` written by `labelle bundle` (cli#363): a positive
+    /// integer or up to three period-separated integers with a positive
+    /// first component — `"42"`, `"1.2.3"` — a STRING so a dotted value
+    /// survives ZON. `null` or `""` = unset: the build number is then
+    /// derived from `.version` as `<major+1>.<minor>.<patch>`, which is
+    /// monotonic under semver ordering (see `bundle.buildVersion` for why
+    /// the shift applies to EVERY major, not just 0). `labelle bundle
+    /// --build-number <n>` overrides both. Only distribution uploads care
+    /// — a local `.app` runs with any value.
+    ///
+    /// OWNERSHIP CAVEAT — same as `.prebuild`: the canonical schema lives in
+    /// `labelle-assembler` (`src/config.zig`), whose manifest parse is
+    /// strict, so until the assembler mirrors this field
+    /// `labelle-assembler generate` rejects a manifest that sets it. The
+    /// companion change is a pure schema addition; only the CLI reads it.
+    build_number: ?[]const u8 = null,
     /// When true, the window is created hidden (headless CI).
     hidden: bool = false,
     /// Plugins — each declares its repo and version.
