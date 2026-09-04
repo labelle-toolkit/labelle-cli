@@ -252,6 +252,7 @@ fn generateStudioManifest(
     const orientation = switch (cfg.orientation) {
         .portrait => "portrait",
         .landscape => "landscape",
+        .sensor_landscape => "sensorLandscape",
         .all => "unspecified",
     };
 
@@ -354,4 +355,22 @@ test "generateStudioManifest advertises the gamepad as an optional feature" {
     const out = try generateStudioManifest(allocator, "Test", cfg);
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "<uses-feature android:name=\"android.hardware.gamepad\" android:required=\"false\" />") != null);
+}
+
+test "generateStudioManifest maps every Orientation to its android:screenOrientation value" {
+    // Same exhaustive pin as the package (APK) manifest — the Studio-project
+    // manifest is a second emitter of the same attribute and has drifted from
+    // it before, so both are checked against the identical table (#341).
+    const allocator = std.testing.allocator;
+    inline for (.{
+        .{ project_config.Orientation.portrait, "portrait" },
+        .{ project_config.Orientation.landscape, "landscape" },
+        .{ project_config.Orientation.sensor_landscape, "sensorLandscape" },
+        .{ project_config.Orientation.all, "unspecified" },
+    }) |case| {
+        const xml = try generateStudioManifest(allocator, "T", .{ .orientation = case[0] });
+        defer allocator.free(xml);
+        const expected = "android:screenOrientation=\"" ++ case[1] ++ "\"";
+        try std.testing.expect(std.mem.indexOf(u8, xml, expected) != null);
+    }
 }

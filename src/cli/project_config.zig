@@ -95,7 +95,28 @@ pub const PluginDep = struct {
 
 // ── iOS Configuration ──────────────────────────────────────────────
 
-pub const Orientation = enum { portrait, landscape, all };
+/// Screen-orientation policy for the mobile platforms.
+///
+/// MIRRORED in labelle-assembler `src/config.zig` — `project.labelle` is
+/// parsed strictly there first, so both copies must learn a new value
+/// together or `generate` rejects the field before the CLI sees it (#341).
+///
+/// FLOOR: `sensor_landscape` needs an assembler that carries
+/// labelle-assembler#693. Until a release with it is pinned into
+/// `DEFAULT_ASSEMBLER_VERSION`, a project using the value must pin
+/// `assembler_version` (or set `LABELLE_ASSEMBLER`); on an older assembler
+/// `generate` fails with `unexpected enum literal 'sensor_landscape'`.
+pub const Orientation = enum {
+    portrait,
+    /// Android `"landscape"` — ONE landscape direction; a 180° flip does not
+    /// rotate the game. iOS emits BOTH landscape directions; the two
+    /// platforms differ here by design.
+    landscape,
+    /// Landscape only, but EITHER direction — Android `"sensorLandscape"`.
+    /// iOS emits the same array as `.landscape`, which already allowed both.
+    sensor_landscape,
+    all,
+};
 
 pub const IosConfig = struct {
     app_name: []const u8 = "",
@@ -492,4 +513,31 @@ test "AssetCompression.formatFor + default png" {
     const m = AssetCompression{ .android = .astc, .desktop = .astc };
     try @import("std").testing.expectEqual(AssetFormat.astc, m.formatFor(.android));
     try @import("std").testing.expectEqual(AssetFormat.png, m.formatFor(.wasm));
+}
+
+test "Orientation: every value parses from ZON on both the .android and .ios blocks" {
+    // Mirrors the assembler's parse test (labelle-assembler src/config.zig):
+    // the two copies of this enum must accept the identical value set, or a
+    // `project.labelle` that generates fine still fails when the CLI reads it.
+    // Arena, not `std.zon.parse.free`: both structs have `[]const u8` fields
+    // defaulting to a static `""`, which the testing allocator refuses to free.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    inline for (.{
+        .{ "portrait", Orientation.portrait },
+        .{ "landscape", Orientation.landscape },
+        .{ "sensor_landscape", Orientation.sensor_landscape },
+        .{ "all", Orientation.all },
+    }) |case| {
+        const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
+        const android = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, src, null, .{});
+        try std.testing.expectEqual(case[1], android.orientation);
+        const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
+        try std.testing.expectEqual(case[1], ios.orientation);
+    }
+
+    try std.testing.expectEqual(Orientation.all, (AndroidConfig{}).orientation);
+    try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
 }

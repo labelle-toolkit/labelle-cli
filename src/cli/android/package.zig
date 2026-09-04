@@ -400,6 +400,7 @@ fn generateAndroidManifest(
     const orientation = switch (cfg.orientation) {
         .portrait => "portrait",
         .landscape => "landscape",
+        .sensor_landscape => "sensorLandscape",
         .all => "unspecified",
     };
 
@@ -692,5 +693,24 @@ pub fn copyDirectory(allocator: std.mem.Allocator, src: []const u8, dst: []const
             .file => try cwd.copyFile(src_sub, cwd, dst_sub, io, .{}),
             else => {},
         }
+    }
+}
+
+test "generateAndroidManifest maps every Orientation to its android:screenOrientation value" {
+    // Exhaustive on purpose: `sensorLandscape` is the whole point of #341, and
+    // pinning the other three guards the deliberate asymmetry — `.landscape`
+    // stays ONE direction on Android (a 180° flip does not rotate the game),
+    // which is what `.sensor_landscape` now exists to opt out of.
+    const allocator = std.testing.allocator;
+    inline for (.{
+        .{ project_config.Orientation.portrait, "portrait" },
+        .{ project_config.Orientation.landscape, "landscape" },
+        .{ project_config.Orientation.sensor_landscape, "sensorLandscape" },
+        .{ project_config.Orientation.all, "unspecified" },
+    }) |case| {
+        const xml = try generateAndroidManifest(allocator, "com.test.game", "Test", .{ .orientation = case[0] }, false);
+        defer allocator.free(xml);
+        const expected = "android:screenOrientation=\"" ++ case[1] ++ "\"";
+        try std.testing.expect(std.mem.indexOf(u8, xml, expected) != null);
     }
 }

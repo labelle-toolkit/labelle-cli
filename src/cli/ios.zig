@@ -200,7 +200,10 @@ fn generateInfoPlist(allocator: std.mem.Allocator, bundle_id: []const u8, app_na
         \\        <string>UIInterfaceOrientationPortrait</string>
         \\    </array>
         ,
-        .landscape =>
+        // iOS `.landscape` already allowed BOTH directions, so
+        // `.sensor_landscape` is the same plist array here — the two values
+        // only diverge on Android (#341).
+        .landscape, .sensor_landscape =>
         \\    <array>
         \\        <string>UIInterfaceOrientationLandscapeLeft</string>
         \\        <string>UIInterfaceOrientationLandscapeRight</string>
@@ -878,4 +881,35 @@ test "wantsHelpOnly: real work is not intercepted" {
     try std.testing.expect(!wantsHelpOnly(&.{ "build", "--device", "--release" }));
     try std.testing.expect(!wantsHelpOnly(&.{ "xcode", "--team-id=ABC" }));
     try std.testing.expect(!wantsHelpOnly(&.{"run"}));
+}
+
+test "generateInfoPlist maps every Orientation to its UISupportedInterfaceOrientations array" {
+    // iOS `.landscape` already emitted BOTH directions, so `.sensor_landscape`
+    // is byte-identical to it here — the divergence between the two values is
+    // Android-only (#341). Portrait/all are pinned so the shared switch can't
+    // quietly widen.
+    const allocator = std.testing.allocator;
+    const portrait_str = "<string>UIInterfaceOrientationPortrait</string>";
+    const left_str = "<string>UIInterfaceOrientationLandscapeLeft</string>";
+    const right_str = "<string>UIInterfaceOrientationLandscapeRight</string>";
+
+    inline for (.{
+        .{ project_config.Orientation.portrait, true, false },
+        .{ project_config.Orientation.landscape, false, true },
+        .{ project_config.Orientation.sensor_landscape, false, true },
+        .{ project_config.Orientation.all, true, true },
+    }) |case| {
+        const plist = try generateInfoPlist(allocator, "com.test.game", "Test", .{ .orientation = case[0] });
+        defer allocator.free(plist);
+        try std.testing.expectEqual(case[1], std.mem.indexOf(u8, plist, portrait_str) != null);
+        try std.testing.expectEqual(case[2], std.mem.indexOf(u8, plist, left_str) != null);
+        try std.testing.expectEqual(case[2], std.mem.indexOf(u8, plist, right_str) != null);
+    }
+
+    // `.sensor_landscape` and `.landscape` are the SAME plist on iOS.
+    const landscape = try generateInfoPlist(allocator, "com.test.game", "Test", .{ .orientation = .landscape });
+    defer allocator.free(landscape);
+    const sensor = try generateInfoPlist(allocator, "com.test.game", "Test", .{ .orientation = .sensor_landscape });
+    defer allocator.free(sensor);
+    try std.testing.expectEqualStrings(landscape, sensor);
 }
