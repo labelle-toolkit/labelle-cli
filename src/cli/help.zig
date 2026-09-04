@@ -12,7 +12,7 @@ pub fn printHelp() void {
         \\  add pack <name>      Scaffold a pack (packs/<name>/ + pack.labelle)
         \\  add feature <kind> <name>  Scaffold a feature-unit (kind: need, role, status)
         \\  generate [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>]  Generate .labelle/ assembler files
-        \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>]  Generate + build the project (`--progress=json` streams NDJSON progress records on stdout; modes: human, json, off)
+        \\  build [dir] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>] [--linux-desktop]  Generate + build the project (`--progress=json` streams NDJSON progress records on stdout; modes: human, json, off; a desktop build on Linux — or anywhere with `--linux-desktop` — also writes `zig-out/<exe>.desktop` + `zig-out/<exe>.png`, ready for `desktop-file-install`)
         \\  run [dir] [--timeout=<dur>] [--scene=<name>] [--platform=<p>] [--optimize=<mode>] [--progress=<m>] [--docker] [--target=<t>] [--screenshot=<path> [--after=<dur>]] [--headless] [--uncapped] [--ticks=<N>] [--profile] [-- <args>...]  Generate + build + run (default; `--screenshot` captures one frame to <path> and honors the extension you asked for (.png/.bmp/.tga/.jpg): a backend that writes another format (bgfx writes TGA) is re-encoded by the CLI after the run, and the `screenshot written to` line it prints is authoritative; a RELATIVE path resolves against the game's cwd — `.labelle/<target>/`, or the project dir under `--docker` — not your shell's; `--headless` runs windowless, `--uncapped` removes the frame sleep, `--ticks=<N>` exits after N frames — last two imply `--headless`; `--profile` enables the engine frame profiler (per-script/per-plugin ms to the log); `--` forwards trailing args to the game; `--progress=json` streams NDJSON progress records on stdout, but pure NDJSON is guaranteed for `build` ONLY — during `run` the game's own stdout shares the stream, so consumers must skip non-JSON lines or read .labelle/<target>/.build-progress.json instead)
         \\  bundle [dir] [--optimize=<mode>] [--output <dir>] [--build-number <n>] [--progress=<m>]  Generate + build the desktop target, then wrap the exe in a self-contained macOS `<Title>.app` (Info.plist + AppIcon.icns from `.app_icon`, the project's `assets/` staged into Contents/Resources and a launcher that runs the game from there — cli#364; default output `.labelle/<backend>_desktop/zig-out/`; `CFBundleVersion` is `<major+1>.<minor>.<patch>` of `.version` so it always increases with the release — cli#363 — unless `--build-number <n>` (positive integer or `a.b.c`, at most 4/2/2 digits per component) pins it; macOS only — see cli#359)
         \\  status [dir] [--json]  Print the current/last build progress from .labelle/<target>/.build-progress.json (works from a second shell while a build runs)
@@ -61,6 +61,7 @@ pub fn printHelp() void {
         \\  labelle wasm export --output ./release --zip
         \\  labelle wasm export --platform github-pages
         \\  labelle build --optimize=ReleaseFast
+        \\  labelle build --linux-desktop
         \\  labelle bundle
         \\  labelle bundle --optimize=ReleaseFast --output ./dist
         \\  labelle bundle --build-number 42

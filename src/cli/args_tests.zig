@@ -20,6 +20,7 @@ const parseSceneFlag = args.parseSceneFlag;
 const parsePlatformValue = args.parsePlatformValue;
 const parseOptimizeFlag = args.parseOptimizeFlag;
 const parseRunArgs = args.parseRunArgs;
+const parseDirAndScene = args.parseDirAndScene;
 const parseWasmServeArgs = args.parseWasmServeArgs;
 const parseWasmExportArgs = args.parseWasmExportArgs;
 const parseBundleArgs = args.parseBundleArgs;
@@ -1073,4 +1074,39 @@ pub const ParseBundleArgsSpec = struct {
             try std.testing.expect(parseBundleArgs(&iter) == null);
         }
     };
+};
+
+/// `--linux-desktop` on `parseDirAndScene` (cli#359): accepted by `build`,
+/// refused by `generate` (nothing to describe without an exe), default off.
+pub const ParseDirAndSceneLinuxDesktopSpec = struct {
+    test "build accepts --linux-desktop and records it" {
+        var iter = testIter("--linux-desktop ../my-game");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+        try std.testing.expect(result.linux_desktop);
+        try std.testing.expectEqualStrings("../my-game", result.dir);
+    }
+
+    test "build without the flag leaves it off" {
+        var iter = testIter("--optimize=ReleaseFast");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+        try std.testing.expect(!result.linux_desktop);
+        try std.testing.expectEqualStrings("ReleaseFast", result.optimize.?);
+    }
+
+    test "generate refuses --linux-desktop" {
+        var iter = testIter("--linux-desktop");
+        defer iter.deinit();
+        try std.testing.expect(parseDirAndScene(&iter, "generate") == null);
+    }
+
+    test "the flag composes with the other build flags" {
+        var iter = testIter("--platform=desktop --linux-desktop --bake");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+        try std.testing.expect(result.linux_desktop);
+        try std.testing.expect(result.bake);
+        try expect.equal(result.platform.?, Platform.desktop);
+    }
 };

@@ -29,6 +29,7 @@ const progress = @import("progress.zig");
 const astc_cmd = @import("../astc/cmd.zig");
 const sdl_provision = @import("sdl_provision.zig");
 const bundle = @import("bundle.zig");
+const linux_desktop = @import("linux_desktop.zig");
 const args_mod = @import("args.zig");
 const screenshot_format = @import("screenshot_format.zig");
 const ParsedArgs = args_mod.ParsedArgs;
@@ -798,6 +799,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     }
 
     if (command == .build) {
+        // Linux `.desktop` entry + icon (cli#359): after a desktop build,
+        // write `zig-out/<exe>.desktop` + `zig-out/<exe>.png` beside `bin/`
+        // — automatically on a Linux host, or anywhere with
+        // `--linux-desktop`. Skipped under `--docker`: that exe was built
+        // for the container's target and the entry's absolute paths would
+        // describe this host, not the one that will run it. `run` is
+        // deliberately left alone — the entry is a packaging artifact.
+        if (!parsed_args.docker and parsed.platform == .desktop and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
+            const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
+            allocator.free(entry_path);
+        }
         // `labelle build --platform=android` builds the shared library
         // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
         // but, unlike `labelle android build`, used to stop there and leave

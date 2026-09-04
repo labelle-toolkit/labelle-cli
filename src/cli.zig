@@ -3,7 +3,7 @@
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
 ///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game
-///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] — generate + build (no run)
+///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] [--linux-desktop] — generate + build (no run); on Linux (or with `--linux-desktop`) also writes `zig-out/<exe>.desktop` + `zig-out/<exe>.png` for the desktop target (cli#359)
 ///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] — generate + build the desktop target, then wrap the exe in a self-contained macOS `<Title>.app`: Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it (macOS only, cli#359/#364/#363)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
@@ -140,6 +140,7 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.docker_target = result.docker_target;
             parsed_args.bake = result.bake;
             parsed_args.progress_mode = result.progress_mode;
+            parsed_args.linux_desktop = result.linux_desktop;
         } else if (std.mem.eql(u8, first, "bundle")) {
             // `labelle bundle` (cli#359): generate + build the desktop
             // target, then wrap the exe in a macOS `.app`. Host-gated
@@ -556,6 +557,18 @@ pub const ArgsParseHeadlessFlagsSpec = args_tests_mod.ParseHeadlessFlagsSpec;
 pub const ArgsParseWasmServeArgsSpec = args_tests_mod.ParseWasmServeArgsSpec;
 pub const ArgsParseWasmExportArgsSpec = args_tests_mod.ParseWasmExportArgsSpec;
 pub const ArgsParseBundleArgsSpec = args_tests_mod.ParseBundleArgsSpec;
+pub const ArgsParseDirAndSceneLinuxDesktopSpec = args_tests_mod.ParseDirAndSceneLinuxDesktopSpec;
+
+// Linux `.desktop` entry emission (cli#359). Re-exported HERE for the same
+// reason as the screenshot specs below: `linux_desktop` is a private import,
+// so its specs would otherwise never be analyzed.
+const linux_desktop_mod = @import("cli/linux_desktop.zig");
+pub const LinuxDesktopEscapeExecArgSpec = linux_desktop_mod.EscapeExecArgSpec;
+pub const LinuxDesktopDisplayNameSpec = linux_desktop_mod.DisplayNameSpec;
+pub const LinuxDesktopRenderSpec = linux_desktop_mod.RenderSpec;
+pub const LinuxDesktopStageIconSpec = linux_desktop_mod.StageIconSpec;
+pub const LinuxDesktopCreateFromBuildSpec = linux_desktop_mod.CreateFromBuildSpec;
+pub const LinuxDesktopShouldEmitSpec = linux_desktop_mod.ShouldEmitSpec;
 pub const ArgsAppendRunForwardedArgsSpec = args_tests_mod.AppendRunForwardedArgsSpec;
 
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
