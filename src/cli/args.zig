@@ -113,6 +113,10 @@ pub const ParsedArgs = struct {
     docker: bool = false,
     docker_target: ?[]const u8 = null,
     bake: bool = false,
+    /// `labelle build --linux-desktop` (cli#359): write the freedesktop
+    /// `.desktop` entry + 256px PNG beside `zig-out/bin` after a desktop
+    /// build. Automatic on a Linux host; this flag forces it elsewhere.
+    linux_desktop: bool = false,
     // `wasm serve` options. `serve_port` is also read by the wasm
     // branch of `run`; the others only apply to `wasm serve`.
     serve_port: u16 = 8080,
@@ -559,8 +563,10 @@ pub fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []co
     return null;
 }
 
-/// Parse [dir], --scene, --platform, --optimize, --progress, --docker, and --target flags for generate/build commands.
-pub fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode } {
+/// Parse [dir], --scene, --platform, --optimize, --progress, --docker, --target
+/// and (build only) --linux-desktop flags for generate/build commands.
+/// `args` is `anytype` so tests can drive it with an in-memory iterator.
+pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode, linux_desktop: bool } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
@@ -570,6 +576,7 @@ pub fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) 
     var docker_target: ?[]const u8 = null;
     var bake = false;
     var progress_mode: progress.Mode = .human;
+    var linux_desktop = false;
 
     while (args.next()) |arg| {
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
@@ -577,6 +584,17 @@ pub fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) 
             .err => return null,
             .not_scene => {},
             .needs_next => unreachable,
+        }
+        if (std.mem.eql(u8, arg, "--linux-desktop")) {
+            // Only `build` produces the exe the entry points at; on
+            // `generate` there is nothing to describe, so refuse rather
+            // than silently accept a flag that does nothing.
+            if (!std.mem.eql(u8, cmd_name, "build")) {
+                std.debug.print("labelle {s}: --linux-desktop only applies to `labelle build`\n", .{cmd_name});
+                return null;
+            }
+            linux_desktop = true;
+            continue;
         }
         if (parsePlatformFlag(arg, &platform, cmd_name) orelse return null) continue;
         if (parseOptimizeFlag(arg, &optimize, cmd_name) orelse return null) continue;
@@ -613,7 +631,7 @@ pub fn parseDirAndScene(args: *std.process.Args.Iterator, cmd_name: []const u8) 
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode, .linux_desktop = linux_desktop };
 }
 
 /// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
