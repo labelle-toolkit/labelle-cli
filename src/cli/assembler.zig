@@ -25,7 +25,14 @@ const std = @import("std");
 /// project the current assembler line refuses to build). The
 /// released-path smoke test in ci.yml (init with NO local overrides →
 /// generate → build) fails if this constant rots again.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.99.1";
+///
+/// >= 0.101.0 so `.orientation = .sensor_landscape` actually generates
+/// (labelle-cli#341 / #369, assembler#693). The CLI's own `Orientation`
+/// enum accepted the value from #369 on, but the assembler parses
+/// `project.labelle` strictly with its own copy, so on an older pin the
+/// build died in the assembler subprocess with `unexpected enum literal
+/// 'sensor_landscape'` before the CLI's manifest emitters ever ran.
+pub const DEFAULT_ASSEMBLER_VERSION = "0.101.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
 const config = @import("config.zig");
