@@ -177,6 +177,23 @@ fn walkDir(
                 };
                 defer sub.close(io);
 
+                // A directory that is itself a repository root — a git
+                // worktree, a submodule, or a plain nested clone — holds
+                // a *different* revision of some project. Walking into
+                // it recompiles and re-runs whole libraries from another
+                // branch as if they were ours, and a stale copy that no
+                // longer compiles fails `labelle test` for reasons that
+                // are invisible in the working tree. Prune it.
+                //
+                // Keyed on the `.git` marker rather than on a directory
+                // name: the containing folder can be called anything
+                // (`.worktrees/`, `vendor/`, `wt/`), which is exactly
+                // why `skip_dirs` never caught these.
+                if (isNestedCheckout(&sub)) {
+                    if (verbose) std.debug.print("  skip {s} (nested git checkout)\n", .{rel_buf.items});
+                    continue;
+                }
+
                 // If the subdir has its own build.zig, it's a
                 // self-contained Zig package — defer to `zig build
                 // test` there instead of walking its source tree.
@@ -238,6 +255,20 @@ fn isSkipDir(name: []const u8) bool {
         if (std.mem.eql(u8, name, skip)) return true;
     }
     return false;
+}
+
+/// True when `dir` is the root of its own git checkout: a linked
+/// worktree, a submodule, or a nested clone.
+///
+/// Tests for the *existence* of a `.git` entry and deliberately
+/// ignores its kind. In a plain clone `.git` is a directory; in a
+/// worktree or a submodule it is a regular FILE containing a
+/// `gitdir: <path>` pointer. A kind check would therefore miss the
+/// two cases (#371) that actually bite: `git worktree add` and
+/// submodules both drop a *file*.
+fn isNestedCheckout(dir: *std.Io.Dir) bool {
+    dir.access(config.globalIo(), ".git", .{}) catch return false;
+    return true;
 }
 
 /// Cheap heuristic: scan the source for a `test` keyword followed by
@@ -453,4 +484,163 @@ pub const FileHasTestBlockSpec = struct {
             try expect.equal(try writeAndCheck("// no test here\n"), false);
         }
     };
+};
+
+/// #371: `labelle test` used to descend into git worktrees and
+/// submodules nested inside the project, recompiling and re-running
+/// whole libraries from other branches. These specs pin the prune.
+///
+/// The fixtures are hand-built (a `.git` marker written by hand, no
+/// `git` invocation) so they run identically on the ubuntu and windows
+/// CI runners, which have no real checkout to point at. Every fixture
+/// `.zig` file is deliberately test-free and no `build.zig` is written,
+/// so the walk stays in-process: nothing spawns `zig test` or
+/// `zig build test`.
+pub const NestedCheckoutSpec = struct {
+    const TmpTree = struct {
+        tmp: std.testing.TmpDir,
+        abs_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
+
+        fn deinit(self: *TmpTree) void {
+            self.tmp.cleanup();
+        }
+
+        fn write(self: *TmpTree, rel_path: []const u8, contents: []const u8) !void {
+            const io = config.globalIo();
+            if (std.fs.path.dirname(rel_path)) |parent| {
+                try self.tmp.dir.createDirPath(io, parent);
+            }
+            try self.tmp.dir.writeFile(io, .{ .sub_path = rel_path, .data = contents });
+        }
+
+        fn mkdir(self: *TmpTree, rel_path: []const u8) !void {
+            try self.tmp.dir.createDirPath(config.globalIo(), rel_path);
+        }
+
+        /// Number of `.zig` files the walker reports as scanned —
+        /// the "N file(s) scanned" figure from #371.
+        fn scanned(self: *TmpTree) !usize {
+            const n = try self.tmp.dir.realPath(config.globalIo(), &self.abs_buf);
+            var stats = TestStats{};
+            try discoverAndRun(std.testing.allocator, self.abs_buf[0..n], &stats, false);
+            return stats.files_run;
+        }
+    };
+
+    /// The project's own source: one test-free `.zig` file.
+    fn writeOwnSource(t: *TmpTree) !void {
+        try t.write("src/main.zig",
+            \\const std = @import("std");
+            \\pub fn main() void {}
+            \\
+        );
+    }
+
+    /// A duplicate library that must never be walked, planted under an
+    /// arbitrarily-named directory to prove the prune is not keyed on
+    /// the folder's name.
+    fn writeNestedCopy(t: *TmpTree) !void {
+        try t.write("verify-821/libs/ui_kit/root.zig",
+            \\pub fn stale() void {}
+            \\
+        );
+    }
+
+    pub const prunes = struct {
+        test "a nested worktree (.git is a FILE) is not scanned" {
+            var baseline = TmpTree{ .tmp = std.testing.tmpDir(.{}) };
+            defer baseline.deinit();
+            try writeOwnSource(&baseline);
+
+            var nested = TmpTree{ .tmp = std.testing.tmpDir(.{}) };
+            defer nested.deinit();
+            try writeOwnSource(&nested);
+            try writeNestedCopy(&nested);
+            // `git worktree add` writes a *file*, not a directory.
+            try nested.write("verify-821/.git", "gitdir: /somewhere/.git/worktrees/verify-821\n");
+
+            try expect.equal(try nested.scanned(), try baseline.scanned());
+        }
+
+        test "a nested clone (.git is a DIRECTORY) is not scanned" {
+            var baseline = TmpTree{ .tmp = std.testing.tmpDir(.{}) };
+            defer baseline.deinit();
+            try writeOwnSource(&baseline);
+
+            var nested = TmpTree{ .tmp = std.testing.tmpDir(.{}) };
+            defer nested.deinit();
+            try writeOwnSource(&nested);
+            try writeNestedCopy(&nested);
+            try nested.mkdir("verify-821/.git");
+
+            try expect.equal(try nested.scanned(), try baseline.scanned());
+        }
+    };
+
+    pub const keeps = struct {
+        test "an ordinary directory named worktrees is still scanned" {
+            // The prune keys on the `.git` marker, never on the name:
+            // a plain folder that happens to be called `worktrees`
+            // holds real project source and must be walked.
+            var t = TmpTree{ .tmp = std.testing.tmpDir(.{}) };
+            defer t.deinit();
+            try writeOwnSource(&t);
+            try t.write("worktrees/helper.zig",
+                \\pub fn helper() void {}
+                \\
+            );
+
+            try expect.equal(try t.scanned(), @as(usize, 2));
+        }
+
+        test "a nested checkout's sibling source is still scanned" {
+            // Only the checkout subtree disappears; everything beside
+            // it in the project keeps being tested.
+            var t = TmpTree{ .tmp = std.testing.tmpDir(.{}) };
+            defer t.deinit();
+            try writeOwnSource(&t);
+            try t.write("libs/ui_kit/root.zig",
+                \\pub fn live() void {}
+                \\
+            );
+            try writeNestedCopy(&t);
+            try t.write("verify-821/.git", "gitdir: /somewhere\n");
+
+            try expect.equal(try t.scanned(), @as(usize, 2));
+        }
+    };
+};
+
+pub const IsNestedCheckoutSpec = struct {
+    fn probe(build: *const fn (dir: *std.Io.Dir) anyerror!void) !bool {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var dir: std.Io.Dir = tmp.dir;
+        try build(&dir);
+        return isNestedCheckout(&dir);
+    }
+
+    test "true for a .git file (worktree / submodule)" {
+        try expect.equal(try probe(struct {
+            fn f(dir: *std.Io.Dir) anyerror!void {
+                try dir.writeFile(config.globalIo(), .{ .sub_path = ".git", .data = "gitdir: /elsewhere\n" });
+            }
+        }.f), true);
+    }
+
+    test "true for a .git directory (plain clone)" {
+        try expect.equal(try probe(struct {
+            fn f(dir: *std.Io.Dir) anyerror!void {
+                try dir.createDirPath(config.globalIo(), ".git");
+            }
+        }.f), true);
+    }
+
+    test "false with no .git marker at all" {
+        try expect.equal(try probe(struct {
+            fn f(dir: *std.Io.Dir) anyerror!void {
+                try dir.createDirPath(config.globalIo(), "src");
+            }
+        }.f), false);
+    }
 };
