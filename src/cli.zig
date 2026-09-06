@@ -622,6 +622,7 @@ pub const UpdateCheckPackageStatusSpec = update_check.PackageStatusSpec;
 pub const UpdateCheckExitCodeSpec = update_check.ExitCodeSpec;
 pub const UpdateCheckJsonShapeSpec = update_check.JsonShapeSpec;
 pub const UpdateParseArgsSpec = update.ParseUpdateArgsSpec;
+pub const UpdateWindowsScriptSpec = update.WindowsUpdateScriptSpec;
 
 // Surface the build-progress feed specs (cli#284) so
 // `zspec.runAll(@This())` walks into them: the phase state machine,
