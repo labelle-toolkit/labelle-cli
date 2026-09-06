@@ -117,7 +117,7 @@ const windows_update_max_tries = 30;
 /// batch file, spawns it detached, and exits; the helper waits for the lock to
 /// drop, moves the freshly downloaded binary into place, and deletes itself.
 ///
-/// Three things here are deliberate and must not be "simplified" back:
+/// Four things here are deliberate and must not be "simplified" back:
 ///
 ///   1. **The delay is `ping.exe` by ABSOLUTE PATH, not `timeout`.** Two
 ///      independent reasons, both verified on Windows 11:
@@ -154,12 +154,42 @@ const windows_update_max_tries = 30;
 ///      `The batch file cannot be found.` line. Popping the batch context
 ///      first makes the delete the last thing that happens.
 ///
+///   4. **The interpolated paths go through `escapeBatchPercent`.** See there:
+///      an unescaped `%` in an installation path is expanded by `cmd` and the
+///      binary lands somewhere else entirely.
+///
+/// Double every `%` so `cmd` treats it as a literal (CodeRabbit, PR #376).
+///
+/// A batch file expands `%NAME%` at parse time, so an installation path that
+/// legitimately contains percent-delimited text is silently rewritten before
+/// `move` ever sees it. Verified on Windows 11 — a directory literally named
+/// `100%TEMP%done` renders unescaped as `100C:\Users\...\Tempdone`, i.e. the
+/// helper moves the new binary to the wrong place (or fails outright); with
+/// `%%` it renders and moves correctly. `%` is legal in a Windows path and
+/// reachable here through the user profile or a `LABELLE_CACHE` override.
+///
+/// Caller owns the returned buffer.
+fn escapeBatchPercent(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        if (c == '%') try out.append(allocator, '%');
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Caller owns the returned buffer.
 fn windowsUpdateScript(
     allocator: std.mem.Allocator,
-    tmp_path: []const u8,
-    bin_path: []const u8,
+    tmp_path_raw: []const u8,
+    bin_path_raw: []const u8,
 ) ![]u8 {
+    const tmp_path = try escapeBatchPercent(allocator, tmp_path_raw);
+    defer allocator.free(tmp_path);
+    const bin_path = try escapeBatchPercent(allocator, bin_path_raw);
+    defer allocator.free(bin_path);
+
     return std.fmt.allocPrint(allocator,
         \\@echo off
         \\setlocal
@@ -654,6 +684,36 @@ pub const WindowsUpdateScriptSpec = struct {
         const s = try script(testing.allocator);
         defer testing.allocator.free(s);
         try testing.expect(std.mem.indexOf(u8, s, "(goto) 2>nul & del \"%~f0\"") != null);
+    }
+
+    test "a percent sign in a path is escaped so cmd cannot expand it" {
+        // CodeRabbit, PR #376. `%` is legal in a Windows path (reachable via
+        // the user profile or a LABELLE_CACHE override). Unescaped, cmd
+        // expands `%TEMP%` at parse time and the helper moves the new binary
+        // to a path that has nothing to do with the install location.
+        const s = try windowsUpdateScript(
+            testing.allocator,
+            "C:\\tmp\\100%TEMP%done\\labelle-new.exe",
+            "C:\\bin\\100%TEMP%done\\labelle.exe",
+        );
+        defer testing.allocator.free(s);
+
+        try testing.expect(std.mem.indexOf(u8, s, "C:\\tmp\\100%%TEMP%%done\\labelle-new.exe") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "C:\\bin\\100%%TEMP%%done\\labelle.exe") != null);
+        // The single-percent form must not survive anywhere in the script.
+        try testing.expect(std.mem.indexOf(u8, s, "100%TEMP%done") == null);
+    }
+
+    test "escaping leaves the template's own cmd variables alone" {
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+
+        // Paths in this script carry no `%`, so the only `%` left must be the
+        // template's own expansions — escaping them would break the script.
+        try testing.expect(std.mem.indexOf(u8, s, "%SystemRoot%\\System32\\ping.exe") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "\"%LABELLE_SLEEP%\"") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "if %tries% lss 30") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "del \"%~f0\"") != null);
     }
 
     test "still moves the downloaded binary onto the installed path" {
