@@ -36,6 +36,14 @@ pub fn printHelp() void {
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
+        \\Build flags (generate / build / run / astc):
+        \\  --allow-older-cli    Build anyway when labelle.lock says the project was locked by a
+        \\                       NEWER labelle than this binary. Without it that is a hard error
+        \\                       (#353): an older CLI skips project.labelle fields it doesn't know
+        \\                       — e.g. a per-atlas `.astc_block` — and silently ships wrong art.
+        \\                       `LABELLE_ALLOW_OLDER_CLI=1` is the equivalent env form and applies
+        \\                       to every command.
+        \\
         \\Examples:
         \\  labelle init my-game
         \\  labelle add pack citizens
@@ -62,6 +70,7 @@ pub fn printHelp() void {
         \\  labelle wasm export --platform github-pages
         \\  labelle build --optimize=ReleaseFast
         \\  labelle build --linux-desktop
+        \\  labelle build --allow-older-cli
         \\  labelle bundle
         \\  labelle bundle --optimize=ReleaseFast --output ./dist
         \\  labelle bundle --build-number 42

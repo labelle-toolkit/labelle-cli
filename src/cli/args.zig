@@ -170,6 +170,12 @@ pub const ParsedArgs = struct {
     // relative path anchors to the project dir (same rule as `wasm
     // export --output`); see `bundle.resolveOutputDir`.
     bundle_output: ?[]const u8 = null,
+    /// `--allow-older-cli` (#353): downgrade the stale-CLI lock gate from a
+    /// hard error to a warning for THIS invocation. Set by the
+    /// `generate`/`build`/`run` parsers; `labelle astc` carries its own copy
+    /// (it is dispatched before the pipeline). Every other command keeps the
+    /// `LABELLE_ALLOW_OLDER_CLI=1` env form.
+    allow_older_cli: bool = false,
     // `labelle bundle --build-number <n>` (cli#363): pins `CFBundleVersion`.
     // Already validated by the parser; `null` = derived from `.version` —
     // see `bundle.resolveBuildVersion`.
@@ -513,6 +519,14 @@ fn parseEmccFlag(arg: []const u8, args: anytype) ?bool {
     return false;
 }
 
+/// `--allow-older-cli` (#353): the escape hatch of the stale-CLI lock gate
+/// (`lockfile.enforceCliNotStale`). A bare boolean flag — true = consumed.
+/// Deliberately valueless: `LABELLE_ALLOW_OLDER_CLI=1` is the env form for
+/// CI, this is the interactive one.
+pub fn parseAllowOlderCliFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--allow-older-cli");
+}
+
 /// Try the managed-toolchain path overrides (`--zig`, then `--emcc`) for one
 /// arg. true = consumed, false = neither flag, null = a flag with a bad value.
 fn parseToolchainFlag(arg: []const u8, args: anytype) ?bool {
@@ -566,7 +580,7 @@ pub fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []co
 /// Parse [dir], --scene, --platform, --optimize, --progress, --docker, --target
 /// and (build only) --linux-desktop flags for generate/build commands.
 /// `args` is `anytype` so tests can drive it with an in-memory iterator.
-pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode, linux_desktop: bool } {
+pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode, linux_desktop: bool, allow_older_cli: bool } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
@@ -577,8 +591,13 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
     var bake = false;
     var progress_mode: progress.Mode = .human;
     var linux_desktop = false;
+    var allow_older_cli = false;
 
     while (args.next()) |arg| {
+        if (parseAllowOlderCliFlag(arg)) {
+            allow_older_cli = true;
+            continue;
+        }
         switch (parseSceneFlag(arg, args, &scene, cmd_name)) {
             .parsed => continue,
             .err => return null,
@@ -631,7 +650,7 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
             dir_set = true;
         }
     }
-    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode, .linux_desktop = linux_desktop };
+    return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode, .linux_desktop = linux_desktop, .allow_older_cli = allow_older_cli };
 }
 
 /// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
@@ -754,6 +773,9 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
                 std.debug.print("labelle {s}: --after requires a value (e.g. --after 2s)\n", .{cmd_name});
                 return null;
             }
+            continue;
+        } else if (parseAllowOlderCliFlag(arg)) {
+            parsed_args.allow_older_cli = true;
             continue;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             parsed_args.headless = true;

@@ -4,6 +4,17 @@ const config = @import("config.zig");
 const asm_cache = @import("asm_cache.zig");
 
 /// Write labelle.lock into the project root.
+///
+/// `.cli_version` is a HIGH-WATER mark, not "whoever wrote last" (#353):
+/// an existing stamp NEWER than this binary is carried through unchanged.
+/// The gate (`enforceCliNotStale`) already refuses to build such a project,
+/// so the only way here is the deliberate `--allow-older-cli` /
+/// `LABELLE_ALLOW_OLDER_CLI=1` override — and the incident's compounding
+/// half was exactly that a stale binary restamped the lock DOWN to its own
+/// version, which would silently disarm the gate for every later run. One
+/// override must not permanently un-gate the project. To genuinely move a
+/// project back to an older CLI, edit (or delete) the lock's
+/// `.cli_version` line.
 pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig) !void {
     var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
@@ -16,7 +27,20 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
         \\
     );
 
-    try w.print("    .cli_version = \"{s}\",\n", .{project_config.CLI_VERSION});
+    const lock_path = try std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" });
+    defer allocator.free(lock_path);
+
+    // High-water `.cli_version` — see the doc comment above. `previous`
+    // owns the bytes `keep_version` points into, so it stays alive until
+    // after the print.
+    const previous: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), lock_path, allocator, .limited(1024 * 1024)) catch null;
+    defer if (previous) |p| allocator.free(p);
+    const keep_version: []const u8 = blk: {
+        const prev = previous orelse break :blk project_config.CLI_VERSION;
+        const stamped = lockCliVersion(prev) orelse break :blk project_config.CLI_VERSION;
+        break :blk if (isLockNewer(stamped, project_config.CLI_VERSION)) stamped else project_config.CLI_VERSION;
+    };
+    try w.print("    .cli_version = \"{s}\",\n", .{keep_version});
     try w.print("    .resolved = .{{\n", .{});
     try w.print("        .core = .{{ .version = \"{s}\" }},\n", .{cfg.core_version});
     try w.print("        .engine = .{{ .version = \"{s}\" }},\n", .{cfg.engine_version});
@@ -67,9 +91,6 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     }
 
     try w.writeAll("}\n");
-
-    const lock_path = try std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" });
-    defer allocator.free(lock_path);
 
     try std.Io.Dir.cwd().writeFile(config.globalIo(), .{
         .sub_path = lock_path,
@@ -462,12 +483,21 @@ pub fn lockCliVersion(lock_bytes: []const u8) ?[]const u8 {
 /// the old global block size. No error anywhere, visibly broken art.
 ///
 /// Returns `error.StaleCli` after printing an actionable message.
-/// `LABELLE_ALLOW_OLDER_CLI=1` (exactly "1") downgrades it to a warning —
-/// the escape hatch for deliberately building with an older CLI. A missing
-/// lock or one without a parseable version never trips the gate; a lock
-/// that EXISTS but cannot be read fails closed — an unverifiable lock is
-/// not a verified one.
-pub fn enforceCliNotStale(allocator: std.mem.Allocator, project_dir: []const u8) error{StaleCli}!void {
+/// Two equivalent escape hatches downgrade it to a warning, for
+/// deliberately building with an older CLI:
+///   - `allow_older` — the `--allow-older-cli` flag (#353 names it), set
+///     by the command's own parser (`generate`/`build`/`run`/`astc`);
+///   - `LABELLE_ALLOW_OLDER_CLI=1` (exactly "1") — the env form, which
+///     also covers commands whose parsers don't take the flag and is the
+///     usable shape for CI.
+/// A missing lock or one without a parseable version never trips the
+/// gate; a lock that EXISTS but cannot be read fails closed — an
+/// unverifiable lock is not a verified one.
+pub fn enforceCliNotStale(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    allow_older: bool,
+) error{StaleCli}!void {
     const lock_path = std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" }) catch return;
     defer allocator.free(lock_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), lock_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
@@ -487,10 +517,11 @@ pub fn enforceCliNotStale(allocator: std.mem.Allocator, project_dir: []const u8)
 
     const override: ?[]u8 = config.globalEnviron().getAlloc(allocator, "LABELLE_ALLOW_OLDER_CLI") catch null;
     defer if (override) |o| allocator.free(o);
-    if (override != null and std.mem.eql(u8, override.?, "1")) {
+    const env_override = override != null and std.mem.eql(u8, override.?, "1");
+    if (allow_older or env_override) {
         std.debug.print(
-            "labelle: warning: labelle.lock was written by labelle v{s}, this binary is v{s} — proceeding because LABELLE_ALLOW_OLDER_CLI is set\n",
-            .{ lock_version, project_config.CLI_VERSION },
+            "labelle: warning: labelle.lock was written by labelle v{s}, this binary is v{s} — proceeding because {s} is set\n",
+            .{ lock_version, project_config.CLI_VERSION, if (allow_older) "--allow-older-cli" else "LABELLE_ALLOW_OLDER_CLI" },
         );
         return;
     }
@@ -502,7 +533,8 @@ pub fn enforceCliNotStale(allocator: std.mem.Allocator, project_dir: []const u8)
         \\         global block size and mangles the art).
         \\
         \\  Fix:      upgrade this binary to v{s} or newer.
-        \\  Override: LABELLE_ALLOW_OLDER_CLI=1 labelle <command>
+        \\  Override: labelle <command> --allow-older-cli
+        \\            (or LABELLE_ALLOW_OLDER_CLI=1 labelle <command>)
         \\
     , .{ lock_version, project_config.CLI_VERSION, lock_version });
     return error.StaleCli;
@@ -553,4 +585,125 @@ test "lockCliVersion: only the top-level field counts" {
         \\}
     ;
     try std.testing.expect(lockCliVersion(decoys_only) == null);
+}
+
+/// Write a labelle.lock stamped with `version` into a fresh tmp dir and
+/// return the dir path the gate should be pointed at (cwd-relative, the
+/// same shape the other tmp-dir tests here use). Caller frees.
+fn stampedLockDir(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, version: []const u8) ![]u8 {
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "// labelle.lock — resolved dependency versions\n.{{\n    .cli_version = \"{s}\",\n    .resolved = .{{}},\n}}\n",
+        .{version},
+    );
+    defer alloc.free(body);
+    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "labelle.lock", .data = body });
+    return std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+}
+
+test "enforceCliNotStale: a lock from a newer CLI is a hard error" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 99.0.0 is unreachably newer than any real CLI_VERSION, so this
+    // test can't rot into a no-op as the CLI is released.
+    const dir = try stampedLockDir(alloc, &tmp, "99.0.0");
+    defer alloc.free(dir);
+
+    try std.testing.expectError(error.StaleCli, enforceCliNotStale(alloc, dir, false));
+}
+
+test "enforceCliNotStale: --allow-older-cli downgrades the refusal to a warning" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stampedLockDir(alloc, &tmp, "99.0.0");
+    defer alloc.free(dir);
+
+    // Same lock, same binary — the flag is the only difference.
+    try std.testing.expectError(error.StaleCli, enforceCliNotStale(alloc, dir, false));
+    try enforceCliNotStale(alloc, dir, true);
+}
+
+test "enforceCliNotStale: an equal-or-older lock, and no lock at all, pass" {
+    const alloc = std.testing.allocator;
+
+    var same = std.testing.tmpDir(.{});
+    defer same.cleanup();
+    const same_dir = try stampedLockDir(alloc, &same, project_config.CLI_VERSION);
+    defer alloc.free(same_dir);
+    try enforceCliNotStale(alloc, same_dir, false);
+
+    var older = std.testing.tmpDir(.{});
+    defer older.cleanup();
+    const older_dir = try stampedLockDir(alloc, &older, "0.0.1");
+    defer alloc.free(older_dir);
+    try enforceCliNotStale(alloc, older_dir, false);
+
+    // No labelle.lock: nothing to verify against, never a refusal.
+    var empty = std.testing.tmpDir(.{});
+    defer empty.cleanup();
+    const empty_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &empty.sub_path });
+    defer alloc.free(empty_dir);
+    try enforceCliNotStale(alloc, empty_dir, false);
+}
+
+test "enforceCliNotStale: a newer lock's version is not restamped down by the gate" {
+    // The incident's compounding half: the stale binary rewrites the lock
+    // to its OWN version. The gate runs BEFORE any lock write
+    // (`pipeline.run` calls it at the top; `writeLockFile` happens after
+    // the build), so a refused invocation must leave the stamp untouched
+    // — otherwise a second run would sail through against a downgraded
+    // lock. Asserted on the bytes.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stampedLockDir(alloc, &tmp, "99.0.0");
+    defer alloc.free(dir);
+
+    try std.testing.expectError(error.StaleCli, enforceCliNotStale(alloc, dir, false));
+
+    const after = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("99.0.0", lockCliVersion(after).?);
+}
+
+test "writeLockFile: a newer stamp is a high-water mark, not overwritten" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stampedLockDir(alloc, &tmp, "99.0.0");
+    defer alloc.free(dir);
+
+    // The `--allow-older-cli` path: this (older) binary is allowed to
+    // build, and then rewrites the lock. The stamp must NOT come down to
+    // CLI_VERSION — that is what silently disarmed the gate for every
+    // later run in the incident.
+    try writeLockFile(alloc, dir, .{ .name = "t" });
+    const after = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("99.0.0", lockCliVersion(after).?);
+}
+
+test "writeLockFile: an older or absent stamp becomes this CLI's version" {
+    const alloc = std.testing.allocator;
+
+    var older = std.testing.tmpDir(.{});
+    defer older.cleanup();
+    const older_dir = try stampedLockDir(alloc, &older, "0.0.1");
+    defer alloc.free(older_dir);
+    try writeLockFile(alloc, older_dir, .{ .name = "t" });
+    const bumped = try older.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(bumped);
+    try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(bumped).?);
+
+    // No pre-existing lock at all: plain stamp.
+    var fresh = std.testing.tmpDir(.{});
+    defer fresh.cleanup();
+    const fresh_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &fresh.sub_path });
+    defer alloc.free(fresh_dir);
+    try writeLockFile(alloc, fresh_dir, .{ .name = "t" });
+    const written = try fresh.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(written).?);
 }

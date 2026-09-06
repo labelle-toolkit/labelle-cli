@@ -143,3 +143,57 @@ pub const ProjectExistsSpec = struct {
         }
     };
 };
+
+/// #353 guard 2 ("unknown keys in `project.labelle` are a hard error in
+/// the CLI too") — DELIBERATELY NOT IMPLEMENTED, and this spec is the
+/// reason, executable so it cannot rot into folklore.
+///
+/// The CLI's `project_config.ProjectConfig` is a MINIMAL MIRROR of the
+/// assembler's schema (#217): the assembler owns `project.labelle` and
+/// parses it STRICTLY (`ignore_unknown_fields = false`), so a key no
+/// version of the toolchain knows already fails there, at generate time,
+/// in the component that owns the schema. What the CLI's mirror lacks is
+/// not "unknown to everyone" but "known to the pinned assembler, not
+/// mirrored here" — today that includes the resource fields `.image` and
+/// `.grid`. Rejecting those would break projects that are entirely
+/// valid, including ones the CLI builds correctly right now.
+///
+/// The asymmetry is structural and permanent: the assembler is pinned
+/// per project and released independently, so its schema is always
+/// allowed to be ahead of the CLI's mirror. A CLI-side unknown-field
+/// gate would therefore refuse newer-but-valid projects — the inverse of
+/// the incident's failure and a far more frequent one. The stale-CLI lock
+/// gate (`lockfile.enforceCliNotStale`) covers the incident instead: it
+/// keys off the CLI version the project was locked with, which is the
+/// fact that actually predicts "this binary may not understand this
+/// project", rather than guessing from field names.
+pub const CliMirrorToleranceSpec = struct {
+    test "a resource carrying assembler-only fields still parses" {
+        // Arena: the real callers parse into one too (the config strings
+        // outlive every loop iteration and `std.zon.parse.free` is
+        // finicky on some fields — see `astc/cmd.zig`).
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(globalIo(), .{
+            .sub_path = "project.labelle",
+            .data = ".{ .name = \"demo\", .resources = .{" ++
+                " .{ .name = \"tiles\", .image = \"assets/tiles.png\", .grid = .{ .cell_w = 16, .cell_h = 16 } }," ++
+                " .{ .name = \"chars\", .json = \"assets/c.json\", .texture = \"assets/c.png\", .astc_block = .@\"4x4\" }," ++
+                " } }",
+        });
+        const dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+        defer alloc.free(dir);
+
+        // `.image` / `.grid` are assembler-owned resource fields this
+        // CLI's mirror does not carry. A "unknown to me = error" gate
+        // would reject this project; the toolchain builds it fine.
+        const cfg = try readProjectConfigQuiet(alloc, dir);
+        try expect.equal(cfg.resources.len, @as(usize, 2));
+        // The fields the CLI DOES consume are unaffected by the skip.
+        try std.testing.expectEqualStrings("chars", cfg.resources[1].name);
+        try std.testing.expectEqualStrings("4x4", @tagName(cfg.resources[1].astc_block.?));
+    }
+};
