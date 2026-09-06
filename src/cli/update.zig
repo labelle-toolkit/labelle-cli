@@ -106,6 +106,120 @@ fn cmdUpdateCheck(allocator: std.mem.Allocator, version_arg: ?[]const u8, json: 
     }
 }
 
+/// How many times the Windows helper retries the replace before giving up.
+/// At ~1s per attempt that is a ~30s window for the parent `labelle.exe` to
+/// exit and release its lock on the binary.
+const windows_update_max_tries = 30;
+
+/// Build the Windows self-replace helper script (labelle-cli#375).
+///
+/// The running `labelle.exe` cannot overwrite itself, so `update` writes this
+/// batch file, spawns it detached, and exits; the helper waits for the lock to
+/// drop, moves the freshly downloaded binary into place, and deletes itself.
+///
+/// Four things here are deliberate and must not be "simplified" back:
+///
+///   1. **The delay is `ping.exe` by ABSOLUTE PATH, not `timeout`.** Two
+///      independent reasons, both verified on Windows 11:
+///
+///      a. `timeout` is not a `cmd` builtin — it lives in
+///         `%SystemRoot%\System32` and is resolved through `PATH`. The helper
+///         inherits the environment of whatever shell ran `labelle update`,
+///         and Git Bash / MSYS2 / Cygwin put their own `/usr/bin` (which
+///         ships a GNU coreutils `timeout.exe`) AHEAD of System32. GNU
+///         `timeout` rejects the DOS `/t` switch, so the bare name produced
+///         `timeout: invalid time interval '/t'` and returned instantly.
+///
+///      b. Even the REAL `System32\timeout.exe` refuses to run when stdin is
+///         not a console — it prints `ERROR: Input redirection is not
+///         supported, exiting the process immediately.` and exits in ~40ms.
+///         The helper is spawned detached by the CLI, so its stdin is exactly
+///         that. Fixing only (a) would still leave the wait broken here.
+///
+///      `ping -n 2 127.0.0.1` is the redirection-proof batch delay (~1s) and
+///      is unaffected by both. The absolute path keeps (a) fixed for it too.
+///
+///      Losing the wait is not cosmetic: it makes the `move` race the
+///      exiting parent, and a failed `move` turns `goto wait` into an
+///      unthrottled busy loop.
+///
+///   2. **The retry loop is BOUNDED** (`windows_update_max_tries`). Even with
+///      a working sleep, an indefinite loop leaves a stray background process
+///      hammering `move` forever if the old binary never unlocks. On give-up
+///      it prints where the new binary is so the user can move it by hand.
+///
+///   3. **Self-delete uses `(goto) 2>nul & del "%~f0"`.** A plain
+///      `del "%~f0"` deletes the script while `cmd` still holds an open read
+///      handle on it, which is what printed the stray
+///      `The batch file cannot be found.` line. Popping the batch context
+///      first makes the delete the last thing that happens.
+///
+///   4. **The interpolated paths go through `escapeBatchPercent`.** See there:
+///      an unescaped `%` in an installation path is expanded by `cmd` and the
+///      binary lands somewhere else entirely.
+///
+/// Double every `%` so `cmd` treats it as a literal (CodeRabbit, PR #376).
+///
+/// A batch file expands `%NAME%` at parse time, so an installation path that
+/// legitimately contains percent-delimited text is silently rewritten before
+/// `move` ever sees it. Verified on Windows 11 — a directory literally named
+/// `100%TEMP%done` renders unescaped as `100C:\Users\...\Tempdone`, i.e. the
+/// helper moves the new binary to the wrong place (or fails outright); with
+/// `%%` it renders and moves correctly. `%` is legal in a Windows path and
+/// reachable here through the user profile or a `LABELLE_CACHE` override.
+///
+/// Caller owns the returned buffer.
+fn escapeBatchPercent(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        if (c == '%') try out.append(allocator, '%');
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Caller owns the returned buffer.
+fn windowsUpdateScript(
+    allocator: std.mem.Allocator,
+    tmp_path_raw: []const u8,
+    bin_path_raw: []const u8,
+) ![]u8 {
+    const tmp_path = try escapeBatchPercent(allocator, tmp_path_raw);
+    defer allocator.free(tmp_path);
+    const bin_path = try escapeBatchPercent(allocator, bin_path_raw);
+    defer allocator.free(bin_path);
+
+    return std.fmt.allocPrint(allocator,
+        \\@echo off
+        \\setlocal
+        \\if not defined SystemRoot set "SystemRoot=C:\Windows"
+        \\set "LABELLE_SLEEP=%SystemRoot%\System32\ping.exe"
+        \\set /a tries=0
+        \\:wait
+        \\"%LABELLE_SLEEP%" -n 2 127.0.0.1 >nul 2>&1
+        \\move /Y "{s}" "{s}" >nul 2>&1
+        \\if not errorlevel 1 goto done
+        \\set /a tries+=1
+        \\if %tries% lss {d} goto wait
+        \\echo labelle: could not replace "{s}" after {d} attempts.
+        \\echo labelle: the new binary is at "{s}" — move it there manually.
+        \\goto end
+        \\:done
+        \\echo Update complete.
+        \\:end
+        \\(goto) 2>nul & del "%~f0"
+        \\
+    , .{
+        tmp_path,
+        bin_path,
+        windows_update_max_tries,
+        bin_path,
+        windows_update_max_tries,
+        tmp_path,
+    });
+}
+
 /// Self-update the CLI binary by downloading from the release server.
 pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     const parsed = try parseUpdateArgs(cmd_args);
@@ -226,16 +340,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         const bat_path = try std.fs.path.join(allocator, &.{ bin_dir, "labelle-update.bat" });
         defer allocator.free(bat_path);
 
-        const bat_content = try std.fmt.allocPrint(allocator,
-            \\@echo off
-            \\:wait
-            \\timeout /t 1 /nobreak >nul
-            \\move /Y "{s}" "{s}" >nul 2>&1
-            \\if errorlevel 1 goto wait
-            \\echo Update complete.
-            \\del "%~f0"
-            \\
-        , .{ tmp_path, bin_path });
+        const bat_content = try windowsUpdateScript(allocator, tmp_path, bin_path);
         defer allocator.free(bat_content);
 
         const bat_file = std.Io.Dir.cwd().createFile(config.globalIo(), bat_path, .{}) catch |err| {
@@ -510,5 +615,111 @@ pub const ParseUpdateArgsSpec = struct {
         const a = try parseUpdateArgs(&.{"1.2.3"});
         try testing.expect(!a.reportOnly());
         try testing.expectEqualStrings("1.2.3", a.version_arg.?);
+    }
+};
+
+/// The Windows self-replace helper script (labelle-cli#375). Re-exported into
+/// cli.zig so `zspec.runAll` walks into it. These run on every host, not just
+/// Windows: the bug was in the generated TEXT, and a Windows-only spec would
+/// leave it unguarded on the two CI runners that finish first.
+pub const WindowsUpdateScriptSpec = struct {
+    const testing = std.testing;
+
+    fn script(allocator: std.mem.Allocator) ![]u8 {
+        return windowsUpdateScript(allocator, "C:\\tmp\\labelle-new.exe", "C:\\bin\\labelle.exe");
+    }
+
+    test "the delay never uses `timeout`, under any spelling" {
+        // Reason (a): a bare `timeout` is resolved through PATH, and Git Bash
+        // / MSYS2 / Cygwin shadow System32 with a GNU coreutils `timeout.exe`
+        // that rejects `/t`. Reason (b): even the real System32 timeout.exe
+        // bails out when stdin is not a console, which is exactly how the
+        // helper is spawned. Neither spelling is acceptable.
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "timeout") == null);
+    }
+
+    test "the delay is ping.exe by absolute path" {
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+
+        try testing.expect(std.mem.indexOf(u8, s, "%SystemRoot%\\System32\\ping.exe") != null);
+        // No line may invoke a system tool as a bare, PATH-resolved word.
+        var lines = std.mem.splitScalar(u8, s, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            try testing.expect(!std.mem.startsWith(u8, trimmed, "ping "));
+        }
+    }
+
+    test "SystemRoot is defaulted before it is used" {
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+
+        const guard = std.mem.indexOf(u8, s, "if not defined SystemRoot").?;
+        const use = std.mem.indexOf(u8, s, "%SystemRoot%\\System32\\ping.exe").?;
+        try testing.expect(guard < use);
+    }
+
+    test "the retry loop is bounded, not an unthrottled goto" {
+        // A failed `move` used to jump back to a `timeout` that returned
+        // instantly, spinning a background process at 100% CPU forever.
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+
+        try testing.expect(std.mem.indexOf(u8, s, "set /a tries+=1") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "lss 30") != null);
+    }
+
+    test "give-up branch tells the user where the new binary is" {
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "C:\\tmp\\labelle-new.exe\" — move it there manually") != null);
+    }
+
+    test "self-delete pops the batch context first" {
+        // A plain `del \"%~f0\"` printed `The batch file cannot be found.`
+        // because cmd still held a read handle on the script.
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "(goto) 2>nul & del \"%~f0\"") != null);
+    }
+
+    test "a percent sign in a path is escaped so cmd cannot expand it" {
+        // CodeRabbit, PR #376. `%` is legal in a Windows path (reachable via
+        // the user profile or a LABELLE_CACHE override). Unescaped, cmd
+        // expands `%TEMP%` at parse time and the helper moves the new binary
+        // to a path that has nothing to do with the install location.
+        const s = try windowsUpdateScript(
+            testing.allocator,
+            "C:\\tmp\\100%TEMP%done\\labelle-new.exe",
+            "C:\\bin\\100%TEMP%done\\labelle.exe",
+        );
+        defer testing.allocator.free(s);
+
+        try testing.expect(std.mem.indexOf(u8, s, "C:\\tmp\\100%%TEMP%%done\\labelle-new.exe") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "C:\\bin\\100%%TEMP%%done\\labelle.exe") != null);
+        // The single-percent form must not survive anywhere in the script.
+        try testing.expect(std.mem.indexOf(u8, s, "100%TEMP%done") == null);
+    }
+
+    test "escaping leaves the template's own cmd variables alone" {
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+
+        // Paths in this script carry no `%`, so the only `%` left must be the
+        // template's own expansions — escaping them would break the script.
+        try testing.expect(std.mem.indexOf(u8, s, "%SystemRoot%\\System32\\ping.exe") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "\"%LABELLE_SLEEP%\"") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "if %tries% lss 30") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "del \"%~f0\"") != null);
+    }
+
+    test "still moves the downloaded binary onto the installed path" {
+        const s = try script(testing.allocator);
+        defer testing.allocator.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "move /Y \"C:\\tmp\\labelle-new.exe\" \"C:\\bin\\labelle.exe\"") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "echo Update complete.") != null);
     }
 };
