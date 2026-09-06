@@ -28,6 +28,7 @@ const std = @import("std");
 pub const DEFAULT_ASSEMBLER_VERSION = "0.105.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
+const compatibility = @import("compatibility.zig");
 const config = @import("config.zig");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
@@ -35,6 +36,24 @@ const runner = @import("runner.zig");
 
 /// GitHub release URL template for assembler binaries.
 const ASSEMBLER_RELEASE_BASE = "https://github.com/labelle-toolkit/labelle-assembler/releases/download";
+
+/// The LAST assembler release published WITHOUT a `SHA256SUMS` manifest.
+///
+/// labelle-assembler#718/#720 added the manifest to the release workflow;
+/// v0.105.0 (2026-09-06) was the last tag cut before that landed, so every
+/// release AFTER this one ships one and no release up to and including it
+/// does.
+///
+/// Spelled as "the last one without" rather than "the first one with" on
+/// purpose: the first version WITH a manifest is whatever gets tagged next,
+/// which is unknowable while writing this. `>` against this constant is
+/// correct for any future version without needing an edit at release time —
+/// a constant that must be updated by hand on the next release is a constant
+/// that will be wrong on the next release.
+///
+/// This is the version FLOOR for the strip-attack defence in
+/// `verifyAgainstManifest`; see the policy note there.
+const LAST_UNVERIFIED_ASSEMBLER_VERSION = "0.105.0";
 
 /// Look up the override path. Returns null if `LABELLE_ASSEMBLER` is
 /// unset, in which case the CLI should use the in-process generator.
@@ -131,19 +150,158 @@ fn archName() error{UnsupportedPlatform}![]const u8 {
 const exe_suffix = if (builtin.os.tag == .windows) ".exe" else "";
 const exe_name = "labelle-assembler" ++ exe_suffix;
 
+/// Look up `asset`'s expected digest in a `SHA256SUMS` body.
+///
+/// The manifest is the plain `shasum`/coreutils format the release workflow
+/// emits — `<64 hex>  <bare filename>`, two spaces — one line per published
+/// binary. Matching on the exact filename (not a substring) matters: the
+/// five asset names share a prefix, and `labelle-assembler-linux-x86_64`
+/// is a substring of nothing else only by luck of the current naming.
+fn digestFor(manifest: []const u8, asset: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len < 64 + 2 + 1) continue;
+        const sep = std.mem.indexOf(u8, line, "  ") orelse continue;
+        if (sep != 64) continue;
+        const name = std.mem.trim(u8, line[sep + 2 ..], " \t\r");
+        if (std.mem.eql(u8, name, asset)) return line[0..64];
+    }
+    return null;
+}
+
+/// Verify `path`'s bytes against the release's `SHA256SUMS`.
+///
+/// ── The missing-manifest policy, which is the crux of this check ──
+///
+/// No release up to and including `LAST_UNVERIFIED_ASSEMBLER_VERSION` ships
+/// a manifest, so "always fail closed" would brick every project pinned to
+/// one of them — which is every project that exists today. "Always fail
+/// open" is worse in the other direction: an attacker who can replace a
+/// release asset can also DELETE the manifest, and a check that silently
+/// skips when the manifest is absent can be turned off by the very
+/// adversary it defends against (the classic strip attack).
+///
+/// So the policy is neither, and is keyed on the version:
+///
+///   * version >  LAST_UNVERIFIED  → a manifest MUST be present and MUST
+///     match. Its absence is a hard failure, because for those releases
+///     absence can only mean the workflow did not run as expected or
+///     someone removed it. This is what closes the strip attack going
+///     forward.
+///   * version <= LAST_UNVERIFIED  → no manifest was ever published, so a
+///     404 is expected and is NOT a failure. Warn once, loudly, and
+///     proceed. These releases are unverifiable as a matter of historical
+///     fact; pretending otherwise by failing would be a lie about security
+///     that costs every existing user their build.
+///
+/// In BOTH cases, if a manifest IS present it is binding: a mismatch, or a
+/// manifest that does not list this asset, fails. That way the older
+/// releases start being verified the moment someone backfills a manifest
+/// onto them, with no code change here.
+fn verifyAgainstManifest(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    asset: []const u8,
+    path: []const u8,
+) !void {
+    const io = config.globalIo();
+    const manifest_url = try std.fmt.allocPrint(allocator, "{s}/v{s}/SHA256SUMS", .{
+        ASSEMBLER_RELEASE_BASE,
+        version,
+    });
+    defer allocator.free(manifest_url);
+
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}.sha256sums", .{path});
+    defer allocator.free(manifest_path);
+    defer std.Io.Dir.cwd().deleteFile(io, manifest_path) catch {};
+
+    const expect_manifest = compatibility.parseVersion(LAST_UNVERIFIED_ASSEMBLER_VERSION)
+        .olderThan(compatibility.parseVersion(version));
+
+    const fetched = fetch: {
+        const r = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", manifest_path, manifest_url }) catch break :fetch false;
+        defer allocator.free(r.stdout);
+        defer allocator.free(r.stderr);
+        break :fetch switch (r.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    };
+
+    if (!fetched) {
+        if (expect_manifest) {
+            std.debug.print("labelle: SHA256SUMS is missing for assembler v{s} — refusing the download.\n", .{version});
+            std.debug.print("  every assembler release after v{s} publishes one, so its absence means\n", .{LAST_UNVERIFIED_ASSEMBLER_VERSION});
+            std.debug.print("  the release is incomplete or its assets were tampered with.\n", .{});
+            std.debug.print("  url: {s}\n", .{manifest_url});
+            return error.AssemblerChecksumUnavailable;
+        }
+        std.debug.print("labelle: WARNING — assembler v{s} predates published checksums; the download\n", .{version});
+        std.debug.print("  could NOT be verified. Releases after v{s} are verified automatically.\n", .{LAST_UNVERIFIED_ASSEMBLER_VERSION});
+        return;
+    }
+
+    const manifest = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(64 << 10)) catch {
+        std.debug.print("labelle: could not read the downloaded SHA256SUMS — refusing the download.\n", .{});
+        return error.AssemblerChecksumUnavailable;
+    };
+    defer allocator.free(manifest);
+
+    const expected = digestFor(manifest, asset) orelse {
+        std.debug.print("labelle: SHA256SUMS for v{s} does not list '{s}' — refusing the download.\n", .{ version, asset });
+        return error.AssemblerChecksumMissingEntry;
+    };
+
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 << 20)) catch {
+        std.debug.print("labelle: could not read the download to verify it.\n", .{});
+        return error.AssemblerDownloadFailed;
+    };
+    defer allocator.free(data);
+
+    if (!util.sha256Matches(data, expected)) {
+        std.debug.print("labelle: CHECKSUM MISMATCH for assembler v{s} — refusing the download.\n", .{version});
+        std.debug.print("  expected {s} (from the release's SHA256SUMS)\n", .{expected});
+        std.debug.print("  the downloaded bytes are not what the release publishes. Nothing was installed.\n", .{});
+        return error.AssemblerChecksumMismatch;
+    }
+
+    std.debug.print("  checksum ok (SHA256SUMS)\n", .{});
+}
+
 /// Download an assembler binary from GitHub releases and cache it.
 ///
 /// URL pattern: https://github.com/labelle-toolkit/labelle-assembler/releases/download/v<version>/labelle-assembler-<os>-<arch>
 ///
 /// The binary is saved to `~/.labelle/assembler/<version>/labelle-assembler`
 /// and made executable on Unix.
+///
+/// The download is verified against the release's `SHA256SUMS` before it is
+/// put in place. HTTPS and a version pin authenticate the HOST, not the
+/// bytes, and GitHub release assets are MUTABLE — an asset can be deleted
+/// and re-uploaded under the same name on an existing tag — so without this
+/// the CLI would `chmod +x` and execute whatever arrived
+/// (labelle-assembler#616).
+///
+/// Staging matters as much as the check. The bytes land on a `.part` sibling
+/// and are moved to `dest_path` ONLY after they verify, because `dest_path`
+/// is not a scratch location: it is the cache slot, and every caller decides
+/// "already downloaded?" by `access()`ing exactly that path. Writing the
+/// unverified download there directly — as this function used to — means a
+/// failed verification would leave a file that the NEXT run treats as a good
+/// cache hit and never re-downloads or re-checks. So a rejected download
+/// must leave nothing at `dest_path`: nothing cached, nothing executable.
 pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest_path: []const u8) !void {
     const io = config.globalIo();
-    const url = try std.fmt.allocPrint(allocator, "{s}/v{s}/labelle-assembler-{s}-{s}", .{
-        ASSEMBLER_RELEASE_BASE,
-        version,
+    const asset = try std.fmt.allocPrint(allocator, "labelle-assembler-{s}-{s}", .{
         try osName(),
         try archName(),
+    });
+    defer allocator.free(asset);
+    const url = try std.fmt.allocPrint(allocator, "{s}/v{s}/{s}", .{
+        ASSEMBLER_RELEASE_BASE,
+        version,
+        asset,
     });
     defer allocator.free(url);
 
@@ -158,8 +316,14 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
         };
     }
 
+    // Staging path: everything below writes HERE, never to dest_path, until
+    // the bytes have been verified. See the doc comment above.
+    const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{dest_path});
+    defer allocator.free(part_path);
+    defer std.Io.Dir.cwd().deleteFile(io, part_path) catch {};
+
     // Use curl with -L to follow redirects (GitHub releases redirect to S3).
-    const result = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", dest_path, url }) catch {
+    const result = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", part_path, url }) catch {
         std.debug.print("labelle: download failed (is curl installed?)\n", .{});
         std.debug.print("  url: {s}\n", .{url});
         std.debug.print("  you can download manually and place it at: {s}\n", .{dest_path});
@@ -173,16 +337,32 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
             std.debug.print("labelle: download failed (HTTP error, exit code {d})\n", .{code});
             std.debug.print("  url: {s}\n", .{url});
             std.debug.print("  you can download manually and place it at: {s}\n", .{dest_path});
-            // Clean up partial download
-            std.Io.Dir.cwd().deleteFile(io, dest_path) catch {};
+            // The partial download is on `part_path` and the deferred
+            // cleanup above removes it; dest_path was never written.
             return error.AssemblerDownloadFailed;
         },
         else => {
             std.debug.print("labelle: download process terminated abnormally\n", .{});
-            std.Io.Dir.cwd().deleteFile(io, dest_path) catch {};
             return error.AssemblerDownloadFailed;
         },
     }
+
+    // Integrity gate — before anything is moved into the cache slot or made
+    // executable. Mirrors how `python_provision.zig` verifies its download
+    // before extracting, except the expected digest comes from the release's
+    // own manifest rather than a pinned constant (a pinned constant per
+    // assembler version would need a CLI release for every assembler
+    // release).
+    try verifyAgainstManifest(allocator, version, asset, part_path);
+
+    // Verified: move the staged bytes into the cache slot. Only now does
+    // `dest_path` exist, so a caller's `access()` cache-hit check can never
+    // see an unverified binary.
+    std.Io.Dir.cwd().rename(part_path, std.Io.Dir.cwd(), dest_path, io) catch |err| {
+        std.debug.print("labelle: could not move the verified download into place: {any}\n", .{err});
+        std.debug.print("  staged at: {s}\n", .{part_path});
+        return error.AssemblerDownloadFailed;
+    };
 
     // Make executable on Unix.
     if (builtin.os.tag != .windows) {
@@ -598,5 +778,92 @@ pub const ResolveProjectRoot = struct {
         defer alloc.free(root);
 
         try std.testing.expectEqualStrings(main_abs, root);
+    }
+};
+
+/// The download-integrity gate (labelle-assembler#616): manifest parsing and
+/// the missing-manifest version policy, which is the part with a real
+/// decision in it. The end-to-end path is exercised by the released-path
+/// smoke test in ci.yml.
+pub const DownloadVerification = struct {
+    test "digestFor: matches the exact asset name and returns its digest" {
+        const manifest =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  labelle-assembler-linux-aarch64\n" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  labelle-assembler-linux-x86_64\n" ++
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  labelle-assembler-windows-x86_64\n";
+
+        try std.testing.expectEqualStrings(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            digestFor(manifest, "labelle-assembler-linux-x86_64").?,
+        );
+        try std.testing.expectEqualStrings(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            digestFor(manifest, "labelle-assembler-windows-x86_64").?,
+        );
+    }
+
+    test "digestFor: an asset the manifest does not list yields null (never a near-miss)" {
+        const manifest =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  labelle-assembler-linux-x86_64\n";
+        // Not listed at all.
+        try std.testing.expect(digestFor(manifest, "labelle-assembler-macos-aarch64") == null);
+        // A PREFIX of a listed name must not match — the five asset names
+        // share a prefix, so a substring search here would hand back the
+        // wrong platform's digest instead of failing.
+        try std.testing.expect(digestFor(manifest, "labelle-assembler-linux") == null);
+        try std.testing.expect(digestFor(manifest, "labelle-assembler") == null);
+    }
+
+    test "digestFor: tolerates CRLF and a trailing newline, rejects malformed lines" {
+        const crlf = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  labelle-assembler-macos-x86_64\r\n";
+        try std.testing.expectEqualStrings(
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            digestFor(crlf, "labelle-assembler-macos-x86_64").?,
+        );
+        // Single space (not the two-space text form) is not accepted, so a
+        // manifest in an unexpected shape fails closed rather than matching
+        // something approximate.
+        try std.testing.expect(digestFor(
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd labelle-assembler-macos-x86_64\n",
+            "labelle-assembler-macos-x86_64",
+        ) == null);
+        // Short/garbage lines are skipped, not misread.
+        try std.testing.expect(digestFor("garbage\n\n", "labelle-assembler-macos-x86_64") == null);
+    }
+
+    test "the missing-manifest floor: newer than the last unverified release REQUIRES a manifest" {
+        // This is the strip-attack defence. Everything strictly newer than
+        // LAST_UNVERIFIED_ASSEMBLER_VERSION ships SHA256SUMS, so a 404 there
+        // must be fatal — otherwise deleting the manifest disables the check.
+        const floor = compatibility.parseVersion(LAST_UNVERIFIED_ASSEMBLER_VERSION);
+        for ([_][]const u8{ "0.105.1", "0.106.0", "0.200.0", "1.0.0" }) |v| {
+            try std.testing.expect(floor.olderThan(compatibility.parseVersion(v)));
+        }
+    }
+
+    test "the missing-manifest floor: the last unverified release and older do NOT require one" {
+        // These releases genuinely never published a manifest. Failing them
+        // closed would brick every project pinned to one, so they warn and
+        // proceed; a manifest, if one is ever backfilled, still binds.
+        const floor = compatibility.parseVersion(LAST_UNVERIFIED_ASSEMBLER_VERSION);
+        for ([_][]const u8{ "0.105.0", "0.104.0", "0.99.2", "0.1.0" }) |v| {
+            try std.testing.expect(!floor.olderThan(compatibility.parseVersion(v)));
+        }
+        // The default the CLI ships with is on the unverified side today —
+        // i.e. this change does not break the out-of-the-box path.
+        try std.testing.expect(!floor.olderThan(compatibility.parseVersion(DEFAULT_ASSEMBLER_VERSION)));
+    }
+
+    test "a prerelease of the first verified version still requires a manifest" {
+        // `0.106.0-rc1` is newer than 0.105.0, so it is on the verified side.
+        const floor = compatibility.parseVersion(LAST_UNVERIFIED_ASSEMBLER_VERSION);
+        try std.testing.expect(floor.olderThan(compatibility.parseVersion("0.106.0-rc1")));
+    }
+
+    test "sha256Matches is what the gate compares with (digest wiring sanity)" {
+        // Guards the hex-case assumption: the manifest is lowercase hex and
+        // util.sha256Matches only accepts lowercase.
+        try std.testing.expect(util.sha256Matches("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        try std.testing.expect(!util.sha256Matches("abc", "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"));
     }
 };
