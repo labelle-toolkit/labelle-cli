@@ -283,7 +283,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // actionable message instead of a bare parse error. `upgrade` is
     // exempt: it is the way out of this error.
     if (command != .upgrade_cmd) {
-        lockfile.enforceCliNotStale(allocator, project_dir) catch std.process.exit(1);
+        lockfile.enforceCliNotStale(allocator, project_dir, parsed_args.allow_older_cli) catch std.process.exit(1);
     }
 
     var parsed = config.readProjectConfig(arena.allocator(), project_dir) catch |err| {

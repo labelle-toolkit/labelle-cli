@@ -1110,3 +1110,58 @@ pub const ParseDirAndSceneLinuxDesktopSpec = struct {
         try expect.equal(result.platform.?, Platform.desktop);
     }
 };
+
+/// `--allow-older-cli` (#353): the stale-CLI lock gate's escape hatch has
+/// to be ACCEPTED by the build-command parsers, otherwise the flag the
+/// error message advertises would itself be an "unknown flag" error.
+pub const AllowOlderCliFlagSpec = struct {
+    test "generate accepts it" {
+        var iter = testIter("--allow-older-cli");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "generate") orelse return error.TestFailed;
+        try std.testing.expect(result.allow_older_cli);
+    }
+
+    test "build accepts it, and it composes with the other build flags" {
+        var iter = testIter("--platform=desktop --allow-older-cli --optimize=ReleaseFast");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+        try std.testing.expect(result.allow_older_cli);
+        try expect.equal(result.platform.?, Platform.desktop);
+        try std.testing.expectEqualStrings("ReleaseFast", result.optimize.?);
+    }
+
+    test "build defaults it off" {
+        var iter = testIter("--optimize=ReleaseFast");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+        try std.testing.expect(!result.allow_older_cli);
+    }
+
+    test "a positional dir still parses alongside it" {
+        var iter = testIter("--allow-older-cli ../my-game");
+        defer iter.deinit();
+        const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+        try std.testing.expect(result.allow_older_cli);
+        try std.testing.expectEqualStrings("../my-game", result.dir);
+    }
+
+    test "run accepts it and records it on ParsedArgs" {
+        var iter = testIter("--allow-older-cli --timeout=30s");
+        defer iter.deinit();
+        var pa = ParsedArgs{ .command = .run };
+        const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+        try std.testing.expect(pa.allow_older_cli);
+        try std.testing.expect(result.timeout_ns != null);
+    }
+
+    test "run defaults it off, and a game arg after `--` is NOT the flag" {
+        var iter = testIter("-- --allow-older-cli");
+        defer iter.deinit();
+        var pa = ParsedArgs{ .command = .run };
+        _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+        try std.testing.expect(!pa.allow_older_cli);
+        try expect.equal(pa.extra_count, @as(usize, 1));
+        try std.testing.expectEqualStrings("--allow-older-cli", pa.extra_args[0]);
+    }
+};

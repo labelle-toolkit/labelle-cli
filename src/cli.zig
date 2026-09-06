@@ -147,6 +147,7 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.bake = result.bake;
             parsed_args.progress_mode = result.progress_mode;
             parsed_args.linux_desktop = result.linux_desktop;
+            parsed_args.allow_older_cli = result.allow_older_cli;
         } else if (std.mem.eql(u8, first, "bundle")) {
             // `labelle bundle` (cli#359): generate + build the desktop
             // target, then wrap the exe in a macOS `.app`. Host-gated
@@ -564,6 +565,7 @@ pub const ArgsParseWasmServeArgsSpec = args_tests_mod.ParseWasmServeArgsSpec;
 pub const ArgsParseWasmExportArgsSpec = args_tests_mod.ParseWasmExportArgsSpec;
 pub const ArgsParseBundleArgsSpec = args_tests_mod.ParseBundleArgsSpec;
 pub const ArgsParseDirAndSceneLinuxDesktopSpec = args_tests_mod.ParseDirAndSceneLinuxDesktopSpec;
+pub const ArgsAllowOlderCliFlagSpec = args_tests_mod.AllowOlderCliFlagSpec;
 
 // Linux `.desktop` entry emission (cli#359). Re-exported HERE for the same
 // reason as the screenshot specs below: `linux_desktop` is a private import,

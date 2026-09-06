@@ -25,6 +25,9 @@ const usage =
     \\(`.astc_block = .@"4x4"` on the resource); an explicit --block here
     \\overrides every such pin.
     \\
+    \\  --allow-older-cli   proceed even when labelle.lock was written by a
+    \\                      NEWER labelle than this binary (#353).
+    \\
 ;
 
 /// Filesystem mtime probe for the re-encode cache decision (injected into the
@@ -74,6 +77,10 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // validate it against the backend instead of silently emitting an
     // unloadable file.
     var block_explicit = false;
+    // #353: the stale-CLI lock gate's escape hatch, accepted here too —
+    // `labelle astc` is dispatched before pipeline.run, so it owns its own
+    // copy of the flag (see the gate call below).
+    var allow_older_cli = false;
 
     var i: usize = 0;
     while (i < cmd_args.len) : (i += 1) {
@@ -87,6 +94,8 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             i += 1;
             if (i >= cmd_args.len) return usageErr("--quality needs a value");
             opts.quality = parseQuality(cmd_args[i]) orelse return usageErr("unknown --quality");
+        } else if (std.mem.eql(u8, arg, "--allow-older-cli")) {
+            allow_older_cli = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
             return;
@@ -102,7 +111,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // operation a stale binary silently mis-performs (per-atlas
     // `.astc_block` skipped → global block size → mangled art) — so it
     // enforces the lock itself.
-    lockfile.enforceCliNotStale(allocator, dir) catch std.process.exit(1);
+    lockfile.enforceCliNotStale(allocator, dir, allow_older_cli) catch std.process.exit(1);
 
     const cfg = config.readProjectConfigQuiet(allocator, dir) catch {
         std.debug.print("labelle astc: could not read project.labelle in '{s}'\n", .{dir});
