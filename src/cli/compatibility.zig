@@ -25,8 +25,8 @@ pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
     // this respect — see `compatWarnings`.)
     //
     // The real signal is a core range declared by the plugin itself in
-    // `plugin.labelle`; wiring that up needs this check to run after dependency
-    // resolution, when the manifest is on disk. Tracked in #332.
+    // `plugin.labelle`; validatePluginCoreCompat checks it after dependency
+    // installation, when the manifest is on disk (#332).
 
     if (warnings > 0) {
         std.debug.print("labelle: {d} compatibility warning(s) — proceeding anyway\n\n", .{warnings});
@@ -362,4 +362,412 @@ test "parseVersion: a prerelease or build suffix does not bleed into the patch" 
     try std.testing.expect(!parseVersion("1.30.1").olderThan(parseVersion("1.30.1-rc1")));
     // Build metadata has no precedence: 1.30.1+build is still 1.30.1.
     try std.testing.expect(!parseVersion("1.30.1+build7").olderThan(parseVersion("1.30.1")));
+}
+
+// ── Declared plugin→core ranges (#332) ────────────────────────────────
+//
+// The heuristic this replaces compared a plugin's MAJOR to core's MAJOR and had
+// no true-positive power: a plugin versions on its own train, so
+// `pathfinder 4.0.2` targeting core `1.24.1` is normal and was warned about
+// anyway (#230 carved out 0.x plugins; 4.x was the same false positive from the
+// other side). What carries real information is the plugin SAYING which cores
+// it supports.
+//
+// Three properties follow, all deliberate:
+//
+//   * **Absence means nothing is claimed**, not "compatible". A plugin with no
+//     `core_compat` is never warned about — that is the pre-#332 behavior and
+//     every existing plugin keeps it unchanged.
+//   * **A violated range is a WARNING, not a hard failure.** The declaration is
+//     the author's belief about a core they could not have tested against; the
+//     person running the build can see further than they could. Consistent with
+//     every other check in this file, which reports and proceeds.
+//   * **A malformed range is reported as malformed**, never silently treated as
+//     a version. See `parseSemver` for why that distinction needed its own
+//     parser rather than `parseVersion`.
+
+/// Comparison operator in a `core_compat` constraint.
+pub const RangeOp = enum { gte, gt, lte, lt, eq };
+
+/// Strict semver parse for DECLARED ranges.
+///
+/// `parseVersion` above is deliberately lenient — it skips anything non-numeric
+/// — which is right for a pin the toolchain produced but wrong for a string a
+/// human typed into a manifest: it reads `"banana"` as `0.0.0` and would report
+/// a typo as an incompatibility with core 0.0.0. It also builds each component
+/// with unchecked `*10 + digit`, so a long numeric token overflows.
+///
+/// `std.SemanticVersion` gets both right — `error.InvalidVersion` for junk and
+/// a partial triple, `error.Overflow` for an oversized component — and it
+/// implements real semver precedence, so `1.30.1-rc1` orders BELOW `1.30.1`
+/// instead of comparing equal to it, and `+build` metadata is ignored for
+/// ordering as the spec requires.
+fn parseSemver(text: []const u8) RangeError!std.SemanticVersion {
+    return std.SemanticVersion.parse(text) catch |err| switch (err) {
+        error.Overflow => error.VersionOverflow,
+        else => error.BadVersion,
+    };
+}
+
+/// One `<op><version>` term.
+pub const Constraint = struct {
+    op: RangeOp,
+    version: std.SemanticVersion,
+
+    pub fn satisfiedBy(self: Constraint, v: std.SemanticVersion) bool {
+        const ord = v.order(self.version);
+        return switch (self.op) {
+            .gte => ord != .lt,
+            .gt => ord == .gt,
+            .lte => ord != .gt,
+            .lt => ord == .lt,
+            .eq => ord == .eq,
+        };
+    }
+};
+
+/// Upper bound on terms in one range. A realistic declaration is one or two
+/// (`>=1.20.0 <2.0.0`); the cap keeps `Range` a fixed-size value with no
+/// allocation, so parsing cannot fail for memory reasons.
+pub const MAX_CONSTRAINTS = 4;
+
+pub const RangeError = error{
+    Empty,
+    TooManyConstraints,
+    MissingVersion,
+    BadVersion,
+    VersionOverflow,
+};
+
+/// A conjunction of constraints — every term must hold.
+pub const Range = struct {
+    items: [MAX_CONSTRAINTS]Constraint = undefined,
+    len: u8 = 0,
+
+    pub fn satisfiedBy(self: Range, v: std.SemanticVersion) bool {
+        for (self.items[0..self.len]) |c| {
+            if (!c.satisfiedBy(v)) return false;
+        }
+        return true;
+    }
+};
+
+/// Parse a `core_compat` string: whitespace- or comma-separated terms, each an
+/// optional operator followed by a semver. A bare version is an exact match.
+///
+///   ">=1.20.0 <2.0.0"   →  gte 1.20.0  AND  lt 2.0.0
+///   "1.24.1"            →  eq 1.24.1
+pub fn parseRange(text: []const u8) RangeError!Range {
+    var range = Range{};
+    var it = std.mem.tokenizeAny(u8, text, " \t,");
+    while (it.next()) |raw| {
+        if (range.len >= MAX_CONSTRAINTS) return error.TooManyConstraints;
+
+        var rest = raw;
+        var op: RangeOp = .eq;
+        // Two-character operators first: ">=" must not read as ">".
+        if (std.mem.startsWith(u8, rest, ">=")) {
+            op = .gte;
+            rest = rest[2..];
+        } else if (std.mem.startsWith(u8, rest, "<=")) {
+            op = .lte;
+            rest = rest[2..];
+        } else if (std.mem.startsWith(u8, rest, "==")) {
+            op = .eq;
+            rest = rest[2..];
+        } else if (std.mem.startsWith(u8, rest, ">")) {
+            op = .gt;
+            rest = rest[1..];
+        } else if (std.mem.startsWith(u8, rest, "<")) {
+            op = .lt;
+            rest = rest[1..];
+        } else if (std.mem.startsWith(u8, rest, "=")) {
+            op = .eq;
+            rest = rest[1..];
+        }
+
+        if (rest.len == 0) return error.MissingVersion;
+        range.items[range.len] = .{ .op = op, .version = try parseSemver(rest) };
+        range.len += 1;
+    }
+
+    if (range.len == 0) return error.Empty;
+    return range;
+}
+
+/// Human-readable reason for a malformed range, for the diagnostic.
+pub fn rangeErrorHint(err: RangeError) []const u8 {
+    return switch (err) {
+        error.Empty => "the range is empty",
+        error.TooManyConstraints => "too many terms (max 4)",
+        error.MissingVersion => "an operator has no version after it",
+        error.BadVersion => "a term is not a MAJOR.MINOR.PATCH semver",
+        error.VersionOverflow => "a version component is too large",
+    };
+}
+
+/// What a single plugin's declaration amounts to. Separated from the reporting
+/// so the decision is unit-testable without a filesystem or a core install.
+pub const CompatVerdict = union(enum) {
+    /// No `core_compat` in the manifest: the plugin claims nothing. Silent.
+    undeclared,
+    /// Declared and satisfied by the resolved core.
+    ok,
+    /// Declared and violated. Carries the declaration for the message.
+    violated: []const u8,
+    /// Declared but unparseable.
+    malformed: RangeError,
+    /// The core pin is not version-comparable (a `local:` / `@` dev override),
+    /// so no declaration can be judged against it. Silent, like the diamond
+    /// check's own local-override skip.
+    core_not_comparable,
+};
+
+/// Decide one plugin's verdict. Pure: takes the two strings, touches nothing.
+pub fn judgeCoreCompat(declared: ?[]const u8, core_version: []const u8) CompatVerdict {
+    const decl = declared orelse return .undeclared;
+    if (project_config.isLocalVersion(core_version)) return .core_not_comparable;
+
+    const range = parseRange(decl) catch |err| return .{ .malformed = err };
+    const core = parseSemver(core_version) catch return .core_not_comparable;
+
+    return if (range.satisfiedBy(core)) .ok else .{ .violated = decl };
+}
+
+/// Post-resolution plugin compatibility pass (#332).
+///
+/// Sequencing is the substance of this feature, not the comparison. The
+/// pre-resolve `validateCompatibility` runs on `ProjectConfig` alone, when no
+/// plugin manifest is on disk yet; this runs after the assembler's `install`
+/// has populated the package cache, which is the first moment
+/// `<plugin>/plugin.labelle` is readable for a REMOTE plugin. Calling it any
+/// earlier reads every remote plugin as undeclared and silently checks nothing.
+///
+/// Never fatal, and never propagates: a compat check must not be able to break
+/// a build it only had an opinion about. A plugin whose directory or manifest
+/// cannot be read is simply undeclared here — `labelle plugins` is the command
+/// that reports manifest trouble.
+pub fn validatePluginCoreCompat(
+    allocator: std.mem.Allocator,
+    cfg: project_config.ProjectConfig,
+    project_dir: []const u8,
+) void {
+    const warnings = countPluginCompatWarnings(allocator, cfg, project_dir, true);
+    if (warnings > 0) {
+        std.debug.print("labelle: {d} plugin compatibility warning(s) — proceeding anyway\n\n", .{warnings});
+    }
+}
+
+/// Count (and, when `emit`, report) declared-range violations.
+///
+/// Split out with the same `comptime emit` shape `compatWarnings` uses, so the
+/// decision is testable against a real plugin directory without capturing
+/// stderr — which is what makes the fixture tests below exercise the actual
+/// resolve → read → judge path rather than just `judgeCoreCompat`.
+///
+/// The counter is `usize`, not `u8`: the plugin list is unbounded, and a `u8`
+/// would overflow-trap at 256 warnings — turning a check that promises to
+/// "proceed anyway" into a crash on a project with many bad manifests.
+pub fn countPluginCompatWarnings(
+    allocator: std.mem.Allocator,
+    cfg: project_config.ProjectConfig,
+    project_dir: []const u8,
+    comptime emit: bool,
+) usize {
+    const plugins = @import("plugins.zig");
+
+    var warnings: usize = 0;
+    for (cfg.plugins) |dep| {
+        const dir = plugins.resolvePluginDir(allocator, project_dir, dep) catch continue;
+        defer allocator.free(dir);
+
+        var meta = (plugins.readPluginMeta(allocator, dir) catch continue) orelse continue;
+        defer meta.deinit();
+
+        switch (judgeCoreCompat(meta.core_compat, cfg.core_version)) {
+            .undeclared, .ok, .core_not_comparable => {},
+            .violated => |decl| {
+                warnings += 1;
+                if (emit) {
+                    std.debug.print(
+                        "labelle: warning: plugin {s} {s} declares core {s}, but this project pins core {s}\n",
+                        .{ dep.name, dep.version, decl, cfg.core_version },
+                    );
+                    std.debug.print("  the plugin author states it does not support this core\n", .{});
+                    std.debug.print("  hint: move core into the declared range, or upgrade the plugin\n\n", .{});
+                }
+            },
+            .malformed => |err| {
+                warnings += 1;
+                if (emit) {
+                    std.debug.print(
+                        "labelle: warning: plugin {s} has an unreadable .core_compat ({s}): \"{s}\"\n",
+                        .{ dep.name, rangeErrorHint(err), meta.core_compat orelse "" },
+                    );
+                    std.debug.print("  expected a range like \">=1.20.0 <2.0.0\" or an exact \"1.24.1\"\n", .{});
+                    std.debug.print("  the declaration is being IGNORED — compatibility is unchecked for this plugin\n\n", .{});
+                }
+            },
+        }
+    }
+
+    return warnings;
+}
+
+// ── Tests: declared ranges (#332) ─────────────────────────────────────
+
+test "parseRange: the documented two-term range" {
+    const r = try parseRange(">=1.20.0 <2.0.0");
+    try std.testing.expectEqual(@as(u8, 2), r.len);
+    try std.testing.expectEqual(RangeOp.gte, r.items[0].op);
+    try std.testing.expectEqual(RangeOp.lt, r.items[1].op);
+    try std.testing.expect(r.satisfiedBy(try std.SemanticVersion.parse("1.24.1")));
+    try std.testing.expect(r.satisfiedBy(try std.SemanticVersion.parse("1.20.0"))); // inclusive
+    try std.testing.expect(!r.satisfiedBy(try std.SemanticVersion.parse("1.19.9")));
+    try std.testing.expect(!r.satisfiedBy(try std.SemanticVersion.parse("2.0.0"))); // exclusive
+}
+
+test "parseRange: operators, separators and a bare exact version" {
+    try std.testing.expectEqual(RangeOp.eq, (try parseRange("1.24.1")).items[0].op);
+    try std.testing.expectEqual(RangeOp.eq, (try parseRange("=1.24.1")).items[0].op);
+    try std.testing.expectEqual(RangeOp.eq, (try parseRange("==1.24.1")).items[0].op);
+    try std.testing.expectEqual(RangeOp.gt, (try parseRange(">1.24.1")).items[0].op);
+    try std.testing.expectEqual(RangeOp.lte, (try parseRange("<=1.24.1")).items[0].op);
+    // ">=" must not be read as ">" with a stray "=".
+    try std.testing.expectEqual(RangeOp.gte, (try parseRange(">=1.24.1")).items[0].op);
+    // Commas and tabs separate terms just like spaces.
+    try std.testing.expectEqual(@as(u8, 2), (try parseRange(">=1.0.0,<2.0.0")).len);
+    try std.testing.expectEqual(@as(u8, 2), (try parseRange(">=1.0.0\t<2.0.0")).len);
+
+    const exact = try parseRange("1.24.1");
+    try std.testing.expect(exact.satisfiedBy(try std.SemanticVersion.parse("1.24.1")));
+    try std.testing.expect(!exact.satisfiedBy(try std.SemanticVersion.parse("1.24.2")));
+}
+
+test "parseRange: malformed declarations are errors, never silent zeros" {
+    try std.testing.expectError(error.Empty, parseRange(""));
+    try std.testing.expectError(error.Empty, parseRange("   "));
+    try std.testing.expectError(error.MissingVersion, parseRange(">="));
+    try std.testing.expectError(error.BadVersion, parseRange("banana"));
+    try std.testing.expectError(error.BadVersion, parseRange(">=1.2")); // not a full triple
+    try std.testing.expectError(error.BadVersion, parseRange(">=1.2.x"));
+    try std.testing.expectError(error.TooManyConstraints, parseRange(">=1.0.0 <2.0.0 >=3.0.0 <4.0.0 >=5.0.0"));
+
+    // The lenient `parseVersion` would read these as 0.0.0 and report a bogus
+    // incompatibility instead of a bad manifest.
+    try std.testing.expectEqual(@as(u32, 0), parseVersion("banana").major);
+}
+
+test "parseRange: a long numeric token overflows rather than trapping (cli review)" {
+    // A hand-typed manifest can contain anything. An earlier draft counted
+    // digits in a u8 and built components with unchecked `*10 + digit`, so a
+    // token like this could trap the CLI instead of warning about the manifest.
+    var buf: [512]u8 = undefined;
+    @memset(buf[0..300], '9');
+    const long_numeric = buf[0..300];
+    try std.testing.expectError(error.VersionOverflow, parseRange(long_numeric));
+
+    var dotted: [64]u8 = undefined;
+    @memset(dotted[0..20], '9');
+    dotted[20] = '.';
+    @memset(dotted[21..41], '9');
+    dotted[41] = '.';
+    @memset(dotted[42..62], '9');
+    try std.testing.expectError(error.VersionOverflow, parseRange(dotted[0..62]));
+
+    // And the hint is the overflow one, not the generic bad-version one.
+    try std.testing.expectEqualStrings(
+        "a version component is too large",
+        rangeErrorHint(error.VersionOverflow),
+    );
+}
+
+test "parseRange: prerelease sorts below its release, build metadata is ignored" {
+    // Semver precedence, which the numeric-triple comparison could not express:
+    // a release candidate does NOT satisfy a `>=` on its own release.
+    const gate = try parseRange(">=1.30.1");
+    try std.testing.expect(!gate.satisfiedBy(try std.SemanticVersion.parse("1.30.1-rc1")));
+    try std.testing.expect(gate.satisfiedBy(try std.SemanticVersion.parse("1.30.1")));
+
+    // A prerelease sorts below its stable release under semver precedence.
+    const upper = try parseRange("<2.0.0");
+    try std.testing.expect(upper.satisfiedBy(try std.SemanticVersion.parse("2.0.0-rc1")));
+    try std.testing.expect(!upper.satisfiedBy(try std.SemanticVersion.parse("2.0.0")));
+
+    // Build metadata carries no precedence.
+    const exact = try parseRange("1.24.1");
+    try std.testing.expect(exact.satisfiedBy(try std.SemanticVersion.parse("1.24.1+build7")));
+
+    // A declared range may itself name a prerelease.
+    const pre_gate = try parseRange(">=1.30.1-rc1");
+    try std.testing.expect(pre_gate.satisfiedBy(try std.SemanticVersion.parse("1.30.1")));
+    try std.testing.expect(!pre_gate.satisfiedBy(try std.SemanticVersion.parse("1.30.0")));
+}
+
+test "judgeCoreCompat: absence, match, mismatch, malformed" {
+    // ABSENCE — the pre-#332 behavior every existing plugin keeps. Crucially
+    // NOT "compatible": nothing is claimed, so nothing is judged.
+    try std.testing.expectEqual(CompatVerdict.undeclared, judgeCoreCompat(null, "1.24.1"));
+
+    // MATCH — the pathfinder case that used to produce a false positive.
+    try std.testing.expectEqual(CompatVerdict.ok, judgeCoreCompat(">=1.20.0 <2.0.0", "1.24.1"));
+
+    // MISMATCH — a real, declared violation.
+    switch (judgeCoreCompat(">=1.20.0 <2.0.0", "2.1.0")) {
+        .violated => |d| try std.testing.expectEqualStrings(">=1.20.0 <2.0.0", d),
+        else => return error.TestExpectedViolation,
+    }
+    switch (judgeCoreCompat(">=1.26.0", "1.24.1")) {
+        .violated => {},
+        else => return error.TestExpectedViolation,
+    }
+
+    // MALFORMED — reported as a manifest problem, not as an incompatibility.
+    switch (judgeCoreCompat("not-a-range", "1.24.1")) {
+        .malformed => |e| try std.testing.expectEqual(RangeError.BadVersion, e),
+        else => return error.TestExpectedMalformed,
+    }
+}
+
+test "judgeCoreCompat: a local core override is not comparable" {
+    // Same posture as the diamond check: a dev override has no version to
+    // judge, so declarations are skipped rather than guessed at.
+    try std.testing.expectEqual(
+        CompatVerdict.core_not_comparable,
+        judgeCoreCompat(">=1.20.0 <2.0.0", "local:../labelle-core"),
+    );
+    try std.testing.expectEqual(
+        CompatVerdict.core_not_comparable,
+        judgeCoreCompat(">=1.20.0 <2.0.0", "@../labelle-core"),
+    );
+    // An undeclared plugin stays undeclared even under an override — absence is
+    // decided before comparability.
+    try std.testing.expectEqual(
+        CompatVerdict.undeclared,
+        judgeCoreCompat(null, "local:../labelle-core"),
+    );
+}
+
+test "judgeCoreCompat: an unparseable core pin is skipped, not reported as violated" {
+    // A core pin the CLI cannot read is the CLI's problem, not the plugin's.
+    // Blaming the plugin here would be exactly the false positive #332 removes.
+    try std.testing.expectEqual(
+        CompatVerdict.core_not_comparable,
+        judgeCoreCompat(">=1.20.0 <2.0.0", "not-a-version"),
+    );
+}
+
+test "the plugin-vs-core heuristic stays gone (issue #230, #332)" {
+    // #332 does NOT reinstate version guessing. Plugins are judged only by what
+    // they DECLARE, so there is still no predicate that derives compatibility
+    // from a plugin's own version number, and `judgeCoreCompat` never sees one.
+    try std.testing.expect(!@hasDecl(@This(), "pluginCompatWarn"));
+    try std.testing.expect(@TypeOf(judgeCoreCompat) ==
+        fn (?[]const u8, []const u8) CompatVerdict);
+
+    // The regression that started it: pathfinder 4.0.2 on core 1.24.1 — a
+    // plugin four majors "ahead" of core — is silent when it declares nothing,
+    // and silent again when it declares a range that includes this core.
+    try std.testing.expectEqual(CompatVerdict.undeclared, judgeCoreCompat(null, "1.24.1"));
+    try std.testing.expectEqual(CompatVerdict.ok, judgeCoreCompat(">=1.20.0 <2.0.0", "1.24.1"));
 }

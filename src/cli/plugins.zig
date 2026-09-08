@@ -36,6 +36,11 @@ const ZonPluginMeta = struct {
     manifest_version: u8 = 1,
     license: ?[]const u8 = null,
     author: ?[]const u8 = null,
+    /// Declared range of labelle-core versions this plugin supports, e.g.
+    /// `">=1.20.0 <2.0.0"` (cli#332). Absent means the plugin claims nothing,
+    /// which is NOT the same as claiming universal compatibility — see
+    /// `compatibility.validatePluginCoreCompat`.
+    core_compat: ?[]const u8 = null,
 };
 
 /// Provenance metadata read from a plugin's `plugin.labelle`.
@@ -49,12 +54,17 @@ pub const PluginMeta = struct {
     license: ?[]const u8 = null,
     /// Author / vendor string, or null when the manifest omits it.
     author: ?[]const u8 = null,
+    /// Declared labelle-core range, or null when the manifest omits it
+    /// (cli#332). Kept as the raw string: parsing and reporting belong to
+    /// `compatibility.zig`, which owns the version machinery.
+    core_compat: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PluginMeta) void {
         self.allocator.free(self.name);
         if (self.license) |l| self.allocator.free(l);
         if (self.author) |a| self.allocator.free(a);
+        if (self.core_compat) |c| self.allocator.free(c);
     }
 };
 
@@ -109,12 +119,15 @@ pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) erro
     const license = if (parsed.license) |l| try allocator.dupe(u8, l) else null;
     errdefer if (license) |l| allocator.free(l);
     const author = if (parsed.author) |a| try allocator.dupe(u8, a) else null;
+    errdefer if (author) |a| allocator.free(a);
+    const core_compat = if (parsed.core_compat) |c| try allocator.dupe(u8, c) else null;
 
     return PluginMeta{
         .name = name,
         .manifest_version = parsed.manifest_version,
         .license = license,
         .author = author,
+        .core_compat = core_compat,
         .allocator = allocator,
     };
 }
@@ -128,7 +141,7 @@ pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) erro
 /// so there is no "not found" case to fold into a `null`; failures
 /// (`OutOfMemory`, `NoHomeDirectory` from cache-root resolution) are real and
 /// propagate to the caller.
-fn resolvePluginDir(
+pub fn resolvePluginDir(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
     dep: project_config.PluginDep,
@@ -314,6 +327,74 @@ pub const ReadPluginMetaSpec = struct {
             try std.testing.expectEqualStrings("bare", meta.name);
             try expect.toBeNull(meta.license);
             try expect.toBeNull(meta.author);
+        }
+    };
+
+    pub const declared_core_compat = struct {
+        test "reads .core_compat off the manifest (cli#332)" {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try writeManifest(tmp.dir,
+                \\.{
+                \\    .name = "pathfinder",
+                \\    .manifest_version = 1,
+                \\    .core_compat = ">=1.20.0 <2.0.0",
+                \\}
+            );
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const dir = try tmpRealPath(&tmp, &buf);
+
+            var meta = (try readPluginMeta(std.testing.allocator, dir)).?;
+            defer meta.deinit();
+
+            try std.testing.expectEqualStrings(">=1.20.0 <2.0.0", meta.core_compat.?);
+        }
+
+        test "a manifest without .core_compat reads as null, not as a range" {
+            // The whole point of the absence case: an existing plugin that
+            // never heard of #332 must keep reading as "claims nothing".
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try writeManifest(tmp.dir,
+                \\.{
+                \\    .name = "legacy",
+                \\    .manifest_version = 1,
+                \\    .license = "MIT",
+                \\}
+            );
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const dir = try tmpRealPath(&tmp, &buf);
+
+            var meta = (try readPluginMeta(std.testing.allocator, dir)).?;
+            defer meta.deinit();
+
+            try expect.toBeNull(meta.core_compat);
+            try std.testing.expectEqualStrings("MIT", meta.license.?);
+        }
+
+        test "an unknown future field does not break core_compat parsing" {
+            // `ignore_unknown_fields` is what keeps a newer manifest readable;
+            // guard it, since #332 adds the first field anyone might typo.
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try writeManifest(tmp.dir,
+                \\.{
+                \\    .name = "future",
+                \\    .manifest_version = 1,
+                \\    .core_compat = "1.24.1",
+                \\    .some_field_from_2027 = "whatever",
+                \\}
+            );
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const dir = try tmpRealPath(&tmp, &buf);
+
+            var meta = (try readPluginMeta(std.testing.allocator, dir)).?;
+            defer meta.deinit();
+
+            try std.testing.expectEqualStrings("1.24.1", meta.core_compat.?);
         }
     };
 

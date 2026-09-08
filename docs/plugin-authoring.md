@@ -336,3 +336,7 @@ Before the migration there was a 580-line `scripts/playing/01_pathfinder_bridge.
 - [`scripts/rules/README.md`](https://github.com/labelle-toolkit/flying-platform-labelle/blob/main/scripts/rules/README.md) — the runtime-rule vs. static-rule split; `no_plugin_bridges.zig` is the CI-level guardrail.
 - [`libs/pathfinder/`](https://github.com/labelle-toolkit/flying-platform-labelle/tree/main/libs/pathfinder) — canonical Controller implementation.
 - [`libs/worker_controller/`](https://github.com/labelle-toolkit/flying-platform-labelle/tree/main/libs/worker_controller) — Controller with no per-frame work (pure event handler).
+
+## Core compatibility
+
+Declare an optional `core_compat` range in `plugin.labelle` to warn when a project pins an unsupported core. See [the declaration syntax and validation behavior](plugin-core-compatibility.md).

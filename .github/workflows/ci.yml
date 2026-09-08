@@ -67,6 +67,10 @@ jobs:
       - name: CLI tests
         run: zig build test
 
+      - name: Plugin compatibility pipeline regression
+        if: runner.os != 'Windows'
+        run: python3 test/plugin_compat_e2e.py
+
       - name: Build assembler
         run: cd labelle-assembler && zig build
 
