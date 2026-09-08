@@ -546,6 +546,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // which depended on the assembler's `generator` module.
     try asm_bin.run(allocator, "install", &.{ "--project-root", project_dir });
 
+    // Plugin→core compatibility, the POST-RESOLVE half (#332).
+    //
+    // Deliberately here and not beside `validateCompatibility` above: that one
+    // runs on `ProjectConfig` alone, before any package exists on disk, so a
+    // remote plugin's `plugin.labelle` is simply not readable yet and every
+    // declaration would read as absent. `install` above is what populates the
+    // cache, so this is the first point where a declared `.core_compat` can be
+    // honored at all. Warn-only and non-fatal, like every other check in
+    // `compatibility.zig`.
+    compatibility.validatePluginCoreCompat(allocator, parsed, project_dir);
+
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
     defer allocator.free(output_dir);
