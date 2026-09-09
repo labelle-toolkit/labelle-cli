@@ -394,13 +394,19 @@ const OutputFsProbe = struct {
     case_insensitive: ?*const fn (io: std.Io, dir: *const std.Io.Dir) bool = null,
 };
 
+const CasePolicyCache = std.StringHashMapUnmanaged(bool);
+
 fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob, probe: OutputFsProbe) !?BlockClash {
     const io = config.globalIo();
     var seen: std.StringHashMapUnmanaged(struct { name: []const u8, block: convert.BlockSize }) = .empty;
+    var case_policy: CasePolicyCache = .empty;
     defer {
         var it = seen.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
         seen.deinit(allocator);
+        var policy_it = case_policy.keyIterator();
+        while (policy_it.next()) |k| allocator.free(k.*);
+        case_policy.deinit(allocator);
     }
     for (jobs) |job| {
         const src = try std.fs.path.join(allocator, &.{ job.base_dir, job.texture });
@@ -410,7 +416,7 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
         const out = try convert.outputPath(allocator, resolved);
         defer allocator.free(out);
 
-        const key = try outputCollisionKey(allocator, io, out, probe);
+        const key = try outputCollisionKey(allocator, io, out, probe, &case_policy);
         defer allocator.free(key);
 
         if (seen.get(key)) |existing| {
@@ -445,27 +451,27 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
 /// exists yet, the lexical path is kept. On a case-insensitive destination
 /// directory the basename is folded so `Rooms.astc` and `rooms.astc` share
 /// a key; the probe runs in that directory (not a global `/tmp` cache).
-fn outputCollisionKey(allocator: std.mem.Allocator, io: std.Io, lexical_out: []const u8, probe: OutputFsProbe) ![]u8 {
+fn outputCollisionKey(allocator: std.mem.Allocator, io: std.Io, lexical_out: []const u8, probe: OutputFsProbe, case_policy: *CasePolicyCache) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     if (cwd.realPathFileAlloc(io, lexical_out, allocator)) |real_z| {
         defer allocator.free(real_z);
-        return foldBasenameIfNeeded(allocator, io, real_z, probe);
+        return foldBasenameIfNeeded(allocator, io, real_z, probe, case_policy);
     } else |_| {}
 
     if (resolveOutputSymlinkTail(allocator, io, lexical_out)) |symlinked| {
         defer allocator.free(symlinked);
         if (cwd.realPathFileAlloc(io, symlinked, allocator)) |real_z| {
             defer allocator.free(real_z);
-            return foldBasenameIfNeeded(allocator, io, real_z, probe);
+            return foldBasenameIfNeeded(allocator, io, real_z, probe, case_policy);
         } else |_| {}
         const partial = try nearestExistingRealPath(allocator, io, symlinked);
         defer allocator.free(partial);
-        return foldBasenameIfNeeded(allocator, io, partial, probe);
+        return foldBasenameIfNeeded(allocator, io, partial, probe, case_policy);
     }
 
     const partial = try nearestExistingRealPath(allocator, io, lexical_out);
     defer allocator.free(partial);
-    return foldBasenameIfNeeded(allocator, io, partial, probe);
+    return foldBasenameIfNeeded(allocator, io, partial, probe, case_policy);
 }
 
 /// When the output basename is a symlink (even dangling), follow it so
@@ -522,13 +528,22 @@ fn nearestExistingRealPath(allocator: std.mem.Allocator, io: std.Io, path: []con
     }
 }
 
-fn foldBasenameIfNeeded(allocator: std.mem.Allocator, io: std.Io, path: []const u8, probe: OutputFsProbe) ![]u8 {
+fn foldBasenameIfNeeded(allocator: std.mem.Allocator, io: std.Io, path: []const u8, probe: OutputFsProbe, case_policy: *CasePolicyCache) ![]u8 {
     const parent = std.fs.path.dirname(path) orelse return try allocator.dupe(u8, path);
     if (parent.len == 0) return try allocator.dupe(u8, path);
     const cwd = std.Io.Dir.cwd();
-    var dir = cwd.openDir(io, parent, .{}) catch return try allocator.dupe(u8, path);
+    var dir = cwd.openDir(io, parent, .{ .iterate = true }) catch return try allocator.dupe(u8, path);
     defer dir.close(io);
-    if (!resolveDirCaseInsensitive(io, &dir, probe)) return try allocator.dupe(u8, path);
+    const is_case_insensitive = if (case_policy.get(parent)) |cached|
+        cached
+    else blk: {
+        const measured = resolveDirCaseInsensitive(io, &dir, probe);
+        const owned_parent = try allocator.dupe(u8, parent);
+        errdefer allocator.free(owned_parent);
+        try case_policy.put(allocator, owned_parent, measured);
+        break :blk measured;
+    };
+    if (!is_case_insensitive) return try allocator.dupe(u8, path);
     const base = std.fs.path.basename(path);
     const fold_source = canonicalExistingBasename(allocator, io, &dir, base) orelse base;
     defer if (fold_source.ptr != base.ptr) allocator.free(fold_source);
@@ -605,6 +620,8 @@ fn measureDirCaseInsensitive(io: std.Io, dir: *const std.Io.Dir, tag: []const u8
     var lower_buf: [std.fs.max_name_bytes]u8 = undefined;
     const lower = std.fmt.bufPrint(&lower_buf, "{s}-{s}-upper", .{ tag, suffix }) catch return false;
 
+    dir.deleteFile(io, upper) catch {};
+    dir.deleteFile(io, lower) catch {};
     dir.writeFile(io, .{ .sub_path = upper, .data = "x", .flags = .{ .exclusive = true } }) catch return false;
     defer dir.deleteFile(io, upper) catch {};
 
@@ -821,7 +838,7 @@ test "dirPathIsCaseInsensitive: matches independent filesystem measurement" {
 
 test "dirPathIsCaseInsensitive: leaves no probe files behind on miss" {
     const io = config.globalIo();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     _ = dirPathIsCaseInsensitive(io, &tmp.dir);
     var it = tmp.dir.iterate();
