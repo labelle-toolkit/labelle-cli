@@ -1,5 +1,11 @@
 ## CLI351 handoff — `labelle pack --trim` project root selection + Zig 0.16 fixes
 
+### Artifacts
+
+- **PR**: https://github.com/labelle-toolkit/labelle-cli/pull/383
+- **Branch**: `cursor/351-trim-output-project`
+- **Commit**: `76d50ea563fb1be853220264b0a24517b74f2ffe`
+
 ### What I changed
 
 `src/cli/pack.zig`
@@ -39,6 +45,15 @@ zig build test
 Notes:
 - `zig build test` is noisy (many CLI tests intentionally print warnings/errors while asserting behavior), but **the build exits 0**.
 - The fallback/precedence behavior is covered by `test "trim guard: ..."` cases in `src/cli/pack.zig`.
+
+### Test results recorded
+
+- `zig version` → `0.16.0`
+- `zig build test` → **exit 0**
+
+### Blockers
+
+- None known.
 
 ### PR intent / review notes
 
