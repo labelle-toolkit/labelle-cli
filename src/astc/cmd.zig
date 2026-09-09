@@ -477,15 +477,65 @@ fn outputCollisionKey(allocator: std.mem.Allocator, io: std.Io, lexical_out: []c
     return foldBasenameIfNeeded(allocator, io, partial, probe, case_policy);
 }
 
+const FileIdentity = struct {
+    volume: u64,
+    inode: u64,
+};
+
 /// Existing outputs are keyed by the file identity that the encoder will
 /// update, so hardlinks and output symlinks collide even on case-sensitive
-/// filesystems.
+/// filesystems. The volume/device is part of the identity: inode numbers are
+/// only unique within one filesystem.
 fn existingOutputInodeKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, path, .{}) catch return null;
     defer file.close(io);
-    const stat = file.stat(io) catch return null;
-    return std.fmt.allocPrint(allocator, "@inode:{d}", .{stat.inode}) catch null;
+    const identity = switch (builtin.os.tag) {
+        .windows => windowsFileIdentity(file.handle) catch return null,
+        .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .haiku, .serenity => posixFileIdentity(file.handle) catch return null,
+        else => return null,
+    };
+    return fileIdentityKey(allocator, identity);
+}
+
+fn fileIdentityKey(allocator: std.mem.Allocator, identity: FileIdentity) ?[]u8 {
+    return std.fmt.allocPrint(allocator, "@file:{d}:{d}", .{ identity.volume, identity.inode }) catch null;
+}
+
+fn posixFileIdentity(handle: std.posix.fd_t) !FileIdentity {
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(handle, &stat) != 0) return error.StatFailed;
+    return .{
+        .volume = @intCast(stat.dev),
+        .inode = @intCast(stat.ino),
+    };
+}
+
+fn windowsFileIdentity(handle: std.os.windows.HANDLE) !FileIdentity {
+    var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
+    var internal: std.os.windows.FILE.INTERNAL_INFORMATION = undefined;
+    const file_status = std.os.windows.ntdll.NtQueryInformationFile(
+        handle,
+        &iosb,
+        &internal,
+        @sizeOf(@TypeOf(internal)),
+        .Internal,
+    );
+    if (file_status != .SUCCESS) return error.StatFailed;
+
+    var volume: std.os.windows.FILE.FS_VOLUME_INFORMATION = undefined;
+    const volume_status = std.os.windows.ntdll.NtQueryVolumeInformationFile(
+        handle,
+        &iosb,
+        &volume,
+        @sizeOf(@TypeOf(volume)),
+        .Volume,
+    );
+    if (volume_status != .SUCCESS) return error.StatFailed;
+    return .{
+        .volume = volume.VolumeSerialNumber,
+        .inode = @intCast(internal.IndexNumber),
+    };
 }
 
 /// When the output basename is a symlink (even dangling), follow it so
@@ -734,6 +784,19 @@ test "conflictingBlockPin: distinct textures never clash" {
         .{ .name = "b", .base_dir = "/p", .texture = "b.png", .opts = .{ .block = .@"8x8" } },
     };
     try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
+}
+
+test "file identity key distinguishes devices with reused inode numbers" {
+    const a = std.testing.allocator;
+    const same = fileIdentityKey(a, .{ .volume = 17, .inode = 42 }).?;
+    defer a.free(same);
+    const other_volume = fileIdentityKey(a, .{ .volume = 18, .inode = 42 }).?;
+    defer a.free(other_volume);
+    const same_file = fileIdentityKey(a, .{ .volume = 17, .inode = 42 }).?;
+    defer a.free(same_file);
+
+    try std.testing.expect(!std.mem.eql(u8, same, other_volume));
+    try std.testing.expectEqualStrings(same, same_file);
 }
 
 test "conflictingBlockPin: symlinked texture dirs share one output" {
