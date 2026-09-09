@@ -67,6 +67,13 @@ fn candidateRoots(arena: std.mem.Allocator, input_dir: []const u8) ![]const []co
     return out.items;
 }
 
+/// Strip trailing slashes for path walking; keep "/" as "/" (`trimEnd` would
+/// yield "" and make root lookup probe the cwd instead of the filesystem root).
+fn trimTrailingSlash(path: []const u8) []const u8 {
+    if (path.len <= 1) return path;
+    return std.mem.trimEnd(u8, path, "/");
+}
+
 /// Whether a relative path climbs above the working directory. Lexical on
 /// purpose — `a/../b` stays inside, `../b` does not, and no filesystem
 /// access is needed to tell them apart.
@@ -93,7 +100,7 @@ fn escapesCwd(rel: []const u8) bool {
 /// the actual target's older renderer will position incorrectly.
 fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 {
     const io = config.globalIo();
-    const candidates = candidateRoots(arena, input_dir) catch return null;
+    const candidates = candidateRoots(arena, trimTrailingSlash(input_dir)) catch return null;
     for (candidates) |dir| {
         const probe = std.fs.path.join(arena, &.{ dir, "project.labelle" }) catch return null;
         if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| return dir else |_| {}
@@ -106,8 +113,8 @@ fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 
 /// discoverable `project.labelle` (or an unreadable one) skips the check
 /// rather than failing the pack.
 fn trimWarningProjectRoot(arena: std.mem.Allocator, input_dir: []const u8, out_dir: []const u8) ?[]const u8 {
-    const in_norm = std.mem.trimEnd(u8, input_dir, "/");
-    const out_norm = std.mem.trimEnd(u8, out_dir, "/");
+    const in_norm = trimTrailingSlash(input_dir);
+    const out_norm = trimTrailingSlash(out_dir);
 
     if (findProjectRoot(arena, in_norm)) |root| return root;
     if (std.mem.eql(u8, in_norm, out_norm)) return null;
@@ -211,7 +218,7 @@ pub fn cmdPack(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     };
 
     // Trim a trailing slash so basename/dirname behave as expected.
-    const in_trimmed = std.mem.trimEnd(u8, in, "/");
+    const in_trimmed = trimTrailingSlash(in);
     const name = name_opt orelse std.fs.path.basename(in_trimmed);
     const out_dir = out_dir_opt orelse (std.fs.path.dirname(in_trimmed) orelse ".");
 
@@ -290,6 +297,11 @@ test "rendererIgnoresTrim: later releases are fine" {
     try std.testing.expect(!rendererIgnoresTrim("2.0.0"));
 }
 
+test "trimTrailingSlash: preserves the filesystem root" {
+    try std.testing.expectEqualStrings("/", trimTrailingSlash("/"));
+    try std.testing.expectEqualStrings("/games/fp", trimTrailingSlash("/games/fp/"));
+}
+
 test "findProjectRoot: walks up from the input dir to the owning project" {
     // Regression guard: this returned null for every input at one point,
     // which silently disabled the --trim warning everywhere. A guard that
@@ -299,27 +311,25 @@ test "findProjectRoot: walks up from the input dir to the owning project" {
     defer arena.deinit();
     const a = arena.allocator();
     const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
 
-    const root = ".zig-cache/findroot-probe";
-    const nested = root ++ "/assets/raw/ship";
-    cwd.deleteTree(io, root) catch {};
-    try cwd.createDirPath(io, nested);
-    defer cwd.deleteTree(io, root) catch {};
-    try cwd.writeFile(io, .{ .sub_path = root ++ "/project.labelle", .data = ".{ .name = \"x\" }\n" });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try packTestBase(a, tmp);
+    const nested = try std.fs.path.join(a, &.{ root, "assets/raw/ship" });
+    try tmp.dir.createDirPath(io, "assets/raw/ship");
+    try tmp.dir.writeFile(io, .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\" }\n" });
 
     // From the project dir itself, and from several levels below it.
     const from_root = findProjectRoot(a, root) orelse return error.TestExpectedProjectRoot;
-    try std.testing.expect(std.mem.endsWith(u8, from_root, "findroot-probe"));
+    try std.testing.expectEqualStrings(root, from_root);
     const from_nested = findProjectRoot(a, nested) orelse return error.TestExpectedProjectRoot;
-    try std.testing.expect(std.mem.endsWith(u8, from_nested, "findroot-probe"));
+    try std.testing.expectEqualStrings(root, from_nested);
 
     // A directory with no project.labelle above it yields null rather than
     // reading someone else's project.
-    const orphan = ".zig-cache/findroot-orphan";
-    cwd.deleteTree(io, orphan) catch {};
-    try cwd.createDirPath(io, orphan);
-    defer cwd.deleteTree(io, orphan) catch {};
+    var orphan_tmp = std.testing.tmpDir(.{});
+    defer orphan_tmp.cleanup();
+    const orphan = try packTestBase(a, orphan_tmp);
     try std.testing.expect(findProjectRoot(a, orphan) == null);
 }
 
@@ -332,15 +342,14 @@ test "the trim guard reads the gfx pin from the discovered project" {
     defer arena.deinit();
     const a = arena.allocator();
     const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
 
-    const root = ".zig-cache/trimguard-probe";
-    const nested = root ++ "/assets/raw/ship";
-    cwd.deleteTree(io, root) catch {};
-    try cwd.createDirPath(io, nested);
-    defer cwd.deleteTree(io, root) catch {};
-    try cwd.writeFile(io, .{
-        .sub_path = root ++ "/project.labelle",
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try packTestBase(a, tmp);
+    const nested = try std.fs.path.join(a, &.{ root, "assets/raw/ship" });
+    try tmp.dir.createDirPath(io, "assets/raw/ship");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project.labelle",
         .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
     });
 
@@ -370,30 +379,30 @@ const Capture = struct {
     }
 };
 
+/// Cwd-relative path to a `std.testing.tmpDir` fixture (see `config.zig` tests).
+fn packTestBase(arena: std.mem.Allocator, tmp: std.testing.TmpDir) ![]const u8 {
+    return std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+}
+
 test "trim guard: falls back to the --out-dir project when input has none" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
     const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
 
-    const base = ".zig-cache/trimwarn-fallback";
-    const orphan_rel = base ++ "/orphan-sprites";
-    const out_root_rel = base ++ "/out-proj";
-    const out_assets_rel = out_root_rel ++ "/assets";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const orphan = try std.fs.path.join(a, &.{ base, "orphan-sprites" });
+    const out_assets = try std.fs.path.join(a, &.{ base, "out-proj/assets" });
 
-    cwd.deleteTree(io, base) catch {};
-    defer cwd.deleteTree(io, base) catch {};
-    try cwd.createDirPath(io, orphan_rel);
-    try cwd.createDirPath(io, out_assets_rel);
-    try cwd.writeFile(io, .{
-        .sub_path = out_root_rel ++ "/project.labelle",
+    try tmp.dir.createDirPath(io, "orphan-sprites");
+    try tmp.dir.createDirPath(io, "out-proj/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "out-proj/project.labelle",
         .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
     });
-
-    const orphan = try std.fs.path.resolve(a, &.{orphan_rel});
-    const out_assets = try std.fs.path.resolve(a, &.{out_assets_rel});
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -412,29 +421,23 @@ test "trim guard: input-project precedence even when --out-dir is another projec
     defer arena.deinit();
     const a = arena.allocator();
     const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
 
-    const base = ".zig-cache/trimwarn-precedence";
-    const in_root_rel = base ++ "/in-proj";
-    const in_sprites_rel = in_root_rel ++ "/assets/raw/ship";
-    const out_root_rel = base ++ "/out-proj";
-    const out_assets_rel = out_root_rel ++ "/assets";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const in_sprites = try std.fs.path.join(a, &.{ base, "in-proj/assets/raw/ship" });
+    const out_assets = try std.fs.path.join(a, &.{ base, "out-proj/assets" });
 
-    cwd.deleteTree(io, base) catch {};
-    defer cwd.deleteTree(io, base) catch {};
-    try cwd.createDirPath(io, in_sprites_rel);
-    try cwd.createDirPath(io, out_assets_rel);
-    try cwd.writeFile(io, .{
-        .sub_path = in_root_rel ++ "/project.labelle",
+    try tmp.dir.createDirPath(io, "in-proj/assets/raw/ship");
+    try tmp.dir.createDirPath(io, "out-proj/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "in-proj/project.labelle",
         .data = ".{ .name = \"in\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
     });
-    try cwd.writeFile(io, .{
-        .sub_path = out_root_rel ++ "/project.labelle",
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "out-proj/project.labelle",
         .data = ".{ .name = \"out\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
     });
-
-    const in_sprites = try std.fs.path.resolve(a, &.{in_sprites_rel});
-    const out_assets = try std.fs.path.resolve(a, &.{out_assets_rel});
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -449,24 +452,19 @@ test "trim guard: no duplicate warning when input and output share a project" {
     defer arena.deinit();
     const a = arena.allocator();
     const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
 
-    const base = ".zig-cache/trimwarn-nodup";
-    const root_rel = base ++ "/proj";
-    const in_rel = root_rel ++ "/sprites";
-    const out_rel = root_rel ++ "/assets";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const in_abs = try std.fs.path.join(a, &.{ base, "proj/sprites" });
+    const out_abs = try std.fs.path.join(a, &.{ base, "proj/assets" });
 
-    cwd.deleteTree(io, base) catch {};
-    defer cwd.deleteTree(io, base) catch {};
-    try cwd.createDirPath(io, in_rel);
-    try cwd.createDirPath(io, out_rel);
-    try cwd.writeFile(io, .{
-        .sub_path = root_rel ++ "/project.labelle",
+    try tmp.dir.createDirPath(io, "proj/sprites");
+    try tmp.dir.createDirPath(io, "proj/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj/project.labelle",
         .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
     });
-
-    const in_abs = try std.fs.path.resolve(a, &.{in_rel});
-    const out_abs = try std.fs.path.resolve(a, &.{out_rel});
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -483,29 +481,23 @@ test "trim guard: input-project precedence warns even if --out-dir is trim-aware
     defer arena.deinit();
     const a = arena.allocator();
     const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
 
-    const base = ".zig-cache/trimwarn-precedence-warn";
-    const in_root_rel = base ++ "/in-proj";
-    const in_sprites_rel = in_root_rel ++ "/assets/raw/ship";
-    const out_root_rel = base ++ "/out-proj";
-    const out_assets_rel = out_root_rel ++ "/assets";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const in_sprites = try std.fs.path.join(a, &.{ base, "in-proj/assets/raw/ship" });
+    const out_assets = try std.fs.path.join(a, &.{ base, "out-proj/assets" });
 
-    cwd.deleteTree(io, base) catch {};
-    defer cwd.deleteTree(io, base) catch {};
-    try cwd.createDirPath(io, in_sprites_rel);
-    try cwd.createDirPath(io, out_assets_rel);
-    try cwd.writeFile(io, .{
-        .sub_path = in_root_rel ++ "/project.labelle",
+    try tmp.dir.createDirPath(io, "in-proj/assets/raw/ship");
+    try tmp.dir.createDirPath(io, "out-proj/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "in-proj/project.labelle",
         .data = ".{ .name = \"in\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
     });
-    try cwd.writeFile(io, .{
-        .sub_path = out_root_rel ++ "/project.labelle",
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "out-proj/project.labelle",
         .data = ".{ .name = \"out\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
     });
-
-    const in_sprites = try std.fs.path.resolve(a, &.{in_sprites_rel});
-    const out_assets = try std.fs.path.resolve(a, &.{out_assets_rel});
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
