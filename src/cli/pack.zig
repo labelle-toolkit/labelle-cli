@@ -105,28 +105,59 @@ fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 
 /// offsets. Best-effort: `labelle pack` is usable outside a project, so no
 /// discoverable `project.labelle` (or an unreadable one) skips the check
 /// rather than failing the pack.
-fn warnIfRendererIgnoresTrim(gpa: std.mem.Allocator, input_dir: []const u8) void {
+fn trimWarningProjectRoot(arena: std.mem.Allocator, input_dir: []const u8, out_dir: []const u8) ?[]const u8 {
+    const in_norm = std.mem.trimEnd(u8, input_dir, "/");
+    const out_norm = std.mem.trimEnd(u8, out_dir, "/");
+
+    if (findProjectRoot(arena, in_norm)) |root| return root;
+    if (std.mem.eql(u8, in_norm, out_norm)) return null;
+
+    // The atlas is *consumed* by the output directory's project. When the
+    // sprites live outside any project but `--out-dir` points inside one,
+    // the output's gfx pin is the one that determines whether trim offsets
+    // will be applied.
+    return findProjectRoot(arena, out_norm);
+}
+
+const TRIM_WARNING_FMT =
+    \\labelle pack: WARNING — this project pins labelle-gfx {s}, which does NOT
+    \\  apply trim offsets (needs {d}.{d}.{d}+). A trimmed atlas will render with every
+    \\  frame centred on its own silhouette, shifting sprites frame to frame. Bump
+    \\  the gfx pin, or pack without --trim.
+    \\
+;
+
+fn warnIfRendererIgnoresTrimTo(
+    gpa: std.mem.Allocator,
+    input_dir: []const u8,
+    out_dir: []const u8,
+    writer: anytype,
+) !bool {
     // Arena for the parsed config, matching `cmdAstc`: the ZON parse
     // allocates a string per field and this function only needs one of
     // them, so a single arena free beats tracking them individually.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const root = findProjectRoot(arena.allocator(), input_dir) orelse return;
+    const root = trimWarningProjectRoot(arena.allocator(), input_dir, out_dir) orelse return false;
 
     // `gfx_version` is never null — it defaults to the CLI's own paired
     // version when project.labelle omits the pin, which is the right proxy
     // for "what this project will build against".
-    const cfg = config.readProjectConfigQuiet(arena.allocator(), root) catch return;
+    const cfg = config.readProjectConfigQuiet(arena.allocator(), root) catch return false;
     const pinned = cfg.gfx_version;
-    if (!rendererIgnoresTrim(pinned)) return;
-    std.debug.print(
-        \\labelle pack: WARNING — this project pins labelle-gfx {s}, which does NOT
-        \\  apply trim offsets (needs {d}.{d}.{d}+). A trimmed atlas will render with every
-        \\  frame centred on its own silhouette, shifting sprites frame to frame. Bump
-        \\  the gfx pin, or pack without --trim.
-        \\
-    , .{ pinned, TRIM_AWARE_GFX.major, TRIM_AWARE_GFX.minor, TRIM_AWARE_GFX.patch });
+    if (!rendererIgnoresTrim(pinned)) return false;
+    try writer.print(TRIM_WARNING_FMT, .{ pinned, TRIM_AWARE_GFX.major, TRIM_AWARE_GFX.minor, TRIM_AWARE_GFX.patch });
+    return true;
+}
+
+fn warnIfRendererIgnoresTrim(gpa: std.mem.Allocator, input_dir: []const u8, out_dir: []const u8) void {
+    const DebugWriter = struct {
+        fn print(_: @This(), comptime fmt: []const u8, args: anytype) !void {
+            std.debug.print(fmt, args);
+        }
+    };
+    _ = warnIfRendererIgnoresTrimTo(gpa, input_dir, out_dir, DebugWriter{}) catch {};
 }
 
 const usage =
@@ -184,7 +215,7 @@ pub fn cmdPack(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     const name = name_opt orelse std.fs.path.basename(in_trimmed);
     const out_dir = out_dir_opt orelse (std.fs.path.dirname(in_trimmed) orelse ".");
 
-    if (trim) warnIfRendererIgnoresTrim(allocator, in);
+    if (trim) warnIfRendererIgnoresTrim(allocator, in_trimmed, out_dir);
 
     const result = texpack.packDir(allocator, config.globalIo(), in, out_dir, name, .{
         .padding = padding,
@@ -317,6 +348,171 @@ test "the trim guard reads the gfx pin from the discovered project" {
     const cfg = try config.readProjectConfigQuiet(a, found);
     try std.testing.expectEqualStrings("1.30.0", cfg.gfx_version);
     try std.testing.expect(rendererIgnoresTrim(cfg.gfx_version));
+}
+
+fn countSubstr(hay: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, pos, needle)) |at| {
+        count += 1;
+        pos = at + needle.len;
+    }
+    return count;
+}
+
+const Capture = struct {
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    fn print(self: @This(), comptime fmt: []const u8, args: anytype) !void {
+        const s = try std.fmt.allocPrint(self.gpa, fmt, args);
+        defer self.gpa.free(s);
+        try self.buf.appendSlice(self.gpa, s);
+    }
+};
+
+test "trim guard: falls back to the --out-dir project when input has none" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const base = ".zig-cache/trimwarn-fallback";
+    const orphan_rel = base ++ "/orphan-sprites";
+    const out_root_rel = base ++ "/out-proj";
+    const out_assets_rel = out_root_rel ++ "/assets";
+
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, orphan_rel);
+    try cwd.createDirPath(io, out_assets_rel);
+    try cwd.writeFile(io, .{
+        .sub_path = out_root_rel ++ "/project.labelle",
+        .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+
+    const orphan = try std.fs.path.resolve(a, &.{orphan_rel});
+    const out_assets = try std.fs.path.resolve(a, &.{out_assets_rel});
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const did_warn = try warnIfRendererIgnoresTrimTo(alloc, orphan, out_assets, Capture{ .buf = &buf, .gpa = alloc });
+    try std.testing.expect(did_warn);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "WARNING") != null);
+    try std.testing.expectEqual(@as(usize, 1), countSubstr(buf.items, "WARNING"));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.30.0") != null);
+}
+
+test "trim guard: input-project precedence even when --out-dir is another project" {
+    // Input pins a trim-aware gfx; output pins an old one. This must not
+    // warn: the sprites "belong to" the input project when one exists.
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const base = ".zig-cache/trimwarn-precedence";
+    const in_root_rel = base ++ "/in-proj";
+    const in_sprites_rel = in_root_rel ++ "/assets/raw/ship";
+    const out_root_rel = base ++ "/out-proj";
+    const out_assets_rel = out_root_rel ++ "/assets";
+
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, in_sprites_rel);
+    try cwd.createDirPath(io, out_assets_rel);
+    try cwd.writeFile(io, .{
+        .sub_path = in_root_rel ++ "/project.labelle",
+        .data = ".{ .name = \"in\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = out_root_rel ++ "/project.labelle",
+        .data = ".{ .name = \"out\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+
+    const in_sprites = try std.fs.path.resolve(a, &.{in_sprites_rel});
+    const out_assets = try std.fs.path.resolve(a, &.{out_assets_rel});
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const did_warn = try warnIfRendererIgnoresTrimTo(alloc, in_sprites, out_assets, Capture{ .buf = &buf, .gpa = alloc });
+    try std.testing.expect(!did_warn);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "trim guard: no duplicate warning when input and output share a project" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const base = ".zig-cache/trimwarn-nodup";
+    const root_rel = base ++ "/proj";
+    const in_rel = root_rel ++ "/sprites";
+    const out_rel = root_rel ++ "/assets";
+
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, in_rel);
+    try cwd.createDirPath(io, out_rel);
+    try cwd.writeFile(io, .{
+        .sub_path = root_rel ++ "/project.labelle",
+        .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+
+    const in_abs = try std.fs.path.resolve(a, &.{in_rel});
+    const out_abs = try std.fs.path.resolve(a, &.{out_rel});
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const did_warn = try warnIfRendererIgnoresTrimTo(alloc, in_abs, out_abs, Capture{ .buf = &buf, .gpa = alloc });
+    try std.testing.expect(did_warn);
+    try std.testing.expectEqual(@as(usize, 1), countSubstr(buf.items, "WARNING"));
+}
+
+test "trim guard: input-project precedence warns even if --out-dir is trim-aware" {
+    // Input pins an old gfx; output pins a trim-aware one. Still warn: the
+    // input project owns the sprites when it exists.
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const base = ".zig-cache/trimwarn-precedence-warn";
+    const in_root_rel = base ++ "/in-proj";
+    const in_sprites_rel = in_root_rel ++ "/assets/raw/ship";
+    const out_root_rel = base ++ "/out-proj";
+    const out_assets_rel = out_root_rel ++ "/assets";
+
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, in_sprites_rel);
+    try cwd.createDirPath(io, out_assets_rel);
+    try cwd.writeFile(io, .{
+        .sub_path = in_root_rel ++ "/project.labelle",
+        .data = ".{ .name = \"in\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+    try cwd.writeFile(io, .{
+        .sub_path = out_root_rel ++ "/project.labelle",
+        .data = ".{ .name = \"out\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+    });
+
+    const in_sprites = try std.fs.path.resolve(a, &.{in_sprites_rel});
+    const out_assets = try std.fs.path.resolve(a, &.{out_assets_rel});
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const did_warn = try warnIfRendererIgnoresTrimTo(alloc, in_sprites, out_assets, Capture{ .buf = &buf, .gpa = alloc });
+    try std.testing.expect(did_warn);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.30.0") != null);
+    try std.testing.expectEqual(@as(usize, 1), countSubstr(buf.items, "WARNING"));
 }
 
 test "candidateRoots: a relative input ends at the CWD" {
