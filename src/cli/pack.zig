@@ -459,6 +459,14 @@ fn expectCanonicallyEqual(arena: std.mem.Allocator, want: []const u8, got: []con
     try std.testing.expectEqualStrings(try canonicalPath(arena, want), try canonicalPath(arena, got));
 }
 
+fn expectedSymlinkDotProject(arena: std.mem.Allocator, base: []const u8) ![]const u8 {
+    // Windows normalizes `..` before traversing the symlink, so the path
+    // operation stays under proj-a. POSIX traverses `link` first and climbs
+    // from proj-b/assets.
+    const project = if (@import("builtin").os.tag == .windows) "proj-a" else "proj-b";
+    return std.fs.path.join(arena, &.{ base, project });
+}
+
 test "trim guard: falls back to the --out-dir project when input has none" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -658,7 +666,11 @@ test "prepareLookupPath: collapses dot segments that escape cwd" {
     const a = arena.allocator();
 
     const got = try prepareLookupPath(a, "tmp/../../atlas");
-    try expectPathsEqual(a, "../atlas", got);
+    const want = if (@import("builtin").os.tag == .windows)
+        try std.fs.path.resolve(a, &.{ ".", "tmp", "..", "..", "atlas" })
+    else
+        "../atlas";
+    try expectPathsEqual(a, want, got);
     const inside = try prepareLookupPath(a, "assets/../assets/raw");
     try expectPathsEqual(a, "assets/raw", inside);
 }
@@ -803,7 +815,7 @@ test "findProjectRoot: symlink parent segment resolves before dot collapse" {
     });
     try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/link", .{ .is_directory = true });
 
-    const want = try std.fs.path.join(a, &.{ base, "proj-b" });
+    const want = try expectedSymlinkDotProject(a, base);
     const found = findProjectRoot(a, via_parent) orelse return error.TestExpectedProjectRoot;
     try expectCanonicallyEqual(a, want, found);
 
@@ -812,9 +824,13 @@ test "findProjectRoot: symlink parent segment resolves before dot collapse" {
     const orphan = try std.fs.path.join(a, &.{ base, "orphan-sprites" });
     try tmp.dir.createDirPath(io, "orphan-sprites");
     const did_warn = try warnIfRendererIgnoresTrimTo(alloc, orphan, via_parent, Capture{ .buf = &buf, .gpa = alloc });
-    try std.testing.expect(did_warn);
-    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.30.0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.31.0") == null);
+    if (@import("builtin").os.tag == .windows) {
+        try std.testing.expect(!did_warn);
+    } else {
+        try std.testing.expect(did_warn);
+        try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.30.0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.31.0") == null);
+    }
 }
 
 test "findProjectRoot: symlink parent segment with native windows separators" {
@@ -843,7 +859,7 @@ test "findProjectRoot: symlink parent segment with native windows separators" {
     });
     try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/link", .{ .is_directory = true });
 
-    const want = try std.fs.path.join(a, &.{ base, "proj-b" });
+    const want = try expectedSymlinkDotProject(a, base);
     const found = findProjectRoot(a, via_parent) orelse return error.TestExpectedProjectRoot;
     try expectCanonicallyEqual(a, want, found);
 }
