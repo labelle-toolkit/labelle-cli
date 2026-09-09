@@ -365,7 +365,14 @@ pub fn main(proc_init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "targets")) {
             parsed_args.command = .targets;
         } else {
-            // No command — treat as project dir, default to run
+            // Preserve the historical shorthand only for an existing
+            // directory. An arbitrary token is much more likely to be a
+            // misspelled command than a project path.
+            if (!isDirectoryShorthand(first)) {
+                std.debug.print("labelle: unknown command '{s}'\n", .{first});
+                std.debug.print("Run 'labelle help' to see available commands.\n", .{});
+                std.process.exit(1);
+            }
             const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return;
             parsed_args.project_dir = first;
             parsed_args.scene_override = result.scene;
@@ -462,6 +469,10 @@ pub fn main(proc_init: std.process.Init) !void {
     return pipeline.run(allocator, parsed_args);
 }
 
+fn isDirectoryShorthand(path: []const u8) bool {
+    return util.dirExists(path);
+}
+
 /// The usage printer for an invocation that can ONLY print usage, or null
 /// when it asks for real work. Pure and total: the single decision point
 /// `main` consults before any dispatch, so a new fast path cannot be
@@ -521,6 +532,16 @@ pub const HelpOnlyPrinterSpec = struct {
 
         test "ios build --help prints usage" {
             try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{ "build", "--help" }) != null);
+        }
+    };
+
+    pub const FirstArgumentSpec = struct {
+        test "an existing directory keeps the implicit run shorthand" {
+            try std.testing.expect(isDirectoryShorthand("."));
+        }
+
+        test "a missing directory is not accepted as an implicit run command" {
+            try std.testing.expect(!isDirectoryShorthand("definitely-not-a-labelle-directory"));
         }
     };
 

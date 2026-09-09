@@ -464,6 +464,15 @@ pub const ParseRunArgsPassthroughSpec = struct {
             try expect.equal(pa.extra_count, @as(usize, 1));
             try std.testing.expectEqualStrings("somedir", pa.extra_args[0]);
         }
+
+        test "explicit run directory remains accepted even when it is only parsed" {
+            var iter = testIter("missing-project --headless");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("missing-project", result.dir);
+            try std.testing.expect(pa.headless);
+        }
     };
 };
 
