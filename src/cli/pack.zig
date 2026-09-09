@@ -67,20 +67,33 @@ fn candidateRoots(arena: std.mem.Allocator, input_dir: []const u8) ![]const []co
     return out.items;
 }
 
-/// Strip trailing slashes for path walking; keep "/" as "/" (`trimEnd` would
-/// yield "" and make root lookup probe the cwd instead of the filesystem root).
+/// Strip trailing slashes for path walking; keep filesystem roots intact
+/// (`trimEnd` would turn `/` into "" and `C:/` into `C:`).
 fn trimTrailingSlash(path: []const u8) []const u8 {
     if (path.len <= 1) return path;
-    return std.mem.trimEnd(u8, path, "/");
+    var end = path.len;
+    while (end > 1) {
+        const c = path[end - 1];
+        if (c != '/' and !std.fs.path.isSep(c)) break;
+        const without = path[0 .. end - 1];
+        if (without.len == 0) return path[0..1];
+        // Drive root: trimming "C:/" or "C:\" must not become "C:".
+        if (without.len == 2 and without[1] == ':') return path[0..end];
+        end -= 1;
+    }
+    return path[0..end];
 }
 
 /// Whether a relative path climbs above the working directory. Lexical on
 /// purpose — `a/../b` stays inside, `../b` does not, and no filesystem
-/// access is needed to tell them apart.
+/// access is needed to tell them apart. Uses native path separators so
+/// Windows parent-relative inputs like `..\shared\sprites` are recognized.
 fn escapesCwd(rel: []const u8) bool {
+    if (std.fs.path.isAbsolute(rel)) return false;
     var depth: i32 = 0;
-    var it = std.mem.tokenizeScalar(u8, rel, '/');
-    while (it.next()) |seg| {
+    var it = std.fs.path.componentIterator(rel);
+    while (it.next()) |comp| {
+        const seg = comp.name;
         if (std.mem.eql(u8, seg, ".")) continue;
         if (std.mem.eql(u8, seg, "..")) {
             depth -= 1;
@@ -92,6 +105,46 @@ fn escapesCwd(rel: []const u8) bool {
     return false;
 }
 
+/// Collapse `.` / `..` segments before ancestor walking. `tmp/../../atlas`
+/// must become `../../atlas`, not a dirname chain that dips back into cwd.
+fn normalizeLookupPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fs.path.resolve(arena, &.{trimTrailingSlash(path)});
+}
+
+/// Resolve symlinks on the nearest existing ancestor so project lookup
+/// follows where the path actually lands (e.g. `assets -> ../other/assets`).
+fn resolveLookupSymlinks(arena: std.mem.Allocator, path: []const u8) []const u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    if (cwd.realPathFileAlloc(io, path, arena)) |real| {
+        return real[0 .. real.len];
+    } else |_| {}
+
+    var suffixes: std.ArrayList([]const u8) = .empty;
+    var dir = path;
+    while (true) {
+        const base = std.fs.path.basename(dir);
+        if (base.len != 0 and !std.mem.eql(u8, base, ".") and !std.mem.eql(u8, base, "..")) {
+            suffixes.append(arena, base) catch return path;
+        }
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (parent.len == 0 or std.mem.eql(u8, parent, dir)) break;
+        dir = parent;
+
+        if (cwd.realPathFileAlloc(io, dir, arena)) |real_parent| {
+            var result: []const u8 = real_parent[0 .. real_parent.len];
+            var i = suffixes.items.len;
+            while (i > 0) {
+                i -= 1;
+                result = std.fs.path.join(arena, &.{ result, suffixes.items[i] }) catch return path;
+            }
+            return result;
+        } else |_| {}
+    }
+    return path;
+}
+
 /// The nearest directory at or above `input_dir` holding a `project.labelle`,
 /// or null if there is none. `labelle pack` takes an arbitrary input path,
 /// so the owning project is the one the SPRITES belong to — not whatever
@@ -100,7 +153,9 @@ fn escapesCwd(rel: []const u8) bool {
 /// the actual target's older renderer will position incorrectly.
 fn findProjectRoot(arena: std.mem.Allocator, input_dir: []const u8) ?[]const u8 {
     const io = config.globalIo();
-    const candidates = candidateRoots(arena, trimTrailingSlash(input_dir)) catch return null;
+    const normalized = normalizeLookupPath(arena, input_dir) catch return null;
+    const resolved = resolveLookupSymlinks(arena, normalized);
+    const candidates = candidateRoots(arena, resolved) catch return null;
     for (candidates) |dir| {
         const probe = std.fs.path.join(arena, &.{ dir, "project.labelle" }) catch return null;
         if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| return dir else |_| {}
@@ -300,6 +355,9 @@ test "rendererIgnoresTrim: later releases are fine" {
 test "trimTrailingSlash: preserves the filesystem root" {
     try std.testing.expectEqualStrings("/", trimTrailingSlash("/"));
     try std.testing.expectEqualStrings("/games/fp", trimTrailingSlash("/games/fp/"));
+    // Windows drive roots must not collapse to drive-relative "C:".
+    try std.testing.expectEqualStrings("C:/", trimTrailingSlash("C:/"));
+    try std.testing.expectEqualStrings("C:/games/fp", trimTrailingSlash("C:/games/fp/"));
 }
 
 test "findProjectRoot: walks up from the input dir to the owning project" {
@@ -321,9 +379,11 @@ test "findProjectRoot: walks up from the input dir to the owning project" {
 
     // From the project dir itself, and from several levels below it.
     const from_root = findProjectRoot(a, root) orelse return error.TestExpectedProjectRoot;
-    try std.testing.expectEqualStrings(root, from_root);
+    const root_manifest = try std.fs.path.join(a, &.{ from_root, "project.labelle" });
+    _ = std.Io.Dir.cwd().statFile(io, root_manifest, .{}) catch return error.TestExpectedProjectRoot;
     const from_nested = findProjectRoot(a, nested) orelse return error.TestExpectedProjectRoot;
-    try std.testing.expectEqualStrings(root, from_nested);
+    const nested_manifest = try std.fs.path.join(a, &.{ from_nested, "project.labelle" });
+    _ = std.Io.Dir.cwd().statFile(io, nested_manifest, .{}) catch return error.TestExpectedProjectRoot;
 
     // A directory with no project.labelle above it yields null rather than
     // reading someone else's project.
@@ -568,4 +628,136 @@ test "escapesCwd: only a net-upward path escapes" {
     try std.testing.expect(!escapesCwd("assets/raw"));
     try std.testing.expect(!escapesCwd("./assets"));
     try std.testing.expect(!escapesCwd("a/../b"));
+}
+
+test "escapesCwd: windows-style parent-relative paths" {
+    if (@import("builtin").os.tag != .windows) return;
+    try std.testing.expect(escapesCwd("..\\shared\\sprites"));
+    try std.testing.expect(!escapesCwd("assets\\raw"));
+    try std.testing.expect(!escapesCwd("a\\..\\b"));
+}
+
+test "normalizeLookupPath: collapses dot segments that escape cwd" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try normalizeLookupPath(a, "tmp/../../atlas");
+    try std.testing.expectEqualStrings("../atlas", got);
+    const inside = try normalizeLookupPath(a, "assets/../assets/raw");
+    try std.testing.expectEqualStrings("assets/raw", inside);
+}
+
+test "findProjectRoot: filesystem root does not fall back to cwd" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // trimTrailingSlash must keep "/" so lookup probes the root, not cwd.
+    try std.testing.expect(findProjectRoot(arena.allocator(), "/") == null);
+}
+
+test "candidateRoots: dot-segment escape does not probe cwd" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const normalized = try normalizeLookupPath(a, "tmp/../../atlas");
+    const got = try candidateRoots(a, normalized);
+    for (got) |g| try std.testing.expect(!std.mem.eql(u8, g, "."));
+}
+
+test "trim guard: dot-segment out-dir escape does not use cwd project" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const orphan = try std.fs.path.join(a, &.{ base, "orphan-sprites" });
+    // Lexical dirname chain dips through proj-a/tmp/..; normalized it reaches proj-b.
+    const out_escaping = try std.fs.path.join(a, &.{ base, "proj-a/tmp/../../proj-b/outside-atlas" });
+
+    try tmp.dir.createDirPath(io, "orphan-sprites");
+    try tmp.dir.createDirPath(io, "proj-a/tmp");
+    try tmp.dir.createDirPath(io, "proj-b/outside-atlas");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj-a/project.labelle",
+        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj-b/project.labelle",
+        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const did_warn = try warnIfRendererIgnoresTrimTo(alloc, orphan, out_escaping, Capture{ .buf = &buf, .gpa = alloc });
+    try std.testing.expect(did_warn);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.30.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.31.0") == null);
+}
+
+test "trim guard: symlinked out-dir resolves to the target project" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const orphan = try std.fs.path.join(a, &.{ base, "orphan-sprites" });
+    const out_via_symlink = try std.fs.path.join(a, &.{ base, "proj-a/assets/atlases" });
+
+    try tmp.dir.createDirPath(io, "orphan-sprites");
+    try tmp.dir.createDirPath(io, "proj-a");
+    try tmp.dir.createDirPath(io, "proj-b/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj-a/project.labelle",
+        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj-b/project.labelle",
+        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+    try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/assets", .{ .is_directory = true });
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const did_warn = try warnIfRendererIgnoresTrimTo(alloc, orphan, out_via_symlink, Capture{ .buf = &buf, .gpa = alloc });
+    try std.testing.expect(did_warn);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.30.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "labelle-gfx 1.31.0") == null);
+}
+
+test "findProjectRoot: symlinked path with nonexistent leaf" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try packTestBase(a, tmp);
+    const out_leaf = try std.fs.path.join(a, &.{ base, "proj-a/assets/new-atlas" });
+
+    try tmp.dir.createDirPath(io, "proj-a");
+    try tmp.dir.createDirPath(io, "proj-b/assets");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj-a/project.labelle",
+        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "proj-b/project.labelle",
+        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+    });
+    try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/assets", .{ .is_directory = true });
+
+    const found = findProjectRoot(a, out_leaf) orelse return error.TestExpectedProjectRoot;
+    try std.testing.expect(std.mem.endsWith(u8, found, "proj-b"));
+    try std.testing.expect(!std.mem.endsWith(u8, found, "proj-a"));
 }
