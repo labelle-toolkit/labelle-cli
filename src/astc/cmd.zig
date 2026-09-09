@@ -400,6 +400,7 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
     const io = config.globalIo();
     var seen: std.StringHashMapUnmanaged(struct { name: []const u8, block: convert.BlockSize }) = .empty;
     var case_policy: CasePolicyCache = .empty;
+    const cwd = std.Io.Dir.cwd();
     defer {
         var it = seen.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
@@ -413,7 +414,13 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
         defer allocator.free(src);
         const resolved = try std.fs.path.resolve(allocator, &.{src});
         defer allocator.free(resolved);
-        const out = try convert.outputPath(allocator, resolved);
+        const source_identity = if (probe.case_insensitive == null)
+            cwd.realPathFileAlloc(io, resolved, allocator) catch null
+        else
+            null;
+        defer if (source_identity) |identity| allocator.free(identity);
+        const source_path = if (source_identity) |identity| identity else resolved;
+        const out = try convert.outputPath(allocator, source_path);
         defer allocator.free(out);
 
         const key = try outputCollisionKey(allocator, io, out, probe, &case_policy);
@@ -447,10 +454,11 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
 /// `realPath` is used — on macOS that normalizes case to the stored name
 /// when the file exists, but we do not assume that on every filesystem.
 /// When intermediate dirs exist but the `.astc` does not, the nearest
-/// existing ancestor is realpath'd and the tail is reattached. When nothing
-/// exists yet, the lexical path is kept. On a case-insensitive destination
-/// directory the basename is folded so `Rooms.astc` and `rooms.astc` share
-/// a key; the probe runs in that directory (not a global `/tmp` cache).
+/// existing ancestor is realpath'd and the tail is reattached. Existing
+/// source files are resolved before outputPath is called, so their stored
+/// spelling supplies the filesystem's case and Unicode-normalization
+/// semantics. For synthetic paths whose source is absent, the probe's ASCII
+/// fallback is only a best-effort compatibility aid.
 fn outputCollisionKey(allocator: std.mem.Allocator, io: std.Io, lexical_out: []const u8, probe: OutputFsProbe, case_policy: *CasePolicyCache) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     if (cwd.realPathFileAlloc(io, lexical_out, allocator)) |real_z| {
@@ -545,11 +553,14 @@ fn foldBasenameIfNeeded(allocator: std.mem.Allocator, io: std.Io, path: []const 
     };
     if (!is_case_insensitive) return try allocator.dupe(u8, path);
     const base = std.fs.path.basename(path);
-    const fold_source = canonicalExistingBasename(allocator, io, &dir, base) orelse base;
-    defer if (fold_source.ptr != base.ptr) allocator.free(fold_source);
-    const folded = try foldUnicodeBasenameAlloc(allocator, fold_source);
-    defer allocator.free(folded);
-    return std.fs.path.join(allocator, &.{ parent, folded });
+    if (canonicalExistingBasename(allocator, io, &dir, base)) |name| {
+        defer allocator.free(name);
+        return std.fs.path.join(allocator, &.{ parent, name });
+    }
+    var folded: [std.fs.max_name_bytes]u8 = undefined;
+    const base_len = @min(base.len, folded.len);
+    for (base[0..base_len], 0..) |byte, i| folded[i] = std.ascii.toLower(byte);
+    return std.fs.path.join(allocator, &.{ parent, folded[0..base_len] });
 }
 
 /// When `basename` already exists under a case or Unicode alias, return the
@@ -563,36 +574,6 @@ fn canonicalExistingBasename(allocator: std.mem.Allocator, io: std.Io, dir: *con
         if (entry.inode == st.inode) return allocator.dupe(u8, entry.name) catch null;
     }
     return null;
-}
-
-fn foldUnicodeBasenameAlloc(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    var buf: [std.fs.max_name_bytes]u8 = undefined;
-    const folded = try foldUnicodeBasename(&buf, name);
-    return try allocator.dupe(u8, folded);
-}
-
-fn foldUnicodeBasename(output: []u8, input: []const u8) ![]const u8 {
-    var out_i: usize = 0;
-    var i: usize = 0;
-    while (i < input.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch break;
-        if (i + seq_len > input.len) break;
-        const cp = std.unicode.utf8Decode(input[i .. i + seq_len]) catch break;
-        const lower = unicodeToFoldedLower(cp);
-        const encoded_len = std.unicode.utf8Encode(lower, output[out_i..]) catch return error.OutOfSpace;
-        out_i += encoded_len;
-        i += seq_len;
-    }
-    return output[0..out_i];
-}
-
-fn unicodeToFoldedLower(cp: u21) u21 {
-    if (cp >= 'A' and cp <= 'Z') return cp + 32;
-    return switch (cp) {
-        0x00C0...0x00D6 => cp + 32,
-        0x00D8...0x00DE => cp + 32,
-        else => cp,
-    };
 }
 
 fn resolveDirCaseInsensitive(io: std.Io, dir: *const std.Io.Dir, probe: OutputFsProbe) bool {
@@ -611,23 +592,32 @@ fn dirPathIsCaseInsensitive(io: std.Io, dir: *const std.Io.Dir) bool {
 var case_probe_serial: std.atomic.Value(u64) = .init(0);
 
 fn measureDirCaseInsensitive(io: std.Io, dir: *const std.Io.Dir, tag: []const u8) bool {
-    var suffix_buf: [32]u8 = undefined;
-    const suffix = std.fmt.bufPrint(&suffix_buf, "{x}", .{case_probe_serial.fetchAdd(1, .monotonic)}) catch return false;
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var random_buf: [8]u8 = undefined;
+        io.random(&random_buf);
+        const suffix = std.mem.readInt(u64, &random_buf, .little) ^ case_probe_serial.fetchAdd(1, .monotonic);
+        var upper_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const upper = std.fmt.bufPrint(&upper_buf, "{s}-{x}-UPPER", .{ tag, suffix }) catch return false;
+        var lower_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const lower = std.fmt.bufPrint(&lower_buf, "{s}-{x}-upper", .{ tag, suffix }) catch return false;
 
-    var upper_buf: [std.fs.max_name_bytes]u8 = undefined;
-    const upper = std.fmt.bufPrint(&upper_buf, "{s}-{s}-UPPER", .{ tag, suffix }) catch return false;
+        const upper_file = dir.createFile(io, upper, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return false,
+        };
+        upper_file.close(io);
+        defer dir.deleteFile(io, upper) catch {};
 
-    var lower_buf: [std.fs.max_name_bytes]u8 = undefined;
-    const lower = std.fmt.bufPrint(&lower_buf, "{s}-{s}-upper", .{ tag, suffix }) catch return false;
-
-    dir.deleteFile(io, upper) catch {};
-    dir.deleteFile(io, lower) catch {};
-    dir.writeFile(io, .{ .sub_path = upper, .data = "x", .flags = .{ .exclusive = true } }) catch return false;
-    defer dir.deleteFile(io, upper) catch {};
-
-    const opened = dir.openFile(io, lower, .{}) catch return false;
-    opened.close(io);
-    return true;
+        const lower_file = dir.createFile(io, lower, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => return true,
+            else => return false,
+        };
+        lower_file.close(io);
+        dir.deleteFile(io, lower) catch {};
+        return false;
+    }
+    return false;
 }
 
 /// An atlas resource pinning `block`, for the precedence tests.
@@ -847,6 +837,30 @@ test "dirPathIsCaseInsensitive: leaves no probe files behind on miss" {
     }
 }
 
+test "dirPathIsCaseInsensitive: preserves preexisting deterministic probe names" {
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle-ci-0-UPPER", .data = "upper sentinel" });
+    const lower_preexists = tmp.dir.openFile(io, ".labelle-ci-0-upper", .{}) catch null;
+    if (lower_preexists) |file| {
+        file.close(io);
+    } else {
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle-ci-0-upper", .data = "lower sentinel" });
+    }
+
+    _ = dirPathIsCaseInsensitive(io, &tmp.dir);
+
+    var upper: [64]u8 = undefined;
+    const upper_contents = try tmp.dir.readFile(io, ".labelle-ci-0-UPPER", &upper);
+    try std.testing.expectEqualStrings("upper sentinel", upper_contents);
+    if (lower_preexists == null) {
+        var lower: [64]u8 = undefined;
+        const lower_contents = try tmp.dir.readFile(io, ".labelle-ci-0-upper", &lower);
+        try std.testing.expectEqualStrings("lower sentinel", lower_contents);
+    }
+}
+
 test "conflictingBlockPin: case-only aliases follow filesystem case policy" {
     const a = std.testing.allocator;
     const io = config.globalIo();
@@ -869,6 +883,46 @@ test "conflictingBlockPin: case-only aliases follow filesystem case policy" {
         try std.testing.expectEqualStrings("lower", clash.second);
     } else {
         try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+    }
+}
+
+test "conflictingBlockPin: uses filesystem Unicode normalization for existing sources" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    const composed = "caf\u{e9}.png";
+    const decomposed = "cafe\u{301}.png";
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/" ++ composed, .data = "x" });
+
+    const composed_file = try tmp.dir.openFile(io, "assets/" ++ composed, .{});
+    defer composed_file.close(io);
+    const decomposed_file = tmp.dir.openFile(io, "assets/" ++ decomposed, .{}) catch null;
+    const aliases_same_file = if (decomposed_file) |file| blk: {
+        defer file.close(io);
+        const left = try composed_file.stat(io);
+        const right = try file.stat(io);
+        break :blk left.inode == right.inode;
+    } else false;
+    if (!aliases_same_file) {
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/" ++ decomposed, .data = "y" });
+    }
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "composed", .base_dir = base, .texture = "assets/" ++ composed, .opts = .{ .block = .@"4x4" } },
+        .{ .name = "decomposed", .base_dir = base, .texture = "assets/" ++ decomposed, .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = try conflictingBlockPin(a, &jobs);
+    if (aliases_same_file) {
+        try std.testing.expect(clash != null);
+        if (clash) |value| {
+            a.free(value.out);
+        }
+    } else {
+        try std.testing.expect(clash == null);
     }
 }
 
