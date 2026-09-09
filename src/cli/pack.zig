@@ -467,6 +467,11 @@ fn expectedSymlinkDotProject(arena: std.mem.Allocator, base: []const u8) ![]cons
     return std.fs.path.join(arena, &.{ base, project });
 }
 
+fn expectedWindowsResolvedPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), ".", arena);
+    return std.fs.path.resolve(arena, &.{ cwd_path, path });
+}
+
 test "trim guard: falls back to the --out-dir project when input has none" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -669,12 +674,15 @@ test "prepareLookupPath: collapses dot segments that escape cwd" {
     const want = if (@import("builtin").os.tag == .windows) blk: {
         // Windows path resolution produces the absolute destination used by
         // its file APIs when the unresolved tail escapes the cwd.
-        const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), ".", a);
-        break :blk try std.fs.path.resolve(a, &.{ cwd_path, "..", "atlas" });
+        break :blk try expectedWindowsResolvedPath(a, "../atlas");
     } else "../atlas";
     try expectPathsEqual(a, want, got);
     const inside = try prepareLookupPath(a, "assets/../assets/raw");
-    try expectPathsEqual(a, "assets/raw", inside);
+    const inside_want = if (@import("builtin").os.tag == .windows)
+        try expectedWindowsResolvedPath(a, "assets/raw")
+    else
+        "assets/raw";
+    try expectPathsEqual(a, inside_want, inside);
 }
 
 test "findProjectRoot: filesystem root does not fall back to cwd" {
