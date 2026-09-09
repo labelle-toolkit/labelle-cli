@@ -666,10 +666,12 @@ test "prepareLookupPath: collapses dot segments that escape cwd" {
     const a = arena.allocator();
 
     const got = try prepareLookupPath(a, "tmp/../../atlas");
-    const want = if (@import("builtin").os.tag == .windows)
-        try std.fs.path.resolve(a, &.{ ".", "tmp", "..", "..", "atlas" })
-    else
-        "../atlas";
+    const want = if (@import("builtin").os.tag == .windows) blk: {
+        // Windows path resolution produces the absolute destination used by
+        // its file APIs when the unresolved tail escapes the cwd.
+        const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), ".", a);
+        break :blk try std.fs.path.resolve(a, &.{ cwd_path, "..", "atlas" });
+    } else "../atlas";
     try expectPathsEqual(a, want, got);
     const inside = try prepareLookupPath(a, "assets/../assets/raw");
     try expectPathsEqual(a, "assets/raw", inside);
