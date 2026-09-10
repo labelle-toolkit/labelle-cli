@@ -197,11 +197,19 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // and one resource silently ships at a block it did not ask for. Refuse
     // instead of picking a winner.
     if (try conflictingBlockPin(allocator, atlases.items)) |clash| {
-        std.debug.print(
-            "labelle astc: atlases '{s}' and '{s}' both compile to '{s}' but pin different blocks " ++
-                "({s} vs {s}) — pin the same block on both\n",
-            .{ clash.first, clash.second, clash.out, clash.first_block.arg(), clash.second_block.arg() },
-        );
+        if (clash.different_sources) {
+            std.debug.print(
+                "labelle astc: atlases '{s}' and '{s}' use different source textures but both write '{s}' " ++
+                    "— give each source a distinct output\n",
+                .{ clash.first, clash.second, clash.out },
+            );
+        } else {
+            std.debug.print(
+                "labelle astc: atlases '{s}' and '{s}' both compile to '{s}' but pin different blocks " ++
+                    "({s} vs {s}) — pin the same block on both\n",
+                .{ clash.first, clash.second, clash.out, clash.first_block.arg(), clash.second_block.arg() },
+            );
+        }
         // A DISTINCT error, not `InvalidArgs`: the build pipeline treats a
         // failed conversion as non-fatal (it falls back to the source PNG),
         // which would let this rejection be logged and ignored — and worse,
@@ -370,6 +378,7 @@ const BlockClash = struct {
     second: []const u8,
     first_block: convert.BlockSize,
     second_block: convert.BlockSize,
+    different_sources: bool,
 };
 
 /// The first pair of atlases writing one `.astc` with disagreeing blocks,
@@ -398,11 +407,17 @@ const CasePolicyCache = std.StringHashMapUnmanaged(bool);
 
 fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob, probe: OutputFsProbe) !?BlockClash {
     const io = config.globalIo();
-    var seen: std.StringHashMapUnmanaged(struct { name: []const u8, block: convert.BlockSize }) = .empty;
+    var seen: std.StringHashMapUnmanaged(struct {
+        name: []const u8,
+        source: []u8,
+        block: convert.BlockSize,
+    }) = .empty;
     var case_policy: CasePolicyCache = .empty;
     defer {
         var it = seen.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
+        var value_it = seen.valueIterator();
+        while (value_it.next()) |value| allocator.free(value.source);
         seen.deinit(allocator);
         var policy_it = case_policy.keyIterator();
         while (policy_it.next()) |k| allocator.free(k.*);
@@ -416,11 +431,18 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
         const out = try convert.outputPath(allocator, resolved);
         defer allocator.free(out);
 
+        // Source identity is deliberately resolved independently of the
+        // output: a source symlink keeps its own output name, but two
+        // different source files must never share an output, even at the
+        // same block size.
+        const source = try sourceIdentityKey(allocator, io, src);
+        defer allocator.free(source);
         const key = try outputCollisionKey(allocator, io, out, probe, &case_policy);
         defer allocator.free(key);
 
         if (seen.get(key)) |existing| {
-            if (existing.block != job.opts.block) {
+            const different_sources = !std.mem.eql(u8, existing.source, source);
+            if (different_sources or existing.block != job.opts.block) {
                 const owned = try allocator.dupe(u8, out);
                 return .{
                     .out = owned,
@@ -428,13 +450,20 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
                     .second = job.name,
                     .first_block = existing.block,
                     .second_block = job.opts.block,
+                    .different_sources = different_sources,
                 };
             }
             continue;
         }
         const owned_key = try allocator.dupe(u8, key);
         errdefer allocator.free(owned_key);
-        try seen.put(allocator, owned_key, .{ .name = job.name, .block = job.opts.block });
+        const owned_source = try allocator.dupe(u8, source);
+        errdefer allocator.free(owned_source);
+        try seen.put(allocator, owned_key, .{
+            .name = job.name,
+            .source = owned_source,
+            .block = job.opts.block,
+        });
     }
     return null;
 }
@@ -498,6 +527,14 @@ fn existingOutputInodeKey(allocator: std.mem.Allocator, io: std.Io, path: []cons
     return fileIdentityKey(allocator, identity);
 }
 
+/// Return the actual source identity when the source exists. If it cannot be
+/// inspected, retain the resolved source path so synthetic/missing inputs
+/// still get deterministic collision behavior.
+fn sourceIdentityKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    if (existingOutputInodeKey(allocator, io, path)) |key| return key;
+    return std.fmt.allocPrint(allocator, "@path:{s}", .{path});
+}
+
 fn fileIdentityKey(allocator: std.mem.Allocator, identity: FileIdentity) ?[]u8 {
     return std.fmt.allocPrint(allocator, "@file:{d}:{d}", .{ identity.volume, identity.inode }) catch null;
 }
@@ -513,10 +550,7 @@ fn posixFileIdentity(handle: std.posix.fd_t) !FileIdentity {
             &stat,
         );
         if (result != 0) return error.StatFailed;
-        return .{
-            .volume = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
-            .inode = stat.ino,
-        };
+        return linuxFileIdentity(&stat);
     }
 
     var stat: std.c.Stat = undefined;
@@ -524,6 +558,14 @@ fn posixFileIdentity(handle: std.posix.fd_t) !FileIdentity {
     return .{
         .volume = @intCast(stat.dev),
         .inode = @intCast(stat.ino),
+    };
+}
+
+fn linuxFileIdentity(stat: *const std.os.linux.Statx) !FileIdentity {
+    if (!stat.mask.INO) return error.StatFailed;
+    return .{
+        .volume = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
+        .inode = stat.ino,
     };
 }
 
@@ -820,6 +862,21 @@ test "file identity key distinguishes devices with reused inode numbers" {
     try std.testing.expectEqualStrings(same, same_file);
 }
 
+test "linux file identity rejects statx results without an inode bit" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var stat: std.os.linux.Statx = undefined;
+    stat.mask = .{};
+    stat.dev_major = 1;
+    stat.dev_minor = 2;
+    stat.ino = 99;
+    try std.testing.expectError(error.StatFailed, linuxFileIdentity(&stat));
+
+    stat.mask = .{ .INO = true };
+    const identity = try linuxFileIdentity(&stat);
+    try std.testing.expectEqual(@as(u64, 99), identity.inode);
+    try std.testing.expectEqual(@as(u64, 0x00000001_00000002), identity.volume);
+}
+
 test "conflictingBlockPin: symlinked texture dirs share one output" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -902,6 +959,31 @@ test "conflictingBlockPin: hardlinked existing outputs share one inode key" {
     };
     const clash = (try conflictingBlockPin(a, &jobs)).?;
     defer a.free(clash.out);
+    try std.testing.expectEqualStrings("a", clash.first);
+    try std.testing.expectEqualStrings("b", clash.second);
+}
+
+test "conflictingBlockPin: distinct sources sharing an output clash at the same block" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.png", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/b.png", .data = "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.astc", .data = "existing" });
+    try tmp.dir.hardLink("assets/a.astc", tmp.dir, "assets/b.astc", io, .{});
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = base, .texture = "assets/a.png", .opts = .{ .block = .@"8x8" } },
+        .{ .name = "b", .base_dir = base, .texture = "assets/b.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expect(clash.different_sources);
     try std.testing.expectEqualStrings("a", clash.first);
     try std.testing.expectEqualStrings("b", clash.second);
 }
