@@ -7,6 +7,7 @@
 //! from free-tex-packer (FP) or `labelle pack`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../cli/config.zig");
 const project_config = @import("../cli/project_config.zig");
 const asm_cache = @import("../cli/asm_cache.zig");
@@ -196,11 +197,19 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // and one resource silently ships at a block it did not ask for. Refuse
     // instead of picking a winner.
     if (try conflictingBlockPin(allocator, atlases.items)) |clash| {
-        std.debug.print(
-            "labelle astc: atlases '{s}' and '{s}' both compile to '{s}' but pin different blocks " ++
-                "({s} vs {s}) — pin the same block on both\n",
-            .{ clash.first, clash.second, clash.out, clash.first_block.arg(), clash.second_block.arg() },
-        );
+        if (clash.different_sources) {
+            std.debug.print(
+                "labelle astc: atlases '{s}' and '{s}' use different source textures but both write '{s}' " ++
+                    "— give each source a distinct output\n",
+                .{ clash.first, clash.second, clash.out },
+            );
+        } else {
+            std.debug.print(
+                "labelle astc: atlases '{s}' and '{s}' both compile to '{s}' but pin different blocks " ++
+                    "({s} vs {s}) — pin the same block on both\n",
+                .{ clash.first, clash.second, clash.out, clash.first_block.arg(), clash.second_block.arg() },
+            );
+        }
         // A DISTINCT error, not `InvalidArgs`: the build pipeline treats a
         // failed conversion as non-fatal (it falls back to the source PNG),
         // which would let this rejection be logged and ignored — and worse,
@@ -369,6 +378,7 @@ const BlockClash = struct {
     second: []const u8,
     first_block: convert.BlockSize,
     second_block: convert.BlockSize,
+    different_sources: bool,
 };
 
 /// The first pair of atlases writing one `.astc` with disagreeing blocks,
@@ -384,11 +394,34 @@ const BlockClash = struct {
 /// resources whose pins differ but which both fall back to the backend
 /// default produce identical output and are fine.
 fn conflictingBlockPin(allocator: std.mem.Allocator, jobs: []const AtlasJob) !?BlockClash {
-    var seen: std.StringHashMapUnmanaged(struct { name: []const u8, block: convert.BlockSize }) = .empty;
+    return conflictingBlockPinProbe(allocator, jobs, .{});
+}
+
+/// Injectable probe for collision-key tests (e.g. simulate a case-insensitive
+/// destination on a case-sensitive host without a second mount).
+const OutputFsProbe = struct {
+    case_insensitive: ?*const fn (io: std.Io, dir: *const std.Io.Dir) bool = null,
+};
+
+const CasePolicyCache = std.StringHashMapUnmanaged(bool);
+
+fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob, probe: OutputFsProbe) !?BlockClash {
+    const io = config.globalIo();
+    var seen: std.StringHashMapUnmanaged(struct {
+        name: []const u8,
+        source: []u8,
+        block: convert.BlockSize,
+    }) = .empty;
+    var case_policy: CasePolicyCache = .empty;
     defer {
         var it = seen.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
+        var value_it = seen.valueIterator();
+        while (value_it.next()) |value| allocator.free(value.source);
         seen.deinit(allocator);
+        var policy_it = case_policy.keyIterator();
+        while (policy_it.next()) |k| allocator.free(k.*);
+        case_policy.deinit(allocator);
     }
     for (jobs) |job| {
         const src = try std.fs.path.join(allocator, &.{ job.base_dir, job.texture });
@@ -396,31 +429,314 @@ fn conflictingBlockPin(allocator: std.mem.Allocator, jobs: []const AtlasJob) !?B
         const resolved = try std.fs.path.resolve(allocator, &.{src});
         defer allocator.free(resolved);
         const out = try convert.outputPath(allocator, resolved);
-        errdefer allocator.free(out);
+        defer allocator.free(out);
 
-        const gop = try seen.getOrPut(allocator, out);
-        if (gop.found_existing) {
-            // This job's `out` duplicates a key the table already owns, so
-            // it has to go — but only AFTER the clash copy is safely made.
-            // Freeing first left the `errdefer` above armed across the
-            // `dupe`, so an allocation failure there freed `out` twice.
-            if (gop.value_ptr.block != job.opts.block) {
-                const owned = try allocator.dupe(u8, gop.key_ptr.*);
-                allocator.free(out);
+        // Source identity is deliberately resolved independently of the
+        // output: a source symlink keeps its own output name, but two
+        // different source files must never share an output, even at the
+        // same block size.
+        const source = try sourceIdentityKey(allocator, io, resolved);
+        defer allocator.free(source);
+        const key = try outputCollisionKey(allocator, io, out, probe, &case_policy);
+        defer allocator.free(key);
+
+        if (seen.get(key)) |existing| {
+            const different_sources = !std.mem.eql(u8, existing.source, source);
+            if (different_sources or existing.block != job.opts.block) {
+                const owned = try allocator.dupe(u8, out);
                 return .{
                     .out = owned,
-                    .first = gop.value_ptr.name,
+                    .first = existing.name,
                     .second = job.name,
-                    .first_block = gop.value_ptr.block,
+                    .first_block = existing.block,
                     .second_block = job.opts.block,
+                    .different_sources = different_sources,
                 };
             }
-            allocator.free(out);
             continue;
         }
-        gop.value_ptr.* = .{ .name = job.name, .block = job.opts.block };
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+        const owned_source = try allocator.dupe(u8, source);
+        errdefer allocator.free(owned_source);
+        try seen.put(allocator, owned_key, .{
+            .name = job.name,
+            .source = owned_source,
+            .block = job.opts.block,
+        });
     }
     return null;
+}
+
+/// Hash-map key for one `.astc` output. Lexical `resolve` already folds
+/// `./shared.png` spellings; this layer adds filesystem truth for symlink
+/// aliases, case-insensitive spellings, and outputs that do not exist yet.
+///
+/// When the output (or every ancestor needed to reach it) is on disk,
+/// `realPath` is used — on macOS that normalizes case to the stored name
+/// when the file exists, but we do not assume that on every filesystem.
+/// When intermediate dirs exist but the `.astc` does not, the nearest
+/// existing ancestor is realpath'd and the tail is reattached. Existing
+/// Existing outputs are keyed by inode identity before path canonicalization;
+/// missing outputs retain their declared basename. For synthetic paths whose
+/// source and output are absent, the probe's ASCII fallback is only a
+/// best-effort compatibility aid.
+fn outputCollisionKey(allocator: std.mem.Allocator, io: std.Io, lexical_out: []const u8, probe: OutputFsProbe, case_policy: *CasePolicyCache) ![]u8 {
+    const cwd = std.Io.Dir.cwd();
+    if (existingOutputInodeKey(allocator, io, lexical_out)) |key| return key;
+
+    if (cwd.realPathFileAlloc(io, lexical_out, allocator)) |real_z| {
+        defer allocator.free(real_z);
+        return foldBasenameIfNeeded(allocator, io, real_z, probe, case_policy);
+    } else |_| {}
+
+    if (resolveOutputSymlinkTail(allocator, io, lexical_out)) |symlinked| {
+        defer allocator.free(symlinked);
+        if (cwd.realPathFileAlloc(io, symlinked, allocator)) |real_z| {
+            defer allocator.free(real_z);
+            return foldBasenameIfNeeded(allocator, io, real_z, probe, case_policy);
+        } else |_| {}
+        const partial = try nearestExistingRealPath(allocator, io, symlinked);
+        defer allocator.free(partial);
+        return foldBasenameIfNeeded(allocator, io, partial, probe, case_policy);
+    }
+
+    const partial = try nearestExistingRealPath(allocator, io, lexical_out);
+    defer allocator.free(partial);
+    return foldBasenameIfNeeded(allocator, io, partial, probe, case_policy);
+}
+
+const FileIdentity = struct {
+    volume: u64,
+    inode: u64,
+};
+
+/// Existing outputs are keyed by the file identity that the encoder will
+/// update, so hardlinks and output symlinks collide even on case-sensitive
+/// filesystems. The volume/device is part of the identity: inode numbers are
+/// only unique within one filesystem.
+fn existingOutputInodeKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    const identity = switch (builtin.os.tag) {
+        .windows => windowsFileIdentity(file.handle) catch return null,
+        .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .haiku, .serenity => posixFileIdentity(file.handle) catch return null,
+        else => return null,
+    };
+    return fileIdentityKey(allocator, identity);
+}
+
+/// Return the actual source identity when the source exists. If it cannot be
+/// inspected, retain the resolved source path so synthetic/missing inputs
+/// still get deterministic collision behavior.
+fn sourceIdentityKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    if (existingOutputInodeKey(allocator, io, path)) |key| return key;
+    return std.fmt.allocPrint(allocator, "@path:{s}", .{path});
+}
+
+fn fileIdentityKey(allocator: std.mem.Allocator, identity: FileIdentity) ?[]u8 {
+    return std.fmt.allocPrint(allocator, "@file:{d}:{d}", .{ identity.volume, identity.inode }) catch null;
+}
+
+fn posixFileIdentity(handle: std.posix.fd_t) !FileIdentity {
+    if (builtin.os.tag == .linux) {
+        var stat: std.os.linux.Statx = undefined;
+        const result = std.c.statx(
+            handle,
+            "",
+            std.os.linux.AT.EMPTY_PATH,
+            std.os.linux.STATX.BASIC_STATS,
+            &stat,
+        );
+        if (result != 0) return error.StatFailed;
+        return linuxFileIdentity(&stat);
+    }
+
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(handle, &stat) != 0) return error.StatFailed;
+    return .{
+        .volume = @intCast(stat.dev),
+        .inode = @intCast(stat.ino),
+    };
+}
+
+fn linuxFileIdentity(stat: *const std.os.linux.Statx) !FileIdentity {
+    if (!stat.mask.INO) return error.StatFailed;
+    return .{
+        .volume = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
+        .inode = stat.ino,
+    };
+}
+
+fn windowsFileIdentity(handle: std.os.windows.HANDLE) !FileIdentity {
+    var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
+    var internal: std.os.windows.FILE.INTERNAL_INFORMATION = undefined;
+    const file_status = std.os.windows.ntdll.NtQueryInformationFile(
+        handle,
+        &iosb,
+        &internal,
+        @sizeOf(@TypeOf(internal)),
+        .Internal,
+    );
+    if (file_status != .SUCCESS) return error.StatFailed;
+
+    var volume: std.os.windows.FILE.FS_VOLUME_INFORMATION = undefined;
+    const volume_status = std.os.windows.ntdll.NtQueryVolumeInformationFile(
+        handle,
+        &iosb,
+        &volume,
+        @sizeOf(@TypeOf(volume)),
+        .Volume,
+    );
+    // FS_VOLUME_INFORMATION has a variable-length label after the fixed
+    // header; the fixed serial number is valid when the label does not fit.
+    switch (volume_status) {
+        .SUCCESS, .BUFFER_OVERFLOW => {},
+        else => return error.StatFailed,
+    }
+    return .{
+        .volume = volume.VolumeSerialNumber,
+        .inode = @intCast(internal.IndexNumber),
+    };
+}
+
+/// When the output basename is a symlink (even dangling), follow it so
+/// `foo.astc -> shared.astc` shares a key with `shared.astc`.
+fn resolveOutputSymlinkTail(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const parent = std.fs.path.dirname(path) orelse return null;
+    if (parent.len == 0) return null;
+    const base = std.fs.path.basename(path);
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, parent, .{}) catch return null;
+    defer dir.close(io);
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link_len = dir.readLink(io, base, &link_buf) catch return null;
+    const target = link_buf[0..link_len];
+    if (std.fs.path.isAbsolute(target)) return allocator.dupe(u8, target) catch null;
+    return std.fs.path.resolve(allocator, &.{ parent, target }) catch null;
+}
+
+/// When the `.astc` itself is missing, walk upward to the nearest existing
+/// ancestor, realpath it (resolving symlink aliases), then reattach the
+/// missing tail. A symlinked `linked/missing/` therefore shares a key with
+/// `assets/missing/`; when no ancestor exists, the lexical path is kept
+/// (covers `/p/foo.astc` unit-test fixtures).
+fn nearestExistingRealPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const cwd = std.Io.Dir.cwd();
+    var cursor = std.fs.path.dirname(path) orelse return try allocator.dupe(u8, path);
+    if (cursor.len == 0) return try allocator.dupe(u8, path);
+
+    var tail: std.ArrayList([]const u8) = .empty;
+    defer tail.deinit(allocator);
+
+    while (true) {
+        if (cursor.len == 0) return try allocator.dupe(u8, path);
+        cwd.access(io, cursor, .{}) catch {
+            try tail.append(allocator, std.fs.path.basename(cursor));
+            const parent = std.fs.path.dirname(cursor) orelse return try allocator.dupe(u8, path);
+            cursor = parent;
+            continue;
+        };
+        const real_ancestor = cwd.realPathFileAlloc(io, cursor, allocator) catch return try allocator.dupe(u8, path);
+        defer allocator.free(real_ancestor);
+
+        var result = try allocator.dupe(u8, real_ancestor);
+        var i = tail.items.len;
+        while (i > 0) {
+            i -= 1;
+            const joined = try std.fs.path.join(allocator, &.{ result, tail.items[i] });
+            allocator.free(result);
+            result = joined;
+        }
+        const with_base = try std.fs.path.join(allocator, &.{ result, std.fs.path.basename(path) });
+        allocator.free(result);
+        return with_base;
+    }
+}
+
+fn foldBasenameIfNeeded(allocator: std.mem.Allocator, io: std.Io, path: []const u8, probe: OutputFsProbe, case_policy: *CasePolicyCache) ![]u8 {
+    const parent = std.fs.path.dirname(path) orelse return try allocator.dupe(u8, path);
+    if (parent.len == 0) return try allocator.dupe(u8, path);
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, parent, .{ .iterate = true }) catch return try allocator.dupe(u8, path);
+    defer dir.close(io);
+    const is_case_insensitive = if (case_policy.get(parent)) |cached|
+        cached
+    else blk: {
+        const measured = resolveDirCaseInsensitive(io, &dir, probe);
+        const owned_parent = try allocator.dupe(u8, parent);
+        errdefer allocator.free(owned_parent);
+        try case_policy.put(allocator, owned_parent, measured);
+        break :blk measured;
+    };
+    if (!is_case_insensitive) return try allocator.dupe(u8, path);
+    const base = std.fs.path.basename(path);
+    if (canonicalExistingBasename(allocator, io, &dir, base)) |name| {
+        defer allocator.free(name);
+        return std.fs.path.join(allocator, &.{ parent, name });
+    }
+    var folded: [std.fs.max_name_bytes]u8 = undefined;
+    const base_len = @min(base.len, folded.len);
+    for (base[0..base_len], 0..) |byte, i| folded[i] = std.ascii.toLower(byte);
+    return std.fs.path.join(allocator, &.{ parent, folded[0..base_len] });
+}
+
+/// When `basename` already exists under a case or Unicode alias, return the
+/// on-disk spelling so folding matches the destination filesystem.
+fn canonicalExistingBasename(allocator: std.mem.Allocator, io: std.Io, dir: *const std.Io.Dir, basename: []const u8) ?[]u8 {
+    const opened = dir.openFile(io, basename, .{}) catch return null;
+    defer opened.close(io);
+    const st = opened.stat(io) catch return null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.inode == st.inode) return allocator.dupe(u8, entry.name) catch null;
+    }
+    return null;
+}
+
+fn resolveDirCaseInsensitive(io: std.Io, dir: *const std.Io.Dir, probe: OutputFsProbe) bool {
+    if (probe.case_insensitive) |override| return override(io, dir);
+    return dirPathIsCaseInsensitive(io, dir);
+}
+
+/// Create a uniquely named exclusive probe in `dir`; if the lowercase spelling
+/// opens the uppercase file, that directory's volume is case-insensitive.
+/// Only probe files created by this call are removed — preexisting names are
+/// never deleted.
+fn dirPathIsCaseInsensitive(io: std.Io, dir: *const std.Io.Dir) bool {
+    return measureDirCaseInsensitive(io, dir, ".labelle-ci");
+}
+
+var case_probe_serial: std.atomic.Value(u64) = .init(0);
+
+fn measureDirCaseInsensitive(io: std.Io, dir: *const std.Io.Dir, tag: []const u8) bool {
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var random_buf: [8]u8 = undefined;
+        io.random(&random_buf);
+        const suffix = std.mem.readInt(u64, &random_buf, .little) ^ case_probe_serial.fetchAdd(1, .monotonic);
+        var upper_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const upper = std.fmt.bufPrint(&upper_buf, "{s}-{x}-UPPER", .{ tag, suffix }) catch return false;
+        var lower_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const lower = std.fmt.bufPrint(&lower_buf, "{s}-{x}-upper", .{ tag, suffix }) catch return false;
+
+        const upper_file = dir.createFile(io, upper, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return false,
+        };
+        upper_file.close(io);
+        defer dir.deleteFile(io, upper) catch {};
+
+        const lower_file = dir.createFile(io, lower, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => return true,
+            else => return false,
+        };
+        lower_file.close(io);
+        dir.deleteFile(io, lower) catch {};
+        return false;
+    }
+    return false;
 }
 
 /// An atlas resource pinning `block`, for the precedence tests.
@@ -525,12 +841,494 @@ test "conflictingBlockPin: same output with the same block is fine" {
     try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
 }
 
+test "conflictingBlockPin: missing source lexical aliases retain one identity" {
+    for ([_][]const u8{ "./shared.png", "unused/../shared.png" }) |alias| {
+        const jobs = [_]AtlasJob{
+            .{ .name = "a", .base_dir = "/labelle-missing-source-fixture", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
+            .{ .name = "b", .base_dir = "/labelle-missing-source-fixture", .texture = alias, .opts = .{ .block = .@"4x4" } },
+        };
+        try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
+    }
+}
+
 test "conflictingBlockPin: distinct textures never clash" {
     const jobs = [_]AtlasJob{
         .{ .name = "a", .base_dir = "/p", .texture = "a.png", .opts = .{ .block = .@"4x4" } },
         .{ .name = "b", .base_dir = "/p", .texture = "b.png", .opts = .{ .block = .@"8x8" } },
     };
     try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
+}
+
+test "file identity key distinguishes devices with reused inode numbers" {
+    const a = std.testing.allocator;
+    const same = fileIdentityKey(a, .{ .volume = 17, .inode = 42 }).?;
+    defer a.free(same);
+    const other_volume = fileIdentityKey(a, .{ .volume = 18, .inode = 42 }).?;
+    defer a.free(other_volume);
+    const same_file = fileIdentityKey(a, .{ .volume = 17, .inode = 42 }).?;
+    defer a.free(same_file);
+
+    try std.testing.expect(!std.mem.eql(u8, same, other_volume));
+    try std.testing.expectEqualStrings(same, same_file);
+}
+
+test "linux file identity rejects statx results without an inode bit" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var stat: std.os.linux.Statx = undefined;
+    stat.mask = .{};
+    stat.dev_major = 1;
+    stat.dev_minor = 2;
+    stat.ino = 99;
+    try std.testing.expectError(error.StatFailed, linuxFileIdentity(&stat));
+
+    stat.mask = .{ .INO = true };
+    const identity = try linuxFileIdentity(&stat);
+    try std.testing.expectEqual(@as(u64, 99), identity.inode);
+    try std.testing.expectEqual(@as(u64, 0x00000001_00000002), identity.volume);
+}
+
+test "conflictingBlockPin: symlinked texture dirs share one output" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.symLink(io, "assets", "linked", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "via_assets", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "via_link", .base_dir = base, .texture = "linked/shared.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("via_assets", clash.first);
+    try std.testing.expectEqualStrings("via_link", clash.second);
+}
+
+test "conflictingBlockPin: source symlink keeps its declared output name" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.symLink(io, "assets/shared.png", "assets/foo.png", .{});
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "canonical", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "source_alias", .base_dir = base, .texture = "assets/foo.png", .opts = .{ .block = .@"8x8" } },
+    };
+    try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+}
+
+test "conflictingBlockPin: existing .astc reached through a symlink alias clashes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.astc", .data = "\x00\x00\x00\x00\x04\x04\x00\x00" });
+    try tmp.dir.symLink(io, "assets", "linked", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "canonical", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "alias", .base_dir = base, .texture = "linked/shared.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("canonical", clash.first);
+    try std.testing.expectEqualStrings("alias", clash.second);
+}
+
+test "conflictingBlockPin: hardlinked existing outputs share one inode key" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.png", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/b.png", .data = "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.astc", .data = "existing" });
+    try tmp.dir.hardLink("assets/a.astc", tmp.dir, "assets/b.astc", io, .{});
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = base, .texture = "assets/a.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "b", .base_dir = base, .texture = "assets/b.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("a", clash.first);
+    try std.testing.expectEqualStrings("b", clash.second);
+}
+
+test "conflictingBlockPin: distinct sources sharing an output clash at the same block" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.png", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/b.png", .data = "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.astc", .data = "existing" });
+    try tmp.dir.hardLink("assets/a.astc", tmp.dir, "assets/b.astc", io, .{});
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = base, .texture = "assets/a.png", .opts = .{ .block = .@"8x8" } },
+        .{ .name = "b", .base_dir = base, .texture = "assets/b.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expect(clash.different_sources);
+    try std.testing.expectEqualStrings("a", clash.first);
+    try std.testing.expectEqualStrings("b", clash.second);
+}
+
+test "conflictingBlockPin: not-yet-created outputs through symlink aliases clash" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.symLink(io, "assets", "linked", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "b", .base_dir = base, .texture = "linked/shared.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", clash.first_block);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", clash.second_block);
+}
+
+test "conflictingBlockPin: matching blocks through symlink aliases are fine" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.symLink(io, "assets", "linked", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "a", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"8x8" } },
+        .{ .name = "b", .base_dir = base, .texture = "linked/shared.png", .opts = .{ .block = .@"8x8" } },
+    };
+    try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+}
+
+/// Test-only measurement of a directory's case policy. Uses a separate probe
+/// tag from production so tests never gate on `dirPathIsCaseInsensitive`.
+fn testEstablishDirCaseInsensitive(io: std.Io, dir: *const std.Io.Dir) bool {
+    return measureDirCaseInsensitive(io, dir, ".labelle-fs-test");
+}
+
+test "dirPathIsCaseInsensitive: matches independent filesystem measurement" {
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const expected = testEstablishDirCaseInsensitive(io, &tmp.dir);
+    try std.testing.expectEqual(expected, dirPathIsCaseInsensitive(io, &tmp.dir));
+}
+
+test "dirPathIsCaseInsensitive: leaves no probe files behind on miss" {
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    _ = dirPathIsCaseInsensitive(io, &tmp.dir);
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".labelle-ci-"));
+    }
+}
+
+test "dirPathIsCaseInsensitive: preserves preexisting deterministic probe names" {
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle-ci-0-UPPER", .data = "upper sentinel" });
+    const lower_preexists = tmp.dir.openFile(io, ".labelle-ci-0-upper", .{}) catch null;
+    if (lower_preexists) |file| {
+        file.close(io);
+    } else {
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle-ci-0-upper", .data = "lower sentinel" });
+    }
+
+    _ = dirPathIsCaseInsensitive(io, &tmp.dir);
+
+    var upper: [64]u8 = undefined;
+    const upper_contents = try tmp.dir.readFile(io, ".labelle-ci-0-UPPER", &upper);
+    try std.testing.expectEqualStrings("upper sentinel", upper_contents);
+    if (lower_preexists == null) {
+        var lower: [64]u8 = undefined;
+        const lower_contents = try tmp.dir.readFile(io, ".labelle-ci-0-upper", &lower);
+        try std.testing.expectEqualStrings("lower sentinel", lower_contents);
+    }
+}
+
+test "conflictingBlockPin: case-only aliases follow filesystem case policy" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fs_ci = testEstablishDirCaseInsensitive(io, &tmp.dir);
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/Rooms.png", .data = "x" });
+    if (!fs_ci) try tmp.dir.writeFile(io, .{ .sub_path = "assets/rooms.png", .data = "y" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "upper", .base_dir = base, .texture = "assets/Rooms.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "lower", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"8x8" } },
+    };
+    if (fs_ci) {
+        const clash = (try conflictingBlockPin(a, &jobs)).?;
+        defer a.free(clash.out);
+        try std.testing.expectEqualStrings("upper", clash.first);
+        try std.testing.expectEqualStrings("lower", clash.second);
+    } else {
+        try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+    }
+}
+
+test "conflictingBlockPin: uses filesystem Unicode normalization for existing sources" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    const composed = "caf\u{e9}.png";
+    const decomposed = "cafe\u{301}.png";
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/" ++ composed, .data = "x" });
+
+    const composed_file = try tmp.dir.openFile(io, "assets/" ++ composed, .{});
+    defer composed_file.close(io);
+    const decomposed_file = tmp.dir.openFile(io, "assets/" ++ decomposed, .{}) catch null;
+    const aliases_same_file = if (decomposed_file) |file| blk: {
+        defer file.close(io);
+        const left = try composed_file.stat(io);
+        const right = try file.stat(io);
+        break :blk left.inode == right.inode;
+    } else false;
+    if (!aliases_same_file) {
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/" ++ decomposed, .data = "y" });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/caf\u{e9}.astc", .data = "existing" });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "composed", .base_dir = base, .texture = "assets/" ++ composed, .opts = .{ .block = .@"4x4" } },
+        .{ .name = "decomposed", .base_dir = base, .texture = "assets/" ++ decomposed, .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = try conflictingBlockPin(a, &jobs);
+    if (aliases_same_file) {
+        try std.testing.expect(clash != null);
+        if (clash) |value| a.free(value.out);
+    } else try std.testing.expect(clash == null);
+}
+
+test "conflictingBlockPin: case aliases with matching blocks are fine on case-insensitive volumes" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fs_ci = testEstablishDirCaseInsensitive(io, &tmp.dir);
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/Rooms.png", .data = "x" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "upper", .base_dir = base, .texture = "assets/Rooms.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "lower", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"4x4" } },
+    };
+    if (fs_ci) {
+        try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+    } else {
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/rooms.png", .data = "y" });
+        try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+    }
+}
+
+test "conflictingBlockPin: multi-level missing outputs through symlink aliases clash" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.symLink(io, "assets", "linked", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "via_assets", .base_dir = base, .texture = "assets/missing/deep/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "via_link", .base_dir = base, .texture = "linked/missing/deep/shared.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("via_assets", clash.first);
+    try std.testing.expectEqualStrings("via_link", clash.second);
+}
+
+test "nearestExistingRealPath: walks past missing dirs and resolves symlink aliases" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.symLink(io, "assets", "linked", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const missing = try std.fs.path.join(a, &.{ base, "linked/missing/deep/out.astc" });
+    defer a.free(missing);
+    const resolved = try nearestExistingRealPath(a, io, missing);
+    defer a.free(resolved);
+    const expected = try std.fs.path.join(a, &.{ base, "assets/missing/deep/out.astc" });
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+fn probeAlwaysCaseInsensitive(_: std.Io, _: *const std.Io.Dir) bool {
+    return true;
+}
+
+fn probeAlwaysCaseSensitive(_: std.Io, _: *const std.Io.Dir) bool {
+    return false;
+}
+
+test "conflictingBlockPin: injected case-insensitive probe clashes case aliases" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/Rooms.png", .data = "x" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "upper", .base_dir = base, .texture = "assets/Rooms.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "lower", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const probe: OutputFsProbe = .{ .case_insensitive = probeAlwaysCaseInsensitive };
+    const clash = (try conflictingBlockPinProbe(a, &jobs, probe)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("upper", clash.first);
+    try std.testing.expectEqualStrings("lower", clash.second);
+}
+
+test "conflictingBlockPin: dangling output symlink aliases share one key" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/foo.png", .data = "x" });
+    // `shared.astc` does not exist yet; astcenc would follow this link and write there.
+    try tmp.dir.symLink(io, "shared.astc", "assets/foo.astc", .{});
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "canonical", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "via_symlink", .base_dir = base, .texture = "assets/foo.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("canonical", clash.first);
+    try std.testing.expectEqualStrings("via_symlink", clash.second);
+}
+
+test "conflictingBlockPin: existing output symlink aliases share one inode key" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.png", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/foo.png", .data = "y" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/shared.astc", .data = "existing" });
+    try tmp.dir.symLink(io, "shared.astc", "assets/foo.astc", .{});
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "canonical", .base_dir = base, .texture = "assets/shared.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "via_symlink", .base_dir = base, .texture = "assets/foo.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const clash = (try conflictingBlockPin(a, &jobs)).?;
+    defer a.free(clash.out);
+    try std.testing.expectEqualStrings("canonical", clash.first);
+    try std.testing.expectEqualStrings("via_symlink", clash.second);
+}
+
+test "conflictingBlockPin: non-ASCII case aliases follow filesystem case policy" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fs_ci = testEstablishDirCaseInsensitive(io, &tmp.dir);
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/\u{00c4}.png", .data = "x" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "upper", .base_dir = base, .texture = "assets/\u{00c4}.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "lower", .base_dir = base, .texture = "assets/\u{00e4}.png", .opts = .{ .block = .@"8x8" } },
+    };
+    if (fs_ci) {
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/\u{00c4}.astc", .data = "existing" });
+        const clash = (try conflictingBlockPin(a, &jobs)).?;
+        defer a.free(clash.out);
+        try std.testing.expectEqualStrings("upper", clash.first);
+        try std.testing.expectEqualStrings("lower", clash.second);
+    } else {
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/\u{00e4}.png", .data = "y" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/\u{00c4}.astc", .data = "upper" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "assets/\u{00e4}.astc", .data = "lower" });
+        try std.testing.expect((try conflictingBlockPin(a, &jobs)) == null);
+    }
+}
+
+test "conflictingBlockPin: injected case-sensitive probe keeps case aliases distinct" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/Rooms.png", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/rooms.png", .data = "b" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const jobs = [_]AtlasJob{
+        .{ .name = "upper", .base_dir = base, .texture = "assets/Rooms.png", .opts = .{ .block = .@"4x4" } },
+        .{ .name = "lower", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"8x8" } },
+    };
+    const probe: OutputFsProbe = .{ .case_insensitive = probeAlwaysCaseSensitive };
+    try std.testing.expect((try conflictingBlockPinProbe(a, &jobs, probe)) == null);
 }
 
 test "BackendCaps: bgfx rejects blocks it cannot actually upload" {
