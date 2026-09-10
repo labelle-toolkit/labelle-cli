@@ -435,7 +435,7 @@ fn conflictingBlockPinProbe(allocator: std.mem.Allocator, jobs: []const AtlasJob
         // output: a source symlink keeps its own output name, but two
         // different source files must never share an output, even at the
         // same block size.
-        const source = try sourceIdentityKey(allocator, io, src);
+        const source = try sourceIdentityKey(allocator, io, resolved);
         defer allocator.free(source);
         const key = try outputCollisionKey(allocator, io, out, probe, &case_policy);
         defer allocator.free(key);
@@ -839,6 +839,16 @@ test "conflictingBlockPin: same output with the same block is fine" {
         .{ .name = "b", .base_dir = "/p", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
     };
     try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
+}
+
+test "conflictingBlockPin: missing source lexical aliases retain one identity" {
+    for ([_][]const u8{ "./shared.png", "unused/../shared.png" }) |alias| {
+        const jobs = [_]AtlasJob{
+            .{ .name = "a", .base_dir = "/labelle-missing-source-fixture", .texture = "shared.png", .opts = .{ .block = .@"4x4" } },
+            .{ .name = "b", .base_dir = "/labelle-missing-source-fixture", .texture = alias, .opts = .{ .block = .@"4x4" } },
+        };
+        try std.testing.expect((try conflictingBlockPin(std.testing.allocator, &jobs)) == null);
+    }
 }
 
 test "conflictingBlockPin: distinct textures never clash" {
