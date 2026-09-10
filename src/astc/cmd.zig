@@ -503,6 +503,22 @@ fn fileIdentityKey(allocator: std.mem.Allocator, identity: FileIdentity) ?[]u8 {
 }
 
 fn posixFileIdentity(handle: std.posix.fd_t) !FileIdentity {
+    if (builtin.os.tag == .linux) {
+        var stat: std.os.linux.Statx = undefined;
+        const result = std.c.statx(
+            handle,
+            "",
+            std.os.linux.AT.EMPTY_PATH,
+            std.os.linux.STATX.BASIC_STATS,
+            &stat,
+        );
+        if (result != 0) return error.StatFailed;
+        return .{
+            .volume = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
+            .inode = stat.ino,
+        };
+    }
+
     var stat: std.c.Stat = undefined;
     if (std.c.fstat(handle, &stat) != 0) return error.StatFailed;
     return .{
@@ -531,7 +547,12 @@ fn windowsFileIdentity(handle: std.os.windows.HANDLE) !FileIdentity {
         @sizeOf(@TypeOf(volume)),
         .Volume,
     );
-    if (volume_status != .SUCCESS) return error.StatFailed;
+    // FS_VOLUME_INFORMATION has a variable-length label after the fixed
+    // header; the fixed serial number is valid when the label does not fit.
+    switch (volume_status) {
+        .SUCCESS, .BUFFER_OVERFLOW => {},
+        else => return error.StatFailed,
+    }
     return .{
         .volume = volume.VolumeSerialNumber,
         .inode = @intCast(internal.IndexNumber),
