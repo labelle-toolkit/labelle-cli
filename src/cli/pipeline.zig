@@ -64,6 +64,24 @@ const WasmRebuildCtx = struct {
     /// like a failing `generate` or `zig build` already does — not exit
     /// the process out from under the serve loop.
     prebuild_opts: prebuild.Options,
+    /// The shader-compiler override gate, run AFTER the prebuild hooks and
+    /// BEFORE generation on every rebuild — the same function the cold
+    /// pipeline runs before its `assembler generate`. It is a field only so
+    /// the stage test below can supply the override value without touching
+    /// the process environment; production never overrides the default.
+    shader_preflight: *const fn (std.mem.Allocator, []const u8) anyerror!void = material_toolchain.preflight,
+
+    /// Which stage a rebuild stopped at. Ordered as the stages run; the
+    /// watch loop only needs the bool, but the test asserts the ORDER —
+    /// that the shader preflight fires before generation is attempted.
+    const Stage = error{
+        PrebuildFailed,
+        ShaderPreflightFailed,
+        GenerateFailed,
+        FingerprintFailed,
+        ZigSpawnFailed,
+        BuildFailed,
+    };
 
     /// Re-run prebuild → generate → fixFingerprints → `zig build`. Returns
     /// true only on a clean rebuild; on any failure it prints the error
@@ -71,6 +89,11 @@ const WasmRebuildCtx = struct {
     /// reloaded onto a broken build.
     fn rebuild(ctx_ptr: *anyopaque) bool {
         const self: *WasmRebuildCtx = @ptrCast(@alignCast(ctx_ptr));
+        self.rebuildStaged() catch return false;
+        return true;
+    }
+
+    fn rebuildStaged(self: *WasmRebuildCtx) Stage!void {
         const a = self.allocator;
 
         // 0. Re-run the declared prebuild steps, ahead of generation just
@@ -87,40 +110,102 @@ const WasmRebuildCtx = struct {
         //    `--watch`.
         prebuild.runAll(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
-            return false;
+            return error.PrebuildFailed;
+        };
+
+        // 0b. Gate the shader-compiler override AFTER the hooks (a hook may
+        //     be what creates `materials/`) and BEFORE generation. The cold
+        //     pipeline runs this once at startup; a project that gains
+        //     `materials/` while being watched would otherwise skip it and
+        //     hit the opaque compiler failure this gate exists to replace.
+        self.shader_preflight(a, self.project_dir) catch |err| {
+            std.debug.print("labelle: rebuild stopped before generate: shader compiler override rejected ({s})\n", .{@errorName(err)});
+            return error.ShaderPreflightFailed;
         };
 
         // 1. Regenerate — scene/prefab/script *structure* (new files, added
         //    components) can change, not just @embedFile'd content.
         assembler_proc.generate(self.asm_bin, a, self.project_dir, self.platform_tag, self.backend_tag) catch |err| {
             std.debug.print("labelle: rebuild generate failed ({s})\n", .{@errorName(err)});
-            return false;
+            return error.GenerateFailed;
         };
         // 2. `generate` rewrites build.zig with a placeholder fingerprint;
         //    re-fix it before building.
         runner.fixFingerprints(a, self.project_dir, self.output_dir) catch |err| {
             std.debug.print("labelle: rebuild fingerprint fix failed ({s})\n", .{@errorName(err)});
-            return false;
+            return error.FingerprintFailed;
         };
         // 3. Rebuild the WASM bundle (captured output so a compile error
         //    surfaces in the terminal without killing the serve loop).
         const res = runner.runZigWithEnv(a, self.target_dir, self.zig_args, self.zig_env) catch |err| {
             std.debug.print("labelle: rebuild could not spawn zig ({s})\n", .{@errorName(err)});
-            return false;
+            return error.ZigSpawnFailed;
         };
         defer a.free(res.stdout);
         defer a.free(res.stderr);
         switch (res.term) {
             .exited => |code| if (code != 0) {
                 std.debug.print("labelle: rebuild failed:\n{s}\n", .{res.stderr});
-                return false;
+                return error.BuildFailed;
             },
             else => {
                 std.debug.print("labelle: rebuild terminated abnormally\n{s}\n", .{res.stderr});
-                return false;
+                return error.BuildFailed;
             },
         }
-        return true;
+    }
+
+    test "watched rebuild gates the shader override after hooks and before generate" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+
+        // Production wiring: the default IS the cold pipeline's preflight,
+        // not a copy of it.
+        const default_gate = std.meta.fieldInfo(WasmRebuildCtx, .shader_preflight).defaultValue() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(default_gate == material_toolchain.preflight);
+
+        const Fixture = struct {
+            fn invalidOverride(alloc: std.mem.Allocator, dir: []const u8) anyerror!void {
+                // The same gate `preflight` reaches, with the env read
+                // replaced by a known-bad value.
+                return material_toolchain.preflightWith(alloc, dir, "shaderc");
+            }
+        };
+        // No assembler exists at this path, so reaching generation is
+        // observable as GenerateFailed — distinct from the gate firing.
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .shader_preflight = Fixture.invalidOverride,
+        };
+
+        // Started WITHOUT materials/: the invalid override is not consulted
+        // and the rebuild proceeds to generation (which fails for its own
+        // reason here). This is the cold-start shape that skipped the gate.
+        try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+
+        // materials/ appears while watched: the NEXT rebuild must stop at
+        // the preflight, before generation is attempted.
+        try tmp.dir.createDirPath(io, "project/materials");
+        try std.testing.expectError(error.ShaderPreflightFailed, ctx.rebuildStaged());
+        try std.testing.expect(!rebuild(@ptrCast(&ctx)));
     }
 };
 
