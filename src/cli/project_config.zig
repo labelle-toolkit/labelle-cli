@@ -131,6 +131,17 @@ pub const AndroidConfig = struct {
     orientation: Orientation = .all,
     /// Launch the game fullscreen with the status bar and title bar hidden.
     immersive_mode: bool = false,
+    /// Build the APK `android:debuggable` (labelle-assembler#737).
+    ///
+    /// OPT-IN, off by default — a shipping build must never carry it. Its only
+    /// purpose is on-device VERIFICATION: an activity launched normally inherits
+    /// zygote's environment, so the `LABELLE_*` knobs the desktop path already
+    /// honours (`LABELLE_FIXED_DT`, `LABELLE_SCREENSHOT_PATH`) cannot reach the
+    /// process at all. The platform's `wrap.<package>` property CAN hand the
+    /// process a real environment, but only for a debuggable app; `run-as` (to
+    /// read the capture back out of the app's private files dir) likewise needs
+    /// it. Mirrors `labelle-assembler`'s `AndroidConfig.debuggable`.
+    debuggable: bool = false,
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
