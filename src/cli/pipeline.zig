@@ -174,7 +174,7 @@ const WasmRebuildCtx = struct {
             fn invalidOverride(alloc: std.mem.Allocator, dir: []const u8) anyerror!void {
                 // The same gate `preflight` reaches, with the env read
                 // replaced by a known-bad value.
-                return material_toolchain.preflightWith(alloc, dir, "shaderc");
+                return material_toolchain.preflightWith(alloc, dir, "shaderc", .native);
             }
         };
         // No assembler exists at this path, so reaching generation is
@@ -344,6 +344,82 @@ fn noteRunSharesStdout(reporter: ?*progress.Reporter) void {
     const r = reporter orelse return;
     if (r.mode != .json) return;
     std.debug.print("labelle: note: during `run`, game output shares stdout with NDJSON progress records\n", .{});
+}
+
+/// Cold-path stage order (cli#387 gap 3): the shader-compiler override gate
+/// runs BEFORE `assembler install`, not after it. The gate is pure local
+/// stat-ing; the install is a network-bound package fetch that can take
+/// minutes, so validating afterwards made a one-character typo in
+/// `LABELLE_SHADERC` cost a full download before the diagnostic appeared.
+///
+/// `installer` is a value with an `install(allocator, project_dir)` method
+/// rather than a plain fn pointer because the real one carries the resolved
+/// assembler binary. The seam exists so a test can observe that a rejected
+/// override means the install step NEVER RAN, instead of inferring it from
+/// wall-clock timing.
+fn gateThenInstall(
+    a: std.mem.Allocator,
+    project_dir: []const u8,
+    gate: *const fn (std.mem.Allocator, []const u8) anyerror!void,
+    installer: anytype,
+) !void {
+    try gate(a, project_dir);
+    try installer.install(a, project_dir);
+}
+
+/// Production installer: `labelle-assembler install --project-root <dir>`,
+/// which populates the package cache `generate` assumes.
+const AssemblerInstaller = struct {
+    bin: assembler_proc.Assembler,
+
+    fn install(self: AssemblerInstaller, a: std.mem.Allocator, project_dir: []const u8) !void {
+        return self.bin.run(a, "install", &.{ "--project-root", project_dir });
+    }
+};
+
+test "a rejected shader override stops the cold build before any package is installed" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project/materials");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+
+    const Spy = struct {
+        var installed: bool = false;
+        fn install(_: @This(), _: std.mem.Allocator, _: []const u8) !void {
+            installed = true;
+        }
+        // The same gate the cold and watched paths share, with the env read
+        // replaced by a known-bad value.
+        fn badOverride(alloc: std.mem.Allocator, dir: []const u8) anyerror!void {
+            return material_toolchain.preflightWith(alloc, dir, "shaderc", .native);
+        }
+        fn badDockerOverride(alloc: std.mem.Allocator, dir: []const u8) anyerror!void {
+            return material_toolchain.preflightWith(alloc, dir, "shaderc", .docker);
+        }
+        fn goodOverride(alloc: std.mem.Allocator, dir: []const u8) anyerror!void {
+            return material_toolchain.preflightWith(alloc, dir, "/bin/sh", .native);
+        }
+    };
+
+    Spy.installed = false;
+    try std.testing.expectError(error.ShadercOverrideMustBeAbsolute, gateThenInstall(a, project, Spy.badOverride, Spy{}));
+    // The point of the move: the network-bound install never ran.
+    try std.testing.expect(!Spy.installed);
+
+    // `--docker` takes the same ordering, not a bypass.
+    Spy.installed = false;
+    try std.testing.expectError(error.ShadercOverrideMustBeAbsolute, gateThenInstall(a, project, Spy.badDockerOverride, Spy{}));
+    try std.testing.expect(!Spy.installed);
+
+    // A valid override still reaches the install, so the assertions above
+    // are the gate firing rather than the install being unreachable.
+    Spy.installed = false;
+    try gateThenInstall(a, project, Spy.goodOverride, Spy{});
+    try std.testing.expect(Spy.installed);
 }
 
 /// Run the project-scoped pipeline: read project.labelle, then
@@ -630,7 +706,18 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // itself), so delegate `install --project-root` to the binary first.
     // This replaces the CLI's former in-process `cache.ensureCache`,
     // which depended on the assembler's `generator` module.
-    try asm_bin.run(allocator, "install", &.{ "--project-root", project_dir });
+    //
+    // The shader-compiler override gate runs immediately BEFORE this install
+    // (cli#387 gap 3): a typo'd `LABELLE_SHADERC` used to be reported only
+    // after the slow, network-bound fetch had finished. `--docker` selects the
+    // docker-aware variant, which validates identically and then says that the
+    // host path is not forwarded into the container.
+    try gateThenInstall(
+        allocator,
+        project_dir,
+        if (parsed_args.docker) material_toolchain.preflightDocker else material_toolchain.preflight,
+        AssemblerInstaller{ .bin = asm_bin },
+    );
 
     // Plugin→core compatibility, the POST-RESOLVE half (#332).
     //
@@ -691,7 +778,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // same rewrite, which bypasses any loading-scene gate the project
     // declares. The override is delivered at runtime via the
     // `LABELLE_SCENE` env var injected at the spawn site (~line 990).
-    try material_toolchain.preflight(allocator, project_dir);
+    //
+    // (The shader-compiler override gate used to run here. It now runs in
+    // `gateThenInstall`, ahead of the network-bound package install — see
+    // cli#387 gap 3.)
     try assembler_proc.generate(
         asm_bin,
         allocator,
