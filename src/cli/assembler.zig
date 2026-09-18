@@ -25,7 +25,7 @@ const std = @import("std");
 /// project the current assembler line refuses to build). The
 /// released-path smoke test in ci.yml (init with NO local overrides →
 /// generate → build) fails if this constant rots again.
-pub const DEFAULT_ASSEMBLER_VERSION = "0.105.0";
+pub const DEFAULT_ASSEMBLER_VERSION = "0.108.0";
 const builtin = @import("builtin");
 const asm_cache = @import("asm_cache.zig");
 const compatibility = @import("compatibility.zig");
@@ -849,9 +849,12 @@ pub const DownloadVerification = struct {
         for ([_][]const u8{ "0.105.0", "0.104.0", "0.99.2", "0.1.0" }) |v| {
             try std.testing.expect(!floor.olderThan(compatibility.parseVersion(v)));
         }
-        // The default the CLI ships with is on the unverified side today —
-        // i.e. this change does not break the out-of-the-box path.
-        try std.testing.expect(!floor.olderThan(compatibility.parseVersion(DEFAULT_ASSEMBLER_VERSION)));
+        // The default the CLI ships with is now on the VERIFIED side: every
+        // assembler release after v0.105.0 publishes SHA256SUMS, and the
+        // default has moved past the floor. So the out-of-the-box path IS
+        // covered by the strip-attack defence — a missing manifest for the
+        // default is fatal, which is the point.
+        try std.testing.expect(floor.olderThan(compatibility.parseVersion(DEFAULT_ASSEMBLER_VERSION)));
     }
 
     test "a prerelease of the first verified version still requires a manifest" {
