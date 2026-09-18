@@ -64,6 +64,8 @@ pub fn build(b: *std.Build) void {
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
+    const material_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"shader tool override"} });
+    b.step("test-material-toolchain", "Validate shader compiler override diagnostics").dependOn(&b.addRunArtifact(material_tests).step);
 
     // ── Progress-feed subprocess e2e (cli#319) ───────────────────────
     // Spawns the REAL built CLI (`zig-out/bin/labelle build

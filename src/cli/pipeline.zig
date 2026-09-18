@@ -18,6 +18,7 @@ const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const emsdk_activate = @import("emsdk_activate.zig");
 const python_provision = @import("python_provision.zig");
 const prebuild = @import("prebuild.zig");
+const material_toolchain = @import("material_toolchain.zig");
 const bake_mod = @import("bake.zig");
 const docker = @import("docker.zig");
 const serve = @import("serve.zig");
@@ -605,6 +606,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
     // same rewrite, which bypasses any loading-scene gate the project
     // declares. The override is delivered at runtime via the
     // `LABELLE_SCENE` env var injected at the spawn site (~line 990).
+    try material_toolchain.preflight(allocator, project_dir);
     try assembler_proc.generate(
         asm_bin,
         allocator,
