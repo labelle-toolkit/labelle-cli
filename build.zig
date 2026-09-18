@@ -61,6 +61,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     wireStb(b, cli_tests.root_module);
+    // `docs/shader-materials.md` quotes material_toolchain.zig's diagnostics
+    // and its Windows extension lists verbatim. The toolchain tests embed the
+    // doc so the quotes are asserted against the source, not maintained by
+    // hand (cli#389 follow-up: two stale quotes shipped in one PR).
+    cli_tests.root_module.addAnonymousImport("shader_materials_doc", .{ .root_source_file = b.path("docs/shader-materials.md") });
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);

@@ -61,6 +61,34 @@ const windows_exec_exts = [_][]const u8{ ".exe", ".com" };
 /// `shaderc.exe` it invokes.
 const windows_interpreted_exts = [_][]const u8{ ".bat", ".cmd" };
 
+/// The lists as the diagnostics speak them (`.exe or .com`, `.bat/.cmd`),
+/// rendered FROM the arrays so a list edit cannot leave a message behind.
+const exec_exts_spoken = joinExts(&windows_exec_exts, " or ", "");
+const interpreted_exts_spoken = joinExts(&windows_interpreted_exts, "/", "");
+
+/// Diagnostic fragments that `docs/shader-materials.md` quotes verbatim.
+/// Each is spliced into its message below AND asserted against the doc by
+/// the doc-drift test, so editing one side without the other fails the suite
+/// instead of shipping a stale quote (cli#389 shipped two).
+const diag_not_absolute = "is not an absolute path";
+const diag_unavailable = "is unavailable (";
+const diag_not_a_file = ", not an executable file";
+const diag_not_executable_mode = "is not executable by the user running labelle: mode ";
+
+/// Render an extension list: `joinExts(&.{ ".exe", ".com" }, " or ", "")` is
+/// `.exe or .com`; with `"/"` and a backtick quote it is `` `.exe`/`.com` ``,
+/// the doc's spelling. Comptime, so the result splices into format strings.
+fn joinExts(comptime exts: []const []const u8, comptime sep: []const u8, comptime quote: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (exts, 0..) |ext, i| {
+            if (i != 0) out = out ++ sep;
+            out = out ++ quote ++ ext ++ quote;
+        }
+        return out;
+    }
+}
+
 fn hasExtension(path: []const u8, exts: []const []const u8) bool {
     for (exts) |ext| {
         if (path.len < ext.len) continue;
@@ -123,15 +151,15 @@ pub fn validateOverridePath(path: []const u8) !void {
 /// offending value so the message is actionable without re-reading the env.
 pub fn validateOverride(path: []const u8) !void {
     validateOverridePath(path) catch |err| {
-        std.debug.print("labelle: LABELLE_SHADERC '{s}' is not an absolute path; it must name the host shaderc executable, or be unset to build the pinned compiler automatically\n", .{path});
+        std.debug.print("labelle: LABELLE_SHADERC '{s}' " ++ diag_not_absolute ++ "; it must name the host shaderc executable, or be unset to build the pinned compiler automatically\n", .{path});
         return err;
     };
     const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch |err| {
-        std.debug.print("labelle: LABELLE_SHADERC '{s}' is unavailable ({s}); unset it to build the pinned compiler automatically\n", .{ path, @errorName(err) });
+        std.debug.print("labelle: LABELLE_SHADERC '{s}' " ++ diag_unavailable ++ "{s}); unset it to build the pinned compiler automatically\n", .{ path, @errorName(err) });
         return error.ShadercOverrideUnavailable;
     };
     if (stat.kind != .file) {
-        std.debug.print("labelle: LABELLE_SHADERC '{s}' is a {s}, not an executable file; unset it to build the pinned compiler automatically\n", .{ path, @tagName(stat.kind) });
+        std.debug.print("labelle: LABELLE_SHADERC '{s}' is a {s}" ++ diag_not_a_file ++ "; unset it to build the pinned compiler automatically\n", .{ path, @tagName(stat.kind) });
         return error.ShadercOverrideNotAFile;
     }
     // A regular file is not yet a runnable one. Without this the preflight
@@ -141,11 +169,11 @@ pub fn validateOverride(path: []const u8) !void {
         switch (classifyWindowsPath(path)) {
             .directly_executable => {},
             .interpreter_required => {
-                std.debug.print("labelle: LABELLE_SHADERC '{s}' is a batch script, not an executable: Windows cannot spawn a .bat/.cmd as a process image (it only runs via `cmd.exe /c`), and the generated build graph spawns this path directly — it would fail at exec time. Point LABELLE_SHADERC at the shaderc.exe the wrapper invokes, or unset it to build the pinned compiler automatically\n", .{path});
+                std.debug.print("labelle: LABELLE_SHADERC '{s}' is a batch script, not an executable: Windows cannot spawn a " ++ interpreted_exts_spoken ++ " as a process image (it only runs via `cmd.exe /c`), and the generated build graph spawns this path directly — it would fail at exec time. Point LABELLE_SHADERC at the shaderc.exe the wrapper invokes, or unset it to build the pinned compiler automatically\n", .{path});
                 return error.ShadercOverrideNotExecutable;
             },
             .not_executable => {
-                std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable: it has no executable extension (.exe or .com); point it at the shaderc executable, or unset it to build the pinned compiler automatically\n", .{path});
+                std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable: it has no executable extension (" ++ exec_exts_spoken ++ "); point it at the shaderc executable, or unset it to build the pinned compiler automatically\n", .{path});
                 return error.ShadercOverrideNotExecutable;
             },
         }
@@ -155,7 +183,7 @@ pub fn validateOverride(path: []const u8) !void {
         // the mode bits only when it declines to say.
         const runnable = executableByCaller(path) orelse (mode & 0o111 != 0);
         if (!runnable) {
-            std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable by the user running labelle: mode {o}; `chmod +x {s}`, or unset it to build the pinned compiler automatically\n", .{ path, mode & 0o7777, path });
+            std.debug.print("labelle: LABELLE_SHADERC '{s}' " ++ diag_not_executable_mode ++ "{o}; `chmod +x {s}`, or unset it to build the pinned compiler automatically\n", .{ path, mode & 0o7777, path });
             return error.ShadercOverrideNotExecutable;
         }
     }
@@ -395,4 +423,31 @@ test "the effective-permission check runs inside the shared preflightWith, so co
     try std.Io.Dir.cwd().setFilePermissions(io, shaderc, .fromMode(0o755), .{});
     try preflightWith(a, project, shaderc, .native);
     try preflightWith(a, project, shaderc, .docker);
+}
+
+test "shader tool override doc quotes the Windows extension lists and the diagnostics verbatim — cli#389 follow-up" {
+    // build.zig embeds the doc as an anonymous import: this reads the SAME
+    // file a reader does, not a copy kept next to the test.
+    const doc = @embedFile("shader_materials_doc");
+
+    // Rendered exactly as the doc spells a list, `.exe`/`.com`, and matched as
+    // a whole phrase: an extension added to the array but not the doc, or the
+    // reverse, changes the phrase instead of hiding inside a longer one.
+    const allowed = comptime joinExts(&windows_exec_exts, "/", "`");
+    const rejected = comptime joinExts(&windows_interpreted_exts, "/", "`");
+    try expectDocQuotes(doc, "on Windows, no " ++ allowed ++ " extension");
+    try expectDocQuotes(doc, "A Windows " ++ rejected ++ " wrapper is **rejected**");
+
+    // The fragments the doc quotes from the messages above.
+    inline for (.{ diag_not_absolute, diag_unavailable, diag_not_a_file, diag_not_executable_mode }) |fragment| {
+        try expectDocQuotes(doc, fragment);
+    }
+}
+
+/// Names the missing phrase on failure, so the drift is visible in the test
+/// output rather than reconstructed from the assertion that fired.
+fn expectDocQuotes(doc: []const u8, phrase: []const u8) !void {
+    if (std.mem.indexOf(u8, doc, phrase) != null) return;
+    std.debug.print("docs/shader-materials.md no longer contains a phrase the source renders:\n  {s}\nupdate the doc, or the list/diagnostic it quotes, so the two agree\n", .{phrase});
+    return error.ShaderMaterialsDocDrift;
 }

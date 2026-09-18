@@ -25,5 +25,8 @@
         "build.zig.zon",
         "versions.zon",
         "src",
+        // Embedded by the CLI test module (build.zig: `shader_materials_doc`),
+        // so the doc-drift test resolves from the packaged source too.
+        "docs/shader-materials.md",
     },
 }
