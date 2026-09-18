@@ -425,6 +425,17 @@ fn generateAndroidManifest(
     else
         "";
 
+    // Debuggable (labelle-assembler#737). OFF unless the project opts in, so a
+    // release APK's manifest is byte-identical to before. It is what makes the
+    // platform honour `setprop wrap.<package>` (the only way to give an
+    // activity a real environment, hence the only way `LABELLE_FIXED_DT` /
+    // `LABELLE_SCREENSHOT_PATH` reach the game) and what lets `run-as` read the
+    // capture back out of the app's private files dir.
+    const debuggable_attr: []const u8 = if (cfg.debuggable)
+        " android:debuggable=\"true\""
+    else
+        "";
+
     return std.fmt.allocPrint(allocator,
         \\<?xml version="1.0" encoding="utf-8"?>
         \\<manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -436,7 +447,7 @@ fn generateAndroidManifest(
         \\    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
         \\    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
         \\
-        \\    <application android:hasCode="false" android:label="{s}"{s}>
+        \\    <application android:hasCode="false" android:label="{s}"{s}{s}>
         \\        <activity android:name="android.app.NativeActivity"
         \\            android:configChanges="orientation|keyboardHidden|screenSize"
         \\            android:screenOrientation="{s}"{s}
@@ -450,7 +461,24 @@ fn generateAndroidManifest(
         \\    </application>
         \\</manifest>
         \\
-    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, icon_attr, orientation, theme_attr });
+    , .{ package_name, cfg.min_sdk_version, cfg.target_sdk_version, app_name, icon_attr, debuggable_attr, orientation, theme_attr });
+}
+
+test "generateAndroidManifest omits android:debuggable unless the project opts in (#737)" {
+    const allocator = std.testing.allocator;
+    const release = try generateAndroidManifest(allocator, "com.test.game", "Test", AndroidConfig{}, false);
+    defer allocator.free(release);
+    try std.testing.expect(std.mem.indexOf(u8, release, "debuggable") == null);
+
+    const debuggable = try generateAndroidManifest(allocator, "com.test.game", "Test", AndroidConfig{ .debuggable = true }, false);
+    defer allocator.free(debuggable);
+    // On <application>, not on <activity>: `wrap.<package>` is honoured per
+    // APPLICATION, and `run-as` keys off the application flag too.
+    try std.testing.expect(std.mem.indexOf(u8, debuggable, "<application android:hasCode=\"false\" android:label=\"Test\" android:debuggable=\"true\">") != null);
+    // The only difference is that one attribute — nothing else drifts.
+    const stripped = try std.mem.replaceOwned(u8, allocator, debuggable, " android:debuggable=\"true\"", "");
+    defer allocator.free(stripped);
+    try std.testing.expectEqualStrings(release, stripped);
 }
 
 test "generateAndroidManifest omits theme attribute when immersive_mode is false" {
