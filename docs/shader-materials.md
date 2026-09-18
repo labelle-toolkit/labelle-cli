@@ -9,7 +9,15 @@ $env:LABELLE_SHADERC = 'C:/tools/shaderc.exe'
 labelle build
 ```
 
-The override is inherited by the Zig subprocess. It must be an absolute path to an existing regular file. When the project has `materials/`, the CLI preflights the value before generation and **fails the build** — naming the offending value — if it is relative (`LABELLE_SHADERC 'shaderc' is not an absolute path...`), missing (`... is unavailable (FileNotFound)`), or a directory (`... is a directory, not an executable file`). It never falls back to the pinned compiler behind your back: unset the variable to get automatic provisioning. Direct generated builds also accept `zig build -Dshaderc=C:/tools/shaderc.exe`. Unset the override to return to automatic provisioning. Docker builds need paths and tools available inside the container.
+The override is inherited by the Zig subprocess. It must be an absolute path to an existing, **executable** regular file. When the project has `materials/`, the CLI preflights the value **before package installation and before generation** and **fails the build** — naming the offending value — if it is relative (`LABELLE_SHADERC 'shaderc' is not an absolute path...`), missing (`... is unavailable (FileNotFound)`), a directory (`... is a directory, not an executable file`), or not executable (`... is not executable: mode 644 has no execute permission for any user; \`chmod +x ...\``; on Windows, no `.exe`/`.bat`/`.cmd` extension). Because the gate runs ahead of the install step, a bad value is reported without first waiting for the package fetch. It never falls back to the pinned compiler behind your back: unset the variable to get automatic provisioning. Direct generated builds also accept `zig build -Dshaderc=C:/tools/shaderc.exe`.
+
+**`--docker` builds do not receive the override.** The value is still validated on the host — a bad one fails at the preflight, naming it, rather than deep inside the container — but it is deliberately *not* forwarded in, and the CLI prints:
+
+```
+labelle: note: LABELLE_SHADERC '<path>' is a HOST path and is NOT forwarded into the --docker build; the container compiles shaders with its own pinned compiler. A host executable cannot run inside the linux build image, so mapping it in would fail at exec time. Drop --docker for the override to take effect.
+```
+
+Bind-mounting a host-OS/arch `shaderc` into the Linux build image would only swap an honest preflight failure for an `Exec format error` far into `zig build`, so the containerised build provisions the pinned compiler itself.
 
 The generated graph supplies pinned BGFX headers and sprite varyings, compiles each explicitly requested variant, and propagates shader diagnostics/nonzero exits. Windows/Linux desktop currently require SPIR-V, Apple requires Metal, Android/web require GLES. GLSL/Metal/GLES bytecode generation on Windows is supported by shaderc; this alone does not establish GPU runtime coverage on those targets.
 
