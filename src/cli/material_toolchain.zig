@@ -84,26 +84,35 @@ pub fn classifyWindowsPath(path: []const u8) WindowsExecKind {
 /// user running `labelle` — cannot run it, yet the bitwise test passed and
 /// the build died at exec time with `EACCES`.
 ///
-/// `faccessat(..., X_OK, AT_EACCESS)` answers the exact question, against the
-/// EFFECTIVE uid/gid and the process's full supplementary-group set, which a
-/// hand-rolled owner/group/other comparison cannot reproduce (it would need
-/// `getgroups`, and would still be a re-implementation of the kernel's
-/// check). `null` is returned for an errno that is not a permission verdict,
-/// so the caller can fall back rather than reject a usable compiler.
+/// `std.Io.Dir.access(.{ .execute = true })` is the `access(X_OK)` equivalent
+/// the std exposes, and it is the PORTABLE one: it lowers to
+/// `faccessat(dirfd, path, X_OK, 0)` on every POSIX host and to the
+/// permission check on Windows, letting the kernel apply the owner/group/other
+/// class — supplementary groups, ACLs and all — instead of re-deriving it here.
+///
+/// It was first written as `std.c.faccessat(…, AT_EACCESS)`, which compiles on
+/// Darwin and FAILS TO COMPILE on Linux: `AT_EACCESS` is a BSD/Darwin flag that
+/// glibc emulates, `std.os.linux.AT` does not declare it (`0x200` there is
+/// `AT_REMOVEDIR`), and the raw `faccessat` syscall takes no flags at all —
+/// which is why `faccessat2` exists. There is no single portable spelling of
+/// the effective-id variant, so this uses the real-id one.
+///
+/// Real vs effective ids differ only for a setuid/setgid process. `labelle` is
+/// an ordinary CLI and is never installed setuid, so the two are identical
+/// here; this is the same check `test -x` makes. The finding being fixed is
+/// about the permission CLASS (owner vs group vs other), which the kernel
+/// applies either way.
+///
+/// `null` is returned for a result that is not a permission verdict, so the
+/// caller can fall back to the mode bits rather than reject a usable compiler.
 fn executableByCaller(path: []const u8) ?bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return null;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    const rc = std.c.faccessat(std.c.AT.FDCWD, @ptrCast(&buf), std.c.X_OK, std.c.AT.EACCESS);
-    if (rc == 0) return true;
-    return switch (std.c.errno(rc)) {
+    std.Io.Dir.cwd().access(config.globalIo(), path, .{ .execute = true }) catch |err| return switch (err) {
         // A permission verdict: the caller genuinely may not exec it.
-        .ACCES, .PERM, .NOENT, .NOTDIR, .LOOP, .NAMETOOLONG, .TXTBSY => false,
-        // Anything else (an `AT_EACCESS`-less kernel, EINVAL, EIO…) is not an
-        // answer — let the caller fall back to the mode bits.
+        error.AccessDenied, error.PermissionDenied => false,
+        // Anything else is not an answer — let the caller fall back.
         else => null,
     };
+    return true;
 }
 
 pub fn validateOverridePath(path: []const u8) !void {
@@ -319,8 +328,11 @@ test "a Windows batch wrapper is rejected, not accepted as directly spawnable �
 test "an execute bit for OTHER does not make the file executable by its owner — #389 review" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     // root's `X_OK` succeeds whenever ANY class has an execute bit, so the
-    // distinction this test is about does not exist for root.
-    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    // distinction this test is about does not exist for root. `getuid`, not
+    // `geteuid`: the check under test is the real-id `access(X_OK)` form
+    // (see `executableByCaller`), and `std.c.getuid` is the spelling already
+    // proven on this repo's Linux CI (`src/cli/bundle.zig`).
+    if (std.c.getuid() == 0) return error.SkipZigTest;
 
     const a = std.testing.allocator;
     const io = config.globalIo();
@@ -360,7 +372,7 @@ test "an execute bit for OTHER does not make the file executable by its owner �
 
 test "the effective-permission check runs inside the shared preflightWith, so cold/--watch/--docker stay in lockstep" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    if (std.c.getuid() == 0) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = config.globalIo();
     var tmp = std.testing.tmpDir(.{});
