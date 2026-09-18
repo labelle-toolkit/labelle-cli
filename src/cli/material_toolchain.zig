@@ -23,18 +23,87 @@ const config = @import("config.zig");
 /// the override took effect.
 pub const BuildHost = enum { native, docker };
 
+/// How a Windows path's extension relates to spawning it as a PROCESS.
+pub const WindowsExecKind = enum {
+    /// `CreateProcess` can launch this file directly.
+    directly_executable,
+    /// A script that only runs THROUGH `cmd.exe /c` — it can never be the
+    /// executable path of a process spawn.
+    interpreter_required,
+    /// Not a runnable form at all.
+    not_executable,
+};
+
 /// Windows has no execute bit, so executability is an extension question.
 /// The repo's own convention is `exe_suffix = ".exe"` (see `zig_cache.zig`,
-/// `assembler.zig`, `pipeline.zig`); `.bat`/`.cmd` are accepted alongside it
-/// as the other directly-spawnable forms.
-const windows_exec_exts = [_][]const u8{ ".exe", ".bat", ".cmd" };
+/// `assembler.zig`, `pipeline.zig`); `.com` is the other form `CreateProcess`
+/// launches directly.
+const windows_exec_exts = [_][]const u8{ ".exe", ".com" };
 
-fn hasWindowsExecExtension(path: []const u8) bool {
-    for (windows_exec_exts) |ext| {
+/// `.bat`/`.cmd` are NOT in the list above, deliberately (#389 review).
+///
+/// DECISION: REJECT them, with a diagnostic that says what to pass instead.
+///
+/// Windows cannot spawn a batch file as a process image: `CreateProcess`
+/// requires a PE binary, so a `.bat`/`.cmd` only runs as an ARGUMENT to
+/// `cmd.exe /c`. `LABELLE_SHADERC` is consumed by the generated Zig build
+/// graph, which puts the value in the `argv[0]` slot of a plain
+/// `std.process.Child` spawn — there is no seam there for an interpreter,
+/// and inventing one in the CLI would not reach the graph that actually
+/// runs the compiler. Accepting a batch wrapper here therefore passes
+/// preflight and dies at spawn with `error.InvalidExe` — precisely the
+/// late, opaque failure this gate exists to replace, which is why the
+/// earlier allowlist was worse than useless.
+///
+/// Supporting them properly means teaching the generated graph to spawn
+/// `cmd.exe /c <wrapper>`; that is an assembler-side change, not a CLI one,
+/// and is not worth it for a wrapper the user can replace with the real
+/// `shaderc.exe` it invokes.
+const windows_interpreted_exts = [_][]const u8{ ".bat", ".cmd" };
+
+fn hasExtension(path: []const u8, exts: []const []const u8) bool {
+    for (exts) |ext| {
         if (path.len < ext.len) continue;
         if (std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return true;
     }
     return false;
+}
+
+/// Pure classification, so the Windows policy is testable on every host.
+pub fn classifyWindowsPath(path: []const u8) WindowsExecKind {
+    if (hasExtension(path, &windows_exec_exts)) return .directly_executable;
+    if (hasExtension(path, &windows_interpreted_exts)) return .interpreter_required;
+    return .not_executable;
+}
+
+/// Can the INVOKING user execute `path`? `null` when the host cannot say.
+///
+/// `mode & 0o111 != 0` only proves that SOME class carries an execute bit,
+/// not that this process may exec the file (#389 review): a user-owned file
+/// with mode `001` grants execute to *other* only, so the owner — the very
+/// user running `labelle` — cannot run it, yet the bitwise test passed and
+/// the build died at exec time with `EACCES`.
+///
+/// `faccessat(..., X_OK, AT_EACCESS)` answers the exact question, against the
+/// EFFECTIVE uid/gid and the process's full supplementary-group set, which a
+/// hand-rolled owner/group/other comparison cannot reproduce (it would need
+/// `getgroups`, and would still be a re-implementation of the kernel's
+/// check). `null` is returned for an errno that is not a permission verdict,
+/// so the caller can fall back rather than reject a usable compiler.
+fn executableByCaller(path: []const u8) ?bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const rc = std.c.faccessat(std.c.AT.FDCWD, @ptrCast(&buf), std.c.X_OK, std.c.AT.EACCESS);
+    if (rc == 0) return true;
+    return switch (std.c.errno(rc)) {
+        // A permission verdict: the caller genuinely may not exec it.
+        .ACCES, .PERM, .NOENT, .NOTDIR, .LOOP, .NAMETOOLONG, .TXTBSY => false,
+        // Anything else (an `AT_EACCESS`-less kernel, EINVAL, EIO…) is not an
+        // answer — let the caller fall back to the mode bits.
+        else => null,
+    };
 }
 
 pub fn validateOverridePath(path: []const u8) !void {
@@ -60,14 +129,24 @@ pub fn validateOverride(path: []const u8) !void {
     // waves through a `-rw-r--r--` path and the build dies at exec time with
     // exactly the opaque failure the gate exists to replace.
     if (builtin.os.tag == .windows) {
-        if (!hasWindowsExecExtension(path)) {
-            std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable: it has no executable extension (.exe, .bat or .cmd); point it at the shaderc executable, or unset it to build the pinned compiler automatically\n", .{path});
-            return error.ShadercOverrideNotExecutable;
+        switch (classifyWindowsPath(path)) {
+            .directly_executable => {},
+            .interpreter_required => {
+                std.debug.print("labelle: LABELLE_SHADERC '{s}' is a batch script, not an executable: Windows cannot spawn a .bat/.cmd as a process image (it only runs via `cmd.exe /c`), and the generated build graph spawns this path directly — it would fail at exec time. Point LABELLE_SHADERC at the shaderc.exe the wrapper invokes, or unset it to build the pinned compiler automatically\n", .{path});
+                return error.ShadercOverrideNotExecutable;
+            },
+            .not_executable => {
+                std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable: it has no executable extension (.exe or .com); point it at the shaderc executable, or unset it to build the pinned compiler automatically\n", .{path});
+                return error.ShadercOverrideNotExecutable;
+            },
         }
     } else {
         const mode = stat.permissions.toMode();
-        if (mode & 0o111 == 0) {
-            std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable: mode {o} has no execute permission for any user; `chmod +x {s}`, or unset it to build the pinned compiler automatically\n", .{ path, mode & 0o7777, path });
+        // Ask the kernel whether THIS process may exec the file; fall back to
+        // the mode bits only when it declines to say.
+        const runnable = executableByCaller(path) orelse (mode & 0o111 != 0);
+        if (!runnable) {
+            std.debug.print("labelle: LABELLE_SHADERC '{s}' is not executable by the user running labelle: mode {o}; `chmod +x {s}`, or unset it to build the pinned compiler automatically\n", .{ path, mode & 0o7777, path });
             return error.ShadercOverrideNotExecutable;
         }
     }
@@ -209,6 +288,98 @@ test "shader tool override gate applies to --docker builds, and to non-executabl
 
     // Positive case: a genuinely executable compiler passes on both hosts,
     // so none of the rejections above is vacuous.
+    try std.Io.Dir.cwd().setFilePermissions(io, shaderc, .fromMode(0o755), .{});
+    try preflightWith(a, project, shaderc, .native);
+    try preflightWith(a, project, shaderc, .docker);
+}
+
+test "a Windows batch wrapper is rejected, not accepted as directly spawnable — #389 review" {
+    // Pure classification, so the Windows policy is asserted on every host
+    // (the repo's CI runs the suite on macOS/Linux too).
+    //
+    // The MECHANISM, not just the verdict: `.bat`/`.cmd` must land in their
+    // own class, distinct from "no executable extension at all", because the
+    // two get different diagnostics — the batch one tells the user to point
+    // at the `shaderc.exe` the wrapper invokes.
+    try std.testing.expectEqual(WindowsExecKind.interpreter_required, classifyWindowsPath("C:/tools/shaderc.bat"));
+    try std.testing.expectEqual(WindowsExecKind.interpreter_required, classifyWindowsPath("C:/tools/shaderc.CMD"));
+    try std.testing.expectEqual(WindowsExecKind.directly_executable, classifyWindowsPath("C:/tools/shaderc.exe"));
+    try std.testing.expectEqual(WindowsExecKind.directly_executable, classifyWindowsPath("C:/tools/SHADERC.EXE"));
+    try std.testing.expectEqual(WindowsExecKind.directly_executable, classifyWindowsPath("C:/tools/shaderc.com"));
+    try std.testing.expectEqual(WindowsExecKind.not_executable, classifyWindowsPath("C:/tools/shaderc"));
+    try std.testing.expectEqual(WindowsExecKind.not_executable, classifyWindowsPath("C:/tools/shaderc.txt"));
+    // A name that merely CONTAINS the extension is not a match.
+    try std.testing.expectEqual(WindowsExecKind.not_executable, classifyWindowsPath("C:/tools/shaderc.bat.bak"));
+
+    // And the classes really are distinct — a batch file is not quietly
+    // filed under "directly executable", which is how it passed before.
+    try std.testing.expect(classifyWindowsPath("C:/tools/shaderc.bat") != WindowsExecKind.directly_executable);
+}
+
+test "an execute bit for OTHER does not make the file executable by its owner — #389 review" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // root's `X_OK` succeeds whenever ANY class has an execute bit, so the
+    // distinction this test is about does not exist for root.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `---------x`: an execute bit is set, so `mode & 0o111 != 0` is TRUE and
+    // the old gate waved this through — but the bit belongs to *other*, and
+    // the file is owned by the user running the test, whose class (owner) has
+    // no execute permission. Exec fails with EACCES.
+    // Created readable so `realpath` can resolve it, then narrowed: the
+    // point of the test is the MODE at validation time.
+    (try tmp.dir.createFile(io, "shaderc", .{ .permissions = .fromMode(0o644) })).close(io);
+    const path = try tmp.dir.realPathFileAlloc(io, "shaderc", a);
+    defer a.free(path);
+    try std.Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o001), .{});
+
+    // Pin the mechanism: the OLD predicate accepts this file. Without this
+    // the test could pass for a trivial reason (e.g. the file not existing).
+    const mode = (try std.Io.Dir.cwd().statFile(io, path, .{})).permissions.toMode();
+    try std.testing.expect(mode & 0o111 != 0);
+    // ...and the new predicate is the one that rejects it.
+    try std.testing.expectEqual(@as(?bool, false), executableByCaller(path));
+    try std.testing.expectError(error.ShadercOverrideNotExecutable, validateOverride(path));
+
+    // `--x------`: owner-only execute. The bitwise test and the effective
+    // check agree here, so the rejection above is about the CLASS, not about
+    // rejecting every unusual mode.
+    try std.Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o100), .{});
+    try std.testing.expectEqual(@as(?bool, true), executableByCaller(path));
+    try validateOverride(path);
+
+    // …and the ordinary 0755 case is unchanged.
+    try std.Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o755), .{});
+    try validateOverride(path);
+}
+
+test "the effective-permission check runs inside the shared preflightWith, so cold/--watch/--docker stay in lockstep" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project/materials");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+
+    (try tmp.dir.createFile(io, "shaderc", .{ .permissions = .fromMode(0o644) })).close(io);
+    const shaderc = try tmp.dir.realPathFileAlloc(io, "shaderc", a);
+    defer a.free(shaderc);
+    try std.Io.Dir.cwd().setFilePermissions(io, shaderc, .fromMode(0o001), .{});
+
+    // Both hosts reject it — the check lives in `preflightWith`, which the
+    // cold pipeline, the `--watch` rebuild and `--docker` all route through.
+    try std.testing.expectError(error.ShadercOverrideNotExecutable, preflightWith(a, project, shaderc, .native));
+    try std.testing.expectError(error.ShadercOverrideNotExecutable, preflightWith(a, project, shaderc, .docker));
+
+    // Positive control on both, so neither rejection is vacuous.
     try std.Io.Dir.cwd().setFilePermissions(io, shaderc, .fromMode(0o755), .{});
     try preflightWith(a, project, shaderc, .native);
     try preflightWith(a, project, shaderc, .docker);
