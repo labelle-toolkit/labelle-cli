@@ -113,56 +113,9 @@ pub fn buildZigEnv(allocator: std.mem.Allocator, extras: []const EnvKV) !std.pro
 
 const windows = if (is_windows) struct {
     extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.c) std.os.windows.DWORD;
+    extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
+    const WAIT_TIMEOUT: std.os.windows.DWORD = 0x102;
 } else struct {};
-
-/// Shared state between the main thread and the timeout thread.
-/// Heap-allocated so it outlives the spawning stack frame.
-///
-/// Allocate it from `std.heap.page_allocator`, NEVER from the CLI's
-/// DebugAllocator: the detached timeout thread is *designed* to be
-/// abandoned mid-sleep at process exit (see `timeoutKillPosix` — it
-/// sleeps out the timeout and then a SIGKILL grace period), so the ref
-/// it holds routinely outlives `main`'s `gpa.deinit()` leak check.
-/// Tracked by the DebugAllocator, that still-referenced state made
-/// EVERY `labelle run --timeout` whose child died on the first SIGTERM
-/// (or exited before the timeout) print a bogus
-/// `error(DebugAllocator): memory address 0x... leaked: (empty stack
-/// trace)` at shutdown — labelle-assembler#558. Page-allocator memory
-/// is invisible to that leak check and is reclaimed by the OS at exit;
-/// when both sides do release in time, the last `release()` still
-/// frees it normally.
-const TimeoutState = struct {
-    allocator: std.mem.Allocator,
-    /// Who observed the child's end first. The timer thread claims
-    /// `.timed_out` BEFORE it signals; the main thread claims `.exited`
-    /// right after `wait` returns. One compare-and-swap each, so a child
-    /// that died before the deadline can never be reported as a timeout
-    /// just because the timer happened to fire before the main thread
-    /// got to its wait result (cli#390) — and a timer that lost the race
-    /// never signals a process group the child has already left.
-    outcome: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(Outcome.running)),
-    // Both the main thread and the detached timeout thread hold a reference
-    // (init 2); whoever drops the last one frees it. Without this the main
-    // thread's `defer` frees `state` as soon as `child.wait` returns — and if
-    // the child exits BEFORE the timeout fires, the still-sleeping timeout
-    // thread then writes `timed_out` into freed memory (use-after-free).
-    ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
-
-    const Outcome = enum(u8) { running, exited, timed_out };
-
-    /// Try to claim the outcome; true when this caller was first.
-    fn claim(self: *TimeoutState, as: Outcome) bool {
-        return self.outcome.cmpxchgStrong(@intFromEnum(Outcome.running), @intFromEnum(as), .acq_rel, .acquire) == null;
-    }
-
-    fn release(self: *TimeoutState) void {
-        // `.acq_rel`: the decrement publishes our writes to other releasers
-        // and, on the last decrement, observes theirs before we destroy.
-        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
-            self.allocator.destroy(self);
-        }
-    }
-};
 
 /// Report a failed process spawn with the executable + cwd, so a missing
 /// tool or DLL is diagnosable instead of surfacing as a bare
@@ -255,46 +208,17 @@ pub fn runZigInheritWithEnv(
         return err;
     };
 
-    // Heap-allocate so the detached thread can safely access it after this
-    // function returns. Page allocator on purpose — the detached thread may
-    // be abandoned still holding its ref at process exit, and the caller's
-    // (Debug)allocator would report that as a shutdown leak (#558); see the
-    // TimeoutState doc comment.
-    var state: ?*TimeoutState = null;
-    defer if (state) |s| s.release();
-
-    if (timeout_ns) |ns| {
-        state = try std.heap.page_allocator.create(TimeoutState);
-        state.?.* = .{ .allocator = std.heap.page_allocator };
-        // If the spawn below fails, the timer thread never comes into
-        // existence to take its ref — drop it here so the function-level
-        // `defer` (LIFO: it runs after this errdefer) releases the LAST ref
-        // and actually frees. No-op once the spawn succeeds: this errdefer
-        // is scoped to this block, so later errors (e.g. `child.wait`)
-        // don't double-release the thread's ref.
-        errdefer state.?.release();
-
-        if (is_windows) {
-            const win_pid = windows.GetProcessId(child.id.?);
-            const thread = try std.Thread.spawn(.{}, timeoutKillWindows, .{ allocator, win_pid, ns, state.? });
-            thread.detach();
-        } else {
-            const thread = try std.Thread.spawn(.{}, timeoutKillPosix, .{ child.id.?, ns, state.? });
-            thread.detach();
+    // ONE thread decides between "the child ended" and "the deadline
+    // passed", in that order of preference, so a child that has already
+    // ended when the deadline is checked is always reported by its own
+    // status. See `waitWithDeadline`.
+    const term = if (timeout_ns) |ns|
+        (try waitWithDeadline(allocator, &child, ns)) orelse {
+            std.debug.print("\nlabelle: timed out\n", .{});
+            return 0;
         }
-    }
-
-    const term = try child.wait(io);
-
-    // The child is gone. If the timer already claimed the outcome it fired
-    // (and signalled) BEFORE this wait returned: a genuine timeout, which
-    // the smoke-run contract counts as success. Otherwise this claim wins
-    // and the child's own status stands, whatever the timer does later.
-    const did_timeout = if (state) |s| !s.claim(.exited) else false;
-    if (did_timeout) {
-        std.debug.print("\nlabelle: timed out\n", .{});
-        return 0;
-    }
+    else
+        try child.wait(io);
     return exitStatus(term);
 }
 
@@ -627,47 +551,121 @@ fn sleepNanos(ns: u64) void {
 /// Grace period between the SIGTERM and the SIGKILL escalation below.
 const KILL_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 
-fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutState) void {
-    defer state.release();
-    sleepNanos(timeout_ns);
-    // Lost the claim → the child ended on its own before the deadline and
-    // the main thread already has its status. Nothing to kill; signalling
-    // the group now could only hit a pgid that has since been reused.
-    if (!state.claim(.timed_out)) return;
-    // Negative pid = the child's whole process group. The child was spawned
-    // with `.pgid = 0`, so it leads its own group — this signals only THIS
-    // game's process tree (game + its `zig build run` parent), never any
-    // other game that happens to be running.
+/// How often the deadline wait looks for the child's end. The deadline is
+/// honoured to within one step; `--timeout` is a smoke-run budget, not a
+/// precise clock.
+const POLL_STEP_NS: u64 = 20 * std.time.ns_per_ms;
+
+/// Wait for the child under a deadline. Returns the child's termination
+/// when it ended on its own, or null for a GENUINE timeout — the child
+/// was still running at the deadline, and has been killed and reaped.
+///
+/// The decision is made by the ONE thread that observes both events, and
+/// it always checks "has the child ended?" before "has the deadline
+/// passed?" — so the order of EVENTS is what is reported, not the order
+/// in which two threads happened to run (cli#390). The previous design
+/// let a detached timer thread claim "timeout" after its sleep; a child
+/// that had crashed just before the deadline, while the waiting thread
+/// was descheduled, was then reported as a clean timeout, and the timer
+/// signalled a process group the child had already left.
+fn waitWithDeadline(allocator: std.mem.Allocator, child: *std.process.Child, timeout_ns: u64) !?std.process.Child.Term {
+    const io = config.globalIo();
+    if (is_windows) {
+        // The process handle itself answers "ended or not" atomically:
+        // it is signalled by the process's end and stays signalled.
+        const handle = child.id.?;
+        if (windows.WaitForSingleObject(handle, msFromNs(timeout_ns)) != windows.WAIT_TIMEOUT) {
+            // Signalled (or the wait failed, in which case this blocks
+            // and reports the real termination either way).
+            return try child.wait(io);
+        }
+        taskkillTree(allocator, windows.GetProcessId(handle));
+        _ = try child.wait(io);
+        return null;
+    }
+    const pid = child.id.?;
+    if (pollUntil(pid, timeout_ns)) |term| {
+        child.id = null; // reaped here, not through `wait`
+        return term;
+    }
+    // Still running at the deadline. Negative pid = the child's whole
+    // process group: it was spawned with `.pgid = 0`, so it leads its own
+    // group and this reaches only THIS game's process tree, never another
+    // game that happens to be running. SIGTERM first, so a game that
+    // installs a handler can tear down its GPU/window cleanly; then
+    // SIGKILL, which cannot be trapped, for one that ignores it — the
+    // long-standing "labelle run --timeout doesn't terminate" symptom.
+    killGroup(pid, .TERM);
+    if (pollUntil(pid, KILL_GRACE_NS) == null) {
+        killGroup(pid, .KILL);
+        reapBlocking(pid);
+    }
+    child.id = null;
+    return null;
+}
+
+/// Look for the child's end without blocking. Reaps it and returns its
+/// termination when it has ended (however long ago); null while it is
+/// still running.
+fn pollTerm(pid: std.c.pid_t) ?std.process.Child.Term {
+    var status: c_int = 0;
+    const rc = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    if (rc == 0) return null;
+    // A negative rc (ECHILD: nothing left to wait for) still means "not
+    // running" — report it rather than spin.
+    if (rc < 0) return .{ .unknown = 0 };
+    return termFromStatus(@bitCast(status));
+}
+
+fn termFromStatus(s: u32) std.process.Child.Term {
+    const W = std.c.W;
+    if (W.IFEXITED(s)) return .{ .exited = W.EXITSTATUS(s) };
+    if (W.IFSIGNALED(s)) return .{ .signal = W.TERMSIG(s) };
+    if (W.IFSTOPPED(s)) return .{ .stopped = W.STOPSIG(s) };
+    return .{ .unknown = s };
+}
+
+/// Poll until the child ends or `budget_ns` elapses. The first look is
+/// immediate, so a child that ended before the call is never charged a
+/// poll step.
+fn pollUntil(pid: std.c.pid_t, budget_ns: u64) ?std.process.Child.Term {
+    var waited: u64 = 0;
+    while (true) {
+        if (pollTerm(pid)) |term| return term;
+        if (waited >= budget_ns) return null;
+        const step = @min(POLL_STEP_NS, budget_ns - waited);
+        sleepNanos(step);
+        waited += step;
+    }
+}
+
+fn reapBlocking(pid: std.c.pid_t) void {
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+}
+
+fn killGroup(pid: std.c.pid_t, sig: enum { TERM, KILL }) void {
     const pgid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pid));
-    // SIGTERM first, so a game that installs a handler can tear down its
-    // GPU/window cleanly.
-    std.posix.kill(pgid, std.posix.SIG.TERM) catch |err| {
+    const signo = switch (sig) {
+        .TERM => std.posix.SIG.TERM,
+        .KILL => std.posix.SIG.KILL,
+    };
+    std.posix.kill(pgid, signo) catch |err| {
         if (err != error.ProcessNotFound) {
             std.debug.print("labelle: timeout kill failed: {any}\n", .{err});
         }
     };
-    // Escalate to SIGKILL. The bgfx/raylib game traps SIGTERM (it installs a
-    // handler for that clean teardown), so it can also just ignore it —
-    // leaving `child.wait()` to block forever and the game orphaned (the
-    // long-standing "labelle run --timeout doesn't terminate" symptom).
-    // SIGKILL can't be trapped. Still scoped to the same process group, so
-    // other running games are untouched. If the game DID exit on SIGTERM,
-    // `child.wait()` has already returned and `labelle` exits before this
-    // grace elapses — this detached thread dies with the process — so the
-    // SIGKILL only ever fires on a game that actually ignored SIGTERM.
-    sleepNanos(KILL_GRACE_NS);
-    std.posix.kill(pgid, std.posix.SIG.KILL) catch |err| {
-        if (err != error.ProcessNotFound) {
-            std.debug.print("labelle: timeout SIGKILL failed: {any}\n", .{err});
-        }
-    };
 }
 
-fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, timeout_ns: u64, state: *TimeoutState) void {
+fn msFromNs(ns: u64) u32 {
+    // 0xFFFFFFFF is INFINITE to WaitForSingleObject; never hand it that.
+    return @intCast(@min(ns / std.time.ns_per_ms, std.math.maxInt(u32) - 1));
+}
+
+/// `taskkill /F /T` — the process and its tree; no POSIX process groups
+/// on Windows.
+fn taskkillTree(allocator: std.mem.Allocator, pid: std.os.windows.DWORD) void {
     _ = allocator;
-    defer state.release();
-    sleepNanos(timeout_ns);
-    if (!state.claim(.timed_out)) return;
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
     const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };
@@ -772,22 +770,6 @@ test {
     @import("zspec").runAll(@This());
 }
 
-pub const TimeoutStateSpec = struct {
-    test "last release frees exactly once" {
-        // Guard for the ref-count contract the #558 fix relies on: two
-        // holders, the LAST `release()` frees. `testing.allocator`'s
-        // per-test leak check fails this test if the final destroy is
-        // ever skipped; a double destroy would trip its double-free
-        // detection. (Production code allocates from `page_allocator`
-        // precisely so an ABANDONED timer-thread ref — process exiting
-        // mid-sleep — is not reported as a shutdown leak.)
-        const s = try std.testing.allocator.create(TimeoutState);
-        s.* = .{ .allocator = std.testing.allocator };
-        s.release(); // timer thread's ref
-        s.release(); // main thread's ref — last one frees
-    }
-};
-
 // ── Exit-status contract (labelle-cli#390) ──────────────────────────────
 //
 // These spawn the REAL child fixture (`test/fixtures/child.zig`, wired in
@@ -827,15 +809,24 @@ test "run inherit: a child that ends BEFORE the deadline keeps its own status �
     try std.testing.expect((try spawnFixture("abort", armed)) != 0);
 }
 
-test "TimeoutState: the outcome is claimed exactly once — whoever observes the end first wins, the other stands down" {
-    // Main thread reaped first: the timer must neither report a timeout
-    // nor signal the (possibly reused) process group.
-    var reaped = TimeoutState{ .allocator = std.testing.allocator };
-    try std.testing.expect(reaped.claim(.exited));
-    try std.testing.expect(!reaped.claim(.timed_out));
-    try std.testing.expect(!reaped.claim(.exited));
-    // Timer fired first: the main thread's later claim fails → timeout.
-    var fired = TimeoutState{ .allocator = std.testing.allocator };
-    try std.testing.expect(fired.claim(.timed_out));
-    try std.testing.expect(!fired.claim(.exited));
+test "pollTerm: a child that ended before we LOOKED is reported by its status, never as running — the order of events, not of threads" {
+    if (is_windows) return error.SkipZigTest; // the handle-based wait needs no poll
+    const exe = @import("test_fixtures").child_exe;
+    const io = config.globalIo();
+    // Long dead — and unreaped — before the first look. This is exactly the
+    // case the review raised against a timer-thread design: the deadline
+    // check runs late, after the child already crashed.
+    var dead = try std.process.spawn(io, .{ .argv = &.{ exe, "exit:7" }, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    sleepNanos(300 * std.time.ns_per_ms);
+    const term = pollTerm(dead.id.?) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, term);
+    dead.id = null;
+    // A running child reads as running; killing it then reaps through the
+    // same poll, so a timeout path can never leave the child behind.
+    var live = try std.process.spawn(io, .{ .argv = &.{ exe, "sleep:30000" }, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    try std.testing.expect(pollTerm(live.id.?) == null);
+    try std.posix.kill(live.id.?, std.posix.SIG.KILL);
+    const killed = pollUntil(live.id.?, 5 * std.time.ns_per_s) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, killed);
+    live.id = null;
 }
