@@ -794,11 +794,29 @@ test "run inherit: an abnormal end is never 0 — 128 + signal on POSIX, nonzero
     if (!is_windows) try std.testing.expectEqual(@as(u8, 128 + 6), code);
 }
 
-test "run inherit: a genuine watchdog expiry is 0 (the smoke-run contract) — the child is killed, not waited out" {
-    // Would exit 9 after 30 s if the kill did not land; the 300 ms watchdog
-    // must claim the outcome first, so the status the child never got to
-    // report is irrelevant.
+test "run inherit: a genuine watchdog expiry is 0 (the smoke-run contract) — and the child is KILLED, not waited out" {
+    // The status alone proves nothing here: a timeout is 0 however the
+    // child eventually ends, so a watchdog that never killed would still
+    // return 0 — thirty seconds later, when the child left by itself. The
+    // elapsed time is the mechanism: 300 ms deadline + at most the 2 s
+    // SIGKILL grace, nowhere near the child's 30 s.
+    const started = monotonicMs();
     try std.testing.expectEqual(@as(u8, 0), try spawnFixture("sleep-exit:30000:9", 300 * std.time.ns_per_ms));
+    const elapsed = monotonicMs() - started;
+    try std.testing.expect(elapsed < 10_000);
+}
+
+/// Monotonic milliseconds for the test above (0.16 has no std.time.Timer).
+fn monotonicMs() u64 {
+    if (is_windows) {
+        const K = struct {
+            extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+        };
+        return K.GetTickCount64();
+    }
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
 test "run inherit: a child that ends BEFORE the deadline keeps its own status — a crash under --timeout is not a timeout" {
