@@ -114,6 +114,7 @@ pub fn buildZigEnv(allocator: std.mem.Allocator, extras: []const EnvKV) !std.pro
 const windows = if (is_windows) struct {
     extern "kernel32" fn GetProcessId(Process: std.os.windows.HANDLE) callconv(.c) std.os.windows.DWORD;
     extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
+    extern "kernel32" fn TerminateProcess(hProcess: std.os.windows.HANDLE, uExitCode: c_uint) callconv(.winapi) std.os.windows.BOOL;
     const WAIT_TIMEOUT: std.os.windows.DWORD = 0x102;
 } else struct {};
 
@@ -579,7 +580,14 @@ fn waitWithDeadline(allocator: std.mem.Allocator, child: *std.process.Child, tim
             // and reports the real termination either way).
             return try child.wait(io);
         }
+        // `taskkill /T` reaches the game's process TREE, but it is a spawn
+        // by PATH and can fail to start; the watchdog must not depend on
+        // that. `TerminateProcess` on the handle we already hold always
+        // ends the direct child, so the wait below returns either way —
+        // a timeout that silently degrades into "wait the child out" is
+        // the one failure a watchdog cannot have.
         taskkillTree(allocator, windows.GetProcessId(handle));
+        _ = windows.TerminateProcess(handle, 1);
         _ = try child.wait(io);
         return null;
     }
@@ -628,14 +636,21 @@ fn termFromStatus(s: u32) std.process.Child.Term {
 /// Poll until the child ends or `budget_ns` elapses. The first look is
 /// immediate, so a child that ended before the call is never charged a
 /// poll step.
+///
+/// The budget is measured on the MONOTONIC clock, not by summing the
+/// sleeps asked for: a sleep takes at least its duration, and a CLI that
+/// is descheduled or suspended takes far longer, so a summed budget
+/// stretches without bound. A child that has already ENDED when we look
+/// is still reported by its status even if the deadline has also passed
+/// meanwhile — it really did finish, a crash must never read as success,
+/// and "timeout" means only "we had to kill it".
 fn pollUntil(pid: std.c.pid_t, budget_ns: u64) ?std.process.Child.Term {
-    var waited: u64 = 0;
+    const deadline_ms = monotonicMs() +| budget_ns / std.time.ns_per_ms;
     while (true) {
         if (pollTerm(pid)) |term| return term;
-        if (waited >= budget_ns) return null;
-        const step = @min(POLL_STEP_NS, budget_ns - waited);
-        sleepNanos(step);
-        waited += step;
+        const now_ms = monotonicMs();
+        if (now_ms >= deadline_ms) return null;
+        sleepNanos(@min(POLL_STEP_NS, (deadline_ms - now_ms) * std.time.ns_per_ms));
     }
 }
 
@@ -675,7 +690,10 @@ fn taskkillTree(allocator: std.mem.Allocator, pid: std.os.windows.DWORD) void {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch return;
+    }) catch |err| {
+        std.debug.print("labelle: could not start taskkill ({s}); ending the game process directly — its child processes, if any, are left to exit on their own\n", .{@errorName(err)});
+        return;
+    };
     _ = kill_child.wait(io) catch {};
 }
 
@@ -806,7 +824,8 @@ test "run inherit: a genuine watchdog expiry is 0 (the smoke-run contract) — a
     try std.testing.expect(elapsed < 10_000);
 }
 
-/// Monotonic milliseconds for the test above (0.16 has no std.time.Timer).
+/// Monotonic milliseconds (0.16 has no std.time.Timer): the deadline clock
+/// for `pollUntil`, and the elapsed-time clock for the watchdog test.
 fn monotonicMs() u64 {
     if (is_windows) {
         const K = struct {

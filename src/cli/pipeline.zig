@@ -428,10 +428,15 @@ test "a rejected shader override stops the cold build before any package is inst
 /// subcommands stays in cli.zig `main`; this is invoked only for the
 /// project commands (generate / build / run / wasm / ios / android).
 /// Returns the process exit status the command earned: the game's own exit
-/// status for `run` (0 for a genuine `--timeout` expiry), the failing
-/// stage's for a build that stopped the launch, 0 for everything that
-/// completed. `main` returns it as the CLI's exit code, so automation can
-/// tell a crash from a clean run (cli#390).
+/// status for `run` (0 for a genuine `--timeout` expiry), 0 for everything
+/// that completed. `main` returns it as the CLI's exit code, so automation
+/// can tell a crash from a clean run (cli#390).
+///
+/// A build that stops the launch is always NONZERO, but only the warm
+/// rebuild in the run branch reports its own code: the primary build
+/// (docker / progress / captured) fails through `error.BuildFailed`, i.e.
+/// exit 1, because that error path is what runs this function's errdefers.
+/// The build's real code is in the `failed` progress record either way.
 /// A subcommand that completed is exit 0; its error propagates unchanged.
 /// Lets `run` return a status while the subcommands it delegates to keep
 /// their `!void` signatures.
