@@ -28,7 +28,7 @@ pub fn printHelp() void {
         \\  upgrade [dir] [pkg] [ver] [--check] [--json]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all); `--check` reports pins vs latest WITHOUT writing (exit 2 = updates available), `--json` emits a machine-readable report (implies --check)
         \\  update [ver] [--no-path] [--check] [--json]  Update the labelle CLI itself; `--check` reports installed vs latest WITHOUT installing (exit 2 = update available), `--json` emits a machine-readable report (implies --check)
         \\  clean [--dry-run] [--project=dir]  Remove unused cached package versions
-        \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree
+        \\  test [dir] [--verbose] [--no-libs]  Run inline `test` blocks across the project source tree, then the game-side `tests/` through the generated build — which is REGENERATED first, every time, so an edited, added, deleted or renamed test is what runs (a failed regenerate fails the command; the previously generated tests are never run in its place). `--no-libs` skips only the source-tree walk. The final line counts test TARGETS; the per-test count is Zig's own summary above it
         \\  audit unification [dir]  Pre-flight check for the unified scene/prefab loader (RFC #560)
         \\  migrate unified [dir] [--dry-run]  Auto-fix legacy unified-format patterns (RFC #594 / engine#592)
         \\  check [dir]          Lint packs for §6 convention violations (Packs RFC)
