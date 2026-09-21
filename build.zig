@@ -110,6 +110,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_progress_e2e = b.addRunArtifact(progress_e2e_tests);
+    // The RUN step itself must wait for the install: as mere siblings under
+    // `test-e2e` the two run in parallel, and the test can start against the
+    // previous `zig-out/bin/labelle` and have it replaced mid-run.
+    run_progress_e2e.step.dependOn(b.getInstallStep());
     const e2e_step = b.step("test-e2e", "Run the progress-feed subprocess e2e (opt-in: needs LABELLE_E2E_DEPS + LABELLE_ASSEMBLER)");
     e2e_step.dependOn(b.getInstallStep());
     e2e_step.dependOn(&run_progress_e2e.step);
@@ -127,10 +131,30 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_run_exit_e2e = b.addRunArtifact(run_exit_e2e_tests);
+    run_run_exit_e2e.step.dependOn(b.getInstallStep());
     e2e_step.dependOn(&run_run_exit_e2e.step);
     const e2e_run_step = b.step("test-e2e-run", "Run only the `labelle run` exit-status e2e (opt-in: needs LABELLE_E2E_DEPS + LABELLE_ASSEMBLER + a labelle-null sibling)");
     e2e_run_step.dependOn(b.getInstallStep());
     e2e_run_step.dependOn(&run_run_exit_e2e.step);
+
+    // `labelle test` freshness (labelle-assembler#722): the REAL built CLI on
+    // a headless fixture, with ONLY `labelle test` between edits — edit, add,
+    // delete, rename, a copy-mode transitive import, and a failed refresh.
+    // Same opt-in gate and siblings as the run-exit e2e. Part of `test-e2e`;
+    // `test-e2e-fresh` runs it alone.
+    const test_fresh_e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/test_freshness_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_test_fresh_e2e = b.addRunArtifact(test_fresh_e2e_tests);
+    run_test_fresh_e2e.step.dependOn(b.getInstallStep());
+    e2e_step.dependOn(&run_test_fresh_e2e.step);
+    const e2e_fresh_step = b.step("test-e2e-fresh", "Run only the `labelle test` freshness e2e (opt-in: needs LABELLE_E2E_DEPS + LABELLE_ASSEMBLER + a labelle-null sibling)");
+    e2e_fresh_step.dependOn(b.getInstallStep());
+    e2e_fresh_step.dependOn(&run_test_fresh_e2e.step);
 
     // Build-time ASTC conversion core (assembler#340). `src/astc/convert.zig`
     // is pure command/path/cache logic (std-only), so it runs standalone on the

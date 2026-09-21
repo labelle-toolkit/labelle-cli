@@ -618,6 +618,7 @@ pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
 // not descend into worktrees/submodules parked inside the project.
 pub const TestCmdNestedCheckoutSpec = test_cmd_mod.NestedCheckoutSpec;
 pub const TestCmdIsNestedCheckoutSpec = test_cmd_mod.IsNestedCheckoutSpec;
+pub const TestCmdGameTestFreshnessSpec = test_cmd_mod.GameTestFreshnessSpec;
 
 // Surface the exe-name sanitizer's spec namespace (labelle-assembler#362)
 // so `zspec.runAll(@This())` walks into it.

@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const runner = @import("runner.zig");
+const pipeline = @import("pipeline.zig");
 
 /// Directory names that hold generated, cached, or vendored output
 /// rather than user-authored source. We prune them at the iterator
@@ -90,34 +91,14 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
         try discoverAndRun(allocator, project_dir, &stats, verbose);
     }
 
-    // Game-side `tests/` are exercised through an assembler-generated
-    // `build.zig`'s `test` step, not via bare `zig test <file>`. The
-    // generated build.zig wires the full module graph the exe sees, so
-    // test files can `@import` game modules the same way `main.zig` does.
-    //
-    // Assembler >=0.14.0 emits a backend-agnostic `.labelle/tests/` dir
-    // dedicated to the test step; prefer it when present so we don't
-    // pull raylib (or whatever backend is active) into the test build.
-    // Older assemblers (>=0.13.0, <0.14.0) only emit the exe dir, so
-    // fall back to `.labelle/<backend>_<platform>/`. Picking the backend
-    // from `project.labelle` (rather than the first dir we find) avoids
-    // running stale generations left over from prior backend switches.
-    //
-    // Probe `tests/build.zig` rather than just the directory so a stale
-    // `.labelle/tests/` left behind by a prior 0.14+ generate (e.g. user
-    // downgraded their assembler pin to 0.13.x) doesn't get preferred
-    // over the still-valid backend dir.
-    const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
-    defer allocator.free(tests_build_zig);
-    if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
-        try runGeneratedTestStep(allocator, project_dir, "tests", &stats, verbose);
-    } else |_| {
-        const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
-        defer allocator.free(target_name);
-        try runGeneratedTestStep(allocator, project_dir, target_name, &stats, verbose);
-    }
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+    defer allocator.free(target_name);
+    try runGameTests(allocator, project_dir, target_name, &stats, verbose, .{});
 
-    std.debug.print("\nlabelle test: {d} file(s) scanned, {d} ran tests, {d} failed\n", .{
+    // "test target(s)", not "tests": each is one `zig test`/`zig build test`
+    // invocation. The per-test count is Zig's own summary, printed above by
+    // the game-side step (assembler#722: "1 ran tests" read as one TEST).
+    std.debug.print("\nlabelle test: {d} file(s) scanned, {d} test target(s) run, {d} failed\n", .{
         stats.files_run,
         stats.files_with_tests,
         stats.files_failed,
@@ -333,12 +314,107 @@ fn hasBuildZig(dir: *std.Io.Dir) bool {
 /// test steps. This is how `libs/<lib>/` test files that use
 /// `@import("<lib>")` are exercised.
 fn runZigBuildTest(allocator: std.mem.Allocator, project_dir: []const u8, rel_path: []const u8) !bool {
+    return runZigBuildTestArgs(allocator, project_dir, rel_path, &.{});
+}
+
+/// As `runZigBuildTest`, with extra `zig build test` arguments.
+fn runZigBuildTestArgs(allocator: std.mem.Allocator, project_dir: []const u8, rel_path: []const u8, extra: []const []const u8) !bool {
     const sub_cwd = try std.fs.path.join(allocator, &.{ project_dir, rel_path });
     defer allocator.free(sub_cwd);
     const zig_exe = try runner.resolveZigExe(allocator, project_dir);
     defer allocator.free(zig_exe);
-    const code = try runner.runZigInherit(allocator, sub_cwd, &.{ zig_exe, "build", "test" }, null);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ zig_exe, "build", "test" });
+    try argv.appendSlice(allocator, extra);
+    const code = try runner.runZigInherit(allocator, sub_cwd, argv.items, null);
     return code == 0;
+}
+
+/// Seams for the game-side step, so its two rules — refresh FIRST, and
+/// never run the staged tree when the refresh failed — are asserted by
+/// tests without an assembler or a Zig toolchain in the loop.
+const GameTestHooks = struct {
+    refresh: *const fn (std.mem.Allocator, []const u8) anyerror!void = refreshGeneratedSources,
+    run_step: *const fn (std.mem.Allocator, []const u8, []const u8, *TestStats, bool) anyerror!void = runGeneratedTestStep,
+};
+
+/// Game-side `tests/` are exercised through an assembler-generated
+/// `build.zig`'s `test` step, not via bare `zig test <file>`: the generated
+/// build wires the full module graph the exe sees, so a test file can
+/// `@import` game modules the same way `main.zig` does.
+///
+/// That generated tree is a SNAPSHOT of the project, and running it as found
+/// reports on the project as it was at the last `generate` (assembler#722):
+///
+///   * discovery is baked in — `__tests_root.zig` lists the `tests/*.zig` that
+///     existed then, so a test file added since is never compiled, on ANY OS;
+///   * where the staged convention dirs are copies rather than links (Windows
+///     with neither symlink privilege nor a junction), edits to a test or to
+///     anything it imports never reach the staged tree at all.
+///
+/// Both fail in the direction that hides mistakes — `0 failed` for code that
+/// was never run. So the tree is REFRESHED first, every time: `generate`
+/// reconciles links and copies alike and rewrites the test root, which covers
+/// edits, additions, deletions and renames. And it fails CLOSED: if the
+/// refresh fails, the stale tree is not run as a consolation — a pass from it
+/// would be the exact false green this exists to remove.
+///
+/// A project with no authored `tests/` and no generated tree (a library-only
+/// project that was never generated) has nothing to refresh or run, and is
+/// left alone. A generated tree with `tests/` since DELETED still refreshes,
+/// so orphaned tests are not run from the old snapshot.
+fn runGameTests(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    backend_target: []const u8,
+    stats: *TestStats,
+    verbose: bool,
+    hooks: GameTestHooks,
+) !void {
+    const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
+    defer allocator.free(tests_build_zig);
+    const backend_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", backend_target, "build.zig" });
+    defer allocator.free(backend_build_zig);
+    const authored = try std.fs.path.join(allocator, &.{ project_dir, "tests" });
+    defer allocator.free(authored);
+
+    const generated_before = pathExists(tests_build_zig) or pathExists(backend_build_zig);
+    if (!pathExists(authored) and !generated_before) return;
+
+    hooks.refresh(allocator, project_dir) catch |err| {
+        std.debug.print(
+            "labelle test: could not refresh the generated sources ({s}); NOT running the previously generated tests — they describe the project as it was, and a pass from them would mean nothing. Fix the error above (`labelle generate` reproduces it), then re-run.\n",
+            .{@errorName(err)},
+        );
+        return error.GenerateFailed;
+    };
+
+    // Assembler >=0.14.0 emits a backend-agnostic `.labelle/tests/` dir
+    // dedicated to the test step; prefer it when present so the test build
+    // does not pull in the active backend. Older assemblers only emit the exe
+    // dir, so fall back to `.labelle/<backend>_<platform>/` — chosen from
+    // `project.labelle`, not the first dir found, so a generation left over
+    // from a prior backend switch is never picked. Probed AFTER the refresh,
+    // and on `build.zig` rather than the directory, so a `.labelle/tests/`
+    // left by a since-downgraded assembler is not preferred over the dir the
+    // refresh just wrote.
+    const target = if (pathExists(tests_build_zig)) "tests" else backend_target;
+    try hooks.run_step(allocator, project_dir, target, stats, verbose);
+}
+
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
+    return true;
+}
+
+/// `labelle generate` for `project_dir`, through the same pipeline the
+/// command itself uses — assembler resolution, staging, fingerprints — so a
+/// refreshed tree is exactly what `labelle generate && labelle test` gave.
+fn refreshGeneratedSources(allocator: std.mem.Allocator, project_dir: []const u8) !void {
+    std.debug.print("  refreshing generated sources (labelle generate)\n", .{});
+    const code = try pipeline.run(allocator, .{ .command = .generate, .project_dir = project_dir });
+    if (code != 0) return error.GenerateFailed;
 }
 
 /// Run `zig build test` in `<project_dir>/.labelle/<target_name>/`.
@@ -382,7 +458,11 @@ fn runGeneratedTestStep(
 
     stats.files_with_tests += 1;
     std.debug.print("  build-test {s}\n", .{rel_path});
-    const ok = runZigBuildTest(allocator, project_dir, rel_path) catch |err| {
+    // `--summary all`: Zig prints "N/N tests passed" for the step, which is
+    // the only enumerated count there is — the line at the end counts test
+    // TARGETS, so without this a run that compiled none of your tests looks
+    // identical to one that ran them all (assembler#722).
+    const ok = runZigBuildTestArgs(allocator, project_dir, rel_path, &.{ "--summary", "all" }) catch |err| {
         std.debug.print("    FAILED: {s} ({any})\n", .{ rel_path, err });
         stats.files_failed += 1;
         return;
@@ -652,5 +732,118 @@ pub const IsNestedCheckoutSpec = struct {
                 try dir.createDirPath(config.globalIo(), "src");
             }
         }.f), false);
+    }
+};
+
+/// Records what the game-side step did, in order. File-level because the
+/// hooks are plain function pointers with no context argument.
+var hook_log: [8]u8 = undefined;
+var hook_log_len: usize = 0;
+var hook_refresh_fails: bool = false;
+
+fn resetHookLog(refresh_fails: bool) void {
+    hook_log_len = 0;
+    hook_refresh_fails = refresh_fails;
+}
+fn recordingRefresh(_: std.mem.Allocator, _: []const u8) anyerror!void {
+    hook_log[hook_log_len] = 'R';
+    hook_log_len += 1;
+    if (hook_refresh_fails) return error.AssemblerExploded;
+}
+var hook_ran_target: [32]u8 = undefined;
+var hook_ran_target_len: usize = 0;
+fn recordingRunStep(_: std.mem.Allocator, _: []const u8, target: []const u8, _: *TestStats, _: bool) anyerror!void {
+    hook_log[hook_log_len] = 'T';
+    hook_log_len += 1;
+    @memcpy(hook_ran_target[0..target.len], target);
+    hook_ran_target_len = target.len;
+}
+const recording_hooks: GameTestHooks = .{ .refresh = recordingRefresh, .run_step = recordingRunStep };
+
+fn tmpProjectPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    const n = try tmp.dir.realPath(config.globalIo(), buf);
+    return buf[0..n];
+}
+
+pub const GameTestFreshnessSpec = struct {
+    test "refreshes BEFORE running — a staged tree is never run as found (assembler#722)" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "tests");
+        try tmp.dir.createDirPath(io, ".labelle/tests");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/tests/build.zig", .data = "// stale\n" });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try tmpProjectPath(&tmp, &buf);
+
+        resetHookLog(false);
+        var stats = TestStats{};
+        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        // The ORDER is the assertion: refresh, then the test step.
+        try std.testing.expectEqualStrings("RT", hook_log[0..hook_log_len]);
+        try std.testing.expectEqualStrings("tests", hook_ran_target[0..hook_ran_target_len]);
+    }
+
+    test "fails CLOSED — a failed refresh never falls back to the previously generated tests" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "tests");
+        try tmp.dir.createDirPath(io, ".labelle/tests");
+        // A previously PASSING tree is sitting right there, runnable.
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/tests/build.zig", .data = "// yesterday's green\n" });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try tmpProjectPath(&tmp, &buf);
+
+        resetHookLog(true);
+        var stats = TestStats{};
+        try std.testing.expectError(error.GenerateFailed, runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks));
+        // Refresh was attempted; the test step was NOT reached.
+        try std.testing.expectEqualStrings("R", hook_log[0..hook_log_len]);
+        try std.testing.expectEqual(@as(usize, 0), stats.files_with_tests);
+    }
+
+    test "tests/ deleted but a generated tree remains — still refreshed, so orphans are not run from the snapshot" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, ".labelle/tests");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/tests/build.zig", .data = "// lists tests that no longer exist\n" });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try tmpProjectPath(&tmp, &buf);
+
+        resetHookLog(false);
+        var stats = TestStats{};
+        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        try std.testing.expectEqualStrings("RT", hook_log[0..hook_log_len]);
+    }
+
+    test "no tests/ and nothing generated — a library-only project is left alone (no generate, no step)" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try tmpProjectPath(&tmp, &buf);
+
+        resetHookLog(false);
+        var stats = TestStats{};
+        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        try std.testing.expectEqual(@as(usize, 0), hook_log_len);
+    }
+
+    test "an older assembler with no .labelle/tests/ — the backend dir is the target, chosen after the refresh" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "tests");
+        try tmp.dir.createDirPath(io, ".labelle/null_desktop");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/null_desktop/build.zig", .data = "//\n" });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try tmpProjectPath(&tmp, &buf);
+
+        resetHookLog(false);
+        var stats = TestStats{};
+        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        try std.testing.expectEqualStrings("RT", hook_log[0..hook_log_len]);
+        try std.testing.expectEqualStrings("null_desktop", hook_ran_target[0..hook_ran_target_len]);
     }
 };
