@@ -635,6 +635,14 @@ jobs:
           repository: labelle-toolkit/labelle-assembler
           ref: main
           path: labelle-assembler
+      # The `labelle run` exit-status e2e (cli#390, test/run_exit_e2e.zig)
+      # drives a headless game: its fixture pins the null backend `local:`
+      # to this checkout so the backend never comes from a release fetch.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-null
+          ref: main
+          path: labelle-null
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2

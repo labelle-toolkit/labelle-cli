@@ -61,12 +61,31 @@ pub fn build(b: *std.Build) void {
         }),
     });
     wireStb(b, cli_tests.root_module);
+    // Child-process fixture for the runner's exit-status tests (cli#390):
+    // the tests spawn a REAL process and read its real termination status
+    // back, so the mapping is proven at the process boundary rather than
+    // on a mocked `Term`. The path reaches the tests through a test-only
+    // options module; the `labelle` exe never sees it.
+    const child_fixture = b.addExecutable(.{
+        .name = "labelle-test-child",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fixtures/child.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const child_fixture_install = b.addInstallArtifact(child_fixture, .{});
+    const test_fixtures = b.addOptions();
+    test_fixtures.addOption([]const u8, "child_exe", b.getInstallPath(.bin, child_fixture.out_filename));
+    cli_tests.root_module.addOptions("test_fixtures", test_fixtures);
     // `docs/shader-materials.md` quotes material_toolchain.zig's diagnostics
     // and its Windows extension lists verbatim. The toolchain tests embed the
     // doc so the quotes are asserted against the source, not maintained by
     // hand (cli#389 follow-up: two stale quotes shipped in one PR).
     cli_tests.root_module.addAnonymousImport("shader_materials_doc", .{ .root_source_file = b.path("docs/shader-materials.md") });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+    run_cli_tests.step.dependOn(&child_fixture_install.step);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
     const material_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"shader tool override"} });
@@ -94,6 +113,24 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("test-e2e", "Run the progress-feed subprocess e2e (opt-in: needs LABELLE_E2E_DEPS + LABELLE_ASSEMBLER)");
     e2e_step.dependOn(b.getInstallStep());
     e2e_step.dependOn(&run_progress_e2e.step);
+
+    // `labelle run` exit-status contract (cli#390): spawns the REAL built
+    // CLI on a headless (`null` backend) fixture whose script exits with a
+    // chosen status, and asserts the CLI's own exit status. Same opt-in
+    // gate and sibling checkouts as above, plus `labelle-null`. Part of
+    // `test-e2e`; `test-e2e-run` runs it alone.
+    const run_exit_e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/run_exit_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_run_exit_e2e = b.addRunArtifact(run_exit_e2e_tests);
+    e2e_step.dependOn(&run_run_exit_e2e.step);
+    const e2e_run_step = b.step("test-e2e-run", "Run only the `labelle run` exit-status e2e (opt-in: needs LABELLE_E2E_DEPS + LABELLE_ASSEMBLER + a labelle-null sibling)");
+    e2e_run_step.dependOn(b.getInstallStep());
+    e2e_run_step.dependOn(&run_run_exit_e2e.step);
 
     // Build-time ASTC conversion core (assembler#340). `src/astc/convert.zig`
     // is pure command/path/cache logic (std-only), so it runs standalone on the

@@ -427,7 +427,25 @@ test "a rejected shader override stops the cold build before any package is inst
 /// variant selected by `parsed_args`). Dispatch of the standalone
 /// subcommands stays in cli.zig `main`; this is invoked only for the
 /// project commands (generate / build / run / wasm / ios / android).
-pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
+/// Returns the process exit status the command earned: the game's own exit
+/// status for `run` (0 for a genuine `--timeout` expiry), 0 for everything
+/// that completed. `main` returns it as the CLI's exit code, so automation
+/// can tell a crash from a clean run (cli#390).
+///
+/// A build that stops the launch is always NONZERO, but only the warm
+/// rebuild in the run branch reports its own code: the primary build
+/// (docker / progress / captured) fails through `error.BuildFailed`, i.e.
+/// exit 1, because that error path is what runs this function's errdefers.
+/// The build's real code is in the `failed` progress record either way.
+/// A subcommand that completed is exit 0; its error propagates unchanged.
+/// Lets `run` return a status while the subcommands it delegates to keep
+/// their `!void` signatures.
+fn ok(result: anytype) !u8 {
+    if (comptime @typeInfo(@TypeOf(result)) == .error_union) try result;
+    return 0;
+}
+
+pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const command = parsed_args.command;
     const project_dir = parsed_args.project_dir;
     const timeout_ns = parsed_args.timeout_ns;
@@ -452,7 +470,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         if (err == error.FileNotFound) {
             config.printNoProjectError(project_dir);
         }
-        return;
+        return 1;
     };
 
     // Normalize the deprecated `.initial_scene` alias (RFC #560 / #565)
@@ -513,7 +531,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
 
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
-        return upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]);
+        return ok(upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]));
     }
 
     // `labelle wasm serve|export --no-build` — skip the generate+build
@@ -540,15 +558,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         if (parsed_args.wasm_export) {
             const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
             defer allocator.free(out_abs);
-            return export_mod.packageExport(allocator, web_dir, project_web_dir, .{
+            return ok(export_mod.packageExport(allocator, web_dir, project_web_dir, .{
                 .output_dir = out_abs,
                 .zip = parsed_args.export_zip,
                 .platform = parsed_args.export_pkg_platform,
-            });
+            }));
         }
         // No watch in the `--no-build` path (the parser already rejects the
         // `--watch --no-build` combination, so `serve_watch` is false here).
-        return serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
+        return ok(serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null));
     }
 
     // ── Build-progress feed (cli#284) ──────────────────────────────────
@@ -850,16 +868,16 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         emsdk_activate.activateFetchedEmsdk(allocator, target_dir, resolved_emsdk.version);
     }
 
-    if (command == .generate) return;
+    if (command == .generate) return 0;
 
     // `labelle ios` subcommand — handles its own build/xcode/run
     if (command == .ios_cmd) {
-        return ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir);
+        return ok(ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir));
     }
 
     // `labelle android` subcommand — handles its own build/run
     if (command == .android_cmd) {
-        return android.handleAndroid(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, project_dir, target_dir);
+        return ok(android.handleAndroid(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, project_dir, target_dir));
     }
 
     // Warn if --target is used without --docker (it has no effect otherwise)
@@ -983,7 +1001,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
         defer allocator.free(quoted);
         std.debug.print("  open {s}\n", .{quoted});
         if (reporter) |r| r.finishDone(0);
-        return;
+        return 0;
     }
 
     if (command == .build) {
@@ -1009,7 +1027,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
         }
         if (reporter) |r| r.finishDone(0);
-        return;
+        return 0;
     }
 
     // Run
@@ -1204,7 +1222,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
                 std.debug.print("labelle: cannot run cross-compiled binary (target: {s})\n", .{t});
                 std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
                 if (reporter) |r| r.finishDone(0); // build succeeded; run skipped
-                return;
+                return 0;
             }
             // The assembler names the desktop binary after the project
             // (sanitized) so concurrent games are distinguishable to
@@ -1226,8 +1244,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             }
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
-            // exit — the code is carried in the terminal record.
+            // exit — the code is carried in the terminal record, and it is
+            // also the CLI's exit status (cli#390).
             if (reporter) |r| r.finishDone(run_result);
+            return run_result;
         } else {
             // Build, then run the game BINARY DIRECTLY rather than via
             // `zig build run`. `zig build run` launches the game in its own
@@ -1249,7 +1269,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             if (build_result != 0) {
                 if (reporter) |r| r.finishFailed(build_result, "zig build failed");
                 std.debug.print("\nlabelle: build failed (exit {d})\n", .{build_result});
-                return;
+                // A failed prerequisite build stops the launch AND fails
+                // the command — it used to fall out of here as exit 0.
+                return build_result;
             }
             // Exe name: the assembler names the desktop exe after the
             // sanitized project (labelle-assembler#362); older generated
@@ -1284,10 +1306,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !void {
             }
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
-            // exit — the code is carried in the terminal record.
+            // exit — the code is carried in the terminal record, and it is
+            // also the CLI's exit status (cli#390).
             if (reporter) |r| r.finishDone(run_result);
+            return run_result;
         }
     }
+    return 0;
 }
 
 /// Extensions a backend may append to the requested screenshot path instead of
