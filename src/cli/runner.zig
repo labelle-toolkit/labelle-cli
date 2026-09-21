@@ -133,13 +133,27 @@ const windows = if (is_windows) struct {
 /// frees it normally.
 const TimeoutState = struct {
     allocator: std.mem.Allocator,
-    timed_out: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Who observed the child's end first. The timer thread claims
+    /// `.timed_out` BEFORE it signals; the main thread claims `.exited`
+    /// right after `wait` returns. One compare-and-swap each, so a child
+    /// that died before the deadline can never be reported as a timeout
+    /// just because the timer happened to fire before the main thread
+    /// got to its wait result (cli#390) — and a timer that lost the race
+    /// never signals a process group the child has already left.
+    outcome: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(Outcome.running)),
     // Both the main thread and the detached timeout thread hold a reference
     // (init 2); whoever drops the last one frees it. Without this the main
     // thread's `defer` frees `state` as soon as `child.wait` returns — and if
     // the child exits BEFORE the timeout fires, the still-sleeping timeout
     // thread then writes `timed_out` into freed memory (use-after-free).
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
+
+    const Outcome = enum(u8) { running, exited, timed_out };
+
+    /// Try to claim the outcome; true when this caller was first.
+    fn claim(self: *TimeoutState, as: Outcome) bool {
+        return self.outcome.cmpxchgStrong(@intFromEnum(Outcome.running), @intFromEnum(as), .acq_rel, .acquire) == null;
+    }
 
     fn release(self: *TimeoutState) void {
         // `.acq_rel`: the decrement publishes our writes to other releasers
@@ -272,31 +286,36 @@ pub fn runZigInheritWithEnv(
 
     const term = try child.wait(io);
 
-    const did_timeout = if (state) |s| s.timed_out.load(.acquire) else false;
+    // The child is gone. If the timer already claimed the outcome it fired
+    // (and signalled) BEFORE this wait returned: a genuine timeout, which
+    // the smoke-run contract counts as success. Otherwise this claim wins
+    // and the child's own status stands, whatever the timer does later.
+    const did_timeout = if (state) |s| !s.claim(.exited) else false;
+    if (did_timeout) {
+        std.debug.print("\nlabelle: timed out\n", .{});
+        return 0;
+    }
+    return exitStatus(term);
+}
 
+/// The process exit status a termination maps to, as a shell would report
+/// it: the child's own code, or 128 + signal for an abnormal end. Never 0
+/// for anything but a clean exit — a crash must not read as success
+/// (cli#390).
+fn exitStatus(term: std.process.Child.Term) u8 {
     return switch (term) {
-        .exited => |code| blk: {
-            if (did_timeout) {
-                std.debug.print("\nlabelle: timed out\n", .{});
-                break :blk 0;
-            }
-            break :blk code;
-        },
-        .signal => |sig| {
-            if (did_timeout) {
-                std.debug.print("\nlabelle: timed out\n", .{});
-                return 0;
-            }
+        .exited => |code| code,
+        .signal => |sig| blk: {
             std.debug.print("labelle: killed by signal {d}\n", .{@intFromEnum(sig)});
-            return 1;
+            break :blk 128 +% @as(u8, @truncate(@intFromEnum(sig)));
         },
-        .stopped => |sig| {
+        .stopped => |sig| blk: {
             std.debug.print("labelle: stopped by signal {d}\n", .{@intFromEnum(sig)});
-            return 1;
+            break :blk 128 +% @as(u8, @truncate(@intFromEnum(sig)));
         },
-        .unknown => |val| {
+        .unknown => |val| blk: {
             std.debug.print("labelle: unknown termination {d}\n", .{val});
-            return 1;
+            break :blk 1;
         },
     };
 }
@@ -611,7 +630,10 @@ const KILL_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 fn timeoutKillPosix(pid: std.process.Child.Id, timeout_ns: u64, state: *TimeoutState) void {
     defer state.release();
     sleepNanos(timeout_ns);
-    state.timed_out.store(true, .release);
+    // Lost the claim → the child ended on its own before the deadline and
+    // the main thread already has its status. Nothing to kill; signalling
+    // the group now could only hit a pgid that has since been reused.
+    if (!state.claim(.timed_out)) return;
     // Negative pid = the child's whole process group. The child was spawned
     // with `.pgid = 0`, so it leads its own group — this signals only THIS
     // game's process tree (game + its `zig build run` parent), never any
@@ -645,7 +667,7 @@ fn timeoutKillWindows(allocator: std.mem.Allocator, pid: std.os.windows.DWORD, t
     _ = allocator;
     defer state.release();
     sleepNanos(timeout_ns);
-    state.timed_out.store(true, .release);
+    if (!state.claim(.timed_out)) return;
     var pid_buf: [16]u8 = undefined;
     const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
     const argv = [_][]const u8{ "taskkill", "/F", "/T", "/PID", pid_str };
@@ -765,3 +787,55 @@ pub const TimeoutStateSpec = struct {
         s.release(); // main thread's ref — last one frees
     }
 };
+
+// ── Exit-status contract (labelle-cli#390) ──────────────────────────────
+//
+// These spawn the REAL child fixture (`test/fixtures/child.zig`, wired in
+// build.zig as the `test_fixtures` options module) and read its real
+// termination status back through the same function `labelle run` uses.
+// A mocked `Term` would prove the switch, not the process boundary.
+
+fn spawnFixture(spec: []const u8, timeout_ns: ?u64) !u8 {
+    const exe = @import("test_fixtures").child_exe;
+    return runZigInheritWithEnv(std.testing.allocator, ".", &.{ exe, spec }, timeout_ns, null);
+}
+
+test "run inherit: the child's own exit status is the return value — 0 stays 0, 7 stays 7" {
+    try std.testing.expectEqual(@as(u8, 0), try spawnFixture("exit:0", null));
+    try std.testing.expectEqual(@as(u8, 7), try spawnFixture("exit:7", null));
+}
+
+test "run inherit: an abnormal end is never 0 — 128 + signal on POSIX, nonzero everywhere" {
+    const code = try spawnFixture("abort", null);
+    try std.testing.expect(code != 0);
+    // SIGABRT is 6 on every POSIX target this CLI builds for.
+    if (!is_windows) try std.testing.expectEqual(@as(u8, 128 + 6), code);
+}
+
+test "run inherit: a genuine watchdog expiry is 0 (the smoke-run contract) — the child is killed, not waited out" {
+    // Would exit 9 after 30 s if the kill did not land; the 300 ms watchdog
+    // must claim the outcome first, so the status the child never got to
+    // report is irrelevant.
+    try std.testing.expectEqual(@as(u8, 0), try spawnFixture("sleep-exit:30000:9", 300 * std.time.ns_per_ms));
+}
+
+test "run inherit: a child that ends BEFORE the deadline keeps its own status — a crash under --timeout is not a timeout" {
+    const armed: u64 = 5 * std.time.ns_per_s;
+    try std.testing.expectEqual(@as(u8, 7), try spawnFixture("exit:7", armed));
+    try std.testing.expectEqual(@as(u8, 0), try spawnFixture("exit:0", armed));
+    try std.testing.expectEqual(@as(u8, 7), try spawnFixture("sleep-exit:150:7", armed));
+    try std.testing.expect((try spawnFixture("abort", armed)) != 0);
+}
+
+test "TimeoutState: the outcome is claimed exactly once — whoever observes the end first wins, the other stands down" {
+    // Main thread reaped first: the timer must neither report a timeout
+    // nor signal the (possibly reused) process group.
+    var reaped = TimeoutState{ .allocator = std.testing.allocator };
+    try std.testing.expect(reaped.claim(.exited));
+    try std.testing.expect(!reaped.claim(.timed_out));
+    try std.testing.expect(!reaped.claim(.exited));
+    // Timer fired first: the main thread's later claim fails → timeout.
+    var fired = TimeoutState{ .allocator = std.testing.allocator };
+    try std.testing.expect(fired.claim(.timed_out));
+    try std.testing.expect(!fired.claim(.exited));
+}

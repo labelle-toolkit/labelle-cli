@@ -107,7 +107,10 @@ fn handleToolchainCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
     return error.UnknownSubcommand;
 }
 
-pub fn main(proc_init: std.process.Init) !void {
+/// Returns the process exit status. `run` earns the game's own status (a
+/// crash can no longer exit 0 — cli#390); every other command returns 0 on
+/// completion and an error (exit 1) or an explicit code on failure.
+pub fn main(proc_init: std.process.Init) !u8 {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -125,7 +128,7 @@ pub fn main(proc_init: std.process.Init) !void {
 
     const first_arg = args.next();
     if (first_arg == null) {
-        return help.printHelp();
+        return ok(help.printHelp());
     }
 
     if (first_arg) |first| {
@@ -172,7 +175,7 @@ pub fn main(proc_init: std.process.Init) !void {
             parsed_args.progress_mode = result.progress_mode;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
-            const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return;
+            const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return 0;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
@@ -322,7 +325,7 @@ pub fn main(proc_init: std.process.Init) !void {
             const sub = args.next();
             if (sub != null and std.mem.eql(u8, sub.?, "serve")) {
                 parsed_args.command = .wasm_cmd;
-                const result = parseWasmServeArgs(&args) orelse return;
+                const result = parseWasmServeArgs(&args) orelse return 0;
                 parsed_args.project_dir = result.dir;
                 parsed_args.serve_port = result.port;
                 parsed_args.serve_no_build = result.no_build;
@@ -334,7 +337,7 @@ pub fn main(proc_init: std.process.Init) !void {
             } else if (sub != null and std.mem.eql(u8, sub.?, "export")) {
                 parsed_args.command = .wasm_cmd;
                 parsed_args.wasm_export = true;
-                const result = parseWasmExportArgs(&args) orelse return;
+                const result = parseWasmExportArgs(&args) orelse return 0;
                 parsed_args.project_dir = result.dir;
                 parsed_args.export_output = result.output;
                 parsed_args.export_zip = result.zip;
@@ -353,7 +356,7 @@ pub fn main(proc_init: std.process.Init) !void {
                 }
                 std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]\n", .{});
                 std.debug.print("         labelle wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]\n", .{});
-                return;
+                return 0;
             }
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
@@ -373,7 +376,7 @@ pub fn main(proc_init: std.process.Init) !void {
                 std.debug.print("Run 'labelle help' to see available commands.\n", .{});
                 std.process.exit(1);
             }
-            const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return;
+            const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return 0;
             parsed_args.project_dir = first;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
@@ -410,30 +413,31 @@ pub fn main(proc_init: std.process.Init) !void {
     // decision above the fast paths retires the pattern instead of
     // patching a fourth site.
     if (helpOnlyPrinter(command, parsed_args.extra_args[0..parsed_args.extra_count])) |printUsage| {
-        return printUsage();
+        printUsage();
+        return 0;
     }
 
     // Standalone commands (no project.labelle needed)
     switch (command) {
-        .help_cmd => return help.printHelp(),
-        .version => return help.printVersion(),
-        .targets => return help.printTargets(),
-        .init_cmd => return init.cmdInit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .add_cmd => return add.cmdAdd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .install_cmd => return install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .update_cmd => return update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .clean_cmd => return clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .test_cmd => return test_cmd_mod.cmdTest(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .pack_cmd => return pack.cmdPack(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .astc_cmd => return astc_cmd.cmdAstc(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .audit_cmd => return audit.cmdAudit(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .migrate_cmd => return migrate.cmdMigrate(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .check_cmd => return check.cmdCheck(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .plugins_cmd => return plugins.cmdPlugins(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .doctor_cmd => return doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .assembler_cmd => return handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .toolchain_cmd => return handleToolchainCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
-        .status_cmd => return status_mod.cmdStatus(allocator, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .help_cmd => return ok(help.printHelp()),
+        .version => return ok(help.printVersion()),
+        .targets => return ok(help.printTargets()),
+        .init_cmd => return ok(init.cmdInit(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .add_cmd => return ok(add.cmdAdd(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .install_cmd => return ok(install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .update_cmd => return ok(update.cmdUpdate(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .clean_cmd => return ok(clean.cmdClean(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .test_cmd => return ok(test_cmd_mod.cmdTest(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .pack_cmd => return ok(pack.cmdPack(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .astc_cmd => return ok(astc_cmd.cmdAstc(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .audit_cmd => return ok(audit.cmdAudit(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .migrate_cmd => return ok(migrate.cmdMigrate(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .check_cmd => return ok(check.cmdCheck(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .plugins_cmd => return ok(plugins.cmdPlugins(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .doctor_cmd => return ok(doctor.cmdDoctor(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .assembler_cmd => return ok(handleAssemblerCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .toolchain_cmd => return ok(handleToolchainCmd(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
+        .status_cmd => return ok(status_mod.cmdStatus(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
         else => {},
     }
 
@@ -462,11 +466,19 @@ pub fn main(proc_init: std.process.Init) !void {
                 if (err == error.AndroidToolsMissing) std.process.exit(1);
                 return err;
             };
-            return;
+            return 0;
         }
     }
 
     return pipeline.run(allocator, parsed_args);
+}
+
+/// A completed standalone command is exit 0; its error, if any, propagates
+/// (exit 1 with the error name printed), exactly as before `main` returned
+/// a status.
+fn ok(result: anytype) !u8 {
+    if (comptime @typeInfo(@TypeOf(result)) == .error_union) try result;
+    return 0;
 }
 
 fn isDirectoryShorthand(path: []const u8) bool {
