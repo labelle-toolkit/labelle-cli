@@ -721,6 +721,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 1,
                 "conflicting .astc_block pins compile to one .astc — see the error above",
             ),
+            // A stale `.astc` (wrong block for this target) that could not be
+            // deleted would be swapped in by the assembler — the PNG fallback
+            // below would be a lie. Stop instead (labelle-bgfx#134).
+            error.StaleAstcSiblingUndeletable => progress.fatalExit(
+                1,
+                "a stale .astc sibling could not be deleted — see the error above",
+            ),
             else => std.debug.print(
                 "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
                 .{@errorName(err)},

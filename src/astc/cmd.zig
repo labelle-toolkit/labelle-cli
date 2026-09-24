@@ -80,8 +80,22 @@ fn siblingIsCurrent(src: []const u8, out: []const u8, block: convert.BlockSize) 
 /// to the PNG, so a leftover from another platform/block (or a half-written
 /// astcenc output) must go, leaving the documented PNG fallback instead of an
 /// atlas the target cannot load.
-fn discardSibling(out: []const u8) void {
-    std.Io.Dir.cwd().deleteFile(config.globalIo(), out) catch {};
+///
+/// A sibling that CANNOT be deleted (a Windows process holding it open, a
+/// read-only directory) is fatal: continuing would hand exactly that stale
+/// file to the assembler. The pipeline stops the build on this error.
+fn discardSibling(out: []const u8) error{StaleAstcSiblingUndeletable}!void {
+    std.Io.Dir.cwd().deleteFile(config.globalIo(), out) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            std.debug.print(
+                "labelle astc: '{s}' is stale for this target and could not be deleted ({s}) " ++
+                    "— delete it by hand and rebuild\n",
+                .{ out, @errorName(err) },
+            );
+            return error.StaleAstcSiblingUndeletable;
+        },
+    };
 }
 
 pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -243,13 +257,13 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // current for THIS target, or the PNG fallback would pick up (say) an
     // 8x8 file an Android build left for a web build that can't load it.
     const astcenc = resolveAstcenc(allocator) catch |err| {
-        for (atlases.items) |job| discardIfNotCurrent(allocator, job);
+        for (atlases.items) |job| try discardIfNotCurrent(allocator, job);
         return err;
     };
     defer allocator.free(astcenc);
 
     for (atlases.items) |job| {
-        convertAtlas(allocator, astcenc, job.base_dir, job.texture, job.opts, &tally);
+        try convertAtlas(allocator, astcenc, job.base_dir, job.texture, job.opts, &tally);
     }
 
     std.debug.print("labelle astc: {d} converted, {d} up-to-date, {d} failed\n", .{ tally.converted, tally.cached, tally.failed });
@@ -282,12 +296,12 @@ fn resolveAstcenc(allocator: std.mem.Allocator) ![]const u8 {
 
 /// `discardSibling` for a queued atlas whose sibling is not current for its
 /// resolved block (used when no encode will run at all).
-fn discardIfNotCurrent(allocator: std.mem.Allocator, job: AtlasJob) void {
+fn discardIfNotCurrent(allocator: std.mem.Allocator, job: AtlasJob) error{StaleAstcSiblingUndeletable}!void {
     const src = std.fs.path.join(allocator, &.{ job.base_dir, job.texture }) catch return;
     defer allocator.free(src);
     const out = convert.outputPath(allocator, src) catch return;
     defer allocator.free(out);
-    if (!siblingIsCurrent(src, out, job.opts.block)) discardSibling(out);
+    if (!siblingIsCurrent(src, out, job.opts.block)) try discardSibling(out);
 }
 
 const Tally = struct {
@@ -328,7 +342,8 @@ fn resourceOpts(
 
 /// Convert one atlas texture (path relative to `base_dir`) to its co-located
 /// `.astc` sibling, honouring the mtime + block-size cache. Shared by the
-/// game-resource and pack/plugin-resource loops.
+/// game-resource and pack/plugin-resource loops. A failed encode is counted
+/// (the build degrades to PNG); only an undeletable stale sibling errors.
 fn convertAtlas(
     allocator: std.mem.Allocator,
     astcenc: []const u8,
@@ -336,7 +351,7 @@ fn convertAtlas(
     texture: []const u8,
     opts: convert.Options,
     tally: *Tally,
-) void {
+) error{StaleAstcSiblingUndeletable}!void {
     const src = std.fs.path.join(allocator, &.{ base_dir, texture }) catch {
         tally.failed += 1;
         return;
@@ -356,20 +371,29 @@ fn convertAtlas(
         tally.cached += 1;
         return;
     }
-    // From here the existing sibling (if any) is stale for this target: any
-    // failure below must not leave it behind for the assembler to swap in.
-    var encoded = false;
-    defer if (!encoded) discardSibling(out);
+    // From here the existing sibling (if any) is stale for this target: a
+    // failed encode must not leave it behind for the assembler to swap in.
+    if (!encodeAtlas(allocator, astcenc, src, out, opts, tally)) try discardSibling(out);
+}
 
+/// Run astcenc for one atlas; true on success. Failures are tallied.
+fn encodeAtlas(
+    allocator: std.mem.Allocator,
+    astcenc: []const u8,
+    src: []const u8,
+    out: []const u8,
+    opts: convert.Options,
+    tally: *Tally,
+) bool {
     const args = convert.buildArgs(allocator, astcenc, src, out, opts) catch {
         tally.failed += 1;
-        return;
+        return false;
     };
     defer allocator.free(args);
     const r = util.runCmd(allocator, args) catch {
         std.debug.print("labelle astc: failed to run astcenc on {s}\n", .{src});
         tally.failed += 1;
-        return;
+        return false;
     };
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
@@ -379,12 +403,12 @@ fn convertAtlas(
     };
     if (ok) {
         std.debug.print("  {s} -> {s} ({s})\n", .{ src, out, opts.block.arg() });
-        encoded = true;
         tally.converted += 1;
     } else {
         std.debug.print("labelle astc: astcenc failed on {s}\n{s}\n", .{ src, r.stderr });
         tally.failed += 1;
     }
+    return ok;
 }
 
 /// The `.resources` a pack/plugin manifest declares (asset-plugins P1/P2), or
@@ -1508,7 +1532,7 @@ test "a failed web re-encode deletes the stale 8x8 sibling (PNG fallback, never 
     // An astcenc that cannot run: the encode fails, and the 8x8 file the
     // assembler would otherwise swap in must be gone.
     var tally = Tally{};
-    convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
+    try convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
     try std.testing.expectEqual(@as(usize, 1), tally.failed);
     try std.testing.expectEqual(@as(usize, 0), tally.cached);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "assets/rooms.astc", .{}));
@@ -1525,17 +1549,51 @@ test "a current sibling survives a failed-encoder run; a stale one does not" {
     // Cached path: a 4x4 sibling is current for bgfx web, so convertAtlas
     // never runs the (broken) encoder and keeps the file.
     var tally = Tally{};
-    convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
+    try convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
     try std.testing.expectEqual(@as(usize, 1), tally.cached);
     _ = try tmp.dir.statFile(io, "assets/rooms.astc", .{});
 
     // astcenc unavailable (no encode at all): a current sibling is kept...
     const job: AtlasJob = .{ .name = "rooms", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"4x4" } };
-    discardIfNotCurrent(a, job);
+    try discardIfNotCurrent(a, job);
     _ = try tmp.dir.statFile(io, "assets/rooms.astc", .{});
     // ...but one at the wrong block for this target is dropped.
     var stale = job;
     stale.opts.block = .@"8x8";
-    discardIfNotCurrent(a, stale);
+    try discardIfNotCurrent(a, stale);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "assets/rooms.astc", .{}));
+}
+
+test "an undeletable stale sibling is a fatal error, not a silent PNG fallback" {
+    // POSIX-only: a read-only directory is how we make the unlink fail. Root
+    // ignores directory permissions, so the premise can't be staged there.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (std.c.getuid() == 0) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try stageSibling(&tmp, &buf, .@"8x8");
+
+    var assets = try tmp.dir.openDir(io, "assets", .{});
+    defer assets.close(io);
+    try assets.setPermissions(io, .fromMode(0o555));
+    defer assets.setPermissions(io, .fromMode(0o755)) catch {};
+
+    // bgfx web: the 8x8 sibling is stale, astcenc fails, and the delete is
+    // refused → the error the pipeline turns into a fatal exit.
+    var tally = Tally{};
+    try std.testing.expectError(
+        error.StaleAstcSiblingUndeletable,
+        convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally),
+    );
+    // It got there through the failed-encode path, and the file is still
+    // there — which is exactly why continuing would be wrong.
+    try std.testing.expectEqual(@as(usize, 1), tally.failed);
+    _ = try tmp.dir.statFile(io, "assets/rooms.astc", .{});
+
+    // Same when astcenc can't be resolved at all.
+    const job: AtlasJob = .{ .name = "rooms", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"4x4" } };
+    try std.testing.expectError(error.StaleAstcSiblingUndeletable, discardIfNotCurrent(a, job));
 }
