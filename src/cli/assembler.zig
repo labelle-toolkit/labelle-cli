@@ -74,17 +74,22 @@ pub fn lookupOverride(allocator: std.mem.Allocator) !?[]u8 {
 /// checkout, not next to the worktree. See resolveProjectRoot.
 fn resolveLocalAssembler(allocator: std.mem.Allocator, rel_path: []const u8, project_dir: []const u8) ![]u8 {
     const io = config.globalIo();
-    const source_dir = if (std.fs.path.isAbsolute(rel_path))
-        try allocator.dupe(u8, rel_path)
-    else blk: {
-        const root = try resolveProjectRoot(allocator, project_dir);
-        defer allocator.free(root);
-        break :blk try std.fs.path.join(allocator, &.{ root, rel_path });
-    };
+    // The directory a relative `rel_path` was joined against: the main
+    // checkout in a worktree, else `project_dir`. Null for absolute paths.
+    const root: ?[]u8 = if (std.fs.path.isAbsolute(rel_path)) null else try resolveProjectRoot(allocator, project_dir);
+    defer if (root) |r| allocator.free(r);
+    const source_dir = if (root) |r|
+        try std.fs.path.join(allocator, &.{ r, rel_path })
+    else
+        try allocator.dupe(u8, rel_path);
     defer allocator.free(source_dir);
 
     const real_source = std.Io.Dir.cwd().realPathFileAlloc(io, source_dir, allocator) catch |err| {
-        std.debug.print("labelle: local assembler path '{s}' does not exist: {any}\n", .{ source_dir, err });
+        // labelle-assembler#756: from a worktree, say the relative path was
+        // anchored at the main checkout and how to point at a worktree.
+        const msg = try missingLocalAssemblerMessage(allocator, rel_path, source_dir, project_dir, root, err);
+        defer allocator.free(msg);
+        std.debug.print("{s}\n", .{msg});
         return error.AssemblerNotCached;
     };
     defer allocator.free(real_source);
@@ -544,6 +549,36 @@ pub fn cmdListAssemblers(allocator: std.mem.Allocator) !void {
 // assembler binary — which the harness builds on via `resolveAssembler` /
 // `resolveDefault`.
 
+/// Message for a `local:` assembler path that does not exist
+/// (labelle-assembler#756). Pure formatting — caller owns the result.
+///
+/// When `written` is relative and was joined against a `project_root`
+/// (the main checkout) that differs from `project_dir` (a worktree), the
+/// message names the path as written, both checkouts, and the fix: pin an
+/// absolute path. Otherwise it is the pre-#756 message unchanged.
+fn missingLocalAssemblerMessage(
+    allocator: std.mem.Allocator,
+    written: []const u8,
+    resolved: []const u8,
+    project_dir: []const u8,
+    project_root: ?[]const u8,
+    err: anyerror,
+) ![]u8 {
+    const anchored_elsewhere = !std.fs.path.isAbsolute(written) and
+        if (project_root) |r| !std.mem.eql(u8, r, project_dir) else false;
+    if (!anchored_elsewhere) {
+        return std.fmt.allocPrint(allocator, "labelle: local assembler path '{s}' does not exist: {any}", .{ resolved, err });
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "labelle: local assembler path '{s}' does not exist (resolved to '{s}'): {any}\n" ++
+            "         Relative local: paths resolve from the main checkout\n" ++
+            "         ('{s}'), not this worktree ('{s}').\n" ++
+            "         To use an assembler worktree, pin it with an absolute path.",
+        .{ written, resolved, err, project_root.?, project_dir },
+    );
+}
+
 /// If `project_dir` is a git worktree, return the path of the main checkout.
 /// Otherwise return a copy of `project_dir` unchanged.
 ///
@@ -623,6 +658,82 @@ const zspec = @import("zspec");
 test {
     zspec.runAll(@This());
 }
+
+pub const MissingLocalAssemblerMessage = struct {
+    test "relative path missing from a worktree explains the anchoring" {
+        const alloc = std.testing.allocator;
+        const msg = try missingLocalAssemblerMessage(
+            alloc,
+            "../labelle-assembler",
+            "/src/fp/../labelle-assembler",
+            "/src/.worktrees/fp-perf",
+            "/src/fp",
+            error.FileNotFound,
+        );
+        defer alloc.free(msg);
+        try std.testing.expectEqualStrings(
+            "labelle: local assembler path '../labelle-assembler' does not exist (resolved to '/src/fp/../labelle-assembler'): error.FileNotFound\n" ++
+                "         Relative local: paths resolve from the main checkout\n" ++
+                "         ('/src/fp'), not this worktree ('/src/.worktrees/fp-perf').\n" ++
+                "         To use an assembler worktree, pin it with an absolute path.",
+            msg,
+        );
+    }
+
+    test "absolute path keeps the plain message" {
+        const alloc = std.testing.allocator;
+        const msg = try missingLocalAssemblerMessage(
+            alloc,
+            "/src/.worktrees/asm-wt",
+            "/src/.worktrees/asm-wt",
+            "/src/.worktrees/fp-perf",
+            null,
+            error.FileNotFound,
+        );
+        defer alloc.free(msg);
+        try std.testing.expectEqualStrings("labelle: local assembler path '/src/.worktrees/asm-wt' does not exist: error.FileNotFound", msg);
+    }
+
+    test "main checkout keeps the plain message" {
+        const alloc = std.testing.allocator;
+        const msg = try missingLocalAssemblerMessage(
+            alloc,
+            "../labelle-assembler",
+            "/src/fp/../labelle-assembler",
+            "/src/fp",
+            "/src/fp",
+            error.FileNotFound,
+        );
+        defer alloc.free(msg);
+        try std.testing.expectEqualStrings("labelle: local assembler path '/src/fp/../labelle-assembler' does not exist: error.FileNotFound", msg);
+    }
+
+    test "real worktree layout: the anchor resolveProjectRoot picks is named" {
+        const alloc = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, "main/.git/worktrees/wt");
+        try tmp.dir.createDirPath(io, "wt");
+        const main_abs = try tmp.dir.realPathFileAlloc(io, "main", alloc);
+        defer alloc.free(main_abs);
+        const wt_abs = try tmp.dir.realPathFileAlloc(io, "wt", alloc);
+        defer alloc.free(wt_abs);
+        const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+        defer alloc.free(linkfile);
+        try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = linkfile });
+
+        const root = try resolveProjectRoot(alloc, wt_abs);
+        defer alloc.free(root);
+        const msg = try missingLocalAssemblerMessage(alloc, "../missing", "x", wt_abs, root, error.FileNotFound);
+        defer alloc.free(msg);
+        const expected = try std.fmt.allocPrint(alloc, "('{s}'), not this worktree ('{s}')", .{ main_abs, wt_abs });
+        defer alloc.free(expected);
+        try std.testing.expect(std.mem.indexOf(u8, msg, expected) != null);
+    }
+};
 
 pub const ResolveProjectRoot = struct {
     test "main checkout (.git is a directory) returns project_dir unchanged" {
