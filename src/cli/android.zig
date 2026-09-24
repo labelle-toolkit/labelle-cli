@@ -254,10 +254,10 @@ pub fn handleAndroid(
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
             const abis = try build_mod.buildAllAbis(arena.allocator(), target_dir, release_mode);
-            try run_mod.deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis, signing);
+            try run_mod.deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis, signing, &.{});
         } else {
             try build_mod.androidBuild(allocator, target_dir, emulator, release_mode);
-            try run_mod.deployToDevice(allocator, project_dir, target_dir, cfg, emulator, signing);
+            try run_mod.deployToDevice(allocator, project_dir, target_dir, cfg, emulator, signing, &.{});
         }
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         try deploy_mod.cmdDeploy(allocator, project_dir, target_dir, cfg, .{
