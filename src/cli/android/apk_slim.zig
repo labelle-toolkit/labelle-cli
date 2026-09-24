@@ -253,10 +253,9 @@ fn stageDir(
 ) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, dst) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    // `dst` is created on the first file kept in it, so a tree whose files
+    // are all skipped (a `raw/` without videos) leaves no empty dirs behind.
+    var dst_made = false;
 
     var src_dir = try cwd.openDir(io, src, .{ .iterate = true });
     defer src_dir.close(io);
@@ -274,14 +273,9 @@ fn stageDir(
         defer allocator.free(dst_sub);
 
         switch (entry.kind) {
-            .directory => {
-                // A whole `raw/` tree is skipped without creating it.
-                if (std.mem.eql(u8, rel, "raw")) {
-                    try countSkippedTree(allocator, src_sub, summary);
-                    continue;
-                }
-                try stageDir(allocator, src_sub, dst_sub, rel, embedded, summary);
-            },
+            // Every file, `raw/` included, goes through `skipReason`: that is
+            // where the video exemption lives.
+            .directory => try stageDir(allocator, src_sub, dst_sub, rel, embedded, summary),
             .file => {
                 if (skipReason(rel, embedded)) |reason| {
                     const st = try cwd.statFile(io, src_sub, .{});
@@ -289,29 +283,15 @@ fn stageDir(
                     summary.skipped_bytes[@intFromEnum(reason)] += st.size;
                     continue;
                 }
+                if (!dst_made) {
+                    cwd.createDirPath(io, dst) catch |err| switch (err) {
+                        error.PathAlreadyExists => {},
+                        else => return err,
+                    };
+                    dst_made = true;
+                }
                 try cwd.copyFile(src_sub, cwd, dst_sub, io, .{});
                 summary.kept_files += 1;
-            },
-            else => {},
-        }
-    }
-}
-
-fn countSkippedTree(allocator: std.mem.Allocator, path: []const u8, summary: *StageSummary) !void {
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
-    var dir = try cwd.openDir(io, path, .{ .iterate = true });
-    defer dir.close(io);
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
-        const sub = try std.fs.path.join(allocator, &.{ path, entry.name });
-        defer allocator.free(sub);
-        switch (entry.kind) {
-            .directory => try countSkippedTree(allocator, sub, summary),
-            .file => {
-                const st = try cwd.statFile(io, sub, .{});
-                summary.skipped_files[@intFromEnum(SkipReason.packer_source)] += 1;
-                summary.skipped_bytes[@intFromEnum(SkipReason.packer_source)] += st.size;
             },
             else => {},
         }
@@ -695,6 +675,33 @@ pub const StageAssetsSpec = struct {
         try expect.equal(summary.skipped_files[@intFromEnum(SkipReason.embedded)], 2);
         try expect.equal(summary.skipped_files[@intFromEnum(SkipReason.astc_png_sibling)], 1);
         try expect.equal(summary.skippedBytes(), 4 + 4 + 2 + 4 + 3);
+    }
+
+    test "a video under raw/ is staged, the rest of raw/ is not" {
+        const a = std.testing.allocator;
+        var fx = try NativeFixture.init();
+        defer fx.deinit();
+        try fx.write("src/raw/clip.mp4", "VIDEO");
+        try fx.write("src/raw/x.MP4", "VID2");
+        try fx.write("src/raw/frame.png", "RAW");
+        try fx.write("src/raw/sheet/f0.png", "RAW0");
+        const src = try fx.path("src");
+        defer a.free(src);
+        const dst = try fx.path("dst");
+        defer a.free(dst);
+        var none: EmbeddedAssets = .{};
+        defer none.deinit(a);
+        const summary = try stageAssets(a, src, dst, none);
+
+        const got = try fx.read("dst/raw/clip.mp4");
+        defer a.free(got);
+        try std.testing.expectEqualStrings("VIDEO", got);
+        try std.testing.expect(fx.exists("dst/raw/x.MP4"));
+        try std.testing.expect(!fx.exists("dst/raw/frame.png"));
+        // A raw/ subtree with nothing kept is not even created.
+        try std.testing.expect(!fx.exists("dst/raw/sheet"));
+        try expect.equal(summary.kept_files, 2);
+        try expect.equal(summary.skipped_files[@intFromEnum(SkipReason.packer_source)], 2);
     }
 
     test "no embeds known: everything but raw/ ships" {
