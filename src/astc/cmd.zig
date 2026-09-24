@@ -26,6 +26,10 @@ const usage =
     \\(`.astc_block = .@"4x4"` on the resource); an explicit --block here
     \\overrides every such pin.
     \\
+    \\  --platform <p>      target platform (desktop|android|ios|wasm); default
+    \\                      is project.labelle's `.platform`. Loadable blocks
+    \\                      depend on it (bgfx on wasm samples 4x4 only).
+    \\  --backend <b>       target backend; default is project.labelle's.
     \\  --allow-older-cli   proceed even when labelle.lock was written by a
     \\                      NEWER labelle than this binary (#353).
     \\
@@ -62,6 +66,38 @@ fn existingBlockMatches(out: []const u8, block: convert.BlockSize) bool {
     return header[4] == d.x and header[5] == d.y;
 }
 
+/// Whether the `.astc` sibling at `out` can be kept as-is: newer than its
+/// source AND encoded at `block`. The block check is what keeps a sibling
+/// shared across platforms honest — an 8x8 file an Android build left behind
+/// is NOT current for a bgfx web build that needs 4x4 (labelle-bgfx#134), so
+/// switching platforms re-encodes rather than shipping an unloadable atlas.
+fn siblingIsCurrent(src: []const u8, out: []const u8, block: convert.BlockSize) bool {
+    return !convert.needsReencode(Stat, src, out) and existingBlockMatches(out, block);
+}
+
+/// Delete a sibling that is not current for this run. Called when we could
+/// not produce a fresh one: the assembler swaps in ANY `.astc` it finds next
+/// to the PNG, so a leftover from another platform/block (or a half-written
+/// astcenc output) must go, leaving the documented PNG fallback instead of an
+/// atlas the target cannot load.
+///
+/// A sibling that CANNOT be deleted (a Windows process holding it open, a
+/// read-only directory) is fatal: continuing would hand exactly that stale
+/// file to the assembler. The pipeline stops the build on this error.
+fn discardSibling(out: []const u8) error{StaleAstcSiblingUndeletable}!void {
+    std.Io.Dir.cwd().deleteFile(config.globalIo(), out) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            std.debug.print(
+                "labelle astc: '{s}' is stale for this target and could not be deleted ({s}) " ++
+                    "— delete it by hand and rebuild\n",
+                .{ out, @errorName(err) },
+            );
+            return error.StaleAstcSiblingUndeletable;
+        },
+    };
+}
+
 pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // One arena for the whole command: the parsed ProjectConfig + every path
     // join / subprocess buffer frees in a single deinit (the config strings
@@ -82,6 +118,11 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // `labelle astc` is dispatched before pipeline.run, so it owns its own
     // copy of the flag (see the gate call below).
     var allow_older_cli = false;
+    // Target overrides: `labelle build --platform=wasm` resolves a platform
+    // (and backend) that project.labelle may not declare, and the loadable
+    // blocks depend on both — so the pipeline passes what it resolved.
+    var platform_override: ?project_config.Platform = null;
+    var backend_override: ?project_config.Backend = null;
 
     var i: usize = 0;
     while (i < cmd_args.len) : (i += 1) {
@@ -95,6 +136,14 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             i += 1;
             if (i >= cmd_args.len) return usageErr("--quality needs a value");
             opts.quality = parseQuality(cmd_args[i]) orelse return usageErr("unknown --quality");
+        } else if (std.mem.eql(u8, arg, "--platform")) {
+            i += 1;
+            if (i >= cmd_args.len) return usageErr("--platform needs a value (e.g. wasm)");
+            platform_override = std.meta.stringToEnum(project_config.Platform, cmd_args[i]) orelse return usageErr("unknown --platform");
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            i += 1;
+            if (i >= cmd_args.len) return usageErr("--backend needs a value (e.g. bgfx)");
+            backend_override = std.meta.stringToEnum(project_config.Backend, cmd_args[i]) orelse return usageErr("unknown --backend");
         } else if (std.mem.eql(u8, arg, "--allow-older-cli")) {
             allow_older_cli = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -124,35 +173,20 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // (error.LoadFailed), which on FP left the game stuck on the loading scene.
     // Default to a backend-safe block when the user didn't pin one; reject an
     // explicit block the backend can't load rather than baking a dud.
-    const caps: convert.BackendCaps = switch (cfg.backend) {
-        .sokol => .sokol_4x4_only,
-        .raylib => .raylib_4x4_8x8,
-        // bgfx uploads any block it can name and validates none of them, so
-        // an unsupported one renders garbage with no error at all — verified
-        // on device with 6x6. See `BackendCaps.bgfx_4x4_8x8`.
-        .bgfx => .bgfx_4x4_8x8,
-        .wgpu => .full,
-        // sdl/null aren't ASTC upload targets; the gfx seam falls back to PNG
-        // decode if they ever see a compressed blob, so leave block unconstrained.
-        .sdl, .null => .full,
-    };
+    const backend = backend_override orelse cfg.backend;
+    const platform = platform_override orelse cfg.platform;
+    const caps = backendCaps(backend, platform);
     if (block_explicit) {
         if (!caps.supports(opts.block)) {
             std.debug.print(
-                "labelle astc: backend '{s}' cannot upload ASTC {s} (try {s})\n",
-                .{ @tagName(cfg.backend), opts.block.arg(), caps.defaultBlock().arg() },
+                "labelle astc: backend '{s}' on {s} cannot upload ASTC {s} (try {s})\n",
+                .{ @tagName(backend), @tagName(platform), opts.block.arg(), caps.defaultBlock().arg() },
             );
             return error.InvalidArgs;
         }
     } else {
         opts.block = caps.defaultBlock();
     }
-
-    // Resolve the astcenc binary (download + cache on first use).
-    const cache_root = try asm_cache.getCacheRoot(allocator);
-    defer allocator.free(cache_root);
-    const astcenc = try astcenc_bin.ensure(allocator, cache_root, astcenc_bin.DEFAULT_VERSION);
-    defer allocator.free(astcenc);
 
     var tally = Tally{};
 
@@ -218,12 +252,56 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         return error.ConflictingAstcBlocks;
     }
 
+    // Resolve the astcenc binary (download + cache on first use). If that
+    // fails, nothing gets re-encoded — so drop every sibling that is not
+    // current for THIS target, or the PNG fallback would pick up (say) an
+    // 8x8 file an Android build left for a web build that can't load it.
+    const astcenc = resolveAstcenc(allocator) catch |err| {
+        for (atlases.items) |job| try discardIfNotCurrent(allocator, job);
+        return err;
+    };
+    defer allocator.free(astcenc);
+
     for (atlases.items) |job| {
-        convertAtlas(allocator, astcenc, job.base_dir, job.texture, job.opts, &tally);
+        try convertAtlas(allocator, astcenc, job.base_dir, job.texture, job.opts, &tally);
     }
 
     std.debug.print("labelle astc: {d} converted, {d} up-to-date, {d} failed\n", .{ tally.converted, tally.cached, tally.failed });
     if (tally.failed > 0) return error.AstcConversionFailed;
+}
+
+/// Which ASTC blocks `backend` can load on `platform` — see `BackendCaps`.
+fn backendCaps(backend: project_config.Backend, platform: project_config.Platform) convert.BackendCaps {
+    return switch (backend) {
+        .sokol => .sokol_4x4_only,
+        .raylib => .raylib_4x4_8x8,
+        // bgfx uploads any block it can name and validates none of them, so
+        // an unsupported one renders garbage with no error at all — verified
+        // on device with 6x6. See `BackendCaps.bgfx_4x4_8x8`. On the web its
+        // WebGL2 format table drops 8x8 too (labelle-bgfx#134/#76), leaving
+        // 4x4 as the only loadable block — see `BackendCaps.bgfx_web_4x4_only`.
+        .bgfx => if (platform == .wasm) .bgfx_web_4x4_only else .bgfx_4x4_8x8,
+        .wgpu => .full,
+        // sdl/null aren't ASTC upload targets; the gfx seam falls back to PNG
+        // decode if they ever see a compressed blob, so leave block unconstrained.
+        .sdl, .null => .full,
+    };
+}
+
+fn resolveAstcenc(allocator: std.mem.Allocator) ![]const u8 {
+    const cache_root = try asm_cache.getCacheRoot(allocator);
+    defer allocator.free(cache_root);
+    return astcenc_bin.ensure(allocator, cache_root, astcenc_bin.DEFAULT_VERSION);
+}
+
+/// `discardSibling` for a queued atlas whose sibling is not current for its
+/// resolved block (used when no encode will run at all).
+fn discardIfNotCurrent(allocator: std.mem.Allocator, job: AtlasJob) error{StaleAstcSiblingUndeletable}!void {
+    const src = std.fs.path.join(allocator, &.{ job.base_dir, job.texture }) catch return;
+    defer allocator.free(src);
+    const out = convert.outputPath(allocator, src) catch return;
+    defer allocator.free(out);
+    if (!siblingIsCurrent(src, out, job.opts.block)) try discardSibling(out);
 }
 
 const Tally = struct {
@@ -252,7 +330,7 @@ fn resourceOpts(
     const pinned = res.astc_block orelse return base;
     if (!caps.supports(pinned)) {
         std.debug.print(
-            "labelle astc: atlas '{s}' pins ASTC {s}, which this backend cannot upload — using {s}\n",
+            "labelle astc: atlas '{s}' pins ASTC {s}, which this target cannot upload — using {s}\n",
             .{ res.name, pinned.arg(), base.block.arg() },
         );
         return base;
@@ -264,7 +342,8 @@ fn resourceOpts(
 
 /// Convert one atlas texture (path relative to `base_dir`) to its co-located
 /// `.astc` sibling, honouring the mtime + block-size cache. Shared by the
-/// game-resource and pack/plugin-resource loops.
+/// game-resource and pack/plugin-resource loops. A failed encode is counted
+/// (the build degrades to PNG); only an undeletable stale sibling errors.
 fn convertAtlas(
     allocator: std.mem.Allocator,
     astcenc: []const u8,
@@ -272,7 +351,7 @@ fn convertAtlas(
     texture: []const u8,
     opts: convert.Options,
     tally: *Tally,
-) void {
+) error{StaleAstcSiblingUndeletable}!void {
     const src = std.fs.path.join(allocator, &.{ base_dir, texture }) catch {
         tally.failed += 1;
         return;
@@ -286,21 +365,35 @@ fn convertAtlas(
 
     // Up-to-date only if the output is newer than the source AND was
     // encoded at the requested block size — otherwise a `--block` change
-    // would silently keep the stale format (the mtime alone can't see it).
-    if (!convert.needsReencode(Stat, src, out) and existingBlockMatches(out, opts.block)) {
+    // (or a platform switch) would silently keep the stale format (the
+    // mtime alone can't see it).
+    if (siblingIsCurrent(src, out, opts.block)) {
         tally.cached += 1;
         return;
     }
+    // From here the existing sibling (if any) is stale for this target: a
+    // failed encode must not leave it behind for the assembler to swap in.
+    if (!encodeAtlas(allocator, astcenc, src, out, opts, tally)) try discardSibling(out);
+}
 
+/// Run astcenc for one atlas; true on success. Failures are tallied.
+fn encodeAtlas(
+    allocator: std.mem.Allocator,
+    astcenc: []const u8,
+    src: []const u8,
+    out: []const u8,
+    opts: convert.Options,
+    tally: *Tally,
+) bool {
     const args = convert.buildArgs(allocator, astcenc, src, out, opts) catch {
         tally.failed += 1;
-        return;
+        return false;
     };
     defer allocator.free(args);
     const r = util.runCmd(allocator, args) catch {
         std.debug.print("labelle astc: failed to run astcenc on {s}\n", .{src});
         tally.failed += 1;
-        return;
+        return false;
     };
     defer allocator.free(r.stdout);
     defer allocator.free(r.stderr);
@@ -315,6 +408,7 @@ fn convertAtlas(
         std.debug.print("labelle astc: astcenc failed on {s}\n{s}\n", .{ src, r.stderr });
         tally.failed += 1;
     }
+    return ok;
 }
 
 /// The `.resources` a pack/plugin manifest declares (asset-plugins P1/P2), or
@@ -1347,4 +1441,160 @@ test "BackendCaps: bgfx rejects blocks it cannot actually upload" {
     const base = convert.Options{ .block = .@"8x8" };
     const opts = resourceOpts(atlasPinning(.@"6x6"), base, false, caps);
     try std.testing.expectEqual(convert.BlockSize.@"8x8", opts.block);
+}
+
+test "backendCaps: bgfx on wasm loads 4x4 only; every other target is unchanged" {
+    // WebGL2 bgfx drops 8x8 (`emulated_only`, labelle-bgfx#134/#76).
+    try std.testing.expectEqual(convert.BackendCaps.bgfx_web_4x4_only, backendCaps(.bgfx, .wasm));
+    // Native bgfx keeps the two hardware-verified blocks.
+    for ([_]project_config.Platform{ .desktop, .android, .ios }) |p| {
+        try std.testing.expectEqual(convert.BackendCaps.bgfx_4x4_8x8, backendCaps(.bgfx, p));
+    }
+    // No other backend's caps depend on the platform.
+    for (std.enums.values(project_config.Platform)) |p| {
+        try std.testing.expectEqual(convert.BackendCaps.sokol_4x4_only, backendCaps(.sokol, p));
+        try std.testing.expectEqual(convert.BackendCaps.raylib_4x4_8x8, backendCaps(.raylib, p));
+        try std.testing.expectEqual(convert.BackendCaps.full, backendCaps(.wgpu, p));
+        try std.testing.expectEqual(convert.BackendCaps.full, backendCaps(.sdl, p));
+        try std.testing.expectEqual(convert.BackendCaps.full, backendCaps(.null, p));
+    }
+}
+
+test "resourceOpts: bgfx web encodes the default and an 8x8 pin at 4x4" {
+    const caps = backendCaps(.bgfx, .wasm);
+    // The run-wide default a bgfx web build starts from is 4x4, not 8x8...
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", caps.defaultBlock());
+    const base = convert.Options{ .block = caps.defaultBlock() };
+    // ...an unpinned atlas takes it...
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", resourceOpts(atlasPinning(null), base, false, caps).block);
+    // ...and an 8x8 pin (fine on Android) is downgraded, not baked.
+    try std.testing.expect(!caps.supports(.@"8x8"));
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", resourceOpts(atlasPinning(.@"8x8"), base, false, caps).block);
+}
+
+test "resourceOpts: non-wasm bgfx still honours an 8x8 pin and defaults to 8x8" {
+    const caps = backendCaps(.bgfx, .android);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", caps.defaultBlock());
+    const base = convert.Options{ .block = caps.defaultBlock() };
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", resourceOpts(atlasPinning(.@"8x8"), base, false, caps).block);
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", resourceOpts(atlasPinning(.@"4x4"), base, false, caps).block);
+}
+
+/// A minimal `.astc` header (magic + block dims + 1x1x1 image) — all
+/// `existingBlockMatches` reads.
+fn fakeAstcHeader(block: convert.BlockSize) [16]u8 {
+    const d = block.dims();
+    return .{ 0x13, 0xAB, 0xA1, 0x5C, d.x, d.y, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0 };
+}
+
+/// Temp project with `assets/rooms.png` and, written AFTER it (so the mtime
+/// check alone would call it fresh), an `assets/rooms.astc` encoded at
+/// `sibling_block` — the state an Android build leaves behind.
+fn stageSibling(tmp: *std.testing.TmpDir, buf: []u8, sibling_block: convert.BlockSize) ![]const u8 {
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/rooms.png", .data = "png" });
+    const header = fakeAstcHeader(sibling_block);
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/rooms.astc", .data = &header });
+    return buf[0..try tmp.dir.realPath(io, buf)];
+}
+
+test "an existing 8x8 sibling is re-encoded to 4x4 for bgfx web" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try stageSibling(&tmp, &buf, .@"8x8");
+    const src = try std.fs.path.join(a, &.{ base, "assets/rooms.png" });
+    defer a.free(src);
+    const out = try convert.outputPath(a, src);
+    defer a.free(out);
+
+    // The mtime says fresh — it is the header BLOCK that decides.
+    try std.testing.expect(!convert.needsReencode(Stat, src, out));
+    // Same file: current for the Android build that wrote it...
+    const android = resourceOpts(atlasPinning(.@"8x8"), .{ .block = backendCaps(.bgfx, .android).defaultBlock() }, false, backendCaps(.bgfx, .android));
+    try std.testing.expect(siblingIsCurrent(src, out, android.block));
+    // ...but NOT for the web build, which resolves 4x4 and so re-encodes.
+    const web = resourceOpts(atlasPinning(.@"8x8"), .{ .block = backendCaps(.bgfx, .wasm).defaultBlock() }, false, backendCaps(.bgfx, .wasm));
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", web.block);
+    try std.testing.expect(!siblingIsCurrent(src, out, web.block));
+}
+
+test "a failed web re-encode deletes the stale 8x8 sibling (PNG fallback, never 8x8)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try stageSibling(&tmp, &buf, .@"8x8");
+
+    // An astcenc that cannot run: the encode fails, and the 8x8 file the
+    // assembler would otherwise swap in must be gone.
+    var tally = Tally{};
+    try convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
+    try std.testing.expectEqual(@as(usize, 1), tally.failed);
+    try std.testing.expectEqual(@as(usize, 0), tally.cached);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "assets/rooms.astc", .{}));
+}
+
+test "a current sibling survives a failed-encoder run; a stale one does not" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try stageSibling(&tmp, &buf, .@"4x4");
+
+    // Cached path: a 4x4 sibling is current for bgfx web, so convertAtlas
+    // never runs the (broken) encoder and keeps the file.
+    var tally = Tally{};
+    try convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
+    try std.testing.expectEqual(@as(usize, 1), tally.cached);
+    _ = try tmp.dir.statFile(io, "assets/rooms.astc", .{});
+
+    // astcenc unavailable (no encode at all): a current sibling is kept...
+    const job: AtlasJob = .{ .name = "rooms", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"4x4" } };
+    try discardIfNotCurrent(a, job);
+    _ = try tmp.dir.statFile(io, "assets/rooms.astc", .{});
+    // ...but one at the wrong block for this target is dropped.
+    var stale = job;
+    stale.opts.block = .@"8x8";
+    try discardIfNotCurrent(a, stale);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "assets/rooms.astc", .{}));
+}
+
+test "an undeletable stale sibling is a fatal error, not a silent PNG fallback" {
+    // POSIX-only: a read-only directory is how we make the unlink fail. Root
+    // ignores directory permissions, so the premise can't be staged there.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (std.c.getuid() == 0) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try stageSibling(&tmp, &buf, .@"8x8");
+
+    // Path-based chmod (fchmodat), not `openDir` + `setPermissions`: on
+    // Linux a non-iterable Dir is an O_PATH fd, and fchmod on it is EBADF —
+    // which Zig 0.16 panics on as a programmer bug. Restore before cleanup.
+    try tmp.dir.setFilePermissions(io, "assets", .fromMode(0o555), .{});
+    defer tmp.dir.setFilePermissions(io, "assets", .fromMode(0o755), .{}) catch {};
+
+    // bgfx web: the 8x8 sibling is stale, astcenc fails, and the delete is
+    // refused → the error the pipeline turns into a fatal exit.
+    var tally = Tally{};
+    try std.testing.expectError(
+        error.StaleAstcSiblingUndeletable,
+        convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally),
+    );
+    // It got there through the failed-encode path, and the file is still
+    // there — which is exactly why continuing would be wrong.
+    try std.testing.expectEqual(@as(usize, 1), tally.failed);
+    _ = try tmp.dir.statFile(io, "assets/rooms.astc", .{});
+
+    // Same when astcenc can't be resolved at all.
+    const job: AtlasJob = .{ .name = "rooms", .base_dir = base, .texture = "assets/rooms.png", .opts = .{ .block = .@"4x4" } };
+    try std.testing.expectError(error.StaleAstcSiblingUndeletable, discardIfNotCurrent(a, job));
 }

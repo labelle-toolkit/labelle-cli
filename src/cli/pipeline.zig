@@ -707,10 +707,26 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // like it worked. So a config error stops the build, while a conversion
     // failure still degrades to PNG.
     if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-        astc_cmd.cmdAstc(allocator, &.{project_dir}) catch |err| switch (err) {
+        // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
+        // sokol) and the Android backend fallback all differ from what
+        // project.labelle declares, and the loadable blocks depend on both.
+        astc_cmd.cmdAstc(allocator, &.{
+            project_dir,
+            "--platform",
+            @tagName(parsed.platform),
+            "--backend",
+            @tagName(parsed.backend),
+        }) catch |err| switch (err) {
             error.ConflictingAstcBlocks => progress.fatalExit(
                 1,
                 "conflicting .astc_block pins compile to one .astc — see the error above",
+            ),
+            // A stale `.astc` (wrong block for this target) that could not be
+            // deleted would be swapped in by the assembler — the PNG fallback
+            // below would be a lie. Stop instead (labelle-bgfx#134).
+            error.StaleAstcSiblingUndeletable => progress.fatalExit(
+                1,
+                "a stale .astc sibling could not be deleted — see the error above",
             ),
             else => std.debug.print(
                 "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
