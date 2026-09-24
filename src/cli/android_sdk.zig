@@ -359,6 +359,18 @@ pub fn findNdkSysroot(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 
     }
 }
 
+/// `llvm-strip` from the same NDK toolchain `findNdkSysroot` resolves:
+/// `<ndk>/toolchains/llvm/prebuilt/<host>/bin/llvm-strip`, the sibling of
+/// the sysroot. It is the tool the Android Gradle plugin strips release
+/// `.so`s with, and what `android/apk_slim.zig` uses to drop DWARF from
+/// the packaged library (labelle-assembler#755).
+pub fn findNdkLlvmStrip(allocator: std.mem.Allocator, sdk_home: []const u8) ![]u8 {
+    const sysroot = try findNdkSysroot(allocator, sdk_home);
+    defer allocator.free(sysroot);
+    const prebuilt = std.fs.path.dirname(sysroot) orelse return error.NdkNotFound;
+    return joinIfExists(allocator, &.{ prebuilt, "bin", exeName("llvm-strip") }) orelse error.NdkNotFound;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 /// NDK `<host>` triple used in `toolchains/llvm/prebuilt/<host>/`.

@@ -21,6 +21,7 @@ const run_mod = @import("android/run.zig");
 const deploy_mod = @import("android/deploy.zig");
 const doctor_mod = @import("android/doctor.zig");
 const studio_mod = @import("android/studio.zig");
+const apk_slim_mod = @import("android/apk_slim.zig");
 
 // ── Public re-exports ──────────────────────────────────────────────
 // Keeps `android.buildAndPackage`, `android.deployToDevice`, etc.
@@ -31,6 +32,8 @@ pub const buildAndPackage = build_mod.buildAndPackage;
 pub const buildAllAbis = build_mod.buildAllAbis;
 pub const packageApk = package_mod.packageApk;
 pub const packageApkWithAbis = package_mod.packageApkWithAbis;
+pub const PackageOptions = package_mod.PackageOptions;
+pub const stripForOptimize = apk_slim_mod.stripForOptimize;
 pub const deployToDevice = run_mod.deployToDevice;
 pub const deployToDeviceWithAbis = run_mod.deployToDeviceWithAbis;
 pub const DeployOpts = deploy_mod.DeployOpts;
@@ -250,14 +253,15 @@ pub fn handleAndroid(
         defer allocator.free(apk_path);
         std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
     } else if (std.mem.eql(u8, cmd, "run")) {
+        const package_opts: PackageOptions = .{ .strip_native = apk_slim_mod.stripForReleaseMode(release_mode) };
         if (all_abis) {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
             const abis = try build_mod.buildAllAbis(arena.allocator(), target_dir, release_mode);
-            try run_mod.deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis, signing, &.{});
+            try run_mod.deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis, signing, package_opts, &.{});
         } else {
             try build_mod.androidBuild(allocator, target_dir, emulator, release_mode);
-            try run_mod.deployToDevice(allocator, project_dir, target_dir, cfg, emulator, signing, &.{});
+            try run_mod.deployToDevice(allocator, project_dir, target_dir, cfg, emulator, signing, package_opts, &.{});
         }
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         try deploy_mod.cmdDeploy(allocator, project_dir, target_dir, cfg, .{
