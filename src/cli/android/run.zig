@@ -113,12 +113,17 @@ fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_
 }
 
 /// The `adb` arguments that launch the NativeActivity:
-/// `shell am start -n <activity> [--es <key> <value>]...`, one string extra
+/// `shell am start -S -n <activity> [--es <key> <value>]...`, one string extra
 /// per entry in `extras`, keyed by the `LABELLE_*` env-var name (cli#397).
 /// The Android runtime turns the extras back into env vars before the game
 /// starts (labelle-bgfx#139, labelle-sokol#25); a runtime without that
 /// support just ignores them. No extras → the bare launch, so a previous
 /// run's options can never leak into this one.
+///
+/// `-S` force-stops the app first, extras or not: the NativeActivity never
+/// reads a new intent, so a plain `am start` on a running app only brings it
+/// to the front and drops the extras (labelle-bgfx#140) — and a stale
+/// running app would also mask a freshly installed build.
 ///
 /// `adb shell` joins its argv with spaces and hands the result to the
 /// device's `sh`, so every value is single-quoted (`shellQuote`) — a scene
@@ -127,7 +132,7 @@ fn installAndLaunch(allocator: std.mem.Allocator, apk_path: []const u8, package_
 /// allocated in `arena`.
 pub fn amStartArgs(arena: std.mem.Allocator, activity: []const u8, extras: []const EnvKV) ![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
-    try args.appendSlice(arena, &.{ "shell", "am", "start", "-n", activity });
+    try args.appendSlice(arena, &.{ "shell", "am", "start", "-S", "-n", activity });
     for (extras) |kv| {
         try args.appendSlice(arena, &.{ "--es", kv.key, try shellQuote(arena, kv.value) });
     }
@@ -215,7 +220,7 @@ test "amStartArgs: no run options → the bare launch, no extras" {
     defer arena.deinit();
     var sec_buf: [32]u8 = undefined;
     const got = try launchArgsFor(arena.allocator(), .{}, &sec_buf);
-    try expectArgs(&.{ "shell", "am", "start", "-n", "com.example.game/android.app.NativeActivity" }, got);
+    try expectArgs(&.{ "shell", "am", "start", "-S", "-n", "com.example.game/android.app.NativeActivity" }, got);
 }
 
 test "amStartArgs: --scene becomes --es LABELLE_SCENE" {
@@ -224,7 +229,7 @@ test "amStartArgs: --scene becomes --es LABELLE_SCENE" {
     var sec_buf: [32]u8 = undefined;
     const got = try launchArgsFor(arena.allocator(), .{ .scene = "big_colony" }, &sec_buf);
     try expectArgs(&.{
-        "shell", "am",            "start",        "-n", "com.example.game/android.app.NativeActivity",
+        "shell", "am",            "start",        "-S", "-n", "com.example.game/android.app.NativeActivity",
         "--es",  "LABELLE_SCENE", "'big_colony'",
     }, got);
 }
@@ -239,9 +244,9 @@ test "amStartArgs: --profile and --screenshot/--after map to their keys" {
         .screenshot_after_ns = 2500 * std.time.ns_per_ms,
     }, &sec_buf);
     try expectArgs(&.{
-        "shell",              "am",              "start",                        "-n",      "com.example.game/android.app.NativeActivity",
-        "--es",               "LABELLE_PROFILE", "'1'",                          "--es",    "LABELLE_SCREENSHOT_PATH",
-        "'/sdcard/shot.png'", "--es",            "LABELLE_SCREENSHOT_AFTER_SEC", "'2.500'",
+        "shell", "am",                           "start",   "-S",   "-n",                      "com.example.game/android.app.NativeActivity",
+        "--es",  "LABELLE_PROFILE",              "'1'",     "--es", "LABELLE_SCREENSHOT_PATH", "'/sdcard/shot.png'",
+        "--es",  "LABELLE_SCREENSHOT_AFTER_SEC", "'2.500'",
     }, got);
 }
 
@@ -250,7 +255,7 @@ test "amStartArgs: --after without --screenshot adds nothing" {
     defer arena.deinit();
     var sec_buf: [32]u8 = undefined;
     const got = try launchArgsFor(arena.allocator(), .{ .screenshot_after_ns = std.time.ns_per_s }, &sec_buf);
-    try std.testing.expectEqual(@as(usize, 5), got.len);
+    try expectArgs(&.{ "shell", "am", "start", "-S", "-n", "com.example.game/android.app.NativeActivity" }, got);
 }
 
 test "shellQuote: shell-unsafe values are single-quoted" {
