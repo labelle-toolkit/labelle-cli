@@ -83,13 +83,17 @@ pub const NativeStage = enum {
     strip_unavailable,
     /// `llvm-strip` ran and failed: copied as built.
     strip_failed,
+    /// The unstripped copy could not be written to `symbols/`: copied as
+    /// built (a strip nobody can symbolize is not worth shipping).
+    symbols_unwritable,
 };
 
 /// Stage `so_path` at `staged_so`. When `strip` is set and `strip_tool`
 /// resolves, the staged copy is `strip_tool --strip-unneeded` of the
 /// library and the original is copied to `symbols_so` first. Every
-/// failure of the strip path falls back to a plain copy — a strip
-/// problem must not cost the user their APK.
+/// failure of the strip path — including a `symbols/` that cannot be
+/// written — falls back to a plain copy: symbol preservation and
+/// stripping are best-effort and must not cost the user their APK.
 pub fn stageNativeLib(
     allocator: std.mem.Allocator,
     so_path: []const u8,
@@ -109,8 +113,14 @@ pub fn stageNativeLib(
         return .strip_unavailable;
     };
 
-    if (std.fs.path.dirname(symbols_so)) |dir| try cwd.createDirPath(io, dir);
-    try cwd.copyFile(so_path, cwd, symbols_so, io, .{});
+    preserveSymbols(so_path, symbols_so) catch |err| {
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        writeSymbolsWarning(&w, symbols_so, err) catch {};
+        std.debug.print("{s}", .{w.buffered()});
+        try cwd.copyFile(so_path, cwd, staged_so, io, .{});
+        return .symbols_unwritable;
+    };
 
     const ok = blk: {
         const result = util.runCmd(allocator, &.{ tool, "--strip-unneeded", "-o", staged_so, so_path }) catch break :blk false;
@@ -125,6 +135,19 @@ pub fn stageNativeLib(
         return .strip_failed;
     }
     return .stripped;
+}
+
+fn preserveSymbols(so_path: []const u8, symbols_so: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    if (std.fs.path.dirname(symbols_so)) |dir| try cwd.createDirPath(io, dir);
+    try cwd.copyFile(so_path, cwd, symbols_so, io, .{});
+}
+
+/// The warning `stageNativeLib` prints when the unstripped copy cannot be
+/// written. Separate so a spec can pin that it names the path and error.
+pub fn writeSymbolsWarning(w: *std.Io.Writer, symbols_so: []const u8, err: anyerror) !void {
+    try w.print("labelle: warning: cannot write unstripped copy {s} ({s}); packaging libgame.so unstripped\n", .{ symbols_so, @errorName(err) });
 }
 
 // ── Asset staging ──────────────────────────────────────────────────
@@ -550,6 +573,44 @@ pub const StageNativeLibSpec = struct {
         const got = try fx.read("staged.so");
         defer a.free(got);
         try std.testing.expectEqualStrings("BUILT-WITH-DWARF", got);
+    }
+
+    test "an unwritable symbols/ stages the built library unstripped, strip never runs" {
+        const a = std.testing.allocator;
+        var fx = try NativeFixture.init();
+        defer fx.deinit();
+        try fx.write("libgame.so", "BUILT-WITH-DWARF");
+        // The recording fake needs `sh`; on Windows a missing tool still
+        // tells the paths apart (it would report `.strip_failed`).
+        const tool = if (builtin.os.tag == .windows) try a.dupe(u8, "Z:\\nonexistent\\llvm-strip.exe") else try fx.fakeStrip(0);
+        defer a.free(tool);
+        // A regular FILE where the `symbols` dir must go: no directory can
+        // be created under it, for any user (root included) on any OS —
+        // unlike a chmod'ed dir, which root writes through anyway.
+        try fx.write("symbols", "not a directory");
+        const so = try fx.path("libgame.so");
+        defer a.free(so);
+        const staged = try fx.path("staged.so");
+        defer a.free(staged);
+        const sym = try fx.path("symbols/arm64-v8a/libgame.so");
+        defer a.free(sym);
+
+        try expect.equal(try stageNativeLib(a, so, staged, sym, true, tool), .symbols_unwritable);
+        // The fallback ran BEFORE the tool: nothing was stripped.
+        try std.testing.expect(!fx.exists("strip-args"));
+        const got = try fx.read("staged.so");
+        defer a.free(got);
+        try std.testing.expectEqualStrings("BUILT-WITH-DWARF", got);
+    }
+
+    test "the symbols warning names the path and the error" {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeSymbolsWarning(&w, "t/symbols/arm64-v8a/libgame.so", error.NotDir);
+        try std.testing.expectEqualStrings(
+            "labelle: warning: cannot write unstripped copy t/symbols/arm64-v8a/libgame.so (NotDir); packaging libgame.so unstripped\n",
+            w.buffered(),
+        );
     }
 
     test "a failing strip falls back to the built library" {

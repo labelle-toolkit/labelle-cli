@@ -131,6 +131,8 @@ pub fn packageApkWithAbis(
             .stripped => std.debug.print("labelle: stripped {s}/libgame.so; unstripped copy for ndk-stack: {s}\n", .{ abi.abi_dir, symbols_so }),
             .strip_unavailable => std.debug.print("labelle: warning: NDK llvm-strip not found, packaging {s}/libgame.so unstripped\n", .{abi.abi_dir}),
             .strip_failed => std.debug.print("labelle: warning: llvm-strip failed, packaging {s}/libgame.so unstripped\n", .{abi.abi_dir}),
+            // `stageNativeLib` already printed the path + error.
+            .symbols_unwritable => {},
         }
     }
 
