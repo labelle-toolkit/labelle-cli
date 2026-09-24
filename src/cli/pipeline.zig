@@ -1116,7 +1116,16 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // Android: deploy to device/emulator
         if (reporter) |r| r.beginPhase(.run, "deploying to Android");
         std.debug.print("labelle: deploying to Android...\n", .{});
-        try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{});
+        // An app the system starts has no environment we control, so the
+        // env-based run options travel as `am start --es` intent extras
+        // under the same `LABELLE_*` names (cli#397); the Android runtime
+        // turns them back into env vars (labelle-bgfx#139,
+        // labelle-sokol#25). A runtime without that support ignores them.
+        var launch_extras: std.ArrayList(runner.EnvKV) = .empty;
+        defer launch_extras.deinit(allocator);
+        var sec_buf: [32]u8 = undefined;
+        try runner.appendRunOptionEnv(allocator, &launch_extras, runOptionEnv(&parsed_args), &sec_buf);
+        try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{}, launch_extras.items);
         if (reporter) |r| r.finishDone(0);
     } else {
         if (timeout_ns) |t| {
@@ -1173,9 +1182,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         if (has_scene_env or has_screenshot_env or has_headless_env or has_profile_env) {
             var extras: std.ArrayList(runner.EnvKV) = .empty;
             defer extras.deinit(allocator);
-            if (parsed_args.scene_override) |scene| {
-                try extras.append(allocator, .{ .key = "LABELLE_SCENE", .value = scene });
-            }
+            // --scene / --profile / --screenshot(+--after): the list shared
+            // with the Android launch (cli#397).
+            var sec_buf: [32]u8 = undefined;
+            try runner.appendRunOptionEnv(allocator, &extras, runOptionEnv(&parsed_args), &sec_buf);
             var ticks_buf: [32]u8 = undefined;
             if (parsed_args.headless) {
                 try extras.append(allocator, .{ .key = "LABELLE_HEADLESS", .value = "1" });
@@ -1187,17 +1197,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                     try extras.append(allocator, .{ .key = "LABELLE_HEADLESS_TICKS", .value = ticks_str });
                 }
             }
-            if (parsed_args.profile) {
-                try extras.append(allocator, .{ .key = "LABELLE_PROFILE", .value = "1" });
-            }
-            var sec_buf: [32]u8 = undefined;
             if (parsed_args.screenshot_path) |path| {
-                try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_PATH", .value = path });
-                if (parsed_args.screenshot_after_ns) |ns| {
-                    const sec_f64 = @as(f64, @floatFromInt(ns)) / @as(f64, std.time.ns_per_s);
-                    const sec_str = try std.fmt.bufPrint(&sec_buf, "{d:.3}", .{sec_f64});
-                    try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_AFTER_SEC", .value = sec_str });
-                }
                 // Deliberately "requested", not "will be written to": the
                 // backend picks the real filename and may not honor this path
                 // (labelle-bgfx#57 appends its own `.tga`). The authoritative
@@ -1348,6 +1348,17 @@ const FileStamp = struct {
         return before.size != after.size or before.mtime_ns != after.mtime_ns;
     }
 };
+
+/// The `labelle run` options that reach the game as `LABELLE_*` variables on
+/// every platform (env block on desktop, intent extras on Android — cli#397).
+fn runOptionEnv(parsed_args: *const ParsedArgs) runner.RunOptionEnv {
+    return .{
+        .scene = parsed_args.scene_override,
+        .profile = parsed_args.profile,
+        .screenshot_path = parsed_args.screenshot_path,
+        .screenshot_after_ns = parsed_args.screenshot_after_ns,
+    };
+}
 
 /// Where a screenshot might land, fingerprinted before the game runs.
 ///

@@ -502,6 +502,44 @@ fn runZigInheritHeartbeat(
 /// "parent env + one extra var," so we snapshot first.
 pub const EnvKV = struct { key: []const u8, value: []const u8 };
 
+/// The platform-neutral `labelle run` options that reach the game as
+/// `LABELLE_*` variables: `--scene`, `--profile`, `--screenshot`/`--after`.
+/// ONE list shared by the desktop spawn (env block) and the Android launch
+/// (`am start --es` intent extras, cli#397) so the two can't drift.
+/// Desktop-only knobs (`--headless` & co) are appended by the desktop path.
+pub const RunOptionEnv = struct {
+    scene: ?[]const u8 = null,
+    profile: bool = false,
+    screenshot_path: ?[]const u8 = null,
+    screenshot_after_ns: ?u64 = null,
+};
+
+/// Append one `EnvKV` per option in `opts` that was actually given — an
+/// unset option adds nothing, so no stale value reaches the game. The
+/// `LABELLE_SCREENSHOT_AFTER_SEC` value is formatted into `sec_buf`, which
+/// must outlive `extras`.
+pub fn appendRunOptionEnv(
+    allocator: std.mem.Allocator,
+    extras: *std.ArrayList(EnvKV),
+    opts: RunOptionEnv,
+    sec_buf: *[32]u8,
+) !void {
+    if (opts.scene) |scene| {
+        try extras.append(allocator, .{ .key = "LABELLE_SCENE", .value = scene });
+    }
+    if (opts.profile) {
+        try extras.append(allocator, .{ .key = "LABELLE_PROFILE", .value = "1" });
+    }
+    if (opts.screenshot_path) |path| {
+        try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_PATH", .value = path });
+        if (opts.screenshot_after_ns) |ns| {
+            const sec_f64 = @as(f64, @floatFromInt(ns)) / @as(f64, std.time.ns_per_s);
+            const sec_str = try std.fmt.bufPrint(sec_buf, "{d:.3}", .{sec_f64});
+            try extras.append(allocator, .{ .key = "LABELLE_SCREENSHOT_AFTER_SEC", .value = sec_str });
+        }
+    }
+}
+
 pub fn buildEnvironWithExtra(
     allocator: std.mem.Allocator,
     extras: []const EnvKV,
