@@ -1576,10 +1576,11 @@ test "an undeletable stale sibling is a fatal error, not a silent PNG fallback" 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const base = try stageSibling(&tmp, &buf, .@"8x8");
 
-    var assets = try tmp.dir.openDir(io, "assets", .{});
-    defer assets.close(io);
-    try assets.setPermissions(io, .fromMode(0o555));
-    defer assets.setPermissions(io, .fromMode(0o755)) catch {};
+    // Path-based chmod (fchmodat), not `openDir` + `setPermissions`: on
+    // Linux a non-iterable Dir is an O_PATH fd, and fchmod on it is EBADF —
+    // which Zig 0.16 panics on as a programmer bug. Restore before cleanup.
+    try tmp.dir.setFilePermissions(io, "assets", .fromMode(0o555), .{});
+    defer tmp.dir.setFilePermissions(io, "assets", .fromMode(0o755), .{}) catch {};
 
     // bgfx web: the 8x8 sibling is stale, astcenc fails, and the delete is
     // refused → the error the pipeline turns into a fatal exit.
