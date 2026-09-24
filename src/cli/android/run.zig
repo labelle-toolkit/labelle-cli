@@ -18,13 +18,13 @@ const EnvKV = runner.EnvKV;
 /// entry point — picks the ABI from `emulator` + host arch, then
 /// delegates to `deployToDeviceWithAbis`. `launch_extras` are handed to the
 /// app as intent string extras (see `amStartArgs`).
-pub fn deployToDevice(allocator: std.mem.Allocator, project_dir: []const u8, target_dir: []const u8, cfg: project_config.ProjectConfig, emulator: bool, signing: SigningConfig, launch_extras: []const EnvKV) !void {
+pub fn deployToDevice(allocator: std.mem.Allocator, project_dir: []const u8, target_dir: []const u8, cfg: project_config.ProjectConfig, emulator: bool, signing: SigningConfig, opts: package.PackageOptions, launch_extras: []const EnvKV) !void {
     const abi_dir = package.hostAbiDir(emulator);
     const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_path);
 
     const abis = [_]StagedAbi{.{ .abi_dir = abi_dir, .so_path = so_path }};
-    try deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis[0..], signing, launch_extras);
+    try deployToDeviceWithAbis(allocator, project_dir, target_dir, cfg, abis[0..], signing, opts, launch_extras);
 }
 
 /// Shared staging / packaging / install / launch pipeline used by
@@ -39,9 +39,10 @@ pub fn deployToDeviceWithAbis(
     cfg: project_config.ProjectConfig,
     abis: []const StagedAbi,
     signing: SigningConfig,
+    opts: package.PackageOptions,
     launch_extras: []const EnvKV,
 ) !void {
-    const apk_path = try package.packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis, signing);
+    const apk_path = try package.packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis, signing, opts);
     defer allocator.free(apk_path);
 
     const package_name = try package.resolvePackageName(allocator, cfg);

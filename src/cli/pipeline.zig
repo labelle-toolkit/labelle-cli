@@ -1038,7 +1038,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // a bare `.so`. Package it into a signed APK so the artifact is
         // installable — backend-agnostic, so it covers sokol and bgfx alike.
         if (parsed.platform == .android) {
-            const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{});
+            const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{}, .{
+                .strip_native = android.stripForOptimize(effective_optimize),
+            });
             defer allocator.free(apk_path);
             std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
         }
@@ -1141,7 +1143,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         defer launch_extras.deinit(allocator);
         var sec_buf: [32]u8 = undefined;
         try runner.appendRunOptionEnv(allocator, &launch_extras, runOptionEnv(&parsed_args), &sec_buf);
-        try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{}, launch_extras.items);
+        try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{}, .{
+            .strip_native = android.stripForOptimize(effective_optimize),
+        }, launch_extras.items);
         if (reporter) |r| r.finishDone(0);
     } else {
         if (timeout_ns) |t| {

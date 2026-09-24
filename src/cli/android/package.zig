@@ -10,11 +10,14 @@ const asm_cache = @import("../asm_cache.zig");
 const util = @import("../util.zig");
 const android = @import("../android.zig");
 const launcher_icon = @import("launcher_icon.zig");
+const apk_slim = @import("apk_slim.zig");
+const android_sdk = @import("../android_sdk.zig");
 
 const ProjectConfig = project_config.ProjectConfig;
 const AndroidConfig = project_config.AndroidConfig;
 const SigningConfig = android.SigningConfig;
 const StagedAbi = android.StagedAbi;
+pub const PackageOptions = apk_slim.PackageOptions;
 
 /// Post-validation signing values passed into apksigner. Unlike
 /// `SigningConfig`, every required field is non-optional — the
@@ -41,12 +44,13 @@ pub fn packageApk(
     cfg: ProjectConfig,
     emulator: bool,
     signing: SigningConfig,
+    opts: PackageOptions,
 ) ![]u8 {
     const abi_dir = hostAbiDir(emulator);
     const so_path = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "lib", "libgame.so" });
     defer allocator.free(so_path);
     const abis = [_]StagedAbi{.{ .abi_dir = abi_dir, .so_path = so_path }};
-    return packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis[0..], signing);
+    return packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis[0..], signing, opts);
 }
 
 /// Package a signed APK from one or more built `libgame.so` entries.
@@ -62,6 +66,10 @@ pub fn packageApk(
 ///
 /// `project_dir` is the source project root — needed because
 /// `.app_icon` in `project.labelle` is relative to it (cli#340).
+///
+/// `opts` carries the size controls of labelle-assembler#755 (see
+/// `apk_slim.zig`): release builds stage a stripped `.so` and keep the
+/// unstripped one under `<target_dir>/symbols/<abi>/`.
 pub fn packageApkWithAbis(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
@@ -69,6 +77,7 @@ pub fn packageApkWithAbis(
     cfg: ProjectConfig,
     abis: []const StagedAbi,
     signing: SigningConfig,
+    opts: PackageOptions,
 ) ![]u8 {
     if (abis.len == 0) return error.NoAbisProvided;
 
@@ -94,6 +103,17 @@ pub fn packageApkWithAbis(
     // Intentionally ignoring errors: the staging directory may not exist on first run.
     std.Io.Dir.cwd().deleteTree(config.globalIo(), staging_dir) catch {};
 
+    // The unstripped libraries of the PREVIOUS package would not match
+    // this APK — drop them before (maybe) writing new ones.
+    const symbols_dir = try std.fs.path.join(allocator, &.{ target_dir, apk_slim.symbols_dir_name });
+    defer allocator.free(symbols_dir);
+    std.Io.Dir.cwd().deleteTree(config.globalIo(), symbols_dir) catch {};
+
+    // Release builds strip the packaged library with the NDK's llvm-strip
+    // (labelle-assembler#755). A missing tool only costs the size win.
+    const strip_tool: ?[]u8 = if (opts.strip_native) findStripTool(allocator) else null;
+    defer if (strip_tool) |t| allocator.free(t);
+
     // Fan out every staged .so into `lib/<abi>/libgame.so`. The fat
     // APK case produces multiple directories under `lib/`; apksigner
     // and Android's package installer pick the right one per device.
@@ -104,7 +124,14 @@ pub fn packageApkWithAbis(
 
         const staged_so = try std.fs.path.join(allocator, &.{ lib_dir, "libgame.so" });
         defer allocator.free(staged_so);
-        try std.Io.Dir.cwd().copyFile(abi.so_path, std.Io.Dir.cwd(), staged_so, config.globalIo(), .{});
+        const symbols_so = try std.fs.path.join(allocator, &.{ symbols_dir, abi.abi_dir, "libgame.so" });
+        defer allocator.free(symbols_so);
+        switch (try apk_slim.stageNativeLib(allocator, abi.so_path, staged_so, symbols_so, opts.strip_native, strip_tool)) {
+            .copied => {},
+            .stripped => std.debug.print("labelle: stripped {s}/libgame.so; unstripped copy for ndk-stack: {s}\n", .{ abi.abi_dir, symbols_so }),
+            .strip_unavailable => std.debug.print("labelle: warning: NDK llvm-strip not found, packaging {s}/libgame.so unstripped\n", .{abi.abi_dir}),
+            .strip_failed => std.debug.print("labelle: warning: llvm-strip failed, packaging {s}/libgame.so unstripped\n", .{abi.abi_dir}),
+        }
     }
 
     // Stage the launcher icon into `res/mipmap-*/ic_launcher.png`
@@ -128,8 +155,22 @@ pub fn packageApkWithAbis(
     defer allocator.free(assets_src);
     const assets_dst = try std.fs.path.join(allocator, &.{ staging_dir, "assets" });
     defer allocator.free(assets_dst);
+    //
+    // Only what the runtime reads from the APK is staged: the packer's
+    // `raw/` sources and every file the generated main.zig `@embedFile`s
+    // (plus the PNG an embedded ASTC replaced) are already in libgame.so
+    // or never loaded at all (labelle-assembler#755, `apk_slim.zig`).
     if (std.Io.Dir.cwd().access(config.globalIo(), assets_src, .{})) |_| {
-        try copyDirectory(allocator, assets_src, assets_dst);
+        var embedded = try apk_slim.loadEmbeddedAssets(allocator, target_dir);
+        defer embedded.deinit(allocator);
+        const summary = try apk_slim.stageAssets(allocator, assets_src, assets_dst, embedded);
+        if (summary.skippedFiles() > 0) {
+            std.debug.print("labelle: staged {d} asset files; left out {d} ({d:.1} MB on disk) the runtime does not read from the APK\n", .{
+                summary.kept_files,
+                summary.skippedFiles(),
+                apk_slim.mb(summary.skippedBytes()),
+            });
+        }
     } else |err| switch (err) {
         error.FileNotFound => {}, // no assets to stage — fine
         else => return err,
@@ -139,7 +180,16 @@ pub fn packageApkWithAbis(
     const apk_path = try std.fs.path.join(allocator, &.{ target_dir, "game.apk" });
     errdefer allocator.free(apk_path);
     try buildApk(allocator, staging_dir, apk_path, android_cfg, signing);
+    apk_slim.printSizeReport(allocator, apk_path);
     return apk_path;
+}
+
+/// The NDK `llvm-strip`, or null (with nothing printed — the caller
+/// warns per library) when no SDK/NDK can be resolved.
+fn findStripTool(allocator: std.mem.Allocator) ?[]u8 {
+    const sdk_home = android_sdk.findSdkHome(allocator) catch return null;
+    defer allocator.free(sdk_home);
+    return android_sdk.findNdkLlvmStrip(allocator, sdk_home) catch null;
 }
 
 /// Pick the ABI directory for a single-arch build. On Apple Silicon

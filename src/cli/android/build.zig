@@ -7,6 +7,7 @@ const runner = @import("../runner.zig");
 const android = @import("../android.zig");
 const package = @import("package.zig");
 const config = @import("../config.zig");
+const apk_slim = @import("apk_slim.zig");
 
 const ReleaseMode = android.ReleaseMode;
 const SigningConfig = android.SigningConfig;
@@ -174,6 +175,7 @@ pub fn buildAndPackage(
     emulator: bool,
     signing: SigningConfig,
 ) ![]const u8 {
+    const opts: package.PackageOptions = .{ .strip_native = apk_slim.stripForReleaseMode(release_mode) };
     if (all_abis) {
         // Arena contains every intermediate path string and the
         // StagedAbi slice returned by buildAllAbis — they all live
@@ -182,9 +184,9 @@ pub fn buildAndPackage(
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const abis = try buildAllAbis(arena.allocator(), target_dir, release_mode);
-        return package.packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis, signing);
+        return package.packageApkWithAbis(allocator, project_dir, target_dir, cfg, abis, signing, opts);
     } else {
         try androidBuild(allocator, target_dir, emulator, release_mode);
-        return package.packageApk(allocator, project_dir, target_dir, cfg, emulator, signing);
+        return package.packageApk(allocator, project_dir, target_dir, cfg, emulator, signing, opts);
     }
 }

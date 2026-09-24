@@ -612,6 +612,16 @@ pub const LinuxDesktopCreateFromBuildSpec = linux_desktop_mod.CreateFromBuildSpe
 pub const LinuxDesktopShouldEmitSpec = linux_desktop_mod.ShouldEmitSpec;
 pub const ArgsAppendRunForwardedArgsSpec = args_tests_mod.AppendRunForwardedArgsSpec;
 
+// APK size controls (labelle-assembler#755): release strip, asset-staging
+// exclusions and the size report. Private import, so re-exported here.
+const apk_slim_mod = @import("cli/android/apk_slim.zig");
+pub const ApkSlimStripDecisionSpec = apk_slim_mod.StripDecisionSpec;
+pub const ApkSlimStageNativeLibSpec = apk_slim_mod.StageNativeLibSpec;
+pub const ApkSlimScanEmbeddedAssetsSpec = apk_slim_mod.ScanEmbeddedAssetsSpec;
+pub const ApkSlimSkipReasonSpec = apk_slim_mod.SkipReasonSpec;
+pub const ApkSlimStageAssetsSpec = apk_slim_mod.StageAssetsSpec;
+pub const ApkSlimSizeReportSpec = apk_slim_mod.SizeReportSpec;
+
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
 pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;
 // The nested-git-checkout prune (labelle-cli#371): `labelle test` must
