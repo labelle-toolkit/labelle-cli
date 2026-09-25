@@ -77,12 +77,17 @@ pub const BackendCaps = enum {
     /// web, and the web build's startup pick (assembler >= 0.113.0) falls
     /// back to the atlas's PNG.
     bgfx_4x4_8x8,
+    /// bgfx on the web, pinned OLDER than v0.28.1: its WebGL format table
+    /// omits 8x8, so an 8x8 atlas is refused there (labelle-bgfx#147/#76).
+    /// Only 4x4 is loadable. `labelle astc` picks this from the project's
+    /// resolved `backend_package` version.
+    bgfx_web_4x4_only,
     full,
 
     /// Can this backend's runtime upload `block` as-is?
     pub fn supports(self: BackendCaps, block: BlockSize) bool {
         return switch (self) {
-            .sokol_4x4_only => block == .@"4x4",
+            .sokol_4x4_only, .bgfx_web_4x4_only => block == .@"4x4",
             .raylib_4x4_8x8, .bgfx_4x4_8x8 => block == .@"4x4" or block == .@"8x8",
             .full => true,
         };
@@ -94,7 +99,7 @@ pub const BackendCaps = enum {
     /// sprite-atlas default.
     pub fn defaultBlock(self: BackendCaps) BlockSize {
         return switch (self) {
-            .sokol_4x4_only => .@"4x4",
+            .sokol_4x4_only, .bgfx_web_4x4_only => .@"4x4",
             else => .@"8x8",
         };
     }
