@@ -69,14 +69,18 @@ pub const BackendCaps = enum {
     /// it cannot sample (labelle-bgfx#76), only the two blocks verified on
     /// hardware are offered — a build error beats silent garbage on a player's
     /// device.
+    ///
+    /// The same two blocks on the web: labelle-toolkit/zbgfx's emscripten
+    /// format table now lists the full ASTC LDR set, as WebGL's extension
+    /// provides, so 8x8 samples natively there too (labelle-bgfx#147; before
+    /// it, web was 4x4-only). A bgfx older than that fix refuses 8x8 on the
+    /// web, and the web build's startup pick (assembler >= 0.113.0) falls
+    /// back to the atlas's PNG.
     bgfx_4x4_8x8,
-    /// bgfx on the web (wasm/WebGL2) samples ONLY 4x4 of the blocks we ship.
-    /// Its emscripten format table (`isTextureFormatValidPerSpec` in
-    /// renderer_gl.cpp) omits ASTC 8x8, so Chrome reports an 8x8 atlas as
-    /// `emulated_only` and bgfx (0.26.1+, labelle-bgfx#76) refuses it — the
-    /// atlas never loads. 4x4 is verified on Chrome/Apple silicon and Android
-    /// Chrome on an Adreno 610. Desktop/Android bgfx keep `bgfx_4x4_8x8`.
-    /// See labelle-bgfx#134.
+    /// bgfx on the web, pinned OLDER than v0.28.1: its WebGL format table
+    /// omits 8x8, so an 8x8 atlas is refused there (labelle-bgfx#147/#76).
+    /// Only 4x4 is loadable. `labelle astc` picks this from the project's
+    /// resolved `backend_package` version.
     bgfx_web_4x4_only,
     full,
 
@@ -91,7 +95,7 @@ pub const BackendCaps = enum {
 
     /// Block to use when the caller didn't pass `--block`: the smallest GPU
     /// footprint (largest block) the backend can still load. sokol can only do
-    /// 4×4 (and so can bgfx on the web); everyone else gets the 8×8
+    /// 4×4; everyone else gets the 8×8
     /// sprite-atlas default.
     pub fn defaultBlock(self: BackendCaps) BlockSize {
         return switch (self) {
@@ -216,10 +220,6 @@ test "BackendCaps.supports gates blocks by what the runtime can upload" {
     try std.testing.expect(BackendCaps.raylib_4x4_8x8.supports(.@"8x8"));
     try std.testing.expect(!BackendCaps.raylib_4x4_8x8.supports(.@"6x6"));
     try std.testing.expect(!BackendCaps.raylib_4x4_8x8.supports(.@"12x12"));
-    // bgfx on WebGL2 samples 4×4 only — 8×8 is `emulated_only` (bgfx#134).
-    try std.testing.expect(BackendCaps.bgfx_web_4x4_only.supports(.@"4x4"));
-    try std.testing.expect(!BackendCaps.bgfx_web_4x4_only.supports(.@"8x8"));
-    try std.testing.expect(!BackendCaps.bgfx_web_4x4_only.supports(.@"6x6"));
     // wgpu takes the full astcenc range.
     try std.testing.expect(BackendCaps.full.supports(.@"4x4"));
     try std.testing.expect(BackendCaps.full.supports(.@"12x12"));
@@ -228,8 +228,6 @@ test "BackendCaps.supports gates blocks by what the runtime can upload" {
 test "BackendCaps.defaultBlock picks the smallest footprint each backend can load" {
     // sokol must fall back to 4×4 (the blocker this fix exists for).
     try std.testing.expectEqual(BlockSize.@"4x4", BackendCaps.sokol_4x4_only.defaultBlock());
-    // bgfx on the web too: its 8×8 sprite-atlas default would not load.
-    try std.testing.expectEqual(BlockSize.@"4x4", BackendCaps.bgfx_web_4x4_only.defaultBlock());
     try std.testing.expectEqual(BlockSize.@"8x8", BackendCaps.bgfx_4x4_8x8.defaultBlock());
     // others keep the 8×8 sprite-atlas default, and it must be loadable.
     try std.testing.expectEqual(BlockSize.@"8x8", BackendCaps.raylib_4x4_8x8.defaultBlock());
