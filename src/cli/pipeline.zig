@@ -70,8 +70,12 @@ const WasmRebuildCtx = struct {
     /// like a failing `generate` or `zig build` already does — not exit
     /// the process out from under the serve loop.
     prebuild_opts: prebuild.Options,
-    /// The shader-compiler override gate, run AFTER the prebuild hooks and
-    /// BEFORE generation on every rebuild — the same function the cold
+    /// The prebuild runner. A field only so the stage-order test below can
+    /// observe whether the steps ran without spawning them; production never
+    /// overrides it.
+    run_prebuild: *const fn (std.mem.Allocator, []const u8, []const prebuild.Step, prebuild.Options) prebuild.Error!void = prebuild.runAll,
+    /// The shader-compiler override gate, run AFTER the prebuild steps and
+    /// the `before generate` hooks and BEFORE generation on every rebuild — the same function the cold
     /// pipeline runs before its `assembler generate`. It is a field only so
     /// the stage test below can supply the override value without touching
     /// the process environment; production never overrides the default.
@@ -110,10 +114,10 @@ const WasmRebuildCtx = struct {
     /// watch loop only needs the bool, but the test asserts the ORDER —
     /// that the shader preflight fires before generation is attempted.
     const Stage = error{
-        PrebuildFailed,
         ReplanFailed,
-        ShaderPreflightFailed,
+        PrebuildFailed,
         HookFailed,
+        ShaderPreflightFailed,
         GenerateFailed,
         FingerprintFailed,
         ZigSpawnFailed,
@@ -153,39 +157,47 @@ const WasmRebuildCtx = struct {
     fn rebuildStaged(self: *WasmRebuildCtx) Stage!void {
         const a = self.allocator;
 
-        // 0. Re-run the declared prebuild steps, ahead of generation just
-        //    as the initial pipeline does. Steps that declare `.inputs` +
-        //    `.outputs` are skipped while fresh, so the common watch
-        //    iteration costs a few stats — and their declared `.outputs`
-        //    are excluded from the watch signature (`ignore_files` at the
-        //    `serveAndOpen` call below), so the run that DOES regenerate
-        //    them no longer looks like a fresh edit on the next poll.
-        //    A step that declares no `.outputs` runs on every rebuild by
-        //    design and is not excluded from anything; if such a step
-        //    also writes into the watched tree it retriggers the watcher
-        //    in a loop, so declare `.outputs` for generators used under
-        //    `--watch`.
-        prebuild.runAll(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
-            std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
-            return error.PrebuildFailed;
-        };
-
-        // 0a. Re-read the project, rediscover the providers and replan the
-        //     hook phases for THIS rebuild (see `replan`). A failing replan
-        //     — a malformed manifest saved mid-session, say — is reported
-        //     like a failing core step and stops here, before any phase.
+        // 0. Re-read the project, rediscover the providers, re-check that
+        //    the served target still has a pinned owner and replan the hook
+        //    phases for THIS rebuild (see `replan`) — FIRST, ahead of every
+        //    side-effecting stage. A watched edit that removes or unpins the
+        //    target owner used to be refused only after the prebuild
+        //    commands below had already run once for the invalid
+        //    configuration (Codex P2 on #421). A failing replan — a
+        //    malformed manifest saved mid-session, say — is reported like a
+        //    failing core step and stops here, before any stage.
         if (self.replan) |replan| {
             replan.run(replan.ctx, self) catch |err| {
-                std.debug.print("labelle: rebuild stopped before generate: provider replan failed ({s})\n", .{@errorName(err)});
+                std.debug.print("labelle: rebuild stopped before prebuild: provider replan failed ({s})\n", .{@errorName(err)});
                 return error.ReplanFailed;
             };
         }
 
-        // 0b. Gate the shader-compiler override AFTER the hooks (a hook may
-        //     be what creates `materials/`) and BEFORE generation. The cold
-        //     pipeline runs this once at startup; a project that gains
+        // 0a. Re-run the declared prebuild steps, ahead of generation just
+        //     as the initial pipeline does. Steps that declare `.inputs` +
+        //     `.outputs` are skipped while fresh, so the common watch
+        //     iteration costs a few stats — and their declared `.outputs`
+        //     are excluded from the watch signature (`ignore_files` at the
+        //     `serveAndOpen` call below), so the run that DOES regenerate
+        //     them no longer looks like a fresh edit on the next poll.
+        //     A step that declares no `.outputs` runs on every rebuild by
+        //     design and is not excluded from anything; if such a step
+        //     also writes into the watched tree the watcher re-baselines
+        //     after one follow-up rebuild (`serve.WatchBaseline`), but
+        //     declaring `.outputs` avoids even that one.
+        self.run_prebuild(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
+            std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
+            return error.PrebuildFailed;
+        };
+
+        // 0b. The `before generate` hooks, then the shader-compiler override
+        //     gate AFTER them (a prebuild step or a before-generate hook may
+        //     be what creates `materials/`; Codex P2 on #420) and BEFORE the
+        //     core generation. The cold pipeline gates at startup and again
+        //     after its own before-generate hooks; a project that gains
         //     `materials/` while being watched would otherwise skip it and
         //     hit the opaque compiler failure this gate exists to replace.
+        try self.hookPhase(self.generate_plan.before, .generate, .before, self.generate_out);
         self.shader_preflight(a, self.project_dir) catch |err| {
             std.debug.print("labelle: rebuild stopped before generate: shader compiler override rejected ({s})\n", .{@errorName(err)});
             return error.ShaderPreflightFailed;
@@ -193,8 +205,8 @@ const WasmRebuildCtx = struct {
 
         // 1. Regenerate — scene/prefab/script *structure* (new files, added
         //    components) can change, not just @embedFile'd content. Wrapped
-        //    in the `generate` hook phases exactly like the cold pipeline.
-        try self.hookPhase(self.generate_plan.before, .generate, .before, self.generate_out);
+        //    in the `generate` hook phases exactly like the cold pipeline
+        //    (its `before` phase ran with the gate above).
         if (self.generate_plan.replace) |replacement| {
             try self.hookPhase(&.{replacement}, .generate, .replace, self.generate_out);
         } else {
@@ -242,7 +254,7 @@ const WasmRebuildCtx = struct {
         }
     }
 
-    test "watched rebuild gates the shader override after hooks and before generate" {
+    test "watched rebuild gates the shader override after the before-generate hooks and before generate" {
         if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
         const a = std.testing.allocator;
         const io = config.globalIo();
@@ -290,9 +302,39 @@ const WasmRebuildCtx = struct {
         // reason here). This is the cold-start shape that skipped the gate.
         try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
 
-        // materials/ appears while watched: the NEXT rebuild must stop at
-        // the preflight, before generation is attempted.
-        try tmp.dir.createDirPath(io, "project/materials");
+        // A `before generate` hook creates materials/: the gate runs AFTER
+        // that phase, so this very rebuild stops at the preflight, before
+        // generation is attempted (Codex P2 on #420).
+        const Hook = struct {
+            var materials: []const u8 = "";
+            var ran = false;
+            fn run(_: *provider_hooks.Site, _: []const provider_hooks.Planned, _: provider_contract.Step, phase: provider_contract.Phase, _: []const u8) anyerror!u8 {
+                if (phase == .before) {
+                    ran = true;
+                    try std.Io.Dir.cwd().createDirPath(config.globalIo(), materials);
+                }
+                return 0;
+            }
+            var provider: provider_dispatch.Provider = .{
+                .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+                .dir = "/pkg",
+                .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+                .verified = true,
+            };
+        };
+        Hook.materials = try std.fs.path.join(a, &.{ project, "materials" });
+        defer a.free(Hook.materials);
+        ctx.run_hook_phase = Hook.run;
+        ctx.generate_plan = .{ .before = &.{.{
+            .provider = &Hook.provider,
+            .hook = .{ .id = "gen", .step = .generate, .target = "wasm", .when = .before, .build_step = "tool", .executable = "bin/tool" },
+            .qualified = "pkg/gen",
+        }} };
+        try std.testing.expectError(error.ShaderPreflightFailed, ctx.rebuildStaged());
+        try std.testing.expect(Hook.ran);
+
+        // materials/ stays: every later rebuild stops at the preflight too.
+        ctx.generate_plan = .{};
         try std.testing.expectError(error.ShaderPreflightFailed, ctx.rebuildStaged());
         try std.testing.expect(!rebuild(@ptrCast(&ctx)));
     }
@@ -518,6 +560,15 @@ const WasmRebuildCtx = struct {
             }
             fn reset() void {
                 phase_count = 0;
+                prebuilds = 0;
+            }
+            // The prebuild runner: counts runs, and records whether the
+            // replan of this rebuild had already happened.
+            var prebuilds: usize = 0;
+            var replans_at_prebuild: usize = 0;
+            fn runPrebuild(_: std.mem.Allocator, _: []const u8, _: []const prebuild.Step, _: prebuild.Options) prebuild.Error!void {
+                prebuilds += 1;
+                replans_at_prebuild = replans;
             }
         };
         var counter: usize = 0;
@@ -542,14 +593,20 @@ const WasmRebuildCtx = struct {
             .generate_plan = .{ .replace = Fixture.planned("gen-stale", .generate, .replace) },
             .build_plan = .{ .replace = Fixture.planned("build-stale", .build, .replace) },
             .run_hook_phase = Spy.run,
+            .run_prebuild = Spy.runPrebuild,
             .replan = .{ .ctx = &counter, .run = Spy.replan },
         };
+        // Production wiring: the default prebuild runner IS the cold one.
+        const default_prebuild = std.meta.fieldInfo(WasmRebuildCtx, .run_prebuild).defaultValue() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(default_prebuild == prebuild.runAll);
 
         // Rebuild 1: replanned once; the FRESH plans ran, the startup plans
-        // did not.
+        // did not. The replan came first: the prebuild steps ran after it.
         Spy.reset();
         try ctx.rebuildStaged();
         try std.testing.expectEqual(@as(usize, 1), counter);
+        try std.testing.expectEqual(@as(usize, 1), Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 1), Spy.replans_at_prebuild);
         try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
         try std.testing.expectEqualStrings("gen-fresh", Spy.phases[0]);
         try std.testing.expectEqualStrings("build-fresh", Spy.phases[1]);
@@ -565,6 +622,10 @@ const WasmRebuildCtx = struct {
         try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 3), counter);
         try std.testing.expectEqual(@as(usize, 0), Spy.phase_count);
+        // ...and before the prebuild steps: an edit that drops or unpins the
+        // served target's owner runs no side-effecting prebuild work for
+        // the refused configuration (Codex P2 on #421).
+        try std.testing.expectEqual(@as(usize, 0), Spy.prebuilds);
         try std.testing.expectEqualStrings("gen-fresh", ctx.generate_plan.replace.?.hook.id);
         try std.testing.expectEqualStrings("build-fresh", ctx.build_plan.replace.?.hook.id);
         Spy.fail_next = false;
@@ -582,13 +643,13 @@ const WasmRebuildCtx = struct {
 };
 
 /// The production replan for `wasm serve --watch` (`WasmRebuildCtx.replan`):
-/// re-reads `project.labelle`, rediscovers the providers with the package
-/// cache `.populated` (the cold pipeline's install ran before the server
-/// started) and replans the `generate` and `build` phases for the target
-/// being served. Each successful replan lives on its own arena; the
-/// previous generation — its arena and any pinned provider sources it
-/// extracted — is released only once the new one is installed, so a failed
-/// replan leaves the context pointing at intact storage.
+/// re-reads `project.labelle`, brings the package cache and `labelle.lock`
+/// in line with it when it changed, rediscovers the providers with the
+/// package cache `.populated` and replans the `generate` and `build` phases
+/// for the target being served. Each successful replan lives on its own
+/// arena; the previous generation — its arena and any pinned provider
+/// sources it extracted — is released only once the new one is installed,
+/// so a failed replan leaves the context pointing at intact storage.
 const WatchReplan = struct {
     backing: std.mem.Allocator,
     project_dir: []const u8,
@@ -596,6 +657,51 @@ const WatchReplan = struct {
     /// until the first replan: the startup plans live on the pipeline's
     /// hook arena, which outlives the server.
     current: ?*Generation = null,
+    /// Populates the package cache for the project as it now reads — the
+    /// cold pipeline's `assembler install`. `null` skips the install (the
+    /// plumbing tests' shape).
+    installer: ?Installer = null,
+    /// Rewrites `labelle.lock` for the re-read project, as the cold pipeline
+    /// does before generation. A field only so a test can observe it.
+    write_lock: *const fn (std.mem.Allocator, []const u8, project_config.ProjectConfig) anyerror!void = lockfile.writeLockFile,
+    /// SHA-256 of the `project.labelle` bytes the package cache and the lock
+    /// were last brought in line with. `null` until `baseline` or the first
+    /// replan. A replan that reads the same bytes skips the install and the
+    /// lock write: the common watched edit (a script, an asset) costs
+    /// nothing here.
+    synced: ?[32]u8 = null,
+
+    /// The package-cache install seam: `run(ctx, allocator, project_dir)`.
+    const Installer = struct {
+        ctx: *const anyopaque,
+        run: *const fn (*const anyopaque, std.mem.Allocator, []const u8) anyerror!void,
+    };
+
+    /// Production installer: the pipeline's `AssemblerInstaller`.
+    fn assemblerInstaller(installer: *const AssemblerInstaller) Installer {
+        return .{ .ctx = installer, .run = struct {
+            fn run(ctx: *const anyopaque, a: std.mem.Allocator, project_dir: []const u8) anyerror!void {
+                const self: *const AssemblerInstaller = @ptrCast(@alignCast(ctx));
+                return self.install(a, project_dir);
+            }
+        }.run };
+    }
+
+    fn digestProject(a: std.mem.Allocator, project_dir: []const u8) ![32]u8 {
+        const path = try std.fs.path.join(a, &.{ project_dir, "project.labelle" });
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(16 * 1024 * 1024));
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return digest;
+    }
+
+    /// Record the project the cold pipeline just installed and locked, so
+    /// the first replan does not repeat that work for unchanged bytes.
+    fn baseline(self: *WatchReplan) void {
+        self.synced = digestProject(self.backing, self.project_dir) catch null;
+    }
 
     const Generation = struct {
         arena: std.heap.ArenaAllocator,
@@ -622,11 +728,21 @@ const WatchReplan = struct {
         const next = try Generation.create(self.backing);
         errdefer next.destroy(self.backing);
         const a = next.arena.allocator();
+        const digest = try digestProject(a, self.project_dir);
         var cfg = try config.readProjectConfig(a, self.project_dir);
         // The served target's platform and backend are the pipeline's
         // resolved ones (`wasm serve` overrides what the file declares).
         cfg.platform = ctx.hooks.cfg.platform;
         cfg.backend = ctx.hooks.cfg.backend;
+        // An edited `project.labelle` may declare a package the startup
+        // install never fetched and the startup lock never pinned: install
+        // first, as the cold pipeline does ahead of discovery, or an added
+        // remote provider fails `.populated` discovery with
+        // `ProviderPackageMissing` and an added local one's first hook
+        // fails `MissingProviderPin` — on every rebuild until the server
+        // restarts (Codex P2 on #420).
+        const changed = if (self.synced) |synced| !std.mem.eql(u8, &synced, &digest) else true;
+        if (changed) if (self.installer) |installer| try installer.run(installer.ctx, a, self.project_dir);
         const providers: []const provider_dispatch.Provider = if (cfg.plugins.len == 0)
             &.{}
         else
@@ -645,6 +761,11 @@ const WatchReplan = struct {
         }
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
+        // The lock follows the re-read project once the target is confirmed
+        // and the plans are good — the cold pipeline's order — and before
+        // any hook runs, since each hook verifies its pin against it.
+        if (changed) try self.write_lock(a, self.project_dir, cfg);
+        self.synced = digest;
         // Install only now, so a failure above leaves the previous plans —
         // and their storage — untouched.
         ctx.hooks.providers = providers;
@@ -655,8 +776,16 @@ const WatchReplan = struct {
         self.current = next;
     }
 
-    fn deinit(self: *WatchReplan) void {
-        if (self.current) |generation| generation.destroy(self.backing);
+    /// Release the current generation. Once a replan succeeded, `site`'s
+    /// `providers` and `cfg` point into that generation, so they are put back
+    /// on the caller's stable (startup) storage first: nothing on the site
+    /// may dangle, whatever runs after this (Codex P2 on #420).
+    fn deinit(self: *WatchReplan, site: *provider_hooks.Site, stable_providers: []const provider_dispatch.Provider, stable_cfg: project_config.ProjectConfig) void {
+        if (self.current) |generation| {
+            site.providers = stable_providers;
+            site.cfg = stable_cfg;
+            generation.destroy(self.backing);
+        }
         self.current = null;
     }
 
@@ -711,7 +840,8 @@ const WatchReplan = struct {
             .hooks = &site,
         };
         var replan = WatchReplan{ .backing = a, .project_dir = project };
-        defer replan.deinit();
+        const startup_cfg = site.cfg;
+        defer replan.deinit(&site, &.{}, startup_cfg);
 
         // First replan: the manifest's generate hook is planned; the site
         // now knows the provider and the re-read config.
@@ -776,6 +906,174 @@ const WatchReplan = struct {
         try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.run(&replan, &ctx));
         try Kept.check(&replan, &ctx, &site, good);
         try std.testing.expectEqualStrings("local:../pkg", site.cfg.plugins[0].repo);
+    }
+
+    // An edit to `project.labelle` brings the package cache and the lock in
+    // line before discovery: a newly declared remote package is installed
+    // (else `.populated` discovery fails `ProviderPackageMissing` on every
+    // rebuild), the lock is rewritten after the plans are good, and an
+    // unchanged project costs neither.
+    test "watch replan installs and relocks when project.labelle changes" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        const home = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(home);
+        asm_cache.setCacheRootOverride(home);
+        defer asm_cache.clearCacheRootOverride();
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "pkg/plugin.labelle",
+            .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        });
+        const local = ".{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" }";
+        const remote = ".{ .name = \"extra\", .repo = \"example/extra\", .version = \"1.0.0\" }";
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\", .plugins = .{ " ++ local ++ " } }" });
+
+        const Spy = struct {
+            var events: [8][]const u8 = undefined;
+            var count: usize = 0;
+            var cache_dir: []const u8 = "";
+            var fail_install = false;
+            fn install(_: *const anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!void {
+                events[count] = "install";
+                count += 1;
+                if (fail_install) return error.InstallFailed;
+                // What `assembler install` does for a declared remote package.
+                try std.Io.Dir.cwd().createDirPath(config.globalIo(), cache_dir);
+            }
+            fn lock(_: std.mem.Allocator, _: []const u8, cfg: project_config.ProjectConfig) anyerror!void {
+                events[count] = if (cfg.plugins.len == 2) "lock-2" else "lock-1";
+                count += 1;
+            }
+        };
+        Spy.count = 0;
+        Spy.cache_dir = try std.fs.path.join(a, &.{ home, "packages", "plugins", "example", "extra", "1.0.0" });
+        defer a.free(Spy.cache_dir);
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+        };
+        var replan = WatchReplan{
+            .backing = a,
+            .project_dir = project,
+            .installer = .{ .ctx = &Spy.count, .run = Spy.install },
+            .write_lock = Spy.lock,
+        };
+        const startup_cfg = site.cfg;
+        defer replan.deinit(&site, &.{}, startup_cfg);
+        // The cold pipeline installed and locked this project: the baseline.
+        replan.baseline();
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(@as(usize, 0), Spy.count);
+
+        // The project gains a remote package the startup install never saw.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\", .plugins = .{ " ++ local ++ ", " ++ remote ++ " } }" });
+        // A failing install fails the replan (previous state kept) and is
+        // retried on the next rebuild, with no lock written in between.
+        Spy.fail_install = true;
+        try std.testing.expectError(error.InstallFailed, WatchReplan.run(&replan, &ctx));
+        try std.testing.expectEqual(@as(usize, 1), site.cfg.plugins.len);
+        Spy.fail_install = false;
+        try WatchReplan.run(&replan, &ctx);
+        // Installed first (discovery then found the package), locked for the
+        // new project last.
+        try std.testing.expectEqual(@as(usize, 3), Spy.count);
+        try std.testing.expectEqualStrings("install", Spy.events[0]);
+        try std.testing.expectEqualStrings("install", Spy.events[1]);
+        try std.testing.expectEqualStrings("lock-2", Spy.events[2]);
+        try std.testing.expectEqual(@as(usize, 2), site.cfg.plugins.len);
+        // Unchanged again: nothing re-runs.
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(@as(usize, 3), Spy.count);
+
+        // Without the install the same edit is the reported failure: the
+        // cache never learns about the package.
+        var bare = WatchReplan{ .backing = a, .project_dir = project, .write_lock = Spy.lock };
+        defer bare.deinit(&site, &.{}, startup_cfg);
+        try std.Io.Dir.cwd().deleteTree(io, Spy.cache_dir);
+        try std.testing.expectError(error.ProviderPackageMissing, WatchReplan.run(&bare, &ctx));
+    }
+
+    // Once a rebuild replanned, the site points into the replan's storage;
+    // releasing it puts the site back on the stable startup storage, so a
+    // shutdown hook after it can never read freed memory.
+    test "watch replan release restores the site's stable storage" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "pkg/plugin.labelle",
+            .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
+        });
+        const Lock = struct {
+            fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
+        };
+        const stable_providers = [_]provider_dispatch.Provider{.{
+            .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+            .dir = "/startup",
+            .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+            .verified = true,
+        }};
+        const stable_cfg: project_config.ProjectConfig = .{ .name = "startup" };
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        site.providers = &stable_providers;
+        site.cfg = stable_cfg;
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+        };
+        var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = Lock.none };
+        try WatchReplan.run(&replan, &ctx);
+        // The site now reads the replan's generation, not the startup storage.
+        try std.testing.expect(site.providers.ptr != &stable_providers);
+        try std.testing.expectEqualStrings("game", site.cfg.name);
+        replan.deinit(&site, &stable_providers, stable_cfg);
+        try std.testing.expect(replan.current == null);
+        try std.testing.expect(site.providers.ptr == &stable_providers);
+        try std.testing.expectEqualStrings("startup", site.cfg.name);
+        try std.testing.expectEqualStrings("/startup", site.providers[0].dir);
     }
 };
 
@@ -946,6 +1244,99 @@ const AssemblerInstaller = struct {
         return self.bin.run(a, "install", &.{ "--project-root", project_dir });
     }
 };
+
+/// The cold pipeline's `before generate` phase, then the shader-compiler
+/// override gate AGAIN. `gateThenInstall` validated the override before the
+/// install, but a before-generate hook may be what creates `materials/`:
+/// with no consumer at that point the gate passed, and an unusable
+/// `LABELLE_SHADERC` then failed generation or the build with the opaque
+/// error the gate exists to replace (Codex P2 on #420). The re-check runs
+/// only when hooks ran — otherwise nothing changed since the first one —
+/// and before every core generation input reader. On success the progress
+/// detail is back on the core step (`provider_hooks.runBefore`).
+fn beforeGenerate(
+    site: *provider_hooks.Site,
+    before: []const provider_hooks.Planned,
+    output_dir: []const u8,
+    project_dir: []const u8,
+    gate: *const fn (std.mem.Allocator, []const u8) anyerror!void,
+) !u8 {
+    const code = try provider_hooks.runBefore(site, before, .generate, output_dir, "assembler generate");
+    if (code != 0) return code;
+    if (before.len != 0) try gate(site.backing, project_dir);
+    return 0;
+}
+
+test "pipeline: the shader override is re-gated after the before-generate hooks" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/labelle.lock",
+        .data = ".{ .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
+    });
+    const Fixture = struct {
+        var provider: provider_dispatch.Provider = .{
+            .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+            .dir = "/pkg",
+            .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+            .verified = true,
+        };
+        var materials: []const u8 = "";
+        var hook_ran = false;
+        var gate_ran = false;
+        // The before-generate hook creates `materials/`, the shape the
+        // startup gate could not see.
+        fn hook(_: std.mem.Allocator, _: provider_dispatch.Host, _: []const u8, _: provider_dispatch.Provider, _: provider_contract.Tool, _: provider_dispatch.ToolRun) anyerror!u8 {
+            hook_ran = true;
+            try std.Io.Dir.cwd().createDirPath(config.globalIo(), materials);
+            return 0;
+        }
+        // The same gate the cold path runs, with the env read replaced by a
+        // known-bad value.
+        fn badOverride(alloc: std.mem.Allocator, dir: []const u8) anyerror!void {
+            gate_ran = true;
+            return material_toolchain.preflightWith(alloc, dir, "shaderc", .native);
+        }
+    };
+    Fixture.materials = try std.fs.path.join(a, &.{ project, "materials" });
+    // The startup gate (before the install) passes: no `materials/` yet.
+    try gateThenInstall(a, project, Fixture.badOverride, struct {
+        fn install(_: @This(), _: std.mem.Allocator, _: []const u8) !void {}
+    }{});
+    const planned: provider_hooks.Planned = .{
+        .provider = &Fixture.provider,
+        .hook = .{ .id = "gen", .step = .generate, .target = "desktop", .when = .before, .build_step = "tool", .executable = "bin/tool" },
+        .qualified = "pkg/gen",
+    };
+    var site: provider_hooks.Site = .{
+        .a = a,
+        .backing = std.testing.allocator,
+        .providers = &.{Fixture.provider},
+        .root = project,
+        .cfg = .{ .name = "game" },
+        .target = "desktop",
+        .optimize = .Debug,
+        .progress = .off,
+        .reporter = null,
+        .host = .{ .zig = "/z", .cache_root = project, .global_cache = project, .packages = project },
+        .run_tool = Fixture.hook,
+    };
+    // No hooks: nothing could have changed, so the gate is not re-run.
+    Fixture.gate_ran = false;
+    try std.testing.expectEqual(@as(u8, 0), try beforeGenerate(&site, &.{}, project, project, Fixture.badOverride));
+    try std.testing.expect(!Fixture.gate_ran);
+    // The hook creates `materials/`; the re-check fires after it and stops
+    // the command before any core generation.
+    try std.testing.expectError(error.ShadercOverrideMustBeAbsolute, beforeGenerate(&site, &.{planned}, project, project, Fixture.badOverride));
+    try std.testing.expect(Fixture.hook_ran and Fixture.gate_ran);
+}
 
 test "a rejected shader override stops the cold build before any package is installed" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
@@ -1377,7 +1768,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // The server returns on Ctrl+C / SIGTERM, the serve's clean end, and
         // the after hooks run then — as on the building path.
         try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
-        return provider_hooks.runPhase(&no_build_site, no_build_plan.after, .run, .after, no_build_out);
+        return provider_hooks.finishServe(&no_build_site, no_build_plan.after, no_build_out);
     }
 
     // (Provider discovery, the ownership check of the provisional target
@@ -1704,9 +2095,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // #420). Both pre-passes are part of the core generation they feed, so
     // a `replace generate` hook stands in for them too: the replacement
     // owns whatever preprocessing its generation needs.
+    //
+    // The shader-compiler override is gated again right after the `before`
+    // phase (`beforeGenerate`): a hook may be what creates `materials/`.
     const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, target.name, null);
     {
-        const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.before, .generate, .before, generate_out);
+        const gate: *const fn (std.mem.Allocator, []const u8) anyerror!void = if (parsed_args.docker) material_toolchain.preflightDocker else material_toolchain.preflight;
+        const code = try beforeGenerate(&hook_site, hook_plans.generate.before, generate_out, project_dir, gate);
         if (code != 0) return code;
     }
     core_generate: {
@@ -2042,7 +2437,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             null;
         const bundle_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .bundle, target.name, bundle_override);
         {
-            const code = try provider_hooks.runPhase(&hook_site, hook_plans.bundle.before, .bundle, .before, bundle_out);
+            // The feed returns to "packaging bundle" once the hooks are done.
+            const code = try provider_hooks.runBefore(&hook_site, hook_plans.bundle.before, .bundle, bundle_out, "packaging bundle");
             if (code != 0) return code;
         }
         core_bundle: {
@@ -2092,6 +2488,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // device launch (`provider_hooks.RunOutcome`). The interactive `wasm
     // serve` loop is the one exception in timing: its `done` record lands
     // before the loop and the after hooks run only once the server returns.
+    //
+    // A cross-compiled `--docker --target=<t>` binary cannot run on this
+    // host, so the core launch is skipped — and with it the whole `run`
+    // step: decided HERE, before the `before run` hooks, so no run hook
+    // prepares (or fails) a launch that never happens (Codex P2 on #420).
+    if (crossTargetLaunchSkipped(parsed_args.docker, parsed_args.docker_target, parsed.platform, hook_plans.run.replace != null)) |t| {
+        std.debug.print("labelle: cannot run cross-compiled binary (target: {s})\n", .{t});
+        std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
+        if (reporter) |r| r.finishDone(0); // build succeeded; run skipped
+        return 0;
+    }
     const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.run.before, .run, .before, run_out);
@@ -2130,8 +2537,25 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             // the terminal `done` record lands before the serve loop. The
             // loop returns on Ctrl+C / SIGTERM (`serve.serveAndOpen`
             // installs the handler), which is how the `after run` hooks
-            // below become reachable at all (Codex P2 on #420).
+            // below become reachable at all (Codex P2 on #420); a failing
+            // one revises that provisional `done` (`finishServe`).
             if (reporter) |r| r.finishDone(0);
+            // The watched session's replan storage lives at THIS scope, not
+            // inside the `--watch` branch: once a rebuild has replanned,
+            // `hook_site.cfg`/`providers` point into its current generation,
+            // and the `after run` hooks below resolve settings through them.
+            // Destroyed at the watch branch's end, that storage was freed
+            // before the shutdown hooks read it (Codex P2 on #420). The
+            // defer runs after the `return` expression below is evaluated,
+            // i.e. after the hooks, and restores the startup storage on the
+            // site as it releases the generation.
+            const watch_installer = AssemblerInstaller{ .bin = asm_bin };
+            var watch_replan = WatchReplan{
+                .backing = allocator,
+                .project_dir = project_dir,
+                .installer = WatchReplan.assemblerInstaller(&watch_installer),
+            };
+            defer watch_replan.deinit(&hook_site, providers, parsed);
             if (parsed_args.serve_watch) {
                 // `--watch` (cli#208): hand the serve loop a rebuild callback
                 // that re-runs the same generate→fingerprint→zig-build steps
@@ -2142,9 +2566,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 // rebuild re-reads the project and replans through
                 // `watch_replan`, so an edited manifest or `provider_config`
                 // reaches the next rebuild; the plans computed above are only
-                // the initial state.
-                var watch_replan = WatchReplan{ .backing = allocator, .project_dir = project_dir };
-                defer watch_replan.deinit();
+                // the initial state. The project the cold pipeline just
+                // installed and locked is the replan's baseline: an edit to
+                // `project.labelle` re-runs the install and rewrites the lock.
+                watch_replan.baseline();
                 var rebuild_ctx = WasmRebuildCtx{
                     .allocator = allocator,
                     .asm_bin = asm_bin,
@@ -2196,10 +2621,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             } else {
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
             }
-            // The server returned (Ctrl+C / SIGTERM): the feed is already
-            // terminal, so only the hooks themselves run here. The stop was
-            // asked for, so this is the serve's clean end.
-            return provider_hooks.runPhase(&hook_site, hook_plans.run.after, .run, .after, run_out);
+            // The server returned (Ctrl+C / SIGTERM): the serve's clean end.
+            // The feed already says `done`; only the hooks run here, and a
+            // failing one revises that record to `failed`.
+            return provider_hooks.finishServe(&hook_site, hook_plans.run.after, run_out);
         }
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
@@ -2317,13 +2742,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // When --docker was used, run the built binary directly instead of
         // calling `zig build run` (local Zig may be broken).
         if (parsed_args.docker) {
-            // Cross-compiled binaries can't be run on the host
-            if (parsed_args.docker_target) |t| {
-                std.debug.print("labelle: cannot run cross-compiled binary (target: {s})\n", .{t});
-                std.debug.print("  binary is at: {s}/zig-out/bin/\n", .{target_dir});
-                if (reporter) |r| r.finishDone(0); // build succeeded; run skipped
-                return 0;
-            }
+            // (A cross-compiled binary never reaches here: the launch is
+            // skipped before the run hooks — `crossTargetLaunchSkipped`.)
             // The assembler names the desktop binary after the project
             // (sanitized) so concurrent games are distinguishable to
             // `pgrep` (labelle-assembler#362). Derive the same name here so
@@ -2412,6 +2832,33 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             // watchdog's kill, which is also exit 0.
             return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_outcome);
         }
+    }
+}
+
+/// The `--target` of a `run --docker` whose launch is skipped: a
+/// cross-compiled binary cannot run on this host. Only the host launch
+/// branch launches a binary here — `wasm`, `ios` and `android` deploy their
+/// own way — and a `replace run` hook stands in for the launch entirely, so
+/// neither is skipped. `null` when the launch happens.
+fn crossTargetLaunchSkipped(in_docker: bool, docker_target: ?[]const u8, platform: project_config.Platform, replaced: bool) ?[]const u8 {
+    if (!in_docker or replaced) return null;
+    switch (platform) {
+        .wasm, .ios, .android => return null,
+        else => return docker_target,
+    }
+}
+
+test "pipeline: a cross-target docker run is skipped before the run hooks" {
+    // The skipped shape: docker, a cross target, the host launch branch.
+    try std.testing.expectEqualStrings("aarch64-linux", crossTargetLaunchSkipped(true, "aarch64-linux", .desktop, false).?);
+    // Each condition alone is not enough.
+    try std.testing.expect(crossTargetLaunchSkipped(false, "aarch64-linux", .desktop, false) == null);
+    try std.testing.expect(crossTargetLaunchSkipped(true, null, .desktop, false) == null);
+    // A replacement launches its own way; the deploy targets never reach
+    // the host launch branch.
+    try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", .desktop, true) == null);
+    for ([_]project_config.Platform{ .wasm, .ios, .android }) |platform| {
+        try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", platform, false) == null);
     }
 }
 
