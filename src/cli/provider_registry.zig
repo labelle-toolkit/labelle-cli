@@ -87,11 +87,22 @@ pub const Registry = struct {
         return pins;
     }
 
-    fn find(self: Registry, package: []const u8, version: []const u8) ?Record {
+    /// The schema-2 record for one release, or null (always null for schema 1).
+    pub fn find(self: Registry, package: []const u8, version: []const u8) ?Record {
         for (self.records) |record| {
             if (std.mem.eql(u8, record.package, package) and std.mem.eql(u8, record.version, version)) return record;
         }
         return null;
+    }
+
+    /// The document in canonical form: compact JSON of exactly the fields its
+    /// schema defines, in declaration order, records in document order. It
+    /// parses back to the same `Registry`, so two documents with the same
+    /// normalised bytes are the same document whatever their whitespace or
+    /// key order. Its SHA-256 is what a provider preview binds (#433).
+    pub fn normalised(self: Registry, a: std.mem.Allocator) ![]const u8 {
+        if (!self.claimsOwnership()) return std.json.Stringify.valueAlloc(a, github.Document{ .schema_version = self.schema_version, .providers = self.pins }, .{});
+        return std.json.Stringify.valueAlloc(a, SchemaTwo{ .schema_version = self.schema_version, .defaults = self.defaults, .providers = self.records }, .{});
     }
 
     /// The verified manifest of a release about to be pinned must declare
@@ -296,4 +307,24 @@ test "provider registry: a pinned release must declare exactly what its record c
     // Mechanism: schema 1 has no claims, so the same disagreeing manifest passes.
     const one: Registry = .{ .schema_version = 1, .pins = doc.pins };
     try one.checkDeclarations(pin, lies);
+}
+
+test "provider registry: the normalised document ignores layout, keeps every schema field, and reparses to itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compact = try parse(a, "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++ testRecord("fixture", "1.0.0", "\"probe\"", "\"probe-target\"") ++ "]}");
+    // Same document, other whitespace and key order: same normalised bytes.
+    const spaced = try parse(a, "{ \"providers\" : [" ++ testRecord("fixture", "1.0.0", "\"probe\"", "\"probe-target\"") ++ "],\n  \"defaults\": [ ], \"schema_version\": 2 }");
+    const bytes = try compact.normalised(a);
+    try std.testing.expectEqualStrings(bytes, try spaced.normalised(a));
+    try std.testing.expectEqualStrings(bytes, try (try parse(a, bytes)).normalised(a));
+    // A claim is part of it, and so is the schema: the same pins as schema 1 differ.
+    const other_claim = try parse(a, "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++ testRecord("fixture", "1.0.0", "\"probe\"", "") ++ "]}");
+    try std.testing.expect(!std.mem.eql(u8, bytes, try other_claim.normalised(a)));
+    const one: Registry = .{ .schema_version = 1, .pins = compact.pins };
+    const one_bytes = try one.normalised(a);
+    try std.testing.expect(!std.mem.eql(u8, bytes, one_bytes));
+    // Schema 1 normalises to a valid schema-1 document (no schema-2 keys).
+    try std.testing.expectEqual(@as(u8, 1), (try parse(a, one_bytes)).schema_version);
 }

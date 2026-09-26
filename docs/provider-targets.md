@@ -47,6 +47,8 @@ one target, in two halves, before anything is generated, locked or built:
 
    The second line comes only from the cached registry document, the one
    the last `labelle providers resolve --accept` was resolved against.
+   That is the normalised document its preview bound and the user reviewed
+   ([pins](provider-github-pins.md)), never a later fetch.
    Nothing is fetched, and the CLI never invents a name.
 
    - A **schema-2** document publishes target ownership

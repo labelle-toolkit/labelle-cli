@@ -527,7 +527,9 @@ fn fileDirConflict(name: []const u8, folded: []const u8) error{CaseFoldedProvide
 }
 
 /// One previewed pin: every field the user was shown, including the derived
-/// archive URL, so a later accept can be checked against exactly that.
+/// archive URL and, for a schema-2 registry, the record's ownership claims
+/// (`null`/`[]` under schema 1, which claims nothing), so a later accept can
+/// be checked against exactly that.
 pub const PreviewEntry = struct {
     package: []const u8,
     repo: []const u8,
@@ -535,9 +537,21 @@ pub const PreviewEntry = struct {
     commit: []const u8,
     sha256: []const u8,
     archive_url: []const u8,
+    namespace: ?[]const u8,
+    targets: []const []const u8,
 
-    fn fromPin(a: std.mem.Allocator, pin: Pin) !PreviewEntry {
-        return .{ .package = pin.package, .repo = pin.repo, .version = pin.version, .commit = pin.commit, .sha256 = pin.sha256, .archive_url = try pin.archiveUrl(a) };
+    fn fromPin(a: std.mem.Allocator, doc: registry.Registry, pin: Pin) !PreviewEntry {
+        const record = doc.find(pin.package, pin.version);
+        return .{
+            .package = pin.package,
+            .repo = pin.repo,
+            .version = pin.version,
+            .commit = pin.commit,
+            .sha256 = pin.sha256,
+            .archive_url = try pin.archiveUrl(a),
+            .namespace = if (record) |r| r.namespace else null,
+            .targets = if (record) |r| r.targets else &.{},
+        };
     }
 
     fn toPin(self: PreviewEntry) Pin {
@@ -545,11 +559,37 @@ pub const PreviewEntry = struct {
     }
 };
 
+/// The preview file's own format. 2 added the registry binding (#433); an
+/// older file is unreadable, which only asks for a new review.
+pub const preview_schema: u8 = 2;
+
 /// Persisted by a preview, consumed (and removed) by a successful accept.
+/// It binds the WHOLE registry document, not only the selected pins (#433):
+/// `registry_digest` is the SHA-256 of `Registry.normalised`, so a schema
+/// swap, a changed claim or default, or a changed unselected record between
+/// preview and accept is a mismatch. `registry_schema`, `defaults` and each
+/// entry's claims repeat parts of that document so a mismatch can name the
+/// field; the digest is the catch-all for everything else.
 pub const Preview = struct {
     schema_version: u8,
     source: []const u8,
+    registry_schema: u8,
+    registry_digest: []const u8,
+    defaults: []const registry.DefaultRef,
     digest: []const u8,
+    providers: []const PreviewEntry,
+
+    /// Everything the preview digest covers: the record minus the digest.
+    fn body(self: Preview) PreviewBody {
+        return .{ .source = self.source, .registry_schema = self.registry_schema, .registry_digest = self.registry_digest, .defaults = self.defaults, .providers = self.providers };
+    }
+};
+
+const PreviewBody = struct {
+    source: []const u8,
+    registry_schema: u8,
+    registry_digest: []const u8,
+    defaults: []const registry.DefaultRef,
     providers: []const PreviewEntry,
 };
 
@@ -559,16 +599,28 @@ fn sha256Hex(a: std.mem.Allocator, data: []const u8) ![]const u8 {
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 
-/// SHA-256 over the canonical JSON of the registry source and every shown
-/// field. Recomputed on load, so an edited preview file is caught too.
-pub fn previewDigest(a: std.mem.Allocator, source: []const u8, entries: []const PreviewEntry) ![]const u8 {
-    return sha256Hex(a, try std.json.Stringify.valueAlloc(a, .{ .source = source, .providers = entries }, .{}));
+/// SHA-256 over the canonical JSON of the registry source, the registry
+/// binding and every shown field. Recomputed on load, so an edited preview
+/// file is caught too.
+fn previewDigest(a: std.mem.Allocator, body: PreviewBody) ![]const u8 {
+    return sha256Hex(a, try std.json.Stringify.valueAlloc(a, body, .{}));
 }
 
-fn previewEntries(a: std.mem.Allocator, pins: []const Pin) ![]const PreviewEntry {
+/// The preview record for `pins` selected from `doc` (read from `source`).
+fn previewOf(a: std.mem.Allocator, source: []const u8, doc: registry.Registry, pins: []const Pin) !Preview {
     const entries = try a.alloc(PreviewEntry, pins.len);
-    for (pins, 0..) |pin, i| entries[i] = try PreviewEntry.fromPin(a, pin);
-    return entries;
+    for (pins, 0..) |pin, i| entries[i] = try PreviewEntry.fromPin(a, doc, pin);
+    var preview: Preview = .{
+        .schema_version = preview_schema,
+        .source = source,
+        .registry_schema = doc.schema_version,
+        .registry_digest = try sha256Hex(a, try doc.normalised(a)),
+        .defaults = doc.defaults,
+        .digest = "",
+        .providers = entries,
+    };
+    preview.digest = try previewDigest(a, preview.body());
+    return preview;
 }
 
 fn writeAtomically(a: std.mem.Allocator, dest: []const u8, data: []const u8) !void {
@@ -580,14 +632,12 @@ fn writeAtomically(a: std.mem.Allocator, dest: []const u8, data: []const u8) !vo
     try std.Io.Dir.renameAbsolute(temp, dest, io);
 }
 
-pub fn writePreview(a: std.mem.Allocator, root: []const u8, source: []const u8, pins: []const Pin) ![]const u8 {
-    const entries = try previewEntries(a, pins);
-    const digest = try previewDigest(a, source, entries);
+pub fn writePreview(a: std.mem.Allocator, root: []const u8, source: []const u8, doc: registry.Registry, pins: []const Pin) !Preview {
+    const preview = try previewOf(a, source, doc, pins);
     const dest = try std.fs.path.join(a, &.{ root, preview_name });
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), std.fs.path.dirname(dest).?);
-    const preview: Preview = .{ .schema_version = 1, .source = source, .digest = digest, .providers = entries };
     try writeAtomically(a, dest, try std.json.Stringify.valueAlloc(a, preview, .{ .whitespace = .indent_2 }));
-    return digest;
+    return preview;
 }
 
 /// Missing, unparseable, or digest-mismatched previews all fail closed: accept
@@ -606,13 +656,16 @@ pub fn loadPreview(a: std.mem.Allocator, root: []const u8) !Preview {
         return error.ProviderPreviewCorrupt;
     };
     const preview = parsed.value;
-    if (preview.schema_version != 1) return error.ProviderPreviewCorrupt;
+    if (preview.schema_version != preview_schema) {
+        std.debug.print("labelle: provider preview {s} has format {d}, this CLI writes {d}; run 'labelle providers resolve' again\n", .{ preview_name, preview.schema_version, preview_schema });
+        return error.ProviderPreviewCorrupt;
+    }
     for (preview.providers) |entry| {
         const pin = entry.toPin();
         pin.validate() catch return error.ProviderPreviewCorrupt;
         if (!std.mem.eql(u8, entry.archive_url, try pin.archiveUrl(a))) return error.ProviderPreviewCorrupt;
     }
-    if (!std.mem.eql(u8, preview.digest, try previewDigest(a, preview.source, preview.providers))) {
+    if (!std.mem.eql(u8, preview.digest, try previewDigest(a, preview.body()))) {
         std.debug.print("labelle: provider preview {s} does not match its digest; run 'labelle providers resolve' again\n", .{preview_name});
         return error.ProviderPreviewCorrupt;
     }
@@ -623,15 +676,29 @@ fn reportChange(package: []const u8, field: []const u8, previewed: []const u8, n
     std.debug.print("labelle: provider '{s}' {s} changed since preview: {s} -> {s}\n", .{ package, field, previewed, now });
 }
 
-/// Every field the user reviewed must equal what the registry serves now.
-/// Any difference names the package and field(s) and aborts the accept.
-pub fn checkPreview(a: std.mem.Allocator, preview: Preview, source: []const u8, pins: []const Pin) !void {
+fn jsonText(a: std.mem.Allocator, value: anytype) []const u8 {
+    return std.json.Stringify.valueAlloc(a, value, .{}) catch "<unprintable>";
+}
+
+/// Every field the user reviewed, and the whole registry document it came
+/// from, must equal what the registry serves now. Any difference names the
+/// field (and package) and aborts the accept.
+pub fn checkPreview(a: std.mem.Allocator, preview: Preview, source: []const u8, doc: registry.Registry, pins: []const Pin) !void {
     var changed = false;
     if (!std.mem.eql(u8, preview.source, source)) {
         std.debug.print("labelle: registry source changed since preview: {s} -> {s}\n", .{ preview.source, source });
         changed = true;
     }
-    const fresh = try previewEntries(a, pins);
+    const now = try previewOf(a, source, doc, pins);
+    if (preview.registry_schema != now.registry_schema) {
+        std.debug.print("labelle: registry schema_version changed since preview: {d} -> {d}\n", .{ preview.registry_schema, now.registry_schema });
+        changed = true;
+    }
+    if (!std.mem.eql(u8, jsonText(a, preview.defaults), jsonText(a, now.defaults))) {
+        std.debug.print("labelle: registry defaults changed since preview: {s} -> {s}\n", .{ jsonText(a, preview.defaults), jsonText(a, now.defaults) });
+        changed = true;
+    }
+    const fresh = now.providers;
     for (preview.providers) |old| {
         var found = false;
         for (fresh) |new| {
@@ -640,6 +707,14 @@ pub fn checkPreview(a: std.mem.Allocator, preview: Preview, source: []const u8, 
             inline for (.{ "repo", "version", "commit", "sha256", "archive_url" }) |field| {
                 if (!std.mem.eql(u8, @field(old, field), @field(new, field))) {
                     reportChange(old.package, field, @field(old, field), @field(new, field));
+                    changed = true;
+                }
+            }
+            inline for (.{ "namespace", "targets" }) |field| {
+                const was = jsonText(a, @field(old, field));
+                const is = jsonText(a, @field(new, field));
+                if (!std.mem.eql(u8, was, is)) {
+                    reportChange(old.package, field, was, is);
                     changed = true;
                 }
             }
@@ -656,6 +731,13 @@ pub fn checkPreview(a: std.mem.Allocator, preview: Preview, source: []const u8, 
             std.debug.print("labelle: provider '{s}' is selected now but was not previewed\n", .{new.package});
             changed = true;
         }
+    }
+    // The catch-all: nothing shown above differs, yet the document does, so
+    // an unselected release record changed (it could otherwise reach the
+    // cached ownership table the accept writes for target diagnostics).
+    if (!changed and !std.mem.eql(u8, preview.registry_digest, now.registry_digest)) {
+        std.debug.print("labelle: registry document changed since preview outside the selected releases (an unselected release record): sha256 {s} -> {s}\n", .{ preview.registry_digest, now.registry_digest });
+        changed = true;
     }
     if (changed) {
         std.debug.print("labelle: refusing --accept: the registry no longer matches the reviewed preview. Run 'labelle providers resolve' again and review the new pins.\n", .{});
@@ -708,17 +790,29 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
             try selected.append(a, pin);
             found = true;
             std.debug.print("  {s} {s}: {s}@{s}\n    sha256 {s}\n    {s}\n", .{ pin.package, pin.version, pin.repo, pin.commit, pin.sha256, try pin.archiveUrl(a) });
+            if (doc.find(pin.package, pin.version)) |record| {
+                std.debug.print("    namespace {s}, targets {s}\n", .{ jsonText(a, record.namespace), jsonText(a, record.targets) });
+            }
         }
         if (known and !found) return error.ProviderReleaseNotInRegistry;
     }
     if (!accept) {
-        const digest = try writePreview(a, root, source, selected.items);
-        std.debug.print("Preview: {d} provider pin(s), digest {s}, recorded in {s}.\nRepeat with --accept to verify archives and write {s}; accept refuses any pin that differs from this preview.\n", .{ selected.items.len, digest, preview_name, lock_name });
+        const shown = try writePreview(a, root, source, doc, selected.items);
+        if (doc.claimsOwnership()) std.debug.print("  registry defaults {s}\n", .{jsonText(a, doc.defaults)});
+        std.debug.print("  registry schema {d}, normalised document sha256 {s}\n", .{ shown.registry_schema, shown.registry_digest });
+        std.debug.print("Preview: {d} provider pin(s), digest {s}, recorded in {s}.\nRepeat with --accept to verify archives and write {s}; accept refuses any pin, claim, default or other registry record that differs from this preview.\n", .{ selected.items.len, shown.digest, preview_name, lock_name });
         return;
     }
     // Acceptance is bound to the reviewed record: the fresh fetch may only
-    // confirm it, and the pins prepared below are the previewed ones.
-    try checkPreview(a, preview.?, source, selected.items);
+    // confirm it (the whole normalised document, not just the selected
+    // pins), and the pins prepared below are the previewed ones.
+    try checkPreview(a, preview.?, source, doc, selected.items);
+    // What the target-hint cache will hold after the commit: the normalised
+    // form of the document just bound to the preview, so its bytes hash to
+    // the reviewed `registry_digest`. `checkPreview` already refused any
+    // other document; the re-check keeps that true if it ever changes.
+    const reviewed = try doc.normalised(a);
+    if (!std.mem.eql(u8, try sha256Hex(a, reviewed), preview.?.registry_digest)) return error.ProviderPreviewMismatch;
     selected.clearRetainingCapacity();
     for (preview.?.providers) |entry| try selected.append(a, entry.toPin());
     std.debug.print("Accepting preview digest {s}.\n", .{preview.?.digest});
@@ -775,9 +869,9 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
         std.debug.print("labelle: warning: the new pins are committed, but the consumed preview {s} could not be removed ({s}); delete it by hand before the next review\n", .{ preview_name, @errorName(err) });
     };
     // The accepted document is kept as the hint source of the no-provider
-    // diagnostic (a preview stays read-only). Best effort: a failed cache
-    // write changes nothing about the pins just written.
-    cacheRegistry(a, metadata) catch |err| {
+    // diagnostic (a preview stays read-only): `reviewed`, never this run's
+    // raw fetch. Best effort: a failed cache write changes nothing about the pins.
+    cacheRegistry(a, reviewed) catch |err| {
         std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
     };
 }
@@ -907,6 +1001,10 @@ const AcceptFixture = struct {
         try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = self.registry, .data = try schemaTwo(a, self.pin, namespace, targets) });
     }
 
+    fn publishRaw(self: *AcceptFixture, bytes: []const u8) !void {
+        try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = self.registry, .data = bytes });
+    }
+
     fn run(self: *AcceptFixture, a: std.mem.Allocator, accept: bool) !void {
         return resolve(a, self.root, self.registry, accept, true, &.{});
     }
@@ -939,7 +1037,7 @@ test "provider github: accept is bound to the recorded preview" {
     try std.testing.expectEqualStrings(fx.pin.sha256, preview.providers[0].sha256);
     try std.testing.expectEqualStrings(try fx.pin.archiveUrl(a), preview.providers[0].archive_url);
     try std.testing.expectEqualStrings(fx.registry, preview.source);
-    try std.testing.expectEqualStrings(try previewDigest(a, fx.registry, preview.providers), preview.digest);
+    try std.testing.expectEqualStrings(try previewDigest(a, preview.body()), preview.digest);
     // (b) The registry is repointed between preview and accept: the changed
     // field is rejected by name, the lock is never written, and the stale
     // preview stays so the diagnostic can be compared against it.
@@ -965,6 +1063,63 @@ test "provider github: accept is bound to the recorded preview" {
     try std.testing.expect(!try fx.exists(a, preview_name));
     // A consumed preview cannot be accepted twice.
     try std.testing.expectError(error.ProviderPreviewMissing, fx.run(a, true));
+}
+
+test "provider github: accept is bound to the whole registry document, not only the selected pins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const fixture_record = try std.fmt.allocPrint(a, "{{\"package\":\"fixture\",\"repo\":\"{s}\",\"version\":\"{s}\",\"commit\":\"{s}\",\"sha256\":\"{s}\",\"namespace\":\"probe\",\"targets\":[]}}", .{ fx.pin.repo, fx.pin.version, fx.pin.commit, fx.pin.sha256 });
+    const other_record = "{\"package\":\"other\",\"repo\":\"example/other\",\"version\":\"1.0.0\",\"commit\":\"" ++ "3" ** 40 ++ "\",\"sha256\":\"" ++ "0" ** 64 ++ "\",\"namespace\":null,\"targets\":[\"TARGET\"]}";
+    const Doc = struct {
+        fn of(al: std.mem.Allocator, fixture: []const u8, other_target: []const u8, defaults: []const u8, sep: []const u8) ![]const u8 {
+            const other = try std.mem.replaceOwned(u8, al, other_record, "TARGET", other_target);
+            return std.fmt.allocPrint(al, "{{\"schema_version\":2,{s}\"defaults\":[{s}],{s}\"providers\":[{s},{s}{s}]}}", .{ sep, defaults, sep, fixture, sep, other });
+        }
+    };
+    // (1) Schema 2 swapped for an otherwise identical schema 1: same pins,
+    // but the declaration check would become a no-op. Rejected.
+    try fx.publishSchemaTwo(a, "\"probe\"", "");
+    try fx.run(a, false);
+    try fx.publish(a, fx.pin);
+    try std.testing.expectError(error.ProviderPreviewMismatch, fx.run(a, true));
+    try std.testing.expect(!try fx.exists(a, lock_name));
+    // (2) A selected record's ownership claim changes. Mechanism: the
+    // reviewed claim (`null`) is false and the served one is true, so the
+    // declaration check alone would pin it; only the preview binding refuses.
+    try fx.publishSchemaTwo(a, "null", "");
+    try fx.run(a, false);
+    try fx.publishSchemaTwo(a, "\"probe\"", "");
+    try std.testing.expectError(error.ProviderPreviewMismatch, fx.run(a, true));
+    try std.testing.expect(!try fx.exists(a, lock_name));
+    // (3) An unselected record's claim changes: only the document digest sees it.
+    try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", ""));
+    try fx.run(a, false);
+    try fx.publishRaw(try Doc.of(a, fixture_record, "moved-target", "", ""));
+    try std.testing.expectError(error.ProviderPreviewMismatch, fx.run(a, true));
+    try std.testing.expect(!try fx.exists(a, lock_name));
+    // (4) The defaults list changes.
+    try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", ""));
+    try fx.run(a, false);
+    try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "{\"package\":\"fixture\",\"version\":\"1.0.0\"}", ""));
+    try std.testing.expectError(error.ProviderPreviewMismatch, fx.run(a, true));
+    try std.testing.expect(!try fx.exists(a, lock_name));
+    // (5) The same document with other whitespace is the same normalised
+    // document: accepted. The target-hint cache then holds exactly the
+    // reviewed document (its bytes hash to the preview's registry digest).
+    try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", ""));
+    try fx.run(a, false);
+    const reviewed = try loadPreview(a, fx.root);
+    try std.testing.expectEqual(@as(u8, 2), reviewed.registry_schema);
+    try std.testing.expectEqualStrings("probe", reviewed.providers[0].namespace.?);
+    try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", "\n  "));
+    try fx.run(a, true);
+    try std.testing.expect(try fx.exists(a, lock_name));
+    const cached = try read(a, try std.fs.path.join(a, &.{ fx.home, registry_cache_dir, registry_cache_file }), 1024 * 1024);
+    try std.testing.expectEqualStrings(reviewed.registry_digest, try sha256Hex(a, cached));
+    try std.testing.expectEqualStrings("other", cachedRegistryOwner(a, "other-target").?);
 }
 
 test "provider github: accept stays committed when the consumed preview cannot be removed" {

@@ -123,10 +123,17 @@ contains at most one version per package. Releases are stable exact semver.
 
 `labelle providers resolve [providers.json]` previews the exact project-declared
 versions, commits and hashes and records them, with a digest, in
-`.labelle/providers.preview.json`. `--accept` requires the registry to still
-equal that recorded preview (any changed field aborts with
-`ProviderPreviewMismatch`; no preview aborts with `ProviderPreviewMissing`),
-verifies archives against the previewed hashes and provider manifests, checks
+`.labelle/providers.preview.json`. The preview binds the whole registry
+document, not only the selected pins: it also records the registry
+`schema_version`, the `defaults` list, each selected record's
+`namespace`/`targets` claims, and the SHA-256 of the normalised document
+(compact JSON of exactly the fields its schema defines, records in document
+order, so whitespace and key order do not matter). `--accept` requires the
+registry to still equal that recorded preview. Any changed field aborts with
+`ProviderPreviewMismatch` and names it: source, `schema_version`, `defaults`,
+a selected release's pin fields or claims, or, when none of those changed, an
+unselected release record. No preview aborts with `ProviderPreviewMissing`.
+It then verifies archives against the previewed hashes and provider manifests, checks
 ownership, then atomically writes `labelle.providers.lock` and removes the
 preview.
 Commit it alongside `labelle.lock`, which remains the ordinary dependency lock
@@ -192,7 +199,9 @@ which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
 - **Lookup by target and by namespace** answers "which package provides
   `<t>`" without downloading or extracting anything. The no-provider
   diagnostic reads it from the cached registry the last `--accept` used
-  (see [provider targets](provider-targets.md#resolution)). Projectless
+  (see [provider targets](provider-targets.md#resolution)). That cache holds
+  the normalised document bound to the accepted preview, so its bytes hash to
+  the preview's registry digest; a later fetch nobody reviewed never reaches it. Projectless
   bootstrap (phase 5) uses the same table for namespaces.
 - **The claims are checked, not trusted.** `labelle providers resolve --accept`
   compares every release it pins against that release's verified manifest.
@@ -212,7 +221,7 @@ Whether defaults come from the online index or an offline stamped scaffold, `ini
 
 Index defaults are suggestions, not automatically trusted project declarations. Initial acceptance covers the complete resolved dependency graph; changes to that graph require explicit resolution. Merely fetching/parsing metadata is allowed before consent, but compiling or executing package build scripts is not.
 
-The online defaults are the registry's schema-2 `defaults` list (§4), resolved to exact records. The offline source is the release-stamped scaffold template, which is data the assembler's `init` ships, not CLI code. Consent uses the same binding as `labelle providers resolve`: what is written is exactly what was shown. `init` presents the resolved default records. Only after explicit acceptance (interactive, or the explicit noninteractive option) does it write `.plugins` and `labelle.providers.lock` from those same records. A registry that changes in between is a mismatch, not a new default. Today `labelle init` (delegated to `labelle-assembler init`) scaffolds only the core/engine/gfx pins, and no default package is added. This section is the rule the first default package must follow; it does not describe current behaviour.
+The online defaults are the registry's schema-2 `defaults` list (§4), resolved to exact records. The `providers resolve` preview already binds that list together with the rest of the registry document (§4), so a defaults change between preview and accept is a mismatch there too. The offline source is the release-stamped scaffold template, which is data the assembler's `init` ships, not CLI code. Consent uses the same binding as `labelle providers resolve`: what is written is exactly what was shown. `init` presents the resolved default records. Only after explicit acceptance (interactive, or the explicit noninteractive option) does it write `.plugins` and `labelle.providers.lock` from those same records. A registry that changes in between is a mismatch, not a new default. Today `labelle init` (delegated to `labelle-assembler init`) scaffolds only the core/engine/gfx pins, and no default package is added. This section is the rule the first default package must follow; it does not describe current behaviour.
 
 ## 6. Hook execution
 
