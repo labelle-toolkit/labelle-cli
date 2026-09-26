@@ -6,7 +6,8 @@
 //! Walks every source file under `src/` at test time (`.zig`, plus the
 //! compiled `.c`/`.h` vendored there), splits each into `[A-Za-z0-9]+` runs
 //! and compares each run case-insensitively against `forbidden`, first as a
-//! whole and then piece by piece at CamelCase boundaries. A token that ends
+//! whole and then at CamelCase boundaries (including listed compounds that
+//! span pieces, such as `UIKit` in `UIKitGlue`). A token that ends
 //! in digits is also compared by its letter root, so a version or bit-width
 //! suffix does not hide a name. So `ios_cmd`, `cli/android/`, `IosConfig`,
 //! `iOS`, `iOSConfig`, `getSDLPath`, `wasm32`, `android14`, `sdl3` and
@@ -19,7 +20,9 @@
 //! naming a platform is a finding too. The JSON wire fixtures under
 //! `cli/provider_contract/` are data, not source, and stay out of scope:
 //! they describe what a provider may send, so a provider name there is not
-//! core code knowing a platform.
+//! core code knowing a platform. Source-shaped symlinks are rejected, even
+//! when allowlisted: neither the link name nor unread target contents may
+//! bypass the guard (and dangling, external or cyclic targets are not read).
 //!
 //! Files that still carry legacy platform code sit on `allowed_files`, a
 //! migration allowlist that can only SHRINK: the test also fails when an
@@ -36,10 +39,45 @@ const std = @import("std");
 /// `ios`: `macos` is a host the core runs on, `tvos`, `watchos`, `visionos`
 /// and `maccatalyst` are only ever targets.
 const forbidden = [_][]const u8{
-    "android",  "ios",         "web",    "wasm", "emsdk", "emscripten", "steam",
-    "itch",     "xcode",       "gradle", "apk",  "aab",   "ndk",        "raylib",
-    "sokol",    "sdl",         "sdl2",   "bgfx", "wgpu",  "tvos",       "watchos",
-    "visionos", "maccatalyst",
+    "android",
+    "ios",
+    "web",
+    "wasm",
+    "emsdk",
+    "emscripten",
+    "steam",
+    "itch",
+    "xcode",
+    "gradle",
+    "apk",
+    "aab",
+    "ndk",
+    "raylib",
+    "sokol",
+    "sdl",
+    "sdl2",
+    "bgfx",
+    "wgpu",
+    "tvos",
+    "watchos",
+    "visionos",
+    "maccatalyst",
+
+    // RFC #406 / #419 provider identities, not general affix stripping:
+    // Steam's SDK/CLI, itch's publisher, iOS's UI SDK/build tool, Android's
+    // device bridge and the web compiler all belong to their providers.
+    "steamworks",
+    "steamcmd",
+    "butler",
+    "uikit",
+    "xcodebuild",
+    "adb",
+    "emcc",
+
+    // SDL's conventional library/package prefix (libsdl2-dev, libSDL3.so).
+    // The numeric-root rule covers later versions without banning all libs.
+    "libsdl",
+    "libsdl2",
 };
 
 /// Host OS names: the core legitimately branches on the OS it runs on,
@@ -56,8 +94,12 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `web` joined, and once more after the numeric-suffix rule (`wasm32`,
 /// `sdl3`) and the Apple targets (`tvos`, `watchos`, `visionos`,
 /// `maccatalyst`, spelled in `astc/cmd.zig`) joined (still 53 entries: every
-/// file those reach was already listed). Shrink only: an entry whose file is
-/// clean fails the test until it is removed. Note the path scan: an entry
+/// file those reach was already listed). Rechecked for #419's compound,
+/// package and tool/SDK identities: still 53 entries, no new exemptions.
+/// Existing SDL provisioning/doctor, mobile SDK and emsdk migration files
+/// already cover the newly detected uses; provider-neutral files stay clean.
+/// Shrink only: an entry whose file is clean fails until it is removed.
+/// Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
 /// moved or renamed, not merely emptied of platform words.
 const allowed_files = [_][]const u8{
@@ -203,7 +245,8 @@ fn splitsBefore(text: []const u8, start: usize, i: usize) bool {
 
 /// Yields the forbidden words of `text` in order of occurrence. Each
 /// `[A-Za-z0-9]+` run is classified whole first (`iOS`, `ANDROID`), then,
-/// when the whole run is not a forbidden word, once per CamelCase piece.
+/// when the whole run is not forbidden, at CamelCase boundaries. Listed
+/// compounds can span pieces (UI|Kit); unrelated pieces remain separate.
 const Tokenizer = struct {
     text: []const u8,
     pos: usize = 0,
@@ -226,6 +269,17 @@ const Tokenizer = struct {
                 }
             }
             const start = self.pos;
+            // A listed name can itself span acronym boundaries (UI|Kit).
+            // Match only complete prefixes ending at a CamelCase boundary,
+            // never a substring such as UIKit in UIKitten or UIKithelper.
+            var end = start + 1;
+            while (end <= self.run_end and end - start <= max_word_len) : (end += 1) {
+                if (end != self.run_end and !splitsBefore(self.text, start, end)) continue;
+                if (classifyExact(self.text[start..end])) |word| {
+                    self.pos = end;
+                    return word;
+                }
+            }
             self.pos += 1;
             while (self.pos < self.run_end and !splitsBefore(self.text, start, self.pos)) self.pos += 1;
             if (classify(self.text[start..self.pos])) |word| return word;
@@ -258,6 +312,30 @@ const Scan = struct {
     fn deinit(self: *Scan) void {
         for (self.offenders.items) |o| self.gpa.free(o);
         self.offenders.deinit(self.gpa);
+    }
+
+    /// Return whether to read an entry. Never follow source-shaped links:
+    /// rejection applies before the allowlist and does not trust the target.
+    fn sourceEntry(self: *Scan, path: []const u8, kind: std.Io.File.Kind) !bool {
+        if (!isSource(path)) return false;
+        if (kind == .sym_link) {
+            const msg = try std.fmt.allocPrint(self.gpa, "src/{s}: source symlink is not allowed; use a regular source file", .{path});
+            errdefer self.gpa.free(msg);
+            try self.offenders.append(self.gpa, msg);
+            return false;
+        }
+        return kind == .file;
+    }
+
+    fn tree(self: *Scan, io: std.Io, src: std.Io.Dir) !void {
+        var walker = try src.walk(self.gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (!try self.sourceEntry(entry.path, entry.kind)) continue;
+            const bytes = try entry.dir.readFileAlloc(io, entry.basename, self.gpa, .limited(4 << 20));
+            defer self.gpa.free(bytes);
+            try self.file(entry.path, bytes);
+        }
     }
 
     /// Note one file: its path (relative to `src/`, scanned first, every
@@ -305,7 +383,32 @@ fn expectWords(text: []const u8, expected: []const []const u8) !void {
 test "the tokenizer flags whole alphanumeric runs, case-insensitively" {
     try expectWords("std.Io ios_cmd biosphere Android cli/android/run.zig SDL2_image", &.{ "ios", "android", "android", "sdl2" });
     // Substrings inside a longer lowercase run never match: `wasm` is not a word here.
-    try expectWords("wasmtime bgfxdebug libsdl", &.{});
+    try expectWords("wasmtime bgfxdebug libpng", &.{});
+}
+
+test "known compound and package forms flag without matching benign substrings" {
+    try expectWords("Steamworks STEAMWORKS SteamworksSdk steamworks_sdk", &.{ "steamworks", "steamworks", "steamworks", "steamworks" });
+    try expectWords("libsdl libsdl2-dev libsdl2-mixer-dev libSDL2.so LIBSDL3 Libsdl3Package", &.{ "libsdl", "libsdl2", "libsdl2", "libsdl2", "libsdl", "libsdl" });
+    // ASCII controls: known identities, not arbitrary lib/works/sdk suffixes.
+    try expectWords("frameworks clockworks libpng libz libcurl2-dev sdk dev steamworking libsdlhelper", &.{});
+    var scan: Scan = .{ .gpa = std.testing.allocator };
+    defer scan.deinit();
+    try scan.file("cli/libsdl2-dev.zig", "// Steamworks\n");
+    try std.testing.expectEqual(@as(usize, 2), scan.offenders.items.len);
+    try std.testing.expectEqualStrings("src/cli/libsdl2-dev.zig: 'libsdl2' in path " ++ finding_note, scan.offenders.items[0]);
+    try std.testing.expectEqualStrings("src/cli/libsdl2-dev.zig:1: 'steamworks' " ++ finding_note, scan.offenders.items[1]);
+    try scan.file("cli/libpng-dev.zig", "// clockworks\n");
+    try std.testing.expectEqual(@as(usize, 2), scan.offenders.items.len);
+}
+
+test "RFC provider tools and SDK identities flag in commands paths and identifiers" {
+    try expectWords("butler UIKit steamcmd xcodebuild adb emcc", &.{ "butler", "uikit", "steamcmd", "xcodebuild", "adb", "emcc" });
+    try expectWords("ButlerPublisher UIKitGlue SteamcmdTool XcodebuildRunner AdbDevice EmccCompiler", &.{ "butler", "uikit", "steamcmd", "xcodebuild", "adb", "emcc" });
+    try expectWords("BUTLER.EXE UIKit/UIKit.h bin/steamcmd --xcodebuild adb.exe emcc.py", &.{ "butler", "uikit", "uikit", "steamcmd", "xcodebuild", "adb", "emcc" });
+    // Host tools and generic contract vocabulary remain available to core.
+    try expectWords("zig cc clang git SDK tool compiler publisher device build macos windows linux", &.{});
+    try expectWords("butlers uikits steamcmdline xcodebuilder adblock emcclib", &.{});
+    try expectWords("getUIKitPath UIKitGlue UIKitten UIKithelper UIKeyboard Toolkit", &.{ "uikit", "uikit" });
 }
 
 test "the tokenizer splits CamelCase at case transitions and acronym boundaries" {
@@ -351,7 +454,7 @@ test "a numeric suffix does not hide a forbidden root" {
     try expectWords("android14", &.{"android"});
     try expectWords("sdl3", &.{"sdl"});
     try expectWords("bgfx2 SOKOL3 Emsdk4", &.{ "bgfx", "sokol", "emsdk" });
-    try expectWords("target = .wasm32; api >= android14; libSDL3", &.{ "wasm", "android", "sdl" });
+    try expectWords("target = .wasm32; api >= android14; libSDL3", &.{ "wasm", "android", "libsdl" });
     // The exact table entry wins over the root: `sdl2` is listed as such.
     try expectWords("sdl2 SDL2_image", &.{ "sdl2", "sdl2" });
     // CamelCase pieces get the same treatment.
@@ -512,22 +615,70 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+test "source symlink rejection precedes the allowlist and root sentinel" {
+    var scan: Scan = .{ .gpa = std.testing.allocator };
+    defer scan.deinit();
+    for ([_][]const u8{ "cli/steam.zig", "cli/provider.zig", "cli/bridge.c", "cli/bridge.h", "cli/ios.zig", cli_root }) |path| {
+        try std.testing.expect(!try scan.sourceEntry(path, .sym_link));
+    }
+    try std.testing.expectEqual(@as(usize, 6), scan.offenders.items.len);
+    try std.testing.expectEqualStrings("src/cli/steam.zig: source symlink is not allowed; use a regular source file", scan.offenders.items[0]);
+    try std.testing.expect(!scan.saw_cli_root);
+    try std.testing.expect(!scan.dirty[allowedIndex("cli/ios.zig").?]);
+    // Identical ASCII names as regular files are read; data links stay out
+    // of scope, as do directories (the walker visits their children).
+    try std.testing.expect(try scan.sourceEntry("cli/provider.zig", .file));
+    try std.testing.expect(try scan.sourceEntry("cli/bridge.c", .file));
+    try std.testing.expect(try scan.sourceEntry("cli/bridge.h", .file));
+    try std.testing.expect(!try scan.sourceEntry("cli/fixture.json", .sym_link));
+    try std.testing.expect(!try scan.sourceEntry("cli/folder.zig", .directory));
+    try std.testing.expectEqual(@as(usize, 6), scan.offenders.items.len);
+}
+
+test "the real walker rejects source links with dirty names or hidden contents" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = cli_root, .data = "const value = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "clean.txt", .data = "// benign ASCII\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "hidden.txt", .data = "// Steamworks UIKit\n" });
+    var clean: Scan = .{ .gpa = std.testing.allocator };
+    defer clean.deinit();
+    try clean.tree(io, tmp.dir);
+    try std.testing.expect(clean.saw_cli_root);
+    try std.testing.expectEqual(@as(usize, 0), clean.offenders.items.len);
+
+    tmp.dir.symLink(io, "clean.txt", "steam.zig", .{}) catch |err| switch (err) {
+        // Windows may lack symlink privileges; the entry-policy test above
+        // still exercises rejection there. Other failures are real failures.
+        error.AccessDenied, error.PermissionDenied => if (@import("builtin").os.tag == .windows) return error.SkipZigTest else return err,
+        else => return err,
+    };
+    try tmp.dir.symLink(io, "hidden.txt", "provider.zig", .{});
+    try tmp.dir.symLink(io, "hidden.txt", "bridge.c", .{});
+    try tmp.dir.symLink(io, "missing.txt", "bridge.h", .{});
+    try tmp.dir.symLink(io, "loop.zig", "loop.zig", .{});
+    try tmp.dir.symLink(io, "hidden.txt", "fixture.json", .{});
+    var linked: Scan = .{ .gpa = std.testing.allocator };
+    defer linked.deinit();
+    try linked.tree(io, tmp.dir);
+    try std.testing.expect(linked.saw_cli_root);
+    try std.testing.expectEqual(@as(usize, 5), linked.offenders.items.len);
+    for ([_][]const u8{ "steam.zig", "provider.zig", "bridge.c", "bridge.h", "loop.zig" }) |path| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "src/{s}: source symlink is not allowed; use a regular source file", .{path});
+        defer std.testing.allocator.free(expected);
+        try std.testing.expect(containsString(linked.offenders.items, expected));
+    }
+}
+
 test "no core file names a platform, store, package or backend" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var src = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
     defer src.close(io);
-    var walker = try src.walk(gpa);
-    defer walker.deinit();
-
     var scan: Scan = .{ .gpa = gpa };
     defer scan.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !isSource(entry.path)) continue;
-        const bytes = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(4 << 20));
-        defer gpa.free(bytes);
-        try scan.file(entry.path, bytes);
-    }
+    try scan.tree(io, src);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
