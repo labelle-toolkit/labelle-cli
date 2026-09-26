@@ -6,9 +6,12 @@
 //! Walks every source file under `src/` at test time (`.zig`, plus the
 //! compiled `.c`/`.h` vendored there), splits each into `[A-Za-z0-9]+` runs
 //! and compares each run case-insensitively against `forbidden`, first as a
-//! whole and then piece by piece at CamelCase boundaries. So `ios_cmd`,
-//! `cli/android/`, `IosConfig`, `iOS`, `iOSConfig` and `getSDLPath` flag
-//! while `std.Io`, `biosphere`, `Iostream` and `iostream` do not. The file's
+//! whole and then piece by piece at CamelCase boundaries. A token that ends
+//! in digits is also compared by its letter root, so a version or bit-width
+//! suffix does not hide a name. So `ios_cmd`, `cli/android/`, `IosConfig`,
+//! `iOS`, `iOSConfig`, `getSDLPath`, `wasm32`, `android14`, `sdl3` and
+//! `Wasm32Target` flag while `std.Io`, `biosphere`, `Iostream`, `iostream`,
+//! `win32`, `x86_64`, `utf8`, `base64` and `sha256` do not. The file's
 //! path relative to `src/` is scanned the same way: a file whose directory
 //! or name carries a platform (`cli/steam/upload.zig`) is a finding even
 //! when its contents are clean, so renaming and moving files stays part of
@@ -29,15 +32,20 @@ const std = @import("std");
 /// Platform, store, package and backend names the core must not mention.
 /// Canonical lowercase; a token is compared after lowercasing. `web` is the
 /// platform the RFC moves into the `labelle-web` provider, alongside its
-/// `wasm`/`emsdk` toolchain names.
+/// `wasm`/`emsdk` toolchain names. The Apple target platforms sit beside
+/// `ios`: `macos` is a host the core runs on, `tvos`, `watchos`, `visionos`
+/// and `maccatalyst` are only ever targets.
 const forbidden = [_][]const u8{
-    "android", "ios",   "web",    "wasm", "emsdk", "emscripten", "steam",
-    "itch",    "xcode", "gradle", "apk",  "aab",   "ndk",        "raylib",
-    "sokol",   "sdl",   "sdl2",   "bgfx", "wgpu",
+    "android",  "ios",         "web",    "wasm", "emsdk", "emscripten", "steam",
+    "itch",     "xcode",       "gradle", "apk",  "aab",   "ndk",        "raylib",
+    "sokol",    "sdl",         "sdl2",   "bgfx", "wgpu",  "tvos",       "watchos",
+    "visionos", "maccatalyst",
 };
 
 /// Host OS names: the core legitimately branches on the OS it runs on,
-/// so these are permanently allowed and never flagged.
+/// so these are permanently allowed and never flagged. Exact forms: `win32`
+/// is allowed as spelled, and its root `win` is not forbidden, so the
+/// numeric-suffix rule in `classify` cannot reach past it.
 const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win32" };
 
 /// Migration allowlist of files that still contain forbidden words. Paths
@@ -45,11 +53,13 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// are no directory prefixes, so a new file under `cli/android/` is not
 /// exempt. Recomputed on `feat/agnostic-guard` after the CamelCase split
 /// and the C scan, and again after the path scan, the `iOS` spelling and
-/// `web` joined (still 53 entries: every file those reach was already
-/// listed). Shrink only: an entry whose file is clean fails the test until
-/// it is removed. Note the path scan: an entry under `cli/android/` or
-/// named `cli/ios.zig` stays dirty until the file is moved or renamed, not
-/// merely emptied of platform words.
+/// `web` joined, and once more after the numeric-suffix rule (`wasm32`,
+/// `sdl3`) and the Apple targets (`tvos`, `watchos`, `visionos`,
+/// `maccatalyst`, spelled in `astc/cmd.zig`) joined (still 53 entries: every
+/// file those reach was already listed). Shrink only: an entry whose file is
+/// clean fails the test until it is removed. Note the path scan: an entry
+/// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
+/// moved or renamed, not merely emptied of platform words.
 const allowed_files = [_][]const u8{
     // This file: it spells the forbidden table out.
     "agnostic_guard_test.zig",
@@ -142,14 +152,30 @@ fn isWordByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c);
 }
 
-/// The canonical forbidden word `run` spells (case-insensitively), or null.
-fn classify(run: []const u8) ?[]const u8 {
+/// The canonical forbidden word `run` spells exactly (case-insensitively),
+/// or null: a host OS name, or nothing on either table.
+fn classifyExact(run: []const u8) ?[]const u8 {
     if (run.len > max_word_len) return null;
     var buf: [max_word_len]u8 = undefined;
     const lower = std.ascii.lowerString(buf[0..run.len], run);
     for (allowed_words) |a| if (std.mem.eql(u8, a, lower)) return null;
     for (forbidden) |f| if (std.mem.eql(u8, f, lower)) return f;
     return null;
+}
+
+/// The canonical forbidden word `run` spells, or null. Exact spelling
+/// first (so `sdl2` and the allowed `win32` resolve as listed); then, when
+/// the run is `<letters><digits>`, its letter root, so a version or
+/// bit-width suffix does not hide a name: `wasm32`, `android14`, `sdl3` and
+/// `bgfx2` flag. `win32`, `x86_64`, `utf8`, `base64` and `sha256` do not:
+/// `win32` is allowed as spelled and `win`, `x`, `utf`, `base` and `sha` are
+/// not forbidden. An all-digit run has no root and never matches.
+fn classify(run: []const u8) ?[]const u8 {
+    if (classifyExact(run)) |word| return word;
+    var root = run.len;
+    while (root > 0 and std.ascii.isDigit(run[root - 1])) root -= 1;
+    if (root == 0 or root == run.len) return null;
+    return classifyExact(run[0..root]);
 }
 
 /// True when a CamelCase boundary falls between `text[i - 1]` and
@@ -289,7 +315,7 @@ test "the tokenizer splits CamelCase at case transitions and acronym boundaries"
     try expectWords("SDL2Provision", &.{"sdl2"});
     try expectWords("getSDLPath", &.{"sdl"});
     try expectWords("pub const IosConfig2 = struct {};", &.{"ios"});
-    // Digits stay attached to the preceding run; host OS names still pass.
+    // Digits stay attached to the preceding piece; host OS names still pass.
     try expectWords("Win32Handle win32 x86_64", &.{});
     // No boundary inside a capitalised word or an all-lowercase run.
     try expectWords("std.Io Iostream biosphere wasmtime IoReader", &.{});
@@ -317,6 +343,39 @@ test "web is forbidden alongside its toolchain names" {
     try expectWords("wasm emsdk WasmConfig", &.{ "wasm", "emsdk", "wasm" });
     // Substrings inside a longer lowercase run never match.
     try expectWords("webhook website cobweb", &.{});
+}
+
+test "a numeric suffix does not hide a forbidden root" {
+    // Whole runs: the letter root before an all-digit suffix is classified.
+    try expectWords("wasm32", &.{"wasm"});
+    try expectWords("android14", &.{"android"});
+    try expectWords("sdl3", &.{"sdl"});
+    try expectWords("bgfx2 SOKOL3 Emsdk4", &.{ "bgfx", "sokol", "emsdk" });
+    try expectWords("target = .wasm32; api >= android14; libSDL3", &.{ "wasm", "android", "sdl" });
+    // The exact table entry wins over the root: `sdl2` is listed as such.
+    try expectWords("sdl2 SDL2_image", &.{ "sdl2", "sdl2" });
+    // CamelCase pieces get the same treatment.
+    try expectWords("Wasm32Target", &.{"wasm"});
+    try expectWords("Sdl3Provision getAndroid14Sdk", &.{ "sdl", "android" });
+    // Exact allowed forms and roots that are not forbidden stay clean.
+    try expectWords("win32 Win32Handle x86_64 utf8 base64 sha256 macos14", &.{});
+    try std.testing.expectEqual(@as(?[]const u8, null), classify("win32"));
+    try std.testing.expectEqual(@as(?[]const u8, null), classify("x86"));
+    try std.testing.expectEqual(@as(?[]const u8, null), classify("64"));
+    try std.testing.expectEqual(@as(?[]const u8, null), classify("utf8"));
+    try std.testing.expectEqual(@as(?[]const u8, null), classify("base64"));
+    try std.testing.expectEqual(@as(?[]const u8, null), classify("sha256"));
+    // Digits in the middle are not a suffix: no root is taken from them.
+    try expectWords("web2py sdl2image", &.{});
+}
+
+test "the Apple target platforms are forbidden; macOS is a host" {
+    try expectWords("tvos watchos visionos maccatalyst", &.{ "tvos", "watchos", "visionos", "maccatalyst" });
+    try expectWords("tvOS watchOS visionOS MacCatalyst", &.{ "tvos", "watchos", "visionos", "maccatalyst" });
+    try expectWords("TvosTarget WatchosBuild VisionosSim", &.{ "tvos", "watchos", "visionos" });
+    try expectWords("macOS macos MacOS macos14", &.{});
+    // Prose and longer runs around the names do not match.
+    try expectWords("television watchdog vision catalyst", &.{});
 }
 
 test "CamelCase pieces" {
