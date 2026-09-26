@@ -585,38 +585,146 @@ const TreeSignature = struct {
     }
 };
 
+/// One file's entry in a `TreeSnapshot`: a hash of its path (`key`) and of
+/// its `(size, mtime)` (`state`).
+const PathState = struct {
+    key: u64,
+    state: u64,
+
+    fn lessThan(_: void, a: PathState, b: PathState) bool {
+        return a.key < b.key;
+    }
+};
+
+/// The key a path gets in a `TreeSnapshot`.
+fn pathKey(path: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, path);
+}
+
+/// The watched tree at one instant: its `TreeSignature` plus every file's
+/// `PathState`, sorted by key, so two snapshots can be diffed per path
+/// (`changedPaths`). Taken only around a rebuild — the cheap signature
+/// alone still drives the polls.
+const TreeSnapshot = struct {
+    sig: TreeSignature = .{},
+    paths: std.ArrayList(PathState) = .empty,
+    /// False when recording a path failed (out of memory): the per-path
+    /// view is partial, so no delta can be drawn from it.
+    complete: bool = true,
+
+    fn record(self: *TreeSnapshot, a: std.mem.Allocator, path: []const u8, size: u64, mtime_ns: i128) void {
+        self.sig.mix(path, size, mtime_ns);
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&size));
+        const m: i128 = mtime_ns;
+        h.update(std.mem.asBytes(&m));
+        self.paths.append(a, .{ .key = pathKey(path), .state = h.final() }) catch {
+            self.complete = false;
+        };
+    }
+
+    fn sort(self: *TreeSnapshot) void {
+        std.mem.sort(PathState, self.paths.items, {}, PathState.lessThan);
+    }
+};
+
+/// The keys of the paths added, removed or changed between two sorted
+/// snapshots, ascending. Caller owns the result.
+fn changedPaths(a: std.mem.Allocator, before: []const PathState, after: []const PathState) ![]u64 {
+    var out: std.ArrayList(u64) = .empty;
+    errdefer out.deinit(a);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < before.len or j < after.len) {
+        if (j == after.len or (i < before.len and before[i].key < after[j].key)) {
+            try out.append(a, before[i].key);
+            i += 1;
+        } else if (i == before.len or after[j].key < before[i].key) {
+            try out.append(a, after[j].key);
+            j += 1;
+        } else {
+            if (before[i].state != after[j].state) try out.append(a, before[i].key);
+            i += 1;
+            j += 1;
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// True when every key of sorted `sub` is in sorted `super`.
+fn isSubset(sub: []const u64, super: []const u64) bool {
+    var j: usize = 0;
+    for (sub) |key| {
+        while (j < super.len and super[j] < key) j += 1;
+        if (j == super.len or super[j] != key) return false;
+        j += 1;
+    }
+    return true;
+}
+
 /// Which tree signature counts as built once a rebuild callback returns.
 ///
-/// Normally it is the `trigger` — the stable signature the rebuild was
-/// fired for — so a file the user saves while the rebuild runs still
-/// differs from it and fires the next rebuild. But a rebuild can also
-/// write into the watched tree itself: a provider lifecycle hook (which
-/// declares no outputs) or a prebuild step without `.outputs`. Those
-/// writes look like an edit on the next poll, and a hook that rewrites its
-/// output on every run used to rebuild and reload forever (Codex P2 on
-/// #420).
+/// Each rebuild is bracketed by two snapshots of the watched tree: `start`,
+/// taken right before the callback (the rebuild's trigger), and `post`,
+/// right after it. Their per-path diff is the rebuild's `delta`: every path
+/// that changed WHILE it ran — its own writes (a provider lifecycle hook
+/// declares no outputs; a prebuild step may omit `.outputs`) and any edit
+/// the user saved meanwhile, which the rebuild may or may not have read.
 ///
-/// So the signature is also taken right AFTER each callback (`post`). When
-/// a rebuild is fired for exactly the previous callback's `post` — nothing
-/// changed since that rebuild ended — everything it covers happened during
-/// that callback: the rebuild's own writes, or an edit saved while it ran.
-/// This follow-up rebuild picks up such an edit, and whatever the
-/// follow-up's own callback writes is then taken as the rebuild's output:
-/// the baseline moves to its `post`. A self-writing rebuild therefore costs
-/// one follow-up rebuild per edit, and terminates. The window a save can
-/// still be missed in shrinks to the follow-up rebuild itself.
+/// The rule:
+///
+/// - A rebuild whose `delta` is empty is built at its trigger (= `post`).
+/// - A rebuild is SETTLED — `post` counts as built — only when it is a
+///   follow-up (fired for exactly the previous rebuild's `post`: nothing
+///   changed between the two) AND its `delta` is a subset of the previous
+///   rebuild's `delta`. A self-writing hook rewrites the same paths on
+///   every run, so its follow-up changes nothing new and settles: one extra
+///   rebuild per edit, never a loop (Codex P2 on #420).
+/// - Otherwise the rebuild is built at its trigger only, so `post` stays
+///   unbuilt and fires one more rebuild. A path the user saves during a
+///   rebuild — the first one or a follow-up — is a path that rebuild's
+///   predecessor did not change, so the next rebuild is scheduled and
+///   reads it (Codex P2 on #427: the follow-up used to accept its whole
+///   `post`, an edit it had already compiled past included). That next
+///   rebuild is itself a follow-up whose `delta` is the hook's writes
+///   again, so the chain still ends.
+///
+/// Snapshots are `(size, mtime)` per path, so one case stays ambiguous: a
+/// path changed during two CONSECUTIVE rebuilds (a user re-saving, during
+/// the follow-up, the same file they also saved during the rebuild before
+/// it) is indistinguishable from a hook rewriting its output, and is taken
+/// as the follow-up's own write. Settling there is what bounds the hook.
 const WatchBaseline = struct {
     /// Signature of the last (attempted) build.
     applied: TreeSignature,
     /// Signature taken right after the last rebuild callback returned.
     post: ?TreeSignature = null,
+    /// Sorted keys of the paths the last rebuild changed while it ran;
+    /// `null` when unknown (none yet, or its snapshots were partial).
+    /// Owned by `allocator`.
+    delta: ?[]u64 = null,
+    allocator: std.mem.Allocator,
 
-    /// Record a finished rebuild fired for `trigger`, with the tree at
-    /// `post` once the callback returned.
-    fn settle(self: *WatchBaseline, trigger: TreeSignature, post: TreeSignature) void {
+    fn deinit(self: *WatchBaseline) void {
+        if (self.delta) |d| self.allocator.free(d);
+        self.delta = null;
+    }
+
+    /// Record a finished rebuild fired for `trigger` (its start-of-rebuild
+    /// signature), with the tree at `post` once the callback returned and
+    /// `delta` the sorted keys of the paths that changed in between
+    /// (`null`: unknown, which never settles on `post`). Borrows `delta`.
+    fn settle(self: *WatchBaseline, trigger: TreeSignature, post: TreeSignature, delta: ?[]const u64) void {
         const follow_up = if (self.post) |previous| trigger.eql(previous) else false;
-        self.applied = if (follow_up) post else trigger;
+        const settled = if (delta) |d|
+            d.len == 0 or (follow_up and self.delta != null and isSubset(d, self.delta.?))
+        else
+            false;
+        self.applied = if (settled) post else trigger;
         self.post = post;
+        const kept: ?[]u64 = if (delta) |d| self.allocator.dupe(u64, d) catch null else null;
+        self.deinit();
+        self.delta = kept;
     }
 
     /// True when `sig` differs from the last build (subject to debounce).
@@ -691,6 +799,33 @@ fn computeSignature(
     ignore_files: []const []const u8,
     sig: *TreeSignature,
 ) void {
+    var snap: TreeSnapshot = .{ .sig = sig.* };
+    walkTree(io, allocator, dir_path, ignore_files, &snap, false);
+    sig.* = snap.sig;
+}
+
+/// The watched tree's `TreeSnapshot`: `computeSignature`'s walk, also
+/// recording every file's `PathState` (sorted). `allocator` owns `paths`.
+fn snapshotTree(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    ignore_files: []const []const u8,
+) TreeSnapshot {
+    var snap: TreeSnapshot = .{};
+    walkTree(io, allocator, dir_path, ignore_files, &snap, true);
+    snap.sort();
+    return snap;
+}
+
+fn walkTree(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    ignore_files: []const []const u8,
+    snap: *TreeSnapshot,
+    per_path: bool,
+) void {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
@@ -701,13 +836,17 @@ fn computeSignature(
             const sub = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(sub);
             if (isNestedCheckout(io, allocator, sub)) continue;
-            computeSignature(io, allocator, sub, ignore_files, sig);
+            walkTree(io, allocator, sub, ignore_files, snap, per_path);
         } else if (entry.kind == .file) {
             const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(fpath);
             if (skipWatchFile(fpath, ignore_files)) continue;
             const st = std.Io.Dir.cwd().statFile(io, fpath, .{}) catch continue;
-            sig.mix(fpath, st.size, st.mtime.nanoseconds);
+            if (per_path) {
+                snap.record(allocator, fpath, st.size, st.mtime.nanoseconds);
+            } else {
+                snap.sig.mix(fpath, st.size, st.mtime.nanoseconds);
+            }
         }
     }
 }
@@ -749,7 +888,11 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
     var initial = TreeSignature{};
     computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &initial);
     _ = scan_arena.reset(.retain_capacity);
-    var baseline: WatchBaseline = .{ .applied = initial };
+    var baseline: WatchBaseline = .{ .applied = initial, .allocator = std.heap.page_allocator };
+    defer baseline.deinit();
+    // The two per-path snapshots bracketing each rebuild; reset after it.
+    var rebuild_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer rebuild_arena.deinit();
     var last = initial;
     var stable_polls: u32 = 0;
 
@@ -773,11 +916,19 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
         if (!shouldRebuild(baseline.unbuilt(sig), stable_polls, cfg.quiet_polls)) continue;
 
         std.debug.print("labelle: change detected — rebuilding WASM...\n", .{});
+        // The tree as this rebuild starts on it, and as the callback leaves
+        // it: their per-path diff is what changed while it ran
+        // (`WatchBaseline`).
+        const ra = rebuild_arena.allocator();
+        const start = snapshotTree(io, ra, cfg.watch_dir, cfg.ignore_files);
         const ok = cfg.rebuild_fn(cfg.rebuild_ctx);
-        var post = TreeSignature{};
-        computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &post);
-        _ = scan_arena.reset(.retain_capacity);
-        baseline.settle(sig, post);
+        const post = snapshotTree(io, ra, cfg.watch_dir, cfg.ignore_files);
+        const delta: ?[]const u64 = if (start.complete and post.complete)
+            changedPaths(ra, start.paths.items, post.paths.items) catch null
+        else
+            null;
+        baseline.settle(start.sig, post.sig, delta);
+        _ = rebuild_arena.reset(.retain_capacity);
         stable_polls = 0;
         if (ok) {
             _ = state.version.fetchAdd(1, .release);
@@ -797,50 +948,148 @@ fn testSig(label: []const u8) TreeSignature {
     return sig;
 }
 
+/// A scripted rebuild for the baseline tests: the sorted path keys that
+/// changed while it ran.
+fn testDelta(comptime paths: []const []const u8) [paths.len]u64 {
+    var keys: [paths.len]u64 = undefined;
+    for (paths, 0..) |path, i| keys[i] = pathKey(path);
+    std.mem.sort(u64, &keys, {}, std.sort.asc(u64));
+    return keys;
+}
+
 test "watch baseline: a rebuild that rewrites its own output settles after one follow-up" {
     // A hook that rewrites `assets/out.png` on every run: each callback
-    // leaves the tree at a fresh signature.
+    // leaves the tree at a fresh signature, with that one path changed.
+    const hook = testDelta(&.{"assets/out.png"});
     const edited = testSig("user edit");
-    var b: WatchBaseline = .{ .applied = testSig("start") };
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
     try std.testing.expect(b.unbuilt(edited));
     // Rebuild 1, for the user's edit; its hook writes -> `write1`.
     const write1 = testSig("hook write 1");
-    b.settle(edited, write1);
-    // The hook's write is unbuilt: one follow-up rebuild fires (it would
-    // also pick up an edit saved during rebuild 1).
+    b.settle(edited, write1, &hook);
+    // The hook's write is unbuilt: one follow-up rebuild fires.
     try std.testing.expect(b.unbuilt(write1));
-    // The follow-up's hook writes again -> `write2`, taken as its output.
+    // The follow-up's hook writes the same path again -> `write2`: nothing
+    // its predecessor did not change, so it settles on `write2`.
     const write2 = testSig("hook write 2");
-    b.settle(write1, write2);
-    // Settled: the tree as the follow-up left it is built. No third rebuild,
-    // where re-baselining on the trigger alone looped forever.
+    b.settle(write1, write2, &hook);
     try std.testing.expect(!b.unbuilt(write2));
-    // The mechanism: without the follow-up rule the trigger is what counts
-    // as built, so the hook's write re-fires on every poll.
-    var naive: WatchBaseline = .{ .applied = testSig("start") };
-    naive.settle(edited, write1);
-    naive.post = null; // forget the post-callback signature
-    naive.settle(write1, write2);
-    try std.testing.expect(naive.unbuilt(write2));
+    // The mechanism: it is the follow-up's delta that settles it — the
+    // same rebuild with an unknown delta leaves the hook's write pending.
+    var unknown: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer unknown.deinit();
+    unknown.settle(edited, write1, &hook);
+    unknown.settle(write1, write2, null);
+    try std.testing.expect(unknown.unbuilt(write2));
+}
+
+test "watch baseline: an edit saved during the follow-up rebuild stays pending (Codex P2 on #427)" {
+    const hook = testDelta(&.{"assets/out.png"});
+    // The follow-up changed the hook's path AND a source the user saved
+    // after the follow-up had read it.
+    const hook_and_edit = testDelta(&.{ "assets/out.png", "src/main.zig" });
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
+    const edited = testSig("user edit");
+    const write1 = testSig("hook write 1");
+    b.settle(edited, write1, &hook);
+    try std.testing.expect(b.unbuilt(write1));
+    // Follow-up (fired for `write1`), during which the user saves main.zig.
+    const write2_with_edit = testSig("hook write 2 + edit");
+    b.settle(write1, write2_with_edit, &hook_and_edit);
+    // Not settled: main.zig is new relative to the previous rebuild's
+    // writes, so the tree the follow-up left is still unbuilt and fires
+    // one more rebuild. The old rule accepted it and lost the edit.
+    try std.testing.expect(b.unbuilt(write2_with_edit));
+    try std.testing.expect(b.applied.eql(write1));
+    // That rebuild (fired for exactly the follow-up's post) only rewrites
+    // the hook's path again: a subset, so the chain ends here — (a) still
+    // holds with the edit in it, after exactly one more rebuild.
+    const write3 = testSig("hook write 3");
+    b.settle(write2_with_edit, write3, &hook);
+    try std.testing.expect(!b.unbuilt(write3));
+}
+
+test "watch baseline: a scripted session never settles past an unread edit and never loops" {
+    // A self-writing hook plus user saves landing at every point of the
+    // chain. Each step: the trigger the watcher fired for, and what changed
+    // while that rebuild ran. `must_rebuild` is whether the tree it left
+    // is (correctly) still unbuilt.
+    const Step = struct { trigger: []const u8, post: []const u8, delta: []const u64, must_rebuild: bool };
+    const hook = testDelta(&.{"gen/out.zig"});
+    const hook_a = testDelta(&.{ "gen/out.zig", "src/a.zig" });
+    const hook_b = testDelta(&.{ "gen/out.zig", "src/b.zig" });
+    const none = testDelta(&.{});
+    const a_only = testDelta(&.{"src/a.zig"});
+    const script = [_]Step{
+        // Edit 1; the hook writes; a.zig saved meanwhile -> follow-up.
+        .{ .trigger = "e1", .post = "p1", .delta = &hook_a, .must_rebuild = true },
+        // Follow-up; b.zig saved during it -> one more.
+        .{ .trigger = "p1", .post = "p2", .delta = &hook_b, .must_rebuild = true },
+        // One more: only the hook's path -> settled.
+        .{ .trigger = "p2", .post = "p3", .delta = &hook, .must_rebuild = false },
+        // A later ordinary edit, with a save of a.zig during it and no
+        // self-write -> the next rebuild reads a.zig...
+        .{ .trigger = "e2", .post = "p4", .delta = &a_only, .must_rebuild = true },
+        // ...and writes nothing: built.
+        .{ .trigger = "p4", .post = "p4", .delta = &none, .must_rebuild = false },
+    };
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
+    for (script) |step| {
+        b.settle(testSig(step.trigger), testSig(step.post), step.delta);
+        try std.testing.expectEqual(step.must_rebuild, b.unbuilt(testSig(step.post)));
+    }
 }
 
 test "watch baseline: an edit saved during an ordinary rebuild still fires the next one" {
-    var b: WatchBaseline = .{ .applied = testSig("start") };
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
     const first = testSig("edit 1");
     // A rebuild that writes nothing into the tree; the user saves again
     // while it runs, so the tree after the callback is `second`.
     const second = testSig("edit 2");
-    b.settle(first, second);
+    const edit = testDelta(&.{"src/main.zig"});
+    b.settle(first, second, &edit);
     try std.testing.expect(b.unbuilt(second));
     // That rebuild (fired for `second`) writes nothing: settled on it.
-    b.settle(second, second);
+    b.settle(second, second, &.{});
     try std.testing.expect(!b.unbuilt(second));
     // A later edit is an ordinary trigger again: built at the trigger, so
     // a save during THIS rebuild is not swallowed either.
     const third = testSig("edit 3");
     const fourth = testSig("edit 4");
-    b.settle(third, fourth);
+    b.settle(third, fourth, &edit);
     try std.testing.expect(b.unbuilt(fourth));
+}
+
+test "changedPaths: added, removed and changed paths, by key" {
+    const a = std.testing.allocator;
+    var before: TreeSnapshot = .{};
+    defer before.paths.deinit(a);
+    before.record(a, "keep", 1, 1);
+    before.record(a, "edit", 1, 1);
+    before.record(a, "gone", 1, 1);
+    before.sort();
+    var after: TreeSnapshot = .{};
+    defer after.paths.deinit(a);
+    after.record(a, "keep", 1, 1);
+    after.record(a, "edit", 1, 2);
+    after.record(a, "new", 1, 1);
+    after.sort();
+    const delta = try changedPaths(a, before.paths.items, after.paths.items);
+    defer a.free(delta);
+    const expected = testDelta(&.{ "edit", "gone", "new" });
+    try std.testing.expectEqualSlices(u64, &expected, delta);
+    try std.testing.expect(isSubset(&testDelta(&.{"edit"}), delta));
+    try std.testing.expect(!isSubset(&testDelta(&.{ "edit", "keep" }), delta));
+    // The snapshot's signature is the one the polls compute.
+    var sig = TreeSignature{};
+    sig.mix("keep", 1, 1);
+    sig.mix("edit", 1, 2);
+    sig.mix("new", 1, 1);
+    try std.testing.expect(sig.eql(after.sig));
 }
 
 test "resolveTarget: root maps to index.html" {

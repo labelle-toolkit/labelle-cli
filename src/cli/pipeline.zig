@@ -38,6 +38,7 @@ const provider_dispatch = @import("provider_dispatch.zig");
 const provider_github = @import("provider_github.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const provider_targets = @import("provider_targets.zig");
+const plugins = @import("plugins.zig");
 const asm_cache = @import("asm_cache.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
@@ -91,8 +92,9 @@ const WasmRebuildCtx = struct {
     hooks: *provider_hooks.Site,
     generate_plan: provider_hooks.Plan = .{},
     build_plan: provider_hooks.Plan = .{},
-    /// Rediscovers the providers and replans both phases at the start of
-    /// EVERY rebuild, so a watched edit to `project.labelle`, to a provider
+    /// Rediscovers the providers and replans both phases on EVERY rebuild
+    /// (ownership pre-check first, full replan after the prebuild steps —
+    /// see `Replan`), so a watched edit to `project.labelle`, to a provider
     /// manifest or to `provider_config` reaches the next rebuild. The
     /// startup plans above are only the initial state; with a replan
     /// installed they never run a rebuild themselves (they were captured
@@ -114,8 +116,9 @@ const WasmRebuildCtx = struct {
     /// watch loop only needs the bool, but the test asserts the ORDER —
     /// that the shader preflight fires before generation is attempted.
     const Stage = error{
-        ReplanFailed,
+        TargetPrecheckFailed,
         PrebuildFailed,
+        ReplanFailed,
         HookFailed,
         ShaderPreflightFailed,
         GenerateFailed,
@@ -124,11 +127,25 @@ const WasmRebuildCtx = struct {
         BuildFailed,
     };
 
-    /// The per-rebuild replan seam: `run` receives `ctx` and the context it
-    /// must update (`hooks.providers`, `hooks.cfg`, `generate_plan`,
-    /// `build_plan`).
+    /// The per-rebuild replan seam, in two stages around the prebuild steps:
+    ///
+    /// - `precheck` runs FIRST, ahead of every side-effecting stage: a cheap,
+    ///   side-effect-free ownership check of the served target against the
+    ///   manifests the declared packages have NOW (no install, no lock, no
+    ///   plan). It refuses only a target whose owner is clearly gone or
+    ///   unpinned, so an edit that drops or unpins the owner runs no prebuild
+    ///   work for the refused configuration (Codex P2 on #421). A verdict it
+    ///   cannot draw yet (a declared package it cannot read, a local
+    ///   manifest a prebuild step may generate) is left to `run`.
+    /// - `run` runs AFTER the prebuild steps and before the first hook phase:
+    ///   the full rediscovery + replan + ownership validation, so provider
+    ///   metadata a prebuild step generates — a local provider's
+    ///   `plugin.labelle`, say — reaches THIS rebuild's plans (Codex P2 on
+    ///   #427). It receives `ctx` and the context it must update
+    ///   (`hooks.providers`, `hooks.cfg`, `generate_plan`, `build_plan`).
     pub const Replan = struct {
         ctx: *anyopaque,
+        precheck: ?*const fn (*anyopaque, *WasmRebuildCtx) anyerror!void = null,
         run: *const fn (*anyopaque, *WasmRebuildCtx) anyerror!void,
     };
 
@@ -157,21 +174,18 @@ const WasmRebuildCtx = struct {
     fn rebuildStaged(self: *WasmRebuildCtx) Stage!void {
         const a = self.allocator;
 
-        // 0. Re-read the project, rediscover the providers, re-check that
-        //    the served target still has a pinned owner and replan the hook
-        //    phases for THIS rebuild (see `replan`) — FIRST, ahead of every
-        //    side-effecting stage. A watched edit that removes or unpins the
-        //    target owner used to be refused only after the prebuild
-        //    commands below had already run once for the invalid
-        //    configuration (Codex P2 on #421). A failing replan — a
-        //    malformed manifest saved mid-session, say — is reported like a
-        //    failing core step and stops here, before any stage.
-        if (self.replan) |replan| {
-            replan.run(replan.ctx, self) catch |err| {
-                std.debug.print("labelle: rebuild stopped before prebuild: provider replan failed ({s})\n", .{@errorName(err)});
-                return error.ReplanFailed;
+        // 0. The served target's ownership pre-check (`Replan.precheck`),
+        //    FIRST, ahead of every side-effecting stage: a watched edit that
+        //    removes or unpins the target owner used to be refused only
+        //    after the prebuild commands below had already run once for the
+        //    invalid configuration (Codex P2 on #421). Metadata only; the
+        //    authoritative check is the full replan after the prebuild.
+        if (self.replan) |replan| if (replan.precheck) |precheck| {
+            precheck(replan.ctx, self) catch |err| {
+                std.debug.print("labelle: rebuild stopped before prebuild: served target check failed ({s})\n", .{@errorName(err)});
+                return error.TargetPrecheckFailed;
             };
-        }
+        };
 
         // 0a. Re-run the declared prebuild steps, ahead of generation just
         //     as the initial pipeline does. Steps that declare `.inputs` +
@@ -182,13 +196,29 @@ const WasmRebuildCtx = struct {
         //     them no longer looks like a fresh edit on the next poll.
         //     A step that declares no `.outputs` runs on every rebuild by
         //     design and is not excluded from anything; if such a step
-        //     also writes into the watched tree the watcher re-baselines
-        //     after one follow-up rebuild (`serve.WatchBaseline`), but
-        //     declaring `.outputs` avoids even that one.
+        //     also writes into the watched tree the watcher settles after
+        //     one follow-up rebuild (`serve.WatchBaseline`), but declaring
+        //     `.outputs` avoids even that one.
         self.run_prebuild(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
             return error.PrebuildFailed;
         };
+
+        // 0a'. Re-read the project, rediscover the providers, re-check that
+        //      the served target still has a pinned owner and replan the
+        //      hook phases for THIS rebuild (see `replan`) — AFTER the
+        //      prebuild steps, which may generate the provider metadata the
+        //      discovery reads (a local provider's `plugin.labelle`), and
+        //      whose declared outputs never schedule a corrective rebuild of
+        //      their own; before every hook phase. A failing replan — a
+        //      malformed manifest saved mid-session, say — is reported like
+        //      a failing core step and stops here, before any hook.
+        if (self.replan) |replan| {
+            replan.run(replan.ctx, self) catch |err| {
+                std.debug.print("labelle: rebuild stopped before generate: provider replan failed ({s})\n", .{@errorName(err)});
+                return error.ReplanFailed;
+            };
+        }
 
         // 0b. The `before generate` hooks, then the shader-compiler override
         //     gate AFTER them (a prebuild step or a before-generate hook may
@@ -509,9 +539,11 @@ const WasmRebuildCtx = struct {
         try std.testing.expectEqualStrings("unpinned", Spy.calls[2].id);
     }
 
-    // The replan seam: every rebuild replans before its first phase, the
-    // plans the replan installs are the ones that run, and a failing replan
-    // stops the rebuild ahead of every phase with the previous plans intact.
+    // The replan seam: every rebuild pre-checks the target before the
+    // prebuild steps and replans after them, before its first hook phase;
+    // the plans the replan installs are the ones that run, and a failing
+    // replan stops the rebuild ahead of every hook with the previous plans
+    // intact.
     test "watched rebuild replans the hook phases on every rebuild" {
         if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
         const a = std.testing.allocator;
@@ -562,13 +594,23 @@ const WasmRebuildCtx = struct {
                 phase_count = 0;
                 prebuilds = 0;
             }
-            // The prebuild runner: counts runs, and records whether the
-            // replan of this rebuild had already happened.
+            // The ownership pre-check: counts runs; `refuse_next` stands in
+            // for a target whose owner is clearly gone.
+            var prechecks: usize = 0;
+            var refuse_next = false;
+            fn precheck(_: *anyopaque, _: *WasmRebuildCtx) anyerror!void {
+                prechecks += 1;
+                if (refuse_next) return error.NoProviderForTarget;
+            }
+            // The prebuild runner: counts runs, and records how far this
+            // rebuild's pre-check and replan had got when it ran.
             var prebuilds: usize = 0;
             var replans_at_prebuild: usize = 0;
+            var prechecks_at_prebuild: usize = 0;
             fn runPrebuild(_: std.mem.Allocator, _: []const u8, _: []const prebuild.Step, _: prebuild.Options) prebuild.Error!void {
                 prebuilds += 1;
                 replans_at_prebuild = replans;
+                prechecks_at_prebuild = prechecks;
             }
         };
         var counter: usize = 0;
@@ -594,19 +636,21 @@ const WasmRebuildCtx = struct {
             .build_plan = .{ .replace = Fixture.planned("build-stale", .build, .replace) },
             .run_hook_phase = Spy.run,
             .run_prebuild = Spy.runPrebuild,
-            .replan = .{ .ctx = &counter, .run = Spy.replan },
+            .replan = .{ .ctx = &counter, .precheck = Spy.precheck, .run = Spy.replan },
         };
         // Production wiring: the default prebuild runner IS the cold one.
         const default_prebuild = std.meta.fieldInfo(WasmRebuildCtx, .run_prebuild).defaultValue() orelse return error.TestUnexpectedResult;
         try std.testing.expect(default_prebuild == prebuild.runAll);
 
         // Rebuild 1: replanned once; the FRESH plans ran, the startup plans
-        // did not. The replan came first: the prebuild steps ran after it.
+        // did not. The pre-check came first, the prebuild steps next, the
+        // replan after them (so it sees what they generate).
         Spy.reset();
         try ctx.rebuildStaged();
         try std.testing.expectEqual(@as(usize, 1), counter);
         try std.testing.expectEqual(@as(usize, 1), Spy.prebuilds);
-        try std.testing.expectEqual(@as(usize, 1), Spy.replans_at_prebuild);
+        try std.testing.expectEqual(@as(usize, 1), Spy.prechecks_at_prebuild);
+        try std.testing.expectEqual(@as(usize, 0), Spy.replans_at_prebuild);
         try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
         try std.testing.expectEqualStrings("gen-fresh", Spy.phases[0]);
         try std.testing.expectEqualStrings("build-fresh", Spy.phases[1]);
@@ -615,20 +659,30 @@ const WasmRebuildCtx = struct {
         try std.testing.expect(rebuild(@ptrCast(&ctx)));
         try std.testing.expectEqual(@as(usize, 2), counter);
         try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
-        // A failing replan stops the rebuild before any phase, and the plans
-        // installed by the last good replan stay in place.
+        // A failing replan stops the rebuild before any hook phase, and the
+        // plans installed by the last good replan stay in place.
         Spy.fail_next = true;
         Spy.reset();
         try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 3), counter);
         try std.testing.expectEqual(@as(usize, 0), Spy.phase_count);
-        // ...and before the prebuild steps: an edit that drops or unpins the
-        // served target's owner runs no side-effecting prebuild work for
-        // the refused configuration (Codex P2 on #421).
-        try std.testing.expectEqual(@as(usize, 0), Spy.prebuilds);
+        // (It ran after the prebuild steps, by design: they may generate
+        // the metadata the replan reads.)
+        try std.testing.expectEqual(@as(usize, 1), Spy.prebuilds);
         try std.testing.expectEqualStrings("gen-fresh", ctx.generate_plan.replace.?.hook.id);
         try std.testing.expectEqualStrings("build-fresh", ctx.build_plan.replace.?.hook.id);
         Spy.fail_next = false;
+        // A refusing pre-check stops the rebuild before the prebuild steps:
+        // an edit that drops or unpins the served target's owner runs no
+        // side-effecting prebuild work for the refused configuration (Codex
+        // P2 on #421) — and no replan either.
+        Spy.refuse_next = true;
+        Spy.reset();
+        try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 0), Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 3), counter);
+        try std.testing.expectEqual(@as(usize, 0), Spy.phase_count);
+        Spy.refuse_next = false;
         // Without a replan the startup plans are what run (the earlier tests'
         // shape), so the fresh plans above came from the seam.
         ctx.replan = null;
@@ -776,6 +830,75 @@ const WatchReplan = struct {
         self.current = next;
     }
 
+    /// The ownership pre-check (`WasmRebuildCtx.Replan.precheck`): before
+    /// the prebuild steps, re-read `project.labelle` and read the manifests
+    /// the declared packages have NOW — the same metadata-only (`.unknown`)
+    /// discovery the cold pipeline's pre-install verdict uses
+    /// (`earlyTargetCheck`), on a scratch arena freed before returning: no
+    /// install, no lock write, no plan, nothing installed on `ctx`.
+    ///
+    /// It refuses only what no prebuild step can mend:
+    /// - an owner that is a remote package without an integrity pin
+    ///   (`UnverifiedTargetOwner`) — a pin lives in `project.labelle`;
+    /// - no owner at all (`NoProviderForTarget`) while every declared LOCAL
+    ///   package already has a manifest to read and no declared remote
+    ///   package is unread — the project dropped the owner, or its manifest
+    ///   stopped declaring the target.
+    ///
+    /// Everything else passes to the full replan after the prebuild, which
+    /// stays the authoritative check: a declared local package without a
+    /// `plugin.labelle` yet (a prebuild step may be what generates it —
+    /// Codex P2 on #427) and a declared remote package not in the cache yet
+    /// (the replan's install fetches it). An error reading the project or a
+    /// present manifest fails closed, as the cold pre-install check does.
+    /// A manifest that exists is taken at face value here: one that a
+    /// prebuild step would regenerate to START declaring the target is
+    /// refused by this check, as it is at cold start.
+    fn precheck(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
+        const self: *WatchReplan = @ptrCast(@alignCast(ptr));
+        var scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var cfg = try config.readProjectConfig(a, self.project_dir);
+        cfg.platform = ctx.hooks.cfg.platform;
+        cfg.backend = ctx.hooks.cfg.backend;
+        var sources: provider_github.Sources = .{ .a = a };
+        defer sources.deinit();
+        const view = try provider_dispatch.discoverAll(a, ctx.hooks.root, cfg, &sources, .unknown);
+        if (view.unresolved.len != 0) return;
+        if (provider_targets.resolve(view.providers, ctx.hooks.target)) |_| {
+            return;
+        } else |err| switch (err) {
+            error.NoProviderForTarget => if (try localManifestPending(a, ctx.hooks.root, cfg)) return,
+            error.UnverifiedTargetOwner => {},
+            else => return err,
+        }
+        // Refused: `confirmTarget` prints the cold pipeline's diagnostic.
+        return switch (try confirmTarget(a, view.providers, ctx.hooks.target)) {
+            .resolved => {},
+            .refused => |kind| switch (kind) {
+                .no_provider => error.NoProviderForTarget,
+                .unpinned_owner => error.UnverifiedTargetOwner,
+            },
+        };
+    }
+
+    /// True when a declared local package has no `plugin.labelle` yet —
+    /// discovery reads it as a runtime-only package, but a prebuild step
+    /// may be about to generate its manifest.
+    fn localManifestPending(a: std.mem.Allocator, root: []const u8, cfg: project_config.ProjectConfig) !bool {
+        for (cfg.plugins) |dep| {
+            if (!dep.isLocal()) continue;
+            const dir = try plugins.resolvePluginDir(a, root, dep);
+            const manifest_path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
+            std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return true,
+                else => return err,
+            };
+        }
+        return false;
+    }
+
     /// Release the current generation. Once a replan succeeded, `site`'s
     /// `providers` and `cfg` point into that generation, so they are put back
     /// on the caller's stable (startup) storage first: nothing on the site
@@ -906,6 +1029,219 @@ const WatchReplan = struct {
         try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.run(&replan, &ctx));
         try Kept.check(&replan, &ctx, &site, good);
         try std.testing.expectEqualStrings("local:../pkg", site.cfg.plugins[0].repo);
+    }
+
+    /// Shared fixture for the two-stage (pre-check → prebuild → replan)
+    /// tests below: a project declaring a local package `pkg` that owns
+    /// `wasm`, a rebuild context wired to the production pre-check and
+    /// replan, and spies for the prebuild runner and the hook phases.
+    const TwoStage = struct {
+        const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
+        const local_project = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }";
+
+        fn manifest(buf: []u8, targets: []const u8, hooks: []const u8) ![]const u8 {
+            return std.fmt.bufPrint(buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ {s} }}, .hooks = .{{ {s} }} }}", .{ targets, hooks });
+        }
+
+        const Spy = struct {
+            var prebuilds: usize = 0;
+            /// When set, the prebuild step writes this manifest text here —
+            /// a generator whose output is the provider's metadata.
+            var generate_path: []const u8 = "";
+            var generate_text: []const u8 = "";
+            var hooks: [4][]const u8 = undefined;
+            var hook_count: usize = 0;
+            fn reset() void {
+                prebuilds = 0;
+                hook_count = 0;
+                generate_path = "";
+            }
+            fn runPrebuild(_: std.mem.Allocator, _: []const u8, _: []const prebuild.Step, _: prebuild.Options) prebuild.Error!void {
+                prebuilds += 1;
+                if (generate_path.len != 0) {
+                    std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = generate_path, .data = generate_text }) catch return error.PrebuildStepFailed;
+                }
+            }
+            fn runHook(_: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+                for (list) |planned| {
+                    hooks[hook_count] = planned.qualified;
+                    hook_count += 1;
+                }
+                return 0;
+            }
+            fn lock(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
+        };
+    };
+
+    // Stage one: a watched edit that leaves the served target clearly
+    // ownerless (or unpinned) is refused by the pre-check, before the
+    // prebuild steps run a single side effect for it (Codex P2 on #421).
+    test "watched rebuild refuses a target whose owner disappeared before the prebuild steps" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        var buf: [1024]u8 = undefined;
+        const owning = try TwoStage.manifest(&buf, "\"wasm\"", TwoStage.gen_hook);
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = owning });
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+        const startup_cfg = site.cfg;
+        defer replan.deinit(&site, &.{}, startup_cfg);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+            .run_prebuild = TwoStage.Spy.runPrebuild,
+            .run_hook_phase = TwoStage.Spy.runHook,
+            .replan = .{ .ctx = &replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+        };
+
+        // Owned: the pre-check passes, the prebuild runs, the replan plans
+        // the hook (generation then fails on the missing assembler).
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.hook_count);
+        const good = replan.current.?;
+
+        // (a) The manifest stops declaring the target.
+        var unowned_buf: [1024]u8 = undefined;
+        const unowned = try TwoStage.manifest(&unowned_buf, "", TwoStage.gen_hook);
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = unowned });
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
+        try std.testing.expectEqual(good, replan.current.?);
+        // (b) The project drops the package.
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = owning });
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
+        // (c) The owner becomes a remote package with no integrity pin.
+        const home = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(home);
+        asm_cache.setCacheRootOverride(home);
+        defer asm_cache.clearCacheRootOverride();
+        const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "pkg", "1.0.0" });
+        defer a.free(cached);
+        try tmp.dir.createDirPath(io, cached);
+        const cached_manifest = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
+        defer a.free(cached_manifest);
+        try tmp.dir.writeFile(io, .{ .sub_path = cached_manifest, .data = owning });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
+        });
+        try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.precheck(&replan, &ctx));
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(good, replan.current.?);
+
+        // Not "clearly gone": the local package has no manifest yet, which a
+        // prebuild step may generate. The pre-check defers; the prebuild
+        // runs; the full replan after it is what refuses, when nothing did.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
+        try tmp.dir.deleteFile(io, "pkg/plugin.labelle");
+        try WatchReplan.precheck(&replan, &ctx);
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
+        try std.testing.expectEqual(good, replan.current.?);
+    }
+
+    // Stage two: a prebuild step that generates the provider's manifest is
+    // seen by THIS rebuild's replan — the plans that run are the generated
+    // ones, not the stale or missing metadata from before the prebuild
+    // (Codex P2 on #427).
+    test "watched rebuild replans after a prebuild step generates provider metadata" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        const pkg = try tmp.dir.realPathFileAlloc(io, "pkg", a);
+        defer a.free(pkg);
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+        const startup_cfg = site.cfg;
+        defer replan.deinit(&site, &.{}, startup_cfg);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+            .run_prebuild = TwoStage.Spy.runPrebuild,
+            .run_hook_phase = TwoStage.Spy.runHook,
+            .replan = .{ .ctx = &replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+        };
+
+        // The manifest does not exist when the rebuild starts; the prebuild
+        // step generates it, owning the target and declaring a hook.
+        var buf: [1024]u8 = undefined;
+        const generated = try TwoStage.manifest(&buf, "\"wasm\"", TwoStage.gen_hook);
+        const manifest_path = try std.fs.path.join(a, &.{ pkg, "plugin.labelle" });
+        defer a.free(manifest_path);
+        TwoStage.Spy.reset();
+        TwoStage.Spy.generate_path = manifest_path;
+        TwoStage.Spy.generate_text = generated;
+        try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
+        // The replan saw the generated manifest: its hook is planned and ran
+        // in this very rebuild.
+        try std.testing.expectEqual(@as(usize, 1), ctx.generate_plan.before.len);
+        try std.testing.expectEqualStrings("pkg/gen", ctx.generate_plan.before[0].qualified);
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.hook_count);
+        try std.testing.expectEqualStrings("pkg/gen", TwoStage.Spy.hooks[0]);
+
+        // The mechanism: the same rebuild with a prebuild that generates
+        // nothing is refused by the replan — so the plan above came from
+        // the manifest the prebuild wrote, read after it ran.
+        try tmp.dir.deleteFile(io, "pkg/plugin.labelle");
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
     }
 
     // An edit to `project.labelle` brings the package cache and the lock in
@@ -2594,7 +2930,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                     .build_plan = hook_plans.build,
                     .generate_out = generate_out,
                     .build_out = build_out,
-                    .replan = .{ .ctx = &watch_replan, .run = WatchReplan.run },
+                    .replan = .{ .ctx = &watch_replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
                 };
                 // The hooks' declared `.outputs` are excluded from the watch
                 // signature so the rebuild callback can't trip its own
