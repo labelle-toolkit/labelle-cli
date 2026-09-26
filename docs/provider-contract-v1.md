@@ -1,6 +1,6 @@
 # Provider contract v1
 
-Status: phase-1 contract and validation foundation for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Dispatch, fetching, publication and runtime extraction are not implemented by this change.
+Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings, progress overrides and platform extraction remain pending.
 
 Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
@@ -72,24 +72,68 @@ Each entry has exactly `package` and `file`; package entries are unique and must
 
 Move the former platform-specific settings into these files in the platform migration PRs; do not silently translate or continue accepting removed fields. The schema must be accepted by the shared project parser/assembler boundary before consumer migration. Phase 1 specifies this field; it does not yet change `project_config.zig`.
 
-## 4. Index and global-lock records
+## 4. GitHub manifest and project integrity lock
 
-Use UTF-8 JSON with `schema_version: 1`. The registry repository owns records; one publishing workflow emits immutable snapshots, then updates a pointer to a completed snapshot. Record and verify its hash. No snapshot is executable configuration.
+The agreed registry is a GitHub repository, `labelle-toolkit/labelle-registry`,
+containing `providers.json`. Read it directly from raw GitHub or from a local
+checkout. There is no R2 endpoint, publication service or generated snapshot.
+This replaces the earlier proposed index/global-lock schema.
 
-Index root fields are `schema_version`, `revision` (immutable registry commit), `providers` (array), and `defaults` (array of package names). Unknown fields and duplicate keys fail validation for this schema version. Each provider record contains:
+Registry and project integrity lock use the same strict UTF-8 JSON shape:
 
-- `package`: unique package identity;
-- `namespaces`: unique owned command namespaces;
-- `targets`: unique owned targets, independently indexed from namespaces;
-- `releases`: immutable release records.
+```json
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "package": "labelle-example",
+      "repo": "labelle-toolkit/labelle-example",
+      "version": "1.0.0",
+      "commit": "<40 lowercase hex characters>",
+      "sha256": "<64 lowercase hex characters>"
+    }
+  ]
+}
+```
 
-Each release contains `version` (stable semver), `source_url` (HTTPS archive), `sha256` (64 lowercase hex digits), `command_contract` (semver range), `bootstrap_zig` (exact version), `hosts` (supported host triples), `namespaces` and `targets` (this release's subset of owned names), and `commands` (objects with `name` and `needs_project`). Index command/ownership data must agree with the downloaded manifest before building it. Duplicate releases or conflicting ownership are errors. Resolution excludes prereleases unless explicitly requested and excludes host/contract-incompatible releases. The full index schema validator is a phase-2/5 deliverable; phase 1 tests the ownership table and target lookup independently.
+The placeholders above must be replaced with real values. The archive URL is
+constructed as `https://codeload.github.com/<repo>/tar.gz/<commit>`; arbitrary
+archive hosts, tags and branch names are not accepted. SHA-256 covers the
+compressed archive bytes, separately from any Zig dependency content hashes.
+Duplicate JSON keys, unknown fields, duplicate package/version records,
+repository conflicts and unsupported schemas are errors. A project lock
+contains at most one version per package. Releases are stable exact semver.
 
-Target lookup supports actionable missing-provider diagnostics without a platform-name table in the CLI. It must not silently install a provider inside a project. Offline diagnostics use cached index data; without that data, report the missing target without inventing a package name.
+`labelle providers resolve [providers.json]` previews the exact project-declared
+versions, commits and hashes and records them, with a digest, in
+`.labelle/providers.preview.json`. `--accept` requires the registry to still
+equal that recorded preview (any changed field aborts with
+`ProviderPreviewMismatch`; no preview aborts with `ProviderPreviewMissing`),
+verifies archives against the previewed hashes and provider manifests, checks
+ownership, then atomically writes `labelle.providers.lock` and removes the
+preview.
+Commit it alongside `labelle.lock`, which remains the ordinary dependency lock
+and is not rewritten by provider resolution. No package code runs during
+resolution. A failed resolve leaves the previous integrity lock intact.
 
-The global lock root contains `schema_version` and `pins` (array). Each pin contains `package`, `version`, `source_url`, `sha256`, `registry_revision`, `contract_version`, `bootstrap_zig`, and `dependencies` (array of exact package/version/source_url/sha256 records). Package identities in each resolved graph are unique. The global lock is stored under the existing Labelle cache root, respecting `LABELLE_HOME`. A project lock remains authoritative inside projects; the global lock is never a fallback for it.
+Normal commands use only matching project pins and cached archives; no
+registry lookup, download or pin update is implicit. Verify the archive hash
+on every invocation, extract into a fresh temporary directory, and remove it
+afterward. Never execute the older unverified plugin extraction cache. Missing
+or corrupted archives fail closed. Repair the cached archive and explicitly
+resolve again; a changed GitHub archive is not automatically accepted.
 
-A normal run verifies content against the recorded hash. A mismatch is fatal; repair/refetch the same immutable content or explicitly resolve/update a provider. Never treat corrupted cache data as consent to execute a different release. A separate explicit global-provider update operation prepares and verifies the replacement before atomically changing the lock. CLI self-update never moves provider pins. Exact CLI spelling is a phase-2 decision.
+Namespace, target and command-contract declarations come from the verified
+`plugin.labelle`, rather than duplicated registry metadata. Source archives
+must be self-contained and have one root directory. Unsafe paths, links,
+case-insensitive duplicate paths and unsupported entry types are rejected.
+Compiler and Zig dependencies still require explicit preparation; host builds
+use Zig system-package mode to disable dependency downloads.
+
+`--offline` requires local metadata and cached archives. Global/projectless
+bootstrap and default-package selection remain later work using GitHub data;
+they do not require a separate publishing service. CLI self-update never
+changes provider pins.
 
 ## 5. Default-package consent
 
@@ -113,6 +157,6 @@ Keep specific existing sites on the shrinking migration allowlist until replaced
 
 Phase 1 supplies this contract, wire-context validation, installed-tool path validation, ownership conflict checks and target lookup. `zig build test-provider-contract` runs those tests; `zig build test` includes the same target, avoiding an uncollected test root.
 
-Phase 2 implements manifest/range parsing, config mapping, full index/global-lock schema validation, filesystem validation, host-tool build/discovery/cache and process dispatch. Phase 3 implements hook planning and the Android provider; phase 4 consolidates packaging/Gradle; phase 5 publishes the registry and enables projectless resolution/updates. Registry fixtures can be used earlier without publishing a live index.
+Phase 2 implements manifest/range parsing, GitHub integrity pins, config mapping, filesystem validation, host-tool build/discovery/cache and process dispatch. Phase 3 implements hook planning and the Android provider; phase 4 consolidates packaging/Gradle; phase 5 enables projectless resolution/updates using the same GitHub repository. Registry records are ordinary reviewed commits, not a publication service.
 
 Before #411 closes, review all six decisions against the architecture RFC. Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.
