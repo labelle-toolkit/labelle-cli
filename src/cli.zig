@@ -80,7 +80,9 @@ const pipeline = @import("cli/pipeline.zig");
 
 /// Handle `labelle assembler <subcommand>`.
 fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
-    const usage = "Usage: labelle providers resolve [providers.json] [--accept] [--offline]\n";
+    const usage = "Usage: labelle providers resolve [providers.json] [--accept] [--offline]\n" ++
+        "  Without --accept: preview pins and record them in .labelle/providers.preview.json.\n" ++
+        "  --accept: pin only what that preview recorded; a changed registry is rejected.\n";
     const sub = args.next() orelse {
         std.debug.print("{s}", .{usage});
         return 0;

@@ -105,8 +105,13 @@ repository conflicts and unsupported schemas are errors. A project lock
 contains at most one version per package. Releases are stable exact semver.
 
 `labelle providers resolve [providers.json]` previews the exact project-declared
-versions, commits and hashes. `--accept` verifies archives and provider
-manifests, checks ownership, then atomically writes `labelle.providers.lock`.
+versions, commits and hashes and records them, with a digest, in
+`.labelle/providers.preview.json`. `--accept` requires the registry to still
+equal that recorded preview (any changed field aborts with
+`ProviderPreviewMismatch`; no preview aborts with `ProviderPreviewMissing`),
+verifies archives against the previewed hashes and provider manifests, checks
+ownership, then atomically writes `labelle.providers.lock` and removes the
+preview.
 Commit it alongside `labelle.lock`, which remains the ordinary dependency lock
 and is not rewritten by provider resolution. No package code runs during
 resolution. A failed resolve leaves the previous integrity lock intact.
