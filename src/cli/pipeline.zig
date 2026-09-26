@@ -779,6 +779,31 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         bundle.printUnsupported();
         return 1;
     }
+    // (3) A provider target whose ownership is decidable NOW is decided
+    //     now, so an identifier-shaped typo (`--platform=waasm`) never runs
+    //     `.prebuild`, the assembler resolution, the ASTC prepass or the
+    //     install first (Codex on #421). This is the same metadata-only read
+    //     `labelle targets` does (`.unknown`: cached manifests, no
+    //     installer): when it can read EVERY declared package, the verdict
+    //     — no owner, or an unpinned remote owner — is the one the
+    //     post-install check would reach, so it lands here with the same
+    //     diagnostics. A declared remote package it cannot read yet (cold
+    //     cache, no pin) leaves the view partial, and the verdict waits for
+    //     the post-install discovery, which stays the authoritative check.
+    //     A manifest that fails discovery fails it closed here: the install
+    //     cannot mend a manifest it can already read. Never for the core
+    //     target, which needs no provider.
+    if (!provisional.is_core) {
+        var early_sources: provider_github.Sources = .{ .a = hook_arena };
+        defer early_sources.deinit();
+        const early = provider_dispatch.discoverAll(hook_arena, project_root, parsed, &early_sources, .unknown) catch |err| {
+            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        if (early.unresolved.len == 0) {
+            _ = try confirmTarget(hook_arena, early.providers, requested_target) orelse return 1;
+        }
+    }
     // The legacy sites below (`parsed.platform == .X`; the guard's migration
     // allowlist) keep working for the schema-named provider targets. A
     // target outside the enum reaches only steps its provider does not
