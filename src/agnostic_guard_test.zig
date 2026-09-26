@@ -76,6 +76,8 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// again after joins across CamelCase pieces (`UIKitView`): no file newly
 /// dirty, still 54 entries. The `cli/serve.zig` split added the four
 /// `cli/serve/` files that carry its moved platform words: 58 entries.
+/// The `cli/pipeline.zig` split added the eleven `cli/pipeline/` files that
+/// carry its moved platform words (all but `context.zig`): 69 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -121,6 +123,19 @@ const allowed_files = [_][]const u8{
     "cli/material_toolchain.zig",
     "cli/pack.zig",
     "cli/pipeline.zig",
+    // Split out of `cli/pipeline.zig` (moves only): the stage code they
+    // carry names the legacy targets, backends and their toolchains.
+    "cli/pipeline/args_resolve.zig",
+    "cli/pipeline/build.zig",
+    "cli/pipeline/export_output.zig",
+    "cli/pipeline/generate.zig",
+    "cli/pipeline/install.zig",
+    "cli/pipeline/run.zig",
+    "cli/pipeline/screenshot.zig",
+    "cli/pipeline/testing.zig",
+    "cli/pipeline/watch.zig",
+    "cli/pipeline/watch_replan.zig",
+    "cli/pipeline/watch_replan_tests.zig",
     "cli/plugins.zig",
     "cli/prebuild.zig",
     "cli/progress.zig",
