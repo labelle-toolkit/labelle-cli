@@ -857,6 +857,7 @@ const WatchReplan = struct {
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         const run_plan = try provider_hooks.plan(a, providers, .run, ctx.hooks.target);
+        if (refuseLegacyWasmReplacement(run_plan)) return error.LegacyWasmReplacement;
         // The lock follows the re-read project once the target is confirmed
         // and the plans are good — the cold pipeline's order — and before
         // any hook runs, since each hook verifies its pin against it.
@@ -890,7 +891,9 @@ const WatchReplan = struct {
     /// (`earlyTargetCheck`), on a scratch arena freed before returning: no
     /// install, no lock write, no plan, nothing installed on `ctx`.
     ///
-    /// It refuses only what no prebuild step can mend:
+    /// A known run replacement is refused before prebuild: a legacy watch
+    /// session cannot switch server implementations while it is running.
+    /// Ownership refusals are limited to what no prebuild step can mend:
     /// - an owner that is a remote package without an integrity pin
     ///   (`UnverifiedTargetOwner`) — a pin lives in `project.labelle`;
     /// - no owner at all (`NoProviderForTarget`) while the project declares
@@ -927,6 +930,7 @@ const WatchReplan = struct {
         var sources: provider_github.Sources = .{ .a = a, .shared = self.extractionCache(), .extract = false };
         defer sources.deinit();
         const view = try provider_dispatch.discoverAll(a, ctx.hooks.root, cfg, &sources, .unknown);
+        if (try refuseKnownLegacyWasmReplacement(a, view.providers, ctx.hooks.target)) return error.LegacyWasmReplacement;
         if (view.unresolved.len != 0) return;
         if (provider_targets.resolve(view.providers, ctx.hooks.target)) |_| {
             return;
@@ -1043,6 +1047,14 @@ const WatchReplan = struct {
         try Manifest.write(tmp.dir, build_hook);
         try WatchReplan.run(&replan, &ctx);
         const good = replan.current.?;
+        // A manifest edit cannot silently add a server replacement to a
+        // running legacy watch session. Both checks keep the old plans.
+        try Manifest.write(tmp.dir, ".{ .id = \"server\", .step = .run, .target = \"wasm\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\" }");
+        try std.testing.expectError(error.LegacyWasmReplacement, WatchReplan.precheck(&replan, &ctx));
+        try std.testing.expectError(error.LegacyWasmReplacement, WatchReplan.run(&replan, &ctx));
+        try std.testing.expectEqual(good, replan.current.?);
+        try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
+        try Manifest.write(tmp.dir, build_hook);
 
         // The served target loses its owner (Codex P1 on #421). Each case
         // fails the replan with the cold pipeline's error and keeps the
@@ -2158,7 +2170,7 @@ const EarlyVerdict = enum {
 /// the install held every pinned provider twice, and a `wasm serve
 /// --no-build` server kept both for its lifetime (Codex P2 on #421).
 /// `error.ProviderDiscoveryFailed` after printing the reason.
-fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: project_config.ProjectConfig, requested: []const u8) !EarlyVerdict {
+fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: project_config.ProjectConfig, requested: []const u8, legacy_wasm: bool) !EarlyVerdict {
     var scratch = std.heap.ArenaAllocator.init(backing);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -2168,6 +2180,7 @@ fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: p
         std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
         return error.ProviderDiscoveryFailed;
     };
+    if (legacy_wasm and try refuseKnownLegacyWasmReplacement(a, early.providers, requested)) return .refused;
     if (early.unresolved.len != 0) return .deferred;
     return switch (try confirmTarget(a, early.providers, requested)) {
         .resolved => .confirmed,
@@ -2200,7 +2213,7 @@ test "pipeline: the early target check frees its discovery before returning" {
     };
     for (cases) |case| {
         var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        const verdict = try earlyTargetCheck(counting.allocator(), project, cfg, case.target);
+        const verdict = try earlyTargetCheck(counting.allocator(), project, cfg, case.target, false);
         try std.testing.expectEqual(case.verdict, verdict);
         try std.testing.expect(counting.allocations > 0);
         try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
@@ -2322,7 +2335,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     //     so the pinned archives it reads are not held again beside the
     //     authoritative discovery's copies (Codex P2 on #421).
     if (!provisional.is_core) {
-        switch (earlyTargetCheck(allocator, project_root, parsed, requested_target) catch return 1) {
+        switch (earlyTargetCheck(allocator, project_root, parsed, requested_target, command == .wasm_cmd) catch return 1) {
             .confirmed, .deferred => {},
             .refused => return 1,
         }
@@ -2389,6 +2402,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             .resolved => |resolved| resolved,
             .refused => return 1,
         };
+        const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
+        if (refuseLegacyWasmReplacement(no_build_plan)) return 1;
         const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
         defer allocator.free(wasm_target);
         const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
@@ -2407,9 +2422,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
 
-        // The run hooks are planned from the same discovery (`known`) the
-        // served target was just confirmed against, for the served name.
-        const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
         // The same wire `optimize` the building path reports for this
         // platform; there is no progress feed on this path.
         const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {
@@ -2659,6 +2671,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
         .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
     };
+    if (command == .wasm_cmd and refuseLegacyWasmReplacement(hook_plans.run)) {
+        if (reporter) |r| r.finishFailed(1, "legacy wasm command conflicts with a provider run replacement");
+        return 1;
+    }
     // The labelle-assembler#378 boundary: the assembler generates only for
     // the schema platforms, so a provider target outside that enum can be
     // generated for only by its provider's `replace` hook on `generate`.
@@ -3529,6 +3545,31 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_outcome);
         }
     }
+}
+
+/// Inspect readable declarations without requiring unresolved providers' hook
+/// edges to be plannable. A known replacement is enough to refuse the verb.
+fn refuseKnownLegacyWasmReplacement(a: std.mem.Allocator, providers: []const provider_dispatch.Provider, target: []const u8) !bool {
+    for (providers) |*provider| for (provider.meta.hooks) |hook| {
+        if (hook.step == .run and hook.when == .replace and std.mem.eql(u8, hook.target, target)) {
+            const qualified = try std.fmt.allocPrint(a, "{s}/{s}", .{ provider.meta.name, hook.id });
+            defer a.free(qualified);
+            return refuseLegacyWasmReplacement(.{ .replace = .{ .provider = provider, .hook = hook, .qualified = qualified } });
+        }
+    };
+    return false;
+}
+
+/// Legacy wasm verbs share the run phase but have their own arguments and
+/// export semantics. A replacement cannot receive those through hook context.
+fn refuseLegacyWasmReplacement(plan: provider_hooks.Plan) bool {
+    const replacement = plan.replace orelse return false;
+    std.debug.print(
+        "labelle: legacy `wasm serve/export` cannot invoke run replacement '{s}'\n" ++
+            "  use the provider commands listed by `labelle help`, or `labelle run/bundle --platform=wasm`.\n",
+        .{replacement.qualified},
+    );
+    return true;
 }
 
 /// The `--target` of a `run --docker` whose launch is skipped: a
