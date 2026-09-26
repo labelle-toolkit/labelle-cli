@@ -6,6 +6,8 @@ const cache = @import("asm_cache.zig");
 const manifest = @import("provider_manifest.zig");
 const contract = @import("provider_contract.zig");
 const util = @import("util.zig");
+const dispatch = @import("provider_dispatch.zig");
+const hooks = @import("provider_hooks.zig");
 
 pub const lock_name = "labelle.providers.lock";
 /// Project-local record of the last `resolve` preview. `--accept` refuses to
@@ -446,17 +448,27 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     var sources: Sources = .{ .a = a };
     defer sources.deinit();
     var ownership: std.ArrayList(contract.Ownership) = .empty;
+    // The accepted set as `discover` would see it, so the hook graph is
+    // validated across remote AND local providers before any pin is written
+    // (Codex P2 on #420): an accept that wrote a lock for a graph with a
+    // missing reference, a phase-order violation, duplicate replacements or
+    // a cycle only moved the failure to the project's next help/build.
+    var providers: std.ArrayList(dispatch.Provider) = .empty;
     for (selected.items) |pin| {
         const dir = try sources.fromPin(pin, !offline);
         const meta = try manifest.parse(a, try read(a, try std.fs.path.join(a, &.{ dir, "plugin.labelle" }), 1024 * 1024));
         const ns = try a.alloc([]const u8, if (meta.namespace != null) 1 else 0);
         if (meta.namespace) |value| ns[0] = value;
         try ownership.append(a, .{ .package = pin.package, .namespaces = ns, .targets = meta.targets });
+        for (cfg.plugins) |dep| {
+            if (std.mem.eql(u8, dep.name, pin.package)) try providers.append(a, .{ .dep = dep, .dir = dir, .meta = meta, .verified = true });
+        }
     }
     // Include local owners before changing pins, even though they need no archive.
     for (cfg.plugins) |dep| {
         if (!dep.isLocal()) continue;
-        const path = try std.fs.path.resolve(a, &.{ root, dep.localPath(), "plugin.labelle" });
+        const dir = try std.fs.path.resolve(a, &.{ root, dep.localPath() });
+        const path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
         const bytes = read(a, path, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -467,8 +479,10 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
         const ns = try a.alloc([]const u8, if (meta.namespace != null) 1 else 0);
         if (meta.namespace) |value| ns[0] = value;
         try ownership.append(a, .{ .package = dep.name, .namespaces = ns, .targets = meta.targets });
+        try providers.append(a, .{ .dep = dep, .dir = dir, .meta = meta, .verified = true });
     }
     try contract.validateOwnership(ownership.items, reserved);
+    try hooks.validateAll(a, providers.items);
     const dest = try std.fs.path.join(a, &.{ root, lock_name });
     try writeAtomically(a, dest, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = selected.items }, .{ .whitespace = .indent_2 }));
     // The preview is consumed: a second --accept must be preceded by a new review.
