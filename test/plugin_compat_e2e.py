@@ -3,6 +3,11 @@
 
 Only install creates the remote manifest, so moving validation before install
 or removing it makes the warning/order assertions fail. No packages are fetched.
+The remote package DIRECTORY always lands at install (as the real assembler's
+does — a light pack ships no manifest but is still a directory); only the
+manifest is optional, which is what "absent manifest" means. An absent
+directory after install is a broken install and fails provider discovery
+closed (`ProviderPackageMissing`), by design.
 Requires a built CLI and a POSIX host for the executable assembler fixture.
 """
 import json
@@ -23,8 +28,8 @@ elif sys.argv[1] == "install":
     target = Path(os.environ["COMPAT_MANIFEST"])
     if os.environ["COMPAT_SOURCE"] == "remote":
         assert not target.exists(), "manifest must not exist before install"
+        target.parent.mkdir(parents=True, exist_ok=True)
         if os.environ["COMPAT_CONTENT"] != "missing":
-            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(os.environ["COMPAT_CONTENT"])
     print("FIXTURE_INSTALL_DONE", file=sys.stderr, flush=True)
 elif sys.argv[1] == "generate":

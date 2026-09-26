@@ -793,35 +793,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         return ok(serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null));
     }
 
-    // ── Provider lifecycle hooks (contract §6; docs/provider-hooks.md) ──
-    // Discovery reads every declared provider manifest and validates the
-    // whole hook graph ONCE, up front, so a malformed provider fails a plain
-    // `labelle build` closed before the assembler or a compiler runs. It is
-    // skipped for a project with no plugins; for pinned remote providers it
-    // is the same verified extraction every provider command performs (the
-    // integrity model of cli#414 — the cost is accepted). The plans are pure
-    // and computed here for all four steps; a project without hooks gets
-    // four empty plans and never resolves the host compiler.
+    // (Provider discovery and the hook plans are computed further down,
+    // right after the package cache is populated — see the `gateThenInstall`
+    // call. The resolved target string is needed earlier, for the plans and
+    // the hook site; provider-declared targets arrive with the next slice
+    // (RFC #406 phase 3b), for now it is the legacy platform name.)
     const hook_arena = arena.allocator();
-    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
-    var provider_sources: provider_github.Sources = .{ .a = hook_arena };
-    defer provider_sources.deinit();
-    const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
-        &.{}
-    else
-        provider_dispatch.discover(hook_arena, project_root, parsed, &provider_sources) catch |err| {
-            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-            return 1;
-        };
-    // The resolved target string; provider-declared targets arrive with the
-    // next slice (RFC #406 phase 3b), for now it is the legacy platform name.
     const hook_target = @tagName(parsed.platform);
-    const hook_plans = .{
-        .generate = try provider_hooks.plan(hook_arena, providers, .generate, hook_target),
-        .build = try provider_hooks.plan(hook_arena, providers, .build, hook_target),
-        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, hook_target),
-        .run = try provider_hooks.plan(hook_arena, providers, .run, hook_target),
-    };
 
     // ── Build-progress feed (cli#284) ──────────────────────────────────
     // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so
@@ -1006,6 +984,40 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         if (parsed_args.docker) material_toolchain.preflightDocker else material_toolchain.preflight,
         AssemblerInstaller{ .bin = asm_bin },
     );
+
+    // ── Provider lifecycle hooks (contract §6; docs/provider-hooks.md) ──
+    // Discovery reads every declared provider manifest and validates the
+    // whole hook graph ONCE, so a malformed provider fails a plain `labelle
+    // build` closed before generation or any compiler runs. It sits HERE,
+    // after `install` populated the package cache and not before it (Codex
+    // P1 on #420): a declared remote package that is neither pinned nor yet
+    // in the ordinary cache has no manifest to read, and discovering ahead of
+    // the installer read every such package as runtime-only — a cold cache
+    // silently built without the package's hooks while a warm one ran them
+    // (or refused as unpinned). With the cache populated, `.populated` makes
+    // an absent package an error instead. Skipped for a project with no
+    // plugins; for pinned remote providers it is the same verified extraction
+    // every provider command performs (the integrity model of cli#414 — the
+    // cost is accepted). The plans are pure and computed here for all four
+    // steps; a project without hooks gets four empty plans and never resolves
+    // the host compiler.
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
+    var provider_sources: provider_github.Sources = .{ .a = hook_arena };
+    defer provider_sources.deinit();
+    const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
+        &.{}
+    else
+        provider_dispatch.discover(hook_arena, project_root, parsed, &provider_sources, .populated) catch |err| {
+            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+            if (reporter) |r| r.finishFailed(1, "provider discovery failed");
+            return 1;
+        };
+    const hook_plans = .{
+        .generate = try provider_hooks.plan(hook_arena, providers, .generate, hook_target),
+        .build = try provider_hooks.plan(hook_arena, providers, .build, hook_target),
+        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, hook_target),
+        .run = try provider_hooks.plan(hook_arena, providers, .run, hook_target),
+    };
 
     // Plugin→core compatibility, the POST-RESOLVE half (#332).
     //
