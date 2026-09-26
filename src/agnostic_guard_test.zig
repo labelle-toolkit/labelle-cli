@@ -34,13 +34,25 @@ const std = @import("std");
 /// platform the RFC moves into the `labelle-web` provider, alongside its
 /// `wasm`/`emsdk` toolchain names. The Apple target platforms sit beside
 /// `ios`: `macos` is a host the core runs on, `tvos`, `watchos`, `visionos`
-/// and `maccatalyst` are only ever targets.
+/// and `maccatalyst` are only ever targets. The RFC's provider tools and
+/// SDKs follow: `butler` (itch), `uikit` (iOS glue), `steamworks` and
+/// `steamcmd` (Steam), `xcodebuild`, `adb`, `gradlew` and `emcc`.
 const forbidden = [_][]const u8{
-    "android",  "ios",         "web",    "wasm", "emsdk", "emscripten", "steam",
-    "itch",     "xcode",       "gradle", "apk",  "aab",   "ndk",        "raylib",
-    "sokol",    "sdl",         "sdl2",   "bgfx", "wgpu",  "tvos",       "watchos",
-    "visionos", "maccatalyst",
+    "android",  "ios",         "web",     "wasm",  "emsdk",      "emscripten", "steam",
+    "itch",     "xcode",       "gradle",  "apk",   "aab",        "ndk",        "raylib",
+    "sokol",    "sdl",         "sdl2",    "bgfx",  "wgpu",       "tvos",       "watchos",
+    "visionos", "maccatalyst", "butler",  "uikit", "steamworks", "steamcmd",   "xcodebuild",
+    "adb",      "emcc",        "gradlew",
 };
+
+/// Package and compound affixes around a forbidden root: `libsdl2`
+/// (`libsdl2-dev` tokenizes as `libsdl2`, `dev`), `Steamworks`, `steamcmd`,
+/// `xcodebuild`, `androidsdk`. Only a whole run or CamelCase piece that is
+/// exactly `[lib]<root>[suffix]` flags, so `library`, `worksheet`, `devices`,
+/// `buildkit`, `rebuild` and `frameworks` stay clean: their remainder is not
+/// a forbidden root.
+const affix_prefix = "lib";
+const affix_suffixes = [_][]const u8{ "works", "cmd", "build", "dev", "sdk" };
 
 /// Host OS names: the core legitimately branches on the OS it runs on,
 /// so these are permanently allowed and never flagged. Exact forms: `win32`
@@ -56,7 +68,9 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `web` joined, and once more after the numeric-suffix rule (`wasm32`,
 /// `sdl3`) and the Apple targets (`tvos`, `watchos`, `visionos`,
 /// `maccatalyst`, spelled in `astc/cmd.zig`) joined (still 53 entries: every
-/// file those reach was already listed). Shrink only: an entry whose file is
+/// file those reach was already listed). Recomputed on `development` for
+/// #419 (affixes, source symlinks, the RFC tool names): one entry added,
+/// `cli/provider_hooks.zig` (new since, citing `adb`), 54 entries. Shrink only: an entry whose file is
 /// clean fails the test until it is removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
 /// moved or renamed, not merely emptied of platform words.
@@ -106,6 +120,8 @@ const allowed_files = [_][]const u8{
     "cli/progress.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
+    // Added with the RFC tool names (#419): a doc comment cites `adb shell am start`.
+    "cli/provider_hooks.zig",
     "cli/python_provision.zig",
     "cli/runner.zig",
     "cli/screenshot_format.zig",
@@ -170,12 +186,35 @@ fn classifyExact(run: []const u8) ?[]const u8 {
 /// `bgfx2` flag. `win32`, `x86_64`, `utf8`, `base64` and `sha256` do not:
 /// `win32` is allowed as spelled and `win`, `x`, `utf`, `base` and `sha` are
 /// not forbidden. An all-digit run has no root and never matches.
-fn classify(run: []const u8) ?[]const u8 {
+fn classifyRoot(run: []const u8) ?[]const u8 {
     if (classifyExact(run)) |word| return word;
     var root = run.len;
     while (root > 0 and std.ascii.isDigit(run[root - 1])) root -= 1;
     if (root == 0 or root == run.len) return null;
     return classifyExact(run[0..root]);
+}
+
+/// `classifyRoot`, then the run with a `lib` prefix and/or one of
+/// `affix_suffixes` removed (`libsdl2`, `itchworks`, `libwasmdev`). The
+/// remainder must itself classify, so ordinary words that merely share an
+/// affix (`library`, `rebuild`, `frameworks`) stay clean.
+fn classify(run: []const u8) ?[]const u8 {
+    if (classifyRoot(run)) |word| return word;
+    const bodies = [_][]const u8{ run, stripPrefix(run) orelse "" };
+    for (bodies, 0..) |body, i| {
+        if (body.len == 0) continue;
+        if (i > 0) if (classifyRoot(body)) |word| return word;
+        for (affix_suffixes) |suf| {
+            if (body.len <= suf.len or !std.ascii.endsWithIgnoreCase(body, suf)) continue;
+            if (classifyRoot(body[0 .. body.len - suf.len])) |word| return word;
+        }
+    }
+    return null;
+}
+
+fn stripPrefix(run: []const u8) ?[]const u8 {
+    if (run.len <= affix_prefix.len or !std.ascii.startsWithIgnoreCase(run, affix_prefix)) return null;
+    return run[affix_prefix.len..];
 }
 
 /// True when a CamelCase boundary falls between `text[i - 1]` and
@@ -290,6 +329,14 @@ const Scan = struct {
         }
     }
 
+    /// A symlink the guard cannot scan: always a finding, allowlist or not.
+    fn linkFinding(self: *Scan, path: []const u8, comptime fmt: []const u8, args: anytype) !void {
+        const what = try std.fmt.allocPrint(self.gpa, fmt, args);
+        defer self.gpa.free(what);
+        const msg = try std.fmt.allocPrint(self.gpa, "src/{s}: {s} {s}", .{ path, what, finding_note });
+        try self.offenders.append(self.gpa, msg);
+    }
+
     /// Allowlist entries no scanned file needed: they must be removed.
     fn stale(self: *const Scan, out: *std.ArrayList([]const u8)) !void {
         for (allowed_files, 0..) |a, i| if (!self.dirty[i]) try out.append(self.gpa, a);
@@ -305,7 +352,7 @@ fn expectWords(text: []const u8, expected: []const []const u8) !void {
 test "the tokenizer flags whole alphanumeric runs, case-insensitively" {
     try expectWords("std.Io ios_cmd biosphere Android cli/android/run.zig SDL2_image", &.{ "ios", "android", "android", "sdl2" });
     // Substrings inside a longer lowercase run never match: `wasm` is not a word here.
-    try expectWords("wasmtime bgfxdebug libsdl", &.{});
+    try expectWords("wasmtime bgfxdebug", &.{});
 }
 
 test "the tokenizer splits CamelCase at case transitions and acronym boundaries" {
@@ -507,27 +554,144 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     try std.testing.expect(containsString(stale.items, "cli/pack.zig"));
 }
 
+test "package and compound affixes do not hide a forbidden root" {
+    // The explicit RFC forms resolve to their own table entry.
+    try expectWords("Steamworks steamcmd xcodebuild", &.{ "steamworks", "steamcmd", "xcodebuild" });
+    // `libsdl2-dev` tokenizes as `libsdl2` and `dev`; the `lib` prefix is stripped.
+    try expectWords("apt install libsdl2-dev", &.{"sdl2"});
+    try expectWords("libsdl LibSDL3 libwasm", &.{ "sdl", "sdl", "wasm" });
+    try expectWords("itchworks androidsdk ioscmd webbuild wasmdev libwebdev", &.{ "itch", "android", "ios", "web", "wasm", "web" });
+    // The mechanism: none of these is a table entry, nor a numeric-suffix
+    // root, so only the affix rule can reach them.
+    for ([_][]const u8{ "libsdl2", "itchworks", "androidsdk", "ioscmd", "libwasmdev" }) |w| {
+        try std.testing.expectEqual(@as(?[]const u8, null), classifyRoot(w));
+        try std.testing.expect(classify(w) != null);
+    }
+    // Ordinary words that share an affix stay clean in both directions.
+    try expectWords("library worksheet devices buildkit rebuild prebuild frameworks subcmd libc libwebp", &.{});
+    try expectWords("Library Worksheet Devices BuildKit LibraryPath", &.{});
+    // The affix and host OS rules compose: an allowed root stays allowed.
+    try expectWords("libwin32 linuxdev macossdk", &.{});
+}
+
+test "the RFC's provider tools and SDKs are forbidden" {
+    try expectWords("butler push uikit adb shell emcc gradlew", &.{ "butler", "uikit", "adb", "emcc", "gradlew" });
+    try expectWords("UIKit uikit_view ButlerPush AdbDevice", &.{ "uikit", "uikit", "butler", "adb" });
+    // Longer runs around the names do not match.
+    try expectWords("butlers uikitten adbc emccx gradlewrapper", &.{});
+}
+
+test "source symlinks are path-checked and followed inside the repository" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // symlinks need privileges there
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/src/cli");
+    try tmp.dir.createDirPath(io, "repo/shared/dir");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/cli.zig", .data = "const x = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/shared/dirty.zig", .data = "const x = 1;\nconst y = sokol;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/shared/clean.zig", .data = "const x = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.zig", .data = "const x = 1;\n" });
+    // Contents behind a clean link name are scanned under the link's path.
+    try tmp.dir.symLink(io, "../shared/dirty.zig", "repo/src/linked.zig", .{});
+    // A forbidden link name is a path finding even when the target is clean.
+    try tmp.dir.symLink(io, "../../shared/clean.zig", "repo/src/cli/steam.zig", .{});
+    // Escaping the repository, dangling, or linking a directory: findings.
+    try tmp.dir.symLink(io, "../../outside.zig", "repo/src/escape.zig", .{});
+    try tmp.dir.symLink(io, "missing.zig", "repo/src/dangling.zig", .{});
+    try tmp.dir.symLink(io, "../shared/dir", "repo/src/linked_dir", .{ .is_directory = true });
+    // A link that is not source-shaped is ignored, like a plain `.md` file.
+    try tmp.dir.symLink(io, "../../outside.zig", "repo/src/notes.md", .{});
+
+    var repo = try tmp.dir.openDir(io, "repo", .{});
+    defer repo.close(io);
+    var scan: Scan = .{ .gpa = gpa };
+    defer scan.deinit();
+    try scanTree(io, gpa, repo, &scan);
+    try std.testing.expect(scan.saw_cli_root);
+
+    const expected = [_][]const u8{
+        "src/linked.zig:2: 'sokol' ",
+        "src/cli/steam.zig: 'steam' in path ",
+        "src/escape.zig: is a symlink to ",
+        "src/dangling.zig: is a symlink that does not resolve",
+        "src/linked_dir: is a symlink to a directory",
+    };
+    try std.testing.expectEqual(expected.len, scan.offenders.items.len);
+    for (expected) |e| {
+        const hit = for (scan.offenders.items) |o| {
+            if (std.mem.startsWith(u8, o, e)) break true;
+        } else false;
+        if (!hit) {
+            for (scan.offenders.items) |o| std.debug.print("got: {s}\n", .{o});
+            std.debug.print("missing: {s}\n", .{e});
+            return error.TestExpectedFinding;
+        }
+    }
+}
+
 fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |h| if (std.mem.eql(u8, h, needle)) return true;
     return false;
 }
 
+/// Walks `repo/src` into `scan`. Regular source files are scanned as they
+/// are. A symlink is never skipped silently: a source-shaped link
+/// (`src/cli/steam.zig -> ../shared/upload.zig`) is path-checked under its
+/// own name and its target's contents are scanned, provided the target
+/// resolves to a file inside `repo`; a link that dangles, leaves the
+/// repository or points at something other than a file is a finding. A
+/// link to a directory is a finding whatever its name, since the walk does
+/// not descend into it and the files behind it would go unscanned. Other
+/// links (a `notes.md` link) are ignored like the files they stand for.
+fn scanTree(io: std.Io, gpa: std.mem.Allocator, repo: std.Io.Dir, scan: *Scan) !void {
+    var src = try repo.openDir(io, "src", .{ .iterate = true });
+    defer src.close(io);
+    var repo_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo_real = repo_buf[0..try repo.realPathFile(io, ".", &repo_buf)];
+    var walker = try src.walk(gpa);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => if (isSource(entry.path)) {
+                const bytes = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(4 << 20));
+                defer gpa.free(bytes);
+                try scan.file(entry.path, bytes);
+            },
+            .sym_link => try scanLink(io, gpa, repo_real, entry.dir, entry.basename, entry.path, scan),
+            else => {},
+        }
+    }
+}
+
+fn scanLink(io: std.Io, gpa: std.mem.Allocator, repo_real: []const u8, dir: std.Io.Dir, basename: []const u8, path: []const u8, scan: *Scan) !void {
+    const st = dir.statFile(io, basename, .{}) catch |err| {
+        if (!isSource(path)) return;
+        return scan.linkFinding(path, "is a symlink that does not resolve ({t})", .{err});
+    };
+    if (st.kind == .directory)
+        return scan.linkFinding(path, "is a symlink to a directory the guard does not walk; commit the files instead", .{});
+    if (!isSource(path)) return;
+    if (st.kind != .file)
+        return scan.linkFinding(path, "is a symlink to something other than a regular file", .{});
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = target_buf[0..try dir.realPathFile(io, basename, &target_buf)];
+    const inside = target.len > repo_real.len and std.mem.startsWith(u8, target, repo_real) and
+        std.fs.path.isSep(target[repo_real.len]);
+    if (!inside)
+        return scan.linkFinding(path, "is a symlink to {s}, outside the repository; the guard cannot scan it", .{target});
+    const bytes = try dir.readFileAlloc(io, basename, gpa, .limited(4 << 20));
+    defer gpa.free(bytes);
+    try scan.file(path, bytes);
+}
+
 test "no core file names a platform, store, package or backend" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var src = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
-    defer src.close(io);
-    var walker = try src.walk(gpa);
-    defer walker.deinit();
-
     var scan: Scan = .{ .gpa = gpa };
     defer scan.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !isSource(entry.path)) continue;
-        const bytes = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(4 << 20));
-        defer gpa.free(bytes);
-        try scan.file(entry.path, bytes);
-    }
+    try scanTree(io, gpa, std.Io.Dir.cwd(), &scan);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);

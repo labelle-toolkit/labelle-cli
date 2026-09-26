@@ -34,7 +34,10 @@ package and changed field(s), writes nothing, and asks for a new preview.
 Only then does it download source archives, verify SHA-256 against the
 previewed hash, validate manifests and namespace/target ownership, and
 atomically replace `labelle.providers.lock`. A successful accept removes the
-preview file, so each accept is preceded by its own review. It does not run
+preview file, so each accept is preceded by its own review. The lock rename is
+the commit point: if the preview cannot be removed afterwards (for example a
+read-only `.labelle`), the accept still exits 0 with the new lock in place and
+warns that the preview must be deleted by hand. It does not run
 any provider build code.
 
 Commit both locks. The companion JSON lock avoids having ordinary game
@@ -71,7 +74,11 @@ review the new entries before accepting them. Editing the preview file by
 hand invalidates its digest and is treated like a missing preview.
 
 Archives must be self-contained: one directory root, regular files/directories,
-no symlinks, hardlinks, path traversal or conflicting portable filenames. Entry
+no symlinks, hardlinks, path traversal or conflicting portable filenames.
+Two paths that differ only in ASCII case are a duplicate
+(`DuplicateProviderArchivePath`), and a regular file whose case-folded path is
+an ancestor of another entry (`root/Foo` beside `root/foo/bar.zig`, in either
+order) is rejected as `CaseFoldedProviderArchiveFileDirConflict`. Entry
 paths must be plain ASCII: case-insensitive filesystems also fold non-ASCII
 letters (`Ä.zig` and `ä.zig` collide), the CLI only compares ASCII case, and
 provider archives are source trees, so any non-ASCII byte in a path is
