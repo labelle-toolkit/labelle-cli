@@ -83,7 +83,8 @@ pub const Tool = struct {
                 return error.InvalidExecutable;
         }
         // Native extension is selected by the host, not authored in the manifest.
-        if (std.mem.endsWith(u8, path, ".exe")) return error.InvalidExecutable;
+        // Windows ignores suffix case, so `.EXE` is the same authored extension.
+        if (std.ascii.endsWithIgnoreCase(path, ".exe")) return error.InvalidExecutable;
     }
 };
 
@@ -152,13 +153,25 @@ fn identifier(value: []const u8) bool {
 fn absolute(path: []const u8) !void {
     if (std.mem.indexOfScalar(u8, path, 0) != null or !std.fs.path.isAbsolute(path))
         return error.InvalidPath;
-    if (@import("builtin").os.tag == .windows) {
-        // A rooted /path still depends on the current drive on Windows.
-        const drive = path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and
-            (path[2] == '/' or path[2] == '\\');
-        const unc = std.mem.startsWith(u8, path, "\\\\") or std.mem.startsWith(u8, path, "//");
-        if (!drive and !unc) return error.InvalidPath;
-    }
+    // A rooted /path still depends on the current drive on Windows.
+    if (@import("builtin").os.tag == .windows and !windowsVolumeQualified(path)) return error.InvalidPath;
+}
+
+/// Windows paths must name their volume: `X:\...` or a UNC `\\server\share...`.
+/// Host-independent so the rule is exercised by the tests on every platform.
+fn windowsVolumeQualified(path: []const u8) bool {
+    const seps = "/\\";
+    const drive = path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and
+        std.mem.indexOfScalar(u8, seps, path[2]) != null;
+    if (drive) return true;
+    if (path.len < 2 or std.mem.indexOfScalar(u8, seps, path[0]) == null or std.mem.indexOfScalar(u8, seps, path[1]) == null)
+        return false;
+    // std classifies bare `//` and `//server` as absolute; a share needs both a
+    // non-empty server and a non-empty share name to address anything.
+    const server_end = std.mem.indexOfAnyPos(u8, path, 2, seps) orelse return false;
+    if (server_end == 2) return false;
+    var rest = std.mem.tokenizeAny(u8, path[server_end + 1 ..], seps);
+    return rest.next() != null;
 }
 
 const fixture = if (@import("builtin").os.tag == .windows)
@@ -228,9 +241,27 @@ test "context rejects relative paths and command hook metadata" {
     value.optimize = .ReleaseFast;
     try std.testing.expectError(error.InvalidProjectlessContext, value.validate(false));
     if (@import("builtin").os.tag == .windows) {
+        for ([_][]const u8{ "/current-drive-relative", "//", "//server", "//server/" }) |path| {
+            value = parsed.value;
+            value.output_dir = path;
+            try std.testing.expectError(error.InvalidPath, value.validate(false));
+        }
         value = parsed.value;
-        value.output_dir = "/current-drive-relative";
-        try std.testing.expectError(error.InvalidPath, value.validate(false));
+        value.output_dir = "//server/share";
+        try value.validate(false);
+    }
+}
+
+test "windows volume qualification requires a drive or a complete UNC share" {
+    for ([_][]const u8{ "C:/provider", "c:\\provider", "//server/share", "\\\\server\\share\\dir", "//server//share" }) |path| {
+        try std.testing.expect(windowsVolumeQualified(path));
+    }
+    for ([_][]const u8{ "", "/rooted", "C:relative", "//", "//server", "//server/", "///share", "\\\\.", "\\\\?\\" }) |path| {
+        try std.testing.expect(!windowsVolumeQualified(path));
+    }
+    // The qualification check is what rejects incomplete UNC prefixes; std alone accepts them.
+    for ([_][]const u8{ "//", "//server", "//server/" }) |path| {
+        try std.testing.expect(std.fs.path.isAbsoluteWindows(path));
     }
 }
 
@@ -239,6 +270,13 @@ test "tool must declare a contained deterministic installed executable" {
     for ([_][]const u8{ "", "/bin/tool", "bin/../escape", "bin//tool", "bin/./tool", "bin/tool.exe", "bin/C:tool", "bin/tool\\other", "bin/tool\x00" }) |path| {
         try std.testing.expectError(error.InvalidExecutable, (Tool{ .build_step = "cmd-test", .executable = path }).validate());
     }
+    // Case variants of the native suffix would make the runner look for `tool.EXE.exe`.
+    for ([_][]const u8{ "bin/tool.EXE", "bin/tool.Exe", "bin/nested/tool.eXe" }) |path| {
+        try std.testing.expect(!std.mem.endsWith(u8, path, ".exe"));
+        try std.testing.expectError(error.InvalidExecutable, (Tool{ .build_step = "cmd-test", .executable = path }).validate());
+    }
+    // An extension that merely contains the suffix letters is still a plain tool name.
+    try (Tool{ .build_step = "cmd-test", .executable = "bin/tool.exec" }).validate();
     try std.testing.expectError(error.InvalidBuildStep, (Tool{ .build_step = "--help", .executable = "bin/tool" }).validate());
 }
 
