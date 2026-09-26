@@ -11,6 +11,7 @@ const toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
 const github = @import("provider_github.zig");
 const hooks = @import("provider_hooks.zig");
+const asm_cache = @import("asm_cache.zig");
 
 // Existing platform commands remain reserved until their extraction lands.
 pub const reserved = [_][]const u8{
@@ -49,7 +50,9 @@ pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
 /// there is nothing to read.
 pub const CacheState = enum {
     /// Metadata-only callers (`labelle help`, command dispatch) run before
-    /// any installer: an absent package is simply not listed.
+    /// any installer: an absent package is simply not listed, and a hook
+    /// reference into it is deferred rather than reported missing, so the
+    /// providers that ARE present keep their commands (Codex P2 on #420).
     unknown,
     /// The pipeline discovers AFTER the assembler populated the cache, so an
     /// absent package is a broken install and fails closed — otherwise a cold
@@ -67,14 +70,25 @@ pub const CacheState = enum {
 pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) ![]Provider {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
+    // Declared remote packages with no directory to read while the cache
+    // state is `unknown`. They are neither providers nor runtime-only
+    // packages yet, so a hook reference into one is deferred rather than
+    // reported missing (`hooks.validateAll`).
+    var unresolved: std.ArrayList([]const u8) = .empty;
     for (cfg.plugins) |dep| {
         const pinned = if (dep.isLocal()) null else try sources.projectDir(root, dep);
         const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
-        if (pinned == null and !dep.isLocal() and cache_state == .populated) {
+        if (pinned == null and !dep.isLocal()) {
             std.Io.Dir.cwd().access(config.globalIo(), dir, .{}) catch |err| switch (err) {
-                error.FileNotFound => {
-                    std.debug.print("labelle: package '{s}' ({s}@{s}) is not in the package cache after install: {s}\n", .{ dep.name, dep.repo, dep.version, dir });
-                    return error.ProviderPackageMissing;
+                error.FileNotFound => switch (cache_state) {
+                    .populated => {
+                        std.debug.print("labelle: package '{s}' ({s}@{s}) is not in the package cache after install: {s}\n", .{ dep.name, dep.repo, dep.version, dir });
+                        return error.ProviderPackageMissing;
+                    },
+                    .unknown => {
+                        try unresolved.append(a, dep.name);
+                        continue;
+                    },
                 },
                 else => return err,
             };
@@ -96,7 +110,7 @@ pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConf
         try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta, .verified = dep.isLocal() or pinned != null });
     }
     try contract.validateOwnership(owners.items, &reserved);
-    try hooks.validateAll(a, providers.items);
+    try hooks.validateAll(a, providers.items, unresolved.items);
     return providers.items;
 }
 
@@ -464,4 +478,68 @@ test "provider dispatch: canonical containment respects component boundaries" {
     try std.testing.expect(contained("/tmp/install", "/tmp/install/bin/tool"));
     try std.testing.expect(!contained("/tmp/install", "/tmp/install-evil/bin/tool"));
     try std.testing.expect(!contained("/tmp/install", "/tmp/install"));
+}
+
+test "provider dispatch: an unread remote package defers its references under .unknown and fails .populated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg-a");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // The ordinary package cache lives under this tmp dir, so the remote
+    // package is absent until the test writes it there.
+    const home = try tmp.dir.realPathFileAlloc(io, ".", a);
+    asm_cache.setCacheRootOverride(home);
+    defer asm_cache.clearCacheRootOverride();
+    const Manifests = struct {
+        fn write(dir: std.Io.Dir, sub_path: []const u8, name: []const u8, hook: []const u8) !void {
+            var buf: [512]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"{s}\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{{ {s} }} }}", .{ name, hook });
+            try dir.writeFile(config.globalIo(), .{ .sub_path = sub_path, .data = text });
+        }
+    };
+    const a_hook = ".{ .id = \"a\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\", .after_hooks = .{ \"pkg-b/b\" } }";
+    try Manifests.write(tmp.dir, "pkg-a/plugin.labelle", "pkg-a", a_hook);
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg-a", .repo = "local:../pkg-a", .version = "1.0.0" },
+        .{ .name = "pkg-b", .repo = "example/pkg-b", .version = "1.0.0" },
+    } };
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+
+    // Cold: metadata-only discovery lists the provider it can read and
+    // defers the reference into the one it cannot; the pipeline's
+    // populated discovery fails closed on the same absence.
+    const partial = try discover(a, root, cfg, &sources, .unknown);
+    try std.testing.expectEqual(@as(usize, 1), partial.len);
+    try std.testing.expectEqualStrings("pkg-a", partial[0].meta.name);
+    try std.testing.expectError(error.ProviderPackageMissing, discover(a, root, cfg, &sources, .populated));
+    // A reference into a package the project never declared is a typo
+    // even while pkg-b is unread.
+    const typo = ".{ .id = \"a\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\", .after_hooks = .{ \"pkg-c/b\" } }";
+    try Manifests.write(tmp.dir, "pkg-a/plugin.labelle", "pkg-a", typo);
+    try std.testing.expectError(error.MissingHookReference, discover(a, root, cfg, &sources, .unknown));
+    try Manifests.write(tmp.dir, "pkg-a/plugin.labelle", "pkg-a", a_hook);
+
+    // Warm: the package is in the ordinary cache. Both states read it, and
+    // a reference it does not satisfy is missing in both.
+    const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "pkg-b", "1.0.0" });
+    try tmp.dir.createDirPath(io, cached);
+    const manifest_path = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
+    const b_hook = ".{ .id = \"b\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    try Manifests.write(tmp.dir, manifest_path, "pkg-b", b_hook);
+    for ([_]CacheState{ .unknown, .populated }) |state| {
+        const both = try discover(a, root, cfg, &sources, state);
+        try std.testing.expectEqual(@as(usize, 2), both.len);
+        try std.testing.expectEqualStrings("pkg-b", both[1].meta.name);
+    }
+    const other = ".{ .id = \"other\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    try Manifests.write(tmp.dir, manifest_path, "pkg-b", other);
+    for ([_]CacheState{ .unknown, .populated }) |state| {
+        try std.testing.expectError(error.MissingHookReference, discover(a, root, cfg, &sources, state));
+    }
 }

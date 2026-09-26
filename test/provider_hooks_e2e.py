@@ -368,6 +368,38 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert exe.exists() and not remote_cache.exists(), "the pinned provider needed the ordinary cache"
     assert "hook 'fixture-c/c-pre'" in pinned.stderr, pinned.stderr
     (project / "labelle.providers.lock").unlink()
+
+    # ── Cold cache: a reference into the unread package is unresolved ─────
+    # `labelle help` and command dispatch discover before any installer, so
+    # fixture-c has nothing to read here. fixture-a's edge into it used to
+    # fail the whole graph with MissingHookReference — hiding every
+    # provider's commands from `help` and refusing dispatch until the
+    # package happened to enter the cache (Codex P2 on #420). Now `help` is
+    # intact, the pipeline still fails closed on the ABSENT package (not on
+    # the reference), and once the package is readable the reference is
+    # checked for real.
+    a_manifest.write_text(manifest("fixture-a", [hook("a-pre", "build", "before", after=["fixture-c/c-pre"])]))
+    declare(dep_a, dep_c)
+    cold()
+    intact = run("help", extra_env=dead)
+    assert "Usage: labelle" in intact.stderr and "discovery failed" not in intact.stderr, intact.stderr
+    assert "MissingHookReference" not in intact.stderr, intact.stderr
+    absent_ref = run("build", code=1)
+    assert "ProviderPackageMissing" in absent_ref.stderr and "MissingHookReference" not in absent_ref.stderr, absent_ref.stderr
+    # A typo into a package that is not declared at all is still reported
+    # while fixture-c is unread.
+    a_manifest.write_text(manifest("fixture-a", [hook("a-pre", "build", "before", after=["fixture-d/c-pre"])]))
+    typo = run("help", extra_env=dead)
+    assert "MissingHookReference" in typo.stderr and "fixture-d/c-pre" in typo.stderr, typo.stderr
+    # Once the installer delivers fixture-c, a reference it does not satisfy
+    # is missing at `help` too — the deferral was about the unread package,
+    # not about remote packages in general.
+    a_manifest.write_text(manifest("fixture-a", [hook("a-pre", "build", "before", after=["fixture-c/nope"])]))
+    run("build", code=1, extra_env=populate)
+    assert remote_cache.exists()
+    present = run("help", extra_env=dead)
+    assert "MissingHookReference" in present.stderr and "fixture-c/nope" in present.stderr, present.stderr
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     declare(dep_b, dep_a)
 
     # ── bundle ────────────────────────────────────────────────────────────

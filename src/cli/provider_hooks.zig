@@ -65,10 +65,26 @@ fn find(entries: []const Planned, qualified: []const u8) ?Planned {
     return null;
 }
 
+/// The `<package>` half of a qualified `<package>/<id>` reference.
+fn packageOf(qualified: []const u8) []const u8 {
+    const slash = std.mem.indexOfScalar(u8, qualified, '/') orelse return qualified;
+    return qualified[0..slash];
+}
+
 /// Cross-provider rules of contract §6, checked once at discovery so that
 /// `labelle help` and `providers resolve --accept` fail on a broken graph
 /// too. Prints one diagnostic line per failure, then returns the error.
-pub fn validateAll(a: std.mem.Allocator, providers: []const dispatch.Provider) !void {
+///
+/// `unresolved` names packages the project declares that discovery could
+/// not read this time — a remote package absent from every cache while the
+/// cache state is `unknown` (metadata-only `help` and command dispatch run
+/// before any installer). A reference into one of them is *unresolved*, not
+/// missing: nothing can be said about it until the package is present, and
+/// failing would hide every provider's commands from `help` and refuse
+/// dispatch for a graph that is valid once the cache is warm (Codex P2 on
+/// #420). A reference into a package that IS present, or into one the
+/// project never declared, is still a genuine `MissingHookReference`.
+pub fn validateAll(a: std.mem.Allocator, providers: []const dispatch.Provider, unresolved: []const []const u8) !void {
     const entries = try collect(a, providers);
     for (entries, 0..) |entry, i| {
         if (entry.hook.when != .replace) continue;
@@ -84,6 +100,11 @@ pub fn validateAll(a: std.mem.Allocator, providers: []const dispatch.Provider) !
     for (entries) |entry| {
         for (entry.hook.after_hooks) |ref| {
             const referenced = find(entries, ref) orelse {
+                var deferred = false;
+                for (unresolved) |package| {
+                    if (std.mem.eql(u8, package, packageOf(ref))) deferred = true;
+                }
+                if (deferred) continue; // Checked once the package can be read.
                 std.debug.print("labelle: hooks: '{s}' references unknown hook '{s}'\n", .{ entry.qualified, ref });
                 return error.MissingHookReference;
             };
@@ -299,7 +320,7 @@ test "provider hooks: before, replace, after; ties by qualified id; independent 
     const mid = Fixture.provider("mid", &.{}, &.{Fixture.hook("audit", .bundle, "probe-target", .after, &.{})});
     const orders = [_][3]dispatch.Provider{ .{ zeta, alpha, mid }, .{ mid, zeta, alpha }, .{ alpha, mid, zeta } };
     for (orders) |providers| {
-        try validateAll(a, &providers);
+        try validateAll(a, &providers, &.{});
         const p = try plan(a, &providers, .bundle, "probe-target");
         try std.testing.expectEqualStrings("alpha/check zeta/prep", try Fixture.ids(a, p.before));
         try std.testing.expectEqualStrings("zeta/pack", p.replace.?.qualified);
@@ -323,7 +344,7 @@ test "provider hooks: after_hooks edges override the qualified-id tie" {
     const zeta = Fixture.provider("zeta", &.{}, &.{Fixture.hook("x", .build, "desktop", .after, &.{})});
     const alpha = Fixture.provider("alpha", &.{}, &.{Fixture.hook("y", .build, "desktop", .after, &.{"zeta/x"})});
     for ([_][2]dispatch.Provider{ .{ zeta, alpha }, .{ alpha, zeta } }) |providers| {
-        try validateAll(a, &providers);
+        try validateAll(a, &providers, &.{});
         const p = try plan(a, &providers, .build, "desktop");
         try std.testing.expectEqualStrings("zeta/x alpha/y", try Fixture.ids(a, p.after));
     }
@@ -337,7 +358,7 @@ test "provider hooks: after_hooks edges override the qualified-id tie" {
         Fixture.hook("first", .build, "desktop", .before, &.{}),
     });
     const across = [_]dispatch.Provider{ zeta, early };
-    try validateAll(a, &across);
+    try validateAll(a, &across, &.{});
     try std.testing.expectEqualStrings("alpha/y zeta/x", try Fixture.ids(a, (try plan(a, &across, .build, "desktop")).after));
 }
 
@@ -349,23 +370,23 @@ test "provider hooks: cross-provider graph errors" {
         Fixture.hook("one", .bundle, "probe-target", .replace, &.{}),
         Fixture.hook("two", .bundle, "probe-target", .replace, &.{}),
     });
-    try std.testing.expectError(error.DuplicateReplaceHook, validateAll(a, &.{owner}));
+    try std.testing.expectError(error.DuplicateReplaceHook, validateAll(a, &.{owner}, &.{}));
     const other = Fixture.provider("other", &.{}, &.{Fixture.hook("late", .bundle, "probe-target", .after, &.{})});
     const missing = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .bundle, "probe-target", .after, &.{"other/absent"})});
-    try std.testing.expectError(error.MissingHookReference, validateAll(a, &.{ other, missing }));
+    try std.testing.expectError(error.MissingHookReference, validateAll(a, &.{ other, missing }, &.{}));
     const mismatch = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .build, "probe-target", .after, &.{"other/late"})});
-    try std.testing.expectError(error.HookReferenceMismatch, validateAll(a, &.{ other, mismatch }));
+    try std.testing.expectError(error.HookReferenceMismatch, validateAll(a, &.{ other, mismatch }, &.{}));
     const early = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .bundle, "probe-target", .before, &.{"other/late"})});
-    try std.testing.expectError(error.HookPhaseOrder, validateAll(a, &.{ other, early }));
+    try std.testing.expectError(error.HookPhaseOrder, validateAll(a, &.{ other, early }, &.{}));
     const replace_to_after = Fixture.provider("pkg", &.{"probe-target"}, &.{Fixture.hook("h", .bundle, "probe-target", .replace, &.{"other/late"})});
-    try std.testing.expectError(error.HookPhaseOrder, validateAll(a, &.{ other, replace_to_after }));
+    try std.testing.expectError(error.HookPhaseOrder, validateAll(a, &.{ other, replace_to_after }, &.{}));
     const loop_a = Fixture.provider("pkg-a", &.{}, &.{Fixture.hook("h", .bundle, "probe-target", .after, &.{"pkg-b/h"})});
     const loop_b = Fixture.provider("pkg-b", &.{}, &.{Fixture.hook("h", .bundle, "probe-target", .after, &.{"pkg-a/h"})});
-    try std.testing.expectError(error.HookCycle, validateAll(a, &.{ loop_a, loop_b }));
-    try std.testing.expectError(error.HookCycle, validateAll(a, &.{ loop_b, loop_a }));
+    try std.testing.expectError(error.HookCycle, validateAll(a, &.{ loop_a, loop_b }, &.{}));
+    try std.testing.expectError(error.HookCycle, validateAll(a, &.{ loop_b, loop_a }, &.{}));
     // A well-formed pair passes, so the errors above are the rules firing.
     const good = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .bundle, "probe-target", .after, &.{"other/late"})});
-    try validateAll(a, &.{ other, good });
+    try validateAll(a, &.{ other, good }, &.{});
 }
 
 test "provider hooks: step output directories follow the layout contract" {
@@ -387,3 +408,34 @@ test "provider hooks: step output directories follow the layout contract" {
     const core = try bundle.resolveOutputDir(a, "proj", target_dir, null);
     try std.testing.expectEqualStrings(core, try stepOutputDir(a, target_dir, .bundle, "desktop", null));
 }
+
+test "provider hooks: a reference into a declared-but-unread package is unresolved, not missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const local = Fixture.provider("local", &.{}, &.{Fixture.hook("h", .build, "desktop", .after, &.{"remote/late"})});
+    // `remote` is declared but could not be read (cold cache, `.unknown`):
+    // the reference is deferred and the graph passes with the one provider.
+    try validateAll(a, &.{local}, &.{"remote"});
+    // The same graph with nothing unresolved is the genuine error, so the
+    // pass above is the deferral firing rather than the check being absent.
+    try std.testing.expectError(error.MissingHookReference, validateAll(a, &.{local}, &.{}));
+    // A typo into a package the project never declared is still caught,
+    // even while some other package is unresolved.
+    const typo = Fixture.provider("local", &.{}, &.{Fixture.hook("h", .build, "desktop", .after, &.{"remot/late"})});
+    try std.testing.expectError(error.MissingHookReference, validateAll(a, &.{typo}, &.{"remote"}));
+    // Once `remote` is read, its hooks are checked for real: a present
+    // package without the named hook is missing, and with it every rule
+    // applies (here the slot mismatch).
+    const remote_without = Fixture.provider("remote", &.{}, &.{Fixture.hook("other", .build, "desktop", .after, &.{})});
+    try std.testing.expectError(error.MissingHookReference, validateAll(a, &.{ local, remote_without }, &.{}));
+    const remote_elsewhere = Fixture.provider("remote", &.{}, &.{Fixture.hook("late", .bundle, "desktop", .after, &.{})});
+    try std.testing.expectError(error.HookReferenceMismatch, validateAll(a, &.{ local, remote_elsewhere }, &.{}));
+    const remote_ok = Fixture.provider("remote", &.{}, &.{Fixture.hook("late", .build, "desktop", .after, &.{})});
+    try validateAll(a, &.{ local, remote_ok }, &.{});
+    // The deferred reference creates no edge, so the plan still orders the
+    // hooks that are present.
+    const p = try plan(a, &.{local}, .build, "desktop");
+    try std.testing.expectEqualStrings("local/h", try Fixture.ids(a, p.after));
+}
+
