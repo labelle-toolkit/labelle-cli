@@ -1,5 +1,6 @@
 //! GitHub metadata + a project pin file. No registry service or implicit updates.
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config.zig");
 const project = @import("project_config.zig");
 const cache = @import("asm_cache.zig");
@@ -308,6 +309,12 @@ fn validateTar(a: std.mem.Allocator, bytes: []const u8) !void {
     var root: ?[]const u8 = null;
     var names: std.StringHashMap(void) = .init(a);
     defer names.deinit();
+    // Case-folded regular-file paths, and every case-folded path that some
+    // entry needs to be a directory (each proper ancestor of an entry).
+    var files: std.StringHashMap(void) = .init(a);
+    defer files.deinit();
+    var parents: std.StringHashMap(void) = .init(a);
+    defer parents.deinit();
     while (try it.next()) |entry| {
         if (entry.kind == .sym_link) return error.ProviderArchiveLinkNotSupported;
         if (!safeArchivePath(entry.name)) return error.UnsafeProviderArchivePath;
@@ -336,8 +343,26 @@ fn validateTar(a: std.mem.Allocator, bytes: []const u8) !void {
         // Case-fold on every host so archives are portable to Windows.
         const key = try std.ascii.allocLowerString(a, trimmed);
         if ((try names.getOrPut(key)).found_existing) return error.DuplicateProviderArchivePath;
+        // A regular file `root/Foo` and an entry below `root/foo/` extract on
+        // a case-sensitive host but collide on a case-insensitive one, in
+        // either archive order.
+        var end = key.len;
+        while (std.mem.lastIndexOfScalar(u8, key[0..end], '/')) |cut| : (end = cut) {
+            const parent = key[0..cut];
+            if (files.contains(parent)) return fileDirConflict(entry.name, parent);
+            if ((try parents.getOrPut(parent)).found_existing) break; // Its ancestors were checked already.
+        }
+        if (entry.kind != .directory) {
+            if (parents.contains(key)) return fileDirConflict(entry.name, key);
+            try files.put(key, {});
+        }
     }
     if (root == null) return error.EmptyProviderArchive;
+}
+
+fn fileDirConflict(name: []const u8, folded: []const u8) error{CaseFoldedProviderArchiveFileDirConflict} {
+    std.debug.print("provider archive entry '{s}' conflicts with another entry: '{s}' is both a regular file and a directory once ASCII case is folded\n", .{ name, folded });
+    return error.CaseFoldedProviderArchiveFileDirConflict;
 }
 
 /// One previewed pin: every field the user was shown, including the derived
@@ -477,7 +502,12 @@ pub fn checkPreview(a: std.mem.Allocator, preview: Preview, source: []const u8, 
     }
 }
 
+/// Test-only fault: makes `removePreview` fail as an unwritable `.labelle`
+/// would, so the post-commit path can be exercised on every host.
+var fail_preview_removal_for_test = false;
+
 fn removePreview(a: std.mem.Allocator, root: []const u8) !void {
+    if (builtin.is_test and fail_preview_removal_for_test) return error.AccessDenied;
     std.Io.Dir.cwd().deleteFile(config.globalIo(), try std.fs.path.join(a, &.{ root, preview_name })) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -571,9 +601,15 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     try hooks.validateAll(a, providers.items, &.{});
     const dest = try std.fs.path.join(a, &.{ root, lock_name });
     try writeAtomically(a, dest, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = selected.items }, .{ .whitespace = .indent_2 }));
-    // The preview is consumed: a second --accept must be preceded by a new review.
-    try removePreview(a, root);
+    // The lock rename above is the commit point: from here on the accept has
+    // succeeded, so nothing below may turn it into a failed exit (a failed
+    // accept promises the old lock). The preview is consumed so a second
+    // --accept needs a new review; if it cannot be removed, say so and keep
+    // the exit status in agreement with the lock on disk (#418).
     std.debug.print("Pinned {d} provider(s) in {s}. Commit this file with labelle.lock.\n", .{ selected.items.len, lock_name });
+    removePreview(a, root) catch |err| {
+        std.debug.print("labelle: warning: the new pins are committed, but the consumed preview {s} could not be removed ({s}); delete it by hand before the next review\n", .{ preview_name, @errorName(err) });
+    };
     // The accepted document is kept as the hint source of the no-provider
     // diagnostic (a preview stays read-only). Best effort: a failed cache
     // write changes nothing about the pins just written.
@@ -746,6 +782,32 @@ test "provider github: accept is bound to the recorded preview" {
     try std.testing.expect(!try fx.exists(a, preview_name));
     // A consumed preview cannot be accepted twice.
     try std.testing.expectError(error.ProviderPreviewMissing, fx.run(a, true));
+}
+
+test "provider github: accept stays committed when the consumed preview cannot be removed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const lock_path = try std.fs.path.join(a, &.{ fx.root, lock_name });
+    const old_lock = "{\"schema_version\":1,\"providers\":[]}";
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = lock_path, .data = old_lock });
+    try fx.run(a, false);
+    fail_preview_removal_for_test = true;
+    defer fail_preview_removal_for_test = false;
+    // The delete fails after the lock rename: the accept still succeeds, and
+    // the lock on disk is the new one, so exit status and lock state agree.
+    try fx.run(a, true);
+    const lock = try parse(a, try read(a, lock_path, 1024 * 1024), true);
+    try std.testing.expectEqual(@as(usize, 1), lock.providers.len);
+    try std.testing.expectEqualStrings(fx.pin.sha256, lock.providers[0].sha256);
+    // The fault really ran: the preview the accept could not consume is still there.
+    try std.testing.expect(try fx.exists(a, preview_name));
+    // Mechanism check: with the fault lifted the same path removes it.
+    fail_preview_removal_for_test = false;
+    try fx.run(a, true);
+    try std.testing.expect(!try fx.exists(a, preview_name));
 }
 
 test "provider github: an edited preview file fails its digest and is not accepted" {
@@ -934,4 +996,32 @@ test "provider github: Windows reserved device names are rejected by their own r
     try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/conout$.zig")));
     // Directory components count too.
     try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/aux/a.zig")));
+}
+
+fn testArchiveOf(a: std.mem.Allocator, paths: []const []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    var tar: std.tar.Writer = .{ .underlying_writer = &aw.writer };
+    try tar.setRoot("repo-sha");
+    try tar.writeFileBytes("plugin.labelle", "", .{});
+    for (paths) |path| try tar.writeFileBytes(path, "", .{});
+    try tar.finishPedantically();
+    return aw.toOwnedSlice();
+}
+
+test "provider github: case-folded file/directory conflicts are rejected by their own rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // ASCII twins: a file whose folded name is not a folded ancestor passes,
+    // including a sibling that shares a prefix but not a path component.
+    try validateTar(a, try testArchiveOf(a, &.{ "Foo.zig", "foo/bar.zig" }));
+    try validateTar(a, try testArchiveOf(a, &.{ "foo/bar.zig", "Foox" }));
+    try validateTar(a, try testArchiveOf(a, &.{ "src/a.zig", "SRC/b.zig" }));
+    // Either order, and at any depth.
+    try std.testing.expectError(error.CaseFoldedProviderArchiveFileDirConflict, validateTar(a, try testArchiveOf(a, &.{ "Foo", "foo/bar.zig" })));
+    try std.testing.expectError(error.CaseFoldedProviderArchiveFileDirConflict, validateTar(a, try testArchiveOf(a, &.{ "foo/bar.zig", "Foo" })));
+    try std.testing.expectError(error.CaseFoldedProviderArchiveFileDirConflict, validateTar(a, try testArchiveOf(a, &.{ "src/Lib", "SRC/lib/deep/x.zig" })));
+    try std.testing.expectError(error.CaseFoldedProviderArchiveFileDirConflict, validateTar(a, try testArchiveOf(a, &.{ "src/lib/deep/x.zig", "Src/LIB" })));
+    // Same case is a conflict on every host, so it gets the same rule.
+    try std.testing.expectError(error.CaseFoldedProviderArchiveFileDirConflict, validateTar(a, try testArchiveOf(a, &.{ "foo", "foo/bar.zig" })));
 }
