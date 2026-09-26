@@ -348,6 +348,36 @@ pub const ToolRun = struct {
     build_number: ?[]const u8 = null,
 };
 
+/// The wire context for one invocation (contract §2), in the wire version
+/// negotiated from the provider's `command_contract` range: the newest one
+/// this CLI speaks that the range admits. `build_number` is a `1.1.0` key, so
+/// a provider capped below it (`>=1.0.0 <1.1.0`) gets the exact `1.0.0` wire
+/// without it — its strict decoder would reject the unknown key and fail
+/// the bundle instead of packaging (Codex P2 on #421) — and the drop is
+/// reported once on stderr rather than silently.
+pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRun) !contract.Context {
+    const wire = try manifest.negotiate(provider.meta.command_contract orelse return error.MissingCommandContract);
+    const build_number = if (run.build_number) |number| blk: {
+        if (contract.carriesBuildNumber(wire)) break :blk number;
+        std.debug.print("labelle: note: '{s}' speaks provider contract {s}, which has no build_number; --build-number={s} is not passed to it\n", .{ provider.meta.name, wire, number });
+        break :blk null;
+    } else null;
+    return .{
+        .contract_version = wire,
+        .invocation = run.invocation,
+        .package_dir = provider.dir,
+        .project_dir = root,
+        .target = run.target,
+        .lock_file = run.lock_file,
+        .config_file = run.settings,
+        .output_dir = run.output_dir,
+        .zig_executable = host.zig,
+        .optimize = run.optimize,
+        .progress = run.progress,
+        .build_number = build_number,
+    };
+}
+
 /// Build the tool in a fresh isolated prefix, verify the declared executable,
 /// write the context file and run it. Returns the tool's exit status; the
 /// workspace is removed whatever happens.
@@ -375,20 +405,7 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     if (build_code != 0) return build_code;
     if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
     const exe = try executable(a, prefix, tool.executable);
-    const ctx: contract.Context = .{
-        .contract_version = contract.version,
-        .invocation = run.invocation,
-        .package_dir = provider.dir,
-        .project_dir = root,
-        .target = run.target,
-        .lock_file = run.lock_file,
-        .config_file = run.settings,
-        .output_dir = run.output_dir,
-        .zig_executable = host.zig,
-        .optimize = run.optimize,
-        .progress = run.progress,
-        .build_number = run.build_number,
-    };
+    const ctx = try wireContext(provider, host, root, run);
     try ctx.validate(run.needs_project);
     const context_path = try std.fs.path.join(a, &.{ run_dir, "context.json" });
     const data = try std.json.Stringify.valueAlloc(a, ctx, .{});
@@ -441,22 +458,65 @@ test "provider dispatch: a hook ToolRun yields a valid hook context, and none wi
         .cwd = abs,
     };
     // The same construction `runTool` performs from a ToolRun.
-    var ctx: contract.Context = .{
-        .contract_version = contract.version,
-        .invocation = run.invocation,
-        .package_dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
-        .project_dir = abs,
-        .target = run.target,
-        .lock_file = run.lock_file,
-        .config_file = run.settings,
-        .output_dir = run.output_dir,
-        .zig_executable = try std.fs.path.join(a, &.{ abs, "zig" }),
-        .optimize = run.optimize,
-        .progress = run.progress,
+    const provider: Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+        .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+        .verified = true,
     };
+    const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    var ctx = try wireContext(provider, host, abs, run);
     try ctx.validate(run.needs_project);
     ctx.invocation.phase = null;
     try std.testing.expectError(error.InvalidInvocation, ctx.validate(true));
+}
+
+test "provider dispatch: build_number reaches only a provider whose range admits the 1.1 wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const abs = if (builtin.os.tag == .windows) "C:\\proj" else "/proj";
+    const run: ToolRun = .{
+        .invocation = .{ .kind = .hook, .id = "pack", .step = .bundle, .phase = .replace },
+        .needs_project = true,
+        .target = "probe-target",
+        .lock_file = try std.fs.path.join(a, &.{ abs, "labelle.lock" }),
+        .output_dir = try std.fs.path.join(a, &.{ abs, "dist" }),
+        .optimize = .ReleaseSafe,
+        .progress = .off,
+        .settings = null,
+        .trailing = &.{},
+        .cwd = abs,
+        .build_number = "42",
+    };
+    const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    var provider: Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+        .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+        .verified = true,
+    };
+    // An open v1 range: negotiated to 1.1.0, which carries the key.
+    const open = try wireContext(provider, host, abs, run);
+    try open.validate(true);
+    try std.testing.expectEqualStrings("1.1.0", open.contract_version);
+    try std.testing.expectEqualStrings("42", open.build_number.?);
+    const open_wire = try std.json.Stringify.valueAlloc(a, open, .{});
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"build_number\":\"42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"contract_version\":\"1.1.0\"") != null);
+    // A provider capped at the 1.0 wire: the exact 1.0.0 wire, no key — so
+    // its strict decoder sees nothing unknown.
+    provider.meta.command_contract = ">=1.0.0 <1.1.0";
+    const capped = try wireContext(provider, host, abs, run);
+    try capped.validate(true);
+    try std.testing.expectEqualStrings("1.0.0", capped.contract_version);
+    try std.testing.expect(capped.build_number == null);
+    const capped_wire = try std.json.Stringify.valueAlloc(a, capped, .{});
+    try std.testing.expect(std.mem.indexOf(u8, capped_wire, "build_number") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped_wire, "\"contract_version\":\"1.0.0\"") != null);
+    // A range the CLI cannot speak at all is refused, never guessed.
+    provider.meta.command_contract = ">=2.0.0";
+    try std.testing.expectError(error.UnsupportedContract, wireContext(provider, host, abs, run));
 }
 
 test "provider dispatch: lock mismatch and duplicates fail closed" {

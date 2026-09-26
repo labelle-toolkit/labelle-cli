@@ -23,6 +23,17 @@ pub const Hook = struct {
     executable: []const u8,
     after_hooks: []const []const u8 = &.{},
 };
+/// The newest wire version this CLI speaks (`contract.supported_versions`)
+/// that `range_text` admits, or `error.UnsupportedContract` when it admits
+/// none. The result is static storage.
+pub fn negotiate(range_text: []const u8) ![]const u8 {
+    const range = try compat.parseRange(range_text);
+    for (contract.supported_versions) |candidate| {
+        if (range.satisfiedBy(std.SemanticVersion.parse(candidate) catch unreachable)) return candidate;
+    }
+    return error.UnsupportedContract;
+}
+
 pub const Manifest = struct {
     name: []const u8 = "",
     manifest_version: u8 = 1,
@@ -40,8 +51,9 @@ pub const Manifest = struct {
         if (!self.isProvider()) return;
         if (!contract.identifier(self.name)) return error.InvalidPackageName;
         if (self.manifest_version != 2) return error.UnsupportedManifest;
-        const range = try compat.parseRange(self.command_contract orelse return error.MissingCommandContract);
-        if (!range.satisfiedBy(try std.SemanticVersion.parse(contract.version))) return error.UnsupportedContract;
+        // The range must admit at least one wire version this CLI speaks;
+        // the newest one it admits is the one the provider receives.
+        _ = try negotiate(self.command_contract orelse return error.MissingCommandContract);
         if (self.commands.len != 0 and self.namespace == null) return error.MissingNamespace;
         if (self.namespace) |ns| if (!contract.identifier(ns)) return error.InvalidNamespace;
         // A declared target names directories on every host
@@ -166,6 +178,9 @@ test "provider manifest: strict records, negotiation, defaults and runtime exten
     try std.testing.expectError(error.ParseZon, parse(a, typo));
     const incompatible = try std.mem.replaceOwned(u8, a, good, ">=1.0.0 <2.0.0", ">=2.0.0");
     try std.testing.expectError(error.UnsupportedContract, parse(a, incompatible));
+    // A provider capped at the 1.0 wire stays valid: the CLI still speaks it.
+    const capped = try std.mem.replaceOwned(u8, a, good, ">=1.0.0 <2.0.0", ">=1.0.0 <1.1.0");
+    _ = try parse(a, capped);
     const v1 = try std.mem.replaceOwned(u8, a, good, "manifest_version = 2", "manifest_version = 1");
     try std.testing.expectError(error.UnsupportedManifest, parse(a, v1));
     try std.testing.expect(!(try parse(a, ".{ .name = \"runtime\", .resources = .{} }")).isProvider());
@@ -278,4 +293,17 @@ test "provider manifest: a repeated top-level field is rejected, never last-wins
     }
     // Unknown runtime fields are subject to the same rule.
     try std.testing.expectError(error.DuplicateManifestField, parse(a, ".{ .name = \"runtime\", .resources = .{}, .resources = .{} }"));
+}
+
+test "provider manifest: contract negotiation picks the newest wire the provider's range admits" {
+    try std.testing.expectEqualStrings("1.1.0", contract.version);
+    // An open v1 range admits every additive minor, so it gets the newest.
+    try std.testing.expectEqualStrings("1.1.0", try negotiate(">=1.0.0 <2.0.0"));
+    try std.testing.expectEqualStrings("1.1.0", try negotiate(">=1.1.0"));
+    // A provider capped below 1.1.0 keeps the exact 1.0.0 wire.
+    try std.testing.expectEqualStrings("1.0.0", try negotiate(">=1.0.0 <1.1.0"));
+    try std.testing.expectEqualStrings("1.0.0", try negotiate("1.0.0"));
+    // Nothing this CLI speaks: refused, never downgraded to a guess.
+    try std.testing.expectError(error.UnsupportedContract, negotiate(">=2.0.0"));
+    try std.testing.expectError(error.UnsupportedContract, negotiate("1.0.5"));
 }

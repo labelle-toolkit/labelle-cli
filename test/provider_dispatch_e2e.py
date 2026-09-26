@@ -70,7 +70,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     assert first["args"] == literal, first
     assert Path(first["cwd"]) == project
     ctx = first["context"]
-    assert ctx["contract_version"] == "1.0.0" and ctx["target"] == "desktop"
+    # `>=1.0.0 <2.0.0` admits every additive v1 minor: the newest wire.
+    assert ctx["contract_version"] == "1.1.0" and ctx["target"] == "desktop"
     assert ctx["invocation"] == {"kind": "command", "id": "inspect", "step": None, "phase": None}
     assert Path(ctx["package_dir"]) == provider
     assert Path(ctx["lock_file"]) == lock_file
@@ -104,6 +105,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     lock_file.write_text(lock.replace('version = "1.0.0"', 'version = "2.0.0"'))
     assert "StaleProviderPin" in run("probe", "inspect", code=1).stderr
     lock_file.write_text(lock)
+    # A provider capped below 1.1.0 is still spoken to, on the exact 1.0.0 wire.
+    (provider / "plugin.labelle").write_text(manifest.replace(">=1.0.0 <2.0.0", ">=1.0.0 <1.1.0"))
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["context"]["contract_version"] == "1.0.0"
     (provider / "plugin.labelle").write_text(manifest.replace(">=1.0.0 <2.0.0", ">=2.0.0"))
     assert "UnsupportedContract" in run("probe", "inspect", code=1).stderr
     (provider / "plugin.labelle").write_text(manifest.replace('namespace = "probe"', 'namespace = "build"'))

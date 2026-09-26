@@ -1,7 +1,32 @@
 //! Provider contract v1. Pure validation; does not resolve or execute packages.
 const std = @import("std");
 
-pub const version = "1.0.0";
+/// The contract version this CLI implements: the newest wire it speaks.
+pub const version = "1.1.0";
+
+/// Every wire version this CLI can speak, newest first. A minor is additive:
+/// `1.1.0` is `1.0.0` plus the optional `build_number` key (§2). The version
+/// a provider receives is negotiated from its `command_contract` range
+/// (`provider_manifest.negotiate`), so a provider pinned to `<1.1.0` keeps receiving the exact
+/// `1.0.0` wire and never sees a key it would reject as unknown.
+pub const supported_versions = [_][]const u8{ version, "1.0.0" };
+
+/// The first wire version that carries `build_number`.
+pub const build_number_since = "1.1.0";
+
+/// True when the wire `contract_version` carries the `build_number` key.
+pub fn carriesBuildNumber(wire_version: []const u8) bool {
+    const wire = std.SemanticVersion.parse(wire_version) catch return false;
+    const since = std.SemanticVersion.parse(build_number_since) catch unreachable;
+    return wire.order(since) != .lt;
+}
+
+fn supported(wire_version: []const u8) bool {
+    for (supported_versions) |candidate| {
+        if (std.mem.eql(u8, wire_version, candidate)) return true;
+    }
+    return false;
+}
 pub const context_env = "LABELLE_CONTEXT";
 pub const Step = enum { generate, build, bundle, run };
 pub const Phase = enum { before, replace, after };
@@ -16,10 +41,11 @@ pub const Invocation = struct {
 };
 
 /// All fields are required on the wire, including explicitly null fields —
-/// except `build_number`, the one optional key: present only in a `bundle`
-/// hook's context when the user passed `--build-number`, and absent (never
-/// null) everywhere else, so a context without it is byte-identical to the
-/// pre-field wire. Paths are absolute for the host running the provider.
+/// except `build_number`, the one optional key: added by wire `1.1.0`,
+/// present only in a `bundle` hook's context when the user passed
+/// `--build-number` and the negotiated wire is `1.1.0` or newer, and absent
+/// (never null) everywhere else, so a context without it is byte-identical
+/// to the `1.0.0` wire. Paths are absolute for the host running the provider.
 pub const Context = struct {
     contract_version: []const u8,
     invocation: Invocation,
@@ -38,7 +64,7 @@ pub const Context = struct {
     build_number: ?[]const u8 = null,
 
     pub fn validate(self: Context, needs_project: bool) !void {
-        if (!std.mem.eql(u8, self.contract_version, version)) return error.UnsupportedContract;
+        if (!supported(self.contract_version)) return error.UnsupportedContract;
         if (!identifier(self.invocation.id)) return error.InvalidIdentifier;
         try absolute(self.package_dir);
         try absolute(self.output_dir);
@@ -63,6 +89,8 @@ pub const Context = struct {
             },
         }
         if (self.build_number) |number| {
+            // A `1.0.0` wire has no such key: its strict decoders reject it.
+            if (!carriesBuildNumber(self.contract_version)) return error.UnsupportedContract;
             if (self.invocation.kind != .hook or self.invocation.step != .bundle) return error.InvalidInvocation;
             if (number.len == 0) return error.InvalidBuildNumber;
         }
@@ -377,6 +405,7 @@ test "build_number is optional on the wire and only for bundle hooks" {
     try std.testing.expect(std.mem.indexOf(u8, plain, "\"target\":null") != null);
     // Present on a command: refused.
     var value = parsed.value;
+    value.contract_version = version;
     value.build_number = "42";
     try std.testing.expectError(error.InvalidInvocation, value.validate(false));
     // Present on a bundle hook: accepted, written and read back.
@@ -396,4 +425,31 @@ test "build_number is optional on the wire and only for bundle hooks" {
     value.invocation.step = .bundle;
     value.build_number = "";
     try std.testing.expectError(error.InvalidBuildNumber, value.validate(true));
+}
+
+test "a 1.0.0 context never carries build_number; both wires otherwise validate" {
+    try std.testing.expectEqualStrings("1.1.0", version);
+    try std.testing.expect(carriesBuildNumber("1.1.0"));
+    try std.testing.expect(!carriesBuildNumber("1.0.0"));
+    const parsed = try parseContext(std.testing.allocator, fixture, false);
+    defer parsed.deinit();
+    var value = parsed.value;
+    value.project_dir = value.package_dir;
+    value.lock_file = value.zig_executable;
+    value.target = "sample-target";
+    value.invocation = .{ .kind = .hook, .id = "pack", .step = .bundle, .phase = .replace };
+    // Both supported wires validate without the key...
+    for (supported_versions) |wire| {
+        value.contract_version = wire;
+        try value.validate(true);
+    }
+    // ...and only the 1.1.0 wire may carry it: a strict 1.0.0 decoder
+    // rejects the key as unknown, so the CLI must never emit it there.
+    value.build_number = "42";
+    value.contract_version = "1.0.0";
+    try std.testing.expectError(error.UnsupportedContract, value.validate(true));
+    value.contract_version = "1.1.0";
+    try value.validate(true);
+    value.contract_version = "1.2.0";
+    try std.testing.expectError(error.UnsupportedContract, value.validate(true));
 }

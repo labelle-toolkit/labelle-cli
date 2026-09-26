@@ -161,6 +161,9 @@ A `bundle` hook's context also carries `build_number` when the user passed
 core packager): the provider that packages its target is the one that stamps
 the number, so it would otherwise be dropped. The key is **absent** — not
 null — for every other step's hooks and for a `bundle` without the flag.
+`build_number` is a contract `1.1.0` key: a provider whose `command_contract`
+range stops below `1.1.0` receives the `1.0.0` wire without it (see
+[wire versions and negotiation](provider-contract-v1.md#wire-versions-and-negotiation)).
 
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
