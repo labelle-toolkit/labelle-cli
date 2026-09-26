@@ -27,6 +27,39 @@ pub fn main(init: std.process.Init) !u8 {
         .sub_path = try std.fs.path.join(a, &.{ output, "capture.json" }),
         .data = capture,
     });
+    // Hooks share one output directory per step, so appending one line per
+    // invocation to `hooks.log` makes their order observable. The timestamp
+    // is monotonic within a host; `lock_file_exists` is checked at the moment
+    // the hook runs (the lock must already exist for a `before generate` hook).
+    const invocation = ctx.value.object.get("invocation").?;
+    const lock_file = ctx.value.object.get("lock_file").?;
+    const lock_exists = lock_file == .string and blk: {
+        std.Io.Dir.cwd().access(init.io, lock_file.string, .{}) catch break :blk false;
+        break :blk true;
+    };
+    const line = try std.json.Stringify.valueAlloc(a, .{
+        .invocation = invocation,
+        .target = ctx.value.object.get("target").?,
+        .output_dir = output,
+        .lock_file = lock_file,
+        .lock_file_exists = lock_exists,
+        .optimize = ctx.value.object.get("optimize").?,
+        .progress = ctx.value.object.get("progress").?,
+        .package_dir = ctx.value.object.get("package_dir").?,
+        .nanoseconds = std.Io.Timestamp.now(init.io, .awake).nanoseconds,
+    }, .{});
+    const log_path = try std.fs.path.join(a, &.{ output, "hooks.log" });
+    const previous = std.Io.Dir.cwd().readFileAlloc(init.io, log_path, a, .limited(1024 * 1024)) catch "";
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = log_path,
+        .data = try std.mem.concat(a, u8, &.{ previous, line, "\n" }),
+    });
+    // Hooks receive no argv, so a failing hook is selected by environment:
+    // `PROVIDER_PROBE_FAIL=<hook id>` makes that hook exit 7.
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_FAIL")) |fail_id| {
+        if (invocation == .object and invocation.object.get("id").?.string.len > 0 and
+            std.mem.eql(u8, invocation.object.get("id").?.string, fail_id)) return 7;
+    } else |_| {}
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "fail")) return 7;
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "crash")) @panic("provider fixture crash");
     return 0;

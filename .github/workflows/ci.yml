@@ -78,6 +78,9 @@ jobs:
       - name: Provider configuration subprocess regression
         run: python test/provider_config_e2e.py
 
+      - name: Provider lifecycle hooks subprocess regression
+        run: python test/provider_hooks_e2e.py
+
       - name: CLI tests
         run: zig build test
 

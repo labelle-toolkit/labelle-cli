@@ -76,7 +76,8 @@ provider must treat its context as read-only. Its exit status is preserved.
   currently belong to the provider; this slice does not interpret them as CLI
   flags or claim to implement the full progress contract.
 - Projectless resolution/bootstrap and global updates remain phase 5. Hook
-  execution, generic target routing and platform extraction remain later work.
+  execution is now implemented; see [provider hooks](provider-hooks.md).
+  Generic target routing and platform extraction remain later work.
 
 ## Verification
 
