@@ -74,8 +74,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// #419 (affixes, source symlinks, the RFC tool names): one entry added,
 /// `cli/provider_hooks.zig` (new since, citing `adb`), 54 entries. Recomputed
 /// again after joins across CamelCase pieces (`UIKitView`): no file newly
-/// dirty, still 54 entries. Shrink only: an entry whose file is
-/// clean fails the test until it is removed. Note the path scan: an entry
+/// dirty, still 54 entries. The `cli/serve.zig` split added the four
+/// `cli/serve/` files that carry its moved platform words: 58 entries.
+/// Shrink only: an entry whose file is clean fails the test until it is
+/// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
 /// moved or renamed, not merely emptied of platform words.
 const allowed_files = [_][]const u8{
@@ -131,6 +133,12 @@ const allowed_files = [_][]const u8{
     "cli/screenshot_format.zig",
     "cli/sdl_provision.zig",
     "cli/serve.zig",
+    // Split out of `cli/serve.zig` (moves only): the serve code they carry
+    // mentions the served build and its output dir.
+    "cli/serve/http.zig",
+    "cli/serve/server.zig",
+    "cli/serve/tree.zig",
+    "cli/serve/watch.zig",
     "cli/status.zig",
     "cli/stb_image.h",
     "cli/stb_image_impl.c",
