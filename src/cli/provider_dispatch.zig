@@ -10,6 +10,7 @@ const runner = @import("runner.zig");
 const toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
 const github = @import("provider_github.zig");
+const hooks = @import("provider_hooks.zig");
 
 // Existing platform commands remain reserved until their extraction lands.
 pub const reserved = [_][]const u8{
@@ -18,7 +19,7 @@ pub const reserved = [_][]const u8{
     "plugins",  "doctor",  "assembler", "toolchain", "status", "ios",   "android", "wasm",
     "help",     "version", "targets",   "providers",
 };
-const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
+pub const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
 
 fn read(a: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(1024 * 1024));
@@ -42,7 +43,9 @@ pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
     }
 }
 
-fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) ![]Provider {
+/// Every provider the project declares, with ownership and the cross-provider
+/// hook graph validated. Metadata only: no compiler, lock or build script.
+pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) ![]Provider {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
     for (cfg.plugins) |dep| {
@@ -65,6 +68,7 @@ fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, 
         try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta, .verified = dep.isLocal() or pinned != null });
     }
     try contract.validateOwnership(owners.items, &reserved);
+    try hooks.validateAll(a, providers.items);
     return providers.items;
 }
 
@@ -128,18 +132,7 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
                 std.debug.print("labelle {s} {s} — {s}\n", .{ namespace, name, cmd.help });
                 return 0;
             }
-            const lock_path = try std.fs.path.join(a, &.{ root, "labelle.lock" });
-            const lock_bytes = read(a, lock_path) catch |err| {
-                std.debug.print("labelle: provider commands require the project's labelle.lock: {s}\n", .{@errorName(err)});
-                return error.MissingProjectLock;
-            };
-            const Lock = struct { plugins: []const project.PluginDep = &.{} };
-            const lock = try std.zon.parse.fromSliceAlloc(Lock, a, try a.dupeZ(u8, lock_bytes), null, .{ .ignore_unknown_fields = true });
-            try validatePin(provider.dep, lock.plugins);
-            if (!provider.verified) {
-                std.debug.print("labelle: remote provider '{s}' is unpinned. Run labelle providers resolve, review the pins, then repeat with --accept.\n", .{provider.dep.name});
-                return error.RemoteProviderIntegrityRequired;
-            }
+            const lock_path = try requirePinned(a, root, provider);
             const settings = try resolveSettings(a, root, cfg, providers, provider.meta.name);
             return try execute(a, root, cfg, provider, cmd, lock_path, settings, trailing.items);
         }
@@ -148,6 +141,25 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
         return 1;
     }
     return null;
+}
+
+/// Execution (a command or a hook) needs the project's ordinary lock to name
+/// this exact provider, and a remote provider to carry an integrity pin.
+/// Returns the lock's real path for the wire context.
+pub fn requirePinned(a: std.mem.Allocator, root: []const u8, provider: Provider) ![]const u8 {
+    const lock_path = try std.fs.path.join(a, &.{ root, "labelle.lock" });
+    const lock_bytes = read(a, lock_path) catch |err| {
+        std.debug.print("labelle: provider execution requires the project's labelle.lock: {s}\n", .{@errorName(err)});
+        return error.MissingProjectLock;
+    };
+    const Lock = struct { plugins: []const project.PluginDep = &.{} };
+    const lock = try std.zon.parse.fromSliceAlloc(Lock, a, try a.dupeZ(u8, lock_bytes), null, .{ .ignore_unknown_fields = true });
+    try validatePin(provider.dep, lock.plugins);
+    if (!provider.verified) {
+        std.debug.print("labelle: remote provider '{s}' is unpinned. Run labelle providers resolve, review the pins, then repeat with --accept.\n", .{provider.dep.name});
+        return error.RemoteProviderIntegrityRequired;
+    }
+    return real(a, lock_path);
 }
 
 fn isHelp(arg: []const u8) bool {
@@ -178,12 +190,12 @@ fn executable(a: std.mem.Allocator, prefix: []const u8, relative: []const u8) ![
 
 /// Create `dir` if needed and return its canonical absolute path, so it means
 /// the same thing in a child that runs with a different cwd.
-fn canonicalDir(a: std.mem.Allocator, dir: []const u8) ![]const u8 {
+pub fn canonicalDir(a: std.mem.Allocator, dir: []const u8) ![]const u8 {
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
     return real(a, dir);
 }
 
-fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
+pub fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
     var result: ?[]const u8 = null;
     for (cfg.provider_config) |entry| {
         var resolved = false;
@@ -229,9 +241,14 @@ fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectC
     return result;
 }
 
-fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8) !u8 {
+/// The pinned host compiler and the canonical cache tree every provider tool
+/// build shares. Resolved once per CLI invocation, lazily, so a project
+/// without hooks never touches the compiler check.
+pub const Host = struct { zig: []const u8, cache_root: []const u8, global_cache: []const u8, packages: []const u8 };
+
+/// Unlike the game runner, provider execution must never download a compiler.
+pub fn resolveHost(a: std.mem.Allocator, root: []const u8) !Host {
     const io = config.globalIo();
-    // Unlike the game runner, command dispatch must never download a compiler.
     const required = try toolchain.resolveRequiredVersion(a, root);
     const zig_candidate = (try toolchain.lookupEnvOverride(a)) orelse try zig_cache.binaryPath(a, required.version);
     const zig = real(a, zig_candidate) catch {
@@ -250,7 +267,35 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     // `github.cacheRoot` already resolves LABELLE_HOME against this process's
     // cwd; `canonicalDir` creates the directory and returns its real path.
     const cache_root = try github.cacheRoot(a);
-    const runs = try canonicalDir(a, try std.fs.path.join(a, &.{ cache_root, "provider-runs" }));
+    const global_cache = try std.fs.path.join(a, &.{ cache_root, zig_cache.GLOBAL_CACHE_SUBDIR });
+    // Zig's system package mode disables fetching. Its package directory is
+    // explicit so a missing dependency fails instead of reaching the network.
+    const packages = try canonicalDir(a, try std.fs.path.join(a, &.{ global_cache, "p" }));
+    return .{ .zig = zig, .cache_root = cache_root, .global_cache = global_cache, .packages = packages };
+}
+
+/// One invocation of a provider tool: the wire-context fields the caller
+/// decides (contract §2) plus how the child is launched.
+pub const ToolRun = struct {
+    invocation: contract.Invocation,
+    needs_project: bool,
+    target: ?[]const u8,
+    lock_file: ?[]const u8,
+    /// Absolute; created by the caller.
+    output_dir: []const u8,
+    optimize: contract.Optimize,
+    progress: contract.Progress,
+    settings: ?[]const u8,
+    trailing: []const []const u8,
+    cwd: []const u8,
+};
+
+/// Build the tool in a fresh isolated prefix, verify the declared executable,
+/// write the context file and run it. Returns the tool's exit status; the
+/// workspace is removed whatever happens.
+pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Provider, tool: contract.Tool, run: ToolRun) !u8 {
+    const io = config.globalIo();
+    const runs = try canonicalDir(a, try std.fs.path.join(a, &.{ host.cache_root, "provider-runs" }));
     var random: [16]u8 = undefined;
     io.random(&random);
     const run_dir = try std.fs.path.join(a, &.{ runs, &std.fmt.bytesToHex(random, .lower) });
@@ -263,48 +308,96 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     var env = try runner.buildZigEnv(a, &.{});
     defer env.deinit();
     // Keep relative LABELLE_HOME stable when child cwd changes to the package.
-    const global_cache = try std.fs.path.join(a, &.{ cache_root, zig_cache.GLOBAL_CACHE_SUBDIR });
-    try env.put("ZIG_GLOBAL_CACHE_DIR", global_cache);
-    try env.put("ZIG_LOCAL_CACHE_DIR", try std.fs.path.join(a, &.{ cache_root, zig_cache.LOCAL_CACHE_SUBDIR }));
-    try env.put("LABELLE_HOME", cache_root);
+    try env.put("ZIG_GLOBAL_CACHE_DIR", host.global_cache);
+    try env.put("ZIG_LOCAL_CACHE_DIR", try std.fs.path.join(a, &.{ host.cache_root, zig_cache.LOCAL_CACHE_SUBDIR }));
+    try env.put("LABELLE_HOME", host.cache_root);
     // Zig owns the complete source/dependency/compiler/options cache identity.
     // Always run the install step: never trust a stale installed executable.
-    // Zig's system package mode disables fetching. Its package directory is
-    // explicit so a missing dependency fails instead of reaching the network.
-    const packages = try canonicalDir(a, try std.fs.path.join(a, &.{ global_cache, "p" }));
-    const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ zig, "build", cmd.build_step, "--prefix", prefix, "--system", packages }, null, &env);
+    const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ host.zig, "build", tool.build_step, "--prefix", prefix, "--system", host.packages }, null, &env);
     if (build_code != 0) return build_code;
     if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
-    const exe = try executable(a, prefix, cmd.executable);
-    var output: []const u8 = root;
-    for ([_][]const u8{ ".labelle", "providers", provider.meta.name }) |segment| {
-        output = try std.fs.path.join(a, &.{ output, segment });
-        try std.Io.Dir.cwd().createDirPath(io, output);
-        output = try real(a, output);
-        if (!contained(root, output)) return error.EscapingProviderOutput;
-    }
+    const exe = try executable(a, prefix, tool.executable);
     const ctx: contract.Context = .{
         .contract_version = contract.version,
-        .invocation = .{ .kind = .command, .id = cmd.name, .step = null, .phase = null },
+        .invocation = run.invocation,
         .package_dir = provider.dir,
         .project_dir = root,
-        .target = @tagName(cfg.platform),
-        .lock_file = try real(a, lock_path),
-        .config_file = settings,
-        .output_dir = try real(a, output),
-        .zig_executable = zig,
-        .optimize = .Debug,
-        .progress = .human,
+        .target = run.target,
+        .lock_file = run.lock_file,
+        .config_file = run.settings,
+        .output_dir = run.output_dir,
+        .zig_executable = host.zig,
+        .optimize = run.optimize,
+        .progress = run.progress,
     };
-    try ctx.validate(cmd.needs_project);
+    try ctx.validate(run.needs_project);
     const context_path = try std.fs.path.join(a, &.{ run_dir, "context.json" });
     const data = try std.json.Stringify.valueAlloc(a, ctx, .{});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = context_path, .data = data });
     try env.put(contract.context_env, context_path);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, exe);
-    try argv.appendSlice(a, trailing);
-    return runner.runZigInheritWithEnv(a, root, argv.items, null, &env);
+    try argv.appendSlice(a, run.trailing);
+    return runner.runZigInheritWithEnv(a, run.cwd, argv.items, null, &env);
+}
+
+/// A project command: Debug, human progress, output under
+/// `.labelle/providers/<package>`, trailing arguments verbatim.
+fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8) !u8 {
+    const host = try resolveHost(a, root);
+    var output: []const u8 = root;
+    for ([_][]const u8{ ".labelle", "providers", provider.meta.name }) |segment| {
+        output = try canonicalDir(a, try std.fs.path.join(a, &.{ output, segment }));
+        if (!contained(root, output)) return error.EscapingProviderOutput;
+    }
+    return runTool(a, host, root, provider, cmd.tool(), .{
+        .invocation = .{ .kind = .command, .id = cmd.name, .step = null, .phase = null },
+        .needs_project = cmd.needs_project,
+        .target = @tagName(cfg.platform),
+        .lock_file = lock_path,
+        .output_dir = output,
+        .optimize = .Debug,
+        .progress = .human,
+        .settings = settings,
+        .trailing = trailing,
+        .cwd = root,
+    });
+}
+
+test "provider dispatch: a hook ToolRun yields a valid hook context, and none without a phase" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const abs = if (builtin.os.tag == .windows) "C:\\proj" else "/proj";
+    const run: ToolRun = .{
+        .invocation = .{ .kind = .hook, .id = "stamp", .step = .build, .phase = .after },
+        .needs_project = true,
+        .target = "desktop",
+        .lock_file = try std.fs.path.join(a, &.{ abs, "labelle.lock" }),
+        .output_dir = try std.fs.path.join(a, &.{ abs, "zig-out" }),
+        .optimize = .ReleaseFast,
+        .progress = .json,
+        .settings = null,
+        .trailing = &.{},
+        .cwd = abs,
+    };
+    // The same construction `runTool` performs from a ToolRun.
+    var ctx: contract.Context = .{
+        .contract_version = contract.version,
+        .invocation = run.invocation,
+        .package_dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .project_dir = abs,
+        .target = run.target,
+        .lock_file = run.lock_file,
+        .config_file = run.settings,
+        .output_dir = run.output_dir,
+        .zig_executable = try std.fs.path.join(a, &.{ abs, "zig" }),
+        .optimize = run.optimize,
+        .progress = run.progress,
+    };
+    try ctx.validate(run.needs_project);
+    ctx.invocation.phase = null;
+    try std.testing.expectError(error.InvalidInvocation, ctx.validate(true));
 }
 
 test "provider dispatch: lock mismatch and duplicates fail closed" {
