@@ -165,6 +165,48 @@ null — for every other step's hooks and for a `bundle` without the flag.
 range stops below `1.1.0` receives the `1.0.0` wire without it (see
 [wire versions and negotiation](provider-contract-v1.md#wire-versions-and-negotiation)).
 
+On wire `1.2.0` every hook's context also carries **`target_dir`**: the
+absolute generated target directory, `.labelle/<backend>_<target>/`. It is
+the same directory for every step, whatever `output_dir` is, so a `bundle`
+hook still finds the generated tree and the build output when `--output`
+moves its `output_dir` somewhere else.
+
+A **`run`**-step hook (`before`, `replace` or `after`) also gets the
+**`run`** object on wire `1.2.0`. It holds the `labelle run` options that a
+replacement launch needs:
+
+```json
+"run": {
+  "env": [
+    { "name": "LABELLE_SCENE", "value": "intro" },
+    { "name": "LABELLE_SCREENSHOT_PATH", "value": "shot.png" },
+    { "name": "LABELLE_SCREENSHOT_AFTER_SEC", "value": "2.000" }
+  ],
+  "args": ["a", "b"],
+  "timeout_ms": 30000
+}
+```
+
+- `env` is exactly the list the core launch sets for `--scene`, `--profile`,
+  `--screenshot` and `--after`, with the same names, values and order. An
+  option the user didn't pass adds nothing. The desktop-only headless knobs
+  aren't run options and never appear here.
+- `args` are the tokens after `--`, verbatim.
+- `timeout_ms` is `--timeout` in milliseconds, or null.
+
+The CLI maps none of this to a platform. The provider decides how the pairs
+reach its game, for example as launch extras on a device.
+
+The object is present, and possibly empty, on every `run`-step hook of a
+`1.2.0` wire. That includes `wasm serve`'s `run` hooks, which have no
+`labelle run` options, so their object is empty. It's absent on every other
+step.
+
+A provider whose range stops below `1.2.0` gets the older wire, without
+either key. If its `run` hook would have received options the user passed,
+the CLI prints one line per hook:
+`labelle: note: run options not passed to '<package>/<id>' (provider contract <wire> < 1.2.0)`.
+
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
 because a `before generate` hook already needs it. A generation that then
@@ -284,7 +326,8 @@ sort), the deferral of references into an unread package (at the graph and
 at discovery, against a real cache layout in both cache states), the
 per-phase scratch arena (a counting allocator proves two phases on one site
 leave nothing live), the pin-before-compiler order (an unpinned provider is
-refused with the host resolver never reached), the `run` outcomes (only
+refused with the host resolver never reached), `target_dir` on every
+hook and the `run` options on `run`-step hooks only, the `run` outcomes (only
 `exited_clean` reaches the hook machinery), the output-layout contract and
 the hook wire context; `zig build test` also covers the watched-rebuild
 hook plumbing (the phases, and the per-rebuild replan: invoked on every
@@ -316,7 +359,13 @@ before hooks'), `run` hooks around the game, a `--timeout` kill running no
 `after run` hook (and printing the skip line) while a clean exit still
 does, the `run` hooks wrapping `wasm export --no-build` with nothing
 installed, generated or built, an `after build` edit to `zig-out/` reaching
-the launched game intact, a cold package cache failing closed or running a
+the launched game intact, contract `1.2.0` on a provider target (every
+hook's `target_dir` for `build`, `run` and `bundle`, including `bundle
+--output` elsewhere; a `replace run` hook receiving the three `LABELLE_*`
+pairs of `--scene`/`--screenshot`/`--after`, the `--` arguments and the
+timeout, while a planted host-launch sentinel that the unreplaced run does
+execute never runs; a provider capped below `1.2.0` getting neither key and
+the one `note:` line), a cold package cache failing closed or running a
 pinned provider's hooks (never skipping them) — with an unpinned remote hook
 refused as `RemoteProviderIntegrityRequired` while `LABELLE_ZIG` points
 nowhere, and the same dead compiler being the failure once the pin is

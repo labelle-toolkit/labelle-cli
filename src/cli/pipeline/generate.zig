@@ -297,6 +297,7 @@ test "pipeline: the shader override is re-gated after the before-generate hooks"
         .root = project,
         .cfg = .{ .name = "game" },
         .target = "desktop",
+        .target_dir = project,
         .optimize = .Debug,
         .progress = .off,
         .reporter = null,

@@ -296,10 +296,15 @@ test "provider manifest: a repeated top-level field is rejected, never last-wins
 }
 
 test "provider manifest: contract negotiation picks the newest wire the provider's range admits" {
-    try std.testing.expectEqualStrings("1.1.0", contract.version);
+    try std.testing.expectEqualStrings("1.2.0", contract.version);
     // An open v1 range admits every additive minor, so it gets the newest.
-    try std.testing.expectEqualStrings("1.1.0", try negotiate(">=1.0.0 <2.0.0"));
-    try std.testing.expectEqualStrings("1.1.0", try negotiate(">=1.1.0"));
+    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.0.0 <2.0.0"));
+    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.1.0"));
+    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.2.0"));
+    // A provider capped below 1.2.0 keeps the exact 1.1.0 wire, without
+    // `target_dir` or `run`.
+    try std.testing.expectEqualStrings("1.1.0", try negotiate(">=1.0.0 <1.2.0"));
+    try std.testing.expectEqualStrings("1.1.0", try negotiate("1.1.0"));
     // A provider capped below 1.1.0 keeps the exact 1.0.0 wire.
     try std.testing.expectEqualStrings("1.0.0", try negotiate(">=1.0.0 <1.1.0"));
     try std.testing.expectEqualStrings("1.0.0", try negotiate("1.0.0"));

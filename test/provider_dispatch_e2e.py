@@ -71,7 +71,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     assert Path(first["cwd"]) == project
     ctx = first["context"]
     # `>=1.0.0 <2.0.0` admits every additive v1 minor: the newest wire.
-    assert ctx["contract_version"] == "1.1.0" and ctx["target"] == "desktop"
+    assert ctx["contract_version"] == "1.2.0" and ctx["target"] == "desktop"
+    # A command's 1.2.0 `target_dir` is an explicit null; `run` is hook-only.
+    assert "target_dir" in ctx and ctx["target_dir"] is None and "run" not in ctx, ctx
     assert ctx["invocation"] == {"kind": "command", "id": "inspect", "step": None, "phase": None}
     assert Path(ctx["package_dir"]) == provider
     assert Path(ctx["lock_file"]) == lock_file

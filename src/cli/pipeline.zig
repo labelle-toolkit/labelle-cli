@@ -290,6 +290,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // Reaches the `bundle` hooks only; a provider target's bundle
         // replacement would otherwise drop it silently (Codex P2 on #421).
         .build_number = if (command == .bundle_cmd) parsed_args.bundle_build_number else null,
+        // Every hook's contract §2 `target_dir` (wire 1.2.0+), under the
+        // canonical root so it is absolute whatever `project_dir` was.
+        .target_dir = try std.fs.path.join(hook_arena, &.{ project_root, ".labelle", target_name }),
+        // The `run` hooks' contract §2 `run` (wire 1.2.0+): the options the
+        // core launch would set, for a replacement standing in for it.
+        .run_options = if (command == .run) try run_stage.hookRunOptions(hook_arena, &parsed_args) else null,
     };
 
     const cx: context.Context = .{
