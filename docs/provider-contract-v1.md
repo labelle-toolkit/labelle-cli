@@ -2,6 +2,10 @@
 
 Status: phase-1 contract and validation foundation for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Dispatch, fetching, publication and runtime extraction are not implemented by this change.
 
+Implementation progress: [project-local dispatch](provider-local-dispatch.md)
+implements the first executable slice of phase 2. Its explicit limitations
+do not weaken the normative contract below; full phase-2 acceptance is pending.
+
 This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the exact CLI contract version; it never warns and proceeds. The v1 context below uses the exact wire version `1.0.0`; additional wire versions require explicit decoder support.
 
 ## 1. Package declarations and installed tools

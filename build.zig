@@ -100,6 +100,8 @@ pub fn build(b: *std.Build) void {
     const provider_step = b.step("test-provider-contract", "Validate provider contract v1");
     provider_step.dependOn(&run_provider_tests.step);
     const material_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"shader tool override"} });
+    const dispatch_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"provider "} });
+    b.step("test-provider-dispatch", "Validate provider manifest and dispatch rules").dependOn(&b.addRunArtifact(dispatch_tests).step);
     b.step("test-material-toolchain", "Validate shader compiler override diagnostics").dependOn(&b.addRunArtifact(material_tests).step);
 
     // ── Progress-feed subprocess e2e (cli#319) ───────────────────────
