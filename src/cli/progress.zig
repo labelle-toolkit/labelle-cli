@@ -333,10 +333,20 @@ pub const Reporter = struct {
     /// wrap (`generate`, `compile`, `run`) and the machine rejects a phase
     /// re-entering itself, so a plain `beginPhase` would silently drop
     /// whichever of the hook and the core step came second.
+    ///
+    /// `link` is a refinement of `compile` that Zig's progress stream may
+    /// or may not surface (`compileUpdate`), so a `compile` request while
+    /// the reporter sits in `link` is the same build step still running —
+    /// an `after build` hook, typically — and is emitted as a sub-step of
+    /// the live `link` phase. It is never a backward transition: the
+    /// machine would reject it and the advertised `hook <package>/<id>`
+    /// sub-step would be lost to feed consumers.
     pub fn beginPhaseOrStep(self: *Reporter, phase: Phase, detail: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.machine.current == phase) {
+        const same_step = self.machine.current == phase or
+            (phase == .compile and self.machine.current == .link);
+        if (same_step) {
             self.setDetailLocked(detail);
             self.emitLocked(true, true);
             return;
@@ -907,6 +917,53 @@ pub const ReporterPipelineSpec = struct {
         rep.beginPhaseOrStep(.generate, "hook pkg/late");
         try std.testing.expectEqual(Phase.compile, rep.machine.current.?);
         try std.testing.expectEqualStrings("zig build", rep.detail_buf[0..rep.detail_len]);
+        rep.finishDone(0);
+    }
+
+    test "beginPhaseOrStep(.compile) while in link is a sub-step of link, and is emitted" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        rep.beginPhaseOrStep(.compile, "zig build");
+        // Zig's progress stream detected the link step: compile → link.
+        rep.compileUpdate(null, null, "lld", true);
+        try std.testing.expectEqual(Phase.link, rep.machine.current.?);
+
+        // An `after build` hook reports under the build's phase (`compile`)
+        // while the reporter is already in `link`. Before the fix this was
+        // a rejected backward transition: the phase stayed `link` but the
+        // detail stayed "lld" and no record was written — feed consumers
+        // never saw the advertised sub-step.
+        rep.beginPhaseOrStep(.compile, "hook pkg/post");
+        try std.testing.expectEqual(Phase.link, rep.machine.current.?);
+        try std.testing.expectEqualStrings("hook pkg/post", rep.detail_buf[0..rep.detail_len]);
+        {
+            const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+            defer allocator.free(raw);
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+            defer parsed.deinit();
+            // The record carries the forward phase AND the hook sub-step.
+            try std.testing.expectEqualStrings("link", parsed.value.object.get("phase").?.string);
+            try std.testing.expectEqualStrings("hook pkg/post", parsed.value.object.get("detail").?.string);
+        }
+        // Only the compile/link pair is folded: a genuinely earlier phase is
+        // still refused, so the fold cannot mask a programmer error.
+        rep.beginPhaseOrStep(.generate, "hook pkg/late");
+        try std.testing.expectEqual(Phase.link, rep.machine.current.?);
+        try std.testing.expectEqualStrings("hook pkg/post", rep.detail_buf[0..rep.detail_len]);
+        // And a later phase still moves forward from link.
+        rep.beginPhaseOrStep(.run, "game");
+        try std.testing.expectEqual(Phase.run, rep.machine.current.?);
         rep.finishDone(0);
     }
 
