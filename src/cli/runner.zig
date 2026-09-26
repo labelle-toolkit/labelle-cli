@@ -188,6 +188,9 @@ pub fn runZigInherit(allocator: std.mem.Allocator, cwd: []const u8, argv: []cons
 /// replaces the child's environ when non-null. The map must already
 /// contain everything the child needs (parent env + extra keys); see
 /// `buildEnvironWithExtra` for the standard snapshot-and-add helper.
+///
+/// A genuine `--timeout` expiry is exit status 0 (cli#390); callers that
+/// must tell that kill from a clean exit use `runInheritTerm`.
 pub fn runZigInheritWithEnv(
     allocator: std.mem.Allocator,
     cwd: []const u8,
@@ -195,6 +198,27 @@ pub fn runZigInheritWithEnv(
     timeout_ns: ?u64,
     environ_map: ?*const std.process.Environ.Map,
 ) !u8 {
+    return switch (try runInheritTerm(allocator, cwd, argv, timeout_ns, environ_map)) {
+        .exited => |code| code,
+        .timed_out => 0,
+    };
+}
+
+/// How an inherited-stdio child ended. `exited` carries the status a shell
+/// would report (`exitStatus`); `timed_out` is the watchdog's kill at the
+/// `--timeout` deadline, which is NOT the child's own exit — a publishing
+/// `after run` hook must not read it as a clean run (Codex P2 on #420),
+/// even though the CLI's exit status for it stays 0 (cli#390).
+pub const Termination = union(enum) { exited: u8, timed_out };
+
+/// `runZigInheritWithEnv` with the termination kept explicit.
+pub fn runInheritTerm(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    timeout_ns: ?u64,
+    environ_map: ?*const std.process.Environ.Map,
+) !Termination {
     const io = config.globalIo();
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -216,11 +240,11 @@ pub fn runZigInheritWithEnv(
     const term = if (timeout_ns) |ns|
         (try waitWithDeadline(allocator, &child, ns)) orelse {
             std.debug.print("\nlabelle: timed out\n", .{});
-            return 0;
+            return .timed_out;
         }
     else
         try child.wait(io);
-    return exitStatus(term);
+    return .{ .exited = exitStatus(term) };
 }
 
 /// The process exit status a termination maps to, as a shell would report

@@ -38,7 +38,9 @@ exe_suffix = ".exe" if os.name == "nt" else ""
 # `zig-out/bin/data.txt` and the game prints that file at launch, so a
 # post-build hook's edit to it is observable from the launched game — and a
 # redundant later build would visibly revert it. FAKE_MAIN_BROKEN=1 makes the
-# core build fail. `install` populates the package cache from
+# core build fail; FAKE_GAME_HANG=1 in the LAUNCHED game's environment makes
+# it sleep forever, so a `--timeout` run ends in the watchdog's kill. `install`
+# populates the package cache from
 # FAKE_INSTALL_PLUGIN="<src>|<dest>" when set (a remote package landing in
 # the ordinary cache), and only prints otherwise.
 FAKE_ASSEMBLER = '''import os, shutil, sys
@@ -73,6 +75,9 @@ elif argv and argv[0] == "generate":
         '    const a = init.arena.allocator();\\n'
         '    const data = std.Io.Dir.cwd().readFileAlloc(init.io, "zig-out/bin/data.txt", a, .limited(1024)) catch "missing";\\n'
         '    std.debug.print("DATA={s}\\\\n", .{data});\\n'
+        '    if (init.minimal.environ.getAlloc(a, "FAKE_GAME_HANG")) |_| {\\n'
+        '        while (true) init.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};\\n'
+        '    } else |_| {}\\n'
         '}\\n')
     (target / "main.zig").write_text(body)
     print("FIXTURE_GENERATE", file=sys.stderr, flush=True)
@@ -143,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     home = base / "home"
     env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
-    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN"):
+    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN", "FAKE_GAME_HANG"):
         env.pop(knob, None)
     checks = 0
 
@@ -289,6 +294,27 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert order(entries, "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], entries
     text = result.stderr
     assert text.index("hook 'fixture-b/b-run-pre'") < text.index("labelle: running...") < text.index("hook 'fixture-a/a-run-post'"), text
+    assert "after-run hooks skipped" not in text, text
+
+    # ── run: the --timeout kill is not a clean exit ───────────────────────
+    # The watchdog reports exit 0 after killing the game (cli#390), which
+    # used to read as success and ran the publishing/cleanup `after run`
+    # hooks over a game that was stopped, not finished (Codex P2 on #420).
+    # The fixture game sleeps forever under FAKE_GAME_HANG, so the deadline
+    # is what ends it: the CLI still exits 0, the before hooks ran, no after
+    # hook did, and the skip is announced.
+    reset()
+    killed = run("run", "--timeout=2s", extra_env={"FAKE_GAME_HANG": "1"})
+    assert "labelle: timed out" in killed.stderr, killed.stderr
+    assert "labelle: after-run hooks skipped: the game was stopped by --timeout" in killed.stderr, killed.stderr
+    assert order(log(zig_out), "run") == [("before", "a-run-pre"), ("before", "b-run-pre")], log(zig_out)
+    assert "hook 'fixture-a/a-run-post'" not in killed.stderr and "hook 'fixture-b/b-run-post'" not in killed.stderr, killed.stderr
+    # The same game with the same deadline but no hang exits on its own well
+    # inside it: the deadline above is what ended the run, not the game.
+    reset()
+    inside = run("run", "--timeout=60s")
+    assert "labelle: timed out" not in inside.stderr and "after-run hooks skipped" not in inside.stderr, inside.stderr
+    assert order(log(zig_out), "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], log(zig_out)
 
     # ── run: an `after build` hook's output survives until launch ─────────
     # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs

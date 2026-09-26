@@ -285,13 +285,59 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     return 0;
 }
 
-/// The end of a `run` step: `after` hooks run only when the game exited 0
-/// (contract §6), and the feed is `done` only once they have. A failing
-/// hook's exit code replaces the game's.
-pub fn finishRun(site: *Site, after: []const Planned, output_dir: []const u8, code: u8) !u8 {
-    if (code == 0) {
-        const hook_code = try runPhase(site, after, .run, .after, output_dir);
-        if (hook_code != 0) return hook_code;
+/// How the core `run` step ended. A status of 0 alone does not mean the
+/// game ran to a clean end: the `--timeout` watchdog reports 0 after
+/// killing the game (cli#390), and a simulator or device launch returns
+/// while the app is still running. Only `exited_clean` is the success of
+/// contract §6 that lets a publishing or cleanup `after run` hook run
+/// (Codex P2 on #420); the CLI's exit status is `status()` either way.
+pub const RunOutcome = union(enum) {
+    /// The game process itself exited with status 0.
+    exited_clean,
+    /// The game process exited with this nonzero status (or was killed by a
+    /// signal, 128 + signal).
+    exited_error: u8,
+    /// The watchdog killed the game at the `--timeout` deadline.
+    timed_out,
+    /// The launch returned while the app runs elsewhere (`simctl launch`,
+    /// `adb shell am start`): its exit is never observed.
+    launched_detached,
+
+    pub fn fromExit(code: u8) RunOutcome {
+        return if (code == 0) .exited_clean else .{ .exited_error = code };
+    }
+
+    /// The CLI's exit status for this outcome.
+    pub fn status(self: RunOutcome) u8 {
+        return switch (self) {
+            .exited_error => |code| code,
+            .exited_clean, .timed_out, .launched_detached => 0,
+        };
+    }
+
+    fn skipReason(self: RunOutcome) []const u8 {
+        return switch (self) {
+            .exited_clean => unreachable,
+            .exited_error => "the game exited with an error",
+            .timed_out => "the game was stopped by --timeout",
+            .launched_detached => "the app was launched detached and is still running",
+        };
+    }
+};
+
+/// The end of a `run` step: `after` hooks run only when the game itself
+/// exited 0 (contract §6), and the feed is `done` only once they have. A
+/// failing hook's exit code replaces the game's. Every other outcome skips
+/// the hooks with one `labelle: after-run hooks skipped: <reason>` line
+/// (only when there are hooks to skip) and keeps the outcome's status.
+pub fn finishRun(site: *Site, after: []const Planned, output_dir: []const u8, outcome: RunOutcome) !u8 {
+    const code = outcome.status();
+    switch (outcome) {
+        .exited_clean => {
+            const hook_code = try runPhase(site, after, .run, .after, output_dir);
+            if (hook_code != 0) return hook_code;
+        },
+        else => if (after.len != 0) std.debug.print("labelle: after-run hooks skipped: {s}\n", .{outcome.skipReason()}),
     }
     if (site.reporter) |r| r.finishDone(code);
     return code;
@@ -561,3 +607,39 @@ test "provider hooks: each phase runs on a scratch arena that is freed on return
     try std.testing.expectEqual(@as(usize, 0), counting.live);
 }
 
+test "provider hooks: after-run hooks run only when the game itself exited clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const provider = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .run, "desktop", .after, &.{})});
+    const planned: Planned = .{ .provider = &provider, .hook = provider.meta.hooks[0], .qualified = "pkg/h" };
+    // No lock exists under this root: reaching the hook machinery at all is
+    // observable as `MissingProjectLock`, distinct from a skip.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(@import("config.zig").globalIo(), ".", a);
+    var site: Site = .{
+        .a = a,
+        .backing = std.testing.allocator,
+        .providers = &.{provider},
+        .root = root,
+        .cfg = .{ .name = "game" },
+        .target = "desktop",
+        .optimize = .Debug,
+        .progress = .off,
+        .reporter = null,
+        .host = .{ .zig = "/z", .cache_root = root, .global_cache = root, .packages = root },
+    };
+    const out = try std.fs.path.join(a, &.{ root, "zig-out" });
+    try std.testing.expectEqual(RunOutcome.exited_clean, RunOutcome.fromExit(0));
+    try std.testing.expectEqual(RunOutcome{ .exited_error = 7 }, RunOutcome.fromExit(7));
+    // A clean exit reaches the hook (and fails on the missing lock).
+    try std.testing.expectError(error.MissingProjectLock, finishRun(&site, &.{planned}, out, .exited_clean));
+    // Every other outcome skips it and keeps the outcome's status: the
+    // watchdog and a detached launch are exit 0 without being clean.
+    try std.testing.expectEqual(@as(u8, 0), try finishRun(&site, &.{planned}, out, .timed_out));
+    try std.testing.expectEqual(@as(u8, 0), try finishRun(&site, &.{planned}, out, .launched_detached));
+    try std.testing.expectEqual(@as(u8, 7), try finishRun(&site, &.{planned}, out, .{ .exited_error = 7 }));
+    // With no after hooks a clean exit is simply done.
+    try std.testing.expectEqual(@as(u8, 0), try finishRun(&site, &.{}, out, .exited_clean));
+}

@@ -1423,10 +1423,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `after` runs at each branch's success exit through
     // `provider_hooks.finishRun`, which also owns the terminal `done` record
     // so a `--progress=json` consumer never sees `done` before the hooks
-    // finished. After hooks never run on a nonzero game exit. The
-    // interactive `wasm serve` loop is the one exception in timing: its
-    // `done` record lands before the loop and the after hooks run only once
-    // the server returns.
+    // finished. After hooks never run unless the game itself exited 0 —
+    // not after a nonzero exit, not after the `--timeout` watchdog's kill
+    // (exit 0 for the CLI, cli#390) and not after a detached simulator or
+    // device launch (`provider_hooks.RunOutcome`). The interactive `wasm
+    // serve` loop is the one exception in timing: its `done` record lands
+    // before the loop and the after hooks run only once the server returns.
     const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, hook_target, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.run.before, .run, .before, run_out);
@@ -1435,7 +1437,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     if (hook_plans.run.replace) |replacement| {
         const code = try provider_hooks.runPhase(&hook_site, &.{replacement}, .run, .replace, run_out);
         if (code != 0) return code;
-        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
+        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, .exited_clean);
     }
     if (parsed.platform == .wasm) {
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
@@ -1459,10 +1461,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 .zip = parsed_args.export_zip,
                 .platform = parsed_args.export_pkg_platform,
             });
-            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
+            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, .exited_clean);
         } else {
             // WASM serve: the loop is interactive (runs until Ctrl+C), so
-            // the terminal `done` record lands before the serve loop.
+            // the terminal `done` record lands before the serve loop. The
+            // loop returns on Ctrl+C / SIGTERM (`serve.serveAndOpen`
+            // installs the handler), which is how the `after run` hooks
+            // below become reachable at all (Codex P2 on #420).
             if (reporter) |r| r.finishDone(0);
             if (parsed_args.serve_watch) {
                 // `--watch` (cli#208): hand the serve loop a rebuild callback
@@ -1529,7 +1534,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to iOS Simulator");
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
         try ios.deployToSimulator(allocator, target_dir, parsed);
-        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
+        // `simctl launch` returns while the app runs on: its exit is never
+        // seen here, so this is not the clean exit after hooks wait for.
+        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, .launched_detached);
     } else if (parsed.platform == .android) {
         // Android: deploy to device/emulator
         if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to Android");
@@ -1546,7 +1553,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{}, .{
             .strip_native = android.stripForOptimize(effective_optimize),
         }, launch_extras.items);
-        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
+        // `am start` likewise returns with the app still running.
+        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, .launched_detached);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
@@ -1658,16 +1666,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
             if (reporter) |r| r.beginPhaseOrStep(.run, exe_name);
             noteRunSharesStdout(reporter);
-            const run_result = try runner.runZigInheritWithEnv(allocator, project_dir, run_args.items, timeout_ns, env_map_ptr);
-            if (run_result != 0) {
-                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+            const run_outcome = runOutcome(try runner.runInheritTerm(allocator, project_dir, run_args.items, timeout_ns, env_map_ptr));
+            if (run_outcome == .exited_error) {
+                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_outcome.status()});
             }
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record, and it is
             // also the CLI's exit status (cli#390). After hooks run first,
-            // and only on a clean exit.
-            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_result);
+            // and only when the game itself exited clean — never after the
+            // watchdog's kill, which is also exit 0.
+            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_outcome);
         } else {
             // Run the game BINARY DIRECTLY rather than via `zig build run`.
             // `zig build run` launches the game in its own child process
@@ -1719,16 +1728,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
             if (reporter) |r| r.beginPhaseOrStep(.run, exe_basename);
             noteRunSharesStdout(reporter);
-            const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, run_args.items, timeout_ns, env_map_ptr);
-            if (run_result != 0) {
-                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_result});
+            const run_outcome = runOutcome(try runner.runInheritTerm(allocator, target_dir, run_args.items, timeout_ns, env_map_ptr));
+            if (run_outcome == .exited_error) {
+                std.debug.print("\nlabelle: process exited with code {d}\n", .{run_outcome.status()});
             }
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record, and it is
             // also the CLI's exit status (cli#390). After hooks run first,
-            // and only on a clean exit.
-            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_result);
+            // and only when the game itself exited clean — never after the
+            // watchdog's kill, which is also exit 0.
+            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_outcome);
         }
     }
 }
@@ -1769,6 +1779,14 @@ const FileStamp = struct {
 
 /// The `labelle run` options that reach the game as `LABELLE_*` variables on
 /// every platform (env block on desktop, intent extras on Android — cli#397).
+/// The `run` outcome a launched game's termination stands for.
+fn runOutcome(term: runner.Termination) provider_hooks.RunOutcome {
+    return switch (term) {
+        .exited => |code| provider_hooks.RunOutcome.fromExit(code),
+        .timed_out => .timed_out,
+    };
+}
+
 fn runOptionEnv(parsed_args: *const ParsedArgs) runner.RunOptionEnv {
     return .{
         .scene = parsed_args.scene_override,
