@@ -2389,6 +2389,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             .resolved => |resolved| resolved,
             .refused => return 1,
         };
+        const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
+        if (refuseLegacyWasmReplacement(no_build_plan)) return 1;
         const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
         defer allocator.free(wasm_target);
         const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
@@ -2407,9 +2409,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
 
-        // The run hooks are planned from the same discovery (`known`) the
-        // served target was just confirmed against, for the served name.
-        const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
         // The same wire `optimize` the building path reports for this
         // platform; there is no progress feed on this path.
         const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {
@@ -2659,6 +2658,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
         .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
     };
+    if (command == .wasm_cmd and refuseLegacyWasmReplacement(hook_plans.run)) {
+        if (reporter) |r| r.finishFailed(1, "legacy wasm command conflicts with a provider run replacement");
+        return 1;
+    }
     // The labelle-assembler#378 boundary: the assembler generates only for
     // the schema platforms, so a provider target outside that enum can be
     // generated for only by its provider's `replace` hook on `generate`.
@@ -3529,6 +3532,18 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_outcome);
         }
     }
+}
+
+/// Legacy wasm verbs share the run phase but have their own arguments and
+/// export semantics. A replacement cannot receive those through hook context.
+fn refuseLegacyWasmReplacement(plan: provider_hooks.Plan) bool {
+    const replacement = plan.replace orelse return false;
+    std.debug.print(
+        "labelle: legacy `wasm serve/export` cannot invoke run replacement '{s}'\n" ++
+            "  use the provider commands listed by `labelle help`, or `labelle run/bundle --platform=wasm`.\n",
+        .{replacement.qualified},
+    );
+    return true;
 }
 
 /// The `--target` of a `run --docker` whose launch is skipped: a

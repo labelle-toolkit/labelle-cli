@@ -326,3 +326,13 @@ macOS, and the refusal elsewhere. `test/provider_github_e2e.py` checks that `--a
 broken hook graph without writing the lock. Provider-target resolution and
 bundling are covered by `test/provider_targets_e2e.py`. CI runs them on
 Windows, macOS and Linux.
+
+## Legacy wasm commands
+
+`labelle wasm serve/export` historically shares the `run` phase. When a pinned
+provider declares a run replacement, both legacy verbs are refused before
+generation or hooks (also with `--no-build`). This prevents export from starting
+a server and prevents serve flags from being silently discarded. Use the
+provider's namespaced commands shown by `labelle help`, or the generic
+`labelle run/bundle --platform=wasm` pipeline. Existing before/after hooks around
+the legacy implementation continue to work when no run replacement exists.

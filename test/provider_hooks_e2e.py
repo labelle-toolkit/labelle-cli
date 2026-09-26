@@ -453,6 +453,19 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     reset()
 
+    # A provider server replacement must never turn legacy export into serve,
+    # or silently discard the old serve flags. Refuse before any hook/build.
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS + [hook("web-server", "run", "replace", target="wasm")], targets=["wasm"]))
+    for verb in ("serve", "export"):
+        for flags in (("--no-build",), ()):
+            refused = run("wasm", verb, *flags, code=1)
+            assert "legacy `wasm serve/export`" in refused.stderr, refused.stderr
+            assert "fixture-a/web-server" in refused.stderr, refused.stderr
+            assert "FIXTURE_GENERATE" not in refused.stderr and "WASM Export Complete" not in refused.stderr, refused.stderr
+            assert not log(wasm_target_dir / "zig-out"), "a hook ran before migration refusal"
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+    reset()
+
     # ── run: an `after build` hook's output survives until launch ─────────
     # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs
     # from source. The game prints the file it finds at launch: with the
