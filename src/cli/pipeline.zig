@@ -1028,7 +1028,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // from an earlier build, which is worse than no atlas because it looks
     // like it worked. So a config error stops the build, while a conversion
     // failure still degrades to PNG.
-    if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
+    //
+    // Only for a target the capability tables know (`provisional.legacy`:
+    // `desktop` or a schema-named provider target). A provider target
+    // outside the enum has `parsed.platform` derived as `.desktop` for the
+    // legacy sites, but it is NOT the desktop target: running the desktop
+    // prepass for it would encode ASTC siblings by desktop capabilities for
+    // a provider's own `generate` to pick up (Codex on #421). Its provider
+    // owns its asset pipeline; `cmdAstc` itself refuses such a name.
+    if (provisional.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
         // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
         // sokol) and the Android backend fallback all differ from what
         // project.labelle declares, and the loadable blocks depend on both.
