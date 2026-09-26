@@ -525,6 +525,9 @@ pub fn exeNameFromBuildZig(source: []const u8) ?[]const u8 {
 
 /// The built desktop executable: `name` (what `CFBundleExecutable` gets)
 /// and its `path` under `<target>/zig-out/bin/`. Both owned.
+/// Suffix Zig gives the host-built game executable (`.exe` on Windows).
+const exe_ext = builtin.target.exeFileExt();
+
 pub const ResolvedExe = struct {
     name: []u8,
     path: []u8,
@@ -552,9 +555,6 @@ pub const ResolvedExe = struct {
 /// something the build didn't produce) fall back to probing the two
 /// candidates, and then prefer the MOST RECENTLY MODIFIED one — the one
 /// the build just wrote.
-/// Suffix Zig gives the host-built game executable (`.exe` on Windows).
-const exe_ext = builtin.target.exeFileExt();
-
 pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, project_name: []const u8) !ResolvedExe {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -573,7 +573,7 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
             const path = try std.fs.path.join(allocator, &.{ bin_dir, declared });
             errdefer allocator.free(path);
             if (util.fileExists(path)) {
-                return .{ .name = try allocator.dupe(u8, declared), .path = path };
+                return .{ .name = try allocator.dupe(u8, declared_name), .path = path };
             }
             allocator.free(path);
         }
@@ -596,7 +596,7 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
         };
         if (best == null or st.mtime.nanoseconds > best_mtime) {
             if (best) |b| b.deinit(allocator);
-            best = .{ .name = try allocator.dupe(u8, cand), .path = path };
+            best = .{ .name = try allocator.dupe(u8, cand_name), .path = path };
             best_mtime = st.mtime.nanoseconds;
         } else {
             allocator.free(path);
