@@ -26,9 +26,13 @@ manifest = '''.{ .name = "fixture", .manifest_version = 2,
  .executable = "bin/provider-probe", .help = "Inspect" } } }'''
 checks = 0
 
-def archive(revision="original", extra=None, text=manifest):
+def archive(revision="original", extra=None, text=manifest, before=None):
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        if before:
+            info, content = before
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
         files = {p.name: p.read_bytes() for p in fixture.glob("*.zig")}
         files["plugin.labelle"] = text.encode()
         files["revision.zig"] = f'pub const value = "{revision}";\n'.encode()
@@ -174,12 +178,19 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
         ("fixture-commit/MAIN.ZIG", None, "DuplicateProviderArchivePath"),
         ("fixture-commit/ä.zig", None, "NonAsciiProviderArchivePath"),
         ("fixture-commit/ctrl\x01.zig", None, "ControlCharProviderArchivePath"),
+        # Regular file main.zig first, then an entry below its case-folded name.
+        ("fixture-commit/MAIN.ZIG/x.zig", None, "CaseFoldedProviderArchiveFileDirConflict"),
+        # The reverse order: an entry below Build.zig/ precedes the file build.zig.
+        ("fixture-commit/Build.zig/x.zig", "before", "CaseFoldedProviderArchiveFileDirConflict"),
     ):
         member = tarfile.TarInfo(name)
-        if kind:
-            member.type = kind
-            member.linkname = "../../escape"
-        unsafe_data = archive(extra=(member, b""))
+        if kind == "before":
+            unsafe_data = archive(before=(member, b""))
+        else:
+            if kind:
+                member.type = kind
+                member.linkname = "../../escape"
+            unsafe_data = archive(extra=(member, b""))
         unsafe_pin = dict(pin, sha256=hashlib.sha256(unsafe_data).hexdigest())
         seed(unsafe_pin, unsafe_data)
         metadata([unsafe_pin])
@@ -237,4 +248,21 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     metadata([updated, updated])
     assert "DuplicateProviderRelease" in resolve(code=1).stderr
     assert not preview.exists() and json.loads(lock.read_text())["providers"] == [updated]
+    # The lock rename is the accept's commit point: a preview that cannot be
+    # removed afterwards (read-only .labelle) is a warning, not a failed exit,
+    # so exit status and lock state agree (#418). POSIX permissions only.
+    if os.name != "nt" and os.geteuid() != 0:
+        config([pin])
+        metadata([pin])
+        resolve()
+        labelle_dir = preview.parent
+        labelle_dir.chmod(0o555)
+        try:
+            err = resolve("--accept").stderr
+        finally:
+            labelle_dir.chmod(0o755)
+        assert "could not be removed" in err and "Pinned 1" in err, err
+        assert json.loads(lock.read_text())["providers"] == [pin], "exit 0 but the new lock is not in place"
+        assert preview.exists(), "the removal fault did not fire"
+        cleaned()
     print(f"GitHub provider pins: {checks} real CLI invocations passed")
