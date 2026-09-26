@@ -331,7 +331,10 @@ Windows, macOS and Linux.
 
 `labelle wasm serve/export` historically shares the `run` phase. When a pinned
 provider declares a run replacement, both legacy verbs are refused before
-generation or hooks (also with `--no-build`). This prevents export from starting
+generation or hooks (also with `--no-build`). Known declarations are checked
+before project prebuild commands; post-install discovery checks again for newly
+available providers. Watched manifest edits are checked before prebuild and
+before replacing the active plans, keeping the last good plans on refusal. This prevents export from starting
 a server and prevents serve flags from being silently discarded. Use the
 provider's namespaced commands shown by `labelle help`, or the generic
 `labelle run/bundle --platform=wasm` pipeline. Existing before/after hooks around
