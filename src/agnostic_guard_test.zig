@@ -274,11 +274,14 @@ const Tokenizer = struct {
             // never a substring such as UIKit in UIKitten or UIKithelper.
             var end = start + 1;
             while (end <= self.run_end and end - start <= max_word_len) : (end += 1) {
-                if (end != self.run_end and !splitsBefore(self.text, start, end)) continue;
-                if (classifyExact(self.text[start..end])) |word| {
-                    self.pos = end;
-                    return word;
-                }
+                if (classifyExact(self.text[start..end]) == null) continue;
+                // Versions may follow the compound before the boundary.
+                var boundary = end;
+                while (boundary < self.run_end and std.ascii.isDigit(self.text[boundary])) boundary += 1;
+                if (boundary != self.run_end and !splitsBefore(self.text, start, boundary)) continue;
+                self.pos = boundary;
+                // Preserve exact entries such as sdl2 over the sdl root.
+                return classify(self.text[start..boundary]);
             }
             self.pos += 1;
             while (self.pos < self.run_end and !splitsBefore(self.text, start, self.pos)) self.pos += 1;
@@ -409,6 +412,9 @@ test "RFC provider tools and SDK identities flag in commands paths and identifie
     try expectWords("zig cc clang git SDK tool compiler publisher device build macos windows linux", &.{});
     try expectWords("butlers uikits steamcmdline xcodebuilder adblock emcclib", &.{});
     try expectWords("getUIKitPath UIKitGlue UIKitten UIKithelper UIKeyboard Toolkit", &.{ "uikit", "uikit" });
+    // Compound SDK names retain the same numeric-suffix rule as one piece.
+    try expectWords("UIKit2Glue getUIKit123456789012345Path LibSDL2Package", &.{ "uikit", "uikit", "libsdl2" });
+    try expectWords("UIKit2helper UIKitten2Glue LibPNG2Package", &.{});
 }
 
 test "the tokenizer splits CamelCase at case transitions and acronym boundaries" {
