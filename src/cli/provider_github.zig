@@ -207,6 +207,12 @@ fn validateTar(a: std.mem.Allocator, bytes: []const u8) !void {
     while (try it.next()) |entry| {
         if (entry.kind == .sym_link) return error.ProviderArchiveLinkNotSupported;
         if (!safeArchivePath(entry.name)) return error.UnsafeProviderArchivePath;
+        // The duplicate check below folds ASCII case only; case-insensitive
+        // hosts also fold non-ASCII letters, so such paths are not portable.
+        for (entry.name) |c| if (!std.ascii.isAscii(c)) {
+            std.debug.print("provider archive entry '{s}' contains non-ASCII bytes; archive paths must be ASCII\n", .{entry.name});
+            return error.NonAsciiProviderArchivePath;
+        };
         const trimmed = std.mem.trimEnd(u8, entry.name, "/");
         const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse trimmed.len;
         if (root) |r| {
@@ -325,4 +331,24 @@ test "provider github: immutable GitHub identity and strict document" {
     try std.testing.expect(!safeArchivePath("root/C:/evil"));
     try std.testing.expect(!safeArchivePath("root/evil\\escape"));
     try std.testing.expect(safeArchivePath("repo-sha/src/main.zig"));
+}
+
+fn testArchive(a: std.mem.Allocator, file: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    var tar: std.tar.Writer = .{ .underlying_writer = &aw.writer };
+    try tar.setRoot("repo-sha");
+    try tar.writeFileBytes("plugin.labelle", "", .{});
+    try tar.writeFileBytes(file, "", .{});
+    try tar.finishPedantically();
+    return aw.toOwnedSlice();
+}
+
+test "provider github: non-ASCII archive paths are rejected by their own rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The ASCII twin passes every other check, so only the byte range differs.
+    try validateTar(a, try testArchive(a, "src/a.zig"));
+    try std.testing.expectError(error.NonAsciiProviderArchivePath, validateTar(a, try testArchive(a, "src/ä.zig")));
+    try std.testing.expectError(error.NonAsciiProviderArchivePath, validateTar(a, try testArchive(a, "src/Ä.zig")));
 }

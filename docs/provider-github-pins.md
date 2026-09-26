@@ -47,8 +47,12 @@ content. If GitHub serves different bytes for that commit, verification still
 fails. Do not simply substitute the newly observed hash into a trusted record.
 
 Archives must be self-contained: one directory root, regular files/directories,
-no symlinks, hardlinks, path traversal or conflicting portable filenames. The
-CLI limits compressed input to 128 MiB and expanded tar data to 512 MiB.
+no symlinks, hardlinks, path traversal or conflicting portable filenames. Entry
+paths must be plain ASCII: case-insensitive filesystems also fold non-ASCII
+letters (`Ä.zig` and `ä.zig` collide), the CLI only compares ASCII case, and
+provider archives are source trees, so any non-ASCII byte in a path is
+rejected. The CLI limits compressed input to 128 MiB and expanded tar data to
+512 MiB.
 
 Compiler and Zig package dependencies must already be prepared. The project
 compiler pin is checked and the host install step uses `--system` to disable

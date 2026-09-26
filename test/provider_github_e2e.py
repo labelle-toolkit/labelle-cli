@@ -128,7 +128,15 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     cleaned()
     config([pin])
     # Unsafe archives fail even when their compressed SHA-256 matches the pin.
-    for name, kind in (("fixture-commit/../escape.zig", None), ("fixture-commit/link", tarfile.SYMTYPE), ("other-root/file.zig", None), ("fixture-commit/CON", None), ("fixture-commit/MAIN.ZIG", None)):
+    # Each entry names the rule that rejects it, so a stricter earlier check cannot mask a broken later one.
+    for name, kind, reason in (
+        ("fixture-commit/../escape.zig", None, "UnsafeProviderArchivePath"),
+        ("fixture-commit/link", tarfile.SYMTYPE, "ProviderArchiveLinkNotSupported"),
+        ("other-root/file.zig", None, "MultipleProviderArchiveRoots"),
+        ("fixture-commit/CON", None, "UnsafeProviderArchivePath"),
+        ("fixture-commit/MAIN.ZIG", None, "DuplicateProviderArchivePath"),
+        ("fixture-commit/ä.zig", None, "NonAsciiProviderArchivePath"),
+    ):
         member = tarfile.TarInfo(name)
         if kind:
             member.type = kind
@@ -137,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
         unsafe_pin = dict(pin, sha256=hashlib.sha256(unsafe_data).hexdigest())
         seed(unsafe_pin, unsafe_data)
         metadata([unsafe_pin])
-        resolve("--accept", code=1)
+        assert reason in resolve("--accept", code=1).stderr, name
         assert lock.read_bytes() == old_lock
         assert not (base / "escape.zig").exists()
         cleaned()
