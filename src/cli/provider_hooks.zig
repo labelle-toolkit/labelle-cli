@@ -120,12 +120,26 @@ pub fn validateAll(a: std.mem.Allocator, providers: []const dispatch.Provider, u
             }
         }
     }
-    // Same-phase cycles: order every phase group the way `plan` will.
-    for (entries) |entry| {
+    // Same-phase cycles: order every DISTINCT `(step, target, phase)` group
+    // once, the way `plan` will. Ordering the group of every entry ran the
+    // quadratic sort N times for N hooks in one phase — cubic work with
+    // every temporary left on the discovery arena, enough for a manifest
+    // within the 1 MiB limit to stall `help` and every build (Codex P2 on
+    // #420). `visited` holds one representative per group already ordered.
+    var visited: std.ArrayList(Planned) = .empty;
+    entries_loop: for (entries) |entry| {
+        for (visited.items) |seen| {
+            if (sameSlot(seen.hook, entry.hook) and seen.hook.when == entry.hook.when) continue :entries_loop;
+        }
+        try visited.append(a, entry);
         const group = try select(a, entries, entry.hook.step, entry.hook.target, entry.hook.when);
         _ = try orderPhase(a, group);
     }
 }
+
+/// How many times `orderPhase` ran. A test seam only: the count is what
+/// proves validation orders each group once rather than once per hook.
+var order_phase_calls: usize = 0;
 
 fn select(a: std.mem.Allocator, entries: []const Planned, step: contract.Step, target: []const u8, phase: contract.Phase) ![]Planned {
     var list: std.ArrayList(Planned) = .empty;
@@ -141,6 +155,7 @@ fn select(a: std.mem.Allocator, entries: []const Planned, step: contract.Step, t
 /// the `after_hooks` references that land inside `group`; references to an
 /// earlier phase are satisfied by the phase order and create no edge.
 fn orderPhase(a: std.mem.Allocator, group: []const Planned) ![]Planned {
+    if (builtin.is_test) order_phase_calls += 1;
     const n = group.len;
     const done = try a.alloc(bool, n);
     @memset(done, false);
@@ -242,6 +257,10 @@ pub const Site = struct {
     /// observe which allocator a hook invocation receives without a host
     /// compiler; production never overrides it.
     run_tool: *const fn (std.mem.Allocator, dispatch.Host, []const u8, dispatch.Provider, contract.Tool, dispatch.ToolRun) anyerror!u8 = dispatch.runTool,
+    /// The host-compiler resolver. A field only so the pin-order test below
+    /// can observe that an unpinned provider never reaches it; production
+    /// never overrides it.
+    resolve_host: *const fn (std.mem.Allocator, []const u8) anyerror!dispatch.Host = dispatch.resolveHost,
 };
 
 /// Run one phase of a plan in order, stopping at the first failure. Returns
@@ -255,11 +274,18 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     var scratch = std.heap.ArenaAllocator.init(site.backing);
     defer scratch.deinit();
     const a = scratch.allocator();
-    if (site.host == null) site.host = try dispatch.resolveHost(site.a, site.root);
+    // Every hook's pin is checked BEFORE the host compiler is resolved, as
+    // the command path does (`dispatch.dispatch`): resolving first
+    // ran `zig version` and created cache directories, and on a machine
+    // without the pinned compiler an unpinned remote hook was reported as
+    // `ProviderCompilerMissing` — "install Zig" — instead of the integrity
+    // failure that is the actual problem (Codex P2 on #420).
+    const locks = try a.alloc([]const u8, list.len);
+    for (list, locks) |planned, *lock| lock.* = try dispatch.requirePinned(a, site.root, planned.provider.*);
+    if (site.host == null) site.host = try site.resolve_host(site.a, site.root);
     const output = try dispatch.canonicalDir(a, output_dir);
-    for (list) |planned| {
+    for (list, locks) |planned, lock| {
         const provider = planned.provider.*;
-        const lock = try dispatch.requirePinned(a, site.root, provider);
         const settings = try dispatch.resolveSettings(a, site.root, site.cfg, site.providers, provider.meta.name);
         if (site.reporter) |r| r.beginPhaseOrStep(progressPhase(step), try std.fmt.allocPrint(a, "hook {s}", .{planned.qualified}));
         std.debug.print("labelle: running {s} hook '{s}' for {s} ({s})\n", .{ @tagName(phase), planned.qualified, @tagName(step), site.target });
@@ -452,6 +478,107 @@ test "provider hooks: cross-provider graph errors" {
     // A well-formed pair passes, so the errors above are the rules firing.
     const good = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .bundle, "probe-target", .after, &.{"other/late"})});
     try validateAll(a, &.{ other, good }, &.{});
+}
+
+test "provider hooks: validation orders each (step, target, phase) group once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Six hooks in ONE group (`after build desktop`) across two providers,
+    // plus one hook in a second group, so the count distinguishes "once per
+    // group" (2) from "once per hook" (7).
+    const many = Fixture.provider("many", &.{}, &.{
+        Fixture.hook("h1", .build, "desktop", .after, &.{}),
+        Fixture.hook("h2", .build, "desktop", .after, &.{"many/h1"}),
+        Fixture.hook("h3", .build, "desktop", .after, &.{"many/h2"}),
+        Fixture.hook("h4", .build, "desktop", .after, &.{}),
+    });
+    const more = Fixture.provider("more", &.{}, &.{
+        Fixture.hook("h5", .build, "desktop", .after, &.{"many/h4"}),
+        Fixture.hook("h6", .build, "desktop", .after, &.{}),
+        Fixture.hook("solo", .generate, "desktop", .before, &.{}),
+    });
+    const providers = [_]dispatch.Provider{ many, more };
+    order_phase_calls = 0;
+    try validateAll(a, &providers, &.{});
+    try std.testing.expectEqual(@as(usize, 2), order_phase_calls);
+    // The result is unchanged: the plan is the same topological order the
+    // per-hook validation produced.
+    const p = try plan(a, &providers, .build, "desktop");
+    try std.testing.expectEqualStrings("many/h1 many/h2 many/h3 many/h4 more/h5 more/h6", try Fixture.ids(a, p.after));
+    try std.testing.expectEqualStrings("more/solo", try Fixture.ids(a, (try plan(a, &providers, .generate, "desktop")).before));
+    // The one ordering still sees the whole group: a cycle among later
+    // members of it is caught, so the dedup did not skip validation.
+    const looped = Fixture.provider("more", &.{}, &.{
+        Fixture.hook("h5", .build, "desktop", .after, &.{"more/h6"}),
+        Fixture.hook("h6", .build, "desktop", .after, &.{"more/h5"}),
+    });
+    order_phase_calls = 0;
+    try std.testing.expectError(error.HookCycle, validateAll(a, &.{ many, looped }, &.{}));
+    try std.testing.expectEqual(@as(usize, 1), order_phase_calls);
+}
+
+test "provider hooks: an unpinned provider is refused before the host compiler is resolved" {
+    const io = @import("config.zig").globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "project");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // The lock names the remote provider exactly, so the pin check reaches
+    // the integrity rule rather than failing on the lock itself.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/labelle.lock",
+        .data = ".{ .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
+    });
+    const Spy = struct {
+        var host_calls: usize = 0;
+        var tool_calls: usize = 0;
+        fn resolve(_: std.mem.Allocator, r: []const u8) anyerror!dispatch.Host {
+            host_calls += 1;
+            return .{ .zig = "/z", .cache_root = r, .global_cache = r, .packages = r };
+        }
+        fn run(_: std.mem.Allocator, _: dispatch.Host, _: []const u8, _: dispatch.Provider, _: contract.Tool, _: dispatch.ToolRun) anyerror!u8 {
+            tool_calls += 1;
+            return 0;
+        }
+    };
+    // Production wiring: the default resolver IS the real one.
+    try std.testing.expect((std.meta.fieldInfo(Site, .resolve_host).defaultValue() orelse return error.TestUnexpectedResult) == dispatch.resolveHost);
+    var unpinned = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .build, "desktop", .after, &.{})});
+    unpinned.dep.repo = "example/pkg";
+    unpinned.verified = false;
+    const planned: Planned = .{ .provider = &unpinned, .hook = unpinned.meta.hooks[0], .qualified = "pkg/h" };
+    var site: Site = .{
+        .a = a,
+        .backing = std.testing.allocator,
+        .providers = &.{unpinned},
+        .root = root,
+        .cfg = .{ .name = "game" },
+        .target = "desktop",
+        .optimize = .Debug,
+        .progress = .off,
+        .reporter = null,
+        .run_tool = Spy.run,
+        .resolve_host = Spy.resolve,
+    };
+    const out = try std.fs.path.join(a, &.{ root, "zig-out" });
+    try std.testing.expectError(error.RemoteProviderIntegrityRequired, runPhase(&site, &.{planned}, .build, .after, out));
+    try std.testing.expectEqual(@as(usize, 0), Spy.host_calls);
+    try std.testing.expectEqual(@as(usize, 0), Spy.tool_calls);
+    try std.testing.expect(site.host == null);
+    // The same provider, pinned: the resolver is reached exactly once and
+    // the hook runs — so the zero above is the pin check firing first, not
+    // the resolver being unreachable.
+    var pinned = unpinned;
+    pinned.verified = true;
+    const planned_ok: Planned = .{ .provider = &pinned, .hook = pinned.meta.hooks[0], .qualified = "pkg/h" };
+    site.providers = &.{pinned};
+    try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned_ok}, .build, .after, out));
+    try std.testing.expectEqual(@as(usize, 1), Spy.host_calls);
+    try std.testing.expectEqual(@as(usize, 1), Spy.tool_calls);
 }
 
 test "provider hooks: step output directories follow the layout contract" {
