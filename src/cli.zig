@@ -57,6 +57,7 @@ const migrate = @import("cli/migrate.zig");
 const check = @import("cli/check.zig");
 const plugins = @import("cli/plugins.zig");
 const provider_dispatch = @import("cli/provider_dispatch.zig");
+const provider_github = @import("cli/provider_github.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
 const bundle = @import("cli/bundle.zig");
@@ -78,6 +79,39 @@ const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const pipeline = @import("cli/pipeline.zig");
 
 /// Handle `labelle assembler <subcommand>`.
+fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
+    const usage = "Usage: labelle providers resolve [providers.json] [--accept] [--offline]\n";
+    const sub = args.next() orelse {
+        std.debug.print("{s}", .{usage});
+        return 0;
+    };
+    if (std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h")) {
+        std.debug.print("{s}", .{usage});
+        return 0;
+    }
+    if (!std.mem.eql(u8, sub, "resolve")) return error.UnknownProviderOperation;
+    var source: ?[]const u8 = null;
+    var accept = false;
+    var offline = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print("{s}", .{usage});
+            return 0;
+        }
+        if (std.mem.eql(u8, arg, "--accept")) {
+            accept = true;
+        } else if (std.mem.eql(u8, arg, "--offline")) {
+            offline = true;
+        } else if (std.mem.startsWith(u8, arg, "-") or source != null) return error.InvalidProviderArguments else source = arg;
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try provider_dispatch.projectRoot(a) orelse return error.ProjectRequired;
+    try provider_github.resolve(a, root, source orelse provider_github.registry_url, accept, offline, &provider_dispatch.reserved);
+    return 0;
+}
+
 fn handleAssemblerCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
     if (cmd_args.len == 0 or std.mem.eql(u8, cmd_args[0], "list")) {
         return assembler.cmdListAssemblers(allocator);
@@ -138,6 +172,12 @@ pub fn main(proc_init: std.process.Init) !u8 {
     }
 
     if (first_arg) |first| {
+        if (std.mem.eql(u8, first, "providers")) {
+            return providerCommand(allocator, &args) catch |err| {
+                std.debug.print("labelle: provider resolution failed: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+        }
         if (std.mem.eql(u8, first, "generate") or std.mem.eql(u8, first, "build")) {
             parsed_args.command = if (std.mem.eql(u8, first, "generate")) .generate else .build;
             // A usage error must exit NON-ZERO so a CI step cannot read a

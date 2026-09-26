@@ -1,6 +1,6 @@
 # Project-local provider dispatch — phase 2, first slice
 
-This is the first executable part of phase 2 of CLI #406, stacked on the
+This documents the first executable part of phase 2 of CLI #406, stacked on the
 [v1 contract](provider-contract-v1.md). **Phase 2 is not complete.** This slice
 lets a project's explicitly declared local package expose a host command. It
 does not migrate Android/web commands or change the core target/backend enums.
@@ -27,8 +27,10 @@ records reject unknown fields rather than silently discarding misspellings.
 Execution requires an existing `labelle.lock` whose plugin name, repo and
 version match the project declaration exactly. Local `local:`/`@` references
 are explicit development inputs and intentionally follow local edits.
-Remote commands fail with `RemoteProviderIntegrityRequired`: the existing
-plugin lock's name/version records are not archive integrity pins.
+Remote commands now use the companion GitHub integrity lock described in
+[GitHub provider pins](provider-github-pins.md). Commands without integrity pins
+still fail with `RemoteProviderIntegrityRequired`; ordinary name/version records
+alone never authorize remote execution.
 
 ## Host build and cache
 
@@ -65,9 +67,8 @@ provider must treat its context as read-only. Its exit status is preserved.
 
 ## Remaining phase-2 work
 
-- Archive integrity records, verified remote graph resolution, and complete
-  index/global-lock schema validation. Never enable remote execution using
-  only the old name/version lock records.
+- GitHub archive integrity records and explicit project resolution are now
+  implemented. Projectless/global pin handling remains later work.
 - The shared CLI/assembler `provider_config` schema and contained-file mapping.
   This slice explicitly rejects nonempty mappings instead of silently ignoring
   settings. Configuration cannot yet be used in a game pipeline.

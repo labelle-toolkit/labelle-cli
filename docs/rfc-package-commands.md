@@ -14,7 +14,7 @@ Let packages contribute CLI commands and lifecycle hooks, the way gems contribut
 
 **Mandate: the CLI is agnostic.** Apart from the host desktop target (see [Core scope](#core-scope)), the CLI source contains no platform, store or package name. This is the assembler's agnosticism mandate (labelle-assembler#378 and #619) applied to the CLI.
 
-This RFC specifies the architecture and migration order. [Provider contract v1](provider-contract-v1.md) supplies the normative wire format, installed-tool convention, configuration and registry records, consent rules, and migration details. Its validators are the phase-1 foundation; command execution is not implemented yet.
+This RFC specifies the architecture and migration order. [Provider contract v1](provider-contract-v1.md) supplies the normative wire format, installed-tool convention, configuration and registry records, consent rules, and migration details. Local and GitHub-pinned project commands are implemented in the phase-2 slices; platform extraction and projectless bootstrap remain later work.
 
 ## Problem
 
@@ -139,7 +139,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…`, which packages
   - With that in place, package commands add no new trust boundary inside a project. Until then, this claim does not hold.
 - **Trust, outside a project:** there is no project pin, so the index is a new trust boundary.
   - Index entries carry a content hash for each release. The CLI verifies the fetched archive against it before building, as `zig fetch` does.
-  - The index is served over HTTPS from the same origin as CLI releases and is written only by the providers' release workflows.
+  - The manifest is read directly over HTTPS from the labelle-registry GitHub repository and changed through reviewed pull requests. Provider archives come from exact GitHub commits and are verified against committed hashes.
   - The first time an unpinned package would be used, the CLI asks for confirmation **before invoking anything from the package, including its `build.zig`**, since compiling the tool already runs provider code. The prompt shows the package, version, source URL and content hash. `--yes` (for CI) answers this same pre-build prompt; there is no later or separate consent step.
   - Once confirmed, record the exact provider/dependency/compiler identities and approved hashes in the global lock. Verify later execution against that lock. Hash mismatch is fatal; normal execution never approves replacement bytes. Only an explicitly scoped global-provider update may change pins, after verification/preparation and atomic publication. CLI self-update never changes provider pins.
   - Signing releases (beyond hash integrity) is an open question.
@@ -147,7 +147,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…`, which packages
 ## Resolution
 
 - **Inside a project:** providers come from `project.labelle` and `labelle.lock`, so each project gets the versions it's locked to, like a Gemfile.
-- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches the **newest release whose `command_contract` range includes this CLI's contract version**. Its latest release is used only if it's compatible, so an older CLI keeps working after a provider moves to the next contract major. There is no list of names in the code. Each index entry also publishes, per release, the provider's commands with their `needs_project` flags, so the CLI can refuse a project-only command **before** fetching anything. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
+- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches the **newest release whose `command_contract` range includes this CLI's contract version**. Its latest release is used only if it's compatible, so an older CLI keeps working after a provider moves to the next contract major. There is no list of names in the code. Projectless discovery remains future work. Command declarations and `needs_project` come from verified package manifests; metadata/source fetching must never imply consent to execute package code. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
 - **Dispatch order in `src/cli.zig`:**
   1. built-in commands;
   2. package namespaces;
@@ -201,7 +201,7 @@ The guard's allowlist shrinks at every step, and after platform and backend-iden
 - Explicitly migrated projects run with pinned providers; unmigrated configurations fail clearly without legacy forwarding or implicit package injection.
 - A provider whose `command_contract` excludes the CLI's version fails at resolve time, naming both versions, and nothing is built or run.
 - A projectless command verifies the archive hash and asks for confirmation before its first run.
-- A project-only command run outside a project fails from index metadata alone, before any fetch.
+- A project-only command run outside a project fails before any package build or execution.
 - `labelle.lock` records provider content hashes, and a tampered or re-tagged archive fails verification before building.
 - Provider arguments reach the tool verbatim (`labelle android run --device X` → the tool receives `--device X`).
 - Hooks from several providers on one step run in the documented order, whatever order the manifests were read in.
@@ -209,7 +209,7 @@ The guard's allowlist shrinks at every step, and after platform and backend-iden
 
 ## Open questions
 
-- **Publication setup:** provision the registry publisher and exact R2 endpoint. The v1 JSON records and single-publisher ownership policy are already specified.
+- **Registry:** one JSON manifest in the labelle-registry GitHub repository. No R2 endpoint, registry service, generated snapshots or publisher are needed. The simplified shape in provider contract v1 supersedes the earlier richer index proposal.
 - **Signing:** should provider releases be signed, or is hash integrity plus a trusted index origin enough?
 - **Future credentials integration:** v1 deliberately has no helper RPC. A later version may standardize one if providers need it.
 - **Proprietary SDKs** (Steamworks, consoles): only bring-your-own, with `doctor` pointing to the local SDK path, as with the Spine license?

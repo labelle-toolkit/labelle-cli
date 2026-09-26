@@ -9,16 +9,16 @@ const contract = @import("provider_contract.zig");
 const runner = @import("runner.zig");
 const toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
-const cache = @import("asm_cache.zig");
+const github = @import("provider_github.zig");
 
 // Existing platform commands remain reserved until their extraction lands.
 pub const reserved = [_][]const u8{
     "generate", "build",   "bundle",    "run",       "init",   "add",   "install", "update",
     "upgrade",  "clean",   "test",      "pack",      "astc",   "audit", "migrate", "check",
     "plugins",  "doctor",  "assembler", "toolchain", "status", "ios",   "android", "wasm",
-    "help",     "version", "targets",
+    "help",     "version", "targets",   "providers",
 };
-const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest };
+const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
 
 fn read(a: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(1024 * 1024));
@@ -42,11 +42,12 @@ pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
     }
 }
 
-fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig) ![]Provider {
+fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) ![]Provider {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
     for (cfg.plugins) |dep| {
-        const dir = try plugins.resolvePluginDir(a, root, dep);
+        const pinned = if (dep.isLocal()) null else try sources.projectDir(root, dep);
+        const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
         const path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
         const bytes = read(a, path) catch |err| switch (err) {
             error.FileNotFound => continue, // Runtime plugins may have no manifest.
@@ -61,7 +62,7 @@ fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig) 
         const names = try a.alloc([]const u8, if (meta.namespace != null) 1 else 0);
         if (meta.namespace) |ns| names[0] = ns;
         try owners.append(a, .{ .package = meta.name, .namespaces = names, .targets = meta.targets });
-        try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta });
+        try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta, .verified = dep.isLocal() or pinned != null });
     }
     try contract.validateOwnership(owners.items, &reserved);
     return providers.items;
@@ -80,7 +81,9 @@ pub fn printHelp(allocator: std.mem.Allocator) !void {
     const a = arena.allocator();
     const root = try projectRoot(a) orelse return;
     const cfg = try config.readProjectConfigQuiet(a, root);
-    const providers = try discover(a, root, cfg);
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const providers = try discover(a, root, cfg, &sources);
     if (providers.len != 0) std.debug.print("\nProject package commands:\n", .{});
     for (providers) |provider| printCommands(provider);
 }
@@ -104,7 +107,9 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
     const a = arena.allocator();
     const root = try projectRoot(a) orelse return null;
     const cfg = try config.readProjectConfigQuiet(a, root);
-    const providers = try discover(a, root, cfg);
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const providers = try discover(a, root, cfg, &sources);
     for (providers) |provider| {
         if (!std.mem.eql(u8, namespace, provider.meta.namespace orelse continue)) continue;
         const name = args.next() orelse {
@@ -131,8 +136,8 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
             const Lock = struct { plugins: []const project.PluginDep = &.{} };
             const lock = try std.zon.parse.fromSliceAlloc(Lock, a, try a.dupeZ(u8, lock_bytes), null, .{ .ignore_unknown_fields = true });
             try validatePin(provider.dep, lock.plugins);
-            if (!provider.dep.isLocal()) {
-                std.debug.print("labelle: remote provider '{s}' requires archive integrity pins; remote execution is not enabled yet.\n", .{provider.dep.name});
+            if (!provider.verified) {
+                std.debug.print("labelle: remote provider '{s}' is unpinned. Run labelle providers resolve, review the pins, then repeat with --accept.\n", .{provider.dep.name});
                 return error.RemoteProviderIntegrityRequired;
             }
             // The shared project/assembler schema has not migrated yet. Do not
@@ -192,7 +197,7 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     if (version.term != .exited or version.term.exited != 0) return error.ProviderCompilerFailed;
     if (!std.mem.eql(u8, std.mem.trim(u8, version.stdout, "\r\n "), required.version)) return error.ProviderCompilerVersionMismatch;
 
-    const cache_root = try cache.getCacheRoot(a);
+    const cache_root = try github.cacheRoot(a);
     const runs = try std.fs.path.join(a, &.{ cache_root, "provider-runs" });
     try std.Io.Dir.cwd().createDirPath(io, runs);
     var random: [16]u8 = undefined;
@@ -206,11 +211,16 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     const prefix = try std.fs.path.join(a, &.{ run_dir, "install" });
     var env = try runner.buildZigEnv(a, &.{});
     defer env.deinit();
+    // Keep relative LABELLE_HOME stable when child cwd changes to the package.
+    const global_cache = try std.fs.path.join(a, &.{ cache_root, zig_cache.GLOBAL_CACHE_SUBDIR });
+    try env.put("ZIG_GLOBAL_CACHE_DIR", global_cache);
+    try env.put("ZIG_LOCAL_CACHE_DIR", try std.fs.path.join(a, &.{ cache_root, zig_cache.LOCAL_CACHE_SUBDIR }));
+    try env.put("LABELLE_HOME", cache_root);
     // Zig owns the complete source/dependency/compiler/options cache identity.
     // Always run the install step: never trust a stale installed executable.
     // Zig's system package mode disables fetching. Its package directory is
     // explicit so a missing dependency fails instead of reaching the network.
-    const packages = try std.fs.path.join(a, &.{ try zig_cache.globalCacheDir(a), "p" });
+    const packages = try std.fs.path.join(a, &.{ global_cache, "p" });
     try std.Io.Dir.cwd().createDirPath(io, packages);
     const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ zig, "build", cmd.build_step, "--prefix", prefix, "--system", packages }, null, &env);
     if (build_code != 0) return build_code;
