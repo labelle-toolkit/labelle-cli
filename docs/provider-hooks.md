@@ -40,10 +40,19 @@ the same way and passed as `config_file`.
 
 Every project command that runs the pipeline (`generate`, `build`, `run`,
 `bundle`, and the legacy platform commands that share its generation)
-discovers the declared providers before the assembler or any compiler runs,
-whenever `.plugins` is non-empty. The whole hook graph is validated once, at
-discovery, so `labelle help` and `labelle providers resolve --accept` fail on
-the same problems a build would:
+discovers the declared providers whenever `.plugins` is non-empty. Discovery
+runs **after the package cache is populated** (the assembler's `install`) and
+**before generation or any compiler**: a declared remote package that is
+neither pinned nor yet in the ordinary cache has no manifest to read, so
+discovering ahead of the installer took every such package for runtime-only
+and a cold cache silently built without its hooks while a warm cache ran
+them. With the cache populated, a non-local package that is still absent
+from both caches fails discovery closed (`ProviderPackageMissing`); a package
+directory without a `plugin.labelle` is a runtime-only package (light packs
+ship no manifest). The whole hook graph is validated once, at discovery, so
+`labelle help` and `labelle providers resolve --accept` (which validates the
+accepted remote and local manifests together before writing
+`labelle.providers.lock`) fail on the same problems a build would:
 
 | Error | Rule |
 | --- | --- |
@@ -55,9 +64,10 @@ the same problems a build would:
 
 Each prints one `labelle: hooks: …` line naming the hooks involved. A
 malformed provider therefore fails a plain `labelle build` closed, with
-`labelle: provider discovery failed: <error>` and exit status 1. For pinned
-remote providers, discovery is the same verify-and-extract every provider
-command performs; that cost is accepted (it is the integrity model of #414).
+`labelle: provider discovery failed: <error>`, exit status 1 and a `failed`
+progress record, before anything is generated. For pinned remote providers,
+discovery is the same verify-and-extract every provider command performs;
+that cost is accepted (it is the integrity model of #414).
 
 ## Order
 
@@ -120,7 +130,14 @@ the CLI's exit status.
 
 Hooks report under the progress phase of the step they wrap (`generate`,
 `compile` for `build`, `run` for `bundle` and `run`) as sub-steps named
-`hook <package>/<id>`.
+`hook <package>/<id>`. When Zig's progress stream has already advanced the
+feed from `compile` to `link`, an `after build` hook is a sub-step of `link`
+(the phase never moves backward).
+
+For `run`, the core build is the one and only build of the command: the
+desktop run path launches the binary the `build` step (or its `replace`
+hook) produced, with no warm `zig build` in between, so whatever an `after
+build` hook signed, stripped or patched in `zig-out/` is what runs.
 
 ## Limitations
 
@@ -133,7 +150,11 @@ Hooks report under the progress phase of the step they wrap (`generate`,
   because the core desktop packager is macOS-only and a hook cannot replace
   it. Provider targets (next slice) get their own `bundle` replacement.
 - `wasm serve` is interactive: its `done` record lands before the serve loop
-  and the `after run` hooks run only once the server returns.
+  and the `after run` hooks run only once the server returns. A `--watch`
+  rebuild re-runs the `generate` and `build` hook phases around its core
+  steps exactly as the cold pipeline did (the feed is already terminal, so
+  the hooks' sub-step records are not emitted there); a failing hook stops
+  that rebuild and keeps the server alive, like a failing core step.
 - A `--docker` run whose binary was cross-compiled skips the launch and its
   `after run` hooks with it (nothing ran).
 
@@ -141,8 +162,9 @@ Hooks report under the progress phase of the step they wrap (`generate`,
 
 `zig build test-provider-dispatch` (also collected by `zig build test`)
 covers manifest validation, the planner's order independence, every graph
-error, the output-layout contract and the hook wire context. The real-process
-regression is:
+error, the output-layout contract and the hook wire context; `zig build test`
+also covers the watched-rebuild hook plumbing (the serve loop itself is
+interactive) and the `link`-phase sub-step. The real-process regression is:
 
 ```
 zig build
@@ -156,6 +178,11 @@ edge inverting the tie, the context fields, a failing `before` hook's exit
 code with no core build and no `after` hook, a failing core build skipping
 `after`, discovery errors (`ReplaceRequiresOwnedTarget`, `DuplicateReplaceHook`,
 `MissingHookReference`, `HookPhaseOrder`) at `labelle help` before any
-compiler, `generate` hooks seeing the lock, `run` hooks around the game,
-`bundle` hooks and the `.app` location on macOS, and the refusal elsewhere.
-CI runs it on Windows, macOS and Linux.
+compiler and at `labelle build` after the install but before generation,
+`generate` hooks seeing the lock, `run` hooks around the game, an `after
+build` edit to `zig-out/` reaching the launched game intact, a cold package
+cache failing closed or running a pinned provider's hooks (never skipping
+them), `bundle` hooks and the `.app` location on macOS, and the refusal
+elsewhere. `test/provider_github_e2e.py` checks that `--accept` refuses a
+broken hook graph without writing the lock. CI runs them on Windows, macOS
+and Linux.
