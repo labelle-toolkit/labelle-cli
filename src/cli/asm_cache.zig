@@ -66,7 +66,16 @@ pub fn clearCacheRootOverride() void {
 /// imported so the CLI carries no `labelle_assembler` package dep.
 pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
     if (_cache_root_override) |root| return allocator.dupe(u8, root);
-    if (envLookup(allocator, "LABELLE_HOME")) |home| return home;
+    if (envLookup(allocator, "LABELLE_HOME")) |home| {
+        if (std.fs.path.isAbsolute(home)) return home;
+        // Children run with their own cwd (the project, a provider package)
+        // and receive this root through ZIG_*_CACHE_DIR, so a relative
+        // override is pinned to OUR cwd before it can mean somewhere else.
+        defer allocator.free(home);
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), ".", allocator);
+        defer allocator.free(cwd);
+        return std.fs.path.resolve(allocator, &.{ cwd, home });
+    }
 
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
     const home_dir = envLookup(allocator, home_env) orelse {

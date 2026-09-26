@@ -88,6 +88,16 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     assert not list((home / "provider-runs").iterdir()), "run workspace not cleaned after failure"
     run("probe", "inspect", "crash", code=-1)
     assert not list((home / "provider-runs").iterdir()), "run workspace not cleaned after crash"
+    # A relative LABELLE_HOME is pinned to the CLI's cwd, never to the provider
+    # package the Zig build runs from — otherwise the install lands beneath the
+    # provider source while the CLI looks beneath its own cwd.
+    provider_entries = sorted(p.name for p in provider.iterdir())
+    env["LABELLE_HOME"] = "relative-home"
+    run("probe", "inspect")
+    relative_runs = nested / "relative-home" / "provider-runs"
+    assert relative_runs.is_dir() and not list(relative_runs.iterdir()), "relative workspace not beneath the caller's cwd"
+    assert sorted(p.name for p in provider.iterdir()) == provider_entries, "relative cache tree left beneath the provider"
+    env["LABELLE_HOME"] = str(home)
     # Successful build with missing declared executable must not run an old artifact.
     run("probe", "missing", code=1)
     run("probe", "unknown", code=1)
@@ -97,8 +107,18 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     (provider / "plugin.labelle").write_text(manifest.replace(">=1.0.0 <2.0.0", ">=2.0.0"))
     assert "UnsupportedContract" in run("probe", "inspect", code=1).stderr
     (provider / "plugin.labelle").write_text(manifest.replace('namespace = "probe"', 'namespace = "build"'))
-    assert "ReservedNamespace" in run("help", code=1).stderr
+    assert "ReservedNamespace" in run("probe", "inspect", code=1).stderr
+    # Built-in help is still printed and exits 0; provider discovery on top
+    # of it is best-effort and only warns.
+    broken = run("help")
+    assert "Usage: labelle" in broken.stderr and "ReservedNamespace" in broken.stderr, broken.stderr
+    assert "probe inspect" not in broken.stderr, broken.stderr
     (provider / "plugin.labelle").write_text(manifest)
+    (project / "project.labelle").write_text("not a project manifest")
+    for args in (("help",), ()):
+        broken = run(*args)
+        assert "Usage: labelle" in broken.stderr and "warning" in broken.stderr, (args, broken.stderr)
+    (project / "project.labelle").write_text(project_text)
     remote_dep = dep.replace("local:../provider with spaces", "example/fixture")
     remote_dir = home / "packages/plugins/example/fixture/1.0.0"
     remote_dir.mkdir(parents=True)
