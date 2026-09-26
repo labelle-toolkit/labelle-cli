@@ -71,10 +71,10 @@ def hook(id, step, when, target):
     return f'.{{ .id = "{id}", .step = .{step}, .target = "{target}", .when = .{when}, {TOOL} }}'
 
 
-def manifest(name, targets, hooks=()):
+def manifest(name, targets, hooks=(), contract=">=1.0.0 <2.0.0"):
     declared = ", ".join(json.dumps(t) for t in targets)
     attached = f',\n    .hooks = .{{ {", ".join(hooks)} }}' if hooks else ""
-    return (f'.{{ .name = "{name}", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0",\n'
+    return (f'.{{ .name = "{name}", .manifest_version = 2, .command_contract = "{contract}",\n'
             f'    .targets = .{{ {declared} }}{attached} }}')
 
 
@@ -359,6 +359,22 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     packed = json.loads((bundle_dir / "capture.json").read_text())
     assert packed["context"]["invocation"]["step"] == "bundle", packed
     assert packed["context"]["build_number"] == "42", packed
+    # `build_number` is a contract 1.1.0 key, negotiated from the range: an
+    # open v1 range gets the 1.1.0 wire that carries it...
+    assert packed["context"]["contract_version"] == "1.1.0", packed
+    # ...while a provider capped below 1.1.0 gets the exact 1.0.0 wire with
+    # no such key — a strict 1.0.0 decoder would reject it as unknown and fail
+    # the bundle (Codex P2 on #421) — and the drop is said once, not silent.
+    replacing = [hook("gen", "generate", "replace", "probe-target"), hook("build", "build", "replace", "probe-target"),
+                 hook("pack", "bundle", "replace", "probe-target")]
+    provider_manifest.write_text(manifest("fixture", ["probe-target"], replacing, contract=">=1.0.0 <1.1.0"))
+    reset()
+    capped = run("bundle", "--platform=probe-target", "--build-number=42")
+    packed = json.loads((bundle_dir / "capture.json").read_text())
+    assert packed["context"]["contract_version"] == "1.0.0", packed
+    assert "build_number" not in packed["context"], packed
+    assert "speaks provider contract 1.0.0, which has no build_number; --build-number=42 is not passed to it" in capped.stderr, capped.stderr
+    provider_manifest.write_text(manifest("fixture", ["probe-target"], replacing))
     built = json.loads((target_dir / "zig-out" / "capture.json").read_text())
     assert built["context"]["invocation"]["step"] == "build", built
     assert "build_number" not in built["context"], built

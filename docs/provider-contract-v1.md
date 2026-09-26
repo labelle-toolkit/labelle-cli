@@ -6,7 +6,7 @@ Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
 do not weaken the normative contract below; full phase-2 acceptance is pending.
 
-This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the exact CLI contract version; it never warns and proceeds. The v1 context below uses the exact wire version `1.0.0`; additional wire versions require explicit decoder support.
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.1.0` and still speaks `1.0.0`, and every context carries the negotiated version.
 
 ## 1. Package declarations and installed tools
 
@@ -35,7 +35,7 @@ Every field below is required, except `build_number`. Nullable fields must be pr
 
 | Field | Type / rule |
 | --- | --- |
-| `contract_version` | Exactly `"1.0.0"` for this decoder |
+| `contract_version` | The negotiated wire version: `"1.0.0"` or `"1.1.0"` for this decoder |
 | `invocation` | Object containing `kind`, `id`, `step`, `phase` |
 | `invocation.kind` | `"command"` or `"hook"` |
 | `invocation.id` | Command name or hook ID |
@@ -49,7 +49,23 @@ Every field below is required, except `build_number`. Nullable fields must be pr
 | `zig_executable` | Absolute host compiler filename |
 | `optimize` | `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
 | `progress` | `human`, `json`, or `off` |
-| `build_number` | **Optional** (the only optional key): the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it; absent (never null) otherwise, and an error on any other invocation |
+| `build_number` | **Optional** (the only optional key), **wire `1.1.0`+**: the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it and the negotiated wire is `1.1.0` or newer; absent (never null) otherwise, and an error on any other invocation or on a `1.0.0` context |
+
+### Wire versions and negotiation
+
+The CLI implements contract `1.1.0` and speaks every wire version listed here, newest first:
+
+| Wire | Adds |
+| --- | --- |
+| `1.1.0` | The optional `build_number` key (additive minor). |
+| `1.0.0` | The original v1 context. |
+
+For each invocation the CLI negotiates the **newest** wire version the provider's `command_contract` range admits and writes it as `contract_version`; a range that admits none of them is `UnsupportedContract` at discovery. Keys a wire version does not define are never emitted in it, so a provider decoding strictly (unknown fields are errors, as above) keeps working:
+
+- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.1.0` and must accept the keys `1.1.0` adds. A provider declaring such a range promises exactly that.
+- `>=1.0.0 <1.1.0` (or `1.0.0`) receives the exact `1.0.0` wire. `labelle bundle --build-number=N` is then not passed to it; the CLI prints one `note:` line saying so instead of dropping it silently.
+
+A provider that rejects unknown fields should cap its range at the newest minor it decodes. New optional keys arrive only with a new minor wire version; the major stays `1` until a key is removed or changes meaning.
 
 Paths use host syntax and must be absolute (on Windows, drive-qualified or UNC, not current-drive-rooted). Structural validation does not perform filesystem existence/containment checks; the resolver performs those before launching.
 

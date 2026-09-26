@@ -343,6 +343,49 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     shutil.rmtree(assets, ignore_errors=True)
     declare(dep_b, dep_a)
 
+    # ── generate: the shader override is re-gated after the before hooks ──
+    # A relative LABELLE_SHADERC is unusable, but the gate only consults it
+    # once `materials/` exists. Here `a-gen-pre` is what creates it, so the
+    # startup gate (before the install) passes; the re-check right after the
+    # before-generate hooks must stop the command before generation (Codex
+    # P2 on #420), naming the override instead of failing opaquely later.
+    materials = project / "materials"
+    shutil.rmtree(materials, ignore_errors=True)
+    bad_shaderc = {"LABELLE_SHADERC": "shaderc"}
+    reset()
+    control = run("generate", extra_env=bad_shaderc)
+    assert "FIXTURE_GENERATE" in control.stderr, control.stderr
+    reset()
+    gated = run("generate", code=1, extra_env=dict(bad_shaderc, PROVIDER_PROBE_COPY=f"a-gen-pre|{png}|materials/probe.png"))
+    assert (materials / "probe.png").exists(), "the hook did not create materials/"
+    assert "FIXTURE_INSTALL_DONE" in gated.stderr, gated.stderr  # the startup gate passed
+    assert "ShadercOverrideMustBeAbsolute" in gated.stderr and "FIXTURE_GENERATE" not in gated.stderr, gated.stderr
+    assert gated.stderr.index("hook 'fixture-a/a-gen-pre'") < gated.stderr.index("ShadercOverrideMustBeAbsolute"), gated.stderr
+    shutil.rmtree(materials, ignore_errors=True)
+
+    # ── progress: hook sub-steps hand the detail back to the core step ────
+    # After the before-generate hooks the feed must report the core
+    # generation again, not the last hook "running" through it (Codex P2 on
+    # #420); a hook sub-step never carries the compiler's counters.
+    reset()
+    streamed = subprocess.run([cli, "build", "--progress=json"], cwd=project, env=env, text=True,
+                              capture_output=True, timeout=600)
+    assert streamed.returncode == 0, (streamed.returncode, streamed.stdout, streamed.stderr)
+    checks += 1
+    records = []
+    for line in streamed.stdout.splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            pass
+    details = [(r["phase"], r["detail"]) for r in records]
+    last_gen_hook = max(i for i, (_, d) in enumerate(details) if d in ("hook fixture-a/a-gen-pre", "hook fixture-b/b-gen-pre"))
+    assert ("generate", "assembler generate") in details[last_gen_hook + 1:], details
+    for r in records:
+        if r["detail"].startswith("hook "):
+            assert r["step"] is None and r["total"] is None and r["percent"] is None, r
+    assert records[-1]["phase"] == "done", records[-1]
+
     # ── run: before/after around the game ─────────────────────────────────
     reset()
     result = run("run")

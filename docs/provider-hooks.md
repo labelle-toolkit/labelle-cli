@@ -161,6 +161,9 @@ A `bundle` hook's context also carries `build_number` when the user passed
 core packager): the provider that packages its target is the one that stamps
 the number, so it would otherwise be dropped. The key is **absent** — not
 null — for every other step's hooks and for a `bundle` without the flag.
+`build_number` is a contract `1.1.0` key: a provider whose `command_contract`
+range stops below `1.1.0` receives the `1.0.0` wire without it (see
+[wire versions and negotiation](provider-contract-v1.md#wire-versions-and-negotiation)).
 
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
@@ -200,7 +203,14 @@ Hooks report under the progress phase of the step they wrap (`generate`,
 `compile` for `build`, `run` for `bundle` and `run`) as sub-steps named
 `hook <package>/<id>`. When Zig's progress stream has already advanced the
 feed from `compile` to `link`, an `after build` hook is a sub-step of `link`
-(the phase never moves backward).
+(the phase never moves backward). A hook sub-step carries no `step`/`total`
+counters (the compiler's are cleared), and once a `before generate` or
+`before bundle` phase succeeds the feed returns to the core step's detail
+(`assembler generate`, `packaging bundle`).
+
+The shader-compiler override (`LABELLE_SHADERC`) is validated before the
+package install and again right after the `before generate` hooks, since a
+hook may be what creates `materials/`.
 
 For `run`, the core build is the one and only build of the command: the
 desktop run path launches the binary the `build` step (or its `replace`
@@ -222,7 +232,9 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   checked with the plans after discovery; see [provider
   targets](provider-targets.md#labelle-bundle).
 - `wasm serve` is interactive: its `done` record lands before the serve loop
-  and the `after run` hooks run once the server returns. The server returns
+  and the `after run` hooks run once the server returns; a failing one is
+  followed by a `failed` record carrying the exit code the CLI returns, so
+  the status file ends with the real outcome. The server returns
   on Ctrl+C or SIGTERM: the handler sets a flag, a waker thread pokes the
   listener so the blocked `accept` returns, the loop exits cleanly and the
   hooks run before the process ends (a second Ctrl+C while a hook is still
@@ -233,8 +245,11 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   core steps exactly as the cold pipeline did (the feed is already terminal,
   so the hooks' sub-step records are not emitted there); a failing hook stops
   that rebuild and keeps the server alive, like a failing core step. Every
-  rebuild first re-reads `project.labelle`, rediscovers the providers (with
-  the cache `.populated`, as the cold pipeline did) and replans both phases,
+  rebuild first — before its prebuild steps — re-reads `project.labelle`,
+  re-runs the package install and rewrites `labelle.lock` when that file
+  changed, rediscovers the providers (with the cache `.populated`, as the
+  cold pipeline did), re-checks that the served target still has a pinned
+  owner and replans both phases,
   so a watched edit to the project, to a provider manifest or to a
   `provider_config` file reaches the next rebuild — the plans computed at
   startup are only the initial state, never reused for a rebuild. A replan
@@ -243,9 +258,15 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   phase allocates on a scratch arena freed when the phase returns, and each
   replan lives on its own arena released once the next one is installed —
   only the resolved host compiler outlives them — so a long watch session
-  with hooks does not grow on every saved edit.
-- A `--docker` run whose binary was cross-compiled skips the launch and its
-  `after run` hooks with it (nothing ran).
+  with hooks does not grow on every saved edit. The replan's storage is
+  kept until the shutdown `after run` hooks have run. A hook that writes
+  into the watched tree (hooks declare no outputs) costs one follow-up
+  rebuild per edit, after which the watcher takes the tree as built — it
+  does not rebuild in a loop.
+- A `--docker` run whose binary was cross-compiled skips the launch and
+  every `run` hook with it — decided before the `before run` hooks, so none
+  of them prepares (or fails) a launch that never happens. A `replace run`
+  hook is not skipped: it launches its own way.
 - `wasm serve|export --no-build` skips only `generate` and `build`: serving
   or exporting the existing artifact is the `run` step, and its `before`,
   `replace` and `after run` hooks run as on the building path (`after`
