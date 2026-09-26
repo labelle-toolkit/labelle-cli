@@ -38,6 +38,7 @@ const provider_dispatch = @import("provider_dispatch.zig");
 const provider_github = @import("provider_github.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const provider_targets = @import("provider_targets.zig");
+const asm_cache = @import("asm_cache.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const resolveAndroidBackend = args_mod.resolveAndroidBackend;
@@ -630,6 +631,18 @@ const WatchReplan = struct {
             &.{}
         else
             try provider_dispatch.discover(a, ctx.hooks.root, cfg, &next.sources, .populated);
+        // The served target must still have a pinned owner among the NEW
+        // providers: an edit that drops the owning package, or unpins a
+        // remote owner, fails this rebuild with the cold pipeline's
+        // diagnostic and keeps the previous state — installing empty plans
+        // would generate for a target nobody owns (Codex P1 on #421).
+        switch (try confirmTarget(a, providers, ctx.hooks.target)) {
+            .resolved => {},
+            .refused => |kind| return switch (kind) {
+                .no_provider => error.NoProviderForTarget,
+                .unpinned_owner => error.UnverifiedTargetOwner,
+            },
+        }
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         // Install only now, so a failure above leaves the previous plans —
@@ -664,11 +677,16 @@ const WatchReplan = struct {
             .sub_path = "project/project.labelle",
             .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
         });
+        // The package owns the served target, as the cold pipeline required
+        // before the server started; `targets` lets a step drop that.
         const Manifest = struct {
-            fn write(dir: std.Io.Dir, hooks: []const u8) !void {
+            fn writeAt(dir: std.Io.Dir, sub_path: []const u8, targets: []const u8, hooks: []const u8) !void {
                 var buf: [1024]u8 = undefined;
-                const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{{ {s} }} }}", .{hooks});
-                try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = text });
+                const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ {s} }}, .hooks = .{{ {s} }} }}", .{ targets, hooks });
+                try dir.writeFile(config.globalIo(), .{ .sub_path = sub_path, .data = text });
+            }
+            fn write(dir: std.Io.Dir, hooks: []const u8) !void {
+                try writeAt(dir, "pkg/plugin.labelle", "\"wasm\"", hooks);
             }
         };
         const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
@@ -713,13 +731,51 @@ const WatchReplan = struct {
         try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = "not a manifest" });
         try std.testing.expectError(error.InvalidManifest, WatchReplan.run(&replan, &ctx));
         try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
-        // The project itself changes: the plugin is dropped, so nothing is
-        // planned and the site's config follows.
-        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try Manifest.write(tmp.dir, build_hook);
         try WatchReplan.run(&replan, &ctx);
-        try std.testing.expect(ctx.generate_plan.isEmpty() and ctx.build_plan.isEmpty());
-        try std.testing.expectEqual(@as(usize, 0), site.providers.len);
-        try std.testing.expectEqual(@as(usize, 0), site.cfg.plugins.len);
+        const good = replan.current.?;
+
+        // The served target loses its owner (Codex P1 on #421). Each case
+        // fails the replan with the cold pipeline's error and keeps the
+        // previous generation installed: its plans, its providers, its
+        // config — never empty plans that would generate for an unowned
+        // target.
+        const Kept = struct {
+            fn check(r: *const WatchReplan, c: *const WasmRebuildCtx, s: *const provider_hooks.Site, expected: *const WatchReplan.Generation) !void {
+                try std.testing.expectEqual(expected, r.current.?);
+                try std.testing.expectEqualStrings("pkg/post", c.build_plan.after[0].qualified);
+                try std.testing.expectEqual(@as(usize, 1), s.providers.len);
+                try std.testing.expectEqual(@as(usize, 1), s.cfg.plugins.len);
+            }
+        };
+        // (a) The package stops declaring the target.
+        try Manifest.writeAt(tmp.dir, "pkg/plugin.labelle", "", "");
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.run(&replan, &ctx));
+        try Kept.check(&replan, &ctx, &site, good);
+        try Manifest.write(tmp.dir, build_hook);
+        // (b) The project drops the plugin altogether.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.run(&replan, &ctx));
+        try Kept.check(&replan, &ctx, &site, good);
+        // (c) The owner becomes a remote package read from the ordinary
+        //     cache with no integrity pin: present, but unverified.
+        const home = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(home);
+        asm_cache.setCacheRootOverride(home);
+        defer asm_cache.clearCacheRootOverride();
+        const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "pkg", "1.0.0" });
+        defer a.free(cached);
+        try tmp.dir.createDirPath(io, cached);
+        const cached_manifest = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
+        defer a.free(cached_manifest);
+        try Manifest.writeAt(tmp.dir, cached_manifest, "\"wasm\"", build_hook);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
+        });
+        try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.run(&replan, &ctx));
+        try Kept.check(&replan, &ctx, &site, good);
+        try std.testing.expectEqualStrings("local:../pkg", site.cfg.plugins[0].repo);
     }
 };
 
@@ -1003,6 +1059,76 @@ fn confirmTarget(a: std.mem.Allocator, providers: []const provider_dispatch.Prov
     return .{ .resolved = resolved };
 }
 
+/// The pre-install ownership verdict (`run`, step 3).
+const EarlyVerdict = enum {
+    /// A pinned provider owns the target in the complete metadata view.
+    confirmed,
+    /// A declared remote package is unread, so the view is partial; the
+    /// post-install discovery decides.
+    deferred,
+    /// Refused, with `confirmTarget`'s diagnostic already printed.
+    refused,
+};
+
+/// The metadata-only (`.unknown`) discovery and ownership check that runs
+/// before the install. Everything it reads — the manifests, and the pinned
+/// archives `Sources.fromPin` extracts (up to 128 MiB compressed, 512 MiB of
+/// tar) — lives on a scratch arena carved from `backing` and freed before
+/// this returns: only the verdict leaves. On the pipeline's long-lived arena
+/// that storage was never reclaimed, so the authoritative discovery after
+/// the install held every pinned provider twice, and a `wasm serve
+/// --no-build` server kept both for its lifetime (Codex P2 on #421).
+/// `error.ProviderDiscoveryFailed` after printing the reason.
+fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: project_config.ProjectConfig, requested: []const u8) !EarlyVerdict {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var sources: provider_github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const early = provider_dispatch.discoverAll(a, project_root, cfg, &sources, .unknown) catch |err| {
+        std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+        return error.ProviderDiscoveryFailed;
+    };
+    if (early.unresolved.len != 0) return .deferred;
+    return switch (try confirmTarget(a, early.providers, requested)) {
+        .resolved => .confirmed,
+        .refused => .refused,
+    };
+}
+
+// The mechanism, not just the verdict: the check allocates from `backing`
+// (so the discovery really ran on it) and returns every byte before it
+// returns — nothing it read survives on a longer-lived allocator.
+test "pipeline: the early target check frees its discovery before returning" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", std.testing.allocator);
+    defer std.testing.allocator.free(project);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pkg/plugin.labelle",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }",
+    });
+    const cfg: project_config.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+    } };
+    const cases = [_]struct { target: []const u8, verdict: EarlyVerdict }{
+        .{ .target = "probe-target", .verdict = .confirmed },
+        .{ .target = "other-target", .verdict = .refused },
+    };
+    for (cases) |case| {
+        var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const verdict = try earlyTargetCheck(counting.allocator(), project, cfg, case.target);
+        try std.testing.expectEqual(case.verdict, verdict);
+        try std.testing.expect(counting.allocations > 0);
+        try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
+        try std.testing.expectEqual(counting.allocations, counting.deallocations);
+    }
+}
+
 test "pipeline: each target refusal kind writes its own progress detail" {
     // The two kinds call for different fixes, so their records must differ
     // and the unpinned one must name the condition.
@@ -1113,18 +1239,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     //     A manifest that fails discovery fails it closed here: the install
     //     cannot mend a manifest it can already read. Never for the core
     //     target, which needs no provider.
+    //     The pass runs on a scratch arena of its own (`earlyTargetCheck`),
+    //     so the pinned archives it reads are not held again beside the
+    //     authoritative discovery's copies (Codex P2 on #421).
     if (!provisional.is_core) {
-        var early_sources: provider_github.Sources = .{ .a = hook_arena };
-        defer early_sources.deinit();
-        const early = provider_dispatch.discoverAll(hook_arena, project_root, parsed, &early_sources, .unknown) catch |err| {
-            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-            return 1;
-        };
-        if (early.unresolved.len == 0) {
-            switch (try confirmTarget(hook_arena, early.providers, requested_target)) {
-                .resolved => {},
-                .refused => return 1,
-            }
+        switch (earlyTargetCheck(allocator, project_root, parsed, requested_target) catch return 1) {
+            .confirmed, .deferred => {},
+            .refused => return 1,
         }
     }
     // The legacy sites below (`parsed.platform == .X`; the guard's migration
@@ -1544,6 +1665,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             .off => .off,
         },
         .reporter = reporter,
+        // Reaches the `bundle` hooks only; a provider target's bundle
+        // replacement would otherwise drop it silently (Codex P2 on #421).
+        .build_number = if (command == .bundle_cmd) parsed_args.bundle_build_number else null,
     };
 
     // Issue #217 phase 2: delegate code generation to the standalone

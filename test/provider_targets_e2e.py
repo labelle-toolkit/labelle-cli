@@ -349,6 +349,19 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     assert not any(p.suffix == ".app" for p in bundle_dir.iterdir()), "the core packager ran for a provider target"
     build_entries = log(target_dir / "zig-out")
     assert [(e["invocation"]["step"], e["invocation"]["phase"]) for e in build_entries] == [("build", "replace")], build_entries
+    # No `--build-number`: the key is absent from every context, not null.
+    assert "build_number" not in json.loads((bundle_dir / "capture.json").read_text())["context"]
+    # `--build-number` reaches the provider that packages the target: the
+    # bundle replacement's context carries it (Codex P2 on #421: it used to
+    # be validated and then silently dropped), and no other step's does.
+    reset()
+    run("bundle", "--platform=probe-target", "--build-number=42")
+    packed = json.loads((bundle_dir / "capture.json").read_text())
+    assert packed["context"]["invocation"]["step"] == "bundle", packed
+    assert packed["context"]["build_number"] == "42", packed
+    built = json.loads((target_dir / "zig-out" / "capture.json").read_text())
+    assert built["context"]["invocation"]["step"] == "build", built
+    assert "build_number" not in built["context"], built
     # The separate-value spelling resolves the same target.
     reset()
     run("bundle", "--platform", "probe-target")

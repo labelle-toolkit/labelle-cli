@@ -156,6 +156,12 @@ and `progress` (`--optimize` and `--progress` as the user passed them, so a
 hook builds what the core step builds and speaks the mode the user asked
 for). The tool runs with the project root as cwd and no trailing arguments.
 
+A `bundle` hook's context also carries `build_number` when the user passed
+`labelle bundle --build-number=<N>` (validated before the build, as for the
+core packager): the provider that packages its target is the one that stamps
+the number, so it would otherwise be dropped. The key is **absent** — not
+null — for every other step's hooks and for a `bundle` without the flag.
+
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
 because a `before generate` hook already needs it. A generation that then

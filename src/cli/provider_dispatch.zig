@@ -344,6 +344,8 @@ pub const ToolRun = struct {
     settings: ?[]const u8,
     trailing: []const []const u8,
     cwd: []const u8,
+    /// `bundle` hooks only: `labelle bundle --build-number` (contract §2).
+    build_number: ?[]const u8 = null,
 };
 
 /// Build the tool in a fresh isolated prefix, verify the declared executable,
@@ -385,6 +387,7 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
         .zig_executable = host.zig,
         .optimize = run.optimize,
         .progress = run.progress,
+        .build_number = run.build_number,
     };
     try ctx.validate(run.needs_project);
     const context_path = try std.fs.path.join(a, &.{ run_dir, "context.json" });

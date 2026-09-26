@@ -31,7 +31,7 @@ Commands require a namespace and unique names. Resolve-time validation rejects r
 
 The CLI creates a UTF-8 JSON file and passes its absolute filename in `LABELLE_CONTEXT`. There is no argument-encoded alternative. The provider receives trailing user arguments verbatim through argv, without shell interpolation; the context path is not inserted into argv. The CLI owns the context-file lifetime through process exit and removes it afterward. Providers treat it as read-only.
 
-Every field below is required. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
+Every field below is required, except `build_number`. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
 
 | Field | Type / rule |
 | --- | --- |
@@ -49,6 +49,7 @@ Every field below is required. Nullable fields must be present as JSON null. Unk
 | `zig_executable` | Absolute host compiler filename |
 | `optimize` | `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
 | `progress` | `human`, `json`, or `off` |
+| `build_number` | **Optional** (the only optional key): the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it; absent (never null) otherwise, and an error on any other invocation |
 
 Paths use host syntax and must be absolute (on Windows, drive-qualified or UNC, not current-drive-rooted). Structural validation does not perform filesystem existence/containment checks; the resolver performs those before launching.
 
