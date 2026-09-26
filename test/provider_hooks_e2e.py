@@ -428,7 +428,12 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     # package is an error.
     remote_src = base / "fixture-c"
     shutil.copytree(fixture, remote_src)
-    (remote_src / "plugin.labelle").write_text(manifest("fixture-c", [hook("c-pre", "build", "before")]))
+    # A `generate` hook too: the pipeline resolves its managed compiler for
+    # the core build before any `build` hook, so only a hook that runs
+    # BEFORE generation can show that the pin check itself never touches a
+    # compiler (see (2) below).
+    (remote_src / "plugin.labelle").write_text(manifest("fixture-c", [hook("c-pre", "build", "before"),
+                                                                       hook("c-gen-pre", "generate", "before")]))
     remote_cache = home / "packages" / "plugins" / "example" / "fixture-c" / "1.0.0"
     dep_c = '.{ .name = "fixture-c", .repo = "example/fixture-c", .version = "1.0.0" }'
     declare(dep_c)
@@ -447,16 +452,28 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert not exe.exists() and not remote_cache.exists()
     # (2) The installer delivers it (cold ordinary cache, populated by this
     #     very install): the provider IS discovered, and being unpinned its
-    #     hook is refused — the same outcome a warm cache always had.
+    #     hook is refused — the same outcome a warm cache always had. The
+    #     refusal comes from the pin check, BEFORE the host compiler is
+    #     resolved: LABELLE_ZIG points nowhere, so reaching the compiler
+    #     would have reported ProviderCompilerMissing ("install Zig")
+    #     instead of the integrity failure (Codex P2 on #420) — and the
+    #     `before generate` hook is what fails, so nothing was generated.
     cold()
-    unpinned = run("build", code=1, extra_env=populate)
+    unpinned = run("build", code=1, extra_env=dict(populate, LABELLE_ZIG=dead["LABELLE_ZIG"]))
     assert "RemoteProviderIntegrityRequired" in unpinned.stderr and "'fixture-c' is unpinned" in unpinned.stderr, unpinned.stderr
-    assert "FIXTURE_GENERATE" in unpinned.stderr and "build ok" not in unpinned.stderr and not exe.exists(), unpinned.stderr
+    assert "ProviderCompilerMissing" not in unpinned.stderr and "install the pinned host compiler" not in unpinned.stderr, unpinned.stderr
+    assert "FIXTURE_INSTALL_DONE" in unpinned.stderr and "FIXTURE_GENERATE" not in unpinned.stderr, unpinned.stderr
+    assert "build ok" not in unpinned.stderr and not exe.exists(), unpinned.stderr
     assert remote_cache.exists()
+    # The mechanism: the same dead compiler IS fatal once a pinned hook runs,
+    # so the clean integrity error above means the compiler was never
+    # consulted for the unpinned one (the pin-first order), not that a dead
+    # LABELLE_ZIG goes unnoticed. (4) below pins fixture-c the same way.
     # (3) Warm cache, same command: identical outcome, so cold and warm agree.
     reset()
     warm = run("build", code=1)
     assert "RemoteProviderIntegrityRequired" in warm.stderr and "build ok" not in warm.stderr, warm.stderr
+    assert "FIXTURE_GENERATE" not in warm.stderr, warm.stderr
     # (4) Pinned (the integrity model of cli#414) with a cold ORDINARY cache:
     #     the provider comes from the verified archive and its hook runs.
     payload = io.BytesIO()
@@ -475,8 +492,14 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     (project / "labelle.providers.lock").write_text(json.dumps({"schema_version": 1, "providers": [pin]}))
     pinned = run("build")
     assert order(log(zig_out), "build") == [("before", "c-pre")], log(zig_out)
+    assert order(log(target_dir), "generate") == [("before", "c-gen-pre")], log(target_dir)
     assert exe.exists() and not remote_cache.exists(), "the pinned provider needed the ordinary cache"
     assert "hook 'fixture-c/c-pre'" in pinned.stderr, pinned.stderr
+    # The compiler-order mechanism for (2): with the pin accepted, the same
+    # dead LABELLE_ZIG is reached by the first hook and IS the failure.
+    reset()
+    no_compiler = run("build", code=1, extra_env={"LABELLE_ZIG": dead["LABELLE_ZIG"]})
+    assert "ProviderCompilerMissing" in no_compiler.stderr and "RemoteProviderIntegrityRequired" not in no_compiler.stderr, no_compiler.stderr
     (project / "labelle.providers.lock").unlink()
 
     # ── Cold cache: a reference into the unread package is unresolved ─────
