@@ -539,7 +539,8 @@ pub const WatchConfig = struct {
     ///
     /// Writers with no such declaration — provider lifecycle hooks, a
     /// prebuild step without `.outputs` — are bounded by `WatchBaseline`
-    /// instead: their write costs one follow-up rebuild, never a loop.
+    /// instead: their write costs a bounded number of follow-up rebuilds
+    /// (one when it rewrites the same paths), never a loop.
     ignore_files: []const []const u8 = &.{},
 };
 
@@ -651,6 +652,39 @@ fn changedPaths(a: std.mem.Allocator, before: []const PathState, after: []const 
     return out.toOwnedSlice(a);
 }
 
+/// How many keys of sorted `keys` are not in sorted `seen`.
+fn countNovel(keys: []const u64, seen: []const u64) usize {
+    var n: usize = 0;
+    var j: usize = 0;
+    for (keys) |key| {
+        while (j < seen.len and seen[j] < key) j += 1;
+        if (j == seen.len or seen[j] != key) n += 1;
+    }
+    return n;
+}
+
+/// The sorted, deduplicated union of sorted `x` and `y`. Caller owns it.
+fn unionKeys(a: std.mem.Allocator, x: []const u64, y: []const u64) ![]u64 {
+    var out: std.ArrayList(u64) = .empty;
+    errdefer out.deinit(a);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < x.len or j < y.len) {
+        if (j == y.len or (i < x.len and x[i] < y[j])) {
+            try out.append(a, x[i]);
+            i += 1;
+        } else if (i == x.len or y[j] < x[i]) {
+            try out.append(a, y[j]);
+            j += 1;
+        } else {
+            try out.append(a, x[i]);
+            i += 1;
+            j += 1;
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// True when every key of sorted `sub` is in sorted `super`.
 fn isSubset(sub: []const u64, super: []const u64) bool {
     var j: usize = 0;
@@ -694,7 +728,36 @@ fn isSubset(sub: []const u64, super: []const u64) bool {
 /// the follow-up, the same file they also saved during the rebuild before
 /// it) is indistinguishable from a hook rewriting its output, and is taken
 /// as the follow-up's own write. Settling there is what bounds the hook.
+///
+/// Follow-up cap. A writer that changes a DIFFERENT path on every run (a
+/// timestamp-named report: `{a}`, then `{b}`, then `{c}`) never satisfies
+/// the subset rule, and used to rebuild and reload forever (Codex P2 on
+/// #427). A chain — a rebuild plus the consecutive follow-ups fired for
+/// exactly their predecessor's `post` — therefore also tracks the union of
+/// every delta in it (`recent`) and the writers' `footprint`: the fewest
+/// paths outside `recent` that any rebuild of the chain changed (a varying
+/// writer's per-run count; an edit saved meanwhile only adds to it). From
+/// the `follow_up_cap`-th follow-up on, a follow-up that changed no more
+/// new-to-the-chain paths than that footprint is taken as the writers'
+/// own and SETTLES on its `post`, logged once as `labelle: watch: settled
+/// after N follow-up rebuilds triggered by build outputs`. One that changed
+/// more — the writers' new path plus a source the user saved during it —
+/// still fires one more rebuild, so the edit is read. A user edit saved
+/// between rebuilds never makes a follow-up at all (the trigger is not the
+/// previous `post`): it always rebuilds and starts a new chain. The count
+/// cannot tell apart an edit, saved during a capped follow-up, that adds
+/// no new-to-the-chain path beyond the footprint — a re-save of a path
+/// already in `recent`, or one landing on a run where the writers changed
+/// fewer new paths than usual — and takes it as a build output: the
+/// ambiguity above, widened to the chain. As a last bound, the `follow_up_ceiling`-th follow-up
+/// settles whatever it changed, so no writer (one whose output count keeps
+/// growing, say) can loop.
 const WatchBaseline = struct {
+    /// Follow-ups after which a varying-path chain may settle (see above).
+    const follow_up_cap: u32 = 2;
+    /// Follow-ups after which a chain settles unconditionally.
+    const follow_up_ceiling: u32 = 8;
+
     /// Signature of the last (attempted) build.
     applied: TreeSignature,
     /// Signature taken right after the last rebuild callback returned.
@@ -703,11 +766,29 @@ const WatchBaseline = struct {
     /// `null` when unknown (none yet, or its snapshots were partial).
     /// Owned by `allocator`.
     delta: ?[]u64 = null,
+    /// Consecutive follow-ups in the current chain.
+    follow_ups: u32 = 0,
+    /// Sorted union of the current chain's deltas; `null` when no chain is
+    /// tracked (none yet, a delta was unknown, or it could not be stored).
+    /// Owned by `allocator`.
+    recent: ?[]u64 = null,
+    /// Fewest new-to-the-chain paths any rebuild of the chain changed.
+    footprint: usize = 0,
+    /// Set by the `settle` that ended a chain by the follow-up cap: how many
+    /// follow-ups it took (the watcher logs it); 0 otherwise.
+    capped: u32 = 0,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *WatchBaseline) void {
         if (self.delta) |d| self.allocator.free(d);
         self.delta = null;
+        self.dropChain();
+    }
+
+    fn dropChain(self: *WatchBaseline) void {
+        self.forgetRecent();
+        self.follow_ups = 0;
+        self.footprint = 0;
     }
 
     /// Record a finished rebuild fired for `trigger` (its start-of-rebuild
@@ -716,15 +797,60 @@ const WatchBaseline = struct {
     /// (`null`: unknown, which never settles on `post`). Borrows `delta`.
     fn settle(self: *WatchBaseline, trigger: TreeSignature, post: TreeSignature, delta: ?[]const u64) void {
         const follow_up = if (self.post) |previous| trigger.eql(previous) else false;
-        const settled = if (delta) |d|
+        if (!follow_up) self.dropChain();
+        self.capped = 0;
+        const by_rule = if (delta) |d|
             d.len == 0 or (follow_up and self.delta != null and isSubset(d, self.delta.?))
         else
             false;
+        const settled = by_rule or self.chain(follow_up, delta);
         self.applied = if (settled) post else trigger;
         self.post = post;
         const kept: ?[]u64 = if (delta) |d| self.allocator.dupe(u64, d) catch null else null;
-        self.deinit();
+        if (self.delta) |old| self.allocator.free(old);
         self.delta = kept;
+    }
+
+    /// The follow-up cap (see the type's doc): count a follow-up, record
+    /// `delta` in the chain, and return true when this follow-up settles by
+    /// the cap or the ceiling. An unknown `delta` stops the chain's path
+    /// tracking (the cap cannot judge it) but still counts toward the
+    /// ceiling.
+    fn chain(self: *WatchBaseline, follow_up: bool, delta: ?[]const u64) bool {
+        if (follow_up) self.follow_ups +|= 1;
+        const d = delta orelse {
+            self.forgetRecent();
+            return self.endAtCeiling(follow_up);
+        };
+        const novel = if (self.recent) |r| countNovel(d, r) else d.len;
+        if (follow_up and self.recent != null and self.follow_ups >= follow_up_cap and novel <= self.footprint) {
+            self.capped = self.follow_ups;
+            self.dropChain();
+            return true;
+        }
+        if (self.endAtCeiling(follow_up)) return true;
+        const first = self.recent == null;
+        const merged = unionKeys(self.allocator, self.recent orelse &.{}, d) catch {
+            // Out of memory: stop tracking; only the ceiling still bounds it.
+            self.forgetRecent();
+            return false;
+        };
+        self.forgetRecent();
+        self.recent = merged;
+        self.footprint = if (first) novel else @min(self.footprint, novel);
+        return false;
+    }
+
+    fn forgetRecent(self: *WatchBaseline) void {
+        if (self.recent) |r| self.allocator.free(r);
+        self.recent = null;
+    }
+
+    fn endAtCeiling(self: *WatchBaseline, follow_up: bool) bool {
+        if (!follow_up or self.follow_ups < follow_up_ceiling) return false;
+        self.capped = self.follow_ups;
+        self.dropChain();
+        return true;
     }
 
     /// True when `sig` differs from the last build (subject to debounce).
@@ -928,6 +1054,7 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
         else
             null;
         baseline.settle(start.sig, post.sig, delta);
+        if (baseline.capped != 0) std.debug.print("labelle: watch: settled after {d} follow-up rebuilds triggered by build outputs\n", .{baseline.capped});
         _ = rebuild_arena.reset(.retain_capacity);
         stable_polls = 0;
         if (ok) {
@@ -1041,6 +1168,103 @@ test "watch baseline: a scripted session never settles past an unread edit and n
         b.settle(testSig(step.trigger), testSig(step.post), step.delta);
         try std.testing.expectEqual(step.must_rebuild, b.unbuilt(testSig(step.post)));
     }
+}
+
+test "watch baseline: a hook writing a different path each run settles at the follow-up cap (Codex P2 on #427)" {
+    // A timestamp-named report: every run writes a NEW path, so no
+    // follow-up's delta is a subset of its predecessor's.
+    const r1 = testDelta(&.{"reports/1.txt"});
+    const r2 = testDelta(&.{"reports/2.txt"});
+    const r3 = testDelta(&.{"reports/3.txt"});
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
+    b.settle(testSig("edit"), testSig("p1"), &r1);
+    try std.testing.expect(b.unbuilt(testSig("p1")));
+    // Follow-up 1: below the cap, still pending.
+    b.settle(testSig("p1"), testSig("p2"), &r2);
+    try std.testing.expect(b.unbuilt(testSig("p2")));
+    try std.testing.expectEqual(@as(u32, 0), b.capped);
+    // Follow-up 2 reaches the cap: one new path, the writer's footprint,
+    // so it settles — and it was the cap that did it, not the subset rule.
+    try std.testing.expect(!isSubset(&r3, &r2));
+    b.settle(testSig("p2"), testSig("p3"), &r3);
+    try std.testing.expect(!b.unbuilt(testSig("p3")));
+    try std.testing.expectEqual(WatchBaseline.follow_up_cap, b.capped);
+    // The chain is over: the next edit starts a fresh one, with the full
+    // allowance again.
+    b.settle(testSig("edit 2"), testSig("p4"), &r1);
+    try std.testing.expectEqual(@as(u32, 0), b.capped);
+    try std.testing.expect(b.unbuilt(testSig("p4")));
+    b.settle(testSig("p4"), testSig("p5"), &r2);
+    try std.testing.expect(b.unbuilt(testSig("p5")));
+}
+
+test "watch baseline: an edit saved during a capped follow-up still fires one more rebuild" {
+    const r1 = testDelta(&.{"reports/1.txt"});
+    const r2 = testDelta(&.{"reports/2.txt"});
+    // At the cap, the writer's new report AND a source the user saved
+    // while that follow-up ran: more new paths than the writer's footprint.
+    const r3_edit = testDelta(&.{ "reports/3.txt", "src/main.zig" });
+    const r4 = testDelta(&.{"reports/4.txt"});
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
+    b.settle(testSig("edit"), testSig("p1"), &r1);
+    b.settle(testSig("p1"), testSig("p2"), &r2);
+    b.settle(testSig("p2"), testSig("p3"), &r3_edit);
+    // Not settled: main.zig is read by one more rebuild.
+    try std.testing.expect(b.unbuilt(testSig("p3")));
+    try std.testing.expectEqual(@as(u32, 0), b.capped);
+    // That rebuild only writes the next report: settled past the cap.
+    b.settle(testSig("p3"), testSig("p4"), &r4);
+    try std.testing.expect(!b.unbuilt(testSig("p4")));
+    try std.testing.expectEqual(@as(u32, 3), b.capped);
+}
+
+test "watch baseline: an edit saved between capped-chain rebuilds always rebuilds and restarts the chain" {
+    const r1 = testDelta(&.{"reports/1.txt"});
+    const r2 = testDelta(&.{"reports/2.txt"});
+    const r3 = testDelta(&.{"reports/3.txt"});
+    const r4 = testDelta(&.{"reports/4.txt"});
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
+    b.settle(testSig("edit"), testSig("p1"), &r1);
+    b.settle(testSig("p1"), testSig("p2"), &r2);
+    // The user saves after follow-up 1 returned: the tree the watcher
+    // fires for is not `p2`, so this is no follow-up and cannot settle...
+    b.settle(testSig("p2 + edit"), testSig("p3"), &r3);
+    try std.testing.expect(b.unbuilt(testSig("p3")));
+    try std.testing.expectEqual(@as(u32, 0), b.follow_ups);
+    // ...and its follow-up is the new chain's first, below the cap.
+    b.settle(testSig("p3"), testSig("p4"), &r4);
+    try std.testing.expect(b.unbuilt(testSig("p4")));
+    try std.testing.expectEqual(@as(u32, 1), b.follow_ups);
+}
+
+test "watch baseline: a writer whose output keeps growing settles at the ceiling" {
+    // Each run writes one more new path than the last: never within the
+    // footprint, so only the ceiling ends it.
+    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+    defer b.deinit();
+    var keys: [64]u64 = undefined;
+    for (&keys, 0..) |*k, i| k.* = i;
+    var next: usize = 0;
+    var posts: [WatchBaseline.follow_up_ceiling + 1]TreeSignature = undefined;
+    for (&posts, 0..) |*p, i| {
+        var sig = TreeSignature{};
+        sig.mix("post", i, 0);
+        p.* = sig;
+    }
+    var trigger = testSig("edit");
+    var run: usize = 0;
+    while (run <= WatchBaseline.follow_up_ceiling) : (run += 1) {
+        const d = keys[next .. next + run + 1];
+        next += run + 1;
+        b.settle(trigger, posts[run], d);
+        trigger = posts[run];
+        const at_ceiling = run == WatchBaseline.follow_up_ceiling;
+        try std.testing.expectEqual(!at_ceiling, b.unbuilt(posts[run]));
+    }
+    try std.testing.expectEqual(WatchBaseline.follow_up_ceiling, b.capped);
 }
 
 test "watch baseline: an edit saved during an ordinary rebuild still fires the next one" {

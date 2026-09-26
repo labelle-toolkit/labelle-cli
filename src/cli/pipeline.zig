@@ -197,8 +197,9 @@ const WasmRebuildCtx = struct {
         //     A step that declares no `.outputs` runs on every rebuild by
         //     design and is not excluded from anything; if such a step
         //     also writes into the watched tree the watcher settles after
-        //     one follow-up rebuild (`serve.WatchBaseline`), but declaring
-        //     `.outputs` avoids even that one.
+        //     one follow-up rebuild — a few, capped, when it writes a
+        //     different path each run (`serve.WatchBaseline`) — but
+        //     declaring `.outputs` avoids even those.
         self.run_prebuild(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
             return error.PrebuildFailed;
@@ -760,6 +761,14 @@ const WatchReplan = struct {
     const Generation = struct {
         arena: std.heap.ArenaAllocator,
         sources: provider_github.Sources,
+        /// This generation's `after run` hooks, planned against the same
+        /// providers and config it installs on the site. The serve's
+        /// shutdown runs these (`shutdownRunAfter`), not the startup plan:
+        /// once a replan changed a provider's version the startup plan's
+        /// pins no longer match the rewritten lock (`StaleProviderPin`),
+        /// and added or removed after-run hooks would be ignored (Codex P2
+        /// on #427).
+        run_after: []const provider_hooks.Planned = &.{},
 
         /// Heap-allocated so the arena's address is stable: every allocator
         /// handle carved from it (the sources' included) points at it.
@@ -815,6 +824,7 @@ const WatchReplan = struct {
         }
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
+        const run_plan = try provider_hooks.plan(a, providers, .run, ctx.hooks.target);
         // The lock follows the re-read project once the target is confirmed
         // and the plans are good — the cold pipeline's order — and before
         // any hook runs, since each hook verifies its pin against it.
@@ -826,8 +836,18 @@ const WatchReplan = struct {
         ctx.hooks.cfg = cfg;
         ctx.generate_plan = generate_plan;
         ctx.build_plan = build_plan;
+        next.run_after = run_plan.after;
         if (self.current) |previous| previous.destroy(self.backing);
         self.current = next;
+    }
+
+    /// The `after run` hooks the serve's shutdown runs: the current
+    /// generation's — planned against the providers and config installed on
+    /// the site, and pinned by the lock the replan last wrote — or `startup`
+    /// when no rebuild has replanned yet. Read before `deinit`, which puts
+    /// the site back on the startup storage.
+    fn shutdownRunAfter(self: *const WatchReplan, startup: []const provider_hooks.Planned) []const provider_hooks.Planned {
+        return if (self.current) |generation| generation.run_after else startup;
     }
 
     /// The ownership pre-check (`WasmRebuildCtx.Replan.precheck`): before
@@ -1348,6 +1368,110 @@ const WatchReplan = struct {
         defer bare.deinit(&site, &.{}, startup_cfg);
         try std.Io.Dir.cwd().deleteTree(io, Spy.cache_dir);
         try std.testing.expectError(error.ProviderPackageMissing, WatchReplan.run(&bare, &ctx));
+    }
+
+    // The serve's shutdown runs the CURRENT generation's `after run` hooks:
+    // a rebuild that bumped the provider's version (and rewrote the lock)
+    // and swapped its after-run hook set leaves the startup plan stale —
+    // its pin fails `StaleProviderPin` and its hook set is the old one —
+    // while `shutdownRunAfter` hands the finish the replanned set, which
+    // runs against the new lock (Codex P2 on #427).
+    test "watched serve shutdown runs the replanned after-run hooks" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        const Files = struct {
+            fn write(dir: std.Io.Dir, version: []const u8, hook_id: []const u8) !void {
+                var buf: [1024]u8 = undefined;
+                const manifest = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"wasm\" }}, .hooks = .{{ .{{ .id = \"{s}\", .step = .run, .target = \"wasm\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }} }} }}", .{hook_id});
+                try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = manifest });
+                var pbuf: [512]u8 = undefined;
+                const proj = try std.fmt.bufPrint(&pbuf, ".{{ .name = \"game\", .plugins = .{{ .{{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"{s}\" }} }} }}", .{version});
+                try dir.writeFile(config.globalIo(), .{ .sub_path = "project/project.labelle", .data = proj });
+            }
+        };
+        const Spy = struct {
+            var ran: [4][]const u8 = undefined;
+            var count: usize = 0;
+            fn tool(_: std.mem.Allocator, _: provider_dispatch.Host, _: []const u8, _: provider_dispatch.Provider, _: provider_contract.Tool, tool_run: provider_dispatch.ToolRun) anyerror!u8 {
+                // Static ids from the fixture's two manifests.
+                ran[count] = if (std.mem.eql(u8, tool_run.invocation.id, "publish-v2")) "publish-v2" else "other";
+                count += 1;
+                return 0;
+            }
+        };
+        Spy.count = 0;
+
+        // Startup: v1 with an after-run hook, installed and locked by the
+        // cold pipeline; the startup plan is taken from that state.
+        try Files.write(tmp.dir, "1.0.0", "publish-v1");
+        var startup_arena = std.heap.ArenaAllocator.init(a);
+        defer startup_arena.deinit();
+        const sa = startup_arena.allocator();
+        const startup_cfg = try config.readProjectConfig(sa, project);
+        try lockfile.writeLockFile(sa, project, startup_cfg);
+        var startup_sources: provider_github.Sources = .{ .a = sa };
+        defer startup_sources.deinit();
+        const startup_providers = try provider_dispatch.discover(sa, project, startup_cfg, &startup_sources, .populated);
+        const startup_run = try provider_hooks.plan(sa, startup_providers, .run, "wasm");
+        try std.testing.expectEqualStrings("pkg/publish-v1", startup_run.after[0].qualified);
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        site.providers = startup_providers;
+        site.cfg = startup_cfg;
+        site.host = .{ .zig = "/z", .cache_root = project, .global_cache = project, .packages = project };
+        site.run_tool = Spy.tool;
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+        };
+        var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = lockfile.writeLockFile };
+        defer replan.deinit(&site, startup_providers, startup_cfg);
+        replan.baseline();
+        // No rebuild has replanned yet: the startup plan is the shutdown's.
+        try std.testing.expectEqual(startup_run.after.ptr, replan.shutdownRunAfter(startup_run.after).ptr);
+
+        // A watched edit bumps the provider to v2 and swaps its after-run
+        // hook; the rebuild's replan installs it and relocks.
+        try Files.write(tmp.dir, "2.0.0", "publish-v2");
+        try WatchReplan.run(&replan, &ctx);
+
+        // The startup plan is stale against the rewritten lock...
+        try std.testing.expectError(error.StaleProviderPin, provider_hooks.finishServe(&site, startup_run.after, project));
+        try std.testing.expectEqual(@as(usize, 0), Spy.count);
+        // ...the shutdown's plan is the replanned one, and it runs.
+        const after = replan.shutdownRunAfter(startup_run.after);
+        try std.testing.expectEqual(@as(usize, 1), after.len);
+        try std.testing.expectEqualStrings("pkg/publish-v2", after[0].qualified);
+        try std.testing.expectEqual(@as(u8, 0), try provider_hooks.finishServe(&site, after, project));
+        try std.testing.expectEqual(@as(usize, 1), Spy.count);
+        try std.testing.expectEqualStrings("publish-v2", Spy.ran[0]);
+
+        // A later edit that removes every after-run hook: shutdown runs none.
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "pkg/plugin.labelle",
+            .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        });
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(@as(usize, 0), replan.shutdownRunAfter(startup_run.after).len);
     }
 
     // Once a rebuild replanned, the site points into the replan's storage;
@@ -2960,7 +3084,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             // The server returned (Ctrl+C / SIGTERM): the serve's clean end.
             // The feed already says `done`; only the hooks run here, and a
             // failing one revises that record to `failed`.
-            return provider_hooks.finishServe(&hook_site, hook_plans.run.after, run_out);
+            //
+            // The hooks are the CURRENT generation's (`shutdownRunAfter`):
+            // `hook_site` already carries that generation's providers and
+            // config, and the lock on disk pins its versions.
+            return provider_hooks.finishServe(&hook_site, watch_replan.shutdownRunAfter(hook_plans.run.after), run_out);
         }
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
