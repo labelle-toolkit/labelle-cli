@@ -272,6 +272,18 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     assert UNPINNED in unpinned.stderr and "--accept" in unpinned.stderr, unpinned.stderr
     installed_only(unpinned, "probe-target")
     assert not log(project / ".labelle" / "raylib_probe-target"), "the unpinned provider's replacement ran"
+    # Cold, through `build` (which keeps a progress feed; `generate` is
+    # report-free): the `failed` record names THIS refusal, not the
+    # absent-owner one above, so a status consumer advises pinning the
+    # declared package rather than adding one.
+    reset()
+    shutil.rmtree(home, ignore_errors=True)
+    unpinned = run("build", "--platform=probe-target", code=1, extra_env=populate)
+    assert UNPINNED in unpinned.stderr, unpinned.stderr
+    installed_only(unpinned, "probe-target")
+    status = json.loads((project / ".labelle" / "raylib_probe-target" / ".build-progress.json").read_text())
+    assert status["phase"] == "failed" and status["detail"] == "unpinned provider for target", status
+    assert "unpinned" in status["detail"] and status["detail"] != "no provider for target", status
     # Warm: the same manifest is readable before the install, so the same
     # verdicts land early, with nothing run and the cache left as it was.
     reset()

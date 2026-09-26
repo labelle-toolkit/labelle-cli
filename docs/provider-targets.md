@@ -83,8 +83,9 @@ not readable yet (cold cache, no pin) does the verdict wait for the
 post-install discovery, which stays the authoritative check: a declared
 package that does not declare the requested name is refused there — after
 the install, before the lock, generation or any compiler, with a `failed`
-progress record (`no provider for target`) and nothing else in the target
-directory. The `labelle-assembler#378` gate and the bundle-replacement check
+progress record naming the refusal — `no provider for target`, or
+`unpinned provider for target` when the declaring package is remote and
+unpinned — and nothing else in the target directory. The `labelle-assembler#378` gate and the bundle-replacement check
 below need the hook plans, so they land at the post-install point. `labelle
 wasm serve --no-build` installs nothing and confirms the name against the
 providers discoverable as-is, like `labelle targets`.

@@ -671,25 +671,58 @@ fn ok(result: anytype) !u8 {
     return 0;
 }
 
+/// Why `confirmTarget` refused the requested target. The kind survives to
+/// the `failed` progress record, so a `labelle status --json` consumer can
+/// tell an absent owner (add a provider) from an unpinned one (pin the
+/// declared package) the same way the human diagnostic does (Codex on #421).
+const TargetRefusal = enum {
+    no_provider,
+    unpinned_owner,
+
+    /// The `detail` of the `failed` progress record.
+    fn detail(self: TargetRefusal) []const u8 {
+        return switch (self) {
+            .no_provider => "no provider for target",
+            .unpinned_owner => "unpinned provider for target",
+        };
+    }
+};
+
+const TargetVerdict = union(enum) {
+    resolved: provider_targets.Resolved,
+    refused: TargetRefusal,
+};
+
 /// The ownership half of target resolution with the pipeline's diagnostic:
-/// `provider_targets.resolve` against the discovered providers, or null
-/// after printing the no-provider line (whose registry hint is read from
-/// the cached registry document only). The caller marks its feed and exits.
-fn confirmTarget(a: std.mem.Allocator, providers: []const provider_dispatch.Provider, requested: []const u8) !?provider_targets.Resolved {
-    return provider_targets.resolve(providers, requested) catch |err| switch (err) {
+/// `provider_targets.resolve` against the discovered providers, or the
+/// refusal kind after printing its diagnostic (the no-provider line's
+/// registry hint is read from the cached registry document only). The
+/// caller marks its feed with the kind and exits.
+fn confirmTarget(a: std.mem.Allocator, providers: []const provider_dispatch.Provider, requested: []const u8) !TargetVerdict {
+    const resolved = provider_targets.resolve(providers, requested) catch |err| switch (err) {
         error.NoProviderForTarget => {
             provider_targets.reportNoProvider(a, requested);
-            return null;
+            return .{ .refused = .no_provider };
         },
         // The owner is a remote package read from the ordinary cache with
         // no integrity pin: a target-owning provider is held to the pinned
         // boundary even when no hook of its would ever call `requirePinned`.
         error.UnverifiedTargetOwner => {
             provider_targets.reportUnverifiedOwner(a, providers, requested);
-            return null;
+            return .{ .refused = .unpinned_owner };
         },
         else => return err,
     };
+    return .{ .resolved = resolved };
+}
+
+test "pipeline: each target refusal kind writes its own progress detail" {
+    // The two kinds call for different fixes, so their records must differ
+    // and the unpinned one must name the condition.
+    try std.testing.expectEqualStrings("no provider for target", TargetRefusal.no_provider.detail());
+    try std.testing.expectEqualStrings("unpinned provider for target", TargetRefusal.unpinned_owner.detail());
+    try std.testing.expect(std.mem.indexOf(u8, TargetRefusal.unpinned_owner.detail(), "unpinned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TargetRefusal.no_provider.detail(), "unpinned") == null);
 }
 
 pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
@@ -801,7 +834,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             return 1;
         };
         if (early.unresolved.len == 0) {
-            _ = try confirmTarget(hook_arena, early.providers, requested_target) orelse return 1;
+            switch (try confirmTarget(hook_arena, early.providers, requested_target)) {
+                .resolved => {},
+                .refused => return 1,
+            }
         }
     }
     // The legacy sites below (`parsed.platform == .X`; the guard's migration
@@ -853,7 +889,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
             return 1;
         };
-        const served = try confirmTarget(hook_arena, known, requested_target) orelse return 1;
+        const served = switch (try confirmTarget(hook_arena, known, requested_target)) {
+            .resolved => |resolved| resolved,
+            .refused => return 1,
+        };
         const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
         defer allocator.free(wasm_target);
         const web_dir = try std.fs.path.join(allocator, &.{
@@ -1115,10 +1154,14 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // at which a declared package's manifest is guaranteed readable — and
     // refused when none declares it. This is the only place a provider
     // target becomes a resolved one; nothing has been generated, locked or
-    // compiled yet, and the `failed` progress record names the reason.
-    const target = try confirmTarget(hook_arena, providers, requested_target) orelse {
-        if (reporter) |r| r.finishFailed(1, "no provider for target");
-        return 1;
+    // compiled yet, and the `failed` progress record names the reason —
+    // which of the two refusals it was, since each calls for a different fix.
+    const target = switch (try confirmTarget(hook_arena, providers, requested_target)) {
+        .resolved => |resolved| resolved,
+        .refused => |why| {
+            if (reporter) |r| r.finishFailed(1, why.detail());
+            return 1;
+        },
     };
     const hook_plans = .{
         .generate = try provider_hooks.plan(hook_arena, providers, .generate, target.name),

@@ -246,14 +246,19 @@ fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
         // inspected release's buffers alive until the command exits.
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
-        const meta = cachedManifest(scratch.allocator(), pin) catch |err| switch (err) {
+        const read_manifest = cachedManifest(scratch.allocator(), pin) catch |err| switch (err) {
             error.ProviderArchiveMissing => continue, // Not cached: nothing was read.
             else => {
                 inspected += 1;
                 continue;
             },
-        } orelse continue;
+        };
+        // Counted whether or not the archive carries a `plugin.labelle`: the
+        // bytes were read, verified and decompressed either way, and a
+        // registry of manifest-less releases must not read past the bound
+        // (Codex on #421).
         inspected += 1;
+        const meta = read_manifest orelse continue;
         // `pin.package` is on the caller's allocator, unlike `meta`.
         if (std.mem.eql(u8, meta.name, pin.package) and meta.ownsTarget(target)) return pin.package;
     }
@@ -628,11 +633,22 @@ const AcceptFixture = struct {
     }
 
     fn gzipArchiveWith(a: std.mem.Allocator, plugin_manifest: []const u8) ![]u8 {
+        return gzipArchiveOf(a, plugin_manifest, "// fixture\n");
+    }
+
+    /// A valid archive with no `plugin.labelle` at all (`cachedManifest`
+    /// reads it whole and returns null); `build_zig` varies the bytes so
+    /// every pin verifies its own archive.
+    fn gzipArchiveWithoutManifest(a: std.mem.Allocator, build_zig: []const u8) ![]u8 {
+        return gzipArchiveOf(a, null, build_zig);
+    }
+
+    fn gzipArchiveOf(a: std.mem.Allocator, plugin_manifest: ?[]const u8, build_zig: []const u8) ![]u8 {
         var tar_out: std.Io.Writer.Allocating = .init(a);
         var tar: std.tar.Writer = .{ .underlying_writer = &tar_out.writer };
         try tar.setRoot("fixture-commit");
-        try tar.writeFileBytes("plugin.labelle", plugin_manifest, .{});
-        try tar.writeFileBytes("build.zig", "// fixture\n", .{});
+        if (plugin_manifest) |text| try tar.writeFileBytes("plugin.labelle", text, .{});
+        try tar.writeFileBytes("build.zig", build_zig, .{});
         try tar.finishPedantically();
         var gz_out: std.Io.Writer.Allocating = try .initCapacity(a, 4096);
         var window: [std.compress.flate.max_window_len * 2]u8 = undefined;
@@ -823,6 +839,44 @@ test "provider github: the registry-hint scan reads a bounded number of cached r
     try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = trimmed }, .{}));
     try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "probe-target").?);
     try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "other-1").?);
+}
+
+test "provider github: the registry-hint scan counts manifest-less cached releases against its bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    // `limit` cached releases that verify but carry no `plugin.labelle`:
+    // each is read, verified and decompressed whole before the scan learns
+    // it has nothing to say, so each costs one of the bounded reads.
+    var pins: std.ArrayList(Pin) = .empty;
+    var i: usize = 0;
+    while (i < registry_hint_scan_limit) : (i += 1) {
+        const data = try AcceptFixture.gzipArchiveWithoutManifest(a, try std.fmt.allocPrint(a, "// no manifest {d}\n", .{i}));
+        var pin = fx.pin;
+        pin.version = try std.fmt.allocPrint(a, "1.{d}.0", .{i});
+        pin.sha256 = try sha256Hex(a, data);
+        try cwd.writeFile(io, .{ .sub_path = try archivePath(a, pin), .data = data });
+        try pins.append(a, pin);
+    }
+    const declaring = ".{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }";
+    const data = try AcceptFixture.gzipArchiveWith(a, declaring);
+    var owner = fx.pin;
+    owner.version = "9.0.0";
+    owner.sha256 = try sha256Hex(a, data);
+    try cwd.writeFile(io, .{ .sub_path = try archivePath(a, owner), .data = data });
+    try pins.append(a, owner);
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = pins.items }, .{}));
+    // The bound is spent on the manifest-less releases: the owner behind
+    // them is never read. (Skipping them uncounted would read it and name it.)
+    try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+    // One manifest-less release fewer and the owner is the last read within
+    // the bound: each manifest-less archive cost exactly one read.
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = pins.items[1..] }, .{}));
+    try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "probe-target").?);
 }
 
 fn testArchive(a: std.mem.Allocator, file: []const u8) ![]u8 {
