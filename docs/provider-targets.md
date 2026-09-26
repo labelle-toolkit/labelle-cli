@@ -16,12 +16,28 @@ one target, in two halves, before anything is generated, locked or built:
 1. The requested name is `--platform=<t>` when given, else the project's
    declared `.platform`. The parsers check only that it is identifier-shaped
    (`[a-z][a-z0-9_-]*`); anything else is `invalid target '<t>' (targets are
-   lowercase identifiers; run 'labelle targets')`.
+   lowercase identifiers; run 'labelle targets')`. A Windows reserved device
+   name (`con`, `nul`, `prn`, `aux`, `com1`-`com9`, `lpt1`-`lpt9`) is
+   identifier-shaped but names directories no Windows host can create
+   (`.labelle/<backend>_<t>/`, `zig-out/bundle/<t>/`), so it is refused with
+   its own reason — by the parsers, and at manifest validation for a
+   declared target or a hook's target (`ReservedDeviceTarget`).
 2. `desktop` is the core target and resolves without any provider.
 3. Any other name resolves to the pinned provider whose `plugin.labelle`
    declares it in `.targets`. Ownership is validated at discovery, so at most
    one provider can declare a name (`TargetConflict`) and none can declare
-   `desktop` (`ReservedTarget`).
+   `desktop` (`ReservedTarget`). *Pinned* is load-bearing: a remote package
+   read from the ordinary package cache without an integrity pin
+   (`Provider.verified == false`) is discovered, and `labelle targets` lists
+   its declaration marked `(unpinned)`, but it never resolves a target —
+   owning one means generating, building or bundling for it, so the owner is
+   held to the same boundary as a hook that runs, even when it declares no
+   hook and nothing else would ever ask for its pin:
+
+   ```
+   labelle: target 'wasm' is declared by remote package 'labelle-web', which is unpinned; a target's provider must be pinned. Run labelle providers resolve, review the pins, then repeat with --accept.
+   ```
+
 4. A name nobody declares fails:
 
    ```
@@ -34,7 +50,11 @@ one target, in two halves, before anything is generated, locked or built:
    a package whose verified cached archive declares the target. The registry
    record itself carries no target declarations (contract §4), so the CLI
    reads the manifest out of the cached archive without extracting or
-   running anything, and never invents a name. Nothing is fetched.
+   running anything, and never invents a name. Nothing is fetched. Each
+   archive read decompresses a whole release on a scratch arena freed before
+   the next, and the scan stops at the first owner or after
+   `registry_hint_scan_limit` cached releases, so a large registry bounds
+   the cost of a diagnostic rather than the other way round.
 
 The two halves are the **name** and the **ownership**. The name is settled
 from the string alone, first thing: `desktop` is core, any other name is
@@ -44,17 +64,30 @@ progress feed, the schema platform the pre-install steps key off — and for
 two verdicts that need no provider: a project with no `.plugins` cannot own
 a provider target and is refused before anything is read, written or built,
 and `labelle bundle` of the core target is refused off macOS before any
-install. Ownership is confirmed right after the assembler's `install`
-populated the package cache, because provider discovery runs only then (a
-declared remote package has no readable manifest before it; see [provider
-hooks](provider-hooks.md#discovery-and-the-graph)). A declared package that
-does not declare the requested name is refused there — after the install,
-before the lock, generation or any compiler, with a `failed` progress record
-(`no provider for target`) and nothing else in the target directory. The
-`labelle-assembler#378` gate and the bundle-replacement check below need the
-hook plans, so they land at the same point. `labelle wasm serve --no-build`
-installs nothing and confirms the name against the providers discoverable
-as-is, like `labelle targets`.
+install.
+
+Ownership is decided as early as it can be. Provider discovery is
+authoritative only after the assembler's `install` populated the package
+cache (a declared remote package has no readable manifest before it; see
+[provider hooks](provider-hooks.md#discovery-and-the-graph)) — but for a
+provider target the pipeline first runs the same metadata-only discovery
+`labelle targets` does (cached manifests, no installer). When that read
+every declared package, the verdict it reaches is the one the post-install
+check would reach, so it lands right there: an identifier-shaped typo
+(`--platform=waasm`), a name no declared package owns, or an unpinned remote
+owner is refused before `.prebuild`, the assembler resolution, the ASTC
+prepass or the install run — nothing is read, written or built. A manifest
+that fails discovery fails it closed there too: the install cannot mend a
+manifest that is already readable. Only while a declared remote package is
+not readable yet (cold cache, no pin) does the verdict wait for the
+post-install discovery, which stays the authoritative check: a declared
+package that does not declare the requested name is refused there — after
+the install, before the lock, generation or any compiler, with a `failed`
+progress record (`no provider for target`) and nothing else in the target
+directory. The `labelle-assembler#378` gate and the bundle-replacement check
+below need the hook plans, so they land at the post-install point. `labelle
+wasm serve --no-build` installs nothing and confirms the name against the
+providers discoverable as-is, like `labelle targets`.
 
 The resolved target is a string. It names the generated tree
 (`.labelle/<backend>_<target>/`, from the provisional name, so a refused
@@ -91,7 +124,11 @@ explicit line:
   ```
 
   With one, the provider generates; the core steps it does not replace
-  (`build`, `run`) treat the target as the generic host baseline.
+  (`build`, `run`) treat the target as the generic host baseline. The ASTC
+  prepass is not among them: it keys on the requested target, and a target
+  outside the enum has no capability table (`labelle astc` refuses the name),
+  so the prepass is skipped rather than run with the derived `desktop` — a
+  provider owns its target's asset pipeline.
 
 What waits for assembler#378: string-resolved platforms in `generate`, the
 removal of the `Capability.{wasm,android,ios}` derivation, and the enum
@@ -139,11 +176,14 @@ package injection (RFC #406 "Migration", #410):
 
 Unit tests (`zig build test-provider-dispatch`, also collected by `zig build
 test`) cover `provider_targets.resolve` (core with no providers, a provider
-target, an undeclared target, the schema-name mapping through a provider
-only, the diagnostic with and without a registry hint),
-`provider_github.cachedRegistryOwner` (a hint only from a verified cached
-archive), `args.parseTargetValue` and `parseBundleArgs --platform`. The
-real-process regression is:
+target, an undeclared target, an unpinned remote owner, the schema-name
+mapping through a provider only, the diagnostic with and without a registry
+hint), `provider_github.cachedRegistryOwner` (a hint only from a verified
+cached archive; the bounded scan), `provider_dispatch.discoverAll` (the
+unresolved packages of a partial view), the reserved-device-name rule
+(`provider_contract.targetName`, the manifest's `targets` and hook targets,
+`args.parseTargetValue`) and `parseBundleArgs --platform`. The real-process
+regression is:
 
 ```
 zig build
@@ -153,9 +193,17 @@ python test/provider_targets_e2e.py --zig /path/to/zig
 It drives the actual CLI with a fake assembler that records the target it
 was asked for: the no-provider error for `--platform=wasm`, the declared
 `.platform` and every legacy subcommand, with no assembler invocation; the
-#378 message before the assembler runs; `NoBundleReplacement`; a provider
-replacing `generate`/`build`/`bundle` for `probe-target`, including `labelle
-bundle --platform=probe-target` running the replacement on every host with
-the contract's `output_dir`; a provider owning `wasm` making the assembler
-receive `--platform wasm`; and the `labelle targets` listing. CI runs it on
-Windows, macOS and Linux.
+early verdict for a local provider that does not own the name, including a
+typo that leaves a `.prebuild` marker step unrun (while a resolving target
+runs it); a remote package on a cold cache deferring the verdict to after
+the install (the `failed` record) and, unpinned, refused as an owner both
+after the install and — warm — before it; the #378 message before the
+assembler runs; `NoBundleReplacement`; a provider replacing
+`generate`/`build`/`bundle` for `probe-target`, including `labelle bundle
+--platform=probe-target` running the replacement on every host with the
+contract's `output_dir`; the ASTC prepass running for `desktop` and not for
+`probe-target`; a provider owning `wasm` making the assembler receive
+`--platform wasm`; and the `labelle targets` listing. CI runs it on Windows,
+macOS and Linux. The Docker WASM build in `ci.yml` declares the repo's own
+`test/fixtures/wasm-provider` (a module plugin whose manifest owns `wasm`)
+because the platform packages are not extracted yet.

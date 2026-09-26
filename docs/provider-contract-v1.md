@@ -10,7 +10,7 @@ This document supplies normative v1 details for [the architecture RFC](rfc-packa
 
 ## 1. Package declarations and installed tools
 
-The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, and `targets`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive.
+The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, and `targets`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive. A target name (declared or a hook's) is additionally never a Windows reserved device name (`con`, `nul`, `prn`, `aux`, `com1`-`com9`, `lpt1`-`lpt9`), because the CLI names directories after it.
 
 A command has required `name`, `build_step`, `executable`, and `help`, with optional `needs_project` (default true). A hook has required `id`, `step`, `target`, `when`, `build_step`, and `executable`, with optional `after_hooks` (default empty). Valid steps are `generate`, `build`, `bundle`, `run`; phases are `before`, `replace`, `after`. There is no separate package lifecycle step: `bundle` produces the target distributable.
 
