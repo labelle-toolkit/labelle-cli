@@ -141,7 +141,7 @@ fn uniqueNames(names: []const []const u8) !void {
     }
 }
 
-fn identifier(value: []const u8) bool {
+pub fn identifier(value: []const u8) bool {
     if (value.len == 0 or value[0] < 'a' or value[0] > 'z') return false;
     for (value) |c| {
         if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '_')) return false;

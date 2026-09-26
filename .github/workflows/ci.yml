@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   build:
@@ -63,6 +62,14 @@ jobs:
 
       - name: Build CLI
         run: zig build
+
+      - name: Setup Python for provider subprocess tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Provider dispatch subprocess regression
+        run: python test/provider_dispatch_e2e.py
 
       - name: CLI tests
         run: zig build test
