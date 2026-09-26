@@ -142,8 +142,8 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…`, which packages
 - **Trust, outside a project:** there is no project pin, so the index is a new trust boundary.
   - Index entries carry a content hash for each release. The CLI verifies the fetched archive against it before building, as `zig fetch` does.
   - The index is served over HTTPS from the same origin as CLI releases and is written only by the providers' release workflows.
-  - The first time an unpinned package would run, the CLI asks for confirmation, showing the package, version, source URL and hash (`--yes` for CI).
-  - Once confirmed, it records the pin in a global lock (`~/.labelle/global.lock`); later runs use that pin until `labelle update` moves it.
+  - The first time an unpinned package would be used, the CLI asks for confirmation **before invoking anything from the package, including its `build.zig`**, since compiling the tool already runs provider code. The prompt shows the package, version, source URL and content hash. `--yes` (for CI) answers this same pre-build prompt; there is no later or separate consent step.
+  - Once confirmed, it records the pin in a global lock (`~/.labelle/global.lock`) **as the package, version and the approved content hash**. Every later run verifies the fetched or cached archive against that stored hash, not the index's current one. If the hash differs, for example because a release was re-tagged or the index changed, the CLI refuses to run and asks for confirmation again. `labelle update` moves the pin only through the same confirmation.
   - Signing releases (beyond hash integrity) is an open question.
 
 ## Resolution
