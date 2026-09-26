@@ -100,6 +100,7 @@ pub fn serveNoBuild(
         .root = project_root,
         .cfg = parsed,
         .target = served.name,
+        .target_dir = wasm_target_dir,
         .optimize = no_build_optimize,
         .progress = switch (parsed_args.progress_mode) {
             .human => .human,
@@ -579,4 +580,61 @@ fn runOptionEnv(parsed_args: *const ParsedArgs) runner.RunOptionEnv {
         .screenshot_path = parsed_args.screenshot_path,
         .screenshot_after_ns = parsed_args.screenshot_after_ns,
     };
+}
+
+/// The `run` options a `run`-step hook receives (contract §2 `run`, wire
+/// `1.2.0`+): `env` is exactly the list the core launch sets
+/// (`runner.appendRunOptionEnv` over `runOptionEnv`), `args` the tokens
+/// after `--`, `timeout_ms` the `--timeout`. The CLI maps nothing to any
+/// platform: a provider decides how the pairs reach its game. Everything
+/// lives on `a` (the pipeline's hook arena), which outlives every phase.
+pub fn hookRunOptions(a: std.mem.Allocator, parsed_args: *const ParsedArgs) !provider_contract.RunContext {
+    var extras: std.ArrayList(runner.EnvKV) = .empty;
+    const sec_buf = try a.create([32]u8);
+    try runner.appendRunOptionEnv(a, &extras, runOptionEnv(parsed_args), sec_buf);
+    const env = try a.alloc(provider_contract.RunEnv, extras.items.len);
+    for (extras.items, env) |kv, *entry| entry.* = .{ .name = kv.key, .value = kv.value };
+    return .{
+        .env = env,
+        .args = try a.dupe([]const u8, parsed_args.extra_args[0..parsed_args.extra_count]),
+        .timeout_ms = if (parsed_args.timeout_ns) |ns| ns / std.time.ns_per_ms else null,
+    };
+}
+
+test "pipeline: a run hook's options are the core launch's LABELLE_* list, the -- args and the timeout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed_args: ParsedArgs = .{ .command = .run };
+    // Nothing given: the empty set.
+    const none = try hookRunOptions(a, &parsed_args);
+    try std.testing.expect(!none.given());
+    parsed_args.scene_override = "x";
+    parsed_args.profile = true;
+    parsed_args.screenshot_path = "s.png";
+    parsed_args.screenshot_after_ns = 2 * std.time.ns_per_s;
+    parsed_args.timeout_ns = 30 * std.time.ns_per_s;
+    // Desktop-only knobs are not run options: they never reach a hook.
+    parsed_args.headless = true;
+    parsed_args.extra_args[0] = "a";
+    parsed_args.extra_args[1] = "b";
+    parsed_args.extra_count = 2;
+    const options = try hookRunOptions(a, &parsed_args);
+    try options.validate();
+    // The mechanism: the pairs are the same list the core launch builds.
+    var expected: std.ArrayList(runner.EnvKV) = .empty;
+    var sec_buf: [32]u8 = undefined;
+    try runner.appendRunOptionEnv(a, &expected, runOptionEnv(&parsed_args), &sec_buf);
+    try std.testing.expectEqual(expected.items.len, options.env.len);
+    for (expected.items, options.env) |kv, entry| {
+        try std.testing.expectEqualStrings(kv.key, entry.name);
+        try std.testing.expectEqualStrings(kv.value, entry.value);
+    }
+    try std.testing.expectEqual(@as(usize, 4), options.env.len);
+    try std.testing.expectEqualStrings("LABELLE_SCREENSHOT_AFTER_SEC", options.env[3].name);
+    try std.testing.expectEqualStrings("2.000", options.env[3].value);
+    for (options.env) |entry| try std.testing.expect(!std.mem.eql(u8, entry.name, "LABELLE_HEADLESS"));
+    try std.testing.expectEqual(@as(usize, 2), options.args.len);
+    try std.testing.expectEqualStrings("b", options.args[1]);
+    try std.testing.expectEqual(@as(?u64, 30_000), options.timeout_ms);
 }

@@ -13,6 +13,7 @@ pub fn testSite(a: std.mem.Allocator, project: []const u8) provider_hooks.Site {
         .root = project,
         .cfg = .{ .name = "game" },
         .target = "wasm",
+        .target_dir = project,
         .optimize = .ReleaseSafe,
         .progress = .off,
         .reporter = null,

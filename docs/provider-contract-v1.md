@@ -6,7 +6,7 @@ Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
 do not weaken the normative contract below; full phase-2 acceptance is pending.
 
-This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.1.0` and still speaks `1.0.0`, and every context carries the negotiated version.
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.2.0` and still speaks `1.1.0` and `1.0.0`, and every context carries the negotiated version.
 
 ## 1. Package declarations and installed tools
 
@@ -31,11 +31,11 @@ Commands require a namespace and unique names. Resolve-time validation rejects r
 
 The CLI creates a UTF-8 JSON file and passes its absolute filename in `LABELLE_CONTEXT`. There is no argument-encoded alternative. The provider receives trailing user arguments verbatim through argv, without shell interpolation; the context path is not inserted into argv. The CLI owns the context-file lifetime through process exit and removes it afterward. Providers treat it as read-only.
 
-Every field below is required, except `build_number`. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
+Every field below is required on the wires that define it, except the optional `build_number` and `run`. Nullable fields must be present as JSON null. A key is never emitted on a wire older than the one that added it. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
 
 | Field | Type / rule |
 | --- | --- |
-| `contract_version` | The negotiated wire version: `"1.0.0"` or `"1.1.0"` for this decoder |
+| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"` or `"1.2.0"` for this decoder |
 | `invocation` | Object containing `kind`, `id`, `step`, `phase` |
 | `invocation.kind` | `"command"` or `"hook"` |
 | `invocation.id` | Command name or hook ID |
@@ -49,21 +49,35 @@ Every field below is required, except `build_number`. Nullable fields must be pr
 | `zig_executable` | Absolute host compiler filename |
 | `optimize` | `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
 | `progress` | `human`, `json`, or `off` |
-| `build_number` | **Optional** (the only optional key), **wire `1.1.0`+**: the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it and the negotiated wire is `1.1.0` or newer; absent (never null) otherwise, and an error on any other invocation or on a `1.0.0` context |
+| `build_number` | **Optional**, **wire `1.1.0`+**: the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it and the negotiated wire is `1.1.0` or newer; absent (never null) otherwise, and an error on any other invocation or on a `1.0.0` context |
+| `target_dir` | **Wire `1.2.0`+, required there**: on a hook, the absolute generated target directory (`.labelle/<backend>_<target>/`), the same for every step whatever `output_dir` is; null on a command. The key doesn't exist below `1.2.0`, not even as null |
+| `run` | **Optional**, **wire `1.2.0`+**: present on every `run`-step hook context (any phase) and absent (never null) everywhere else. An object with three required keys, `env`, `args` and `timeout_ms` (see below) |
+
+The `run` object holds the `labelle run` options for a hook that wraps or replaces the launch:
+
+| Key | Type / rule |
+| --- | --- |
+| `env` | Array of `{ "name", "value" }`. These are the platform-neutral `LABELLE_*` variables the core launch sets for `--scene`, `--profile`, `--screenshot` and `--after` (`LABELLE_SCENE`, `LABELLE_PROFILE`, `LABELLE_SCREENSHOT_PATH`, `LABELLE_SCREENSHOT_AFTER_SEC`), in that order. An option the user didn't pass adds nothing. Names match `[A-Za-z_][A-Za-z0-9_]*` and are unique; values contain no NUL |
+| `args` | The tokens after `--`, verbatim, as an array of strings |
+| `timeout_ms` | `--timeout` in milliseconds, or null |
+
+The CLI doesn't map these to any platform. The provider decides how they reach its game, for example as launch extras on a device. A hook on another step, or a command, that carries `run` is an error, and so is a `1.2.0` `run`-step hook without it.
 
 ### Wire versions and negotiation
 
-The CLI implements contract `1.1.0` and speaks every wire version listed here, newest first:
+The CLI implements contract `1.2.0` and speaks every wire version listed here, newest first:
 
 | Wire | Adds |
 | --- | --- |
+| `1.2.0` | `target_dir` on every context and the optional `run` key on `run`-step hooks (additive minor). |
 | `1.1.0` | The optional `build_number` key (additive minor). |
 | `1.0.0` | The original v1 context. |
 
 For each invocation the CLI negotiates the **newest** wire version the provider's `command_contract` range admits and writes it as `contract_version`; a range that admits none of them is `UnsupportedContract` at discovery. Keys a wire version does not define are never emitted in it, so a provider decoding strictly (unknown fields are errors, as above) keeps working:
 
-- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.1.0` and must accept the keys `1.1.0` adds. A provider declaring such a range promises exactly that.
-- `>=1.0.0 <1.1.0` (or `1.0.0`) receives the exact `1.0.0` wire. `labelle bundle --build-number=N` is then not passed to it; the CLI prints one `note:` line saying so instead of dropping it silently.
+- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.2.0` and must accept the keys `1.1.0` and `1.2.0` add. A provider declaring such a range promises exactly that.
+- `>=1.0.0 <1.2.0` receives the exact `1.1.0` wire, without `target_dir` or `run`. If one of its `run` hooks would have received run options the user passed, the CLI prints one `note:` line per hook (`run options not passed to '<package>/<id>' (provider contract 1.1.0 < 1.2.0)`) instead of dropping them silently.
+- `>=1.0.0 <1.1.0` (or `1.0.0`) receives the exact `1.0.0` wire. `labelle bundle --build-number=N` is then not passed to it; the CLI prints one `note:` line saying so instead of dropping it silently. The `1.2.0` rule above applies too.
 
 A provider that rejects unknown fields should cap its range at the newest minor it decodes. New optional keys arrive only with a new minor wire version; the major stays `1` until a key is removed or changes meaning.
 
