@@ -6,7 +6,9 @@
 //! Walks every source file under `src/` at test time (`.zig`, plus the
 //! compiled `.c`/`.h` vendored there), splits each into `[A-Za-z0-9]+` runs
 //! and compares each run case-insensitively against `forbidden`, first as a
-//! whole and then piece by piece at CamelCase boundaries. A token that ends
+//! whole and then piece by piece at CamelCase boundaries, joining up to
+//! `max_join` adjacent pieces so a name that itself spans a boundary
+//! (`UI|Kit` in `UIKitView`) still flags. A token that ends
 //! in digits is also compared by its letter root, so a version or bit-width
 //! suffix does not hide a name. So `ios_cmd`, `cli/android/`, `IosConfig`,
 //! `iOS`, `iOSConfig`, `getSDLPath`, `wasm32`, `android14`, `sdl3` and
@@ -70,7 +72,9 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `maccatalyst`, spelled in `astc/cmd.zig`) joined (still 53 entries: every
 /// file those reach was already listed). Recomputed on `development` for
 /// #419 (affixes, source symlinks, the RFC tool names): one entry added,
-/// `cli/provider_hooks.zig` (new since, citing `adb`), 54 entries. Shrink only: an entry whose file is
+/// `cli/provider_hooks.zig` (new since, citing `adb`), 54 entries. Recomputed
+/// again after joins across CamelCase pieces (`UIKitView`): no file newly
+/// dirty, still 54 entries. Shrink only: an entry whose file is
 /// clean fails the test until it is removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
 /// moved or renamed, not merely emptied of platform words.
@@ -240,9 +244,19 @@ fn splitsBefore(text: []const u8, start: usize, i: usize) bool {
     return i + 1 < text.len and std.ascii.isLower(text[i + 1]);
 }
 
+/// Most adjacent CamelCase pieces of one run the tokenizer joins before
+/// classifying: an acronym-split name (`UI|Kit`, `X|Code`) plus one affix
+/// piece (`Lib|SDL|Dev`). Digits stay on their piece (`UI|Kit2`).
+const max_join = 3;
+
 /// Yields the forbidden words of `text` in order of occurrence. Each
 /// `[A-Za-z0-9]+` run is classified whole first (`iOS`, `ANDROID`), then,
-/// when the whole run is not a forbidden word, once per CamelCase piece.
+/// when the whole run is not a forbidden word, piece by piece: at each piece
+/// the join of the next `max_join` pieces, then the next `max_join - 1`, is
+/// tried before the piece alone, longest first, so a name that spans a
+/// CamelCase boundary (`UI|Kit` in `UIKitView`, `UI|Kit2` in `UIKit2Glue`)
+/// flags while a join that is not a whole name (`U|Int|Kind`, `Gui|Kit`,
+/// `Ui|Kitchen`) stays clean. A matched join consumes its pieces.
 const Tokenizer = struct {
     text: []const u8,
     pos: usize = 0,
@@ -265,8 +279,25 @@ const Tokenizer = struct {
                 }
             }
             const start = self.pos;
-            self.pos += 1;
-            while (self.pos < self.run_end and !splitsBefore(self.text, start, self.pos)) self.pos += 1;
+            // Ends of the next (up to) `max_join` pieces; each piece's own
+            // start feeds `splitsBefore`, as for a single piece.
+            var ends: [max_join]usize = undefined;
+            var n: usize = 0;
+            var p = start;
+            while (n < max_join and p < self.run_end) : (n += 1) {
+                const piece = p;
+                p += 1;
+                while (p < self.run_end and !splitsBefore(self.text, piece, p)) p += 1;
+                ends[n] = p;
+            }
+            var k = n;
+            while (k > 1) : (k -= 1) {
+                if (classify(self.text[start..ends[k - 1]])) |word| {
+                    self.pos = ends[k - 1];
+                    return word;
+                }
+            }
+            self.pos = ends[0];
             if (classify(self.text[start..self.pos])) |word| return word;
         }
     }
@@ -579,6 +610,55 @@ test "the RFC's provider tools and SDKs are forbidden" {
     try expectWords("UIKit uikit_view ButlerPush AdbDevice", &.{ "uikit", "uikit", "butler", "adb" });
     // Longer runs around the names do not match.
     try expectWords("butlers uikitten adbc emccx gradlewrapper", &.{});
+}
+
+/// Splits `text` (one `[A-Za-z0-9]+` run) into CamelCase pieces the way the
+/// tokenizer does, each piece's boundary judged from its own start.
+fn camelPieces(text: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var start: usize = 0;
+    while (start < text.len) {
+        var end = start + 1;
+        while (end < text.len and !splitsBefore(text, start, end)) end += 1;
+        try out.append(std.testing.allocator, text[start..end]);
+        start = end;
+    }
+}
+
+test "a name that spans CamelCase pieces flags (UIKitView), benign joins do not" {
+    // The gap #425 documented: `UIKit` splits as `UI|Kit`, so neither piece
+    // alone is the name.
+    try expectWords("UIKitView UIKitGlue UIKit2Glue", &.{ "uikit", "uikit", "uikit" });
+    try expectWords("getUIKitView let v: UIKitView = x;", &.{ "uikit", "uikit" });
+    try expectWords("XCodeProject LibSDLDev", &.{ "xcode", "sdl" });
+    // A matched join consumes its pieces; a later piece still flags.
+    try expectWords("UIKitSteamBridge", &.{ "uikit", "steam" });
+    // The mechanism: whole-run classification misses, and so does every
+    // single piece; only a join of adjacent pieces reaches the name.
+    const gpa = std.testing.allocator;
+    var pieces: std.ArrayList([]const u8) = .empty;
+    defer pieces.deinit(gpa);
+    const spanning = [_]struct { run: []const u8, join: []const u8 }{
+        .{ .run = "UIKitView", .join = "UIKit" },
+        .{ .run = "UIKitGlue", .join = "UIKit" },
+        .{ .run = "UIKit2Glue", .join = "UIKit2" },
+        .{ .run = "XCodeProject", .join = "XCode" },
+    };
+    for (spanning) |c| {
+        try std.testing.expectEqual(@as(?[]const u8, null), classify(c.run));
+        pieces.clearRetainingCapacity();
+        try camelPieces(c.run, &pieces);
+        try std.testing.expect(pieces.items.len >= 3);
+        for (pieces.items) |piece| try std.testing.expectEqual(@as(?[]const u8, null), classify(piece));
+        try std.testing.expect(std.mem.startsWith(u8, c.run, c.join));
+        try std.testing.expect(classify(c.join) != null);
+    }
+    // Benign controls: realistic identifiers whose joins are not a whole name.
+    // `UIntKind` is `U|Int|Kind` (`uint`, `uintkind`), `GuiKit` is
+    // `guikit`, `UiKitchen` is `uikitchen`, `UIKeyboard` is `UI|Keyboard`.
+    try expectWords("UIntKind GuiKit UiKitchen UIKeyboard UIKitten UIKithelper Toolkit", &.{});
+    try expectWords("IOStream IOSurface IoSlice AdBlock WebGLContext", &.{"web"});
+    // Joins stay inside one run: `UI` and `Kit` across a separator never join.
+    try expectWords("UI_Kit UI.Kit UI Kit", &.{});
 }
 
 test "source symlinks are path-checked and followed inside the repository" {
