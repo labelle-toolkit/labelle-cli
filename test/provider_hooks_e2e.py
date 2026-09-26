@@ -279,7 +279,11 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         run("bundle", code=7, extra_env={"PROVIDER_PROBE_FAIL": "b-bundle-pre"})
         assert not any(p.suffix == ".app" for p in bundle_dir.iterdir()), list(bundle_dir.iterdir())
     else:
+        # The core desktop packager is refused off macOS after discovery
+        # (the gate sits in the pipeline since the targets slice) but before
+        # the reporter, the assembler or any compiler: nothing is created.
         refused = run("bundle", code=1, extra_env=dead)
         assert "macOS" in refused.stderr and "FIXTURE_INSTALL_DONE" not in refused.stderr, refused.stderr
-        assert not (project / ".labelle").exists(), "bundle reached discovery or generation off macOS"
+        assert not (project / ".labelle").exists(), "bundle reached generation off macOS"
+        assert not home.exists(), "bundle touched the cache off macOS"
     print(f"provider hooks: {checks} real CLI invocations passed")

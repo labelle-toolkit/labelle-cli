@@ -1,6 +1,6 @@
 # Provider contract v1
 
-Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings and lifecycle hooks are implemented; progress overrides, provider-declared targets and platform extraction remain pending.
+Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings, lifecycle hooks and provider-declared targets are implemented; progress overrides and platform extraction remain pending.
 
 Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations

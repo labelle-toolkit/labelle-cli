@@ -4,8 +4,9 @@ This documents the hook-execution slice of CLI #406, stacked on the
 [v1 contract](provider-contract-v1.md) §6 and on
 [project-local dispatch](provider-local-dispatch.md). A pinned provider can
 now attach to the project's `generate`, `build`, `bundle` and `run` steps.
-Provider-declared targets and `--platform` resolution are the next slice; the
-platform packages themselves still remain to be extracted.
+[Provider-declared targets](provider-targets.md) resolve `--platform=<t>`
+to the provider that declares `<t>`; the platform packages themselves still
+remain to be extracted.
 
 ## Attaching
 
@@ -94,7 +95,9 @@ this contract the default location of the desktop `.app` moved from
 ## Context
 
 The wire context (§2) for a hook carries `invocation = { "kind": "hook",
-"id": <hook id>, "step": <step>, "phase": <phase> }`, the resolved `target`,
+"id": <hook id>, "step": <step>, "phase": <phase> }`, the resolved `target`
+(the string `provider_targets.resolve` produced — `desktop` or a name a
+pinned provider declares),
 the project's `lock_file`, the provider's `config_file` or null, the step's
 `output_dir`, the pinned `zig_executable`, and this invocation's `optimize`
 and `progress` (`--optimize` and `--progress` as the user passed them, so a
@@ -128,10 +131,13 @@ Hooks report under the progress phase of the step they wrap (`generate`,
   child's stdio is inherited exactly as for provider commands.
 - The legacy `labelle ios …` and `labelle android …` subcommand handlers are
   not hook points for `build`/`run`; they only share the `generate` hooks.
-  They leave with platform extraction.
-- `labelle bundle` is still refused on Linux and Windows before discovery,
-  because the core desktop packager is macOS-only and a hook cannot replace
-  it. Provider targets (next slice) get their own `bundle` replacement.
+  They leave with platform extraction (their target already goes through
+  the resolver, so they need the pinned provider like `--platform=<t>`).
+- `labelle bundle` for the core `desktop` target is still refused on Linux
+  and Windows — after discovery now, but before any build — because the
+  core packager is macOS-only and no hook can replace it (nobody may own
+  `desktop`). A provider target is bundled by its provider's `replace` hook
+  on any host; see [provider targets](provider-targets.md#labelle-bundle).
 - `wasm serve` is interactive: its `done` record lands before the serve loop
   and the `after run` hooks run only once the server returns.
 - A `--docker` run whose binary was cross-compiled skips the launch and its
@@ -157,5 +163,6 @@ code with no core build and no `after` hook, a failing core build skipping
 `after`, discovery errors (`ReplaceRequiresOwnedTarget`, `DuplicateReplaceHook`,
 `MissingHookReference`, `HookPhaseOrder`) at `labelle help` before any
 compiler, `generate` hooks seeing the lock, `run` hooks around the game,
-`bundle` hooks and the `.app` location on macOS, and the refusal elsewhere.
-CI runs it on Windows, macOS and Linux.
+`bundle` hooks and the `.app` location on macOS, and the desktop refusal
+elsewhere. CI runs it on Windows, macOS and Linux. Provider-target
+bundling is covered by `test/provider_targets_e2e.py`.

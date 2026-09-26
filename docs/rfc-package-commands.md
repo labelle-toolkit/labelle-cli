@@ -156,6 +156,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…`, which packages
 
   Namespaces can never shadow built-in commands.
 - **`--platform=<t>`** dispatches to the package that declares target `<t>`. The set of platforms comes from the installed packages, not the CLI. This is the biggest change, and it must line up with labelle-assembler#378.
+  - Implemented in phase 3b: resolution rules, the #378 boundary, `labelle bundle --platform=<t>`, `labelle targets` and the migration note are in [provider targets](provider-targets.md).
 - **Configuration:** project `.provider_config` entries map a declared package to a project-contained provider-owned JSON file. The provider validates its settings; platform-specific core fields are removed during migration. See the v1 mapping contract.
 - **Index:** independent namespace and target ownership tables enable both command dispatch and missing-target diagnostics. The exact record fields, conservative offline behavior and global pin records are defined in the v1 contract.
 - **Conflicts:** two providers of the same namespace or target is a resolve-time error, not "last one wins". So is a namespace that collides with a built-in command, a duplicate command name within a namespace, and two `replace` hooks for the same step and target.

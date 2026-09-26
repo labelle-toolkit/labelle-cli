@@ -12,7 +12,9 @@ one of its descendants. Discovery walks to the nearest `project.labelle` and
 reads manifests from that project's `.plugins`; it never searches global pins.
 Built-ins take precedence, followed by package namespaces, then directory
 shorthand. A package cannot claim a built-in namespace. Existing `android`,
-`ios`, and `wasm` commands remain reserved until their extraction lands.
+`ios`, and `wasm` commands remain reserved until their extraction lands;
+their target already resolves like `--platform=<t>` does, through the
+pinned provider that declares it ([provider targets](provider-targets.md)).
 
 `labelle help`, a namespace with no command, `<namespace> --help`, and
 `<namespace> <command> --help` print manifest metadata without resolving Zig,
@@ -77,7 +79,9 @@ provider must treat its context as read-only. Its exit status is preserved.
   flags or claim to implement the full progress contract.
 - Projectless resolution/bootstrap and global updates remain phase 5. Hook
   execution is now implemented; see [provider hooks](provider-hooks.md).
-  Generic target routing and platform extraction remain later work.
+  Generic target routing is now implemented; see
+  [provider targets](provider-targets.md). Platform extraction remains
+  later work.
 
 ## Verification
 
