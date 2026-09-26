@@ -64,7 +64,7 @@ So the guard over `src/` and the default package don't conflict.
 
 ### 1. Manifest additions
 
-Extend `plugin.labelle` (bump `manifest_version`) with optional fields:
+Extend `plugin.labelle` (bump `manifest_version`) with new fields. They're optional as a group, since a plain runtime plugin declares none of them, but they carry the conditional requirements listed after the example:
 
 ```zig
 .{
@@ -72,11 +72,11 @@ Extend `plugin.labelle` (bump `manifest_version`) with optional fields:
     .manifest_version = 2,
     .namespace = "android",
     .commands = .{
-        .{ .name = "run", .main = "tools/run.zig", .help = "Build, install and launch on a device" },
-        .{ .name = "doctor", .main = "tools/doctor.zig", .help = "Check the SDK, NDK and device setup", .needs_project = false },
+        .{ .name = "run", .build_step = "cmd-run", .help = "Build, install and launch on a device" },
+        .{ .name = "doctor", .build_step = "cmd-doctor", .help = "Check the SDK, NDK and device setup", .needs_project = false },
     },
     .hooks = .{
-        .{ .step = .package, .target = "android", .when = .replace, .main = "tools/package.zig" },
+        .{ .step = .bundle, .target = "android", .when = .replace, .build_step = "hook-bundle" },
     },
     .targets = .{ "android" },
     .command_contract = ">=1.0.0 <2.0.0",
@@ -85,7 +85,9 @@ Extend `plugin.labelle` (bump `manifest_version`) with optional fields:
 
 The field names are illustrative; the serialization is an implementation decision. The semantics are what matter:
 - `namespace` owns the `labelle <namespace> …` subcommands.
-- `commands` are tools built from the package's own source.
+- `commands` are tools built from the package's own source. Each names a **step in the package's own `build.zig`** (`build_step`), not a bare source file, so the package wires its own named modules, build options, generated sources and system libraries exactly as for any Zig build. The CLI never reconstructs a tool's dependency graph.
+- `commands` **requires** `namespace`. A manifest with commands but no namespace has no `labelle <namespace> …` route and is rejected at resolve time.
+- Command names must be **unique within a namespace**. Duplicates are rejected at resolve time rather than depending on iteration order.
 - `hooks` attach to built-in lifecycle steps.
 - `targets` are the values `--platform` accepts because this package is installed.
 - `command_contract` is the contract range the package was written against. It is **required** whenever `commands`, `hooks` or `targets` is present; a manifest that declares any of them without it is rejected at resolve time.
@@ -99,6 +101,7 @@ The field names are illustrative; the serialization is an implementation decisio
   - optimize mode and the lock file;
   - output dir and the Zig executable;
   - progress protocol handles and a credentials helper (keychain/env).
+- **Arguments:** every token after `labelle <namespace> <command>` is forwarded verbatim, in order, to the provider's tool. The CLI parses only its own global flags (e.g. `--platform`, `--release`), and only when they appear *before* the namespace. Provider flags and positional arguments belong to the provider.
 - **Output:** an exit code, plus the existing progress/JSON output protocol.
 - **Projectless context:** for a `needs_project = false` command run outside a project, `project dir`, `target` and `lock` are explicitly `null` in the context. The optimize mode defaults to Debug, and the Zig executable is the bootstrap version the provider metadata declares (see [Resolution](#resolution)). Running a `needs_project = true` command outside a project fails with "run this inside a labelle project" before anything is fetched or built.
 - **Versioning:** the CLI declares the single contract version it implements (e.g. `1.0.0`, a constant in the CLI).
@@ -107,15 +110,21 @@ The field names are illustrative; the serialization is an implementation decisio
 
 ### 3. Lifecycle hook points
 
-- **Named after steps, never platforms:** `generate`, `build`, `bundle`, `package`, `run`.
+- **Named after steps, never platforms:** `generate`, `build`, `bundle`, `run`. These are the existing user-facing commands, so every hook is reachable. `bundle` produces a target's distributable: the desktop app bundle, or the APK/AAB when `labelle bundle --platform=android` dispatches to the android provider's `replace` hook. `run` runs `build`, and deploys through `bundle` where the target needs a packaged artifact.
 - **How a package attaches:** each hook names a step and a `target`.
   - `before` and `after` (like rake's `enhance`) may attach to **any** target, including core-owned `desktop`, **without claiming it**.
   - `replace` is allowed only for a target the package itself declares in `targets`.
 - **Example:** a steam package adds `steam_api64.dll` to the normal `labelle bundle` without owning `bundle`.
+- **Deterministic order,** when several packages attach to the same step and target:
+  1. all `before` hooks;
+  2. then the step, or its single `replace` hook (two `replace` hooks for one step and target is a resolve-time error);
+  3. then all `after` hooks.
+
+  Within each phase, hooks run in **dependency order** among the providers (a provider runs after the providers it depends on), with ties broken by package name. So a signing or archiving package that must see the Steam DLL declares a dependency on the Steam package and runs after it, whatever order the manifests were read in.
 
 ### 4. Output layout
 
-The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/package/<target>/…`, which packages read and write. `steam upload` and `itch publish` both consume the output of `labelle bundle` instead of each re-deriving it.
+The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…`, which packages read and write. `steam upload` and `itch publish` both consume the output of `labelle bundle` instead of each re-deriving it.
 
 ### 5. Aggregation
 
@@ -126,7 +135,10 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 - **Compile on first use.** The CLI is a prebuilt binary and packages are Zig source, so a command's `main` is compiled with the project's pinned Zig the first time it runs, then cached by command entry point, package content hash, resolved dependency graph, Zig version, host OS/architecture/ABI, command-contract version, and effective build options. Different commands and projects must not accidentally reuse an incompatible executable. Local package edits invalidate the cache by content, not version label. Tools compile for the host, not the game target.
 - **Cost:** a few seconds on first use; later runs use the cache.
 - **Windows:** package tools must build and run there too, and CI for provider packages must cover it.
-- **Trust, inside a project:** the package is declared in `project.labelle` and pinned by hash in `labelle.lock`, exactly like every dependency the game build already compiles and runs. Package commands add no new trust boundary there.
+- **Trust, inside a project:** the package is declared in `project.labelle` and pinned in `labelle.lock`, like every dependency the game build already compiles and runs.
+  - **Prerequisite:** today the lock writer (`src/cli/lockfile.zig`) records only each plugin's name, repo and version, not a content hash. So a re-tagged release could supply different code on a cache miss.
+  - Before any provider executes, the lock must record the **content hash** of each provider archive (the same hash `build.zig.zon` uses), and the CLI must verify the fetched archive against it.
+  - With that in place, package commands add no new trust boundary inside a project. Until then, this claim does not hold.
 - **Trust, outside a project:** there is no project pin, so the index is a new trust boundary.
   - Index entries carry a content hash for each release. The CLI verifies the fetched archive against it before building, as `zig fetch` does.
   - The index is served over HTTPS from the same origin as CLI releases and is written only by the providers' release workflows.
@@ -137,7 +149,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 ## Resolution
 
 - **Inside a project:** providers come from `project.labelle` and `labelle.lock`, so each project gets the versions it's locked to, like a Gemfile.
-- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches the **newest release whose `command_contract` range includes this CLI's contract version**. Its latest release is used only if it's compatible, so an older CLI keeps working after a provider moves to the next contract major. There is no list of names in the code. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
+- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches the **newest release whose `command_contract` range includes this CLI's contract version**. Its latest release is used only if it's compatible, so an older CLI keeps working after a provider moves to the next contract major. There is no list of names in the code. Each index entry also publishes, per release, the provider's commands with their `needs_project` flags, so the CLI can refuse a project-only command **before** fetching anything. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
 - **Dispatch order in `src/cli.zig`:**
   1. built-in commands;
   2. package namespaces;
@@ -146,7 +158,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 
   Namespaces can never shadow built-in commands.
 - **`--platform=<t>`** dispatches to the package that declares target `<t>`. The set of platforms comes from the installed packages, not the CLI. This is the biggest change, and it must line up with labelle-assembler#378.
-- **Conflicts:** two providers of the same namespace or target is a resolve-time error, not "last one wins". So is a namespace that collides with a built-in command.
+- **Conflicts:** two providers of the same namespace or target is a resolve-time error, not "last one wins". So is a namespace that collides with a built-in command, a duplicate command name within a namespace, and two `replace` hooks for the same step and target.
 
 ## Runtime seams (not CLI, but same rule)
 
@@ -174,7 +186,7 @@ Steam's first version needs no storage code at all. Steam Auto-Cloud syncs the g
 5. **iOS** (`ios.zig`) moves the same way, and `sdl_provision.zig` moves to the SDL backend package. `docker.zig` is to be decided.
 6. **Steam:** the first store package, confirming the contract generalises. It hooks into desktop `bundle` and provides `labelle steam upload` and `labelle steam doctor`.
 
-The guard's allowlist shrinks at every step, and after step 5 only host OS names remain. Existing web projects explicitly add `labelle-web` and migrate `--platform=wasm` and `labelle wasm ...` to the new provider target/commands. Do not retain legacy aliases. Publish migration instructions with the breaking release; old configurations are unsupported until migrated.
+The guard's allowlist shrinks at every step, and after step 5 only host OS names remain. Existing web projects explicitly add `labelle-web`. `--platform=wasm` itself is unchanged, since the provider declares the `wasm` target; only the legacy `labelle wasm …` subcommands migrate to the provider's namespaced commands. Do not retain legacy aliases. Publish migration instructions with the breaking release; old configurations are unsupported until migrated.
 
 ## Acceptance checks
 
@@ -188,11 +200,14 @@ The guard's allowlist shrinks at every step, and after step 5 only host OS names
 - Explicitly migrated projects run with pinned providers; unmigrated configurations fail clearly without legacy forwarding or implicit package injection.
 - A provider whose `command_contract` excludes the CLI's version fails at resolve time, naming both versions, and nothing is built or run.
 - A projectless command verifies the archive hash and asks for confirmation before its first run.
+- A project-only command run outside a project fails from index metadata alone, before any fetch.
+- `labelle.lock` records provider content hashes, and a tampered or re-tagged archive fails verification before building.
+- Provider arguments reach the tool verbatim (`labelle android run --device X` → the tool receives `--device X`).
+- Hooks from several providers on one step run in the documented order, whatever order the manifests were read in.
 - After adding `labelle-web`, `labelle build --platform=wasm` works under the unchanged target name. Without it, the command fails clearly, naming the provider to add.
 
 ## Open questions
 
-- **Hook ordering:** when several packages attach to the same step, is it declared priority or dependency order?
 - **Package index:** its exact format and hosting (an R2 JSON next to the CLI releases?). The integrity and selection rules above apply regardless.
 - **Signing:** should provider releases be signed, or is hash integrity plus a trusted index origin enough?
 - **Contract surface:** does the credentials helper belong in the contract, or does each package handle its own secrets?
