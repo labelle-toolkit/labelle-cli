@@ -252,6 +252,14 @@ jobs:
               --labelle-version="local:../../labelle-cli" \
               --assembler-version="local:../../labelle-assembler" &&
             cd docker_test &&
+            # `--platform=wasm` resolves only to a provider that declares the
+            # target (docs/provider-targets.md); the platform packages are not
+            # extracted yet, so declare the repo's own `wasm` fixture provider.
+            # The scaffold's empty `.plugins` is the seam: a template change
+            # that removes it must fail here, not as a "no provider" error.
+            grep -q '\.plugins = \.{},' project.labelle &&
+            sed -i 's|\.plugins = \.{},|.plugins = .{ .{ .name = "wasm_fixture", .repo = "local:../../labelle-cli/test/fixtures/wasm-provider", .version = "1.0.0" } },|' project.labelle &&
+            grep -q 'wasm_fixture' project.labelle &&
             ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm &&
             test -f .labelle/raylib_wasm/zig-out/web/game.wasm &&
             echo "Docker WASM build produced game.wasm"
