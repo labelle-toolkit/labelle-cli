@@ -88,6 +88,17 @@ pub fn build(b: *std.Build) void {
     run_cli_tests.step.dependOn(&child_fixture_install.step);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
+
+    // Provider wire-contract tests are independent of CLI/package resolution.
+    const provider_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cli/provider_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_provider_tests = b.addRunArtifact(provider_tests);
+    test_step.dependOn(&run_provider_tests.step);
+    const provider_step = b.step("test-provider-contract", "Validate provider contract v1");
+    provider_step.dependOn(&run_provider_tests.step);
     const material_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"shader tool override"} });
     b.step("test-material-toolchain", "Validate shader compiler override diagnostics").dependOn(&b.addRunArtifact(material_tests).step);
 

@@ -1,0 +1,114 @@
+# Provider contract v1
+
+Status: phase-1 contract and validation foundation for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Dispatch, fetching, publication and runtime extraction are not implemented by this change.
+
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the exact CLI contract version; it never warns and proceeds. The v1 context below uses the exact wire version `1.0.0`; additional wire versions require explicit decoder support.
+
+## 1. Package declarations and installed tools
+
+The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, and `targets`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive.
+
+A command has required `name`, `build_step`, `executable`, and `help`, with optional `needs_project` (default true). A hook has required `id`, `step`, `target`, `when`, `build_step`, and `executable`, with optional `after_hooks` (default empty). Valid steps are `generate`, `build`, `bundle`, `run`; phases are `before`, `replace`, `after`. There is no separate package lifecycle step: `bundle` produces the target distributable.
+
+```zig
+.commands = .{
+    .{ .name = "doctor", .build_step = "cmd-doctor", .executable = "bin/provider-doctor",
+       .help = "Check platform requirements", .needs_project = false },
+},
+```
+
+`build_step` is an install-only step in the package's build graph. The runner invokes `zig build <build_step> --prefix <isolated-prefix>` for the host, with resolved tool dependencies and compiler pinned in advance. The step installs exactly one executable selected by `executable`; it may install supporting data/libraries too. The runner does not guess an artifact from the step name, run the step as the command, or select the first executable found.
+
+`executable` is a portable forward-slash path under `bin/`, without a native suffix, absolute prefix, empty component, `.` or `..`. The runner adds `.exe` on Windows. It verifies that the declared file exists and that its resolved path remains inside the install prefix, including through symlinks. Missing/non-executable outputs fail before dispatch. Provider build scripts wire their own modules; the CLI does not reconstruct module imports. Build scripts are executable code under the same consent/pinning boundary as provider execution.
+
+Commands require a namespace and unique names. Resolve-time validation rejects reserved CLI namespaces and duplicate namespace/target owners. Core owns `desktop`; no package may claim it. Hooks may attach to it without owning it.
+
+## 2. One command-context wire format
+
+The CLI creates a UTF-8 JSON file and passes its absolute filename in `LABELLE_CONTEXT`. There is no argument-encoded alternative. The provider receives trailing user arguments verbatim through argv, without shell interpolation; the context path is not inserted into argv. The CLI owns the context-file lifetime through process exit and removes it afterward. Providers treat it as read-only.
+
+Every field below is required. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
+
+| Field | Type / rule |
+| --- | --- |
+| `contract_version` | Exactly `"1.0.0"` for this decoder |
+| `invocation` | Object containing `kind`, `id`, `step`, `phase` |
+| `invocation.kind` | `"command"` or `"hook"` |
+| `invocation.id` | Command name or hook ID |
+| `invocation.step`, `invocation.phase` | Null for commands; valid step/phase for hooks |
+| `package_dir` | Absolute resolved provider source directory |
+| `project_dir` | Absolute project directory, or null |
+| `target` | Resolved target identifier, or null outside a project |
+| `lock_file` | Absolute project lock filename, or null outside a project |
+| `config_file` | Absolute provider-owned configuration filename, or null |
+| `output_dir` | Absolute invocation output directory, including projectless runs |
+| `zig_executable` | Absolute host compiler filename |
+| `optimize` | `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
+| `progress` | `human`, `json`, or `off` |
+
+Paths use host syntax and must be absolute (on Windows, drive-qualified or UNC, not current-drive-rooted). Structural validation does not perform filesystem existence/containment checks; the resolver performs those before launching.
+
+Inside projects, `target` and `lock_file` are required and non-null. Outside projects, `project_dir`, `target`, `lock_file`, and `config_file` are null and optimize is Debug. Hooks always require a project. A projectless output directory is a per-invocation workspace, never the provider's source cache. The actual filesystem checks, allocation and cleanup are phase-2 runner responsibilities.
+
+Progress uses standard streams rather than invented OS handles: in JSON mode stdout carries the existing CLI NDJSON progress protocol and stderr carries diagnostics; in human/off modes normal command output is permitted. The CLI parses/relays JSON events and owns the single final command outcome. Nonzero provider exit or abnormal termination is failure. No secret values belong in the context or progress stream.
+
+There is **no credentials-helper RPC in v1**. Providers use explicitly configured environment-variable names or their own OS credential integration. Provider configuration stores references, not secret values. This avoids promising a helper endpoint before its protocol exists.
+
+## 3. Provider-owned project settings
+
+Introduce one generic project field mapping package identity to a provider-owned JSON file:
+
+```zig
+.provider_config = .{
+    .{ .package = "labelle-android", .file = "providers/android.json" },
+},
+```
+
+Each entry has exactly `package` and `file`; package entries are unique and must refer to a resolved declared provider. The file is project-relative and must resolve within the project, including through symlinks. The resolver passes its absolute path as `config_file`. Absence maps to null. The provider owns the JSON schema and rejects invalid or missing required settings before side effects. Configuration content participates in build/staging freshness; credentials values do not enter generated files.
+
+Move the former platform-specific settings into these files in the platform migration PRs; do not silently translate or continue accepting removed fields. The schema must be accepted by the shared project parser/assembler boundary before consumer migration. Phase 1 specifies this field; it does not yet change `project_config.zig`.
+
+## 4. Index and global-lock records
+
+Use UTF-8 JSON with `schema_version: 1`. The registry repository owns records; one publishing workflow emits immutable snapshots, then updates a pointer to a completed snapshot. Record and verify its hash. No snapshot is executable configuration.
+
+Index root fields are `schema_version`, `revision` (immutable registry commit), `providers` (array), and `defaults` (array of package names). Unknown fields and duplicate keys fail validation for this schema version. Each provider record contains:
+
+- `package`: unique package identity;
+- `namespaces`: unique owned command namespaces;
+- `targets`: unique owned targets, independently indexed from namespaces;
+- `releases`: immutable release records.
+
+Each release contains `version` (stable semver), `source_url` (HTTPS archive), `sha256` (64 lowercase hex digits), `command_contract` (semver range), `bootstrap_zig` (exact version), `hosts` (supported host triples), `namespaces` and `targets` (this release's subset of owned names), and `commands` (objects with `name` and `needs_project`). Index command/ownership data must agree with the downloaded manifest before building it. Duplicate releases or conflicting ownership are errors. Resolution excludes prereleases unless explicitly requested and excludes host/contract-incompatible releases. The full index schema validator is a phase-2/5 deliverable; phase 1 tests the ownership table and target lookup independently.
+
+Target lookup supports actionable missing-provider diagnostics without a platform-name table in the CLI. It must not silently install a provider inside a project. Offline diagnostics use cached index data; without that data, report the missing target without inventing a package name.
+
+The global lock root contains `schema_version` and `pins` (array). Each pin contains `package`, `version`, `source_url`, `sha256`, `registry_revision`, `contract_version`, `bootstrap_zig`, and `dependencies` (array of exact package/version/source_url/sha256 records). Package identities in each resolved graph are unique. The global lock is stored under the existing Labelle cache root, respecting `LABELLE_HOME`. A project lock remains authoritative inside projects; the global lock is never a fallback for it.
+
+A normal run verifies content against the recorded hash. A mismatch is fatal; repair/refetch the same immutable content or explicitly resolve/update a provider. Never treat corrupted cache data as consent to execute a different release. A separate explicit global-provider update operation prepares and verifies the replacement before atomically changing the lock. CLI self-update never moves provider pins. Exact CLI spelling is a phase-2 decision.
+
+## 5. Default-package consent
+
+Whether defaults come from the online index or an offline stamped scaffold, `init` presents their exact resolved package/version/source/hash records before writing pins or executing package code. Accept explicitly; noninteractive automation supplies an explicit acceptance option, otherwise fail rather than hang. Declining leaves no initialized project or provider pins. Offline initialization requires complete cached release metadata/content and compiler prerequisites for any work it executes.
+
+Index defaults are suggestions, not automatically trusted project declarations. Initial acceptance covers the complete resolved dependency graph; changes to that graph require explicit resolution. Merely fetching/parsing metadata is allowed before consent, but compiling or executing package build scripts is not.
+
+## 6. Hook execution
+
+Resolve stable hook identities as `<package>/<hook-id>`. Within each target/step, execute before hooks, the core operation or unique replacement, then after hooks. Provider dependencies create ordering edges within a phase; explicit `after_hooks` refine hook ordering. Break independent ties by fully qualified hook ID. Reject missing hook references, cycles, dependencies on later phases, and multiple replacements before execution. A replacement belongs only to the target owner. Sequential execution is sufficient for v1.
+
+Stop on any failed hook/operation; after hooks run only after success. Hooks clean up their own temporary resources. Do not run publishing hooks after a failed build or reuse an old output as a new success. Graph construction/execution and its fixture tests belong to phase 3.
+
+## 7. Backend agnosticism migration
+
+Keep the mandate: backend names must also leave core. Add an explicit migration deliverable coordinated with assembler #378: replace the fixed backend enum with a resolved manifest identity, move target-support declarations out of `compatibility.zig`, and replace backend-name branches in `pipeline.zig` with declared capabilities. The shared project schema must accept the identity before consumers switch.
+
+Keep specific existing sites on the shrinking migration allowlist until replaced; do not claim the guard is complete after moving platform commands alone. Desktop stays a core target, but its renderer is still a manifest-resolved backend. No backward aliases for removed enum/config forms.
+
+## Delivery and evidence
+
+Phase 1 supplies this contract, wire-context validation, installed-tool path validation, ownership conflict checks and target lookup. `zig build test-provider-contract` runs those tests; `zig build test` includes the same target, avoiding an uncollected test root.
+
+Phase 2 implements manifest/range parsing, config mapping, full index/global-lock schema validation, filesystem validation, host-tool build/discovery/cache and process dispatch. Phase 3 implements hook planning and the Android provider; phase 4 consolidates packaging/Gradle; phase 5 publishes the registry and enables projectless resolution/updates. Registry fixtures can be used earlier without publishing a live index.
+
+Before #411 closes, review all six decisions against the architecture RFC. Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.
