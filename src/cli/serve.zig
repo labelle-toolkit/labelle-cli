@@ -530,12 +530,16 @@ pub const WatchConfig = struct {
     /// hook's write as a new change and ran a SECOND full
     /// generate/compile/browser-reload for it.
     ///
-    /// Excluding rather than re-snapshotting after the callback is
+    /// Excluding rather than re-snapshotting after every callback is
     /// deliberate: a re-snapshot would also swallow a source file the
     /// user saved DURING the rebuild, which is a silently dropped edit —
     /// strictly worse than a redundant one. A declared output is a
     /// generated target, not a source; the input that produces it is
     /// still watched, so a real change still fires exactly one rebuild.
+    ///
+    /// Writers with no such declaration — provider lifecycle hooks, a
+    /// prebuild step without `.outputs` — are bounded by `WatchBaseline`
+    /// instead: their write costs one follow-up rebuild, never a loop.
     ignore_files: []const []const u8 = &.{},
 };
 
@@ -578,6 +582,46 @@ const TreeSignature = struct {
 
     fn eql(a: TreeSignature, b: TreeSignature) bool {
         return a.file_count == b.file_count and a.digest == b.digest;
+    }
+};
+
+/// Which tree signature counts as built once a rebuild callback returns.
+///
+/// Normally it is the `trigger` — the stable signature the rebuild was
+/// fired for — so a file the user saves while the rebuild runs still
+/// differs from it and fires the next rebuild. But a rebuild can also
+/// write into the watched tree itself: a provider lifecycle hook (which
+/// declares no outputs) or a prebuild step without `.outputs`. Those
+/// writes look like an edit on the next poll, and a hook that rewrites its
+/// output on every run used to rebuild and reload forever (Codex P2 on
+/// #420).
+///
+/// So the signature is also taken right AFTER each callback (`post`). When
+/// a rebuild is fired for exactly the previous callback's `post` — nothing
+/// changed since that rebuild ended — everything it covers happened during
+/// that callback: the rebuild's own writes, or an edit saved while it ran.
+/// This follow-up rebuild picks up such an edit, and whatever the
+/// follow-up's own callback writes is then taken as the rebuild's output:
+/// the baseline moves to its `post`. A self-writing rebuild therefore costs
+/// one follow-up rebuild per edit, and terminates. The window a save can
+/// still be missed in shrinks to the follow-up rebuild itself.
+const WatchBaseline = struct {
+    /// Signature of the last (attempted) build.
+    applied: TreeSignature,
+    /// Signature taken right after the last rebuild callback returned.
+    post: ?TreeSignature = null,
+
+    /// Record a finished rebuild fired for `trigger`, with the tree at
+    /// `post` once the callback returned.
+    fn settle(self: *WatchBaseline, trigger: TreeSignature, post: TreeSignature) void {
+        const follow_up = if (self.post) |previous| trigger.eql(previous) else false;
+        self.applied = if (follow_up) post else trigger;
+        self.post = post;
+    }
+
+    /// True when `sig` differs from the last build (subject to debounce).
+    fn unbuilt(self: WatchBaseline, sig: TreeSignature) bool {
+        return !sig.eql(self.applied);
     }
 };
 
@@ -698,12 +742,15 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
     var scan_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scan_arena.deinit();
 
-    // `applied` = signature of the last (attempted) build. `last` = signature
-    // seen on the previous poll — used to detect a burst still in flight.
-    var applied = TreeSignature{};
-    computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &applied);
+    // `baseline.applied` = signature of the last (attempted) build (see
+    // `WatchBaseline` for how a self-writing rebuild settles it). `last` =
+    // signature seen on the previous poll — used to detect a burst still in
+    // flight.
+    var initial = TreeSignature{};
+    computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &initial);
     _ = scan_arena.reset(.retain_capacity);
-    var last = applied;
+    var baseline: WatchBaseline = .{ .applied = initial };
+    var last = initial;
     var stable_polls: u32 = 0;
 
     const interval = std.Io.Duration.fromMilliseconds(@intCast(cfg.poll_interval_ms));
@@ -723,11 +770,14 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
             continue;
         }
         stable_polls +|= 1;
-        if (!shouldRebuild(!sig.eql(applied), stable_polls, cfg.quiet_polls)) continue;
+        if (!shouldRebuild(baseline.unbuilt(sig), stable_polls, cfg.quiet_polls)) continue;
 
         std.debug.print("labelle: change detected — rebuilding WASM...\n", .{});
         const ok = cfg.rebuild_fn(cfg.rebuild_ctx);
-        applied = sig;
+        var post = TreeSignature{};
+        computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &post);
+        _ = scan_arena.reset(.retain_capacity);
+        baseline.settle(sig, post);
         stable_polls = 0;
         if (ok) {
             _ = state.version.fetchAdd(1, .release);
@@ -739,6 +789,59 @@ fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+/// A distinct synthetic tree signature per label, for the baseline tests.
+fn testSig(label: []const u8) TreeSignature {
+    var sig = TreeSignature{};
+    sig.mix(label, label.len, 0);
+    return sig;
+}
+
+test "watch baseline: a rebuild that rewrites its own output settles after one follow-up" {
+    // A hook that rewrites `assets/out.png` on every run: each callback
+    // leaves the tree at a fresh signature.
+    const edited = testSig("user edit");
+    var b: WatchBaseline = .{ .applied = testSig("start") };
+    try std.testing.expect(b.unbuilt(edited));
+    // Rebuild 1, for the user's edit; its hook writes -> `write1`.
+    const write1 = testSig("hook write 1");
+    b.settle(edited, write1);
+    // The hook's write is unbuilt: one follow-up rebuild fires (it would
+    // also pick up an edit saved during rebuild 1).
+    try std.testing.expect(b.unbuilt(write1));
+    // The follow-up's hook writes again -> `write2`, taken as its output.
+    const write2 = testSig("hook write 2");
+    b.settle(write1, write2);
+    // Settled: the tree as the follow-up left it is built. No third rebuild,
+    // where re-baselining on the trigger alone looped forever.
+    try std.testing.expect(!b.unbuilt(write2));
+    // The mechanism: without the follow-up rule the trigger is what counts
+    // as built, so the hook's write re-fires on every poll.
+    var naive: WatchBaseline = .{ .applied = testSig("start") };
+    naive.settle(edited, write1);
+    naive.post = null; // forget the post-callback signature
+    naive.settle(write1, write2);
+    try std.testing.expect(naive.unbuilt(write2));
+}
+
+test "watch baseline: an edit saved during an ordinary rebuild still fires the next one" {
+    var b: WatchBaseline = .{ .applied = testSig("start") };
+    const first = testSig("edit 1");
+    // A rebuild that writes nothing into the tree; the user saves again
+    // while it runs, so the tree after the callback is `second`.
+    const second = testSig("edit 2");
+    b.settle(first, second);
+    try std.testing.expect(b.unbuilt(second));
+    // That rebuild (fired for `second`) writes nothing: settled on it.
+    b.settle(second, second);
+    try std.testing.expect(!b.unbuilt(second));
+    // A later edit is an ordinary trigger again: built at the trigger, so
+    // a save during THIS rebuild is not swallowed either.
+    const third = testSig("edit 3");
+    const fourth = testSig("edit 4");
+    b.settle(third, fourth);
+    try std.testing.expect(b.unbuilt(fourth));
+}
 
 test "resolveTarget: root maps to index.html" {
     try std.testing.expectEqualStrings("index.html", resolveTarget("/").?);
