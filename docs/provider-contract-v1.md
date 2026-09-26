@@ -1,6 +1,6 @@
 # Provider contract v1
 
-Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings, progress overrides and platform extraction remain pending.
+Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings are implemented; progress overrides and platform extraction remain pending.
 
 Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
@@ -70,7 +70,7 @@ Introduce one generic project field mapping package identity to a provider-owned
 
 Each entry has exactly `package` and `file`; package entries are unique and must refer to a resolved declared provider. The file is project-relative and must resolve within the project, including through symlinks. The resolver passes its absolute path as `config_file`. Absence maps to null. The provider owns the JSON schema and rejects invalid or missing required settings before side effects. Configuration content participates in build/staging freshness; credentials values do not enter generated files.
 
-Move the former platform-specific settings into these files in the platform migration PRs; do not silently translate or continue accepting removed fields. The schema must be accepted by the shared project parser/assembler boundary before consumer migration. Phase 1 specifies this field; it does not yet change `project_config.zig`.
+Move the former platform-specific settings into these files in the platform migration PRs; do not silently translate or continue accepting removed fields. The schema must be accepted by the shared project parser/assembler boundary before consumer migration. The CLI and assembler now share this schema. See [provider configuration](provider-configuration.md) for validation, file containment and rollout requirements.
 
 ## 4. GitHub manifest and project integrity lock
 
