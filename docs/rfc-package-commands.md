@@ -50,7 +50,15 @@ Everything that needs a foreign SDK or toolchain (android, ios, web/emsdk), a st
 
 ### Default packages
 
-As with Rails' default gems, `labelle init` adds **`labelle-web`** to every new project. It is still a separately versioned package, so the CLI stays agnostic, and a desktop-only game can drop it. labelle-studio's web preview depends on `labelle-web` explicitly and builds through `labelle build --platform=web`.
+As with Rails' default gems, `labelle init` adds **`labelle-web`** to every new project. It is still a separately versioned package, and a desktop-only game can drop it. labelle-studio's web preview depends on `labelle-web` explicitly and builds through `labelle build --platform=wasm`.
+
+**The CLI does not know this name.** The default set is data, not code:
+- the package index publishes a `defaults` list, and `labelle init` adds whatever it names;
+- offline, `init` falls back to the scaffold template, a data file outside `src/` whose pins the release workflow already stamps.
+
+So the guard over `src/` and the default package don't conflict.
+
+**The target name stays `wasm`.** `project_config.Platform` and `--platform` use `wasm` today, and `labelle-web` declares the target `wasm`, so no rename or alias is needed. Per the breaking migration below, the one migration step for an existing web project is to add and pin `labelle-web`. After that, `--platform=wasm` resolves to the provider.
 
 ## What the CLI knows (generic only)
 
@@ -65,10 +73,10 @@ Extend `plugin.labelle` (bump `manifest_version`) with optional fields:
     .namespace = "android",
     .commands = .{
         .{ .name = "run", .main = "tools/run.zig", .help = "Build, install and launch on a device" },
-        .{ .name = "doctor", .main = "tools/doctor.zig", .help = "Check the SDK, NDK and device setup" },
+        .{ .name = "doctor", .main = "tools/doctor.zig", .help = "Check the SDK, NDK and device setup", .needs_project = false },
     },
     .hooks = .{
-        .{ .step = .package, .when = .replace, .main = "tools/package.zig" },
+        .{ .step = .package, .target = "android", .when = .replace, .main = "tools/package.zig" },
     },
     .targets = .{ "android" },
     .command_contract = ">=1.0.0 <2.0.0",
@@ -80,7 +88,9 @@ The field names are illustrative; the serialization is an implementation decisio
 - `commands` are tools built from the package's own source.
 - `hooks` attach to built-in lifecycle steps.
 - `targets` are the values `--platform` accepts because this package is installed.
-- `command_contract` is the contract range the package was written against.
+- `command_contract` is the contract range the package was written against. It is **required** whenever `commands`, `hooks` or `targets` is present; a manifest that declares any of them without it is rejected at resolve time.
+- `needs_project = false` marks a command that may run outside a project (see the projectless context below). It defaults to `true`.
+- `namespace` may not be a built-in command name (`run`, `build`, `help`, …). Reserved names are rejected at resolve time with a clear error, rather than silently becoming unreachable.
 
 ### 2. Command contract (versioned)
 
@@ -90,12 +100,17 @@ The field names are illustrative; the serialization is an implementation decisio
   - output dir and the Zig executable;
   - progress protocol handles and a credentials helper (keychain/env).
 - **Output:** an exit code, plus the existing progress/JSON output protocol.
-- **Versioning:** the contract has its own MAJOR version, checked with the existing MAJOR-only compatibility gate. A package declaring an incompatible range fails at resolve time with a clear message, not a crash mid-command.
+- **Projectless context:** for a `needs_project = false` command run outside a project, `project dir`, `target` and `lock` are explicitly `null` in the context. The optimize mode defaults to Debug, and the Zig executable is the bootstrap version the provider metadata declares (see [Resolution](#resolution)). Running a `needs_project = true` command outside a project fails with "run this inside a labelle project" before anything is fetched or built.
+- **Versioning:** the CLI declares the single contract version it implements (e.g. `1.0.0`, a constant in the CLI).
+  - At resolve time, every provider's `command_contract` range must include it, or resolution **fails before anything runs**, naming the package, its range and the CLI's version.
+  - This is **new, fatal behaviour**. It deliberately does not reuse the existing compatibility paths: `depCompatWarn` and the `core_compat` check in `src/cli/compatibility.zig` both warn and proceed.
 
 ### 3. Lifecycle hook points
 
 - **Named after steps, never platforms:** `generate`, `build`, `bundle`, `package`, `run`.
-- **How a package attaches:** `before` or `after` a step (like rake's `enhance`), or `replace`, for the target it provides.
+- **How a package attaches:** each hook names a step and a `target`.
+  - `before` and `after` (like rake's `enhance`) may attach to **any** target, including core-owned `desktop`, **without claiming it**.
+  - `replace` is allowed only for a target the package itself declares in `targets`.
 - **Example:** a steam package adds `steam_api64.dll` to the normal `labelle bundle` without owning `bundle`.
 
 ### 4. Output layout
@@ -111,12 +126,18 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 - **Compile on first use.** The CLI is a prebuilt binary and packages are Zig source, so a command's `main` is compiled with the project's pinned Zig the first time it runs, then cached by command entry point, package content hash, resolved dependency graph, Zig version, host OS/architecture/ABI, command-contract version, and effective build options. Different commands and projects must not accidentally reuse an incompatible executable. Local package edits invalidate the cache by content, not version label. Tools compile for the host, not the game target.
 - **Cost:** a few seconds on first use; later runs use the cache.
 - **Windows:** package tools must build and run there too, and CI for provider packages must cover it.
-- **Trust:** running package code is the same trust level as building the game, so it adds no new risk.
+- **Trust, inside a project:** the package is declared in `project.labelle` and pinned by hash in `labelle.lock`, exactly like every dependency the game build already compiles and runs. Package commands add no new trust boundary there.
+- **Trust, outside a project:** there is no project pin, so the index is a new trust boundary.
+  - Index entries carry a content hash for each release. The CLI verifies the fetched archive against it before building, as `zig fetch` does.
+  - The index is served over HTTPS from the same origin as CLI releases and is written only by the providers' release workflows.
+  - The first time an unpinned package would run, the CLI asks for confirmation, showing the package, version, source URL and hash (`--yes` for CI).
+  - Once confirmed, it records the pin in a global lock (`~/.labelle/global.lock`); later runs use that pin until `labelle update` moves it.
+  - Signing releases (beyond hash integrity) is an open question.
 
 ## Resolution
 
 - **Inside a project:** providers come from `project.labelle` and `labelle.lock`, so each project gets the versions it's locked to, like a Gemfile.
-- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches its latest release. There is no list of names in the code. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
+- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches the **newest release whose `command_contract` range includes this CLI's contract version**. Its latest release is used only if it's compatible, so an older CLI keeps working after a provider moves to the next contract major. There is no list of names in the code. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
 - **Dispatch order in `src/cli.zig`:**
   1. built-in commands;
   2. package namespaces;
@@ -125,7 +146,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 
   Namespaces can never shadow built-in commands.
 - **`--platform=<t>`** dispatches to the package that declares target `<t>`. The set of platforms comes from the installed packages, not the CLI. This is the biggest change, and it must line up with labelle-assembler#378.
-- **Conflicts:** two providers of the same namespace or target is a resolve-time error, not "last one wins".
+- **Conflicts:** two providers of the same namespace or target is a resolve-time error, not "last one wins". So is a namespace that collides with a built-in command.
 
 ## Runtime seams (not CLI, but same rule)
 
@@ -165,11 +186,15 @@ The guard's allowlist shrinks at every step, and after step 5 only host OS names
 - Two tools in one package, and the same tool under distinct compiler/dependency inputs, use distinct cache entries; unchanged inputs reuse the executable.
 - On a fresh host without a project or Zig installation, a projectless diagnostic provisions its declared compiler and runs. Offline missing-toolchain failure is clear.
 - Explicitly migrated projects run with pinned providers; unmigrated configurations fail clearly without legacy forwarding or implicit package injection.
+- A provider whose `command_contract` excludes the CLI's version fails at resolve time, naming both versions, and nothing is built or run.
+- A projectless command verifies the archive hash and asks for confirmation before its first run.
+- After adding `labelle-web`, `labelle build --platform=wasm` works under the unchanged target name. Without it, the command fails clearly, naming the provider to add.
 
 ## Open questions
 
 - **Hook ordering:** when several packages attach to the same step, is it declared priority or dependency order?
-- **Package index:** where it lives and who publishes to it (an R2 JSON next to the CLI releases?).
+- **Package index:** its exact format and hosting (an R2 JSON next to the CLI releases?). The integrity and selection rules above apply regardless.
+- **Signing:** should provider releases be signed, or is hash integrity plus a trusted index origin enough?
 - **Contract surface:** does the credentials helper belong in the contract, or does each package handle its own secrets?
 - **Proprietary SDKs** (Steamworks, consoles): only bring-your-own, with `doctor` pointing to the local SDK path, as with the Spine license?
 - **Tool builds:** should the tool cache be project-local or global? Either placement must use the complete cache identity specified above.
