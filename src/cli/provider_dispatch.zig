@@ -140,16 +140,8 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
                 std.debug.print("labelle: remote provider '{s}' is unpinned. Run labelle providers resolve, review the pins, then repeat with --accept.\n", .{provider.dep.name});
                 return error.RemoteProviderIntegrityRequired;
             }
-            // The shared project/assembler schema has not migrated yet. Do not
-            // silently discard settings that the normative contract reserves.
-            const Settings = struct { provider_config: []const struct { package: []const u8, file: []const u8 } = &.{} };
-            const source = try read(a, try std.fs.path.join(a, &.{ root, "project.labelle" }));
-            const settings = try std.zon.parse.fromSliceAlloc(Settings, a, try a.dupeZ(u8, source), null, .{ .ignore_unknown_fields = true });
-            if (settings.provider_config.len != 0) {
-                std.debug.print("labelle: provider_config requires the shared schema migration; this local-dispatch slice does not support it yet.\n", .{});
-                return error.ProviderConfigurationNotSupported;
-            }
-            return try execute(a, root, cfg, provider, cmd, lock_path, trailing.items);
+            const settings = try resolveSettings(a, root, cfg, providers, provider.meta.name);
+            return try execute(a, root, cfg, provider, cmd, lock_path, settings, trailing.items);
         }
         std.debug.print("labelle: unknown command '{s}' in provider namespace '{s}'\n", .{ name, namespace });
         printCommands(provider);
@@ -184,7 +176,40 @@ fn executable(a: std.mem.Allocator, prefix: []const u8, relative: []const u8) ![
     return resolved;
 }
 
-fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, trailing: []const []const u8) !u8 {
+fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (cfg.provider_config) |entry| {
+        var resolved = false;
+        for (providers) |provider| {
+            if (std.mem.eql(u8, provider.meta.name, entry.package) and provider.verified) resolved = true;
+        }
+        if (!resolved) {
+            std.debug.print("labelle: provider_config '{s}' must name a resolved command/hook provider\n", .{entry.package});
+            return error.UnresolvedProviderConfig;
+        }
+        const requested = try std.fs.path.join(a, &.{ root, entry.file });
+        const path = real(a, requested) catch |err| {
+            std.debug.print("labelle: provider_config '{s}' cannot open '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+            return error.MissingProviderConfig;
+        };
+        if (!contained(root, path)) return error.EscapingProviderConfig;
+        const stat = try std.Io.Dir.cwd().statFile(config.globalIo(), path, .{});
+        if (stat.kind != .file) return error.InvalidProviderConfigFile;
+        const bytes = try read(a, path);
+        defer a.free(bytes);
+        // Check JSON syntax only. The provider owns its settings schema and
+        // must validate semantic requirements before producing side effects.
+        const json = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch {
+            std.debug.print("labelle: provider_config '{s}' is not valid JSON: {s}\n", .{ entry.package, entry.file });
+            return error.InvalidProviderConfigJson;
+        };
+        json.deinit();
+        if (std.mem.eql(u8, entry.package, selected)) result = path;
+    }
+    return result;
+}
+
+fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8) !u8 {
     const io = config.globalIo();
     // Unlike the game runner, command dispatch must never download a compiler.
     const required = try toolchain.resolveRequiredVersion(a, root);
@@ -240,7 +265,7 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
         .project_dir = root,
         .target = @tagName(cfg.platform),
         .lock_file = try real(a, lock_path),
-        .config_file = null,
+        .config_file = settings,
         .output_dir = try real(a, output),
         .zig_executable = zig,
         .optimize = .Debug,

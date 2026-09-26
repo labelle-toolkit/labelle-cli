@@ -160,6 +160,15 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     assert json.loads(capture.read_text())["revision"] == "updated"
     cleaned()
     env["LABELLE_HOME"] = str(home)
+    settings = project / "settings.json"
+    settings.write_text('{"label":"remote-settings"}')
+    project_file = project / "project.labelle"
+    project_file.write_text(project_file.read_text()[:-1] + ', .provider_config = .{ .{ .package = "fixture", .file = "settings.json" } } }')
+    run("probe", "inspect")
+    configured = json.loads(capture.read_text())
+    assert Path(configured["context"]["config_file"]) == settings.resolve()
+    assert configured["setting"] == "remote-settings"
+    cleaned()
     # Missing and duplicate release records fail before source preparation.
     metadata([pin])
     assert "ProviderReleaseNotInRegistry" in resolve("--accept", code=1).stderr

@@ -74,6 +74,9 @@ jobs:
       - name: GitHub provider integrity subprocess regression
         run: python test/provider_github_e2e.py
 
+      - name: Provider configuration subprocess regression
+        run: python test/provider_config_e2e.py
+
       - name: CLI tests
         run: zig build test
 

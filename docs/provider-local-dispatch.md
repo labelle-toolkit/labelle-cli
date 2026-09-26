@@ -60,7 +60,7 @@ directories and symlinks escaping the prefix fail before dispatch.
 The command runs with the project root as cwd and receives trailing arguments
 without shell interpolation. `LABELLE_CONTEXT` names its unique JSON context
 file. This slice supplies the project's current platform, Debug optimization,
-human progress, and `config_file: null`. Output persists under
+human progress, and the selected provider configuration path (or null). Output persists under
 `.labelle/providers/<package>`; installation and context files are removed
 after child exit, including failed builds, nonzero exits and crashes. The
 provider must treat its context as read-only. Its exit status is preserved.
@@ -69,9 +69,9 @@ provider must treat its context as read-only. Its exit status is preserved.
 
 - GitHub archive integrity records and explicit project resolution are now
   implemented. Projectless/global pin handling remains later work.
-- The shared CLI/assembler `provider_config` schema and contained-file mapping.
-  This slice explicitly rejects nonempty mappings instead of silently ignoring
-  settings. Configuration cannot yet be used in a game pipeline.
+- The shared CLI/assembler configuration schema and contained-file mapping are
+  now implemented; see [provider configuration](provider-configuration.md) for
+  the paired assembler requirement.
 - Invocation overrides and JSON progress validation/relay. All trailing flags
   currently belong to the provider; this slice does not interpret them as CLI
   flags or claim to implement the full progress contract.

@@ -87,13 +87,14 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    errdefer allocator.free(source);
+    defer allocator.free(source);
 
     // `ignore_unknown_fields`: the CLI's `project_config.ProjectConfig`
     // is a deliberately minimal copy of the assembler's schema (#217).
     // The assembler owns the schema and may add fields the CLI does not
     // mirror — without this, a newer project.labelle would fail to parse
     // and break the CLI for no good reason.
+    try @import("provider_settings.zig").validateProject(allocator, source);
     return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {

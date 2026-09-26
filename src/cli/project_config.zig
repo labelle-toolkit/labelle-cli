@@ -442,6 +442,8 @@ pub const ProjectConfig = struct {
     hidden: bool = false,
     /// Plugins — each declares its repo and version.
     plugins: []const PluginDep = &.{},
+    /// Provider-owned JSON settings; shared with the assembler project schema.
+    provider_config: []const @import("provider_settings.zig").Entry = &.{},
 
     /// Game states for the state machine. First element is the initial state.
     states: []const []const u8 = &.{"running"},

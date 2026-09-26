@@ -108,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     assert "RemoteProviderIntegrityRequired" in run("probe", "inspect", code=1).stderr
     lock_file.write_text(lock)
     (project / "project.labelle").write_text(project_text[:-1] + ', .provider_config = .{ .{ .package = "fixture", .file = "settings.json" } } }')
-    assert "ProviderConfigurationNotSupported" in run("probe", "inspect", code=1).stderr
+    assert "MissingProviderConfig" in run("probe", "inspect", code=1).stderr
     (project / "project.labelle").write_text(project_text)
     # No project-global fallback.
     run("probe", "inspect", cwd=base, code=1)
