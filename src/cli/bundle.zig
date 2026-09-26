@@ -523,11 +523,11 @@ pub fn exeNameFromBuildZig(source: []const u8) ?[]const u8 {
     return name;
 }
 
-/// The built desktop executable: `name` (what `CFBundleExecutable` gets)
-/// and its `path` under `<target>/zig-out/bin/`. Both owned.
 /// Suffix Zig gives the host-built game executable (`.exe` on Windows).
 const exe_ext = builtin.target.exeFileExt();
 
+/// The built desktop executable: `name` (what `CFBundleExecutable` gets)
+/// and its `path` under `<target>/zig-out/bin/`. Both owned.
 pub const ResolvedExe = struct {
     name: []u8,
     path: []u8,
