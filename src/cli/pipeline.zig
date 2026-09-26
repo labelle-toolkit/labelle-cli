@@ -725,6 +725,12 @@ const WatchReplan = struct {
     /// lock write: the common watched edit (a script, an asset) costs
     /// nothing here.
     synced: ?[32]u8 = null,
+    /// Pinned provider extractions shared across this session's
+    /// generations, keyed by the verified archive hash: a replan reuses the
+    /// directory an unchanged pin was unpacked into and the pre-check reads
+    /// manifests from it without touching an archive (cli#429). Created on
+    /// first use; `null` until then.
+    extractions: ?provider_github.Extractions = null,
 
     /// The package-cache install seam: `run(ctx, allocator, project_dir)`.
     const Installer = struct {
@@ -758,6 +764,28 @@ const WatchReplan = struct {
         self.synced = digestProject(self.backing, self.project_dir) catch null;
     }
 
+    /// Lend the cold pipeline's pinned extractions (`startup`, which
+    /// outlives this replan) to the session, so the first rebuild does not
+    /// unpack an unchanged pin again. Best effort: a failure only costs
+    /// that extraction.
+    fn seed(self: *WatchReplan, startup: *const provider_github.Sources) void {
+        self.extractionCache().seed(startup) catch {};
+    }
+
+    fn extractionCache(self: *WatchReplan) *provider_github.Extractions {
+        if (self.extractions == null) self.extractions = .{ .a = self.backing };
+        return &self.extractions.?;
+    }
+
+    /// Drop the owned extractions no installed generation reads: the
+    /// current one's are kept, everything else a failed replan unpacked, or
+    /// that only a released generation read, is removed.
+    fn pruneExtractions(self: *WatchReplan) void {
+        const cache = if (self.extractions) |*c| c else return;
+        const keep: []const []const provider_github.Sources.Extracted = if (self.current) |generation| &.{generation.sources.used.items} else &.{};
+        cache.retain(keep);
+    }
+
     const Generation = struct {
         arena: std.heap.ArenaAllocator,
         sources: provider_github.Sources,
@@ -789,6 +817,10 @@ const WatchReplan = struct {
     fn run(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
         const self: *WatchReplan = @ptrCast(@alignCast(ptr));
         const next = try Generation.create(self.backing);
+        // Unchanged pins reuse the extraction an earlier generation made;
+        // only a changed pin is unpacked (cli#429).
+        next.sources.shared = self.extractionCache();
+        errdefer self.pruneExtractions();
         errdefer next.destroy(self.backing);
         const a = next.arena.allocator();
         const digest = try digestProject(a, self.project_dir);
@@ -839,6 +871,7 @@ const WatchReplan = struct {
         next.run_after = run_plan.after;
         if (self.current) |previous| previous.destroy(self.backing);
         self.current = next;
+        self.pruneExtractions();
     }
 
     /// The `after run` hooks the serve's shutdown runs: the current
@@ -860,20 +893,25 @@ const WatchReplan = struct {
     /// It refuses only what no prebuild step can mend:
     /// - an owner that is a remote package without an integrity pin
     ///   (`UnverifiedTargetOwner`) — a pin lives in `project.labelle`;
-    /// - no owner at all (`NoProviderForTarget`) while every declared LOCAL
-    ///   package already has a manifest to read and no declared remote
-    ///   package is unread — the project dropped the owner, or its manifest
-    ///   stopped declaring the target.
+    /// - no owner at all (`NoProviderForTarget`) while the project declares
+    ///   no LOCAL package and every declared remote one was read — the
+    ///   project dropped the owner and nothing a prebuild writes can bring
+    ///   one back.
     ///
     /// Everything else passes to the full replan after the prebuild, which
-    /// stays the authoritative check: a declared local package without a
-    /// `plugin.labelle` yet (a prebuild step may be what generates it —
-    /// Codex P2 on #427) and a declared remote package not in the cache yet
-    /// (the replan's install fetches it). An error reading the project or a
-    /// present manifest fails closed, as the cold pre-install check does.
-    /// A manifest that exists is taken at face value here: one that a
-    /// prebuild step would regenerate to START declaring the target is
-    /// refused by this check, as it is at cold start.
+    /// stays authoritative and runs before any hook or generate: any
+    /// declared local package — with no `plugin.labelle` yet, or one that
+    /// does not declare the target NOW, since a prebuild step may be what
+    /// (re)generates it (Codex P2 on #427, cli#429) — and a declared remote
+    /// package not read yet (not in the cache: the replan's install fetches
+    /// it; pinned but not extracted by any earlier generation: the replan
+    /// extracts it). An error reading the project or a present manifest
+    /// fails closed, as the cold pre-install check does.
+    ///
+    /// Metadata only: a pinned remote is read from the directory an earlier
+    /// generation (or the cold pipeline) extracted from the same verified
+    /// archive — no archive is read, decompressed or unpacked here
+    /// (cli#429).
     fn precheck(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
         const self: *WatchReplan = @ptrCast(@alignCast(ptr));
         var scratch = std.heap.ArenaAllocator.init(self.backing);
@@ -882,14 +920,18 @@ const WatchReplan = struct {
         var cfg = try config.readProjectConfig(a, self.project_dir);
         cfg.platform = ctx.hooks.cfg.platform;
         cfg.backend = ctx.hooks.cfg.backend;
-        var sources: provider_github.Sources = .{ .a = a };
+        // Lookup only: a pinned remote is read from the extraction an
+        // earlier generation (or the cold pipeline) verified and unpacked,
+        // never from its archive — a pin with none yet is unread, and the
+        // replan decides (cli#429).
+        var sources: provider_github.Sources = .{ .a = a, .shared = self.extractionCache(), .extract = false };
         defer sources.deinit();
         const view = try provider_dispatch.discoverAll(a, ctx.hooks.root, cfg, &sources, .unknown);
         if (view.unresolved.len != 0) return;
         if (provider_targets.resolve(view.providers, ctx.hooks.target)) |_| {
             return;
         } else |err| switch (err) {
-            error.NoProviderForTarget => if (try localManifestPending(a, ctx.hooks.root, cfg)) return,
+            error.NoProviderForTarget => if (declaresLocalPackage(cfg)) return,
             error.UnverifiedTargetOwner => {},
             else => return err,
         }
@@ -903,19 +945,11 @@ const WatchReplan = struct {
         };
     }
 
-    /// True when a declared local package has no `plugin.labelle` yet —
-    /// discovery reads it as a runtime-only package, but a prebuild step
-    /// may be about to generate its manifest.
-    fn localManifestPending(a: std.mem.Allocator, root: []const u8, cfg: project_config.ProjectConfig) !bool {
-        for (cfg.plugins) |dep| {
-            if (!dep.isLocal()) continue;
-            const dir = try plugins.resolvePluginDir(a, root, dep);
-            const manifest_path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
-            std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return true,
-                else => return err,
-            };
-        }
+    /// True when the project declares any local package: its manifest may
+    /// be (re)generated by a prebuild step, so no ownership verdict drawn
+    /// from what it declares NOW is final.
+    fn declaresLocalPackage(cfg: project_config.ProjectConfig) bool {
+        for (cfg.plugins) |dep| if (dep.isLocal()) return true;
         return false;
     }
 
@@ -930,6 +964,8 @@ const WatchReplan = struct {
             generation.destroy(self.backing);
         }
         self.current = null;
+        if (self.extractions) |*cache| cache.deinit();
+        self.extractions = null;
     }
 
     // Against a real project: edits to the manifest between rebuilds change
@@ -1143,24 +1179,17 @@ const WatchReplan = struct {
         try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.hook_count);
         const good = replan.current.?;
 
-        // (a) The manifest stops declaring the target.
-        var unowned_buf: [1024]u8 = undefined;
-        const unowned = try TwoStage.manifest(&unowned_buf, "", TwoStage.gen_hook);
-        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = unowned });
+        // (a) The project drops the package: no local package is left to
+        // regenerate, so no prebuild can bring an owner back.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
         try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
         TwoStage.Spy.reset();
         try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
         try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
         try std.testing.expectEqual(good, replan.current.?);
-        // (b) The project drops the package.
-        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = owning });
-        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
-        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
-        TwoStage.Spy.reset();
-        try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
-        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
-        // (c) The owner becomes a remote package with no integrity pin.
+        // (b) The only package left is a cached remote one that does not
+        // declare the target: no local candidate, no remote owner.
         const home = try tmp.dir.realPathFileAlloc(io, ".", a);
         defer a.free(home);
         asm_cache.setCacheRootOverride(home);
@@ -1170,20 +1199,29 @@ const WatchReplan = struct {
         try tmp.dir.createDirPath(io, cached);
         const cached_manifest = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
         defer a.free(cached_manifest);
+        var unowned_buf: [1024]u8 = undefined;
+        const unowned = try TwoStage.manifest(&unowned_buf, "", TwoStage.gen_hook);
+        try tmp.dir.writeFile(io, .{ .sub_path = cached_manifest, .data = unowned });
+        const remote_project = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }";
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = remote_project });
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(good, replan.current.?);
+        // (c) The owner becomes a remote package with no integrity pin.
         try tmp.dir.writeFile(io, .{ .sub_path = cached_manifest, .data = owning });
-        try tmp.dir.writeFile(io, .{
-            .sub_path = "project/project.labelle",
-            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
-        });
         try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.precheck(&replan, &ctx));
         TwoStage.Spy.reset();
         try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
         try std.testing.expectEqual(good, replan.current.?);
 
-        // Not "clearly gone": the local package has no manifest yet, which a
-        // prebuild step may generate. The pre-check defers; the prebuild
-        // runs; the full replan after it is what refuses, when nothing did.
+        // Not "clearly gone": a declared local package — with no manifest
+        // yet, or with one that does not declare the target NOW — may be
+        // (re)generated by a prebuild step. The pre-check defers; the
+        // prebuild runs; the full replan after it is what refuses, when
+        // nothing changed the manifest.
         try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
         try tmp.dir.deleteFile(io, "pkg/plugin.labelle");
         try WatchReplan.precheck(&replan, &ctx);
@@ -1192,6 +1230,79 @@ const WatchReplan = struct {
         try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
         try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
         try std.testing.expectEqual(good, replan.current.?);
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = unowned });
+        try WatchReplan.precheck(&replan, &ctx);
+        TwoStage.Spy.reset();
+        try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
+        try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
+        try std.testing.expectEqual(good, replan.current.?);
+    }
+
+    // A served target switches to a local provider whose EXISTING
+    // manifest is a stale prebuild output: it does not declare the target
+    // until the generator reruns. The pre-check must let the prebuild run;
+    // the replan after it sees the regenerated manifest (cli#429).
+    test "watched rebuild lets a prebuild refresh an existing provider manifest" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        const pkg = try tmp.dir.realPathFileAlloc(io, "pkg", a);
+        defer a.free(pkg);
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
+        var stale_buf: [1024]u8 = undefined;
+        const stale = try TwoStage.manifest(&stale_buf, "", TwoStage.gen_hook);
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = stale });
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+        const startup_cfg = site.cfg;
+        defer replan.deinit(&site, &.{}, startup_cfg);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+            .run_prebuild = TwoStage.Spy.runPrebuild,
+            .run_hook_phase = TwoStage.Spy.runHook,
+            .replan = .{ .ctx = &replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+        };
+
+        // The existing manifest does not declare the target, yet the
+        // pre-check defers: a local package's metadata is not final
+        // before its prebuild runs.
+        try WatchReplan.precheck(&replan, &ctx);
+        var buf: [1024]u8 = undefined;
+        const regenerated = try TwoStage.manifest(&buf, "\"wasm\"", TwoStage.gen_hook);
+        const manifest_path = try std.fs.path.join(a, &.{ pkg, "plugin.labelle" });
+        defer a.free(manifest_path);
+        TwoStage.Spy.reset();
+        TwoStage.Spy.generate_path = manifest_path;
+        TwoStage.Spy.generate_text = regenerated;
+        // The rebuild gets past the replan (generation then fails on the
+        // missing assembler): the regenerated manifest owns the target and
+        // its hook ran in this very rebuild.
+        try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
+        try std.testing.expect(replan.current != null);
+        try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.hook_count);
+        try std.testing.expectEqualStrings("pkg/gen", TwoStage.Spy.hooks[0]);
     }
 
     // Stage two: a prebuild step that generates the provider's manifest is
@@ -1262,6 +1373,123 @@ const WatchReplan = struct {
         try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
         try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
+    }
+
+    // A pinned remote provider is unpacked once per changed pin, not twice
+    // per save: the pre-check reads its manifest from the extraction an
+    // earlier generation verified, and a replan reuses the extraction of an
+    // unchanged pin (cli#429).
+    test "watch replan extracts a pinned provider once per changed pin" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "home/provider-archives");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        const home = try tmp.dir.realPathFileAlloc(io, "home", a);
+        defer a.free(home);
+        asm_cache.setCacheRootOverride(home);
+        defer asm_cache.clearCacheRootOverride();
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
+        });
+        const Pins = struct {
+            /// Publish an archive of the owning manifest (bytes varied by
+            /// `variant`) and pin it in the project's provider lock.
+            fn publish(dir: std.Io.Dir, variant: []const u8, commit: u8) !void {
+                const ta = std.testing.allocator;
+                const data = try provider_github.testProviderArchive(ta, ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }", variant);
+                defer ta.free(data);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+                const hex = std.fmt.bytesToHex(digest, .lower);
+                var name_buf: [128]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "home/provider-archives/{s}.tar.gz", .{&hex});
+                try dir.writeFile(config.globalIo(), .{ .sub_path = name, .data = data });
+                var commit_hex: [40]u8 = undefined;
+                @memset(&commit_hex, commit);
+                var lock_buf: [512]u8 = undefined;
+                const lock = try std.fmt.bufPrint(&lock_buf, "{{\"schema_version\":1,\"providers\":[{{\"package\":\"pkg\",\"repo\":\"example/pkg\",\"version\":\"1.0.0\",\"commit\":\"{s}\",\"sha256\":\"{s}\"}}]}}", .{ &commit_hex, &hex });
+                try dir.writeFile(config.globalIo(), .{ .sub_path = "project/" ++ provider_github.lock_name, .data = lock });
+            }
+        };
+        try Pins.publish(tmp.dir, "// v1\n", '1');
+
+        // The cold pipeline's own extraction, lent to the session; its
+        // storage outlives the replan, as `run`'s does.
+        var startup_arena = std.heap.ArenaAllocator.init(a);
+        defer startup_arena.deinit();
+        const sa = startup_arena.allocator();
+        var startup_sources: provider_github.Sources = .{ .a = sa };
+        defer startup_sources.deinit();
+        const startup_cfg_read = try config.readProjectConfig(sa, project);
+        const startup_providers = try provider_dispatch.discover(sa, project, startup_cfg_read, &startup_sources, .populated);
+        try std.testing.expectEqual(@as(usize, 1), startup_providers.len);
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+        };
+        var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+        const startup_cfg = site.cfg;
+        defer replan.deinit(&site, &.{}, startup_cfg);
+        replan.seed(&startup_sources);
+
+        // Two consecutive rebuilds with the pin unchanged: the pre-check
+        // reads the lent extraction, the replan reuses it — nothing is
+        // unpacked, and the providers point at the cold pipeline's copy.
+        const before = provider_github.extraction_count;
+        for (0..2) |_| {
+            try WatchReplan.precheck(&replan, &ctx);
+            try WatchReplan.run(&replan, &ctx);
+            try std.testing.expectEqualStrings(startup_providers[0].dir, site.providers[0].dir);
+        }
+        try std.testing.expectEqual(before, provider_github.extraction_count);
+
+        // The pin changes: the pre-check still unpacks nothing (the new pin
+        // is unread, so it defers), the replan unpacks it exactly once...
+        try Pins.publish(tmp.dir, "// v2\n", '2');
+        try WatchReplan.precheck(&replan, &ctx);
+        try std.testing.expectEqual(before, provider_github.extraction_count);
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(before + 1, provider_github.extraction_count);
+        const v2_dir = try a.dupe(u8, site.providers[0].dir);
+        defer a.free(v2_dir);
+        try std.testing.expect(!std.mem.eql(u8, startup_providers[0].dir, v2_dir));
+        // ...and the two rebuilds after it reuse that extraction.
+        for (0..2) |_| {
+            try WatchReplan.precheck(&replan, &ctx);
+            try WatchReplan.run(&replan, &ctx);
+            try std.testing.expectEqualStrings(v2_dir, site.providers[0].dir);
+        }
+        try std.testing.expectEqual(before + 1, provider_github.extraction_count);
+
+        // Back to v1: its lent extraction is still there, so nothing is
+        // unpacked; v2's, owned by the session and read by no installed
+        // generation any more, is removed.
+        try Pins.publish(tmp.dir, "// v1\n", '1');
+        try WatchReplan.precheck(&replan, &ctx);
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(before + 1, provider_github.extraction_count);
+        try std.testing.expectEqualStrings(startup_providers[0].dir, site.providers[0].dir);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, v2_dir, .{}));
     }
 
     // An edit to `project.labelle` brings the package cache and the lock in
@@ -3030,6 +3258,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 // installed and locked is the replan's baseline: an edit to
                 // `project.labelle` re-runs the install and rewrites the lock.
                 watch_replan.baseline();
+                // The pinned providers the cold pipeline just extracted are
+                // lent to the session (their `Sources` outlives the replan):
+                // a rebuild re-extracts only a pin that changed (cli#429).
+                watch_replan.seed(&provider_sources);
                 var rebuild_ctx = WasmRebuildCtx{
                     .allocator = allocator,
                     .asm_bin = asm_bin,

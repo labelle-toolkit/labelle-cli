@@ -90,7 +90,19 @@ pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectC
     // reported missing (`hooks.validateAll`).
     var unresolved: std.ArrayList([]const u8) = .empty;
     for (cfg.plugins) |dep| {
-        const pinned = if (dep.isLocal()) null else try sources.projectDir(root, dep);
+        // A lookup-only view (`Sources.extract = false`) has no directory for
+        // a pin nothing extracted yet: under `.unknown` that package is
+        // unread, like an uncached one, never mistaken for an unpinned one.
+        const pinned = if (dep.isLocal()) null else sources.projectDir(root, dep) catch |err| switch (err) {
+            error.ProviderSourceNotExtracted => switch (cache_state) {
+                .unknown => {
+                    try unresolved.append(a, dep.name);
+                    continue;
+                },
+                .populated => return err,
+            },
+            else => return err,
+        };
         const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
         if (pinned == null and !dep.isLocal()) {
             std.Io.Dir.cwd().access(config.globalIo(), dir, .{}) catch |err| switch (err) {
