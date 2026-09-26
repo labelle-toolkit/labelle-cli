@@ -1347,6 +1347,40 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             defer allocator.free(bin_dir);
             sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
         }
+
+        // `labelle build` finalization — everything that turns the compiled
+        // tree into the command's final artifact. It sits INSIDE the core
+        // build so the `after build` hooks below see the finished artifact
+        // (a signing, inspecting or publishing hook used to run before the
+        // APK existed, and reported success even when packaging then
+        // failed — Codex P2 on #420), and so that a `replace build` hook
+        // owns it: the replacement produces the artifact its target needs,
+        // packaging included.
+        if (command == .build) {
+            // Linux `.desktop` entry + icon (cli#359): after a desktop build,
+            // write `zig-out/<exe>.desktop` + `zig-out/<exe>.png` beside `bin/`
+            // — automatically on a Linux host, or anywhere with
+            // `--linux-desktop`. Skipped under `--docker`: that exe was built
+            // for the container's target and the entry's absolute paths would
+            // describe this host, not the one that will run it. `run` is
+            // deliberately left alone — the entry is a packaging artifact.
+            if (!parsed_args.docker and parsed.platform == .desktop and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
+                const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
+                allocator.free(entry_path);
+            }
+            // `labelle build --platform=android` builds the shared library
+            // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
+            // but, unlike `labelle android build`, used to stop there and leave
+            // a bare `.so`. Package it into a signed APK so the artifact is
+            // installable — backend-agnostic, so it covers sokol and bgfx alike.
+            if (parsed.platform == .android) {
+                const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{}, .{
+                    .strip_native = android.stripForOptimize(effective_optimize),
+                });
+                defer allocator.free(apk_path);
+                std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
+            }
+        }
     }
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.build.after, .build, .after, build_out);
@@ -1404,29 +1438,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     }
 
     if (command == .build) {
-        // Linux `.desktop` entry + icon (cli#359): after a desktop build,
-        // write `zig-out/<exe>.desktop` + `zig-out/<exe>.png` beside `bin/`
-        // — automatically on a Linux host, or anywhere with
-        // `--linux-desktop`. Skipped under `--docker`: that exe was built
-        // for the container's target and the entry's absolute paths would
-        // describe this host, not the one that will run it. `run` is
-        // deliberately left alone — the entry is a packaging artifact.
-        if (!parsed_args.docker and parsed.platform == .desktop and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
-            const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
-            allocator.free(entry_path);
-        }
-        // `labelle build --platform=android` builds the shared library
-        // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
-        // but, unlike `labelle android build`, used to stop there and leave
-        // a bare `.so`. Package it into a signed APK so the artifact is
-        // installable — backend-agnostic, so it covers sokol and bgfx alike.
-        if (parsed.platform == .android) {
-            const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{}, .{
-                .strip_native = android.stripForOptimize(effective_optimize),
-            });
-            defer allocator.free(apk_path);
-            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
-        }
+        // (The build's finalization — the Linux `.desktop` entry and the
+        // APK packaging — ran inside the core build above, ahead of the
+        // `after build` hooks.)
         if (reporter) |r| r.finishDone(0);
         return 0;
     }

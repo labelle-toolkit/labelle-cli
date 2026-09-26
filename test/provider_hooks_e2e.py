@@ -275,6 +275,26 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert exe.exists()
     assert order(log(zig_out), "build") == [("before", "b-pre"), ("before", "a-pre"), ("after", "a-post")], log(zig_out)
 
+    # ── build: after hooks see the command's FINAL artifact ───────────────
+    # `labelle build` finalizes the compiled tree (the Linux `.desktop` entry
+    # here; the APK on the platform that packages one) and the `after build`
+    # hooks used to run before that finalization, so a signing or publishing
+    # hook never saw the artifact (Codex P2 on #420). `--linux-desktop` emits
+    # the entry on every host: the hook's snapshot of `zig-out/` lists it,
+    # and the entry was written before the hook ran.
+    reset()
+    finalized = run("build", "--linux-desktop")
+    entry = zig_out / ("game" + ".desktop")
+    assert entry.exists(), list(zig_out.iterdir())
+    text = finalized.stderr
+    assert text.index("build ok") < text.index("desktop entry written to") < text.index("hook 'fixture-a/a-post'"), text
+    seen = {e["invocation"]["id"]: e["output_entries"] for e in log(zig_out) if e["invocation"]["step"] == "build"}
+    assert "game.desktop" in seen["a-post"] and "game.desktop" in seen["b-post"], seen
+    # The mechanism: the before hooks ran on the pre-finalization tree, so
+    # the entry's presence in the after snapshot is the ordering, not a
+    # leftover from an earlier command.
+    assert "game.desktop" not in seen["b-pre"] and "game.desktop" not in seen["a-pre"], seen
+
     # ── generate: the lock exists when the before hook runs ───────────────
     reset()
     lock_file.unlink(missing_ok=True)

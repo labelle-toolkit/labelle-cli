@@ -95,6 +95,12 @@ pre-passes and by the assembler. (The pre-passes used to run before the
 hooks; `generate --bake` then failed on a PNG the hook had not yet written.)
 A `replace generate` hook stands in for the pre-passes as well as for the
 assembler: whatever preprocessing its generation needs is its own to do.
+Likewise for `build`, the core step ends with the command's finalization —
+for `labelle build`, the Linux `.desktop` entry and, on a platform that
+packages one, the installable package — so an `after build` hook sees the
+final artifact and never reports success over a packaging step that has
+not run yet; and a `replace build` hook owns that finalization too: the
+replacement produces the artifact its target needs, packaging included.
 Inside a phase the order is a
 topological sort of the `after_hooks` edges that land in that phase; whenever
 several hooks are ready, the lexicographically smallest fully qualified ID

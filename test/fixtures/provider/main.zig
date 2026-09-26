@@ -37,10 +37,26 @@ pub fn main(init: std.process.Init) !u8 {
         std.Io.Dir.cwd().access(init.io, lock_file.string, .{}) catch break :blk false;
         break :blk true;
     };
+    // What the step's output directory holds at the moment the hook runs
+    // (sorted names), so an `after` hook can prove it saw the finished
+    // artifact rather than an intermediate tree (Codex P2 on #420).
+    var output_entries: std.ArrayList([]const u8) = .empty;
+    if (std.Io.Dir.cwd().openDir(init.io, output, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(init.io);
+        var it = dir.iterate();
+        while (try it.next(init.io)) |entry| try output_entries.append(a, try a.dupe(u8, entry.name));
+    } else |_| {}
+    std.mem.sort([]const u8, output_entries.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
     const line = try std.json.Stringify.valueAlloc(a, .{
         .invocation = invocation,
         .target = ctx.value.object.get("target").?,
         .output_dir = output,
+        .output_entries = output_entries.items,
         .lock_file = lock_file,
         .lock_file_exists = lock_exists,
         .optimize = ctx.value.object.get("optimize").?,
