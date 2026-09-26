@@ -759,15 +759,32 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         return ok(upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]));
     }
 
+    // (Provider discovery and the hook plans are computed further down,
+    // right after the package cache is populated — see the `gateThenInstall`
+    // call. The resolved target string is needed earlier, for the plans and
+    // the hook site; provider-declared targets arrive with the next slice
+    // (RFC #406 phase 3b), for now it is the legacy platform name.)
+    const hook_arena = arena.allocator();
+    const hook_target = @tagName(parsed.platform);
+
     // `labelle wasm serve|export --no-build` — skip the generate+build
-    // pipeline entirely and serve/package the existing build output. The
-    // web dir lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
+    // pipeline and serve/package the existing build output. The web dir
+    // lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
+    //
+    // Only generate and build are skipped: serving or exporting the existing
+    // artifact IS the `run` step, so the `run` hook plan (contract §6) runs
+    // here exactly as on the building path — `--no-build` used to return
+    // before discovery and silently dropped every declared run hook (Codex
+    // P2 on #420). No installer runs on this path, so discovery is the
+    // metadata-only kind (`.unknown`, as `labelle help`): a declared remote
+    // package absent from every cache is not listed rather than reported as
+    // a broken install that never happened.
     if (command == .wasm_cmd and parsed_args.serve_no_build) {
         const wasm_target = try std.fmt.allocPrint(allocator, "{s}_wasm", .{@tagName(parsed.backend)});
         defer allocator.free(wasm_target);
-        const web_dir = try std.fs.path.join(allocator, &.{
-            project_dir, ".labelle", wasm_target, "zig-out", "web",
-        });
+        const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
+        defer allocator.free(wasm_target_dir);
+        const web_dir = try std.fs.path.join(allocator, &.{ wasm_target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         if (std.Io.Dir.cwd().access(config.globalIo(), web_dir, .{})) |_| {} else |_| {
             const verb = if (parsed_args.wasm_export) "export" else "serve";
@@ -780,27 +797,66 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         }
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
+
+        const no_build_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
+        var no_build_sources: provider_github.Sources = .{ .a = hook_arena };
+        defer no_build_sources.deinit();
+        const no_build_providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
+            &.{}
+        else
+            provider_dispatch.discover(hook_arena, no_build_root, parsed, &no_build_sources, .unknown) catch |err| {
+                std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+        const no_build_plan = try provider_hooks.plan(hook_arena, no_build_providers, .run, hook_target);
+        // The same wire `optimize` the building path reports for this
+        // platform; there is no progress feed on this path.
+        const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {
+            std.debug.print("labelle: unknown optimize mode '{s}'\n", .{parsed_args.optimize_override.?});
+            return 1;
+        };
+        var no_build_site: provider_hooks.Site = .{
+            .a = hook_arena,
+            .backing = allocator,
+            .providers = no_build_providers,
+            .root = no_build_root,
+            .cfg = parsed,
+            .target = hook_target,
+            .optimize = no_build_optimize,
+            .progress = switch (parsed_args.progress_mode) {
+                .human => .human,
+                .json => .json,
+                .off => .off,
+            },
+            .reporter = null,
+        };
+        const no_build_out = try provider_hooks.stepOutputDir(hook_arena, wasm_target_dir, .run, hook_target, null);
+        {
+            const code = try provider_hooks.runPhase(&no_build_site, no_build_plan.before, .run, .before, no_build_out);
+            if (code != 0) return code;
+        }
+        if (no_build_plan.replace) |replacement| {
+            const code = try provider_hooks.runPhase(&no_build_site, &.{replacement}, .run, .replace, no_build_out);
+            if (code != 0) return code;
+            return provider_hooks.finishRun(&no_build_site, no_build_plan.after, no_build_out, .exited_clean);
+        }
         if (parsed_args.wasm_export) {
             const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
             defer allocator.free(out_abs);
-            return ok(export_mod.packageExport(allocator, web_dir, project_web_dir, .{
+            try export_mod.packageExport(allocator, web_dir, project_web_dir, .{
                 .output_dir = out_abs,
                 .zip = parsed_args.export_zip,
                 .platform = parsed_args.export_pkg_platform,
-            }));
+            });
+            return provider_hooks.finishRun(&no_build_site, no_build_plan.after, no_build_out, .exited_clean);
         }
         // No watch in the `--no-build` path (the parser already rejects the
         // `--watch --no-build` combination, so `serve_watch` is false here).
-        return ok(serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null));
+        // The server returns on Ctrl+C / SIGTERM, the serve's clean end, and
+        // the after hooks run then — as on the building path.
+        try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
+        return provider_hooks.runPhase(&no_build_site, no_build_plan.after, .run, .after, no_build_out);
     }
-
-    // (Provider discovery and the hook plans are computed further down,
-    // right after the package cache is populated — see the `gateThenInstall`
-    // call. The resolved target string is needed earlier, for the plans and
-    // the hook site; provider-declared targets arrive with the next slice
-    // (RFC #406 phase 3b), for now it is the legacy platform name.)
-    const hook_arena = arena.allocator();
-    const hook_target = @tagName(parsed.platform);
 
     // ── Build-progress feed (cli#284) ──────────────────────────────────
     // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so

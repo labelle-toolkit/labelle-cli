@@ -107,7 +107,8 @@ def manifest(name, hooks, targets=()):
 A_HOOKS = [hook("a-pre", "build", "before", after=["fixture-b/b-pre"]), hook("a-post", "build", "after"),
            hook("a-gen-pre", "generate", "before"), hook("a-gen-post", "generate", "after"),
            hook("a-bundle-pre", "bundle", "before"), hook("a-bundle-post", "bundle", "after"),
-           hook("a-run-pre", "run", "before"), hook("a-run-post", "run", "after")]
+           hook("a-run-pre", "run", "before"), hook("a-run-post", "run", "after"),
+           hook("a-wasm-run-pre", "run", "before", target="wasm"), hook("a-wasm-run-post", "run", "after", target="wasm")]
 B_HOOKS = [hook("b-pre", "build", "before"), hook("b-post", "build", "after"),
            hook("b-gen-pre", "generate", "before"), hook("b-gen-post", "generate", "after"),
            hook("b-bundle-pre", "bundle", "before"), hook("b-bundle-post", "bundle", "after"),
@@ -371,6 +372,33 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     inside = run("run", "--timeout=60s")
     assert "labelle: timed out" not in inside.stderr and "after-run hooks skipped" not in inside.stderr, inside.stderr
     assert order(log(zig_out), "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], log(zig_out)
+
+    # ── wasm export --no-build: the run hooks still run ───────────────────
+    # `--no-build` returned before discovery, so every declared run hook was
+    # silently skipped although exporting the existing artifact is the same
+    # run step the building path hooks (Codex P2 on #420). A pre-existing
+    # web dir stands in for the build; nothing is installed or generated,
+    # and the `run` hooks for the `wasm` target wrap the export.
+    reset()
+    wasm_target_dir = project / ".labelle" / "raylib_wasm"
+    wasm_web = wasm_target_dir / "zig-out" / "web"
+    wasm_web.mkdir(parents=True)
+    (wasm_web / "index.html").write_text("<html>fixture</html>")
+    release = project / "release"
+    exported = run("wasm", "export", "--no-build", "--output", "release")
+    assert (release / "index.html").exists() and (release / ".labelle-export").exists(), list(release.iterdir())
+    text = exported.stderr
+    assert "FIXTURE_INSTALL_DONE" not in text and "FIXTURE_GENERATE" not in text and "build ok" not in text, text
+    assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre"), ("after", "a-wasm-run-post")], text
+    assert text.index("hook 'fixture-a/a-wasm-run-pre'") < text.index("WASM Export Complete") < text.index("hook 'fixture-a/a-wasm-run-post'"), text
+    # A failing before hook stops the export: the hook's code is the CLI's
+    # and the output directory is never created.
+    shutil.rmtree(release)
+    (wasm_target_dir / "zig-out" / "hooks.log").unlink()
+    refused = run("wasm", "export", "--no-build", "--output", "release", code=7, extra_env={"PROVIDER_PROBE_FAIL": "a-wasm-run-pre"})
+    assert not release.exists() and "WASM Export Complete" not in refused.stderr, refused.stderr
+    assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre")], refused.stderr
+    reset()
 
     # ── run: an `after build` hook's output survives until launch ─────────
     # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs

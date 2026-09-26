@@ -212,6 +212,13 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   not grow on every saved edit.
 - A `--docker` run whose binary was cross-compiled skips the launch and its
   `after run` hooks with it (nothing ran).
+- `wasm serve|export --no-build` skips only `generate` and `build`: serving
+  or exporting the existing artifact is the `run` step, and its `before`,
+  `replace` and `after run` hooks run as on the building path (`after`
+  once the export is on disk, or once the server returns). No installer
+  runs there, so discovery is the metadata-only kind that `labelle help`
+  uses: a declared remote package absent from every cache is not listed
+  rather than reported as a failed install.
 
 ## Verification
 
