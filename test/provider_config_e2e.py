@@ -52,7 +52,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-settings-") as temp:
         checks += 1
         return result
 
-    def reject(entries, error):
+    def reject(entries, error, *names):
+        """Fail closed with `error`; `names` (package/file) must be diagnosed."""
         config(entries)
         capture.unlink(missing_ok=True)
         # If validation accidentally reaches the build, this deliberately
@@ -63,6 +64,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-settings-") as temp:
         try:
             result = run("probe", "inspect", code=1)
             assert error in result.stderr, result.stderr
+            for name in names:
+                assert name in result.stderr, (name, result.stderr)
             assert "build.zig:" not in result.stderr, result.stderr
             assert not capture.exists()
         finally:
@@ -88,7 +91,18 @@ with tempfile.TemporaryDirectory(prefix="labelle-settings-") as temp:
     reject([entry(file="../outside.json")], "InvalidProviderConfigPath")
     reject([entry(file="/absolute.json")], "InvalidProviderConfigPath")
     reject([entry(file="C:/absolute.json")], "InvalidProviderConfigPath")
-    reject([entry(file="providers")], "InvalidProviderConfigFile")
+    # Path-validation failures must name the mapping so a project with several
+    # mappings can tell which package/file failed.
+    reject([entry(file="providers")], "InvalidProviderConfigFile", "'fixture'", "providers")
+    settings.write_text('{"label":"' + "x" * (1024 * 1024) + '"}')
+    reject([entry()], "StreamTooLong", "'fixture'", "providers/settings.json")
+    if os.name != "nt" and os.geteuid() != 0:  # root ignores mode bits
+        settings.write_text('{"label":"unreadable"}')
+        settings.chmod(0)
+        try:
+            reject([entry()], "AccessDenied", "'fixture'", "providers/settings.json")
+        finally:
+            settings.chmod(0o644)
     settings.write_text('{"label":')
     reject([entry()], "InvalidProviderConfigJson")
     settings.write_text('{"label":"one","label":"two"}')
@@ -112,7 +126,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-settings-") as temp:
     else:
         link.symlink_to(outside, target_is_directory=True)
     try:
-        reject([entry(file="linked/settings.json")], "EscapingProviderConfig")
+        reject([entry(file="linked/settings.json")], "EscapingProviderConfig", "'fixture'", "linked/settings.json")
     finally:
         if os.name == "nt":
             link.rmdir()  # Removes only the junction, never its target.

@@ -10,8 +10,10 @@ Declare a JSON settings file for a package already listed in `.plugins`:
 
 Each entry requires exactly `package` and `file`. Both the CLI and assembler
 accept the same shape and reject unknown entry fields, duplicate package
-mappings, invalid package identifiers and undeclared packages. Paths use
-forward slashes, are project-relative, and cannot contain `..`, a drive prefix,
+mappings, empty package names and undeclared packages. A package name has no
+character rule of its own: it must exactly match a declared `.plugins` name,
+so names such as `3d_renderer` are accepted when declared. Paths use forward
+slashes, are project-relative, and cannot contain `..`, a drive prefix,
 backslashes or empty components. Omitting the mapping gives `config_file: null`.
 
 Before compiling or running a provider command, the CLI checks every mapping

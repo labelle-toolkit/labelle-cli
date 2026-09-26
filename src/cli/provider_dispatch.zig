@@ -192,10 +192,23 @@ fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectC
             std.debug.print("labelle: provider_config '{s}' cannot open '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
             return error.MissingProviderConfig;
         };
-        if (!contained(root, path)) return error.EscapingProviderConfig;
-        const stat = try std.Io.Dir.cwd().statFile(config.globalIo(), path, .{});
-        if (stat.kind != .file) return error.InvalidProviderConfigFile;
-        const bytes = try read(a, path);
+        if (!contained(root, path)) {
+            std.debug.print("labelle: provider_config '{s}' resolves outside the project: {s}\n", .{ entry.package, entry.file });
+            return error.EscapingProviderConfig;
+        }
+        const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch |err| {
+            std.debug.print("labelle: provider_config '{s}' cannot stat '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+            return err;
+        };
+        if (stat.kind != .file) {
+            std.debug.print("labelle: provider_config '{s}' is not a regular file: {s}\n", .{ entry.package, entry.file });
+            return error.InvalidProviderConfigFile;
+        }
+        // Covers the 1 MiB input limit (StreamTooLong) and unreadable files.
+        const bytes = read(a, path) catch |err| {
+            std.debug.print("labelle: provider_config '{s}' cannot read '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+            return err;
+        };
         defer a.free(bytes);
         // Check JSON syntax only. The provider owns its settings schema and
         // must validate semantic requirements before producing side effects.
