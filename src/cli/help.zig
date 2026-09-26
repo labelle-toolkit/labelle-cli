@@ -33,6 +33,7 @@ pub fn printHelp() void {
         \\  migrate unified [dir] [--dry-run]  Auto-fix legacy unified-format patterns (RFC #594 / engine#592)
         \\  check [dir]          Lint packs for §6 convention violations (Packs RFC)
         \\  plugins [dir]        List attached plugins with version, license, and author
+        \\  providers resolve [providers.json] [--accept] [--offline]  Preview or pin GitHub providers for this project
         \\  doctor [dir] [--fix] [--json]  Check build requirements (SDL2, Zig, emsdk); `--fix` provisions, `--json` emits a capability report
         \\  help                 Show this help
         \\  version              Show CLI version
