@@ -681,6 +681,13 @@ fn confirmTarget(a: std.mem.Allocator, providers: []const provider_dispatch.Prov
             provider_targets.reportNoProvider(a, requested);
             return null;
         },
+        // The owner is a remote package read from the ordinary cache with
+        // no integrity pin: a target-owning provider is held to the pinned
+        // boundary even when no hook of its would ever call `requirePinned`.
+        error.UnverifiedTargetOwner => {
+            provider_targets.reportUnverifiedOwner(a, providers, requested);
+            return null;
+        },
         else => return err,
     };
 }
