@@ -9,6 +9,7 @@ const contract = @import("provider_contract.zig");
 const util = @import("util.zig");
 const dispatch = @import("provider_dispatch.zig");
 const hooks = @import("provider_hooks.zig");
+const registry = @import("provider_registry.zig");
 
 pub const lock_name = "labelle.providers.lock";
 /// Project-local record of the last `resolve` preview. `--accept` refuses to
@@ -64,22 +65,30 @@ fn lowerHex(text: []const u8, length: usize) bool {
     return true;
 }
 
-/// Both registry and lock have the same small schema; locks allow one pin/package.
+/// The project integrity lock (and a schema-1 registry) share this small
+/// schema; locks allow one pin/package. Registry documents are read through
+/// `provider_registry.parse`, which also accepts schema 2.
 pub fn parse(a: std.mem.Allocator, bytes: []const u8, is_lock: bool) !Document {
     const parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .allocate = .alloc_always });
     // The caller owns an arena; successful parsed strings live through invocation.
     const doc = parsed.value;
     if (doc.schema_version != 1) return error.UnsupportedProviderSchema;
-    for (doc.providers, 0..) |pin, i| {
+    try checkPins(doc.providers, is_lock);
+    return doc;
+}
+
+/// The per-record and cross-record rules every pin list obeys, whatever
+/// document carried it (a lock, or a registry of either schema).
+pub fn checkPins(pins: []const Pin, is_lock: bool) !void {
+    for (pins, 0..) |pin, i| {
         try pin.validate();
-        for (doc.providers[0..i]) |prev| {
+        for (pins[0..i]) |prev| {
             if (std.mem.eql(u8, pin.package, prev.package)) {
                 if (!std.mem.eql(u8, pin.repo, prev.repo)) return error.ProviderRepositoryConflict;
                 if (is_lock or std.mem.eql(u8, pin.version, prev.version)) return error.DuplicateProviderRelease;
             }
         }
     }
-    return doc;
 }
 
 fn read(a: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
@@ -381,9 +390,13 @@ fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
         error.FileNotFound => return null,
         else => return err,
     };
-    const doc = try parse(a, bytes, false);
+    const doc = try registry.parse(a, bytes);
+    // Schema 2 publishes target ownership (#411): the lookup is by name and
+    // reads no archive at all. Only a schema-1 document, whose records claim
+    // nothing, falls back to the bounded scan of cached archives.
+    if (doc.claimsOwnership()) return doc.targetOwner(target);
     var inspected: usize = 0;
-    for (doc.providers) |pin| {
+    for (doc.pins) |pin| {
         if (inspected == registry_hint_scan_limit) break;
         // Only a verified cached archive can say what a package declares; a
         // release that is not cached, or whose bytes do not verify, says nothing.
@@ -411,11 +424,14 @@ fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
     return null;
 }
 
-/// The package the cached registry document lists whose verified cached
-/// archive declares `target`, or null. Reads the cache only: no network, no
-/// extraction, no package code. The registry record itself carries no target
-/// declarations (contract §4), so a missing document, an uncached archive or
-/// an unreadable manifest is simply no hint — the caller never invents a name.
+/// The package the cached registry document names as the owner of `target`,
+/// or null. Reads the cache only: no network, no extraction, no package code.
+/// A schema-2 document answers from its target-ownership table (whose claims
+/// `--accept` checked against every release it pinned); a schema-1 record
+/// carries no declarations, so there the owner is whichever listed package's
+/// verified cached archive declares the target. A missing document, an
+/// uncached archive or an unreadable manifest is simply no hint — the caller
+/// never invents a name.
 pub fn cachedRegistryOwner(a: std.mem.Allocator, target: []const u8) ?[]const u8 {
     return cachedOwner(a, target) catch null;
 }
@@ -677,7 +693,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
         if (std.mem.indexOf(u8, source, "://") != null) return error.InvalidProviderRegistrySource;
         metadata = try read(a, source, 1024 * 1024);
     }
-    const doc = try parse(a, metadata, false);
+    const doc = try registry.parse(a, metadata);
     const cfg = try config.readProjectConfigQuiet(a, root);
     var selected: std.ArrayList(Pin) = .empty;
     for (cfg.plugins, 0..) |dep, i| {
@@ -685,7 +701,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
         if (dep.isLocal()) continue;
         var known = false;
         var found = false;
-        for (doc.providers) |pin| {
+        for (doc.pins) |pin| {
             if (!std.mem.eql(u8, pin.package, dep.name)) continue;
             known = true;
             if (!pin.matches(dep)) continue;
@@ -718,6 +734,9 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     for (selected.items) |pin| {
         const dir = try sources.fromPin(pin, !offline);
         const meta = try manifest.parse(a, try read(a, try std.fs.path.join(a, &.{ dir, "plugin.labelle" }), 1024 * 1024));
+        // A schema-2 registry's ownership claims for this release must be
+        // what its verified manifest declares, before anything is pinned.
+        try doc.checkDeclarations(pin, meta);
         const ns = try a.alloc([]const u8, if (meta.namespace != null) 1 else 0);
         if (meta.namespace) |value| ns[0] = value;
         try ownership.append(a, .{ .package = pin.package, .namespaces = ns, .targets = meta.targets });
@@ -878,6 +897,16 @@ const AcceptFixture = struct {
         try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = self.registry, .data = data });
     }
 
+    /// A schema-2 registry (#411) listing `pin` with the given ownership
+    /// claims, as JSON fragments (`"probe"` or `null`; `"t1","t2"`).
+    fn schemaTwo(a: std.mem.Allocator, pin: Pin, namespace: []const u8, targets: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{{\"schema_version\":2,\"defaults\":[],\"providers\":[{{\"package\":\"{s}\",\"repo\":\"{s}\",\"version\":\"{s}\",\"commit\":\"{s}\",\"sha256\":\"{s}\",\"namespace\":{s},\"targets\":[{s}]}}]}}", .{ pin.package, pin.repo, pin.version, pin.commit, pin.sha256, namespace, targets });
+    }
+
+    fn publishSchemaTwo(self: *AcceptFixture, a: std.mem.Allocator, namespace: []const u8, targets: []const u8) !void {
+        try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = self.registry, .data = try schemaTwo(a, self.pin, namespace, targets) });
+    }
+
     fn run(self: *AcceptFixture, a: std.mem.Allocator, accept: bool) !void {
         return resolve(a, self.root, self.registry, accept, true, &.{});
     }
@@ -1011,6 +1040,49 @@ test "provider github: the cached registry names a target owner only from a veri
     try std.testing.expect(cachedRegistryOwner(a, "other-target") == null);
     // Bytes that do not verify against the pin say nothing.
     try cwd.writeFile(io, .{ .sub_path = archive_path, .data = "not the archive" });
+    try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+}
+
+test "provider github: accept refuses a schema-2 record whose claims the verified manifest contradicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    // The fixture manifest declares namespace `probe` and no target; the
+    // record claims a target it does not declare. The archive verifies, so
+    // only the claim check can refuse it, and it does before the lock exists.
+    try fx.publishSchemaTwo(a, "\"probe\"", "\"probe-target\"");
+    try fx.run(a, false);
+    try std.testing.expectError(error.RegistryDeclarationMismatch, fx.run(a, true));
+    try std.testing.expect(!try fx.exists(a, lock_name));
+    try fx.publishSchemaTwo(a, "null", "");
+    try fx.run(a, false);
+    try std.testing.expectError(error.RegistryDeclarationMismatch, fx.run(a, true));
+    try std.testing.expect(!try fx.exists(a, lock_name));
+    // Truthful claims pin, and the accepted schema-2 document is the hint source.
+    try fx.publishSchemaTwo(a, "\"probe\"", "");
+    try fx.run(a, false);
+    try fx.run(a, true);
+    const lock = try parse(a, try read(a, try std.fs.path.join(a, &.{ fx.root, lock_name }), 1024 * 1024), true);
+    try std.testing.expectEqual(@as(usize, 1), lock.providers.len);
+    try std.testing.expectEqual(@as(u8, 1), lock.schema_version);
+}
+
+test "provider github: a schema-2 cached registry names a target owner by lookup, reading no archive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    // Remove the only cached archive: a hint can now come only from the table.
+    try std.Io.Dir.cwd().deleteFile(config.globalIo(), try archivePath(a, fx.pin));
+    try cacheRegistry(a, try AcceptFixture.schemaTwo(a, fx.pin, "\"probe\"", "\"probe-target\""));
+    try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "probe-target").?);
+    try std.testing.expect(cachedRegistryOwner(a, "other-target") == null);
+    // Mechanism: the same release as a schema-1 document has no claims, and
+    // with its archive gone the scan has nothing to read, so no hint.
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = &.{fx.pin} }, .{}));
     try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
 }
 

@@ -141,7 +141,8 @@ or corrupted archives fail closed. Repair the cached archive and explicitly
 resolve again; a changed GitHub archive is not automatically accepted.
 
 Namespace, target and command-contract declarations come from the verified
-`plugin.labelle`, rather than duplicated registry metadata. Source archives
+`plugin.labelle`. The registry's ownership tables (schema 2, below) are a
+lookup index over those declarations, not a second authority. Source archives
 must be self-contained and have one root directory. Unsafe paths, links,
 case-insensitive duplicate paths and unsupported entry types are rejected.
 Compiler and Zig dependencies still require explicit preparation; host builds
@@ -152,11 +153,66 @@ bootstrap and default-package selection remain later work using GitHub data;
 they do not require a separate publishing service. CLI self-update never
 changes provider pins.
 
+### Registry schema 2: ownership tables and defaults
+
+The lock stays at schema 1. The registry document may use `schema_version: 2`,
+which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
+
+```json
+{
+  "schema_version": 2,
+  "defaults": [ { "package": "labelle-example", "version": "1.0.0" } ],
+  "providers": [
+    {
+      "package": "labelle-example",
+      "repo": "labelle-toolkit/labelle-example",
+      "version": "1.0.0",
+      "commit": "<40 lowercase hex characters>",
+      "sha256": "<64 lowercase hex characters>",
+      "namespace": "example",
+      "targets": [ "example-target" ]
+    }
+  ]
+}
+```
+
+- **Every key is required.** `namespace` is explicitly `null` for a release
+  that declares none, `targets` is `[]`, and `defaults` is `[]` when there are
+  none. A schema-1 document must not carry any of these keys. Unknown keys,
+  duplicate keys and schemas other than 1 and 2 are errors. All schema-1 pin
+  rules still apply.
+- **Each release record repeats the declarations of that release's
+  `plugin.labelle`.** Names follow the manifest rules: identifiers, no
+  duplicates, no Windows reserved device name as a target, and never
+  `desktop`.
+- **Target and namespace ownership** is the union of a package's releases.
+  Two packages claiming one name is an error, because lookup must name exactly
+  one package. Namespaces the running CLI reserves are not checked here, since
+  one registry serves every CLI version; dispatch refuses them.
+- **Lookup by target and by namespace** answers "which package provides
+  `<t>`" without downloading or extracting anything. The no-provider
+  diagnostic reads it from the cached registry the last `--accept` used
+  (see [provider targets](provider-targets.md#resolution)). Projectless
+  bootstrap (phase 5) uses the same table for namespaces.
+- **The claims are checked, not trusted.** `labelle providers resolve --accept`
+  compares every release it pins against that release's verified manifest.
+  Any difference in namespace or target set fails with
+  `RegistryDeclarationMismatch` before the lock is written. So a pinned
+  release never disagrees with the table that pointed at it, and a wrong claim
+  can only affect a diagnostic about a package that was never pinned.
+- **`defaults`** lists exact releases (`package` + `version`, one entry per
+  package), each matching exactly one record. It resolves to those exact
+  records (`Registry.defaultPins`), which are what the §5 consent prompt shows:
+  package, version, repository, commit, hash. It is never a bare name, a range
+  or "latest".
+
 ## 5. Default-package consent
 
 Whether defaults come from the online index or an offline stamped scaffold, `init` presents their exact resolved package/version/source/hash records before writing pins or executing package code. Accept explicitly; noninteractive automation supplies an explicit acceptance option, otherwise fail rather than hang. Declining leaves no initialized project or provider pins. Offline initialization requires complete cached release metadata/content and compiler prerequisites for any work it executes.
 
 Index defaults are suggestions, not automatically trusted project declarations. Initial acceptance covers the complete resolved dependency graph; changes to that graph require explicit resolution. Merely fetching/parsing metadata is allowed before consent, but compiling or executing package build scripts is not.
+
+The online defaults are the registry's schema-2 `defaults` list (§4), resolved to exact records. The offline source is the release-stamped scaffold template, which is data the assembler's `init` ships, not CLI code. Consent uses the same binding as `labelle providers resolve`: what is written is exactly what was shown. `init` presents the resolved default records. Only after explicit acceptance (interactive, or the explicit noninteractive option) does it write `.plugins` and `labelle.providers.lock` from those same records. A registry that changes in between is a mismatch, not a new default. Today `labelle init` (delegated to `labelle-assembler init`) scaffolds only the core/engine/gfx pins, and no default package is added. This section is the rule the first default package must follow; it does not describe current behaviour.
 
 ## 6. Hook execution
 
@@ -166,7 +222,7 @@ Stop on any failed hook/operation; after hooks run only after success. For `run`
 
 ## 7. Backend agnosticism migration
 
-Keep the mandate: backend names must also leave core. Add an explicit migration deliverable coordinated with assembler #378: replace the fixed backend enum with a resolved manifest identity, move target-support declarations out of `compatibility.zig`, and replace backend-name branches in `pipeline.zig` with declared capabilities. The shared project schema must accept the identity before consumers switch.
+Keep the mandate: backend names must also leave core. The guard already flags them (`raylib`, `sokol`, `sdl`/`sdl2`, `bgfx`, `wgpu`); their current sites are allowlisted. #411 considered narrowing the mandate and guard to platform and store names until backends are manifest-declared, and rejected it. Narrowing would let new backend branches into core unflagged, and the allowlist already expresses "not yet". The deliverable is [CLI #432](https://github.com/labelle-toolkit/labelle-cli/issues/432), coordinated with assembler #378 and blocked on it: replace the fixed backend enum with a resolved manifest identity, move target-support declarations out of `compatibility.zig`, and replace backend-name branches in `pipeline.zig` with declared capabilities. The shared project schema must accept the identity before consumers switch.
 
 Keep specific existing sites on the shrinking migration allowlist until replaced; do not claim the guard is complete after moving platform commands alone. Desktop stays a core target, but its renderer is still a manifest-resolved backend. No backward aliases for removed enum/config forms.
 
@@ -178,4 +234,4 @@ Phase 2 implements manifest/range parsing, GitHub integrity pins, config mapping
 
 Hook planning and execution (§6) are implemented for the four core steps; [provider hooks](provider-hooks.md) documents the ordering rules, the step output-directory layout, the hook context and the remaining limitations.
 
-Before #411 closes, review all six decisions against the architecture RFC. Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.
+#411's review of the six decisions against the architecture RFC: default-package consent (§5, with the §4 `defaults` list), one declared executable per `build_step` (§1), one context wire format (§2), provider-owned settings (§3, [provider configuration](provider-configuration.md)), backend names (§7, [#432](https://github.com/labelle-toolkit/labelle-cli/issues/432)), and target lookup in the index (§4 schema 2). Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.

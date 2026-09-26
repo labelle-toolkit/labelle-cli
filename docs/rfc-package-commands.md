@@ -53,7 +53,7 @@ Everything that needs a foreign SDK or toolchain (android, ios, web/emsdk), a st
 As with Rails' default gems, `labelle init` adds **`labelle-web`** to every new project. It is still a separately versioned package, and a desktop-only game can drop it. labelle-studio's web preview depends on `labelle-web` explicitly and builds through `labelle build --platform=wasm`.
 
 **The CLI does not know this name.** The default set is data, not code:
-- the package index publishes a `defaults` list, and `labelle init` adds whatever it names;
+- the package index publishes a `defaults` list of exact releases (registry schema 2, [contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults)), and `labelle init` *proposes* them;
 - offline, `init` falls back to the scaffold template, a data file outside `src/` whose pins the release workflow already stamps.
 
 Before writing pins or executing package code, `init` shows the exact resolved defaults and dependency graph for explicit acceptance, including when using the offline scaffold. Noninteractive use must opt in explicitly. Index defaults are suggestions, never silently trusted declarations. See the v1 consent contract.
@@ -158,7 +158,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…`, which packages
 - **`--platform=<t>`** dispatches to the package that declares target `<t>`. The set of platforms comes from the installed packages, not the CLI. This is the biggest change, and it must line up with labelle-assembler#378.
   - Implemented in phase 3b: resolution rules, the #378 boundary, `labelle bundle --platform=<t>`, `labelle targets` and the migration note are in [provider targets](provider-targets.md).
 - **Configuration:** project `.provider_config` entries map a declared package to a project-contained provider-owned JSON file. The provider validates its settings; platform-specific core fields are removed during migration. See the v1 mapping contract.
-- **Index:** independent namespace and target ownership tables enable both command dispatch and missing-target diagnostics. The exact record fields, conservative offline behavior and global pin records are defined in the v1 contract.
+- **Index:** registry schema 2 publishes each release's `namespace` and `targets`, so a namespace or target can be looked up by name (projectless dispatch, and the "add labelle-web" diagnostic for `--platform=wasm`) without fetching an archive. `--accept` checks the claims against every pinned release's verified manifest. The exact record fields are in [contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults).
 - **Conflicts:** two providers of the same namespace or target is a resolve-time error, not "last one wins". So is a namespace that collides with a built-in command, a duplicate command name within a namespace, and two `replace` hooks for the same step and target.
 
 ## Runtime seams (not CLI, but same rule)
@@ -172,7 +172,7 @@ Steam's first version needs no storage code at all. Steam Auto-Cloud syncs the g
 
 ## Enforcement
 
-- **A guard test in CI** fails the build if platform, store or package names (`android`, `ios`, `steam`, `emsdk`, …), or the providers' tools and SDKs (`butler`, `uikit`, `steamworks`, `steamcmd`, `xcodebuild`, `adb`, `emcc`, `gradlew`, …), appear in `src/`, including in package and compound forms (`libsdl2`, `Steamworks`) and behind source symlinks. It is modelled on labelle-bgfx's `heap_guard_test`.
+- **A guard test in CI** fails the build if platform, store, package or backend names (`android`, `ios`, `steam`, `emsdk`, `raylib`, `bgfx`, …), or the providers' tools and SDKs (`butler`, `uikit`, `steamworks`, `steamcmd`, `xcodebuild`, `adb`, `emcc`, `gradlew`, …), appear in `src/`, including in package and compound forms (`libsdl2`, `Steamworks`) and behind source symlinks. It is modelled on labelle-bgfx's `heap_guard_test`.
 - **The allowlist:** host OS names (`macos`, `windows`, `linux`) are permanently allowed. Everything else sits on an explicit, shrinking migration allowlist.
 - **Where:** `src/agnostic_guard_test.zig` (`zig build test-guard`, also part of `zig build test`); its file allowlist can only shrink, because the test also fails when an allowlisted file no longer contains a flagged name, so the entry must be removed in the same change.
 
@@ -185,7 +185,7 @@ Steam's first version needs no storage code at all. Steam Auto-Cloud syncs the g
    - first #407: move the backend × platform ASTC table and the bgfx version check into backend manifests;
    - then `labelle-web` takes the `emsdk_*` files, `serve.zig`, the HTML/loading shell (#401/#402), compression and size stamping, and the IndexedDB backend;
    - emscripten linking stays with the backend packages.
-5. **Backend identities:** coordinate with assembler #378 to replace the fixed backend enum and backend-name pipeline/compatibility branches with resolved manifest identities/capabilities. Keep individual legacy sites on the migration allowlist until replaced.
+5. **Backend identities** ([#432](https://github.com/labelle-toolkit/labelle-cli/issues/432), blocked on assembler #378): replace the fixed backend enum and the backend-name branches in the pipeline and compatibility checks with resolved manifest identities and capabilities. Keep individual legacy sites on the migration allowlist until they are replaced.
 6. **iOS** (`ios.zig`) moves the same way, and `sdl_provision.zig` moves to the SDL backend package. `docker.zig` is to be decided.
 7. **Steam:** the first store package, confirming the contract generalises. It hooks into desktop `bundle` and provides `labelle steam upload` and `labelle steam doctor`.
 

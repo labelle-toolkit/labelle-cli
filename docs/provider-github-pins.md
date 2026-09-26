@@ -33,7 +33,11 @@ archive URL. Any difference aborts with `ProviderPreviewMismatch`, names the
 package and changed field(s), writes nothing, and asks for a new preview.
 Only then does it download source archives, verify SHA-256 against the
 previewed hash, validate manifests and namespace/target ownership, and
-atomically replace `labelle.providers.lock`. A successful accept removes the
+atomically replace `labelle.providers.lock`. When the registry is schema 2
+([contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults)),
+each release's `namespace`/`targets` claims must equal its verified
+manifest's declarations. Otherwise `RegistryDeclarationMismatch` names the
+release, and nothing is written. The lock itself stays schema 1. A successful accept removes the
 preview file, so each accept is preceded by its own review. The lock rename is
 the commit point: if the preview cannot be removed afterwards (for example a
 read-only `.labelle`), the accept still exits 0 with the new lock in place and

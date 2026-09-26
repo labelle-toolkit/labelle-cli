@@ -45,16 +45,24 @@ one target, in two halves, before anything is generated, locked or built:
      (registry: labelle-web)
    ```
 
-   The second line appears only when the cached registry document — the one
-   the last `labelle providers resolve --accept` was resolved against — lists
-   a package whose verified cached archive declares the target. The registry
-   record itself carries no target declarations (contract §4), so the CLI
-   reads the manifest out of the cached archive without extracting or
-   running anything, and never invents a name. Nothing is fetched. Each
-   archive read decompresses a whole release on a scratch arena freed before
-   the next, and the scan stops at the first owner or after
-   `registry_hint_scan_limit` cached releases, so a large registry bounds
-   the cost of a diagnostic rather than the other way round.
+   The second line comes only from the cached registry document, the one
+   the last `labelle providers resolve --accept` was resolved against.
+   Nothing is fetched, and the CLI never invents a name.
+
+   - A **schema-2** document publishes target ownership
+     ([contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults)),
+     so the hint is a lookup by target in that table and reads no archive.
+     This works even when none of the owner's releases is cached, which is
+     the usual case for a package the project has never added.
+     `--accept` checked each claim against the verified manifest of every
+     release it pinned.
+   - A **schema-1** record carries no declarations, so the CLI falls back
+     to scanning cached archives. It reads the manifest out of each one
+     without extracting or running anything. Each archive read decompresses
+     a whole release on a scratch arena freed before the next. The scan
+     stops at the first owner or after `registry_hint_scan_limit` cached
+     releases, so a large registry bounds the cost of a diagnostic rather
+     than the other way round.
 
 The two halves are the **name** and the **ownership**. The name is settled
 from the string alone, first thing: `desktop` is core, any other name is
@@ -179,8 +187,10 @@ Unit tests (`zig build test-provider-dispatch`, also collected by `zig build
 test`) cover `provider_targets.resolve` (core with no providers, a provider
 target, an undeclared target, an unpinned remote owner, the schema-name
 mapping through a provider only, the diagnostic with and without a registry
-hint), `provider_github.cachedRegistryOwner` (a hint only from a verified
-cached archive; the bounded scan), `provider_dispatch.discoverAll` (the
+hint), `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
+archive cached; for schema 1, a hint only from a verified cached archive,
+and the bounded scan), `provider_registry` (schema-2 parsing, ownership
+conflicts, lookup by target and namespace), `provider_dispatch.discoverAll` (the
 unresolved packages of a partial view), the reserved-device-name rule
 (`provider_contract.targetName`, the manifest's `targets` and hook targets,
 `args.parseTargetValue`) and `parseBundleArgs --platform`. The real-process
