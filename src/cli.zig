@@ -4,7 +4,7 @@
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
 ///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game; on `--platform=android`, `--scene`/`--profile`/`--screenshot`/`--after` travel as `am start --es LABELLE_*` intent extras (cli#397)
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] [--linux-desktop] — generate + build (no run); on Linux (or with `--linux-desktop`) also writes `zig-out/<exe>.desktop` + `zig-out/<exe>.png` for the desktop target (cli#359)
-///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] — generate + build the desktop target, then wrap the exe in a self-contained macOS `<Title>.app`: Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it (macOS only, cli#359/#364/#363)
+///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] [--platform=<t>] — generate + build the resolved target, then package it: for `desktop`, wrap the exe in a self-contained macOS `<Title>.app` (Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it; macOS only, cli#359/#364/#363); for a provider target, run the provider's `replace` hook on `bundle` (RFC #406, docs/provider-targets.md)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
 ///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
 ///   labelle wasm export [dir] [--output dir] [--zip] [--platform itch|github-pages] [--no-build] — build + package a deployment-ready WASM dir
@@ -58,9 +58,9 @@ const check = @import("cli/check.zig");
 const plugins = @import("cli/plugins.zig");
 const provider_dispatch = @import("cli/provider_dispatch.zig");
 const provider_github = @import("cli/provider_github.zig");
+const provider_targets = @import("cli/provider_targets.zig");
 const doctor = @import("cli/doctor.zig");
 const sdl_provision = @import("cli/sdl_provision.zig");
-const bundle = @import("cli/bundle.zig");
 
 // Argument parsing lives in cli/args.zig (extracted so neither file
 // exceeds ~1000 lines). Alias the decls main/dispatch reference so their
@@ -193,15 +193,13 @@ pub fn main(proc_init: std.process.Init) !u8 {
             parsed_args.linux_desktop = result.linux_desktop;
             parsed_args.allow_older_cli = result.allow_older_cli;
         } else if (std.mem.eql(u8, first, "bundle")) {
-            // `labelle bundle` (cli#359): generate + build the desktop
-            // target, then wrap the exe in a macOS `.app`. Host-gated
-            // HERE, before the project is even read, so a Linux/Windows
-            // user gets the one-line refusal instead of a multi-minute
-            // build followed by a failure.
-            if (!bundle.hostSupported()) {
-                bundle.printUnsupported();
-                std.process.exit(1);
-            }
+            // `labelle bundle` (cli#359): generate + build the resolved
+            // target, then package it — the core macOS `.app` for
+            // `desktop`, or a provider's `replace` hook on `bundle` for a
+            // provider target (`--platform=<t>`, RFC #406 phase 3b). The
+            // host gate lives in the pipeline now, after target resolution,
+            // so it refuses only the core desktop packager off macOS and
+            // still does so before any build (docs/provider-targets.md).
             parsed_args.command = .bundle_cmd;
             // A usage error must exit NON-ZERO so automation can't mistake
             // `labelle bundle --bogus` for a built bundle (Codex on #362).
@@ -214,6 +212,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
             parsed_args.bundle_output = result.output;
             parsed_args.bundle_build_number = result.build_number;
             parsed_args.progress_mode = result.progress_mode;
+            parsed_args.platform_override = result.platform;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
             const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return 0;
@@ -315,6 +314,11 @@ pub fn main(proc_init: std.process.Init) !u8 {
             try collectExtraArgs(&args, &parsed_args);
         } else if (std.mem.eql(u8, first, "ios")) {
             parsed_args.command = .ios_cmd;
+            // The legacy platform subcommand requests its target by name and
+            // goes through the same resolver as `--platform=ios`: without a
+            // pinned provider declaring it, it fails with the no-provider
+            // error (RFC #406 "Migration", no shim; docs/provider-targets.md).
+            parsed_args.platform_override = "ios";
             // First non-flag arg that isn't a subcommand is the project dir
             while (args.next()) |arg| {
                 if (std.mem.startsWith(u8, arg, "-") or
@@ -329,6 +333,9 @@ pub fn main(proc_init: std.process.Init) !u8 {
             }
         } else if (std.mem.eql(u8, first, "android")) {
             parsed_args.command = .android_cmd;
+            // Same rule as `ios`: the target is resolved against the pinned
+            // providers, never assumed.
+            parsed_args.platform_override = "android";
             // Android value-bearing flags: the NEXT token after one of
             // these is the flag's value, not the project directory.
             var expect_value = false;
@@ -373,8 +380,10 @@ pub fn main(proc_init: std.process.Init) !u8 {
                 parsed_args.serve_no_open = result.no_open;
                 parsed_args.serve_watch = result.watch;
                 parsed_args.progress_mode = result.progress_mode;
-                // `wasm serve` always builds/serves the WASM target.
-                parsed_args.platform_override = .wasm;
+                // `wasm serve` always builds/serves the `wasm` target — resolved
+                // like `--platform=wasm`, so it needs the pinned provider that
+                // declares it (docs/provider-targets.md).
+                parsed_args.platform_override = "wasm";
             } else if (sub != null and std.mem.eql(u8, sub.?, "export")) {
                 parsed_args.command = .wasm_cmd;
                 parsed_args.wasm_export = true;
@@ -387,8 +396,9 @@ pub fn main(proc_init: std.process.Init) !u8 {
                 // output" flag (see ParsedArgs.serve_no_build).
                 parsed_args.serve_no_build = result.no_build;
                 parsed_args.progress_mode = result.progress_mode;
-                // `wasm export` always builds/packages the WASM target.
-                parsed_args.platform_override = .wasm;
+                // `wasm export` always builds/packages the `wasm` target (same
+                // resolution as `wasm serve`).
+                parsed_args.platform_override = "wasm";
             } else {
                 if (sub) |s| {
                     std.debug.print("labelle wasm: unknown subcommand '{s}'\n", .{s});
@@ -467,7 +477,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
     switch (command) {
         .help_cmd => return printHelpWithProviders(allocator),
         .version => return ok(help.printVersion()),
-        .targets => return ok(help.printTargets()),
+        .targets => return ok(provider_targets.printTargets(allocator)),
         .init_cmd => return ok(init.cmdInit(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
         .add_cmd => return ok(add.cmdAdd(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
         .install_cmd => return ok(install.cmdInstall(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),

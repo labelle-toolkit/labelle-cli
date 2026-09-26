@@ -4,8 +4,9 @@ This documents the hook-execution slice of CLI #406, stacked on the
 [v1 contract](provider-contract-v1.md) §6 and on
 [project-local dispatch](provider-local-dispatch.md). A pinned provider can
 now attach to the project's `generate`, `build`, `bundle` and `run` steps.
-Provider-declared targets and `--platform` resolution are the next slice; the
-platform packages themselves still remain to be extracted.
+[Provider-declared targets](provider-targets.md) resolve `--platform=<t>`
+to the provider that declares `<t>`; the platform packages themselves still
+remain to be extracted.
 
 ## Attaching
 
@@ -54,7 +55,12 @@ and a cold cache silently built without its hooks while a warm cache ran
 them. With the cache populated, a non-local package that is still absent
 from both caches fails discovery closed (`ProviderPackageMissing`); a package
 directory without a `plugin.labelle` is a runtime-only package (light packs
-ship no manifest). The whole hook graph is validated once, at discovery, so
+ship no manifest). Discovery is also where the requested target's ownership
+is confirmed: the name was settled from the string alone before the
+install (it names the target directory and the feed), and a name no
+discovered provider declares is refused here, ahead of the lock, generation
+and any compiler ([provider targets](provider-targets.md#resolution)). The
+whole hook graph is validated once, at discovery, so
 `labelle help` and `labelle providers resolve --accept` (which validates the
 accepted remote and local manifests together before writing
 `labelle.providers.lock`) fail on the same problems a build would:
@@ -141,12 +147,20 @@ this contract the default location of the desktop `.app` moved from
 ## Context
 
 The wire context (§2) for a hook carries `invocation = { "kind": "hook",
-"id": <hook id>, "step": <step>, "phase": <phase> }`, the resolved `target`,
+"id": <hook id>, "step": <step>, "phase": <phase> }`, the resolved `target`
+(the string `provider_targets.resolve` produced — `desktop` or a name a
+pinned provider declares),
 the project's `lock_file`, the provider's `config_file` or null, the step's
 `output_dir`, the pinned `zig_executable`, and this invocation's `optimize`
 and `progress` (`--optimize` and `--progress` as the user passed them, so a
 hook builds what the core step builds and speaks the mode the user asked
 for). The tool runs with the project root as cwd and no trailing arguments.
+
+A `bundle` hook's context also carries `build_number` when the user passed
+`labelle bundle --build-number=<N>` (validated before the build, as for the
+core packager): the provider that packages its target is the one that stamps
+the number, so it would otherwise be dropped. The key is **absent** — not
+null — for every other step's hooks and for a `bundle` without the flag.
 
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
@@ -199,10 +213,14 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   child's stdio is inherited exactly as for provider commands.
 - The legacy `labelle ios …` and `labelle android …` subcommand handlers are
   not hook points for `build`/`run`; they only share the `generate` hooks.
-  They leave with platform extraction.
-- `labelle bundle` is still refused on Linux and Windows before discovery,
-  because the core desktop packager is macOS-only and a hook cannot replace
-  it. Provider targets (next slice) get their own `bundle` replacement.
+  They leave with platform extraction (their target already goes through
+  the resolver, so they need the pinned provider like `--platform=<t>`).
+- `labelle bundle` for the core `desktop` target is still refused on Linux
+  and Windows — before any install or build — because the core packager is
+  macOS-only and no hook can replace it (nobody may own `desktop`). A
+  provider target is bundled by its provider's `replace` hook on any host,
+  checked with the plans after discovery; see [provider
+  targets](provider-targets.md#labelle-bundle).
 - `wasm serve` is interactive: its `done` record lands before the serve loop
   and the `after run` hooks run once the server returns. The server returns
   on Ctrl+C or SIGTERM: the handler sets a flag, a waker thread pokes the
@@ -284,5 +302,6 @@ nowhere, and the same dead compiler being the failure once the pin is
 accepted — a reference into an uncached remote package leaving `help` intact
 while a typo is still reported, `bundle` hooks and the `.app` location on
 macOS, and the refusal elsewhere. `test/provider_github_e2e.py` checks that `--accept` refuses a
-broken hook graph without writing the lock. CI runs them on Windows, macOS
-and Linux.
+broken hook graph without writing the lock. Provider-target resolution and
+bundling are covered by `test/provider_targets_e2e.py`. CI runs them on
+Windows, macOS and Linux.

@@ -15,8 +15,11 @@ pub const Invocation = struct {
     phase: ?Phase,
 };
 
-/// All fields are required on the wire, including explicitly null fields.
-/// Paths are absolute for the host running the provider.
+/// All fields are required on the wire, including explicitly null fields —
+/// except `build_number`, the one optional key: present only in a `bundle`
+/// hook's context when the user passed `--build-number`, and absent (never
+/// null) everywhere else, so a context without it is byte-identical to the
+/// pre-field wire. Paths are absolute for the host running the provider.
 pub const Context = struct {
     contract_version: []const u8,
     invocation: Invocation,
@@ -29,6 +32,10 @@ pub const Context = struct {
     zig_executable: []const u8,
     optimize: Optimize,
     progress: Progress,
+    /// The build number `labelle bundle --build-number=N` was given, for the
+    /// provider that packages the target (its `bundle` hooks); the core
+    /// packager stamps it itself. Optional on the wire (see above).
+    build_number: ?[]const u8 = null,
 
     pub fn validate(self: Context, needs_project: bool) !void {
         if (!std.mem.eql(u8, self.contract_version, version)) return error.UnsupportedContract;
@@ -55,6 +62,25 @@ pub const Context = struct {
                     return error.InvalidInvocation;
             },
         }
+        if (self.build_number) |number| {
+            if (self.invocation.kind != .hook or self.invocation.step != .bundle) return error.InvalidInvocation;
+            if (number.len == 0) return error.InvalidBuildNumber;
+        }
+    }
+
+    /// Every field in declaration order, nulls included, except an absent
+    /// `build_number`, which is omitted rather than written as null.
+    pub fn jsonStringify(self: Context, jws: anytype) !void {
+        try jws.beginObject();
+        inline for (std.meta.fields(Context)) |field| {
+            const value = @field(self, field.name);
+            const omit = comptime std.mem.eql(u8, field.name, "build_number");
+            if (!omit or value != null) {
+                try jws.objectField(field.name);
+                try jws.write(value);
+            }
+        }
+        try jws.endObject();
     }
 };
 
@@ -148,6 +174,25 @@ pub fn identifier(value: []const u8) bool {
         if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '_')) return false;
     }
     return true;
+}
+
+/// Windows cannot create these names in any directory, case-insensitively
+/// and regardless of extension (`nul.zig` is still the NUL device), so a
+/// path component that is one extracts on Unix but fails on Windows.
+pub fn windowsReservedDeviceName(part: []const u8) bool {
+    const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
+    for ([_][]const u8{ "con", "prn", "aux", "nul", "conin$", "conout$" }) |device| {
+        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
+    }
+    return stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and stem[3] >= '1' and stem[3] <= '9';
+}
+
+/// A target name: an identifier that can also name a directory on every
+/// host. The resolved target becomes a path component (`.labelle/<backend>_<t>/`,
+/// `zig-out/bundle/<t>/`), so a Windows reserved device name — `con`, `nul`,
+/// `com1`, … — is not a target, however well-formed as an identifier.
+pub fn targetName(value: []const u8) bool {
+    return identifier(value) and !windowsReservedDeviceName(value);
 }
 
 fn absolute(path: []const u8) !void {
@@ -299,4 +344,56 @@ test "ownership rejects conflicts and reserved identities before dispatch" {
     try std.testing.expectError(error.ReservedTarget, validateOwnership(&.{second}, &.{}));
     second.targets = &.{ "a", "a" };
     try std.testing.expectError(error.DuplicateName, validateOwnership(&.{second}, &.{}));
+}
+
+test "a target name is an identifier that is not a Windows reserved device name" {
+    for ([_][]const u8{ "desktop", "probe-target", "console", "nul0", "com10", "lpt", "auxiliary", "cons" }) |name| {
+        try std.testing.expect(identifier(name));
+        try std.testing.expect(targetName(name));
+    }
+    for ([_][]const u8{ "con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9" }) |name| {
+        try std.testing.expect(identifier(name));
+        try std.testing.expect(windowsReservedDeviceName(name));
+        try std.testing.expect(!targetName(name));
+    }
+    // The device rule folds case and ignores an extension, like Windows does;
+    // the identifier rule already excludes those spellings on its own.
+    for ([_][]const u8{ "NUL", "Con.tar.gz", "aux.h", "COM1", "conin$", "conout$.zig" }) |name| {
+        try std.testing.expect(windowsReservedDeviceName(name));
+        try std.testing.expect(!targetName(name));
+    }
+    try std.testing.expect(!targetName("Probe"));
+    try std.testing.expect(!targetName(""));
+}
+
+test "build_number is optional on the wire and only for bundle hooks" {
+    // Absent: parses (the pre-field wire) and is not written back.
+    const parsed = try parseContext(std.testing.allocator, fixture, false);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.build_number == null);
+    const plain = try std.json.Stringify.valueAlloc(std.testing.allocator, parsed.value, .{});
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "build_number") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"target\":null") != null);
+    // Present on a command: refused.
+    var value = parsed.value;
+    value.build_number = "42";
+    try std.testing.expectError(error.InvalidInvocation, value.validate(false));
+    // Present on a bundle hook: accepted, written and read back.
+    value.project_dir = value.package_dir;
+    value.lock_file = value.zig_executable;
+    value.target = "sample-target";
+    value.invocation = .{ .kind = .hook, .id = "pack", .step = .bundle, .phase = .replace };
+    try value.validate(true);
+    const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, value, .{});
+    defer std.testing.allocator.free(wire);
+    const back = try parseContext(std.testing.allocator, wire, true);
+    defer back.deinit();
+    try std.testing.expectEqualStrings("42", back.value.build_number.?);
+    // On any other step's hook, or empty: refused.
+    value.invocation.step = .build;
+    try std.testing.expectError(error.InvalidInvocation, value.validate(true));
+    value.invocation.step = .bundle;
+    value.build_number = "";
+    try std.testing.expectError(error.InvalidBuildNumber, value.validate(true));
 }

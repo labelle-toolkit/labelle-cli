@@ -13,6 +13,7 @@ const project_config = @import("../cli/project_config.zig");
 const asm_cache = @import("../cli/asm_cache.zig");
 const util = @import("../cli/util.zig");
 const lockfile = @import("../cli/lockfile.zig");
+const contract = @import("../cli/provider_contract.zig");
 const convert = @import("convert.zig");
 const astcenc_bin = @import("astcenc_bin.zig");
 
@@ -26,8 +27,10 @@ const usage =
     \\(`.astc_block = .@"4x4"` on the resource); an explicit --block here
     \\overrides every such pin.
     \\
-    \\  --platform <p>      target platform (desktop|android|ios|wasm); default
-    \\                      is project.labelle's `.platform`.
+    \\  --platform <t>      target name (the resolved target, as the build pipeline
+    \\                      passes it; `desktop` or a legacy schema platform — other
+    \\                      targets have no ASTC table yet); default is
+    \\                      project.labelle's `.platform`.
     \\  --backend <b>       target backend; default is project.labelle's.
     \\  --allow-older-cli   proceed even when labelle.lock was written by a
     \\                      NEWER labelle than this binary (#353).
@@ -119,8 +122,11 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var allow_older_cli = false;
     // Target overrides: `labelle build --platform=wasm` resolves a platform
     // (and backend) that project.labelle may not declare, and the loadable
-    // blocks depend on both — so the pipeline passes what it resolved.
-    var platform_override: ?project_config.Platform = null;
+    // blocks depend on both — so the pipeline passes what it resolved. The
+    // target is a NAME (RFC #406 phase 3b, `provider_targets.zig`); the
+    // legacy capability table below still keys on the schema enum, so a
+    // target outside it has no table yet (labelle-assembler#378).
+    var platform_override: ?[]const u8 = null;
     var backend_override: ?project_config.Backend = null;
 
     var i: usize = 0;
@@ -137,8 +143,9 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             opts.quality = parseQuality(cmd_args[i]) orelse return usageErr("unknown --quality");
         } else if (std.mem.eql(u8, arg, "--platform")) {
             i += 1;
-            if (i >= cmd_args.len) return usageErr("--platform needs a value (e.g. wasm)");
-            platform_override = std.meta.stringToEnum(project_config.Platform, cmd_args[i]) orelse return usageErr("unknown --platform");
+            if (i >= cmd_args.len) return usageErr("--platform needs a value (e.g. desktop)");
+            if (!contract.identifier(cmd_args[i])) return usageErr("invalid --platform (targets are lowercase identifiers; run 'labelle targets')");
+            platform_override = cmd_args[i];
         } else if (std.mem.eql(u8, arg, "--backend")) {
             i += 1;
             if (i >= cmd_args.len) return usageErr("--backend needs a value (e.g. bgfx)");
@@ -173,7 +180,13 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // Default to a backend-safe block when the user didn't pin one; reject an
     // explicit block the backend can't load rather than baking a dud.
     const backend = backend_override orelse cfg.backend;
-    const platform = platform_override orelse cfg.platform;
+    const platform = if (platform_override) |name|
+        std.meta.stringToEnum(project_config.Platform, name) orelse {
+            std.debug.print("labelle astc: target '{s}' has no ASTC capability table yet (labelle-assembler#378)\n", .{name});
+            return error.InvalidArgs;
+        }
+    else
+        cfg.platform;
     const caps = backendCaps(backend, platform, bgfxWebSamples8x8(cfg.backend_package));
     if (block_explicit) {
         if (!caps.supports(opts.block)) {

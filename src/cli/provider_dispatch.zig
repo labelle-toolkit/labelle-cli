@@ -68,6 +68,20 @@ pub const CacheState = enum {
 /// (the assembler's light packs ship no manifest); only a missing directory
 /// is an error, and only once the cache is `populated`.
 pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) ![]Provider {
+    return (try discoverAll(a, root, cfg, sources, cache_state)).providers;
+}
+
+pub const Discovery = struct {
+    providers: []Provider,
+    /// Declared remote packages with no directory to read (`.unknown` only;
+    /// `.populated` makes them an error). While this is non-empty the
+    /// providers are a partial view: nothing that needs every declared
+    /// package — target ownership above all — can be decided from them.
+    unresolved: []const []const u8,
+};
+
+/// `discover`, also reporting the declared packages it could not read.
+pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) !Discovery {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
     // Declared remote packages with no directory to read while the cache
@@ -111,7 +125,7 @@ pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConf
     }
     try contract.validateOwnership(owners.items, &reserved);
     try hooks.validateAll(a, providers.items, unresolved.items);
-    return providers.items;
+    return .{ .providers = providers.items, .unresolved = unresolved.items };
 }
 
 fn printCommands(provider: Provider) void {
@@ -330,6 +344,8 @@ pub const ToolRun = struct {
     settings: ?[]const u8,
     trailing: []const []const u8,
     cwd: []const u8,
+    /// `bundle` hooks only: `labelle bundle --build-number` (contract §2).
+    build_number: ?[]const u8 = null,
 };
 
 /// Build the tool in a fresh isolated prefix, verify the declared executable,
@@ -371,6 +387,7 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
         .zig_executable = host.zig,
         .optimize = run.optimize,
         .progress = run.progress,
+        .build_number = run.build_number,
     };
     try ctx.validate(run.needs_project);
     const context_path = try std.fs.path.join(a, &.{ run_dir, "context.json" });
@@ -514,9 +531,12 @@ test "provider dispatch: an unread remote package defers its references under .u
     // Cold: metadata-only discovery lists the provider it can read and
     // defers the reference into the one it cannot; the pipeline's
     // populated discovery fails closed on the same absence.
-    const partial = try discover(a, root, cfg, &sources, .unknown);
-    try std.testing.expectEqual(@as(usize, 1), partial.len);
-    try std.testing.expectEqualStrings("pkg-a", partial[0].meta.name);
+    const partial = try discoverAll(a, root, cfg, &sources, .unknown);
+    try std.testing.expectEqual(@as(usize, 1), partial.providers.len);
+    try std.testing.expectEqualStrings("pkg-a", partial.providers[0].meta.name);
+    // The unread package is named, so a caller knows the view is partial.
+    try std.testing.expectEqual(@as(usize, 1), partial.unresolved.len);
+    try std.testing.expectEqualStrings("pkg-b", partial.unresolved[0]);
     try std.testing.expectError(error.ProviderPackageMissing, discover(a, root, cfg, &sources, .populated));
     // A reference into a package the project never declared is a typo
     // even while pkg-b is unread.
@@ -533,9 +553,13 @@ test "provider dispatch: an unread remote package defers its references under .u
     const b_hook = ".{ .id = \"b\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
     try Manifests.write(tmp.dir, manifest_path, "pkg-b", b_hook);
     for ([_]CacheState{ .unknown, .populated }) |state| {
-        const both = try discover(a, root, cfg, &sources, state);
-        try std.testing.expectEqual(@as(usize, 2), both.len);
-        try std.testing.expectEqualStrings("pkg-b", both[1].meta.name);
+        const both = try discoverAll(a, root, cfg, &sources, state);
+        try std.testing.expectEqual(@as(usize, 2), both.providers.len);
+        try std.testing.expectEqualStrings("pkg-b", both.providers[1].meta.name);
+        try std.testing.expectEqual(@as(usize, 0), both.unresolved.len);
+        // Read from the ordinary cache without a pin: present, but unverified.
+        try std.testing.expect(both.providers[0].verified);
+        try std.testing.expect(!both.providers[1].verified);
     }
     const other = ".{ .id = \"other\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
     try Manifests.write(tmp.dir, manifest_path, "pkg-b", other);

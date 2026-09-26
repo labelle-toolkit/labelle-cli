@@ -37,6 +37,8 @@ const provider_contract = @import("provider_contract.zig");
 const provider_dispatch = @import("provider_dispatch.zig");
 const provider_github = @import("provider_github.zig");
 const provider_hooks = @import("provider_hooks.zig");
+const provider_targets = @import("provider_targets.zig");
+const asm_cache = @import("asm_cache.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const resolveAndroidBackend = args_mod.resolveAndroidBackend;
@@ -629,6 +631,18 @@ const WatchReplan = struct {
             &.{}
         else
             try provider_dispatch.discover(a, ctx.hooks.root, cfg, &next.sources, .populated);
+        // The served target must still have a pinned owner among the NEW
+        // providers: an edit that drops the owning package, or unpins a
+        // remote owner, fails this rebuild with the cold pipeline's
+        // diagnostic and keeps the previous state — installing empty plans
+        // would generate for a target nobody owns (Codex P1 on #421).
+        switch (try confirmTarget(a, providers, ctx.hooks.target)) {
+            .resolved => {},
+            .refused => |kind| return switch (kind) {
+                .no_provider => error.NoProviderForTarget,
+                .unpinned_owner => error.UnverifiedTargetOwner,
+            },
+        }
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         // Install only now, so a failure above leaves the previous plans —
@@ -663,11 +677,16 @@ const WatchReplan = struct {
             .sub_path = "project/project.labelle",
             .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
         });
+        // The package owns the served target, as the cold pipeline required
+        // before the server started; `targets` lets a step drop that.
         const Manifest = struct {
-            fn write(dir: std.Io.Dir, hooks: []const u8) !void {
+            fn writeAt(dir: std.Io.Dir, sub_path: []const u8, targets: []const u8, hooks: []const u8) !void {
                 var buf: [1024]u8 = undefined;
-                const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{{ {s} }} }}", .{hooks});
-                try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = text });
+                const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ {s} }}, .hooks = .{{ {s} }} }}", .{ targets, hooks });
+                try dir.writeFile(config.globalIo(), .{ .sub_path = sub_path, .data = text });
+            }
+            fn write(dir: std.Io.Dir, hooks: []const u8) !void {
+                try writeAt(dir, "pkg/plugin.labelle", "\"wasm\"", hooks);
             }
         };
         const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
@@ -712,13 +731,51 @@ const WatchReplan = struct {
         try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = "not a manifest" });
         try std.testing.expectError(error.InvalidManifest, WatchReplan.run(&replan, &ctx));
         try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
-        // The project itself changes: the plugin is dropped, so nothing is
-        // planned and the site's config follows.
-        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try Manifest.write(tmp.dir, build_hook);
         try WatchReplan.run(&replan, &ctx);
-        try std.testing.expect(ctx.generate_plan.isEmpty() and ctx.build_plan.isEmpty());
-        try std.testing.expectEqual(@as(usize, 0), site.providers.len);
-        try std.testing.expectEqual(@as(usize, 0), site.cfg.plugins.len);
+        const good = replan.current.?;
+
+        // The served target loses its owner (Codex P1 on #421). Each case
+        // fails the replan with the cold pipeline's error and keeps the
+        // previous generation installed: its plans, its providers, its
+        // config — never empty plans that would generate for an unowned
+        // target.
+        const Kept = struct {
+            fn check(r: *const WatchReplan, c: *const WasmRebuildCtx, s: *const provider_hooks.Site, expected: *const WatchReplan.Generation) !void {
+                try std.testing.expectEqual(expected, r.current.?);
+                try std.testing.expectEqualStrings("pkg/post", c.build_plan.after[0].qualified);
+                try std.testing.expectEqual(@as(usize, 1), s.providers.len);
+                try std.testing.expectEqual(@as(usize, 1), s.cfg.plugins.len);
+            }
+        };
+        // (a) The package stops declaring the target.
+        try Manifest.writeAt(tmp.dir, "pkg/plugin.labelle", "", "");
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.run(&replan, &ctx));
+        try Kept.check(&replan, &ctx, &site, good);
+        try Manifest.write(tmp.dir, build_hook);
+        // (b) The project drops the plugin altogether.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try std.testing.expectError(error.NoProviderForTarget, WatchReplan.run(&replan, &ctx));
+        try Kept.check(&replan, &ctx, &site, good);
+        // (c) The owner becomes a remote package read from the ordinary
+        //     cache with no integrity pin: present, but unverified.
+        const home = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(home);
+        asm_cache.setCacheRootOverride(home);
+        defer asm_cache.clearCacheRootOverride();
+        const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "pkg", "1.0.0" });
+        defer a.free(cached);
+        try tmp.dir.createDirPath(io, cached);
+        const cached_manifest = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
+        defer a.free(cached_manifest);
+        try Manifest.writeAt(tmp.dir, cached_manifest, "\"wasm\"", build_hook);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
+        });
+        try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.run(&replan, &ctx));
+        try Kept.check(&replan, &ctx, &site, good);
+        try std.testing.expectEqualStrings("local:../pkg", site.cfg.plugins[0].repo);
     }
 };
 
@@ -957,6 +1014,130 @@ fn ok(result: anytype) !u8 {
     return 0;
 }
 
+/// Why `confirmTarget` refused the requested target. The kind survives to
+/// the `failed` progress record, so a `labelle status --json` consumer can
+/// tell an absent owner (add a provider) from an unpinned one (pin the
+/// declared package) the same way the human diagnostic does (Codex on #421).
+const TargetRefusal = enum {
+    no_provider,
+    unpinned_owner,
+
+    /// The `detail` of the `failed` progress record.
+    fn detail(self: TargetRefusal) []const u8 {
+        return switch (self) {
+            .no_provider => "no provider for target",
+            .unpinned_owner => "unpinned provider for target",
+        };
+    }
+};
+
+const TargetVerdict = union(enum) {
+    resolved: provider_targets.Resolved,
+    refused: TargetRefusal,
+};
+
+/// The ownership half of target resolution with the pipeline's diagnostic:
+/// `provider_targets.resolve` against the discovered providers, or the
+/// refusal kind after printing its diagnostic (the no-provider line's
+/// registry hint is read from the cached registry document only). The
+/// caller marks its feed with the kind and exits.
+fn confirmTarget(a: std.mem.Allocator, providers: []const provider_dispatch.Provider, requested: []const u8) !TargetVerdict {
+    const resolved = provider_targets.resolve(providers, requested) catch |err| switch (err) {
+        error.NoProviderForTarget => {
+            provider_targets.reportNoProvider(a, requested);
+            return .{ .refused = .no_provider };
+        },
+        // The owner is a remote package read from the ordinary cache with
+        // no integrity pin: a target-owning provider is held to the pinned
+        // boundary even when no hook of its would ever call `requirePinned`.
+        error.UnverifiedTargetOwner => {
+            provider_targets.reportUnverifiedOwner(a, providers, requested);
+            return .{ .refused = .unpinned_owner };
+        },
+        else => return err,
+    };
+    return .{ .resolved = resolved };
+}
+
+/// The pre-install ownership verdict (`run`, step 3).
+const EarlyVerdict = enum {
+    /// A pinned provider owns the target in the complete metadata view.
+    confirmed,
+    /// A declared remote package is unread, so the view is partial; the
+    /// post-install discovery decides.
+    deferred,
+    /// Refused, with `confirmTarget`'s diagnostic already printed.
+    refused,
+};
+
+/// The metadata-only (`.unknown`) discovery and ownership check that runs
+/// before the install. Everything it reads — the manifests, and the pinned
+/// archives `Sources.fromPin` extracts (up to 128 MiB compressed, 512 MiB of
+/// tar) — lives on a scratch arena carved from `backing` and freed before
+/// this returns: only the verdict leaves. On the pipeline's long-lived arena
+/// that storage was never reclaimed, so the authoritative discovery after
+/// the install held every pinned provider twice, and a `wasm serve
+/// --no-build` server kept both for its lifetime (Codex P2 on #421).
+/// `error.ProviderDiscoveryFailed` after printing the reason.
+fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: project_config.ProjectConfig, requested: []const u8) !EarlyVerdict {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var sources: provider_github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const early = provider_dispatch.discoverAll(a, project_root, cfg, &sources, .unknown) catch |err| {
+        std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+        return error.ProviderDiscoveryFailed;
+    };
+    if (early.unresolved.len != 0) return .deferred;
+    return switch (try confirmTarget(a, early.providers, requested)) {
+        .resolved => .confirmed,
+        .refused => .refused,
+    };
+}
+
+// The mechanism, not just the verdict: the check allocates from `backing`
+// (so the discovery really ran on it) and returns every byte before it
+// returns — nothing it read survives on a longer-lived allocator.
+test "pipeline: the early target check frees its discovery before returning" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", std.testing.allocator);
+    defer std.testing.allocator.free(project);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pkg/plugin.labelle",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }",
+    });
+    const cfg: project_config.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+    } };
+    const cases = [_]struct { target: []const u8, verdict: EarlyVerdict }{
+        .{ .target = "probe-target", .verdict = .confirmed },
+        .{ .target = "other-target", .verdict = .refused },
+    };
+    for (cases) |case| {
+        var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const verdict = try earlyTargetCheck(counting.allocator(), project, cfg, case.target);
+        try std.testing.expectEqual(case.verdict, verdict);
+        try std.testing.expect(counting.allocations > 0);
+        try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
+        try std.testing.expectEqual(counting.allocations, counting.deallocations);
+    }
+}
+
+test "pipeline: each target refusal kind writes its own progress detail" {
+    // The two kinds call for different fixes, so their records must differ
+    // and the unpinned one must name the condition.
+    try std.testing.expectEqualStrings("no provider for target", TargetRefusal.no_provider.detail());
+    try std.testing.expectEqualStrings("unpinned provider for target", TargetRefusal.unpinned_owner.detail());
+    try std.testing.expect(std.mem.indexOf(u8, TargetRefusal.unpinned_owner.detail(), "unpinned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TargetRefusal.no_provider.detail(), "unpinned") == null);
+}
+
 pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const command = parsed_args.command;
     const project_dir = parsed_args.project_dir;
@@ -996,28 +1177,89 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // a loading-scene gate.
     parsed.normalizeInitialPrefab();
 
-    // Apply --platform override
-    if (parsed_args.platform_override) |platform| {
-        parsed.platform = platform;
+    // The requested target (RFC #406 phase 3b, docs/provider-targets.md):
+    // `--platform=<t>` — the legacy platform subcommands set the same
+    // override — else the project's declared platform. It is resolved below
+    // against the core target and the pinned providers' declarations;
+    // `parsed.platform` is derived from the RESULT only where the pinned
+    // assembler and the legacy sites still need the schema enum.
+    const requested_target: []const u8 = parsed_args.platform_override orelse @tagName(parsed.platform);
+
+    // Upgrade modifies project.labelle in the project directory
+    if (command == .upgrade_cmd) {
+        return ok(upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]));
     }
 
-    // `labelle ios` always implies sokol + ios platform
+    // ── Target resolution, the NAME half (RFC #406 phase 3b) ──────────
+    // (docs/provider-targets.md "Resolution")
+    // The target is the core `desktop` or one a pinned provider declares;
+    // nothing else, including the project's own `.platform` and the legacy
+    // `wasm`/`ios`/`android` subcommands (no shim, RFC #406 "Migration").
+    // Ownership needs the providers, and provider discovery runs only
+    // after the assembler's `install` populated the package cache (below,
+    // next to `gateThenInstall`; Codex P1 on #420) — while the target
+    // directory, the progress feed and the schema platform every
+    // pre-install step keys off need the name now. So the name is settled
+    // here from the string alone: `desktop` is core; any other name is
+    // PROVISIONALLY a provider target, confirmed against the discovered
+    // providers right after the install and refused there when nobody
+    // owns it. Two verdicts need no provider and land immediately:
+    const hook_arena = arena.allocator();
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
+    const provisional = try provider_targets.provisional(requested_target);
+    // (1) A project that declares no packages can have no provider, so a
+    //     provider target fails before anything is read, written or built.
+    //     The registry hint in the failure line is read from the cached
+    //     registry document only.
+    if (!provisional.is_core and parsed.plugins.len == 0) {
+        provider_targets.reportNoProvider(hook_arena, requested_target);
+        return 1;
+    }
+    // (2) `labelle bundle` of the core target: the desktop packager is
+    //     macOS-only and no hook can replace it (nobody may own `desktop`,
+    //     so no `replace` hook on `bundle` can plan for it), so refuse it
+    //     off macOS before any install or build, as the old `cli.zig` gate
+    //     did. A provider target is packaged by its provider — checked
+    //     with the plans, after discovery.
+    if (command == .bundle_cmd and provisional.is_core and !bundle.hostSupported()) {
+        bundle.printUnsupported();
+        return 1;
+    }
+    // (3) A provider target whose ownership is decidable NOW is decided
+    //     now, so an identifier-shaped typo (`--platform=waasm`) never runs
+    //     `.prebuild`, the assembler resolution, the ASTC prepass or the
+    //     install first (Codex on #421). This is the same metadata-only read
+    //     `labelle targets` does (`.unknown`: cached manifests, no
+    //     installer): when it can read EVERY declared package, the verdict
+    //     — no owner, or an unpinned remote owner — is the one the
+    //     post-install check would reach, so it lands here with the same
+    //     diagnostics. A declared remote package it cannot read yet (cold
+    //     cache, no pin) leaves the view partial, and the verdict waits for
+    //     the post-install discovery, which stays the authoritative check.
+    //     A manifest that fails discovery fails it closed here: the install
+    //     cannot mend a manifest it can already read. Never for the core
+    //     target, which needs no provider.
+    //     The pass runs on a scratch arena of its own (`earlyTargetCheck`),
+    //     so the pinned archives it reads are not held again beside the
+    //     authoritative discovery's copies (Codex P2 on #421).
+    if (!provisional.is_core) {
+        switch (earlyTargetCheck(allocator, project_root, parsed, requested_target) catch return 1) {
+            .confirmed, .deferred => {},
+            .refused => return 1,
+        }
+    }
+    // The legacy sites below (`parsed.platform == .X`; the guard's migration
+    // allowlist) keep working for the schema-named provider targets. A
+    // target outside the enum reaches only steps its provider does not
+    // replace, which treat it as the generic host baseline. `parsed.platform`
+    // is derived from the NAME only where the pinned assembler and the
+    // legacy sites still need the schema enum.
+    parsed.platform = provisional.legacy orelse .desktop;
+
+    // `labelle ios` always implies the sokol backend (its target came
+    // through the resolver like everything else).
     if (command == .ios_cmd) {
-        parsed.platform = .ios;
         parsed.backend = .sokol;
-    }
-
-    // `labelle android` implies the android platform.
-    if (command == .android_cmd) {
-        parsed.platform = .android;
-    }
-
-    // `labelle bundle` (cli#359) wraps a DESKTOP exe in a macOS `.app`;
-    // a project whose `.platform` says otherwise still gets its desktop
-    // target built and bundled (the parser accepts no `--platform`).
-    if (command == .bundle_cmd and parsed.platform != .desktop) {
-        std.debug.print("labelle bundle: project platform is '{s}'; bundling the desktop target instead\n", .{@tagName(parsed.platform)});
-        parsed.platform = .desktop;
     }
 
     // Resolve the backend for ANY android-targeting invocation —
@@ -1041,19 +1283,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         parsed.backend = android_backend;
     }
 
-    // Upgrade modifies project.labelle in the project directory
-    if (command == .upgrade_cmd) {
-        return ok(upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]));
-    }
-
-    // (Provider discovery and the hook plans are computed further down,
-    // right after the package cache is populated — see the `gateThenInstall`
-    // call. The resolved target string is needed earlier, for the plans and
-    // the hook site; provider-declared targets arrive with the next slice
-    // (RFC #406 phase 3b), for now it is the legacy platform name.)
-    const hook_arena = arena.allocator();
-    const hook_target = @tagName(parsed.platform);
-
     // `labelle wasm serve|export --no-build` — skip the generate+build
     // pipeline and serve/package the existing build output. The web dir
     // lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
@@ -1067,7 +1296,21 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // package absent from every cache is not listed rather than reported as
     // a broken install that never happened.
     if (command == .wasm_cmd and parsed_args.serve_no_build) {
-        const wasm_target = try std.fmt.allocPrint(allocator, "{s}_wasm", .{@tagName(parsed.backend)});
+        // Nothing is installed on this path, so the provisional target is
+        // confirmed against the providers discoverable as-is (`.unknown`,
+        // like `labelle targets`): a package absent from the cache cannot
+        // own a target here. Same diagnostics as the pipeline's own check.
+        var no_build_sources: provider_github.Sources = .{ .a = hook_arena };
+        defer no_build_sources.deinit();
+        const known = provider_dispatch.discover(hook_arena, project_root, parsed, &no_build_sources, .unknown) catch |err| {
+            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        const served = switch (try confirmTarget(hook_arena, known, requested_target)) {
+            .resolved => |resolved| resolved,
+            .refused => return 1,
+        };
+        const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
         defer allocator.free(wasm_target);
         const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
         defer allocator.free(wasm_target_dir);
@@ -1085,17 +1328,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
 
-        const no_build_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
-        var no_build_sources: provider_github.Sources = .{ .a = hook_arena };
-        defer no_build_sources.deinit();
-        const no_build_providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
-            &.{}
-        else
-            provider_dispatch.discover(hook_arena, no_build_root, parsed, &no_build_sources, .unknown) catch |err| {
-                std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-                return 1;
-            };
-        const no_build_plan = try provider_hooks.plan(hook_arena, no_build_providers, .run, hook_target);
+        // The run hooks are planned from the same discovery (`known`) the
+        // served target was just confirmed against, for the served name.
+        const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
         // The same wire `optimize` the building path reports for this
         // platform; there is no progress feed on this path.
         const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {
@@ -1105,10 +1340,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         var no_build_site: provider_hooks.Site = .{
             .a = hook_arena,
             .backing = allocator,
-            .providers = no_build_providers,
-            .root = no_build_root,
+            .providers = known,
+            .root = project_root,
             .cfg = parsed,
-            .target = hook_target,
+            .target = served.name,
             .optimize = no_build_optimize,
             .progress = switch (parsed_args.progress_mode) {
                 .human => .human,
@@ -1117,7 +1352,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             },
             .reporter = null,
         };
-        const no_build_out = try provider_hooks.stepOutputDir(hook_arena, wasm_target_dir, .run, hook_target, null);
+        const no_build_out = try provider_hooks.stepOutputDir(hook_arena, wasm_target_dir, .run, served.name, null);
         {
             const code = try provider_hooks.runPhase(&no_build_site, no_build_plan.before, .run, .before, no_build_out);
             if (code != 0) return code;
@@ -1145,12 +1380,18 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         return provider_hooks.runPhase(&no_build_site, no_build_plan.after, .run, .after, no_build_out);
     }
 
+    // (Provider discovery, the ownership check of the provisional target
+    // and the hook plans are computed further down, right after the package
+    // cache is populated — see the `gateThenInstall` call.)
+
     // ── Build-progress feed (cli#284) ──────────────────────────────────
     // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so
     // the live status file `.labelle/<target>/.build-progress.json` has a
     // home from the first `resolve` record onward (the dir is created by
-    // the reporter; the assembler generates into it later).
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), @tagName(parsed.platform) });
+    // the reporter; the assembler generates into it later). Named after
+    // the PROVISIONAL target: the name depends on the string alone, and a
+    // target refused after the install leaves only a `failed` record here.
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), provisional.name });
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", target_name });
     defer allocator.free(target_dir);
@@ -1292,7 +1533,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         AssemblerInstaller{ .bin = asm_bin },
     );
 
-    // ── Provider lifecycle hooks (contract §6; docs/provider-hooks.md) ──
+    // ── Provider discovery, target ownership and hook plans ────────────
+    // (contract §6; docs/provider-hooks.md, docs/provider-targets.md)
     // Discovery reads every declared provider manifest and validates the
     // whole hook graph ONCE, so a malformed provider fails a plain `labelle
     // build` closed before generation or any compiler runs. It sits HERE,
@@ -1308,7 +1550,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // cost is accepted). The plans are pure and computed here for all four
     // steps; a project without hooks gets four empty plans and never resolves
     // the host compiler.
-    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
     var provider_sources: provider_github.Sources = .{ .a = hook_arena };
     defer provider_sources.deinit();
     const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
@@ -1319,12 +1560,48 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             if (reporter) |r| r.finishFailed(1, "provider discovery failed");
             return 1;
         };
-    const hook_plans = .{
-        .generate = try provider_hooks.plan(hook_arena, providers, .generate, hook_target),
-        .build = try provider_hooks.plan(hook_arena, providers, .build, hook_target),
-        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, hook_target),
-        .run = try provider_hooks.plan(hook_arena, providers, .run, hook_target),
+    // The ownership half of target resolution: the provisional target from
+    // above is confirmed against the discovered providers — the first point
+    // at which a declared package's manifest is guaranteed readable — and
+    // refused when none declares it. This is the only place a provider
+    // target becomes a resolved one; nothing has been generated, locked or
+    // compiled yet, and the `failed` progress record names the reason —
+    // which of the two refusals it was, since each calls for a different fix.
+    const target = switch (try confirmTarget(hook_arena, providers, requested_target)) {
+        .resolved => |resolved| resolved,
+        .refused => |why| {
+            if (reporter) |r| r.finishFailed(1, why.detail());
+            return 1;
+        },
     };
+    const hook_plans = .{
+        .generate = try provider_hooks.plan(hook_arena, providers, .generate, target.name),
+        .build = try provider_hooks.plan(hook_arena, providers, .build, target.name),
+        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
+        .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
+    };
+    // The labelle-assembler#378 boundary: the assembler generates only for
+    // the schema platforms, so a provider target outside that enum can be
+    // generated for only by its provider's `replace` hook on `generate`.
+    // Without one, stop HERE — before the lock, the assembler's `generate`
+    // and any compiler — rather than hand the assembler a name it cannot
+    // take.
+    if (target.legacy == null and hook_plans.generate.replace == null) {
+        std.debug.print("labelle: target '{s}' is declared by '{s}' but the pinned assembler cannot generate for it yet (labelle-assembler#378)\n", .{ target.name, target.providerName() });
+        if (reporter) |r| r.finishFailed(1, "the pinned assembler cannot generate for this target");
+        return 1;
+    }
+    // `labelle bundle` of a provider target is packaged by its provider, so
+    // it needs a `replace` hook on `bundle` — and needs no particular host.
+    // (The core target's macOS-only gate ran before the install, above.)
+    if (command == .bundle_cmd) {
+        if (target.provider) |provider| {
+            if (hook_plans.bundle.replace == null) {
+                std.debug.print("labelle: target '{s}' has no bundle replacement; package '{s}' must declare a `.when = .replace` hook on `bundle`\n", .{ target.name, provider.meta.name });
+                return error.NoBundleReplacement;
+            }
+        }
+    }
 
     // Plugin→core compatibility, the POST-RESOLVE half (#332).
     //
@@ -1357,8 +1634,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const gui_label: []const u8 = if (parsed.gui != null) "configured" else "none";
     if (reporter) |r| r.beginPhase(.generate, "assembler generate");
     std.debug.print("labelle: generating '{s}'...\n", .{parsed.name});
-    std.debug.print("  backend: {s}  platform: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
-        @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
+    std.debug.print("  backend: {s}  target: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
+        @tagName(parsed.backend), target.name, @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
     });
 
     // Scenes and prefabs are always embedded via @embedFile
@@ -1380,7 +1657,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .providers = providers,
         .root = project_root,
         .cfg = parsed,
-        .target = hook_target,
+        .target = target.name,
         .optimize = hook_optimize,
         .progress = switch (parsed_args.progress_mode) {
             .human => .human,
@@ -1388,6 +1665,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             .off => .off,
         },
         .reporter = reporter,
+        // Reaches the `bundle` hooks only; a provider target's bundle
+        // replacement would otherwise drop it silently (Codex P2 on #421).
+        .build_number = if (command == .bundle_cmd) parsed_args.bundle_build_number else null,
     };
 
     // Issue #217 phase 2: delegate code generation to the standalone
@@ -1424,7 +1704,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // #420). Both pre-passes are part of the core generation they feed, so
     // a `replace generate` hook stands in for them too: the replacement
     // owns whatever preprocessing its generation needs.
-    const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, hook_target, null);
+    const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.before, .generate, .before, generate_out);
         if (code != 0) return code;
@@ -1449,7 +1729,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // from an earlier build, which is worse than no atlas because it looks
         // like it worked. So a config error stops the build, while a conversion
         // failure still degrades to PNG.
-        if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
+        //
+        // Only for a target the capability tables know (`target.legacy`:
+        // `desktop` or a schema-named provider target). A provider target
+        // outside the enum has `parsed.platform` derived as `.desktop` for the
+        // legacy sites, but it is NOT the desktop target: running the desktop
+        // prepass for it would encode ASTC siblings by desktop capabilities
+        // (Codex on #421). Its provider owns its asset pipeline; `cmdAstc`
+        // itself refuses such a name.
+        if (target.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
             // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
             // sokol) and the Android backend fallback all differ from what
             // project.labelle declares, and the loadable blocks depend on both.
@@ -1491,11 +1779,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             };
         }
 
+        // The assembler receives the resolved target NAME; the #378 gate above
+        // guarantees it is one the pinned assembler can take.
         try assembler_proc.generate(
             asm_bin,
             allocator,
             project_dir,
-            @tagName(parsed.platform),
+            target.name,
             @tagName(parsed.backend),
         );
 
@@ -1620,7 +1910,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // docker or host `zig build` plus the runtime DLL staging — with
     // `output_dir` = the target's `zig-out/`. A `replace` hook stands in for
     // all of it. Hooks report under the `compile` phase.
-    const build_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .build, hook_target, null);
+    const build_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .build, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.build.before, .build, .before, build_out);
         if (code != 0) return code;
@@ -1707,7 +1997,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             // for the container's target and the entry's absolute paths would
             // describe this host, not the one that will run it. `run` is
             // deliberately left alone — the entry is a packaging artifact.
-            if (!parsed_args.docker and parsed.platform == .desktop and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
+            // Core desktop only: a provider target is packaged by its provider.
+            if (!parsed_args.docker and target.provider == null and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
                 const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
                 allocator.free(entry_path);
             }
@@ -1737,7 +2028,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `done` before the artifact exists.
     if (command == .bundle_cmd) {
         if (reporter) |r| {
-            r.beginPhaseOrStep(.run, "packaging macOS bundle");
+            r.beginPhaseOrStep(.run, "packaging bundle");
             r.clearSpinner();
         }
         // Provider hooks on `bundle` (contract §6). `output_dir` is the step
@@ -1749,7 +2040,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             try bundle.resolveOutputDir(hook_arena, project_dir, target_dir, o)
         else
             null;
-        const bundle_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .bundle, hook_target, bundle_override);
+        const bundle_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .bundle, target.name, bundle_override);
         {
             const code = try provider_hooks.runPhase(&hook_site, hook_plans.bundle.before, .bundle, .before, bundle_out);
             if (code != 0) return code;
@@ -1801,7 +2092,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // device launch (`provider_hooks.RunOutcome`). The interactive `wasm
     // serve` loop is the one exception in timing: its `done` record lands
     // before the loop and the after hooks run only once the server returns.
-    const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, hook_target, null);
+    const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.run.before, .run, .before, run_out);
         if (code != 0) return code;
@@ -1858,7 +2149,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                     .allocator = allocator,
                     .asm_bin = asm_bin,
                     .project_dir = project_dir,
-                    .platform_tag = @tagName(parsed.platform),
+                    .platform_tag = target.name,
                     .backend_tag = @tagName(parsed.backend),
                     .output_dir = output_dir,
                     .target_dir = target_dir,

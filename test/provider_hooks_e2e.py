@@ -379,12 +379,21 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     # run step the building path hooks (Codex P2 on #420). A pre-existing
     # web dir stands in for the build; nothing is installed or generated,
     # and the `run` hooks for the `wasm` target wrap the export.
+    #
+    # `wasm` is a provider target (docs/provider-targets.md): the no-build
+    # path confirms it against the providers discoverable as-is before any
+    # hook, so with nothing declaring it the export is refused. fixture-a
+    # declares it for this section; its run hooks are the ones that wrap.
     reset()
     wasm_target_dir = project / ".labelle" / "raylib_wasm"
     wasm_web = wasm_target_dir / "zig-out" / "web"
     wasm_web.mkdir(parents=True)
     (wasm_web / "index.html").write_text("<html>fixture</html>")
     release = project / "release"
+    undeclared = run("wasm", "export", "--no-build", "--output", "release", code=1)
+    assert "no provider for target 'wasm'" in undeclared.stderr and not release.exists(), undeclared.stderr
+    assert not log(wasm_target_dir / "zig-out"), "a run hook ran for a refused target"
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS, targets=["wasm"]))
     exported = run("wasm", "export", "--no-build", "--output", "release")
     assert (release / "index.html").exists() and (release / ".labelle-export").exists(), list(release.iterdir())
     text = exported.stderr
@@ -398,6 +407,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     refused = run("wasm", "export", "--no-build", "--output", "release", code=7, extra_env={"PROVIDER_PROBE_FAIL": "a-wasm-run-pre"})
     assert not release.exists() and "WASM Export Complete" not in refused.stderr, refused.stderr
     assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre")], refused.stderr
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     reset()
 
     # ── run: an `after build` hook's output survives until launch ─────────
@@ -552,7 +562,19 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         run("bundle", code=7, extra_env={"PROVIDER_PROBE_FAIL": "b-bundle-pre"})
         assert not any(p.suffix == ".app" for p in bundle_dir.iterdir()), list(bundle_dir.iterdir())
     else:
+        # The core desktop packager is refused off macOS by the pipeline
+        # (the gate moved there with the targets slice) right after the
+        # target name is settled — before the reporter, the install, any
+        # provider discovery or compiler: nothing is created, and the cache
+        # (which the cold-cache section above legitimately populated) is
+        # left exactly as it was.
+        def snapshot(root):
+            if not root.exists():
+                return None
+            return sorted((str(p.relative_to(root)), p.stat().st_size if p.is_file() else -1) for p in root.rglob("*"))
+        cache_before = snapshot(home)
         refused = run("bundle", code=1, extra_env=dead)
         assert "macOS" in refused.stderr and "FIXTURE_INSTALL_DONE" not in refused.stderr, refused.stderr
-        assert not (project / ".labelle").exists(), "bundle reached discovery or generation off macOS"
+        assert not (project / ".labelle").exists(), "bundle reached generation off macOS"
+        assert snapshot(home) == cache_before, "bundle touched the cache off macOS"
     print(f"provider hooks: {checks} real CLI invocations passed")

@@ -44,6 +44,14 @@ pub const Manifest = struct {
         if (!range.satisfiedBy(try std.SemanticVersion.parse(contract.version))) return error.UnsupportedContract;
         if (self.commands.len != 0 and self.namespace == null) return error.MissingNamespace;
         if (self.namespace) |ns| if (!contract.identifier(ns)) return error.InvalidNamespace;
+        // A declared target names directories on every host
+        // (`.labelle/<backend>_<t>/`, `zig-out/bundle/<t>/`), so a Windows
+        // reserved device name is refused here, at the declaration, rather
+        // than by a failed `mkdir` on one host after generation and build.
+        for (self.targets) |target| {
+            if (!contract.identifier(target)) return error.InvalidTarget;
+            if (!contract.targetName(target)) return error.ReservedDeviceTarget;
+        }
         for (self.commands, 0..) |cmd, i| {
             if (!contract.identifier(cmd.name) or cmd.help.len == 0) return error.InvalidCommand;
             try cmd.tool().validate();
@@ -53,6 +61,8 @@ pub const Manifest = struct {
         }
         for (self.hooks, 0..) |hook, i| {
             if (!contract.identifier(hook.id) or !contract.identifier(hook.target)) return error.InvalidHook;
+            // No target of that name can ever resolve, so the hook could never run.
+            if (!contract.targetName(hook.target)) return error.ReservedDeviceTarget;
             try (contract.Tool{ .build_step = hook.build_step, .executable = hook.executable }).validate();
             for (self.hooks[0..i]) |prev| {
                 if (std.mem.eql(u8, prev.id, hook.id)) return error.DuplicateHook;
@@ -187,6 +197,28 @@ test "provider manifest: replace hooks need an owned target; before/after attach
         try std.testing.expectEqual(@as(usize, 1), meta.hooks.len);
         try std.testing.expectEqualStrings("desktop", meta.hooks[0].target);
     }
+}
+
+test "provider manifest: a declared or hooked target is never a Windows reserved device name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Identifier-shaped, so only the device rule can refuse them.
+    for ([_][]const u8{ "con", "nul", "prn", "aux", "com1", "lpt9" }) |device| {
+        try std.testing.expect(contract.identifier(device));
+        const declared = try std.fmt.allocPrint(a, "\"{s}\"", .{device});
+        try std.testing.expectError(error.ReservedDeviceTarget, parse(a, try hookManifest(a, declared, "")));
+        // Alongside a legitimate target, and as a hook target (any phase).
+        const mixed = try std.fmt.allocPrint(a, "\"probe-target\", \"{s}\"", .{device});
+        try std.testing.expectError(error.ReservedDeviceTarget, parse(a, try hookManifest(a, mixed, "")));
+        const hook = try std.fmt.allocPrint(a, ".{{ .id = \"pack\", .step = .bundle, .target = \"{s}\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }}", .{device});
+        try std.testing.expectError(error.ReservedDeviceTarget, parse(a, try hookManifest(a, "", hook)));
+    }
+    // Near misses stay valid targets.
+    const near = try parse(a, try hookManifest(a, "\"console\", \"nul0\", \"com10\", \"lpt\"", ""));
+    try std.testing.expectEqual(@as(usize, 4), near.targets.len);
+    // A non-identifier target is still its own error.
+    try std.testing.expectError(error.InvalidTarget, parse(a, try hookManifest(a, "\"Probe\"", "")));
 }
 
 test "provider manifest: after_hooks references are qualified, well-formed and never self" {

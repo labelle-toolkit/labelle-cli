@@ -252,6 +252,10 @@ pub const Site = struct {
     optimize: contract.Optimize,
     progress: contract.Progress,
     reporter: ?*progress.Reporter,
+    /// `labelle bundle --build-number`: handed to the `bundle` hooks only
+    /// (contract §2 `build_number`), since a provider replacement packages
+    /// the target instead of the core packager that would stamp it.
+    build_number: ?[]const u8 = null,
     host: ?dispatch.Host = null,
     /// The tool launcher. A field only so the scratch-arena test below can
     /// observe which allocator a hook invocation receives without a host
@@ -300,6 +304,7 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
             .settings = settings,
             .trailing = &.{},
             .cwd = site.root,
+            .build_number = if (step == .bundle) site.build_number else null,
         });
         if (site.reporter) |r| r.clearSpinner();
         if (code != 0) {

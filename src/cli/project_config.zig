@@ -30,6 +30,14 @@ const astc = @import("../astc/convert.zig");
 
 /// Graphics / windowing backend selection. `null` is a headless backend.
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
+/// The legacy codegen platform: the strict schema type of `project.labelle`'s
+/// `.platform` (mirrored by the assembler's `config.zig`; `provider_settings.zig`
+/// is untouched). The RESOLVED target is a string — see `provider_targets.zig`
+/// (RFC #406 phase 3b): `desktop` is core, every other name must be declared
+/// by a pinned provider, and this enum is derived from the name only where
+/// the pinned assembler still needs it. Enum values other than `desktop`,
+/// and every `parsed.platform == .X` site, are on the agnosticism guard's
+/// migration allowlist until extraction / labelle-assembler#378.
 pub const Platform = enum { desktop, ios, android, wasm };
 
 /// Texture container a platform ships atlases in — `.png` (CPU-decoded) or

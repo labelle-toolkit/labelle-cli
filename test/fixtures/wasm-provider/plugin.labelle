@@ -1,0 +1,15 @@
+// The provider CI builds for the `wasm` target with (docs/provider-targets.md).
+//
+// `--platform=<t>` resolves only to a target a declared provider owns, and
+// the platform packages (`labelle-web`, …) are not extracted yet, so the
+// Docker WASM build in ci.yml declares this package: it owns `wasm` and
+// nothing else — no hooks, no commands — so the assembler still generates
+// for the schema-named target exactly as before. A module plugin, because
+// the assembler wires every declared package as a Zig module
+// (`labelle_<name>`) and links it into the game.
+.{
+    .name = "wasm_fixture",
+    .manifest_version = 2,
+    .command_contract = ">=1.0.0 <2.0.0",
+    .targets = .{"wasm"},
+}

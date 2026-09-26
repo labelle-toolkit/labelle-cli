@@ -1,6 +1,6 @@
 # Provider contract v1
 
-Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings and lifecycle hooks are implemented; progress overrides, provider-declared targets and platform extraction remain pending.
+Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings, lifecycle hooks and provider-declared targets are implemented; progress overrides and platform extraction remain pending.
 
 Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
@@ -10,7 +10,7 @@ This document supplies normative v1 details for [the architecture RFC](rfc-packa
 
 ## 1. Package declarations and installed tools
 
-The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, and `targets`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive.
+The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, and `targets`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive. A target name (declared or a hook's) is additionally never a Windows reserved device name (`con`, `nul`, `prn`, `aux`, `com1`-`com9`, `lpt1`-`lpt9`), because the CLI names directories after it.
 
 A command has required `name`, `build_step`, `executable`, and `help`, with optional `needs_project` (default true). A hook has required `id`, `step`, `target`, `when`, `build_step`, and `executable`, with optional `after_hooks` (default empty). Valid steps are `generate`, `build`, `bundle`, `run`; phases are `before`, `replace`, `after`. There is no separate package lifecycle step: `bundle` produces the target distributable.
 
@@ -31,7 +31,7 @@ Commands require a namespace and unique names. Resolve-time validation rejects r
 
 The CLI creates a UTF-8 JSON file and passes its absolute filename in `LABELLE_CONTEXT`. There is no argument-encoded alternative. The provider receives trailing user arguments verbatim through argv, without shell interpolation; the context path is not inserted into argv. The CLI owns the context-file lifetime through process exit and removes it afterward. Providers treat it as read-only.
 
-Every field below is required. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
+Every field below is required, except `build_number`. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
 
 | Field | Type / rule |
 | --- | --- |
@@ -49,6 +49,7 @@ Every field below is required. Nullable fields must be present as JSON null. Unk
 | `zig_executable` | Absolute host compiler filename |
 | `optimize` | `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
 | `progress` | `human`, `json`, or `off` |
+| `build_number` | **Optional** (the only optional key): the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it; absent (never null) otherwise, and an error on any other invocation |
 
 Paths use host syntax and must be absolute (on Windows, drive-qualified or UNC, not current-drive-rooted). Structural validation does not perform filesystem existence/containment checks; the resolver performs those before launching.
 
