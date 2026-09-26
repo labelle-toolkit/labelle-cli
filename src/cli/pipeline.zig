@@ -37,6 +37,7 @@ const provider_contract = @import("provider_contract.zig");
 const provider_dispatch = @import("provider_dispatch.zig");
 const provider_github = @import("provider_github.zig");
 const provider_hooks = @import("provider_hooks.zig");
+const provider_targets = @import("provider_targets.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const resolveAndroidBackend = args_mod.resolveAndroidBackend;
@@ -488,28 +489,94 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // a loading-scene gate.
     parsed.normalizeInitialPrefab();
 
-    // Apply --platform override
-    if (parsed_args.platform_override) |platform| {
-        parsed.platform = platform;
+    // The requested target (RFC #406 phase 3b, docs/provider-targets.md):
+    // `--platform=<t>` — the legacy platform subcommands set the same
+    // override — else the project's declared platform. It is resolved below
+    // against the core target and the pinned providers' declarations;
+    // `parsed.platform` is derived from the RESULT only where the pinned
+    // assembler and the legacy sites still need the schema enum.
+    const requested_target: []const u8 = parsed_args.platform_override orelse @tagName(parsed.platform);
+
+    // Upgrade modifies project.labelle in the project directory
+    if (command == .upgrade_cmd) {
+        return ok(upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]));
     }
 
-    // `labelle ios` always implies sokol + ios platform
+    // ── Provider discovery, target resolution and hook plans ──────────
+    // (contract §6; docs/provider-hooks.md, docs/provider-targets.md)
+    // Discovery reads every declared provider manifest and validates the
+    // whole hook graph ONCE, up front, so a malformed provider fails a plain
+    // `labelle build` closed before the assembler or a compiler runs. It is
+    // skipped for a project with no plugins; for pinned remote providers it
+    // is the same verified extraction every provider command performs (the
+    // integrity model of cli#414 — the cost is accepted). The plans are pure
+    // and computed here for all four steps; a project without hooks gets
+    // four empty plans and never resolves the host compiler.
+    const hook_arena = arena.allocator();
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
+    var provider_sources: provider_github.Sources = .{ .a = hook_arena };
+    defer provider_sources.deinit();
+    const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
+        &.{}
+    else
+        provider_dispatch.discover(hook_arena, project_root, parsed, &provider_sources) catch |err| {
+            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    // The target is the core `desktop` or one a pinned provider declares;
+    // nothing else, including the project's own `.platform` and the legacy
+    // `wasm`/`ios`/`android` subcommands — without the provider they fail
+    // here, before anything is read, written or built (no shim, RFC #406
+    // "Migration"). The registry hint in the failure line is read from the
+    // cached registry document only.
+    const target = provider_targets.resolve(providers, requested_target) catch |err| switch (err) {
+        error.NoProviderForTarget => {
+            provider_targets.reportNoProvider(hook_arena, requested_target);
+            return 1;
+        },
+        else => return err,
+    };
+    const hook_plans = .{
+        .generate = try provider_hooks.plan(hook_arena, providers, .generate, target.name),
+        .build = try provider_hooks.plan(hook_arena, providers, .build, target.name),
+        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
+        .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
+    };
+    // The labelle-assembler#378 boundary: the assembler generates only for
+    // the schema platforms, so a provider target outside that enum can be
+    // generated for only by its provider's `replace` hook on `generate`.
+    // Without one, stop HERE — before the reporter, the assembler and any
+    // compiler — rather than hand the assembler a name it cannot take.
+    if (target.legacy == null and hook_plans.generate.replace == null) {
+        std.debug.print("labelle: target '{s}' is declared by '{s}' but the pinned assembler cannot generate for it yet (labelle-assembler#378)\n", .{ target.name, target.providerName() });
+        return 1;
+    }
+    // `labelle bundle`: the core desktop packager is macOS-only and no hook
+    // can replace it (nobody may own `desktop`), so refuse it off macOS
+    // before any build, as the old `cli.zig` gate did. A provider target is
+    // packaged by its provider, so it needs a `replace` hook on `bundle` —
+    // and needs no particular host.
+    if (command == .bundle_cmd) {
+        if (target.provider) |provider| {
+            if (hook_plans.bundle.replace == null) {
+                std.debug.print("labelle: target '{s}' has no bundle replacement; package '{s}' must declare a `.when = .replace` hook on `bundle`\n", .{ target.name, provider.meta.name });
+                return error.NoBundleReplacement;
+            }
+        } else if (!bundle.hostSupported() and hook_plans.bundle.replace == null) {
+            bundle.printUnsupported();
+            return 1;
+        }
+    }
+    // The legacy sites below (`parsed.platform == .X`; the guard's migration
+    // allowlist) keep working for the schema-named provider targets. A
+    // target outside the enum reaches only steps its provider does not
+    // replace, which treat it as the generic host baseline.
+    parsed.platform = target.legacy orelse .desktop;
+
+    // `labelle ios` always implies the sokol backend (its target came
+    // through the resolver like everything else).
     if (command == .ios_cmd) {
-        parsed.platform = .ios;
         parsed.backend = .sokol;
-    }
-
-    // `labelle android` implies the android platform.
-    if (command == .android_cmd) {
-        parsed.platform = .android;
-    }
-
-    // `labelle bundle` (cli#359) wraps a DESKTOP exe in a macOS `.app`;
-    // a project whose `.platform` says otherwise still gets its desktop
-    // target built and bundled (the parser accepts no `--platform`).
-    if (command == .bundle_cmd and parsed.platform != .desktop) {
-        std.debug.print("labelle bundle: project platform is '{s}'; bundling the desktop target instead\n", .{@tagName(parsed.platform)});
-        parsed.platform = .desktop;
     }
 
     // Resolve the backend for ANY android-targeting invocation —
@@ -533,16 +600,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         parsed.backend = android_backend;
     }
 
-    // Upgrade modifies project.labelle in the project directory
-    if (command == .upgrade_cmd) {
-        return ok(upgrade.cmdUpgrade(allocator, project_dir, parsed, parsed_args.extra_args[0..parsed_args.extra_count]));
-    }
-
     // `labelle wasm serve|export --no-build` — skip the generate+build
     // pipeline entirely and serve/package the existing build output. The
     // web dir lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
     if (command == .wasm_cmd and parsed_args.serve_no_build) {
-        const wasm_target = try std.fmt.allocPrint(allocator, "{s}_wasm", .{@tagName(parsed.backend)});
+        const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), target.name });
         defer allocator.free(wasm_target);
         const web_dir = try std.fs.path.join(allocator, &.{
             project_dir, ".labelle", wasm_target, "zig-out", "web",
@@ -573,42 +635,12 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         return ok(serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null));
     }
 
-    // ── Provider lifecycle hooks (contract §6; docs/provider-hooks.md) ──
-    // Discovery reads every declared provider manifest and validates the
-    // whole hook graph ONCE, up front, so a malformed provider fails a plain
-    // `labelle build` closed before the assembler or a compiler runs. It is
-    // skipped for a project with no plugins; for pinned remote providers it
-    // is the same verified extraction every provider command performs (the
-    // integrity model of cli#414 — the cost is accepted). The plans are pure
-    // and computed here for all four steps; a project without hooks gets
-    // four empty plans and never resolves the host compiler.
-    const hook_arena = arena.allocator();
-    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
-    var provider_sources: provider_github.Sources = .{ .a = hook_arena };
-    defer provider_sources.deinit();
-    const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
-        &.{}
-    else
-        provider_dispatch.discover(hook_arena, project_root, parsed, &provider_sources) catch |err| {
-            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-            return 1;
-        };
-    // The resolved target string; provider-declared targets arrive with the
-    // next slice (RFC #406 phase 3b), for now it is the legacy platform name.
-    const hook_target = @tagName(parsed.platform);
-    const hook_plans = .{
-        .generate = try provider_hooks.plan(hook_arena, providers, .generate, hook_target),
-        .build = try provider_hooks.plan(hook_arena, providers, .build, hook_target),
-        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, hook_target),
-        .run = try provider_hooks.plan(hook_arena, providers, .run, hook_target),
-    };
-
     // ── Build-progress feed (cli#284) ──────────────────────────────────
     // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so
     // the live status file `.labelle/<target>/.build-progress.json` has a
     // home from the first `resolve` record onward (the dir is created by
     // the reporter; the assembler generates into it later).
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), @tagName(parsed.platform) });
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), target.name });
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", target_name });
     defer allocator.free(target_dir);
@@ -818,8 +850,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const gui_label: []const u8 = if (parsed.gui != null) "configured" else "none";
     if (reporter) |r| r.beginPhase(.generate, "assembler generate");
     std.debug.print("labelle: generating '{s}'...\n", .{parsed.name});
-    std.debug.print("  backend: {s}  platform: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
-        @tagName(parsed.backend), @tagName(parsed.platform), @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
+    std.debug.print("  backend: {s}  target: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
+        @tagName(parsed.backend), target.name, @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
     });
 
     // Scenes and prefabs are always embedded via @embedFile
@@ -840,7 +872,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .providers = providers,
         .root = project_root,
         .cfg = parsed,
-        .target = hook_target,
+        .target = target.name,
         .optimize = hook_optimize,
         .progress = switch (parsed_args.progress_mode) {
             .human => .human,
@@ -888,7 +920,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // core generation — or its unique `replace` hook — then `after` hooks.
     // `output_dir` is the generated tree itself. A failing hook ends the
     // command with the hook's own exit code; nothing past it runs.
-    const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, hook_target, null);
+    const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.before, .generate, .before, generate_out);
         if (code != 0) return code;
@@ -899,11 +931,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             if (code != 0) return code;
             break :core_generate;
         }
+        // The assembler receives the resolved target NAME; the #378 gate above
+        // guarantees it is one the pinned assembler can take.
         try assembler_proc.generate(
             asm_bin,
             allocator,
             project_dir,
-            @tagName(parsed.platform),
+            target.name,
             @tagName(parsed.backend),
         );
 
@@ -1028,7 +1062,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // docker or host `zig build` plus the runtime DLL staging — with
     // `output_dir` = the target's `zig-out/`. A `replace` hook stands in for
     // all of it. Hooks report under the `compile` phase.
-    const build_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .build, hook_target, null);
+    const build_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .build, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.build.before, .build, .before, build_out);
         if (code != 0) return code;
@@ -1111,7 +1145,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `done` before the artifact exists.
     if (command == .bundle_cmd) {
         if (reporter) |r| {
-            r.beginPhaseOrStep(.run, "packaging macOS bundle");
+            r.beginPhaseOrStep(.run, "packaging bundle");
             r.clearSpinner();
         }
         // Provider hooks on `bundle` (contract §6). `output_dir` is the step
@@ -1123,7 +1157,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             try bundle.resolveOutputDir(hook_arena, project_dir, target_dir, o)
         else
             null;
-        const bundle_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .bundle, hook_target, bundle_override);
+        const bundle_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .bundle, target.name, bundle_override);
         {
             const code = try provider_hooks.runPhase(&hook_site, hook_plans.bundle.before, .bundle, .before, bundle_out);
             if (code != 0) return code;
@@ -1162,7 +1196,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // for the container's target and the entry's absolute paths would
         // describe this host, not the one that will run it. `run` is
         // deliberately left alone — the entry is a packaging artifact.
-        if (!parsed_args.docker and parsed.platform == .desktop and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
+        // Core desktop only: a provider target is packaged by its provider.
+        if (!parsed_args.docker and target.provider == null and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
             const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
             allocator.free(entry_path);
         }
@@ -1193,7 +1228,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // interactive `wasm serve` loop is the one exception in timing: its
     // `done` record lands before the loop and the after hooks run only once
     // the server returns.
-    const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, hook_target, null);
+    const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.run.before, .run, .before, run_out);
         if (code != 0) return code;
@@ -1239,7 +1274,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                     .allocator = allocator,
                     .asm_bin = asm_bin,
                     .project_dir = project_dir,
-                    .platform_tag = @tagName(parsed.platform),
+                    .platform_tag = target.name,
                     .backend_tag = @tagName(parsed.backend),
                     .output_dir = output_dir,
                     .target_dir = target_dir,

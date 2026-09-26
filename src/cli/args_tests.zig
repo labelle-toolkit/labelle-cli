@@ -11,13 +11,12 @@ const args = @import("args.zig");
 const expect = @import("zspec").expect;
 
 const ParsedArgs = args.ParsedArgs;
-const Platform = project_config.Platform;
 const Backend = project_config.Backend;
 const valid_optimize_modes = args.valid_optimize_modes;
 const parseSceneArg = args.parseSceneArg;
 const sceneArgValue = args.sceneArgValue;
 const parseSceneFlag = args.parseSceneFlag;
-const parsePlatformValue = args.parsePlatformValue;
+const parseTargetValue = args.parseTargetValue;
 const parseOptimizeFlag = args.parseOptimizeFlag;
 const parseRunArgs = args.parseRunArgs;
 const parseDirAndScene = args.parseDirAndScene;
@@ -317,28 +316,59 @@ pub const ParseOptimizeFlagSpec = struct {
 // zspec only sees the `pub const` namespaces declared directly in
 // cli.zig and would skip the test_cmd_mod's nested spec structs.
 
+/// `--platform=<t>` values are target NAMES, not enum members (RFC #406
+/// phase 3b): the parser checks the identifier shape only, and whether a
+/// target exists is decided by the pipeline against the core target and
+/// the pinned providers' declarations (`provider_targets.resolve`).
 pub const ParsePlatformValueSpec = struct {
-    pub const valid_platforms = struct {
-        test "parses desktop" {
-            try expect.equal(parsePlatformValue("desktop"), Platform.desktop);
+    pub const identifier_shaped_values = struct {
+        test "the core target passes through unchanged" {
+            try std.testing.expectEqualStrings("desktop", parseTargetValue("desktop").?);
         }
-        test "parses wasm" {
-            try expect.equal(parsePlatformValue("wasm"), Platform.wasm);
+        test "any lowercase identifier passes through, known to the CLI or not" {
+            try std.testing.expectEqualStrings("probe-target", parseTargetValue("probe-target").?);
+            try std.testing.expectEqualStrings("t2_beta", parseTargetValue("t2_beta").?);
         }
-        test "parses ios" {
-            try expect.equal(parsePlatformValue("ios"), Platform.ios);
-        }
-        test "parses android" {
-            try expect.equal(parsePlatformValue("android"), Platform.android);
+        test "the returned slice is the input, not a copy of a table entry" {
+            const input = "probe-target";
+            try std.testing.expect(parseTargetValue(input).?.ptr == input.ptr);
         }
     };
 
-    pub const invalid_platforms = struct {
+    pub const rejected_values = struct {
         test "returns null for empty string" {
-            try expect.equal(parsePlatformValue(""), null);
+            try std.testing.expect(parseTargetValue("") == null);
         }
-        test "returns null for unknown value" {
-            try expect.equal(parsePlatformValue("windows"), null);
+        test "returns null for an uppercase name" {
+            try std.testing.expect(parseTargetValue("Windows") == null);
+        }
+        test "returns null for a value with spaces" {
+            try std.testing.expect(parseTargetValue("a b") == null);
+        }
+        test "returns null for a leading digit or dash" {
+            try std.testing.expect(parseTargetValue("1st") == null);
+            try std.testing.expect(parseTargetValue("-flag") == null);
+        }
+    };
+
+    pub const through_the_build_parser = struct {
+        test "build accepts an unknown identifier and hands it on unresolved" {
+            var iter = testIter("--platform=probe-target");
+            defer iter.deinit();
+            const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("probe-target", result.platform.?);
+        }
+        test "build rejects a malformed value" {
+            var iter = testIter("--platform=Probe");
+            defer iter.deinit();
+            try std.testing.expect(parseDirAndScene(&iter, "build") == null);
+        }
+        test "run accepts an unknown identifier too" {
+            var parsed = ParsedArgs{ .command = .run };
+            var iter = testIter("--platform=probe-target");
+            defer iter.deinit();
+            const result = parseRunArgs(&iter, "run", true, &parsed) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("probe-target", result.platform.?);
         }
     };
 };
@@ -869,8 +899,8 @@ pub const AppendRunForwardedArgsSpec = struct {
 };
 
 /// `labelle bundle` flag parser (cli#359). Narrower than `build` on
-/// purpose — see `parseBundleArgs` for why `--platform`/`--docker`/
-/// `--scene` are rejected rather than ignored.
+/// purpose — see `parseBundleArgs` for why `--docker`/`--scene` are
+/// rejected rather than ignored, and `--platform` selects the target.
 pub const ParseBundleArgsSpec = struct {
     pub const defaults = struct {
         test "no args yields cwd project, no optimize, no output or build-number override" {
@@ -1064,13 +1094,61 @@ pub const ParseBundleArgsSpec = struct {
         }
     };
 
-    pub const rejected_flags = struct {
-        test "--platform is not a bundle flag (desktop only)" {
-            var iter = testIter("--platform=wasm");
+    /// `--platform=<t>` (RFC #406 phase 3b): the target to bundle. Shape
+    /// only here; the pipeline resolves it and requires a `replace` hook on
+    /// `bundle` for a provider target.
+    pub const platform_flag = struct {
+        test "--platform=<t> selects the target" {
+            var iter = testIter("--platform=probe-target");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("probe-target", result.platform.?);
+        }
+
+        test "--platform <t> (separate value) is accepted" {
+            var iter = testIter("--platform probe-target");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("probe-target", result.platform.?);
+        }
+
+        test "absent, the project's declared platform is bundled" {
+            var iter = testIter("--optimize=ReleaseFast");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expect(result.platform == null);
+        }
+
+        test "a malformed target is a usage error" {
+            var iter = testIter("--platform=Probe");
             defer iter.deinit();
             try std.testing.expect(parseBundleArgs(&iter) == null);
         }
 
+        test "--platform without a value is a usage error" {
+            var iter = testIter("--platform");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "a following flag is not the value" {
+            var iter = testIter("--platform --progress=json");
+            defer iter.deinit();
+            try std.testing.expect(parseBundleArgs(&iter) == null);
+        }
+
+        test "composes with the other bundle flags" {
+            var iter = testIter("../game --platform=probe-target --output ./dist --progress=off");
+            defer iter.deinit();
+            const result = parseBundleArgs(&iter) orelse return error.TestFailed;
+            try std.testing.expectEqualStrings("../game", result.dir);
+            try std.testing.expectEqualStrings("probe-target", result.platform.?);
+            try std.testing.expectEqualStrings("./dist", result.output.?);
+            try expect.equal(result.progress_mode, progress.Mode.off);
+        }
+    };
+
+    pub const rejected_flags = struct {
         test "--docker is not a bundle flag" {
             var iter = testIter("--docker");
             defer iter.deinit();
@@ -1116,7 +1194,7 @@ pub const ParseDirAndSceneLinuxDesktopSpec = struct {
         const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
         try std.testing.expect(result.linux_desktop);
         try std.testing.expect(result.bake);
-        try expect.equal(result.platform.?, Platform.desktop);
+        try std.testing.expectEqualStrings("desktop", result.platform.?);
     }
 };
 
@@ -1136,7 +1214,7 @@ pub const AllowOlderCliFlagSpec = struct {
         defer iter.deinit();
         const result = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
         try std.testing.expect(result.allow_older_cli);
-        try expect.equal(result.platform.?, Platform.desktop);
+        try std.testing.expectEqualStrings("desktop", result.platform.?);
         try std.testing.expectEqualStrings("ReleaseFast", result.optimize.?);
     }
 

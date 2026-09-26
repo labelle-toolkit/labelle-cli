@@ -13,6 +13,10 @@ pub const lock_name = "labelle.providers.lock";
 /// between preview and accept must not cross the consent boundary).
 pub const preview_name = ".labelle/providers.preview.json";
 pub const registry_url = "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json";
+/// Where the last accepted registry document is kept under the cache root.
+/// Read only by `cachedRegistryOwner`, for a diagnostic; never for resolution.
+pub const registry_cache_dir = "registry";
+pub const registry_cache_file = "providers.json";
 pub const Pin = struct {
     package: []const u8,
     repo: []const u8,
@@ -184,6 +188,71 @@ pub const Sources = struct {
         return null;
     }
 };
+
+/// The `plugin.labelle` of a pinned package, read straight out of its
+/// verified cached archive — nothing is extracted, downloaded or run — or
+/// null when the archive is not cached.
+fn cachedManifest(a: std.mem.Allocator, pin: Pin) !?manifest.Manifest {
+    const bytes = archive(a, pin, false) catch |err| switch (err) {
+        error.ProviderArchiveMissing => return null,
+        else => return err,
+    };
+    defer a.free(bytes);
+    var input: std.Io.Reader = .fixed(bytes);
+    var buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor = std.compress.flate.Decompress.init(&input, .gzip, &buffer);
+    const tar = try decompressor.reader.allocRemaining(a, .limited(512 * 1024 * 1024));
+    defer a.free(tar);
+    try validateTar(a, tar);
+    var reader: std.Io.Reader = .fixed(tar);
+    var name: [4096]u8 = undefined;
+    var link: [4096]u8 = undefined;
+    var it = std.tar.Iterator.init(&reader, .{ .file_name_buffer = &name, .link_name_buffer = &link });
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        // One root directory (validateTar), so the manifest is `<root>/plugin.labelle`.
+        const slash = std.mem.indexOfScalar(u8, entry.name, '/') orelse continue;
+        if (!std.mem.eql(u8, entry.name[slash + 1 ..], "plugin.labelle")) continue;
+        if (entry.size > 1024 * 1024) return error.StreamTooLong;
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try it.streamRemaining(entry, &out.writer);
+        return try manifest.parse(a, out.written());
+    }
+    return null;
+}
+
+fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
+    const path = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir, registry_cache_file });
+    const bytes = read(a, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    const doc = try parse(a, bytes, false);
+    for (doc.providers) |pin| {
+        // Only a verified cached archive can say what a package declares; a
+        // release that is not cached, or whose bytes do not verify, says nothing.
+        const meta = (cachedManifest(a, pin) catch continue) orelse continue;
+        if (std.mem.eql(u8, meta.name, pin.package) and meta.ownsTarget(target)) return pin.package;
+    }
+    return null;
+}
+
+/// The package the cached registry document lists whose verified cached
+/// archive declares `target`, or null. Reads the cache only: no network, no
+/// extraction, no package code. The registry record itself carries no target
+/// declarations (contract §4), so a missing document, an uncached archive or
+/// an unreadable manifest is simply no hint — the caller never invents a name.
+pub fn cachedRegistryOwner(a: std.mem.Allocator, target: []const u8) ?[]const u8 {
+    return cachedOwner(a, target) catch null;
+}
+
+/// Keep the document an accept just resolved against, for `cachedRegistryOwner`.
+fn cacheRegistry(a: std.mem.Allocator, data: []const u8) !void {
+    const dir = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir });
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
+    try writeAtomically(a, try std.fs.path.join(a, &.{ dir, registry_cache_file }), data);
+}
 
 fn safeArchivePath(path: []const u8) bool {
     if (path.len == 0 or std.mem.indexOfAny(u8, path, "\\:\x00<>\"|?*") != null) return false;
@@ -474,6 +543,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     // The preview is consumed: a second --accept must be preceded by a new review.
     try removePreview(a, root);
     std.debug.print("Pinned {d} provider(s) in {s}. Commit this file with labelle.lock.\n", .{ selected.items.len, lock_name });
+    // The accepted document is kept as the hint source of the no-provider
+    // diagnostic (a preview stays read-only). Best effort: a failed cache
+    // write changes nothing about the pins just written.
+    cacheRegistry(a, metadata) catch |err| {
+        std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
+    };
 }
 
 test "provider github: immutable GitHub identity and strict document" {
@@ -523,10 +598,14 @@ const AcceptFixture = struct {
     const manifest_text = ".{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"probe\", .commands = .{ .{ .name = \"inspect\", .build_step = \"tool\", .executable = \"bin/probe\", .help = \"Inspect\" } } }";
 
     fn gzipArchive(a: std.mem.Allocator) ![]u8 {
+        return gzipArchiveWith(a, manifest_text);
+    }
+
+    fn gzipArchiveWith(a: std.mem.Allocator, plugin_manifest: []const u8) ![]u8 {
         var tar_out: std.Io.Writer.Allocating = .init(a);
         var tar: std.tar.Writer = .{ .underlying_writer = &tar_out.writer };
         try tar.setRoot("fixture-commit");
-        try tar.writeFileBytes("plugin.labelle", manifest_text, .{});
+        try tar.writeFileBytes("plugin.labelle", plugin_manifest, .{});
         try tar.writeFileBytes("build.zig", "// fixture\n", .{});
         try tar.finishPedantically();
         var gz_out: std.Io.Writer.Allocating = try .initCapacity(a, 4096);
@@ -646,6 +725,35 @@ test "provider github: an edited preview file fails its digest and is not accept
     try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = path, .data = "{ not json" });
     try std.testing.expectError(error.ProviderPreviewCorrupt, fx.run(a, true));
     try std.testing.expect(!try fx.exists(a, lock_name));
+}
+
+test "provider github: the cached registry names a target owner only from a verified cached archive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    // No cached document: no hint, whatever the archives hold.
+    try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+    // A second release of the package whose manifest declares the target.
+    const declaring = ".{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }";
+    const data = try AcceptFixture.gzipArchiveWith(a, declaring);
+    var pin = fx.pin;
+    pin.version = "1.1.0";
+    pin.sha256 = try sha256Hex(a, data);
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = &.{ fx.pin, pin } }, .{}));
+    // The document lists the package, but the record carries no targets and
+    // the declaring archive is not cached: still no hint.
+    try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+    const archive_path = try archivePath(a, pin);
+    try cwd.writeFile(io, .{ .sub_path = archive_path, .data = data });
+    try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "probe-target").?);
+    try std.testing.expect(cachedRegistryOwner(a, "other-target") == null);
+    // Bytes that do not verify against the pin say nothing.
+    try cwd.writeFile(io, .{ .sub_path = archive_path, .data = "not the archive" });
+    try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
 }
 
 fn testArchive(a: std.mem.Allocator, file: []const u8) ![]u8 {

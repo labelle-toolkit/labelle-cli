@@ -12,6 +12,7 @@ const export_mod = @import("export.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const bundle = @import("bundle.zig");
+const contract = @import("provider_contract.zig");
 
 pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
 
@@ -74,7 +75,6 @@ pub fn parseSceneFlag(
 
 const ParseError = error{TooManyArguments};
 
-const Platform = project_config.Platform;
 const Backend = project_config.Backend;
 
 /// Resolve the backend for an `labelle android` invocation, honoring the
@@ -108,7 +108,11 @@ pub const ParsedArgs = struct {
     extra_count: usize = 0,
     timeout_ns: ?u64 = null,
     scene_override: ?[]const u8 = null,
-    platform_override: ?Platform = null,
+    /// The requested target name (`--platform=<t>`, or the legacy platform
+    /// subcommands' fixed value), resolved by the pipeline against the core
+    /// target and the pinned providers' declared targets — see
+    /// `provider_targets.zig`. A string: the CLI has no list of targets.
+    platform_override: ?[]const u8 = null,
     optimize_override: ?[]const u8 = null,
     docker: bool = false,
     docker_target: ?[]const u8 = null,
@@ -190,6 +194,10 @@ pub const BundleArgs = struct {
     output: ?[]const u8 = null,
     build_number: ?[]const u8 = null,
     progress_mode: progress.Mode = .human,
+    /// `--platform=<t>`: the target to bundle (RFC #406 phase 3b). `null`
+    /// = the project's declared platform. A provider target is bundled by
+    /// that provider's `replace` hook on `bundle`.
+    platform: ?[]const u8 = null,
 };
 
 /// Result of `parseBundleValueFlag`: `.skip` = not this flag.
@@ -227,14 +235,16 @@ fn parseBundleValueFlag(
 }
 
 /// Parse the flags of `labelle bundle [dir] [--optimize=<mode>]
-/// [--output <dir>] [--build-number <n>] [--progress=<m>]`. Deliberately NARROWER than
-/// `build`'s parser: no `--platform` (a `.app` is desktop-only — the
-/// pipeline forces `.desktop`), no `--docker` (the bundle wraps a host
-/// exe; a container-built one may not even be a Mach-O), no `--scene`
-/// (that is a run-time env var, and `bundle` does not run the game).
-/// `--zig` is accepted like everywhere else so a pinned toolchain still
-/// works. `args` is `anytype` so tests can drive it with an in-memory
-/// `Args.IteratorGeneral`, mirroring `parseWasmExportArgs`.
+/// [--output <dir>] [--build-number <n>] [--platform=<t>] [--progress=<m>]`.
+/// Deliberately NARROWER than `build`'s parser: no `--docker` (the bundle
+/// wraps a host exe; a container-built one may not even be a Mach-O), no
+/// `--scene` (that is a run-time env var, and `bundle` does not run the
+/// game). `--platform=<t>` selects the target to bundle (RFC #406 phase
+/// 3b): the core `desktop` bundle, or a provider target whose provider
+/// replaces the `bundle` step. `--zig` is accepted like everywhere else so
+/// a pinned toolchain still works. `args` is `anytype` so tests can drive
+/// it with an in-memory `Args.IteratorGeneral`, mirroring
+/// `parseWasmExportArgs`.
 pub fn parseBundleArgs(args: anytype) ?BundleArgs {
     var result = BundleArgs{};
     var dir_set = false;
@@ -249,6 +259,16 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
         if (parseToolchainFlag(arg, args)) |consumed| {
             if (consumed) continue;
         } else return null;
+        switch (parseBundleValueFlag(arg, args, "platform", "--platform=<target>") orelse return null) {
+            .value => |v| {
+                result.platform = parseTargetValue(v) orelse {
+                    printInvalidTarget("bundle", v);
+                    return null;
+                };
+                continue;
+            },
+            .skip => {},
+        }
         switch (parseBundleValueFlag(arg, args, "output", "--output ./dist") orelse return null) {
             .value => |v| {
                 result.output = v;
@@ -428,33 +448,33 @@ pub fn parseWasmExportArgs(args: anytype) ?WasmExportArgs {
     return result;
 }
 
-/// Parse a --platform=<value> string into a Platform enum, or null if invalid.
-pub fn parsePlatformValue(val: []const u8) ?Platform {
-    return std.meta.stringToEnum(Platform, val);
+/// A `--platform=<value>` target name: `val` itself when it is
+/// identifier-shaped (the contract's `[a-z][a-z0-9_-]*`), else null. Shape
+/// only — whether a target EXISTS is decided by the pipeline against the
+/// core target and the pinned providers (`provider_targets.resolve`), so
+/// the parser holds no list of targets.
+pub fn parseTargetValue(val: []const u8) ?[]const u8 {
+    return if (contract.identifier(val)) val else null;
+}
+
+/// The one diagnostic for a malformed `--platform` value, shared by every
+/// parser that accepts the flag.
+pub fn printInvalidTarget(cmd_name: []const u8, val: []const u8) void {
+    std.debug.print("labelle {s}: invalid target '{s}' (targets are lowercase identifiers; run 'labelle targets')\n", .{ cmd_name, val });
 }
 
 /// Try to parse --platform=<value> from an argument. Returns true if consumed.
-fn parsePlatformFlag(arg: []const u8, platform: *?Platform, cmd_name: []const u8) ?bool {
+fn parsePlatformFlag(arg: []const u8, platform: *?[]const u8, cmd_name: []const u8) ?bool {
     if (!std.mem.startsWith(u8, arg, "--platform=")) return false;
     const val = arg["--platform=".len..];
     if (val.len == 0) {
-        std.debug.print("labelle {s}: --platform requires a value (e.g. --platform=wasm)\n", .{cmd_name});
+        std.debug.print("labelle {s}: --platform requires a value (e.g. --platform=desktop)\n", .{cmd_name});
         return null;
     }
-    platform.* = parsePlatformValue(val);
-    if (platform.* == null) {
-        const expected = comptime blk: {
-            const fields = @typeInfo(Platform).@"enum".fields;
-            var result: []const u8 = "";
-            for (fields, 0..) |f, i| {
-                if (i > 0) result = result ++ ", ";
-                result = result ++ f.name;
-            }
-            break :blk result;
-        };
-        std.debug.print("labelle {s}: unknown platform '{s}' (expected: {s})\n", .{ cmd_name, val, expected });
+    platform.* = parseTargetValue(val) orelse {
+        printInvalidTarget(cmd_name, val);
         return null;
-    }
+    };
     return true;
 }
 
@@ -580,11 +600,11 @@ pub fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []co
 /// Parse [dir], --scene, --platform, --optimize, --progress, --docker, --target
 /// and (build only) --linux-desktop flags for generate/build commands.
 /// `args` is `anytype` so tests can drive it with an in-memory iterator.
-pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode, linux_desktop: bool, allow_older_cli: bool } {
+pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []const u8, scene: ?[]const u8, platform: ?[]const u8, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, progress_mode: progress.Mode, linux_desktop: bool, allow_older_cli: bool } {
     var dir: []const u8 = ".";
     var dir_set = false;
     var scene: ?[]const u8 = null;
-    var platform: ?Platform = null;
+    var platform: ?[]const u8 = null;
     var optimize: ?[]const u8 = null;
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
@@ -659,12 +679,12 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
 /// subsequent token is collected verbatim into `parsed_args.extra_args`
 /// without flag interpretation, so callers can forward args to the game
 /// binary via `zig build run -- <extras>` (see run_cmd handler).
-pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_args: *ParsedArgs) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?Platform, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, screenshot_path: ?[]const u8, screenshot_after_ns: ?u64 } {
+pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed_args: *ParsedArgs) ?struct { dir: []const u8, scene: ?[]const u8, timeout_ns: ?u64, platform: ?[]const u8, optimize: ?[]const u8, docker_build: bool, docker_target: ?[]const u8, bake: bool, screenshot_path: ?[]const u8, screenshot_after_ns: ?u64 } {
     var dir: []const u8 = ".";
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
-    var platform: ?Platform = null;
+    var platform: ?[]const u8 = null;
     var optimize: ?[]const u8 = null;
     var docker_build = false;
     var docker_target: ?[]const u8 = null;
