@@ -71,11 +71,13 @@ test "provider settings: strict mapping, declarations and portable paths" {
     try std.testing.expectError(error.ParseZon, parse(a, ".{ .provider_config = .{ .{ .package = \"fixture\", .file = \"x\", .typo = true } } }"));
     try std.testing.expectError(error.DuplicateProviderConfig, validate(&.{ entries[0], entries[0] }, &plugins));
     try std.testing.expectError(error.UndeclaredProviderConfig, validate(entries, plugins[0..0]));
-    try std.testing.expectError(error.InvalidProviderConfigPackage, validate(&.{.{ .package = "", .file = "x.json" }}, &plugins));
-    // Any declared plugin name is a valid package; only an exact match counts.
-    const numeric = [_]struct { name: []const u8 }{.{ .name = "3d_renderer" }};
-    try validate(&.{.{ .package = "3d_renderer", .file = "providers/3d.json" }}, &numeric);
-    try std.testing.expectError(error.UndeclaredProviderConfig, validate(&.{.{ .package = "3d_renderer", .file = "providers/3d.json" }}, &plugins));
+    // The package rule is exact match against a declared plugin, nothing
+    // narrower: a digit-leading name the scanner accepts (sanitize.zig) is
+    // valid once declared, and only its absence from `.plugins` rejects it.
+    const digit_led = [_]Entry{.{ .package = "3d_renderer", .file = "providers/renderer.json" }};
+    try validate(&digit_led, &[_]struct { name: []const u8 }{.{ .name = "3d_renderer" }});
+    try std.testing.expectError(error.UndeclaredProviderConfig, validate(&digit_led, &plugins));
+    try std.testing.expectError(error.InvalidProviderConfigPackage, validate(&.{.{ .package = "", .file = "providers/x.json" }}, &plugins));
     for ([_][]const u8{ "", "../escape.json", "/absolute", "C:/absolute", "a\\b.json", "a//b.json" }) |path| {
         try std.testing.expectError(error.InvalidProviderConfigPath, validate(&.{.{ .package = "fixture", .file = path }}, &plugins));
     }
