@@ -20,8 +20,9 @@
 //!         Resources/AppIcon.icns      from the resolved icon PNG, via iconutil
 //!         Resources/assets/           copy of the project's `assets/` tree
 //!
-//! `<out>` defaults to the target dir's `zig-out/` (next to `bin/`), or
-//! `--output <dir>`. The exe keeps the name the generated build.zig
+//! `<out>` defaults to the target dir's `zig-out/bundle/desktop/` (the
+//! step output-directory contract shared with provider `bundle` hooks,
+//! see `docs/provider-hooks.md`), or `--output <dir>`. The exe keeps the name the generated build.zig
 //! produced (`util.sanitizeExeName(project.name)`, labelle-assembler#362)
 //! so `CFBundleExecutable` and `pgrep -f <name>` agree with `labelle run`.
 //!
@@ -795,7 +796,10 @@ pub fn buildIcns(allocator: std.mem.Allocator, iconset_dir: []const u8, icns_pat
 /// anchored to the PROJECT dir (same rule as `wasm export --output`, so
 /// `labelle bundle ../game --output dist` lands under the game, next to
 /// where its build output already lives); none → the target dir's
-/// `zig-out/`, beside `bin/`. Caller owns the slice.
+/// `zig-out/bundle/desktop/`, the step output directory provider `bundle`
+/// hooks receive as `output_dir` (`provider_hooks.stepOutputDir`), so the
+/// core packager and every hook agree on where the artifact is. Caller
+/// owns the slice.
 ///
 /// Unlike `wasm export` this never wipes the output dir itself — only
 /// the one `<Title>.app` inside it — so no destructive-path guard is
@@ -810,7 +814,7 @@ pub fn resolveOutputDir(
         if (std.fs.path.isAbsolute(o)) return allocator.dupe(u8, o);
         return std.fs.path.join(allocator, &.{ project_dir, o });
     }
-    return std.fs.path.join(allocator, &.{ target_dir, "zig-out" });
+    return std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bundle", "desktop" });
 }
 
 /// `child` is `parent` itself or lies below it. A plain prefix test is not
@@ -1285,8 +1289,8 @@ pub fn makeScratchIconset(allocator: std.mem.Allocator) ![]u8 {
 /// `labelle bundle` land here (`args.parseBundleArgs`).
 pub const Overrides = struct {
     /// `--output <dir>` (cli#359): where `<Title>.app` lands. `null` = the
-    /// target dir's `zig-out/`; a relative path anchors to the project
-    /// dir — see `resolveOutputDir`.
+    /// target dir's `zig-out/bundle/desktop/`; a relative path anchors to
+    /// the project dir — see `resolveOutputDir`.
     output: ?[]const u8 = null,
     /// `--build-number <n>` (cli#363): the `CFBundleVersion` to write,
     /// already validated by the parser. `null` = the derived rule on
@@ -1922,7 +1926,7 @@ test "writeIconset emits all ten PNGs at their sizes, upscaling a small master" 
     }
 }
 
-test "resolveOutputDir: absolute passes through, relative anchors to the project, default is target zig-out" {
+test "resolveOutputDir: absolute passes through, relative anchors to the project, default is target zig-out/bundle/desktop" {
     const a = testing.allocator;
     const abs_in = if (builtin.os.tag == .windows) "C:\\dist" else "/dist";
     const abs = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", abs_in);
@@ -1937,7 +1941,7 @@ test "resolveOutputDir: absolute passes through, relative anchors to the project
 
     const def = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", null);
     defer a.free(def);
-    const want_def = try std.fs.path.join(a, &.{ "/proj/.labelle/bgfx_desktop", "zig-out" });
+    const want_def = try std.fs.path.join(a, &.{ "/proj/.labelle/bgfx_desktop", "zig-out", "bundle", "desktop" });
     defer a.free(want_def);
     try testing.expectEqualStrings(want_def, def);
 }
@@ -2701,7 +2705,7 @@ test "createFromBuild fails loudly on a missing custom icon before writing anyth
 
     // Precedence: the custom path is fatal even though nothing else is
     // wrong — and no half-written bundle is left behind.
-    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "My Game.app" });
+    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "bundle", "desktop", "My Game.app" });
     defer a.free(bundle);
     try testing.expect(!util.dirExists(bundle));
 }
@@ -2906,7 +2910,7 @@ test "createFromBuild re-checks a --build-number that bypassed the parser, befor
     try testing.expectError(error.InvalidBuildNumber, createFromBuild(a, work, target, cfg, .{ .build_number = "1.2." }));
     try testing.expectError(error.BuildNumberTooLarge, createFromBuild(a, work, target, cfg, .{ .build_number = "10000" }));
 
-    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "My Game.app" });
+    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "bundle", "desktop", "My Game.app" });
     defer a.free(bundle);
     try testing.expect(!util.dirExists(bundle));
 }

@@ -33,6 +33,10 @@ const bundle = @import("bundle.zig");
 const linux_desktop = @import("linux_desktop.zig");
 const args_mod = @import("args.zig");
 const screenshot_format = @import("screenshot_format.zig");
+const provider_contract = @import("provider_contract.zig");
+const provider_dispatch = @import("provider_dispatch.zig");
+const provider_github = @import("provider_github.zig");
+const provider_hooks = @import("provider_hooks.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const resolveAndroidBackend = args_mod.resolveAndroidBackend;
@@ -569,6 +573,36 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         return ok(serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null));
     }
 
+    // ── Provider lifecycle hooks (contract §6; docs/provider-hooks.md) ──
+    // Discovery reads every declared provider manifest and validates the
+    // whole hook graph ONCE, up front, so a malformed provider fails a plain
+    // `labelle build` closed before the assembler or a compiler runs. It is
+    // skipped for a project with no plugins; for pinned remote providers it
+    // is the same verified extraction every provider command performs (the
+    // integrity model of cli#414 — the cost is accepted). The plans are pure
+    // and computed here for all four steps; a project without hooks gets
+    // four empty plans and never resolves the host compiler.
+    const hook_arena = arena.allocator();
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
+    var provider_sources: provider_github.Sources = .{ .a = hook_arena };
+    defer provider_sources.deinit();
+    const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
+        &.{}
+    else
+        provider_dispatch.discover(hook_arena, project_root, parsed, &provider_sources) catch |err| {
+            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    // The resolved target string; provider-declared targets arrive with the
+    // next slice (RFC #406 phase 3b), for now it is the legacy platform name.
+    const hook_target = @tagName(parsed.platform);
+    const hook_plans = .{
+        .generate = try provider_hooks.plan(hook_arena, providers, .generate, hook_target),
+        .build = try provider_hooks.plan(hook_arena, providers, .build, hook_target),
+        .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, hook_target),
+        .run = try provider_hooks.plan(hook_arena, providers, .run, hook_target),
+    };
+
     // ── Build-progress feed (cli#284) ──────────────────────────────────
     // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so
     // the live status file `.labelle/<target>/.build-progress.json` has a
@@ -764,6 +798,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `compatibility.zig`.
     compatibility.validatePluginCoreCompat(allocator, parsed, project_dir);
 
+    // `labelle.lock` is written HERE, before generation, rather than after
+    // it: a `before generate` provider hook already needs the lock (contract
+    // §2 — `lock_file` is non-null inside a project, and the hook's own pin
+    // is verified against it). `install` above populated the cache the lock
+    // writer reads, so every resolved version is already known. A generate
+    // that then fails leaves a fresh lock reflecting the declared pins —
+    // harmless, and `enforceCliNotStale` only reads it on the next run.
+    try lockfile.writeLockFile(allocator, project_dir, parsed);
+
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
     defer allocator.free(output_dir);
@@ -782,6 +825,30 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // Scenes and prefabs are always embedded via @embedFile
     const effective_optimize = parsed_args.optimize_override orelse
         if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
+
+    // Everything a provider hook run needs. The host compiler is resolved by
+    // the first hook that runs (never for an empty plan), and hooks report
+    // under the phase of the core step they wrap; the wire `optimize` and
+    // `progress` mirror this invocation's, so a hook builds what the core
+    // step builds and speaks the mode the user asked for.
+    const hook_optimize = std.meta.stringToEnum(provider_contract.Optimize, effective_optimize orelse "Debug") orelse {
+        std.debug.print("labelle: unknown optimize mode '{s}'\n", .{effective_optimize.?});
+        return 1;
+    };
+    var hook_site: provider_hooks.Site = .{
+        .a = hook_arena,
+        .providers = providers,
+        .root = project_root,
+        .cfg = parsed,
+        .target = hook_target,
+        .optimize = hook_optimize,
+        .progress = switch (parsed_args.progress_mode) {
+            .human => .human,
+            .json => .json,
+            .off => .off,
+        },
+        .reporter = reporter,
+    };
 
     // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
     // @embedFile path picks up the fresh `.rgba` files. Skipped unless
@@ -816,72 +883,94 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // (The shader-compiler override gate used to run here. It now runs in
     // `gateThenInstall`, ahead of the network-bound package install — see
     // cli#387 gap 3.)
-    try assembler_proc.generate(
-        asm_bin,
-        allocator,
-        project_dir,
-        @tagName(parsed.platform),
-        @tagName(parsed.backend),
-    );
-
-    // (`target_name`/`target_dir` — .labelle/raylib_desktop/, etc. — are
-    // computed up front, before the progress reporter init; see cli#284.)
-
-    // fixFingerprints runs `zig build` locally per emitted target dir to
-    // discover the correct hash. With assembler >=0.14.0 there are two
-    // (`<backend>_<platform>/` and `tests/`); patching only the exe dir
-    // would leave `tests/` with a placeholder fingerprint and break
-    // `labelle test`.
     //
-    // For docker builds we skip the exe target — the host Zig toolchain
-    // may not have the native libs the chosen backend needs (that's why
-    // we're routing through docker in the first place). The tests target
-    // is the exception: it uses the null backend (no native libs), so
-    // host Zig can build it even when --docker is set, and skipping
-    // would leave `labelle test` broken on the host after `labelle build
-    // --docker`. Patch `tests/` directly when present.
-    if (!parsed_args.docker) {
-        try runner.fixFingerprints(allocator, project_dir, output_dir);
-    } else {
-        const tests_dir = try std.fs.path.join(allocator, &.{ output_dir, "tests" });
-        defer allocator.free(tests_dir);
-        const tests_build_zig = try std.fs.path.join(allocator, &.{ tests_dir, "build.zig" });
-        defer allocator.free(tests_build_zig);
-        if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
-            try runner.fixFingerprint(allocator, project_dir, tests_dir);
-        } else |_| {}
+    // Provider hooks on `generate` (contract §6): `before` hooks, then the
+    // core generation — or its unique `replace` hook — then `after` hooks.
+    // `output_dir` is the generated tree itself. A failing hook ends the
+    // command with the hook's own exit code; nothing past it runs.
+    const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, hook_target, null);
+    {
+        const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.before, .generate, .before, generate_out);
+        if (code != 0) return code;
     }
-    try lockfile.writeLockFile(allocator, project_dir, parsed);
-    std.debug.print("  generated .labelle/{s}/\n", .{target_name});
-
-    // For a wasm build: activate the emsdk checkout Zig just fetched into the
-    // project-local `zig-pkg/` (during the fingerprint pass above) so the emcc
-    // link step finds `upstream/emscripten/emcc`. Without this a fresh
-    // `labelle build --platform wasm` — or `generate --platform wasm` followed
-    // by a manual `zig build` — dies at the emcc step because the fetched emsdk
-    // package is NOT activated: the remaining half of labelle-assembler#492 (the
-    // docker path already does this in-container). Run it BEFORE the `generate`
-    // early-return so the generate-then-build path is covered too. Best-effort +
-    // idempotent; on failure the build still surfaces the clear #492 guidance.
-    // The PINNED version keeps activation deterministic.
-    if (!parsed_args.docker and parsed.platform == .wasm) {
-        // Python preflight (cli#291): emsdk activation and emcc itself (an
-        // `env python3` script) both need a working interpreter. Fail fast
-        // with the exact fix instead of dying deep inside emsdk activation
-        // with an unrelated-looking error. `autoWireEnv` first: it puts a
-        // previously-provisioned managed Python on this process's PATH (and
-        // wires the TLS bundle on Windows), which is what makes the
-        // availability probe — and the activation below — see it.
-        python_provision.autoWireEnv(allocator);
-        if (!python_provision.isAvailable(allocator)) {
-            std.debug.print("labelle: wasm builds need Python 3 (emsdk activation + emcc) and none was found.\n" ++
-                "  fix: labelle install python   (managed, ~25 MB into ~/.labelle/python)\n" ++
-                "  or install Python 3 yourself and ensure `python3` is on PATH.\n", .{});
-            return error.BuildFailed;
+    core_generate: {
+        if (hook_plans.generate.replace) |replacement| {
+            const code = try provider_hooks.runPhase(&hook_site, &.{replacement}, .generate, .replace, generate_out);
+            if (code != 0) return code;
+            break :core_generate;
         }
-        const resolved_emsdk = try emsdk_toolchain.resolveRequiredVersion(allocator, project_dir);
-        defer allocator.free(resolved_emsdk.version);
-        emsdk_activate.activateFetchedEmsdk(allocator, target_dir, resolved_emsdk.version);
+        try assembler_proc.generate(
+            asm_bin,
+            allocator,
+            project_dir,
+            @tagName(parsed.platform),
+            @tagName(parsed.backend),
+        );
+
+        // (`target_name`/`target_dir` — .labelle/raylib_desktop/, etc. — are
+        // computed up front, before the progress reporter init; see cli#284.)
+
+        // fixFingerprints runs `zig build` locally per emitted target dir to
+        // discover the correct hash. With assembler >=0.14.0 there are two
+        // (`<backend>_<platform>/` and `tests/`); patching only the exe dir
+        // would leave `tests/` with a placeholder fingerprint and break
+        // `labelle test`.
+        //
+        // For docker builds we skip the exe target — the host Zig toolchain
+        // may not have the native libs the chosen backend needs (that's why
+        // we're routing through docker in the first place). The tests target
+        // is the exception: it uses the null backend (no native libs), so
+        // host Zig can build it even when --docker is set, and skipping
+        // would leave `labelle test` broken on the host after `labelle build
+        // --docker`. Patch `tests/` directly when present.
+        if (!parsed_args.docker) {
+            try runner.fixFingerprints(allocator, project_dir, output_dir);
+        } else {
+            const tests_dir = try std.fs.path.join(allocator, &.{ output_dir, "tests" });
+            defer allocator.free(tests_dir);
+            const tests_build_zig = try std.fs.path.join(allocator, &.{ tests_dir, "build.zig" });
+            defer allocator.free(tests_build_zig);
+            if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
+                try runner.fixFingerprint(allocator, project_dir, tests_dir);
+            } else |_| {}
+        }
+        // (`labelle.lock` was written before generation — see the provider
+        // hook note beside `validatePluginCoreCompat`.)
+        std.debug.print("  generated .labelle/{s}/\n", .{target_name});
+
+        // For a wasm build: activate the emsdk checkout Zig just fetched into the
+        // project-local `zig-pkg/` (during the fingerprint pass above) so the emcc
+        // link step finds `upstream/emscripten/emcc`. Without this a fresh
+        // `labelle build --platform wasm` — or `generate --platform wasm` followed
+        // by a manual `zig build` — dies at the emcc step because the fetched emsdk
+        // package is NOT activated: the remaining half of labelle-assembler#492 (the
+        // docker path already does this in-container). Run it BEFORE the `generate`
+        // early-return so the generate-then-build path is covered too. Best-effort +
+        // idempotent; on failure the build still surfaces the clear #492 guidance.
+        // The PINNED version keeps activation deterministic.
+        if (!parsed_args.docker and parsed.platform == .wasm) {
+            // Python preflight (cli#291): emsdk activation and emcc itself (an
+            // `env python3` script) both need a working interpreter. Fail fast
+            // with the exact fix instead of dying deep inside emsdk activation
+            // with an unrelated-looking error. `autoWireEnv` first: it puts a
+            // previously-provisioned managed Python on this process's PATH (and
+            // wires the TLS bundle on Windows), which is what makes the
+            // availability probe — and the activation below — see it.
+            python_provision.autoWireEnv(allocator);
+            if (!python_provision.isAvailable(allocator)) {
+                std.debug.print("labelle: wasm builds need Python 3 (emsdk activation + emcc) and none was found.\n" ++
+                    "  fix: labelle install python   (managed, ~25 MB into ~/.labelle/python)\n" ++
+                    "  or install Python 3 yourself and ensure `python3` is on PATH.\n", .{});
+                return error.BuildFailed;
+            }
+            const resolved_emsdk = try emsdk_toolchain.resolveRequiredVersion(allocator, project_dir);
+            defer allocator.free(resolved_emsdk.version);
+            emsdk_activate.activateFetchedEmsdk(allocator, target_dir, resolved_emsdk.version);
+        }
+    }
+    {
+        const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.after, .generate, .after, generate_out);
+        if (code != 0) return code;
     }
 
     if (command == .generate) return 0;
@@ -935,64 +1024,84 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     try zig_args.append(allocator, "build");
     if (optimize_flag) |flag| try zig_args.append(allocator, flag);
 
-    if (parsed_args.docker) {
-        // Docker builds get phase-level progress only: the toolchain (and
-        // its progress pipe) lives inside the container.
-        if (reporter) |r| r.beginPhase(.compile, "docker build");
-        std.debug.print("labelle: building via docker...\n", .{});
-        const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target, effective_optimize);
-        if (reporter) |r| r.clearSpinner();
-        if (docker_exit != 0) {
-            if (reporter) |r| r.finishFailed(docker_exit, "docker build failed");
-            std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
-            return error.BuildFailed;
+    // Provider hooks on `build` (contract §6) wrap the whole core build —
+    // docker or host `zig build` plus the runtime DLL staging — with
+    // `output_dir` = the target's `zig-out/`. A `replace` hook stands in for
+    // all of it. Hooks report under the `compile` phase.
+    const build_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .build, hook_target, null);
+    {
+        const code = try provider_hooks.runPhase(&hook_site, hook_plans.build.before, .build, .before, build_out);
+        if (code != 0) return code;
+    }
+    core_build: {
+        if (hook_plans.build.replace) |replacement| {
+            const code = try provider_hooks.runPhase(&hook_site, &.{replacement}, .build, .replace, build_out);
+            if (code != 0) return code;
+            break :core_build;
         }
-    } else if (reporter) |r| {
-        // cli#284: spawn `zig build` with Zig's std.Progress IPC pipe
-        // attached — live node names + keepalives flow into the feed
-        // during the compile (see runner.zig for what Zig 0.16 actually
-        // relays), and stdio is inherited so compile errors stream to the
-        // terminal unaltered (nothing is captured or eaten).
-        std.debug.print("labelle: building...\n", .{});
-        r.beginPhase(.compile, "zig build");
-        const build_code = try runner.runZigInheritProgress(allocator, target_dir, zig_args.items, zig_env_ptr, r);
-        // Wipe the spinner line before anything else prints on it.
-        r.clearSpinner();
-        if (build_code != 0) {
-            r.finishFailed(build_code, "zig build failed");
-            std.debug.print("labelle: build failed (exit {d})\n", .{build_code});
-            return error.BuildFailed;
-        }
-    } else {
-        std.debug.print("labelle: building...\n", .{});
-        const build_result = try runner.runZigWithEnv(allocator, target_dir, zig_args.items, zig_env_ptr);
-        defer allocator.free(build_result.stdout);
-        defer allocator.free(build_result.stderr);
+        if (parsed_args.docker) {
+            // Docker builds get phase-level progress only: the toolchain (and
+            // its progress pipe) lives inside the container.
+            if (reporter) |r| r.beginPhaseOrStep(.compile, "docker build");
+            std.debug.print("labelle: building via docker...\n", .{});
+            const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target, effective_optimize);
+            if (reporter) |r| r.clearSpinner();
+            if (docker_exit != 0) {
+                if (reporter) |r| r.finishFailed(docker_exit, "docker build failed");
+                std.debug.print("labelle: docker build failed (exit code {d})\n", .{docker_exit});
+                return error.BuildFailed;
+            }
+        } else if (reporter) |r| {
+            // cli#284: spawn `zig build` with Zig's std.Progress IPC pipe
+            // attached — live node names + keepalives flow into the feed
+            // during the compile (see runner.zig for what Zig 0.16 actually
+            // relays), and stdio is inherited so compile errors stream to the
+            // terminal unaltered (nothing is captured or eaten).
+            std.debug.print("labelle: building...\n", .{});
+            r.beginPhaseOrStep(.compile, "zig build");
+            const build_code = try runner.runZigInheritProgress(allocator, target_dir, zig_args.items, zig_env_ptr, r);
+            // Wipe the spinner line before anything else prints on it.
+            r.clearSpinner();
+            if (build_code != 0) {
+                r.finishFailed(build_code, "zig build failed");
+                std.debug.print("labelle: build failed (exit {d})\n", .{build_code});
+                return error.BuildFailed;
+            }
+        } else {
+            std.debug.print("labelle: building...\n", .{});
+            const build_result = try runner.runZigWithEnv(allocator, target_dir, zig_args.items, zig_env_ptr);
+            defer allocator.free(build_result.stdout);
+            defer allocator.free(build_result.stderr);
 
-        switch (build_result.term) {
-            .exited => |code| if (code != 0) {
-                std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
-                return error.BuildFailed;
-            },
-            else => {
-                std.debug.print("labelle: build process terminated abnormally\n{s}\n", .{build_result.stderr});
-                return error.BuildFailed;
-            },
+            switch (build_result.term) {
+                .exited => |code| if (code != 0) {
+                    std.debug.print("labelle: build failed:\n{s}\n", .{build_result.stderr});
+                    return error.BuildFailed;
+                },
+                else => {
+                    std.debug.print("labelle: build process terminated abnormally\n{s}\n", .{build_result.stderr});
+                    return error.BuildFailed;
+                },
+            }
+        }
+        std.debug.print("  build ok\n", .{});
+
+        // Stage the runtime SDL2.dll next to the freshly-built desktop exe. A
+        // gamepad/SDL2 build's exe fails process creation with a bare
+        // `FileNotFound` when SDL2.dll isn't in its own directory (cli#285): the
+        // Windows loader resolves implicitly-linked DLLs from the exe dir first,
+        // and neither the PATH prepend from autoWireEnv nor a user-set
+        // LABELLE_SDL2_LIB puts the DLL there. Docker builds are skipped — their
+        // exe is built for the container's OS, so a host SDL2.dll is irrelevant.
+        if (!parsed_args.docker and parsed.platform == .desktop and wants_sdl2) {
+            const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
+            defer allocator.free(bin_dir);
+            sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
         }
     }
-    std.debug.print("  build ok\n", .{});
-
-    // Stage the runtime SDL2.dll next to the freshly-built desktop exe. A
-    // gamepad/SDL2 build's exe fails process creation with a bare
-    // `FileNotFound` when SDL2.dll isn't in its own directory (cli#285): the
-    // Windows loader resolves implicitly-linked DLLs from the exe dir first,
-    // and neither the PATH prepend from autoWireEnv nor a user-set
-    // LABELLE_SDL2_LIB puts the DLL there. Docker builds are skipped — their
-    // exe is built for the container's OS, so a host SDL2.dll is irrelevant.
-    if (!parsed_args.docker and parsed.platform == .desktop and wants_sdl2) {
-        const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
-        defer allocator.free(bin_dir);
-        sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
+    {
+        const code = try provider_hooks.runPhase(&hook_site, hook_plans.build.after, .build, .after, build_out);
+        if (code != 0) return code;
     }
 
     // `labelle bundle` (cli#359): the exe is built; wrap it. Packaging
@@ -1002,20 +1111,45 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `done` before the artifact exists.
     if (command == .bundle_cmd) {
         if (reporter) |r| {
-            r.beginPhase(.run, "packaging macOS bundle");
+            r.beginPhaseOrStep(.run, "packaging macOS bundle");
             r.clearSpinner();
         }
-        const app_path = try bundle.createFromBuild(allocator, project_dir, target_dir, parsed, .{
-            .output = parsed_args.bundle_output,
-            .build_number = parsed_args.bundle_build_number,
-        });
-        defer allocator.free(app_path);
-        // `createFromBuild` already printed the plain path. The paste-able
-        // hint is single-quoted so a `"`, `$VAR` or backtick in a project
-        // title stays literal instead of expanding in the user's shell.
-        const quoted = try bundle.shellSingleQuote(allocator, app_path);
-        defer allocator.free(quoted);
-        std.debug.print("  open {s}\n", .{quoted});
+        // Provider hooks on `bundle` (contract §6). `output_dir` is the step
+        // output directory — `zig-out/bundle/<target>/`, or the resolved
+        // `--output` — which is also where the core packager puts the
+        // `.app` (`bundle.resolveOutputDir` shares the default), so hooks
+        // and the packager always agree on the artifact's directory.
+        const bundle_override: ?[]const u8 = if (parsed_args.bundle_output) |o|
+            try bundle.resolveOutputDir(hook_arena, project_dir, target_dir, o)
+        else
+            null;
+        const bundle_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .bundle, hook_target, bundle_override);
+        {
+            const code = try provider_hooks.runPhase(&hook_site, hook_plans.bundle.before, .bundle, .before, bundle_out);
+            if (code != 0) return code;
+        }
+        core_bundle: {
+            if (hook_plans.bundle.replace) |replacement| {
+                const code = try provider_hooks.runPhase(&hook_site, &.{replacement}, .bundle, .replace, bundle_out);
+                if (code != 0) return code;
+                break :core_bundle;
+            }
+            const app_path = try bundle.createFromBuild(allocator, project_dir, target_dir, parsed, .{
+                .output = parsed_args.bundle_output,
+                .build_number = parsed_args.bundle_build_number,
+            });
+            defer allocator.free(app_path);
+            // `createFromBuild` already printed the plain path. The paste-able
+            // hint is single-quoted so a `"`, `$VAR` or backtick in a project
+            // title stays literal instead of expanding in the user's shell.
+            const quoted = try bundle.shellSingleQuote(allocator, app_path);
+            defer allocator.free(quoted);
+            std.debug.print("  open {s}\n", .{quoted});
+        }
+        {
+            const code = try provider_hooks.runPhase(&hook_site, hook_plans.bundle.after, .bundle, .after, bundle_out);
+            if (code != 0) return code;
+        }
         if (reporter) |r| r.finishDone(0);
         return 0;
     }
@@ -1049,6 +1183,26 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     }
 
     // Run
+    //
+    // Provider hooks on `run` (contract §6): `before` runs once here, ahead
+    // of every branch below; a `replace` hook stands in for all of them;
+    // `after` runs at each branch's success exit through
+    // `provider_hooks.finishRun`, which also owns the terminal `done` record
+    // so a `--progress=json` consumer never sees `done` before the hooks
+    // finished. After hooks never run on a nonzero game exit. The
+    // interactive `wasm serve` loop is the one exception in timing: its
+    // `done` record lands before the loop and the after hooks run only once
+    // the server returns.
+    const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, hook_target, null);
+    {
+        const code = try provider_hooks.runPhase(&hook_site, hook_plans.run.before, .run, .before, run_out);
+        if (code != 0) return code;
+    }
+    if (hook_plans.run.replace) |replacement| {
+        const code = try provider_hooks.runPhase(&hook_site, &.{replacement}, .run, .replace, run_out);
+        if (code != 0) return code;
+        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
+    }
     if (parsed.platform == .wasm) {
         const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
@@ -1061,7 +1215,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             // mark `done` once the artifacts are on disk — otherwise a
             // `--progress=json` consumer sees `done` before the export.
             if (reporter) |r| {
-                r.beginPhase(.run, "packaging wasm export");
+                r.beginPhaseOrStep(.run, "packaging wasm export");
                 r.clearSpinner();
             }
             const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
@@ -1071,7 +1225,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 .zip = parsed_args.export_zip,
                 .platform = parsed_args.export_pkg_platform,
             });
-            if (reporter) |r| r.finishDone(0);
+            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
         } else {
             // WASM serve: the loop is interactive (runs until Ctrl+C), so
             // the terminal `done` record lands before the serve loop.
@@ -1123,16 +1277,19 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             } else {
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
             }
+            // The server returned (Ctrl+C): the feed is already terminal, so
+            // only the hooks themselves run here.
+            return provider_hooks.runPhase(&hook_site, hook_plans.run.after, .run, .after, run_out);
         }
     } else if (parsed.platform == .ios) {
         // iOS: deploy to simulator
-        if (reporter) |r| r.beginPhase(.run, "deploying to iOS Simulator");
+        if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to iOS Simulator");
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
         try ios.deployToSimulator(allocator, target_dir, parsed);
-        if (reporter) |r| r.finishDone(0);
+        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
     } else if (parsed.platform == .android) {
         // Android: deploy to device/emulator
-        if (reporter) |r| r.beginPhase(.run, "deploying to Android");
+        if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to Android");
         std.debug.print("labelle: deploying to Android...\n", .{});
         // An app the system starts has no environment we control, so the
         // env-based run options travel as `am start --es` intent extras
@@ -1146,7 +1303,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{}, .{
             .strip_native = android.stripForOptimize(effective_optimize),
         }, launch_extras.items);
-        if (reporter) |r| r.finishDone(0);
+        return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, 0);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
@@ -1256,7 +1413,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             defer run_args.deinit(allocator);
             try run_args.append(allocator, bin_path);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
-            if (reporter) |r| r.beginPhase(.run, exe_name);
+            if (reporter) |r| r.beginPhaseOrStep(.run, exe_name);
             noteRunSharesStdout(reporter);
             const run_result = try runner.runZigInheritWithEnv(allocator, project_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
@@ -1265,9 +1422,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record, and it is
-            // also the CLI's exit status (cli#390).
-            if (reporter) |r| r.finishDone(run_result);
-            return run_result;
+            // also the CLI's exit status (cli#390). After hooks run first,
+            // and only on a clean exit.
+            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_result);
         } else {
             // Build, then run the game BINARY DIRECTLY rather than via
             // `zig build run`. `zig build run` launches the game in its own
@@ -1318,7 +1475,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             defer run_args.deinit(allocator);
             try run_args.append(allocator, rel_bin);
             try appendRunForwardedArgs(&run_args, allocator, &parsed_args);
-            if (reporter) |r| r.beginPhase(.run, exe_basename);
+            if (reporter) |r| r.beginPhaseOrStep(.run, exe_basename);
             noteRunSharesStdout(reporter);
             const run_result = try runner.runZigInheritWithEnv(allocator, target_dir, run_args.items, timeout_ns, env_map_ptr);
             if (run_result != 0) {
@@ -1327,12 +1484,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record, and it is
-            // also the CLI's exit status (cli#390).
-            if (reporter) |r| r.finishDone(run_result);
-            return run_result;
+            // also the CLI's exit status (cli#390). After hooks run first,
+            // and only on a clean exit.
+            return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_result);
         }
     }
-    return 0;
 }
 
 /// Extensions a backend may append to the requested screenshot path instead of
