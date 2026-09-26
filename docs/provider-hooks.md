@@ -206,10 +206,18 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   `--watch` rebuild re-runs the `generate` and `build` hook phases around its
   core steps exactly as the cold pipeline did (the feed is already terminal,
   so the hooks' sub-step records are not emitted there); a failing hook stops
-  that rebuild and keeps the server alive, like a failing core step. Each hook
-  phase allocates on a scratch arena freed when the phase returns — only the
-  resolved host compiler outlives it — so a long watch session with hooks does
-  not grow on every saved edit.
+  that rebuild and keeps the server alive, like a failing core step. Every
+  rebuild first re-reads `project.labelle`, rediscovers the providers (with
+  the cache `.populated`, as the cold pipeline did) and replans both phases,
+  so a watched edit to the project, to a provider manifest or to a
+  `provider_config` file reaches the next rebuild — the plans computed at
+  startup are only the initial state, never reused for a rebuild. A replan
+  that fails (a manifest saved mid-edit, say) stops that rebuild before any
+  hook or core step and leaves the last good plans installed. Each hook
+  phase allocates on a scratch arena freed when the phase returns, and each
+  replan lives on its own arena released once the next one is installed —
+  only the resolved host compiler outlives them — so a long watch session
+  with hooks does not grow on every saved edit.
 - A `--docker` run whose binary was cross-compiled skips the launch and its
   `after run` hooks with it (nothing ran).
 - `wasm serve|export --no-build` skips only `generate` and `build`: serving

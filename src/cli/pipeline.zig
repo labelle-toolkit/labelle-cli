@@ -85,6 +85,17 @@ const WasmRebuildCtx = struct {
     hooks: *provider_hooks.Site,
     generate_plan: provider_hooks.Plan = .{},
     build_plan: provider_hooks.Plan = .{},
+    /// Rediscovers the providers and replans both phases at the start of
+    /// EVERY rebuild, so a watched edit to `project.labelle`, to a provider
+    /// manifest or to `provider_config` reaches the next rebuild. The
+    /// startup plans above are only the initial state; with a replan
+    /// installed they never run a rebuild themselves (they were captured
+    /// once and reused for every rebuild, so removed hooks kept running and
+    /// added ones were skipped until the server restarted — Codex P2 on
+    /// #420). Production installs `WatchReplan`; `null` keeps the startup
+    /// plans (the plumbing tests' shape). A failing replan stops the rebuild
+    /// before any phase and leaves the previous plans installed.
+    replan: ?Replan = null,
     /// The step output directories of the layout contract, as the cold
     /// pipeline computed them (`provider_hooks.stepOutputDir`).
     generate_out: []const u8 = "",
@@ -98,12 +109,21 @@ const WasmRebuildCtx = struct {
     /// that the shader preflight fires before generation is attempted.
     const Stage = error{
         PrebuildFailed,
+        ReplanFailed,
         ShaderPreflightFailed,
         HookFailed,
         GenerateFailed,
         FingerprintFailed,
         ZigSpawnFailed,
         BuildFailed,
+    };
+
+    /// The per-rebuild replan seam: `run` receives `ctx` and the context it
+    /// must update (`hooks.providers`, `hooks.cfg`, `generate_plan`,
+    /// `build_plan`).
+    pub const Replan = struct {
+        ctx: *anyopaque,
+        run: *const fn (*anyopaque, *WasmRebuildCtx) anyerror!void,
     };
 
     /// One hook phase of a watched rebuild. A failing hook (nonzero exit, or
@@ -147,6 +167,17 @@ const WasmRebuildCtx = struct {
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
             return error.PrebuildFailed;
         };
+
+        // 0a. Re-read the project, rediscover the providers and replan the
+        //     hook phases for THIS rebuild (see `replan`). A failing replan
+        //     — a malformed manifest saved mid-session, say — is reported
+        //     like a failing core step and stops here, before any phase.
+        if (self.replan) |replan| {
+            replan.run(replan.ctx, self) catch |err| {
+                std.debug.print("labelle: rebuild stopped before generate: provider replan failed ({s})\n", .{@errorName(err)});
+                return error.ReplanFailed;
+            };
+        }
 
         // 0b. Gate the shader-compiler override AFTER the hooks (a hook may
         //     be what creates `materials/`) and BEFORE generation. The cold
@@ -432,6 +463,262 @@ const WasmRebuildCtx = struct {
         try std.testing.expectError(error.HookFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 3), Spy.count);
         try std.testing.expectEqualStrings("unpinned", Spy.calls[2].id);
+    }
+
+    // The replan seam: every rebuild replans before its first phase, the
+    // plans the replan installs are the ones that run, and a failing replan
+    // stops the rebuild ahead of every phase with the previous plans intact.
+    test "watched rebuild replans the hook phases on every rebuild" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+
+        const Fixture = struct {
+            var provider: provider_dispatch.Provider = .{
+                .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+                .dir = "/pkg",
+                .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+                .verified = true,
+            };
+            fn planned(id: []const u8, step: provider_contract.Step, when: provider_contract.Phase) provider_hooks.Planned {
+                return .{
+                    .provider = &provider,
+                    .hook = .{ .id = id, .step = step, .target = "wasm", .when = when, .build_step = "tool", .executable = "bin/tool" },
+                    .qualified = id,
+                };
+            }
+        };
+        const Spy = struct {
+            var phases: [8][]const u8 = undefined;
+            var phase_count: usize = 0;
+            var replans: usize = 0;
+            var fail_next = false;
+            fn run(_: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+                for (list) |planned| {
+                    phases[phase_count] = planned.hook.id;
+                    phase_count += 1;
+                }
+                return 0;
+            }
+            fn replan(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
+                const counter: *usize = @ptrCast(@alignCast(ptr));
+                counter.* += 1;
+                replans += 1;
+                if (fail_next) return error.ProviderManifestBroken;
+                // What production does: a fresh plan replaces the installed one.
+                ctx.generate_plan = .{ .replace = Fixture.planned("gen-fresh", .generate, .replace) };
+                ctx.build_plan = .{ .replace = Fixture.planned("build-fresh", .build, .replace) };
+            }
+            fn reset() void {
+                phase_count = 0;
+            }
+        };
+        var counter: usize = 0;
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{ "/nonexistent/zig-probe", "build" },
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+            // The startup plans: a `replace` on both steps, so if they ran
+            // the rebuild would succeed on "gen-stale"/"build-stale".
+            .generate_plan = .{ .replace = Fixture.planned("gen-stale", .generate, .replace) },
+            .build_plan = .{ .replace = Fixture.planned("build-stale", .build, .replace) },
+            .run_hook_phase = Spy.run,
+            .replan = .{ .ctx = &counter, .run = Spy.replan },
+        };
+
+        // Rebuild 1: replanned once; the FRESH plans ran, the startup plans
+        // did not.
+        Spy.reset();
+        try ctx.rebuildStaged();
+        try std.testing.expectEqual(@as(usize, 1), counter);
+        try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
+        try std.testing.expectEqualStrings("gen-fresh", Spy.phases[0]);
+        try std.testing.expectEqualStrings("build-fresh", Spy.phases[1]);
+        // Rebuild 2: replanned again — once per rebuild, not once per session.
+        Spy.reset();
+        try std.testing.expect(rebuild(@ptrCast(&ctx)));
+        try std.testing.expectEqual(@as(usize, 2), counter);
+        try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
+        // A failing replan stops the rebuild before any phase, and the plans
+        // installed by the last good replan stay in place.
+        Spy.fail_next = true;
+        Spy.reset();
+        try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 3), counter);
+        try std.testing.expectEqual(@as(usize, 0), Spy.phase_count);
+        try std.testing.expectEqualStrings("gen-fresh", ctx.generate_plan.replace.?.hook.id);
+        try std.testing.expectEqualStrings("build-fresh", ctx.build_plan.replace.?.hook.id);
+        Spy.fail_next = false;
+        // Without a replan the startup plans are what run (the earlier tests'
+        // shape), so the fresh plans above came from the seam.
+        ctx.replan = null;
+        ctx.generate_plan = .{ .replace = Fixture.planned("gen-stale", .generate, .replace) };
+        ctx.build_plan = .{ .replace = Fixture.planned("build-stale", .build, .replace) };
+        Spy.reset();
+        try ctx.rebuildStaged();
+        try std.testing.expectEqual(@as(usize, 3), counter);
+        try std.testing.expectEqualStrings("gen-stale", Spy.phases[0]);
+        try std.testing.expectEqualStrings("build-stale", Spy.phases[1]);
+    }
+};
+
+/// The production replan for `wasm serve --watch` (`WasmRebuildCtx.replan`):
+/// re-reads `project.labelle`, rediscovers the providers with the package
+/// cache `.populated` (the cold pipeline's install ran before the server
+/// started) and replans the `generate` and `build` phases for the target
+/// being served. Each successful replan lives on its own arena; the
+/// previous generation — its arena and any pinned provider sources it
+/// extracted — is released only once the new one is installed, so a failed
+/// replan leaves the context pointing at intact storage.
+const WatchReplan = struct {
+    backing: std.mem.Allocator,
+    project_dir: []const u8,
+    /// Storage of the plans currently installed on the context. `null`
+    /// until the first replan: the startup plans live on the pipeline's
+    /// hook arena, which outlives the server.
+    current: ?*Generation = null,
+
+    const Generation = struct {
+        arena: std.heap.ArenaAllocator,
+        sources: provider_github.Sources,
+
+        /// Heap-allocated so the arena's address is stable: every allocator
+        /// handle carved from it (the sources' included) points at it.
+        fn create(backing: std.mem.Allocator) !*Generation {
+            const generation = try backing.create(Generation);
+            generation.* = .{ .arena = std.heap.ArenaAllocator.init(backing), .sources = undefined };
+            generation.sources = .{ .a = generation.arena.allocator() };
+            return generation;
+        }
+
+        fn destroy(self: *Generation, backing: std.mem.Allocator) void {
+            self.sources.deinit();
+            self.arena.deinit();
+            backing.destroy(self);
+        }
+    };
+
+    fn run(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
+        const self: *WatchReplan = @ptrCast(@alignCast(ptr));
+        const next = try Generation.create(self.backing);
+        errdefer next.destroy(self.backing);
+        const a = next.arena.allocator();
+        var cfg = try config.readProjectConfig(a, self.project_dir);
+        // The served target's platform and backend are the pipeline's
+        // resolved ones (`wasm serve` overrides what the file declares).
+        cfg.platform = ctx.hooks.cfg.platform;
+        cfg.backend = ctx.hooks.cfg.backend;
+        const providers: []const provider_dispatch.Provider = if (cfg.plugins.len == 0)
+            &.{}
+        else
+            try provider_dispatch.discover(a, ctx.hooks.root, cfg, &next.sources, .populated);
+        const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
+        const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
+        // Install only now, so a failure above leaves the previous plans —
+        // and their storage — untouched.
+        ctx.hooks.providers = providers;
+        ctx.hooks.cfg = cfg;
+        ctx.generate_plan = generate_plan;
+        ctx.build_plan = build_plan;
+        if (self.current) |previous| previous.destroy(self.backing);
+        self.current = next;
+    }
+
+    fn deinit(self: *WatchReplan) void {
+        if (self.current) |generation| generation.destroy(self.backing);
+        self.current = null;
+    }
+
+    // Against a real project: edits to the manifest between rebuilds change
+    // the installed plans; a broken manifest fails the replan and keeps the
+    // last good plans; nothing leaks across generations.
+    test "watch replan re-reads the project and provider manifests on every call" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
+        });
+        const Manifest = struct {
+            fn write(dir: std.Io.Dir, hooks: []const u8) !void {
+                var buf: [1024]u8 = undefined;
+                const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{{ {s} }} }}", .{hooks});
+                try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = text });
+            }
+        };
+        const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
+        const build_hook = ".{ .id = \"post\", .step = .build, .target = \"wasm\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+        try Manifest.write(tmp.dir, gen_hook);
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+        };
+        var replan = WatchReplan{ .backing = a, .project_dir = project };
+        defer replan.deinit();
+
+        // First replan: the manifest's generate hook is planned; the site
+        // now knows the provider and the re-read config.
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(@as(usize, 1), ctx.generate_plan.before.len);
+        try std.testing.expectEqualStrings("pkg/gen", ctx.generate_plan.before[0].qualified);
+        try std.testing.expect(ctx.build_plan.isEmpty());
+        try std.testing.expectEqual(@as(usize, 1), site.providers.len);
+        try std.testing.expectEqual(@as(usize, 1), site.cfg.plugins.len);
+        // The manifest changes between rebuilds: the next replan sees it.
+        try Manifest.write(tmp.dir, build_hook);
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expect(ctx.generate_plan.isEmpty());
+        try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
+        // A broken manifest fails the replan; the last good plans stay
+        // installed and remain readable (their generation was kept).
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = "not a manifest" });
+        try std.testing.expectError(error.InvalidManifest, WatchReplan.run(&replan, &ctx));
+        try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
+        // The project itself changes: the plugin is dropped, so nothing is
+        // planned and the site's config follows.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expect(ctx.generate_plan.isEmpty() and ctx.build_plan.isEmpty());
+        try std.testing.expectEqual(@as(usize, 0), site.providers.len);
+        try std.testing.expectEqual(@as(usize, 0), site.cfg.plugins.len);
     }
 };
 
@@ -1559,6 +1846,14 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 // that re-runs the same generate→fingerprint→zig-build steps
                 // this pipeline just did. The context borrows locals that stay
                 // alive because `serveAndOpen` blocks until Ctrl+C.
+                //
+                // The hook plans are NOT borrowed for the session: every
+                // rebuild re-reads the project and replans through
+                // `watch_replan`, so an edited manifest or `provider_config`
+                // reaches the next rebuild; the plans computed above are only
+                // the initial state.
+                var watch_replan = WatchReplan{ .backing = allocator, .project_dir = project_dir };
+                defer watch_replan.deinit();
                 var rebuild_ctx = WasmRebuildCtx{
                     .allocator = allocator,
                     .asm_bin = asm_bin,
@@ -1583,6 +1878,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                     .build_plan = hook_plans.build,
                     .generate_out = generate_out,
                     .build_out = build_out,
+                    .replan = .{ .ctx = &watch_replan, .run = WatchReplan.run },
                 };
                 // The hooks' declared `.outputs` are excluded from the watch
                 // signature so the rebuild callback can't trip its own
