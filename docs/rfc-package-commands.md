@@ -108,7 +108,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 
 ## Execution
 
-- **Compile on first use.** The CLI is a prebuilt binary and packages are Zig source, so a command's `main` is compiled with the project's pinned Zig the first time it runs, then cached by package hash.
+- **Compile on first use.** The CLI is a prebuilt binary and packages are Zig source, so a command's `main` is compiled with the project's pinned Zig the first time it runs, then cached by command entry point, package content hash, resolved dependency graph, Zig version, host OS/architecture/ABI, command-contract version, and effective build options. Different commands and projects must not accidentally reuse an incompatible executable. Local package edits invalidate the cache by content, not version label. Tools compile for the host, not the game target.
 - **Cost:** a few seconds on first use; later runs use the cache.
 - **Windows:** package tools must build and run there too, and CI for provider packages must cover it.
 - **Trust:** running package code is the same trust level as building the game, so it adds no new risk.
@@ -116,7 +116,7 @@ The CLI owns a stable layout, e.g. `zig-out/bundle/<target>/…` and `zig-out/pa
 ## Resolution
 
 - **Inside a project:** providers come from `project.labelle` and `labelle.lock`, so each project gets the versions it's locked to, like a Gemfile.
-- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches its latest release. There is no list of names in the code.
+- **No project yet:** on a fresh machine, e.g. `labelle android doctor`, a small generic **package index** answers "who provides namespace `android`" and fetches its latest release. There is no list of names in the code. The resolved provider metadata declares an exact supported Zig bootstrap version; the generic CLI toolchain installer provisions it before compiling the host tool. This metadata is readable without executing provider code. Missing toolchains in offline mode produce an actionable error. Record the resolved provider and compiler versions locally so the next invocation reuses them until an explicit update. No project or project lock is required for this bootstrap.
 - **Dispatch order in `src/cli.zig`:**
   1. built-in commands;
   2. package namespaces;
@@ -145,7 +145,7 @@ Steam's first version needs no storage code at all. Steam Auto-Cloud syncs the g
 
 1. **#405:** a single APK packaging path, which becomes the code that moves in step 3.
 2. **labelle-bgfx#149:** create `labelle-android` with the shared runtime pieces (services first, then an optional NativeActivity shell with renderer callbacks).
-3. **The mechanism:** manifest fields, contract, dispatch, hooks, cache and index. `labelle-android` is the first provider; `src/cli/android/` and `android_sdk.zig` move there. A thin forwarding shim keeps `labelle android …` working for one minor release.
+3. **The mechanism:** manifest fields, contract, dispatch, hooks, cache and index. `labelle-android` is the first provider; `src/cli/android/` and `android_sdk.zig` move there. This is a breaking migration: existing projects explicitly add and pin the provider and update configuration and commands. There is no forwarding shim, automatic provider injection, or compatibility window.
 4. **Web, as the second provider and a default package:**
    - first #407: move the backend × platform ASTC table and the bgfx version check into backend manifests;
    - then `labelle-web` takes the `emsdk_*` files, `serve.zig`, the HTML/loading shell (#401/#402), compression and size stamping, and the IndexedDB backend;
@@ -153,7 +153,7 @@ Steam's first version needs no storage code at all. Steam Auto-Cloud syncs the g
 5. **iOS** (`ios.zig`) moves the same way, and `sdl_provision.zig` moves to the SDL backend package. `docker.zig` is to be decided.
 6. **Steam:** the first store package, confirming the contract generalises. It hooks into desktop `bundle` and provides `labelle steam upload` and `labelle steam doctor`.
 
-The guard's allowlist shrinks at every step, and after step 5 only host OS names remain.
+The guard's allowlist shrinks at every step, and after step 5 only host OS names remain. Existing web projects explicitly add `labelle-web` and migrate `--platform=wasm` and `labelle wasm ...` to the new provider target/commands. Do not retain legacy aliases. Publish migration instructions with the breaking release; old configurations are unsupported until migrated.
 
 ## Acceptance checks
 
@@ -162,6 +162,9 @@ The guard's allowlist shrinks at every step, and after step 5 only host OS names
 - `labelle help` and `labelle doctor` show package commands and checks.
 - The guard test passes with only host OS names allowed, once step 5 is done.
 - Package commands work on Windows, macOS and Linux runners.
+- Two tools in one package, and the same tool under distinct compiler/dependency inputs, use distinct cache entries; unchanged inputs reuse the executable.
+- On a fresh host without a project or Zig installation, a projectless diagnostic provisions its declared compiler and runs. Offline missing-toolchain failure is clear.
+- Explicitly migrated projects run with pinned providers; unmigrated configurations fail clearly without legacy forwarding or implicit package injection.
 
 ## Open questions
 
@@ -169,4 +172,4 @@ The guard's allowlist shrinks at every step, and after step 5 only host OS names
 - **Package index:** where it lives and who publishes to it (an R2 JSON next to the CLI releases?).
 - **Contract surface:** does the credentials helper belong in the contract, or does each package handle its own secrets?
 - **Proprietary SDKs** (Steamworks, consoles): only bring-your-own, with `doctor` pointing to the local SDK path, as with the Spine license?
-- **Tool builds:** should they share the project's Zig cache or keep a separate global cache keyed by package hash?
+- **Tool builds:** should the tool cache be project-local or global? Either placement must use the complete cache identity specified above.
