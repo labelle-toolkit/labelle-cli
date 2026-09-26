@@ -269,6 +269,7 @@ const WasmRebuildCtx = struct {
     fn testSite(a: std.mem.Allocator, project: []const u8) provider_hooks.Site {
         return .{
             .a = a,
+            .backing = a,
             .providers = &.{},
             .root = project,
             .cfg = .{ .name = "game" },
@@ -1069,6 +1070,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     };
     var hook_site: provider_hooks.Site = .{
         .a = hook_arena,
+        .backing = allocator,
         .providers = providers,
         .root = project_root,
         .cfg = parsed,

@@ -218,7 +218,17 @@ fn progressPhase(step: contract.Step) progress.Phase {
 /// first hook only, so a project whose plan is empty never touches the
 /// compiler check.
 pub const Site = struct {
+    /// Long-lived storage: the pipeline's hook arena, which holds the
+    /// providers, the plans and (once resolved) the host. Nothing a single
+    /// phase allocates lands here.
     a: std.mem.Allocator,
+    /// The allocator every phase's scratch arena is carved from and returned
+    /// to when the phase ends. A watched serve session (`--watch`) runs the
+    /// `generate` and `build` phases on every saved edit through one
+    /// long-lived site; allocating each hook's lock, settings, workspace
+    /// paths, environment and serialised context on the site arena grew
+    /// memory on every rebuild (Codex P2 on #420).
+    backing: std.mem.Allocator,
     providers: []const dispatch.Provider,
     /// Canonical project root.
     root: []const u8,
@@ -228,15 +238,24 @@ pub const Site = struct {
     progress: contract.Progress,
     reporter: ?*progress.Reporter,
     host: ?dispatch.Host = null,
+    /// The tool launcher. A field only so the scratch-arena test below can
+    /// observe which allocator a hook invocation receives without a host
+    /// compiler; production never overrides it.
+    run_tool: *const fn (std.mem.Allocator, dispatch.Host, []const u8, dispatch.Provider, contract.Tool, dispatch.ToolRun) anyerror!u8 = dispatch.runTool,
 };
 
 /// Run one phase of a plan in order, stopping at the first failure. Returns
 /// 0 or the failing hook's exit code, after marking the progress feed
 /// failed; the caller exits with that code.
+///
+/// Everything the phase allocates lives in a scratch arena freed on return;
+/// only the resolved host outlives it, on the site's long-lived arena.
 pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: contract.Phase, output_dir: []const u8) !u8 {
     if (list.len == 0) return 0;
-    const a = site.a;
-    if (site.host == null) site.host = try dispatch.resolveHost(a, site.root);
+    var scratch = std.heap.ArenaAllocator.init(site.backing);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    if (site.host == null) site.host = try dispatch.resolveHost(site.a, site.root);
     const output = try dispatch.canonicalDir(a, output_dir);
     for (list) |planned| {
         const provider = planned.provider.*;
@@ -244,7 +263,7 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
         const settings = try dispatch.resolveSettings(a, site.root, site.cfg, site.providers, provider.meta.name);
         if (site.reporter) |r| r.beginPhaseOrStep(progressPhase(step), try std.fmt.allocPrint(a, "hook {s}", .{planned.qualified}));
         std.debug.print("labelle: running {s} hook '{s}' for {s} ({s})\n", .{ @tagName(phase), planned.qualified, @tagName(step), site.target });
-        const code = try dispatch.runTool(a, site.host.?, site.root, provider, .{ .build_step = planned.hook.build_step, .executable = planned.hook.executable }, .{
+        const code = try site.run_tool(a, site.host.?, site.root, provider, .{ .build_step = planned.hook.build_step, .executable = planned.hook.executable }, .{
             .invocation = .{ .kind = .hook, .id = planned.hook.id, .step = step, .phase = phase },
             .needs_project = true,
             .target = site.target,
@@ -437,5 +456,108 @@ test "provider hooks: a reference into a declared-but-unread package is unresolv
     // hooks that are present.
     const p = try plan(a, &.{local}, .build, "desktop");
     try std.testing.expectEqualStrings("local/h", try Fixture.ids(a, p.after));
+}
+
+/// Counts what is live in a backing allocator, so a test can assert that a
+/// phase returned everything it allocated — the mechanism, not a value.
+const CountingAllocator = struct {
+    inner: std.mem.Allocator,
+    live: usize = 0,
+    allocations: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.inner.rawAlloc(len, alignment, ret_addr);
+        if (result != null) {
+            self.live += len;
+            self.allocations += 1;
+        }
+        return result;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.inner.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live = self.live - memory.len + new_len;
+        return true;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+        if (result != null) self.live = self.live - memory.len + new_len;
+        return result;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+        self.live -= memory.len;
+    }
+};
+
+test "provider hooks: each phase runs on a scratch arena that is freed on return" {
+    const io = @import("config.zig").globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var long_lived = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer long_lived.deinit();
+    const a = long_lived.allocator();
+    try tmp.dir.createDirPath(io, "project");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // The lock a hook run requires, naming the fixture provider exactly.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/labelle.lock",
+        .data = ".{ .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../x\", .version = \"1.0.0\" } } }",
+    });
+    const Spy = struct {
+        var calls: usize = 0;
+        var scratch_ptr: ?*anyopaque = null;
+        fn run(scratch: std.mem.Allocator, _: dispatch.Host, _: []const u8, _: dispatch.Provider, _: contract.Tool, _: dispatch.ToolRun) anyerror!u8 {
+            // What a real invocation does with its allocator: workspace
+            // paths, an environment, a serialised context.
+            _ = try scratch.alloc(u8, 64 * 1024);
+            scratch_ptr = scratch.ptr;
+            calls += 1;
+            return 0;
+        }
+    };
+    var counting: CountingAllocator = .{ .inner = std.testing.allocator };
+    const provider = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .build, "desktop", .after, &.{})});
+    const planned: Planned = .{ .provider = &provider, .hook = provider.meta.hooks[0], .qualified = "pkg/h" };
+    var site: Site = .{
+        .a = a,
+        .backing = counting.allocator(),
+        .providers = &.{provider},
+        .root = root,
+        .cfg = .{ .name = "game" },
+        .target = "desktop",
+        .optimize = .Debug,
+        .progress = .off,
+        .reporter = null,
+        // Pre-resolved, so no compiler is consulted.
+        .host = .{ .zig = "/z", .cache_root = root, .global_cache = root, .packages = root },
+        .run_tool = Spy.run,
+    };
+    const out = try std.fs.path.join(a, &.{ root, "zig-out" });
+    // Production wiring: the default launcher IS the real one.
+    try std.testing.expect((std.meta.fieldInfo(Site, .run_tool).defaultValue() orelse return error.TestUnexpectedResult) == dispatch.runTool);
+
+    try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .build, .after, out));
+    try std.testing.expectEqual(@as(usize, 1), Spy.calls);
+    // The invocation allocated through the scratch, which is carved from
+    // the backing allocator and is NOT the long-lived arena...
+    const first_pass = counting.allocations;
+    try std.testing.expect(first_pass > 0);
+    try std.testing.expect(Spy.scratch_ptr.? != a.ptr);
+    // ...and everything came back when the phase returned.
+    try std.testing.expectEqual(@as(usize, 0), counting.live);
+    // A second phase on the same site (a watched rebuild) allocates afresh
+    // and again leaves nothing live: the scratch is reset per phase, not
+    // accumulated across them.
+    try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .build, .after, out));
+    try std.testing.expectEqual(@as(usize, 2), Spy.calls);
+    try std.testing.expect(counting.allocations > first_pass);
+    try std.testing.expectEqual(@as(usize, 0), counting.live);
 }
 
