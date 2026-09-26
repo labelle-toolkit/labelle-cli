@@ -172,7 +172,7 @@ Steam's first version needs no storage code at all. Steam Auto-Cloud syncs the g
 
 ## Enforcement
 
-- **A guard test in CI** fails the build if platform, store or package names (`android`, `ios`, `steam`, `emsdk`, …) appear in `src/`. It is modelled on labelle-bgfx's `heap_guard_test`.
+- **A guard test in CI** fails the build if platform, store or package names (`android`, `ios`, `steam`, `emsdk`, …), or the providers' tools and SDKs (`butler`, `uikit`, `steamworks`, `steamcmd`, `xcodebuild`, `adb`, `emcc`, `gradlew`, …), appear in `src/`, including in package and compound forms (`libsdl2`, `Steamworks`) and behind source symlinks. It is modelled on labelle-bgfx's `heap_guard_test`.
 - **The allowlist:** host OS names (`macos`, `windows`, `linux`) are permanently allowed. Everything else sits on an explicit, shrinking migration allowlist.
 - **Where:** `src/agnostic_guard_test.zig` (`zig build test-guard`, also part of `zig build test`); its file allowlist can only shrink, because the test also fails when an allowlisted file no longer contains a flagged name, so the entry must be removed in the same change.
 
