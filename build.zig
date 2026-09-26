@@ -180,6 +180,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(astc_tests).step);
+
+    addAgnosticGuard(b, test_step, optimize);
+}
+
+/// Guard: no platform, store, package or backend names in `src/` outside
+/// the shrinking migration allowlist (RFC #406, docs/rfc-package-commands.md
+/// "Enforcement"). The test walks src/, so it always runs on the HOST, from
+/// the repo root. Part of `zig build test`; `zig build test-guard` runs it alone.
+fn addAgnosticGuard(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agnostic_guard_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const guard_run = b.addRunArtifact(guard_tests);
+    guard_run.setCwd(b.path("."));
+    test_step.dependOn(&guard_run.step);
+    b.step("test-guard", "Check src/ for platform, store and package names (RFC #406 agnosticism guard)").dependOn(&guard_run.step);
 }
 
 /// Compile the vendored stb implementation (PNG/TGA/BMP decode, and
