@@ -117,6 +117,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
 
     def reset():
         shutil.rmtree(project / ".labelle", ignore_errors=True)
+        # The lock is written only past discovery; clear the previous run's
+        # so `installed_only` can prove a refused target never reached it.
+        (project / "labelle.lock").unlink(missing_ok=True)
 
     def log(step_dir):
         path = step_dir / "hooks.log"
@@ -129,6 +132,21 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
         assert "FIXTURE_INSTALL_DONE" not in result.stderr and "FIXTURE_GENERATE" not in result.stderr, result.stderr
         assert not (project / ".labelle").exists(), f"the pipeline ran for target {target}"
         assert not home.exists(), "the cache was touched"
+
+    def installed_only(result, target):
+        """A verdict that needs the declared providers: discovery runs only
+        once the assembler's `install` populated the package cache
+        (docs/provider-hooks.md), so the install ran — and nothing after it:
+        no generation, no lock, no compiler. The reporter may have created
+        the target directory for its `failed` record; nothing else is in
+        it."""
+        assert "FIXTURE_INSTALL_DONE" in result.stderr, f"discovery ran before the package cache was populated: {result.stderr}"
+        assert "FIXTURE_GENERATE" not in result.stderr, f"the assembler generated for target {target}: {result.stderr}"
+        assert not (project / "labelle.lock").exists(), "the lock was written for a refused target"
+        for name in (f"raylib_{target}", "raylib_desktop"):
+            tree = project / ".labelle" / name
+            leftovers = [p.name for p in tree.iterdir() if not p.name.startswith(".build-progress")] if tree.exists() else []
+            assert not leftovers, f"the pipeline ran past discovery for target {target}: {leftovers}"
 
     # ── No provider: the schema name alone resolves nothing ───────────────
     declare()
@@ -165,24 +183,41 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
 
     # ── A provider that owns the target but replaces nothing on generate ──
     # The pinned assembler cannot generate for a name outside its enum, so
-    # the build stops with the #378 message before the assembler is invoked.
+    # the build stops with the #378 message before the assembler's
+    # `generate`. With a package declared, every verdict that needs its
+    # manifest — this one, ownership, the bundle replacement — is reached
+    # only after the install populated the cache; the target directory is
+    # named after the requested target throughout.
     declare(dep)
     provider_manifest.write_text(manifest("fixture", ["probe-target"], [hook("pack", "bundle", "replace", "probe-target")]))
     for args in (("build", "--platform=probe-target"), ("generate", "--platform=probe-target"), ("bundle", "--platform=probe-target")):
+        reset()
         stopped = run(*args, code=1)
         assert "target 'probe-target' is declared by 'fixture' but the pinned assembler cannot generate for it yet (labelle-assembler#378)" in stopped.stderr, stopped.stderr
-        untouched(stopped, "probe-target")
-    # Ownership is per target: this provider does not make `wasm` resolvable.
+        installed_only(stopped, "probe-target")
+    # Ownership is per target: this provider does not make `wasm` resolvable,
+    # and that is known only once its manifest is readable — after install.
+    reset()
     refused = run("build", "--platform=wasm", code=1)
+    assert NO_PROVIDER.format(t="wasm") in refused.stderr, refused.stderr
+    assert "(registry:" not in refused.stderr, "a registry owner was invented"
+    installed_only(refused, "wasm")
+    status = json.loads((project / ".labelle" / "raylib_wasm" / ".build-progress.json").read_text())
+    assert status["phase"] == "failed" and status["detail"] == "no provider for target", status
+    # `wasm serve --no-build` installs nothing, so it confirms the target
+    # against the providers discoverable as-is: refused the same way.
+    reset()
+    refused = run("wasm", "serve", "--no-build", code=1)
     assert NO_PROVIDER.format(t="wasm") in refused.stderr, refused.stderr
     untouched(refused, "wasm")
     # A provider target without a bundle replacement cannot be bundled.
     provider_manifest.write_text(manifest("fixture", ["probe-target"],
                                           [hook("gen", "generate", "replace", "probe-target"), hook("build", "build", "replace", "probe-target")]))
+    reset()
     refused = run("bundle", "--platform=probe-target", code=1)
     assert "target 'probe-target' has no bundle replacement; package 'fixture' must declare a `.when = .replace` hook on `bundle`" in refused.stderr, refused.stderr
     assert "NoBundleReplacement" in refused.stderr, refused.stderr
-    untouched(refused, "probe-target")
+    installed_only(refused, "probe-target")
 
     # ── A provider that replaces generate/build/bundle for its target ─────
     provider_manifest.write_text(manifest("fixture", ["probe-target"], [

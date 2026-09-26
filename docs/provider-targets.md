@@ -11,7 +11,7 @@ themselves (`labelle-web`, `labelle-android`, …) still remain to be extracted.
 
 Every command that runs the project pipeline (`generate`, `build`, `run`,
 `bundle`, and the legacy `wasm`, `android` and `ios` subcommands) resolves
-one target before anything is read from the cache, generated or built:
+one target, in two halves, before anything is generated, locked or built:
 
 1. The requested name is `--platform=<t>` when given, else the project's
    declared `.platform`. The parsers check only that it is identifier-shaped
@@ -22,8 +22,7 @@ one target before anything is read from the cache, generated or built:
    declares it in `.targets`. Ownership is validated at discovery, so at most
    one provider can declare a name (`TargetConflict`) and none can declare
    `desktop` (`ReservedTarget`).
-4. A name nobody declares fails, before the assembler, a compiler or the
-   package cache is touched:
+4. A name nobody declares fails:
 
    ```
    labelle: no provider for target 'wasm' in this project; add and pin the package that declares target 'wasm'
@@ -37,10 +36,32 @@ one target before anything is read from the cache, generated or built:
    reads the manifest out of the cached archive without extracting or
    running anything, and never invents a name. Nothing is fetched.
 
+The two halves are the **name** and the **ownership**. The name is settled
+from the string alone, first thing: `desktop` is core, any other name is
+*provisionally* a provider target. That is enough for everything the
+pipeline needs before a provider can be read — the target directory, the
+progress feed, the schema platform the pre-install steps key off — and for
+two verdicts that need no provider: a project with no `.plugins` cannot own
+a provider target and is refused before anything is read, written or built,
+and `labelle bundle` of the core target is refused off macOS before any
+install. Ownership is confirmed right after the assembler's `install`
+populated the package cache, because provider discovery runs only then (a
+declared remote package has no readable manifest before it; see [provider
+hooks](provider-hooks.md#discovery-and-the-graph)). A declared package that
+does not declare the requested name is refused there — after the install,
+before the lock, generation or any compiler, with a `failed` progress record
+(`no provider for target`) and nothing else in the target directory. The
+`labelle-assembler#378` gate and the bundle-replacement check below need the
+hook plans, so they land at the same point. `labelle wasm serve --no-build`
+installs nothing and confirms the name against the providers discoverable
+as-is, like `labelle targets`.
+
 The resolved target is a string. It names the generated tree
-(`.labelle/<backend>_<target>/`), is passed to the assembler's `generate`,
-selects the hook plans, and is the `target` every hook and command context
-carries. `labelle targets` prints what a project can resolve:
+(`.labelle/<backend>_<target>/`, from the provisional name, so a refused
+target leaves only the `failed` record there), is passed to the assembler's
+`generate`, selects the hook plans, and is the `target` every hook and
+command context carries. `labelle targets` prints what a project can
+resolve:
 
 ```
 desktop (core)
@@ -84,13 +105,14 @@ slice, and `provider_settings.zig` is untouched.
 gone):
 
 - `desktop` uses the core macOS packager. The host gate moved from the
-  argument parser into the pipeline, after resolution: off macOS it is still
-  refused before any build, but only for the core target, and no hook can
-  replace it because nobody may own `desktop`.
+  argument parser into the pipeline, right after the name is settled: off
+  macOS it is still refused before any install or build, but only for the
+  core target, and no hook can replace it because nobody may own `desktop`.
 - A provider target must have a `replace` hook on `bundle`, otherwise
   `labelle: target '<t>' has no bundle replacement; package '<pkg>' must
-  declare a `.when = .replace` hook on `bundle`` (`NoBundleReplacement`). The
-  hook runs on any host with `output_dir` =
+  declare a `.when = .replace` hook on `bundle`` (`NoBundleReplacement`),
+  decided with the hook plans after discovery (after the install, before
+  any build). The hook runs on any host with `output_dir` =
   `<target_dir>/zig-out/bundle/<t>/` (or the resolved `--output`), per the
   [output layout](provider-hooks.md#output-layout).
 

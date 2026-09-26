@@ -43,14 +43,42 @@ pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
     }
 }
 
+/// What an absent non-local package means to `discover`. A remote package
+/// that is neither pinned (provider cache) nor in the ordinary package cache
+/// cannot be told apart from a runtime-only package by its manifest, because
+/// there is nothing to read.
+pub const CacheState = enum {
+    /// Metadata-only callers (`labelle help`, command dispatch) run before
+    /// any installer: an absent package is simply not listed.
+    unknown,
+    /// The pipeline discovers AFTER the assembler populated the cache, so an
+    /// absent package is a broken install and fails closed — otherwise a cold
+    /// cache would silently build without the package's hooks while a warm
+    /// one runs them (Codex P1 on #420).
+    populated,
+};
+
 /// Every provider the project declares, with ownership and the cross-provider
 /// hook graph validated. Metadata only: no compiler, lock or build script.
-pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) ![]Provider {
+///
+/// A package directory WITHOUT a `plugin.labelle` is a runtime-only package
+/// (the assembler's light packs ship no manifest); only a missing directory
+/// is an error, and only once the cache is `populated`.
+pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) ![]Provider {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
     for (cfg.plugins) |dep| {
         const pinned = if (dep.isLocal()) null else try sources.projectDir(root, dep);
         const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
+        if (pinned == null and !dep.isLocal() and cache_state == .populated) {
+            std.Io.Dir.cwd().access(config.globalIo(), dir, .{}) catch |err| switch (err) {
+                error.FileNotFound => {
+                    std.debug.print("labelle: package '{s}' ({s}@{s}) is not in the package cache after install: {s}\n", .{ dep.name, dep.repo, dep.version, dir });
+                    return error.ProviderPackageMissing;
+                },
+                else => return err,
+            };
+        }
         const path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
         const bytes = read(a, path) catch |err| switch (err) {
             error.FileNotFound => continue, // Runtime plugins may have no manifest.
@@ -87,7 +115,7 @@ pub fn printHelp(allocator: std.mem.Allocator) !void {
     const cfg = try config.readProjectConfigQuiet(a, root);
     var sources: github.Sources = .{ .a = a };
     defer sources.deinit();
-    const providers = try discover(a, root, cfg, &sources);
+    const providers = try discover(a, root, cfg, &sources, .unknown);
     if (providers.len != 0) std.debug.print("\nProject package commands:\n", .{});
     for (providers) |provider| printCommands(provider);
 }
@@ -113,7 +141,7 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
     const cfg = try config.readProjectConfigQuiet(a, root);
     var sources: github.Sources = .{ .a = a };
     defer sources.deinit();
-    const providers = try discover(a, root, cfg, &sources);
+    const providers = try discover(a, root, cfg, &sources, .unknown);
     for (providers) |provider| {
         if (!std.mem.eql(u8, namespace, provider.meta.namespace orelse continue)) continue;
         const name = args.next() orelse {

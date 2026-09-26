@@ -7,6 +7,9 @@ writes a trivial host executable, so `labelle generate|build|run|bundle` run
 end to end on Windows, macOS and Linux. Every workspace is temporary.
 """
 import argparse
+import gzip
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +17,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 parser = argparse.ArgumentParser()
@@ -28,15 +32,24 @@ fixture = Path(__file__).parent / "fixtures" / "provider"
 exe_suffix = ".exe" if os.name == "nt" else ""
 
 # The fake assembler answers the protocol probe, `install` and `generate`;
-# `generate` writes `.labelle/<backend>_desktop/{build.zig,main.zig}` — a
-# host executable named after the project, with no build.zig.zon so the
-# fingerprint pass skips it. FAKE_MAIN_BROKEN=1 makes the core build fail.
-FAKE_ASSEMBLER = '''import os, sys
+# `generate` writes `.labelle/<backend>_desktop/{build.zig,main.zig,data.txt}`
+# — a host executable named after the project, with no build.zig.zon so the
+# fingerprint pass skips it. The build also INSTALLS `data.txt` to
+# `zig-out/bin/data.txt` and the game prints that file at launch, so a
+# post-build hook's edit to it is observable from the launched game — and a
+# redundant later build would visibly revert it. FAKE_MAIN_BROKEN=1 makes the
+# core build fail. `install` populates the package cache from
+# FAKE_INSTALL_PLUGIN="<src>|<dest>" when set (a remote package landing in
+# the ordinary cache), and only prints otherwise.
+FAKE_ASSEMBLER = '''import os, shutil, sys
 from pathlib import Path
 argv = sys.argv[1:]
 if argv and argv[0] == "--protocol-version":
     print(99)
 elif argv and argv[0] == "install":
+    if os.environ.get("FAKE_INSTALL_PLUGIN"):
+        src, dest = os.environ["FAKE_INSTALL_PLUGIN"].split("|")
+        shutil.copytree(src, dest, dirs_exist_ok=True)
     print("FIXTURE_INSTALL_DONE", file=sys.stderr, flush=True)
 elif argv and argv[0] == "generate":
     root = Path(argv[argv.index("--project-root") + 1])
@@ -51,8 +64,16 @@ elif argv and argv[0] == "generate":
         '        .root_source_file = b.path("main.zig"), .target = b.graph.host,\\n'
         '        .optimize = b.standardOptimizeOption(.{}) }) });\\n'
         '    b.installArtifact(exe);\\n'
+        '    b.installFile("data.txt", "bin/data.txt");\\n'
         '}\\n')
-    body = "this is not zig\\n" if os.environ.get("FAKE_MAIN_BROKEN") == "1" else "pub fn main() void {}\\n"
+    (target / "data.txt").write_text("original")
+    body = "this is not zig\\n" if os.environ.get("FAKE_MAIN_BROKEN") == "1" else (
+        'const std = @import("std");\\n'
+        'pub fn main(init: std.process.Init) !void {\\n'
+        '    const a = init.arena.allocator();\\n'
+        '    const data = std.Io.Dir.cwd().readFileAlloc(init.io, "zig-out/bin/data.txt", a, .limited(1024)) catch "missing";\\n'
+        '    std.debug.print("DATA={s}\\\\n", .{data});\\n'
+        '}\\n')
     (target / "main.zig").write_text(body)
     print("FIXTURE_GENERATE", file=sys.stderr, flush=True)
 else:
@@ -122,8 +143,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     home = base / "home"
     env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
-    env.pop("PROVIDER_PROBE_FAIL", None)
-    env.pop("FAKE_MAIN_BROKEN", None)
+    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN"):
+        env.pop(knob, None)
     checks = 0
 
     def run(*args, code=0, extra_env=None):
@@ -163,10 +184,17 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         a_manifest.write_text(text)
         help_out = run("help", extra_env=dead)
         assert "Usage: labelle" in help_out.stderr and error in help_out.stderr, (error, help_out.stderr)
-        build_out = run("build", code=1, extra_env=dead)
+        # In the pipeline, discovery runs AFTER the package cache is
+        # populated (the assembler's `install`) and BEFORE generation or any
+        # compiler: the install line is there, the generate line is not, and
+        # LABELLE_ZIG still points nowhere so a compiler was never reached.
+        build_out = run("build", code=1, extra_env={"LABELLE_ZIG": dead["LABELLE_ZIG"]})
         assert error in build_out.stderr and "provider discovery failed" in build_out.stderr, (error, build_out.stderr)
-        assert "FIXTURE_INSTALL_DONE" not in build_out.stderr, "discovery did not fail before the assembler"
+        assert "FIXTURE_INSTALL_DONE" in build_out.stderr, "discovery ran before the package cache was populated"
+        assert "FIXTURE_GENERATE" not in build_out.stderr, "discovery did not fail before generation"
         assert not home.exists(), "a failed discovery touched the cache"
+        status = json.loads((target_dir / ".build-progress.json").read_text())
+        assert status["phase"] == "failed" and status["detail"] == "provider discovery failed", status
         a_manifest.write_text(manifest("fixture-a", A_HOOKS))
 
     # `replace` on a target the package does not own — `desktop` is core's.
@@ -261,6 +289,86 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert order(entries, "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], entries
     text = result.stderr
     assert text.index("hook 'fixture-b/b-run-pre'") < text.index("labelle: running...") < text.index("hook 'fixture-a/a-run-post'"), text
+
+    # ── run: an `after build` hook's output survives until launch ─────────
+    # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs
+    # from source. The game prints the file it finds at launch: with the
+    # redundant warm `zig build` that used to precede the launch, the install
+    # step copied the original back over the hook's edit (Codex P2 on #420).
+    reset()
+    run("build")
+    data_file = zig_out / "bin" / "data.txt"
+    assert data_file.read_text() == "original", data_file.read_text()
+    reset()
+    result = run("run", extra_env={"PROVIDER_PROBE_PATCH": "a-post"})
+    assert "DATA=patched:a-post" in result.stderr, result.stderr
+    assert data_file.read_text() == "patched:a-post", data_file.read_text()
+    assert result.stderr.count("build ok") == 1, result.stderr
+    # The mechanism, not just the value: one more `zig build` on the same
+    # tree DOES revert the edit, so the launch above proving it intact means
+    # no build ran between the hook and the game.
+    subprocess.run([zig, "build"], cwd=target_dir, check=True, capture_output=True, timeout=600)
+    assert data_file.read_text() == "original", "a warm zig build no longer re-installs data.txt; the check above is vacuous"
+
+    # ── Cold cache: a declared remote package is never silently skipped ───
+    # Discovery ran ahead of the installer, so on a cold cache a remote
+    # package had no readable manifest and was taken for runtime-only: the
+    # build proceeded without its hooks, while a warm cache ran them (Codex
+    # P1 on #420). Now discovery follows `install`, and after it an absent
+    # package is an error.
+    remote_src = base / "fixture-c"
+    shutil.copytree(fixture, remote_src)
+    (remote_src / "plugin.labelle").write_text(manifest("fixture-c", [hook("c-pre", "build", "before")]))
+    remote_cache = home / "packages" / "plugins" / "example" / "fixture-c" / "1.0.0"
+    dep_c = '.{ .name = "fixture-c", .repo = "example/fixture-c", .version = "1.0.0" }'
+    declare(dep_c)
+    populate = {"FAKE_INSTALL_PLUGIN": f"{remote_src}|{remote_cache}"}
+
+    def cold():
+        reset()
+        shutil.rmtree(home, ignore_errors=True)
+
+    # (1) The installer does not deliver the package: fail closed, after the
+    #     install and before generation — never a hook-less build.
+    cold()
+    absent = run("build", code=1)
+    assert "ProviderPackageMissing" in absent.stderr and "fixture-c" in absent.stderr, absent.stderr
+    assert "FIXTURE_INSTALL_DONE" in absent.stderr and "FIXTURE_GENERATE" not in absent.stderr, absent.stderr
+    assert not exe.exists() and not remote_cache.exists()
+    # (2) The installer delivers it (cold ordinary cache, populated by this
+    #     very install): the provider IS discovered, and being unpinned its
+    #     hook is refused — the same outcome a warm cache always had.
+    cold()
+    unpinned = run("build", code=1, extra_env=populate)
+    assert "RemoteProviderIntegrityRequired" in unpinned.stderr and "'fixture-c' is unpinned" in unpinned.stderr, unpinned.stderr
+    assert "FIXTURE_GENERATE" in unpinned.stderr and "build ok" not in unpinned.stderr and not exe.exists(), unpinned.stderr
+    assert remote_cache.exists()
+    # (3) Warm cache, same command: identical outcome, so cold and warm agree.
+    reset()
+    warm = run("build", code=1)
+    assert "RemoteProviderIntegrityRequired" in warm.stderr and "build ok" not in warm.stderr, warm.stderr
+    # (4) Pinned (the integrity model of cli#414) with a cold ORDINARY cache:
+    #     the provider comes from the verified archive and its hook runs.
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for member in sorted(remote_src.iterdir()):
+            info = tarfile.TarInfo("fixture-c-commit/" + member.name)
+            content = member.read_bytes()
+            info.size, info.mode = len(content), 0o644
+            tar.addfile(info, io.BytesIO(content))
+    archive = gzip.compress(payload.getvalue(), mtime=0)
+    pin = {"package": "fixture-c", "repo": "example/fixture-c", "version": "1.0.0", "commit": "c" * 40,
+           "sha256": hashlib.sha256(archive).hexdigest()}
+    cold()
+    (home / "provider-archives").mkdir(parents=True)
+    (home / "provider-archives" / (pin["sha256"] + ".tar.gz")).write_bytes(archive)
+    (project / "labelle.providers.lock").write_text(json.dumps({"schema_version": 1, "providers": [pin]}))
+    pinned = run("build")
+    assert order(log(zig_out), "build") == [("before", "c-pre")], log(zig_out)
+    assert exe.exists() and not remote_cache.exists(), "the pinned provider needed the ordinary cache"
+    assert "hook 'fixture-c/c-pre'" in pinned.stderr, pinned.stderr
+    (project / "labelle.providers.lock").unlink()
+    declare(dep_b, dep_a)
 
     # ── bundle ────────────────────────────────────────────────────────────
     reset()
