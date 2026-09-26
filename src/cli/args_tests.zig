@@ -349,6 +349,14 @@ pub const ParsePlatformValueSpec = struct {
             try std.testing.expect(parseTargetValue("1st") == null);
             try std.testing.expect(parseTargetValue("-flag") == null);
         }
+        test "returns null for a Windows reserved device name, which is identifier-shaped" {
+            // `zig-out/bundle/<t>/` must be creatable on every host.
+            for ([_][]const u8{ "con", "nul", "prn", "aux", "com1", "lpt9" }) |device| {
+                try std.testing.expect(parseTargetValue(device) == null);
+            }
+            try std.testing.expectEqualStrings("console", parseTargetValue("console").?);
+            try std.testing.expectEqualStrings("com10", parseTargetValue("com10").?);
+        }
     };
 
     pub const through_the_build_parser = struct {

@@ -266,20 +266,12 @@ fn safeArchivePath(path: []const u8) bool {
     return true;
 }
 
-/// Windows cannot create these names in any directory, case-insensitively and
-/// regardless of extension (`nul.zig` is still the NUL device), so an archive
-/// containing one extracts on Unix but fails on Windows.
-fn reservedDeviceName(part: []const u8) bool {
-    const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
-    for ([_][]const u8{ "con", "prn", "aux", "nul", "conin$", "conout$" }) |device| {
-        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
-    }
-    return stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and stem[3] >= '1' and stem[3] <= '9';
-}
-
+/// An archive containing a Windows reserved device name extracts on Unix but
+/// fails on Windows (`contract.windowsReservedDeviceName`, shared with the
+/// target-name rule).
 fn hasReservedDeviceName(path: []const u8) bool {
     var parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, path, "/"), '/');
-    while (parts.next()) |part| if (reservedDeviceName(part)) return true;
+    while (parts.next()) |part| if (contract.windowsReservedDeviceName(part)) return true;
     return false;
 }
 

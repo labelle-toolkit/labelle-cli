@@ -150,6 +150,25 @@ pub fn identifier(value: []const u8) bool {
     return true;
 }
 
+/// Windows cannot create these names in any directory, case-insensitively
+/// and regardless of extension (`nul.zig` is still the NUL device), so a
+/// path component that is one extracts on Unix but fails on Windows.
+pub fn windowsReservedDeviceName(part: []const u8) bool {
+    const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
+    for ([_][]const u8{ "con", "prn", "aux", "nul", "conin$", "conout$" }) |device| {
+        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
+    }
+    return stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and stem[3] >= '1' and stem[3] <= '9';
+}
+
+/// A target name: an identifier that can also name a directory on every
+/// host. The resolved target becomes a path component (`.labelle/<backend>_<t>/`,
+/// `zig-out/bundle/<t>/`), so a Windows reserved device name — `con`, `nul`,
+/// `com1`, … — is not a target, however well-formed as an identifier.
+pub fn targetName(value: []const u8) bool {
+    return identifier(value) and !windowsReservedDeviceName(value);
+}
+
 fn absolute(path: []const u8) !void {
     if (std.mem.indexOfScalar(u8, path, 0) != null or !std.fs.path.isAbsolute(path))
         return error.InvalidPath;
@@ -299,4 +318,24 @@ test "ownership rejects conflicts and reserved identities before dispatch" {
     try std.testing.expectError(error.ReservedTarget, validateOwnership(&.{second}, &.{}));
     second.targets = &.{ "a", "a" };
     try std.testing.expectError(error.DuplicateName, validateOwnership(&.{second}, &.{}));
+}
+
+test "a target name is an identifier that is not a Windows reserved device name" {
+    for ([_][]const u8{ "desktop", "probe-target", "console", "nul0", "com10", "lpt", "auxiliary", "cons" }) |name| {
+        try std.testing.expect(identifier(name));
+        try std.testing.expect(targetName(name));
+    }
+    for ([_][]const u8{ "con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9" }) |name| {
+        try std.testing.expect(identifier(name));
+        try std.testing.expect(windowsReservedDeviceName(name));
+        try std.testing.expect(!targetName(name));
+    }
+    // The device rule folds case and ignores an extension, like Windows does;
+    // the identifier rule already excludes those spellings on its own.
+    for ([_][]const u8{ "NUL", "Con.tar.gz", "aux.h", "COM1", "conin$", "conout$.zig" }) |name| {
+        try std.testing.expect(windowsReservedDeviceName(name));
+        try std.testing.expect(!targetName(name));
+    }
+    try std.testing.expect(!targetName("Probe"));
+    try std.testing.expect(!targetName(""));
 }

@@ -51,7 +51,7 @@ pub const Provisional = struct {
 /// Pure. `InvalidTarget` for a non-identifier (the parsers reject those
 /// first, with their own message).
 pub fn provisional(requested: []const u8) !Provisional {
-    if (!contract.identifier(requested)) return error.InvalidTarget;
+    if (!contract.targetName(requested)) return error.InvalidTarget;
     if (std.mem.eql(u8, requested, core_target)) return .{ .name = core_target, .is_core = true, .legacy = .desktop };
     return .{ .name = requested, .is_core = false, .legacy = std.meta.stringToEnum(project.Platform, requested) };
 }
@@ -203,3 +203,4 @@ test "provider targets: the no-provider diagnostic names a registry owner only w
     try std.testing.expect(std.mem.startsWith(u8, present, absent));
     try std.testing.expectEqualStrings("  (registry: fixture)\n", present[absent.len..]);
 }
+    try std.testing.expectError(error.InvalidTarget, provisional("nul"));

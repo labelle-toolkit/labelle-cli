@@ -454,12 +454,18 @@ pub fn parseWasmExportArgs(args: anytype) ?WasmExportArgs {
 /// core target and the pinned providers (`provider_targets.resolve`), so
 /// the parser holds no list of targets.
 pub fn parseTargetValue(val: []const u8) ?[]const u8 {
-    return if (contract.identifier(val)) val else null;
+    return if (contract.targetName(val)) val else null;
 }
 
 /// The one diagnostic for a malformed `--platform` value, shared by every
-/// parser that accepts the flag.
+/// parser that accepts the flag. A Windows reserved device name is
+/// identifier-shaped, so it gets its own reason: the target names a
+/// directory (`zig-out/bundle/<t>/`) that Windows cannot create.
 pub fn printInvalidTarget(cmd_name: []const u8, val: []const u8) void {
+    if (contract.identifier(val) and contract.windowsReservedDeviceName(val)) {
+        std.debug.print("labelle {s}: invalid target '{s}' (a Windows reserved device name cannot name a target; run 'labelle targets')\n", .{ cmd_name, val });
+        return;
+    }
     std.debug.print("labelle {s}: invalid target '{s}' (targets are lowercase identifiers; run 'labelle targets')\n", .{ cmd_name, val });
 }
 
