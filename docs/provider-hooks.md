@@ -62,8 +62,23 @@ accepted remote and local manifests together before writing
 | `HookPhaseOrder` | it names a hook in a later phase (`before` → `replace`/`after`, `replace` → `after`) |
 | `HookCycle` | a cycle among same-phase references |
 
-Each prints one `labelle: hooks: …` line naming the hooks involved. A
-malformed provider therefore fails a plain `labelle build` closed, with
+Each prints one `labelle: hooks: …` line naming the hooks involved.
+
+The metadata-only callers — `labelle help` and provider command dispatch —
+run before any installer, so a declared remote package that is in neither
+cache has nothing to read and is simply not listed. A reference into such a
+package is then **unresolved, not missing**: `MissingHookReference` is
+deferred until the package can be read (the pipeline's populated discovery,
+`providers resolve --accept`), and `help` keeps listing the commands of the
+providers it did read. Without that, a cached provider that names a valid
+hook in an uncached one lost every provider command from `help` and refused
+dispatch until the second package happened to enter the cache. The deferral
+is exact: a reference into a package the project never declared, or into a
+declared package that *is* present but lacks the hook, is still reported at
+`help` as before, and the same absent package fails the pipeline closed
+(`ProviderPackageMissing`) once the install has run.
+
+A malformed provider therefore fails a plain `labelle build` closed, with
 `labelle: provider discovery failed: <error>`, exit status 1 and a `failed`
 progress record, before anything is generated. For pinned remote providers,
 discovery is the same verify-and-extract every provider command performs;
@@ -124,9 +139,26 @@ nonzero fails the command with **the hook's own exit code**, prints
 feed `failed` with that code. Nothing later runs: a failing `before` hook
 means the core step never starts, and a failing core step (or `replace`
 hook) means no `after` hook runs — contract §6, so a publishing hook can
-never ship a stale artifact. For `run`, after hooks run only when the game
-exited 0, before the terminal `done` record, and a nonzero game exit is still
-the CLI's exit status.
+never ship a stale artifact.
+
+For `run`, the core step has an explicit outcome and `after run` hooks run
+**only when the game process itself exited 0** (`exited_clean`), before the
+terminal `done` record. Every other outcome skips them and prints one
+`labelle: after-run hooks skipped: <reason>` line (only when there are hooks
+to skip); the CLI's exit status is unchanged by the skip:
+
+| Outcome | When | CLI exit status |
+| --- | --- | --- |
+| `exited_clean` | the game exited 0 | 0, or a failing after hook's code |
+| `exited_error` | the game exited nonzero or was killed by a signal | the game's (128 + signal) |
+| `timed_out` | the `--timeout` watchdog stopped the game | 0 (a genuine expiry is not a failure, cli#390) |
+| `launched_detached` | `simctl launch` / `adb shell am start` returned while the app runs on | 0 |
+
+A zero status alone was never a clean exit — the watchdog reports 0 after
+killing the game, and the mobile deploy paths return as soon as the launch is
+issued — so a publishing or cleanup hook used to run after a forced timeout
+or immediately after a device launch. A `replace run` hook that exits 0 and
+`wasm export` are clean ends of the step.
 
 Hooks report under the progress phase of the step they wrap (`generate`,
 `compile` for `build`, `run` for `bundle` and `run`) as sub-steps named
@@ -150,11 +182,20 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   because the core desktop packager is macOS-only and a hook cannot replace
   it. Provider targets (next slice) get their own `bundle` replacement.
 - `wasm serve` is interactive: its `done` record lands before the serve loop
-  and the `after run` hooks run only once the server returns. A `--watch`
-  rebuild re-runs the `generate` and `build` hook phases around its core
-  steps exactly as the cold pipeline did (the feed is already terminal, so
-  the hooks' sub-step records are not emitted there); a failing hook stops
-  that rebuild and keeps the server alive, like a failing core step.
+  and the `after run` hooks run once the server returns. The server returns
+  on Ctrl+C or SIGTERM: the handler sets a flag, a waker thread pokes the
+  listener so the blocked `accept` returns, the loop exits cleanly and the
+  hooks run before the process ends (a second Ctrl+C while a hook is still
+  running forces the exit). On Windows the handler is registered with
+  `SetConsoleCtrlHandler` and covers Ctrl+C, Ctrl+Break and a console close;
+  it is compile-checked but not exercised by CI, so it is best-effort. A
+  `--watch` rebuild re-runs the `generate` and `build` hook phases around its
+  core steps exactly as the cold pipeline did (the feed is already terminal,
+  so the hooks' sub-step records are not emitted there); a failing hook stops
+  that rebuild and keeps the server alive, like a failing core step. Each hook
+  phase allocates on a scratch arena freed when the phase returns — only the
+  resolved host compiler outlives it — so a long watch session with hooks does
+  not grow on every saved edit.
 - A `--docker` run whose binary was cross-compiled skips the launch and its
   `after run` hooks with it (nothing ran).
 
@@ -162,9 +203,16 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
 
 `zig build test-provider-dispatch` (also collected by `zig build test`)
 covers manifest validation, the planner's order independence, every graph
-error, the output-layout contract and the hook wire context; `zig build test`
-also covers the watched-rebuild hook plumbing (the serve loop itself is
-interactive) and the `link`-phase sub-step. The real-process regression is:
+error, the deferral of references into an unread package (at the graph and
+at discovery, against a real cache layout in both cache states), the
+per-phase scratch arena (a counting allocator proves two phases on one site
+leave nothing live), the `run` outcomes (only `exited_clean` reaches the
+hook machinery), the output-layout contract and the hook wire context;
+`zig build test` also covers the watched-rebuild hook plumbing, the serve
+loop's stop flag and the waker's poke (the signal handler itself is
+interactive, so the Ctrl+C path is not driven end to end — it is the flag
+the handler sets that is tested) and the `link`-phase sub-step. The
+real-process regression is:
 
 ```
 zig build
@@ -179,10 +227,12 @@ code with no core build and no `after` hook, a failing core build skipping
 `after`, discovery errors (`ReplaceRequiresOwnedTarget`, `DuplicateReplaceHook`,
 `MissingHookReference`, `HookPhaseOrder`) at `labelle help` before any
 compiler and at `labelle build` after the install but before generation,
-`generate` hooks seeing the lock, `run` hooks around the game, an `after
-build` edit to `zig-out/` reaching the launched game intact, a cold package
-cache failing closed or running a pinned provider's hooks (never skipping
-them), `bundle` hooks and the `.app` location on macOS, and the refusal
-elsewhere. `test/provider_github_e2e.py` checks that `--accept` refuses a
+`generate` hooks seeing the lock, `run` hooks around the game, a `--timeout`
+kill running no `after run` hook (and printing the skip line) while a clean
+exit still does, an `after build` edit to `zig-out/` reaching the launched
+game intact, a cold package cache failing closed or running a pinned
+provider's hooks (never skipping them), a reference into an uncached remote
+package leaving `help` intact while a typo is still reported, `bundle` hooks
+and the `.app` location on macOS, and the refusal elsewhere. `test/provider_github_e2e.py` checks that `--accept` refuses a
 broken hook graph without writing the lock. CI runs them on Windows, macOS
 and Linux.

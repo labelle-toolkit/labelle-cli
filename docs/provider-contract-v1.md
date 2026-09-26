@@ -145,7 +145,7 @@ Index defaults are suggestions, not automatically trusted project declarations. 
 
 Resolve stable hook identities as `<package>/<hook-id>`. Within each target/step, execute before hooks, the core operation or unique replacement, then after hooks. Provider dependencies create ordering edges within a phase; explicit `after_hooks` refine hook ordering. Break independent ties by fully qualified hook ID. Reject missing hook references, cycles, dependencies on later phases, and multiple replacements before execution. A replacement belongs only to the target owner. Sequential execution is sufficient for v1.
 
-Stop on any failed hook/operation; after hooks run only after success. Hooks clean up their own temporary resources. Do not run publishing hooks after a failed build or reuse an old output as a new success. Graph construction/execution and its fixture tests belong to phase 3.
+Stop on any failed hook/operation; after hooks run only after success. For `run`, success means the game process itself exited with status 0: a game the `--timeout` watchdog stopped, or a simulator/device launch that returns while the app is still running, is not a success even though the CLI's own exit status is 0, and its after hooks are skipped with one diagnostic line. Hooks clean up their own temporary resources. Do not run publishing hooks after a failed build or reuse an old output as a new success. Graph construction/execution and its fixture tests belong to phase 3.
 
 ## 7. Backend agnosticism migration
 
