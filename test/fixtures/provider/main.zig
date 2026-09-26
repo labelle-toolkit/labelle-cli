@@ -67,6 +67,23 @@ pub fn main(init: std.process.Init) !u8 {
             });
         }
     } else |_| {}
+    // `PROVIDER_PROBE_COPY=<hook id>|<src>|<dest>` makes that hook produce a
+    // generation INPUT the way an asset-generating hook would: it copies the
+    // absolute `<src>` to `<dest>`, relative to the project root (the hook's
+    // cwd), creating the parent directory. A `before generate` hook's output
+    // must be visible to every pre-pass that reads declared resources
+    // (Codex P2 on #420).
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_COPY")) |spec| {
+        var parts = std.mem.splitScalar(u8, spec, '|');
+        const copy_id = parts.next() orelse "";
+        const src = parts.next() orelse "";
+        const dest = parts.next() orelse "";
+        if (invocation == .object and std.mem.eql(u8, invocation.object.get("id").?.string, copy_id)) {
+            if (std.fs.path.dirname(dest)) |dir| try std.Io.Dir.cwd().createDirPath(init.io, dir);
+            const copied = try std.Io.Dir.cwd().readFileAlloc(init.io, src, a, .limited(16 * 1024 * 1024));
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = dest, .data = copied });
+        }
+    } else |_| {}
     // Hooks receive no argv, so a failing hook is selected by environment:
     // `PROVIDER_PROBE_FAIL=<hook id>` makes that hook exit 7.
     if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_FAIL")) |fail_id| {

@@ -15,10 +15,12 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--zig", default=shutil.which("zig"))
@@ -135,9 +137,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     dep_a = '.{ .name = "fixture-a", .repo = "local:../fixture-a", .version = "1.0.0" }'
     dep_b = '.{ .name = "fixture-b", .repo = "local:../fixture-b", .version = "1.0.0" }'
 
-    def declare(*deps):
+    def declare(*deps, resources=""):
         (project / "project.labelle").write_text(
-            f'.{{ .name = "game", .zig_version = "{version}", .plugins = .{{ {", ".join(deps)} }} }}')
+            f'.{{ .name = "game", .zig_version = "{version}", .plugins = .{{ {", ".join(deps)} }}{resources} }}')
 
     # Reverse alphabetical declaration order is the default for the suite.
     declare(dep_b, dep_a)
@@ -148,7 +150,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     home = base / "home"
     env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
-    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN", "FAKE_GAME_HANG"):
+    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "PROVIDER_PROBE_COPY", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN",
+                 "FAKE_GAME_HANG"):
         env.pop(knob, None)
     checks = 0
 
@@ -285,6 +288,39 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert lock_file.exists() and "fixture-a" in lock_file.read_text()
     assert not exe.exists(), "generate built the project"
     assert not zig_out.exists() or not (zig_out / "hooks.log").exists(), "generate ran build hooks"
+
+    # ── generate: a before-generate hook's output feeds the pre-passes ────
+    # The `--bake` pre-pass reads every declared PNG. `a-gen-pre` is what
+    # writes `assets/hook.png` here (a 1x1 PNG staged outside the project);
+    # the pre-pass used to run before the hook and fail on the missing file
+    # (Codex P2 on #420). Now the hook runs first, the bake sees the PNG and
+    # writes its `.rgba` sibling, and only then does generation run.
+    png = base / "hook.png"
+    raw = zlib.compress(b"\x00\xff\x00\x00\xff")  # one filter byte + one RGBA pixel
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", raw) + chunk(b"IEND", b""))
+    assets = project / "assets"
+    declare(dep_b, dep_a, resources=', .resources = .{ .{ .name = "hook", .json = "assets/hook.json", .texture = "assets/hook.png" } }')
+    reset()
+    shutil.rmtree(assets, ignore_errors=True)
+    baked = run("generate", "--bake", extra_env={"PROVIDER_PROBE_COPY": f"a-gen-pre|{png}|assets/hook.png"})
+    assert (assets / "hook.png").read_bytes() == png.read_bytes(), "the hook did not write the PNG"
+    assert (assets / "hook.rgba").exists(), "the bake pre-pass did not see the hook's PNG"
+    text = baked.stderr
+    assert "baked 1 atlas(es)" in text and "FIXTURE_GENERATE" in text, text
+    assert text.index("hook 'fixture-a/a-gen-pre'") < text.index("baked 1 atlas(es)") < text.index("FIXTURE_GENERATE"), text
+    # The mechanism: the pre-pass genuinely needs the file. With no hook
+    # writing it, the same command fails on the missing PNG, before
+    # generation — so the success above is the hook running first.
+    reset()
+    shutil.rmtree(assets, ignore_errors=True)
+    unfed = run("generate", "--bake", code=1)
+    assert "bake 'assets/hook.png' failed: FileNotFound" in unfed.stderr, unfed.stderr
+    assert "hook 'fixture-a/a-gen-pre'" in unfed.stderr and "FIXTURE_GENERATE" not in unfed.stderr, unfed.stderr
+    shutil.rmtree(assets, ignore_errors=True)
+    declare(dep_b, dep_a)
 
     # ── run: before/after around the game ─────────────────────────────────
     reset()

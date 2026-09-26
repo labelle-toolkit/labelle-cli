@@ -926,47 +926,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
 
-    // ASTC build-time conversion (#340): when this platform ships ASTC atlases
-    // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
-    // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
-    // before the assembler steps (it only needs project.labelle + the PNGs +
-    // astcenc). Non-fatal — on any failure the assembler finds no sibling and
-    // falls back to the source PNG, so the build still succeeds.
-    //
-    // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
-    // compile to one `.astc` with disagreeing block pins; falling back would
-    // hand BOTH of them whatever `.astc` is on disk — including a STALE one
-    // from an earlier build, which is worse than no atlas because it looks
-    // like it worked. So a config error stops the build, while a conversion
-    // failure still degrades to PNG.
-    if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-        // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
-        // sokol) and the Android backend fallback all differ from what
-        // project.labelle declares, and the loadable blocks depend on both.
-        astc_cmd.cmdAstc(allocator, &.{
-            project_dir,
-            "--platform",
-            @tagName(parsed.platform),
-            "--backend",
-            @tagName(parsed.backend),
-        }) catch |err| switch (err) {
-            error.ConflictingAstcBlocks => progress.fatalExit(
-                1,
-                "conflicting .astc_block pins compile to one .astc — see the error above",
-            ),
-            // A stale `.astc` (wrong block for this target) that could not be
-            // deleted would be swapped in by the assembler — the PNG fallback
-            // below would be a lie. Stop instead (labelle-bgfx#134).
-            error.StaleAstcSiblingUndeletable => progress.fatalExit(
-                1,
-                "a stale .astc sibling could not be deleted — see the error above",
-            ),
-            else => std.debug.print(
-                "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
-                .{@errorName(err)},
-            ),
-        };
-    }
+    // (The ASTC conversion pre-pass used to run here, before the install.
+    // It is a generation-input reader — it consumes the declared PNGs — so
+    // it now runs inside the core `generate` step below, AFTER the `before
+    // generate` provider hooks; see the note there.)
 
     // Ensure the package cache is populated. The assembler's `generate`
     // subcommand assumes a populated cache (it does not fetch packages
@@ -1084,19 +1047,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .reporter = reporter,
     };
 
-    // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
-    // @embedFile path picks up the fresh `.rgba` files. Skipped unless
-    // `--bake` is passed: raw RGBA expands heavily-transparent atlases
-    // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
-    // APK size sane. Use for projects whose atlases are nearly opaque
-    // and PNG decode dominates cold start.
-    if (parsed_args.bake) {
-        bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
-            std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
-            return err;
-        };
-    }
-
     // Issue #217 phase 2: delegate code generation to the standalone
     // labelle-assembler binary via the shared subprocess harness, instead
     // of calling an in-process generator. The binary was located above
@@ -1122,6 +1072,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // core generation — or its unique `replace` hook — then `after` hooks.
     // `output_dir` is the generated tree itself. A failing hook ends the
     // command with the hook's own exit code; nothing past it runs.
+    //
+    // The `before` phase runs ahead of EVERY generation-input reader: the
+    // ASTC conversion pre-pass and the `--bake` pre-pass both consume the
+    // declared PNGs, so a hook that produces one of them used to run too
+    // late for them — `generate --bake` failed on the not-yet-written PNG
+    // and a hook-generated PNG never got its `.astc` sibling (Codex P2 on
+    // #420). Both pre-passes are part of the core generation they feed, so
+    // a `replace generate` hook stands in for them too: the replacement
+    // owns whatever preprocessing its generation needs.
     const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, hook_target, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.before, .generate, .before, generate_out);
@@ -1133,6 +1092,62 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             if (code != 0) return code;
             break :core_generate;
         }
+
+        // ASTC build-time conversion (#340): when this platform ships ASTC atlases
+        // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
+        // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
+        // before the assembler's `generate` (it only needs project.labelle + the
+        // PNGs + astcenc). Non-fatal — on any failure the assembler finds no
+        // sibling and falls back to the source PNG, so the build still succeeds.
+        //
+        // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
+        // compile to one `.astc` with disagreeing block pins; falling back would
+        // hand BOTH of them whatever `.astc` is on disk — including a STALE one
+        // from an earlier build, which is worse than no atlas because it looks
+        // like it worked. So a config error stops the build, while a conversion
+        // failure still degrades to PNG.
+        if (parsed.asset_compression.formatFor(parsed.platform) == .astc) {
+            // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
+            // sokol) and the Android backend fallback all differ from what
+            // project.labelle declares, and the loadable blocks depend on both.
+            astc_cmd.cmdAstc(allocator, &.{
+                project_dir,
+                "--platform",
+                @tagName(parsed.platform),
+                "--backend",
+                @tagName(parsed.backend),
+            }) catch |err| switch (err) {
+                error.ConflictingAstcBlocks => progress.fatalExit(
+                    1,
+                    "conflicting .astc_block pins compile to one .astc — see the error above",
+                ),
+                // A stale `.astc` (wrong block for this target) that could not be
+                // deleted would be swapped in by the assembler — the PNG fallback
+                // below would be a lie. Stop instead (labelle-bgfx#134).
+                error.StaleAstcSiblingUndeletable => progress.fatalExit(
+                    1,
+                    "a stale .astc sibling could not be deleted — see the error above",
+                ),
+                else => std.debug.print(
+                    "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
+                    .{@errorName(err)},
+                ),
+            };
+        }
+
+        // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
+        // @embedFile path picks up the fresh `.rgba` files. Skipped unless
+        // `--bake` is passed: raw RGBA expands heavily-transparent atlases
+        // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
+        // APK size sane. Use for projects whose atlases are nearly opaque
+        // and PNG decode dominates cold start.
+        if (parsed_args.bake) {
+            bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
+                std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+        }
+
         try assembler_proc.generate(
             asm_bin,
             allocator,

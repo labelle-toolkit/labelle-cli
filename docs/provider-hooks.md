@@ -87,7 +87,15 @@ that cost is accepted (it is the integrity model of #414).
 ## Order
 
 Within one `(step, target)`: every `before` hook, then the core step or its
-unique `replace` hook, then every `after` hook. Inside a phase the order is a
+unique `replace` hook, then every `after` hook. For `generate`, the core step
+includes its input pre-passes — the ASTC conversion of declared atlases and
+the opt-in `--bake` — so a `before generate` hook runs ahead of every reader
+of the generation inputs: a hook that emits a declared PNG is seen by both
+pre-passes and by the assembler. (The pre-passes used to run before the
+hooks; `generate --bake` then failed on a PNG the hook had not yet written.)
+A `replace generate` hook stands in for the pre-passes as well as for the
+assembler: whatever preprocessing its generation needs is its own to do.
+Inside a phase the order is a
 topological sort of the `after_hooks` edges that land in that phase; whenever
 several hooks are ready, the lexicographically smallest fully qualified ID
 runs first. A reference to an earlier phase is accepted and creates no edge.
