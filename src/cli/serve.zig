@@ -749,9 +749,19 @@ fn isSubset(sub: []const u64, super: []const u64) bool {
 /// no new-to-the-chain path beyond the footprint — a re-save of a path
 /// already in `recent`, or one landing on a run where the writers changed
 /// fewer new paths than usual — and takes it as a build output: the
-/// ambiguity above, widened to the chain. As a last bound, the `follow_up_ceiling`-th follow-up
+/// ambiguity above, widened to the chain.
+///
+/// Ceiling. The `follow_up_ceiling`-th follow-up of a chain settles only
+/// the chain's own output paths — those an earlier rebuild of the chain
+/// changed (`recent`). A path outside that set (a source the user saved
+/// while that follow-up ran, or a writer's new output: the two cannot be
+/// told apart) stays pending: the tree it left is unbuilt, so one more
+/// rebuild reads it, and that rebuild starts a FRESH chain rather than
+/// counting as a ninth follow-up (Codex P2 on #427, cli#429: the ceiling
+/// used to mark every path the final callback saw as built). As the last
+/// bound, a chain started that way which reaches the ceiling again
 /// settles whatever it changed, so no writer (one whose output count keeps
-/// growing, say) can loop.
+/// growing, say) can loop: it costs at most two chains.
 const WatchBaseline = struct {
     /// Follow-ups after which a varying-path chain may settle (see above).
     const follow_up_cap: u32 = 2;
@@ -777,6 +787,13 @@ const WatchBaseline = struct {
     /// Set by the `settle` that ended a chain by the follow-up cap: how many
     /// follow-ups it took (the watcher logs it); 0 otherwise.
     capped: u32 = 0,
+    /// Set when a chain reached the ceiling with paths outside its own
+    /// outputs: the next rebuild (fired for that pending tree) starts a
+    /// fresh chain instead of counting as another follow-up.
+    restart_chain: bool = false,
+    /// The current chain was started by such a ceiling: reaching the
+    /// ceiling again settles unconditionally (the last bound).
+    after_ceiling: bool = false,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *WatchBaseline) void {
@@ -796,8 +813,13 @@ const WatchBaseline = struct {
     /// `delta` the sorted keys of the paths that changed in between
     /// (`null`: unknown, which never settles on `post`). Borrows `delta`.
     fn settle(self: *WatchBaseline, trigger: TreeSignature, post: TreeSignature, delta: ?[]const u64) void {
-        const follow_up = if (self.post) |previous| trigger.eql(previous) else false;
-        if (!follow_up) self.dropChain();
+        const restarted = self.restart_chain;
+        self.restart_chain = false;
+        const follow_up = !restarted and if (self.post) |previous| trigger.eql(previous) else false;
+        if (!follow_up) {
+            self.dropChain();
+            self.after_ceiling = restarted;
+        }
         self.capped = 0;
         const by_rule = if (delta) |d|
             d.len == 0 or (follow_up and self.delta != null and isSubset(d, self.delta.?))
@@ -815,12 +837,12 @@ const WatchBaseline = struct {
     /// `delta` in the chain, and return true when this follow-up settles by
     /// the cap or the ceiling. An unknown `delta` stops the chain's path
     /// tracking (the cap cannot judge it) but still counts toward the
-    /// ceiling.
+    /// ceiling, where it is judged as changing paths outside the chain.
     fn chain(self: *WatchBaseline, follow_up: bool, delta: ?[]const u64) bool {
         if (follow_up) self.follow_ups +|= 1;
         const d = delta orelse {
             self.forgetRecent();
-            return self.endAtCeiling(follow_up);
+            return self.atCeiling(follow_up, null) == .settled;
         };
         const novel = if (self.recent) |r| countNovel(d, r) else d.len;
         if (follow_up and self.recent != null and self.follow_ups >= follow_up_cap and novel <= self.footprint) {
@@ -828,7 +850,11 @@ const WatchBaseline = struct {
             self.dropChain();
             return true;
         }
-        if (self.endAtCeiling(follow_up)) return true;
+        switch (self.atCeiling(follow_up, d)) {
+            .below => {},
+            .settled => return true,
+            .pending => return false,
+        }
         const first = self.recent == null;
         const merged = unionKeys(self.allocator, self.recent orelse &.{}, d) catch {
             // Out of memory: stop tracking; only the ceiling still bounds it.
@@ -846,11 +872,23 @@ const WatchBaseline = struct {
         self.recent = null;
     }
 
-    fn endAtCeiling(self: *WatchBaseline, follow_up: bool) bool {
-        if (!follow_up or self.follow_ups < follow_up_ceiling) return false;
-        self.capped = self.follow_ups;
+    const Ceiling = enum { below, settled, pending };
+
+    /// The ceiling (see the type's doc), judged BEFORE `delta` joins
+    /// `recent`: a follow-up at the ceiling settles when every path it
+    /// changed is one of the chain's own outputs, or when the chain was
+    /// itself started by a ceiling (the last bound). Otherwise the chain
+    /// ends with its `post` pending, and the rebuild that reads it starts a
+    /// fresh chain.
+    fn atCeiling(self: *WatchBaseline, follow_up: bool, delta: ?[]const u64) Ceiling {
+        if (!follow_up or self.follow_ups < follow_up_ceiling) return .below;
+        const own = if (delta) |d| if (self.recent) |r| isSubset(d, r) else false else false;
+        const settled = own or self.after_ceiling;
+        if (settled) self.capped = self.follow_ups;
         self.dropChain();
-        return true;
+        self.after_ceiling = false;
+        self.restart_chain = !settled;
+        return if (settled) .settled else .pending;
     }
 
     /// True when `sig` differs from the last build (subject to debounce).
@@ -1240,31 +1278,110 @@ test "watch baseline: an edit saved between capped-chain rebuilds always rebuild
     try std.testing.expectEqual(@as(u32, 1), b.follow_ups);
 }
 
-test "watch baseline: a writer whose output keeps growing settles at the ceiling" {
-    // Each run writes one more new path than the last: never within the
-    // footprint, so only the ceiling ends it.
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    var keys: [64]u64 = undefined;
-    for (&keys, 0..) |*k, i| k.* = i;
-    var next: usize = 0;
-    var posts: [WatchBaseline.follow_up_ceiling + 1]TreeSignature = undefined;
-    for (&posts, 0..) |*p, i| {
+/// Drives a writer whose output count keeps growing (run `i` writes `i + 1`
+/// paths nobody wrote before): never within the chain's footprint, so only
+/// the ceiling can end its chains.
+const GrowingWriter = struct {
+    b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator },
+    keys: [512]u64 = undefined,
+    next: usize = 0,
+    run: usize = 0,
+    trigger: TreeSignature = testSig("edit"),
+
+    fn init(self: *GrowingWriter) void {
+        for (&self.keys, 0..) |*k, i| k.* = 1_000_000 + i;
+    }
+
+    fn postOf(run: usize) TreeSignature {
         var sig = TreeSignature{};
-        sig.mix("post", i, 0);
-        p.* = sig;
+        sig.mix("post", run, 0);
+        return sig;
     }
-    var trigger = testSig("edit");
-    var run: usize = 0;
-    while (run <= WatchBaseline.follow_up_ceiling) : (run += 1) {
-        const d = keys[next .. next + run + 1];
-        next += run + 1;
-        b.settle(trigger, posts[run], d);
-        trigger = posts[run];
-        const at_ceiling = run == WatchBaseline.follow_up_ceiling;
-        try std.testing.expectEqual(!at_ceiling, b.unbuilt(posts[run]));
+
+    /// One rebuild; `extra` is a path saved while it ran (or null).
+    /// Returns its post signature.
+    fn step(self: *GrowingWriter, extra: ?u64) !TreeSignature {
+        var delta: [64]u64 = undefined;
+        const count = self.run + 1;
+        @memcpy(delta[0..count], self.keys[self.next .. self.next + count]);
+        self.next += count;
+        var len = count;
+        if (extra) |key| {
+            delta[len] = key;
+            len += 1;
+        }
+        std.mem.sort(u64, delta[0..len], {}, std.sort.asc(u64));
+        const post = postOf(self.run);
+        self.b.settle(self.trigger, post, delta[0..len]);
+        self.trigger = post;
+        self.run += 1;
+        return post;
     }
-    try std.testing.expectEqual(WatchBaseline.follow_up_ceiling, b.capped);
+};
+
+test "watch baseline: a writer whose output keeps growing settles at the second ceiling" {
+    var w: GrowingWriter = .{};
+    w.init();
+    defer w.b.deinit();
+    // The first chain: the rebuild plus `follow_up_ceiling` follow-ups.
+    // At its ceiling the writer's new paths are outside the chain's own
+    // outputs, so the tree stays pending and the chain restarts.
+    while (w.run < WatchBaseline.follow_up_ceiling) {
+        try std.testing.expect(w.b.unbuilt(try w.step(null)));
+    }
+    const first_ceiling = try w.step(null);
+    try std.testing.expect(w.b.unbuilt(first_ceiling));
+    try std.testing.expectEqual(@as(u32, 0), w.b.capped);
+    // The fresh chain started by that ceiling reaches it again: the last
+    // bound settles it, so the writer cannot loop.
+    var follow_up: u32 = 0;
+    while (follow_up < WatchBaseline.follow_up_ceiling) : (follow_up += 1) {
+        try std.testing.expect(w.b.unbuilt(try w.step(null)));
+        try std.testing.expectEqual(follow_up, w.b.follow_ups);
+    }
+    const second_ceiling = try w.step(null);
+    try std.testing.expect(!w.b.unbuilt(second_ceiling));
+    try std.testing.expectEqual(WatchBaseline.follow_up_ceiling, w.b.capped);
+}
+
+test "watch baseline: a source edit saved during the ceiling follow-up stays pending (cli#429)" {
+    var w: GrowingWriter = .{};
+    w.init();
+    defer w.b.deinit();
+    while (w.run < WatchBaseline.follow_up_ceiling) _ = try w.step(null);
+    try std.testing.expectEqual(WatchBaseline.follow_up_ceiling - 1, w.b.follow_ups);
+    // The ceiling follow-up: the writer's paths plus a source the user
+    // saved while it ran. Not settled — the old ceiling marked the whole
+    // post built and the edit was never compiled.
+    const trigger = w.trigger;
+    const with_edit = try w.step(pathKey("src/main.zig"));
+    try std.testing.expect(w.b.unbuilt(with_edit));
+    try std.testing.expect(w.b.applied.eql(trigger));
+    try std.testing.expectEqual(@as(u32, 0), w.b.capped);
+    // The rebuild that reads it is fired for exactly that post, yet starts
+    // a fresh chain instead of counting as a ninth follow-up.
+    _ = try w.step(null);
+    try std.testing.expectEqual(@as(u32, 0), w.b.follow_ups);
+    try std.testing.expect(w.b.after_ceiling);
+}
+
+test "watch baseline: a ceiling follow-up that changed only the chain's own outputs settles" {
+    // `atCeiling` judged directly: every path already in the chain's
+    // `recent` set settles; one outside it leaves the tree pending.
+    const own = testDelta(&.{ "gen/a.zig", "gen/b.zig" });
+    const outside = testDelta(&.{ "gen/a.zig", "src/main.zig" });
+    for ([_]struct { delta: []const u64, settles: bool }{
+        .{ .delta = own[0..1], .settles = true },
+        .{ .delta = &outside, .settles = false },
+    }) |case| {
+        var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
+        defer b.deinit();
+        b.recent = try std.testing.allocator.dupe(u64, &own);
+        b.follow_ups = WatchBaseline.follow_up_ceiling;
+        const verdict = b.atCeiling(true, case.delta);
+        try std.testing.expectEqual(if (case.settles) WatchBaseline.Ceiling.settled else .pending, verdict);
+        try std.testing.expectEqual(!case.settles, b.restart_chain);
+    }
 }
 
 test "watch baseline: an edit saved during an ordinary rebuild still fires the next one" {
