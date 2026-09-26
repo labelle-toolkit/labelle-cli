@@ -8,7 +8,7 @@
 
 ## Summary
 
-Consolidate APK staging and packaging policy behind one implementation, initially extracted from the CLI's existing Android packager and ultimately owned by the pinned `labelle-android` package. Generated Zig projects, direct CLI builds, and Android Studio exports consume that implementation. Gradle remains a packaging/signing frontend, not a second source of asset, native-library, or manifest policy.
+Consolidate APK staging and packaging policy behind one implementation, initially extracted from the CLI's existing Android packager and ultimately owned by the pinned `labelle-android` package. The supported packaging frontends are direct CLI builds and Android Studio exports; both consume that implementation. Gradle remains a packaging/signing frontend, not a second source of asset, native-library, or manifest policy. The generated Zig project packaging step (`zig build package`) is retired: no replacement generated-project integration or legacy shim is built.
 
 This RFC specifies the contract and migration only. It does not implement package dispatch, change runtime asset loading, or remove existing entry points.
 
