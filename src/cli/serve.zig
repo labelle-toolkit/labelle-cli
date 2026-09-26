@@ -40,10 +40,118 @@ fn mimeFor(path: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+// ── Graceful stop (Codex P2 on #420) ────────────────────────────────
+//
+// The serve loop used to block until the process died: Ctrl+C killed
+// labelle outright, so the pipeline code after `serveAndOpen` — the
+// `after run` provider hooks — was unreachable. Now Ctrl+C / SIGTERM
+// (POSIX) or a console Ctrl+C / Ctrl+Break / close (Windows) sets
+// `cancel_requested`, a waker thread pokes the listener with one loopback
+// connection so a blocked `accept` returns, the loop observes the flag and
+// returns cleanly, and the caller runs its hooks and exits. A second
+// Ctrl+C while a hook is still running forces the exit (POSIX: status
+// 130; Windows: the console's default handling).
+//
+// The wake goes through a connection rather than `poll` or a socket
+// shutdown because it is the one mechanism that behaves the same on every
+// platform `std.Io.net` supports (`std.posix.poll` is a compile error on
+// Windows, and a shutdown of a listening socket wakes `accept` on Linux
+// but not on macOS) and needs nothing in a signal handler beyond an atomic
+// store. Windows Ctrl+C handling is best-effort: the handler is registered
+// with `SetConsoleCtrlHandler`, but CI cannot exercise a console control
+// event, so it is compile-checked only.
+
+/// Set once a stop was asked for; the serve loop returns when it sees it.
+pub var cancel_requested: std.atomic.Value(bool) = .init(false);
+
+/// Register the stop handler for this process. Idempotent.
+pub fn installCancelHandler() void {
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(consoleCtrl, .TRUE);
+    } else {
+        var act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &act, null);
+        std.posix.sigaction(.TERM, &act, null);
+    }
+}
+
+/// Async-signal-safe: one atomic swap, and `_exit` on the repeat.
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
+    if (cancel_requested.swap(true, .acq_rel)) std.c._exit(130);
+}
+
+const HandlerRoutine = *const fn (ctrl_type: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleCtrlHandler(handler: ?HandlerRoutine, add: std.os.windows.BOOL) callconv(.winapi) std.os.windows.BOOL;
+
+/// Runs on a console-owned thread. Returning TRUE claims the event; the
+/// repeat returns FALSE so the console's default handling ends the process.
+fn consoleCtrl(_: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
+    return if (cancel_requested.swap(true, .acq_rel)) .FALSE else .TRUE;
+}
+
+/// Open and close one loopback connection so a blocked `accept` returns
+/// and the loop can look at its flag. Failure is harmless: the next real
+/// request wakes the loop the same way.
+fn wakeListener(io: std.Io, port: u16) void {
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    const s = peer.connect(io, .{ .mode = .stream }) catch return;
+    s.close(io);
+}
+
+/// Waker thread body: watch `cancel` and, once it is set, poke the
+/// listener. `stop` ends the thread without a poke when the loop is
+/// already gone.
+fn wakeLoop(io: std.Io, port: u16, cancel: *const std.atomic.Value(bool), stop: *const std.atomic.Value(bool)) void {
+    const tick = std.Io.Duration.fromMilliseconds(100);
+    while (!stop.load(.acquire)) {
+        if (cancel.load(.acquire)) {
+            wakeListener(io, port);
+            return;
+        }
+        io.sleep(tick, .awake) catch return;
+    }
+}
+
+/// The accept loop. Returns once `cancel` is set — before handling any
+/// connection accepted after the request, so the wake-up poke (or a real
+/// request racing it) is closed unanswered. Per-connection errors never
+/// end the loop.
+fn serveLoop(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    server: *std.Io.net.Server,
+    web_dir: []const u8,
+    project_web_dir: ?[]const u8,
+    watch_state: ?*WatchState,
+    cancel: *const std.atomic.Value(bool),
+) void {
+    while (!cancel.load(.acquire)) {
+        const stream = server.accept(io) catch |err| {
+            // Transient accept failures (e.g. the peer reset between
+            // the SYN and our accept) shouldn't take the server down.
+            std.debug.print("labelle: accept failed ({s}), continuing\n", .{@errorName(err)});
+            continue;
+        };
+        if (cancel.load(.acquire)) {
+            stream.close(io);
+            return;
+        }
+        handleConnection(io, allocator, stream, web_dir, project_web_dir, watch_state) catch |err| {
+            std.debug.print("labelle: connection error ({s})\n", .{@errorName(err)});
+        };
+    }
+}
+
 /// Serve static files from `web_dir` on 127.0.0.1:`port`, then open the
-/// browser. Blocks forever — returns only on a bind failure (the
-/// accept loop swallows per-connection errors so a flaky tab can't
-/// kill the server).
+/// browser. Blocks until a stop is asked for (Ctrl+C / SIGTERM; see
+/// `installCancelHandler`), then returns cleanly so the caller can run
+/// what follows the serve — or returns early on a bind failure. The
+/// accept loop swallows per-connection errors so a flaky tab can't kill
+/// the server.
 ///
 /// `web_dir` is the build output dir (`.labelle/<backend>_wasm/zig-out/web`).
 /// `project_web_dir` is the durable project shell dir (`<project>/web`);
@@ -80,10 +188,24 @@ pub fn serveAndOpen(
     };
     defer server.deinit(io);
 
+    // The stop handler and its waker come first, so a Ctrl+C at any point
+    // after the bind ends the loop instead of the process. `wstate.stop`
+    // also ends the waker if the loop is left some other way.
+    installCancelHandler();
+    var wstate = WatchState{};
+    const waker: ?std.Thread = std.Thread.spawn(.{}, wakeLoop, .{ io, port, &cancel_requested, &wstate.stop }) catch |err| blk: {
+        std.debug.print("labelle: could not start the stop watcher ({s}); Ctrl+C ends the process without after-run hooks\n", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (waker) |t| {
+        wstate.stop.store(true, .release);
+        t.join();
+    };
+
     // Start the file watcher before printing the banner so its status is
     // reflected. `wstate` lives on this frame — `serveAndOpen` blocks until
-    // Ctrl+C, so it outlives the watcher thread and every connection.
-    var wstate = WatchState{};
+    // the stop is asked for, so it outlives the watcher thread and every
+    // connection.
     var watch_thread: ?std.Thread = null;
     if (watch) |cfg| {
         watch_thread = std.Thread.spawn(.{}, watchLoop, .{ io, cfg, &wstate }) catch |err| blk: {
@@ -116,17 +238,8 @@ pub fn serveAndOpen(
 
     if (open_browser_tab) openBrowser(allocator, port);
 
-    while (true) {
-        const stream = server.accept(io) catch |err| {
-            // Transient accept failures (e.g. the peer reset between
-            // the SYN and our accept) shouldn't take the server down.
-            std.debug.print("labelle: accept failed ({s}), continuing\n", .{@errorName(err)});
-            continue;
-        };
-        handleConnection(io, allocator, stream, web_dir, project_web_dir, watch_state) catch |err| {
-            std.debug.print("labelle: connection error ({s})\n", .{@errorName(err)});
-        };
-    }
+    serveLoop(io, allocator, &server, web_dir, project_web_dir, watch_state, &cancel_requested);
+    std.debug.print("\nlabelle: stopping server\n", .{});
 }
 
 /// True if `path` names a regular file that can be opened for reading.
@@ -1280,4 +1393,71 @@ test "isNestedCheckout: keys on the .git marker's existence, not its kind" {
         defer alloc.free(p);
         try std.testing.expectEqual(case.want, isNestedCheckout(io, alloc, p));
     }
+}
+
+// A stop request ends the accept loop — the path that makes the `after run`
+// hooks after `serveAndOpen` reachable (Codex P2 on #420). The signal /
+// console handler itself is interactive and is not driven here; the flag
+// it sets and the waker's poke are.
+test "serveLoop: returns on a stop request after serving what came before it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(web_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "stop_test.html", .data = "<h1>still here</h1>" });
+
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    defer server.deinit(io);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, serveLoop, .{ io, alloc, &server, web_dir, @as(?[]const u8, null), @as(?*WatchState, null), &cancel });
+
+    // A request ahead of the stop is answered in full.
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", bound.port) catch unreachable;
+    {
+        const s = try peer.connect(io, .{ .mode = .stream });
+        defer s.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = s.writer(io, &wbuf);
+        try w.interface.print("GET /stop_test.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{});
+        try w.interface.flush();
+        var rbuf: [4096]u8 = undefined;
+        var r = s.reader(io, &rbuf);
+        const response = try r.interface.allocRemaining(alloc, .unlimited);
+        defer alloc.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "still here") != null);
+    }
+
+    // The stop: flag, then the same poke the waker thread sends. The join
+    // completes only because the loop saw the flag — a loop that ignored it
+    // would answer the poke, block in the next accept and never return.
+    cancel.store(true, .release);
+    wakeListener(io, bound.port);
+    t.join();
+
+    // Once set, the loop does not accept at all: a direct call returns
+    // without touching the listener (nobody connects here).
+    serveLoop(io, alloc, &server, web_dir, null, null, &cancel);
+}
+
+test "wakeLoop: pokes the listener once the flag is set and ends on stop without one" {
+    const io = std.testing.io;
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    defer server.deinit(io);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var stop: std.atomic.Value(bool) = .init(false);
+    // Stop first: the waker must end without connecting.
+    stop.store(true, .release);
+    wakeLoop(io, bound.port, &cancel, &stop);
+    stop.store(false, .release);
+    // Cancel: the waker's poke is what `accept` returns with.
+    cancel.store(true, .release);
+    const t = try std.Thread.spawn(.{}, wakeLoop, .{ io, bound.port, &cancel, &stop });
+    defer t.join();
+    const poke = try server.accept(io);
+    poke.close(io);
 }

@@ -551,7 +551,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
         try providers.append(a, .{ .dep = dep, .dir = dir, .meta = meta, .verified = true });
     }
     try contract.validateOwnership(ownership.items, reserved);
-    try hooks.validateAll(a, providers.items);
+    try hooks.validateAll(a, providers.items, &.{});
     const dest = try std.fs.path.join(a, &.{ root, lock_name });
     try writeAtomically(a, dest, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = selected.items }, .{ .whitespace = .indent_2 }));
     // The preview is consumed: a second --accept must be preceded by a new review.
