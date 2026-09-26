@@ -1,0 +1,101 @@
+//! Graceful stop for the serve loop: the POSIX signal / Windows console
+//! control handler that sets `cancel_requested`, and the waker that pokes
+//! a blocked `accept` so the loop can observe it.
+const std = @import("std");
+const builtin = @import("builtin");
+const testBindFreePort = @import("testing.zig").testBindFreePort;
+
+// ── Graceful stop (Codex P2 on #420) ────────────────────────────────
+//
+// The serve loop used to block until the process died: Ctrl+C killed
+// labelle outright, so the pipeline code after `serveAndOpen` — the
+// `after run` provider hooks — was unreachable. Now Ctrl+C / SIGTERM
+// (POSIX) or a console Ctrl+C / Ctrl+Break / close (Windows) sets
+// `cancel_requested`, a waker thread pokes the listener with one loopback
+// connection so a blocked `accept` returns, the loop observes the flag and
+// returns cleanly, and the caller runs its hooks and exits. A second
+// Ctrl+C while a hook is still running forces the exit (POSIX: status
+// 130; Windows: the console's default handling).
+//
+// The wake goes through a connection rather than `poll` or a socket
+// shutdown because it is the one mechanism that behaves the same on every
+// platform `std.Io.net` supports (`std.posix.poll` is a compile error on
+// Windows, and a shutdown of a listening socket wakes `accept` on Linux
+// but not on macOS) and needs nothing in a signal handler beyond an atomic
+// store. Windows Ctrl+C handling is best-effort: the handler is registered
+// with `SetConsoleCtrlHandler`, but CI cannot exercise a console control
+// event, so it is compile-checked only.
+
+/// Set once a stop was asked for; the serve loop returns when it sees it.
+pub var cancel_requested: std.atomic.Value(bool) = .init(false);
+
+/// Register the stop handler for this process. Idempotent.
+pub fn installCancelHandler() void {
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(consoleCtrl, .TRUE);
+    } else {
+        var act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &act, null);
+        std.posix.sigaction(.TERM, &act, null);
+    }
+}
+
+/// Async-signal-safe: one atomic swap, and `_exit` on the repeat.
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
+    if (cancel_requested.swap(true, .acq_rel)) std.c._exit(130);
+}
+
+const HandlerRoutine = *const fn (ctrl_type: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleCtrlHandler(handler: ?HandlerRoutine, add: std.os.windows.BOOL) callconv(.winapi) std.os.windows.BOOL;
+
+/// Runs on a console-owned thread. Returning TRUE claims the event; the
+/// repeat returns FALSE so the console's default handling ends the process.
+fn consoleCtrl(_: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
+    return if (cancel_requested.swap(true, .acq_rel)) .FALSE else .TRUE;
+}
+
+/// Open and close one loopback connection so a blocked `accept` returns
+/// and the loop can look at its flag. Failure is harmless: the next real
+/// request wakes the loop the same way.
+pub fn wakeListener(io: std.Io, port: u16) void {
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    const s = peer.connect(io, .{ .mode = .stream }) catch return;
+    s.close(io);
+}
+
+/// Waker thread body: watch `cancel` and, once it is set, poke the
+/// listener. `stop` ends the thread without a poke when the loop is
+/// already gone.
+pub fn wakeLoop(io: std.Io, port: u16, cancel: *const std.atomic.Value(bool), stop: *const std.atomic.Value(bool)) void {
+    const tick = std.Io.Duration.fromMilliseconds(100);
+    while (!stop.load(.acquire)) {
+        if (cancel.load(.acquire)) {
+            wakeListener(io, port);
+            return;
+        }
+        io.sleep(tick, .awake) catch return;
+    }
+}
+
+test "wakeLoop: pokes the listener once the flag is set and ends on stop without one" {
+    const io = std.testing.io;
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    defer server.deinit(io);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var stop: std.atomic.Value(bool) = .init(false);
+    // Stop first: the waker must end without connecting.
+    stop.store(true, .release);
+    wakeLoop(io, bound.port, &cancel, &stop);
+    stop.store(false, .release);
+    // Cancel: the waker's poke is what `accept` returns with.
+    cancel.store(true, .release);
+    const t = try std.Thread.spawn(.{}, wakeLoop, .{ io, bound.port, &cancel, &stop });
+    defer t.join();
+    const poke = try server.accept(io);
+    poke.close(io);
+}
