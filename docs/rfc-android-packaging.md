@@ -8,7 +8,7 @@
 
 ## Summary
 
-Consolidate APK staging and packaging policy behind one implementation, initially extracted from the CLI's existing Android packager and ultimately owned by the pinned `labelle-android` package. Generated Zig projects, direct CLI builds, and Android Studio exports consume that implementation. Gradle remains a packaging/signing frontend, not a second source of asset, native-library, or manifest policy.
+Consolidate APK staging and packaging policy behind one implementation, initially extracted from the CLI's existing Android packager and ultimately owned by the pinned `labelle-android` package. The supported packaging frontends are direct CLI builds and Android Studio exports; both consume that implementation. Gradle remains a packaging/signing frontend, not a second source of asset, native-library, or manifest policy. The generated Zig project packaging step (`zig build package`) is retired: no replacement generated-project integration or legacy shim is built.
 
 This RFC specifies the contract and migration only. It does not implement package dispatch, change runtime asset loading, or remove existing entry points.
 
@@ -27,7 +27,7 @@ Issue #405 originally proposed permanent CLI ownership. Its direction update and
 - Preserve Debug libraries and retain matching symbols for stripped Release libraries.
 - Support current embedded assets and the future APK-loaded assets from assembler #759.
 - Preserve Windows support and backend-specific declarations without backend-owned manifest templates.
-- Keep existing callers working through a bounded compatibility migration.
+- Make a breaking migration: existing projects explicitly adopt the new packages and entry points. No compatibility shims or legacy aliases.
 
 ## Ownership
 
@@ -73,11 +73,11 @@ Keep the current best-effort behavior for unavailable/failed stripping, with an 
 
 The orchestration path generates and builds once, then passes resolved artifacts to the shared package-only operation. Packaging returns output paths, staging/strip outcomes, size information, and a nonzero status on required-step failure.
 
-### Generated `zig build package`
+### Retire generated `zig build package`
 
-Keep a thin compatibility step that depends on native compilation and invokes the package-only operation. It must never call a top-level command that generates/builds the same target again. Resolve the compatible pinned provider instead of silently using whichever global CLI happens to be installed. Missing providers or incompatible versions must produce actionable errors.
+Remove the assembler-owned packaging step and its template. Existing generated projects must be regenerated and their callers changed to the supported packaging entry point. Do not add a forwarding shim, legacy alias, or fallback to a global CLI.
 
-Before package dispatch exists, a documented internal CLI adapter may provide this contract. Its lifetime ends when the package provider is available; do not introduce a second implementation for the shim.
+The new package-only operation consumes already-built artifacts and must never call top-level generation/build again. Until #406 lands, it can be exposed directly by the consolidated CLI implementation; once package dispatch lands, it belongs to the explicitly pinned provider. Missing providers or unsupported contract versions fail with actionable errors.
 
 ### Android Studio / Gradle
 
@@ -103,15 +103,15 @@ After migration, backend repositories contain declarations and examples, not exe
 
 1. Document and test the existing direct-packager behavior with representative inventories.
 2. Extract the package-only contract and shared manifest/staging/reporting functions within the CLI. Preserve existing direct entry points.
-3. Adapt Studio and the generated Zig packaging step; add freshness, variant, and error-propagation coverage.
+3. Adapt Studio and remove the generated Zig packaging step; update callers and add freshness, variant, and error-propagation coverage.
 4. Migrate sokol and both bgfx APK consumers, then retire duplicated scripts/templates once their replacements pass.
-5. Under #406, move the implementation to pinned `labelle-android`, switching adapters to generic dispatch. Follow that RFC's one-minor-release forwarding window and document the version compatibility matrix.
+5. Under #406, move the implementation to pinned `labelle-android` and generic dispatch. Existing projects must explicitly add the package and update their configuration and commands. No forwarding window, implicit provider injection, or legacy aliases.
 
-Consolidation does not wait for the runtime extraction or APK asset-loader migration, but its contract must accommodate both. Removing an old path is gated on releasing its replacement and updating consumers.
+Consolidation does not wait for the runtime extraction or APK asset-loader migration, but its contract must accommodate both. Publish the replacement and migration instructions together. Consumers must update explicitly; old generated projects are not supported by the new entry points.
 
 ## Validation and acceptance
 
-For Flying Platform with bgfx and a sokol example, exercise each supported entry point in Debug and Release. Compare normalized archive inventories and manifest semantics, not whole signed-APK hashes: signing, ZIP metadata, and frontend-generated metadata may differ.
+For explicitly migrated Flying Platform with bgfx and a sokol example, exercise the direct and Gradle entry points in Debug and Release. Compare normalized archive inventories and manifest semantics, not whole signed-APK hashes: signing, ZIP metadata, and frontend-generated metadata may differ.
 
 Required checks:
 
@@ -120,7 +120,7 @@ Required checks:
 - Debug libraries retain debugging information; stripped Release libraries have matching preserved symbols. Missing strip-tool fallback is visible.
 - A Debug-to-Release and Release-to-Debug sequence uses the correct native artifact.
 - Editing/removing assets and changing native inputs cannot reuse stale staged output.
-- Packaging-only compatibility invocation cannot re-enter generation/build; subprocess failures reach the caller.
+- Package-only invocation cannot re-enter generation/build; subprocess failures reach the caller. Retired entry points have no forwarding implementation.
 - Manifest requirements, orientation, debuggable behavior, icons and library/activity identity agree across frontends.
 - Every actual packaging path emits a size report. Studio export reports staging until an archive exists.
 - The standalone video-decode example still builds and launches.
@@ -133,6 +133,6 @@ Size comparisons use the same game revision, ABI, variant and inputs. Consolidat
 - Concrete input format and where the producer emits it.
 - Gradle freshness integration: automatic local preparation or explicit regeneration failure.
 - Supported variant/ABI matrix for the first migration release.
-- Compatibility versions and release ordering across CLI, assembler and backend consumers.
+- Required provider/contract versions and breaking-release ordering across CLI, assembler and backend consumers.
 
 These choices must be recorded in implementation PRs. They do not change the single-owner policy defined here.
