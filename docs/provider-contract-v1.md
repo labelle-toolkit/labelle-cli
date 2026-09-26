@@ -1,6 +1,6 @@
 # Provider contract v1
 
-Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings are implemented; progress overrides and platform extraction remain pending.
+Status: normative contract for [CLI #406](https://github.com/labelle-toolkit/labelle-cli/issues/406) and [#411](https://github.com/labelle-toolkit/labelle-cli/issues/411). Local dispatch and project GitHub integrity pins are implemented; shared settings and lifecycle hooks are implemented; progress overrides, provider-declared targets and platform extraction remain pending.
 
 Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
@@ -145,7 +145,7 @@ Index defaults are suggestions, not automatically trusted project declarations. 
 
 Resolve stable hook identities as `<package>/<hook-id>`. Within each target/step, execute before hooks, the core operation or unique replacement, then after hooks. Provider dependencies create ordering edges within a phase; explicit `after_hooks` refine hook ordering. Break independent ties by fully qualified hook ID. Reject missing hook references, cycles, dependencies on later phases, and multiple replacements before execution. A replacement belongs only to the target owner. Sequential execution is sufficient for v1.
 
-Stop on any failed hook/operation; after hooks run only after success. Hooks clean up their own temporary resources. Do not run publishing hooks after a failed build or reuse an old output as a new success. Graph construction/execution and its fixture tests belong to phase 3.
+Stop on any failed hook/operation; after hooks run only after success. For `run`, success means the game process itself exited with status 0: a game the `--timeout` watchdog stopped, or a simulator/device launch that returns while the app is still running, is not a success even though the CLI's own exit status is 0, and its after hooks are skipped with one diagnostic line. Hooks clean up their own temporary resources. Do not run publishing hooks after a failed build or reuse an old output as a new success. Graph construction/execution and its fixture tests belong to phase 3.
 
 ## 7. Backend agnosticism migration
 
@@ -158,5 +158,7 @@ Keep specific existing sites on the shrinking migration allowlist until replaced
 Phase 1 supplies this contract, wire-context validation, installed-tool path validation, ownership conflict checks and target lookup. `zig build test-provider-contract` runs those tests; `zig build test` includes the same target, avoiding an uncollected test root.
 
 Phase 2 implements manifest/range parsing, GitHub integrity pins, config mapping, filesystem validation, host-tool build/discovery/cache and process dispatch. Phase 3 implements hook planning and the Android provider; phase 4 consolidates packaging/Gradle; phase 5 enables projectless resolution/updates using the same GitHub repository. Registry records are ordinary reviewed commits, not a publication service.
+
+Hook planning and execution (§6) are implemented for the four core steps; [provider hooks](provider-hooks.md) documents the ordering rules, the step output-directory layout, the hook context and the remaining limitations.
 
 Before #411 closes, review all six decisions against the architecture RFC. Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.

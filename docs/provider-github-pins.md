@@ -90,8 +90,9 @@ providers may get less compiled-object reuse than local providers. This keeps
 archive verification authoritative without another mutable source-cache index.
 Provider build scripts remain trusted code, not sandboxed processes.
 
-[Shared provider settings](provider-configuration.md) are now implemented.
-Invocation overrides/JSON progress, hooks and projectless bootstrap remain. The registry starts empty;
+[Shared provider settings](provider-configuration.md) and
+[lifecycle hooks](provider-hooks.md) are now implemented. Invocation
+overrides/JSON progress and projectless bootstrap remain. The registry starts empty;
 do not publish placeholder releases for the platform-package scaffolds.
 
 ## Tests

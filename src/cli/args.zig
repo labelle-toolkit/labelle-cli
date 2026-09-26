@@ -166,7 +166,7 @@ pub const ParsedArgs = struct {
     // mode (that's what `labelle status` reads).
     progress_mode: progress.Mode = .human,
     // `labelle bundle --output <dir>` (cli#359): where the macOS `.app`
-    // lands. `null` = the target dir's `zig-out/`, beside `bin/`. A
+    // lands. `null` = the target dir's `zig-out/bundle/desktop/`. A
     // relative path anchors to the project dir (same rule as `wasm
     // export --output`); see `bundle.resolveOutputDir`.
     bundle_output: ?[]const u8 = null,

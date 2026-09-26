@@ -26,11 +26,11 @@ manifest = '''.{ .name = "fixture", .manifest_version = 2,
  .executable = "bin/provider-probe", .help = "Inspect" } } }'''
 checks = 0
 
-def archive(revision="original", extra=None):
+def archive(revision="original", extra=None, text=manifest):
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w", format=tarfile.PAX_FORMAT) as tar:
         files = {p.name: p.read_bytes() for p in fixture.glob("*.zig")}
-        files["plugin.labelle"] = manifest.encode()
+        files["plugin.labelle"] = text.encode()
         files["revision.zig"] = f'pub const value = "{revision}";\n'.encode()
         for name, content in files.items():
             info = tarfile.TarInfo("fixture-commit/" + name)
@@ -187,6 +187,22 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
         assert lock.read_bytes() == old_lock
         assert not (base / "escape.zig").exists()
         cleaned()
+    # The hook graph is validated at --accept, before any pin is written: a
+    # provider whose hook references a hook nobody declares is rejected by
+    # the graph error's name, and the working lock is untouched (Codex P2 on
+    # #420 — an accepted lock used to fail only on the next help/build).
+    hooked = manifest.replace('.namespace = "probe",', '.namespace = "probe", .hooks = .{ .{ .id = "sign", .step = .build, '
+                              '.target = "desktop", .when = .after, .build_step = "probe-tool", .executable = "bin/provider-probe", '
+                              '.after_hooks = .{ "fixture/nope" } } },')
+    assert hooked != manifest
+    hooked_data = archive(text=hooked)
+    hooked_pin = dict(pin, sha256=hashlib.sha256(hooked_data).hexdigest())
+    seed(hooked_pin, hooked_data)
+    metadata([hooked_pin])
+    err = accept(code=1).stderr
+    assert "MissingHookReference" in err and "'fixture/sign' references unknown hook 'fixture/nope'" in err, err
+    assert lock.read_bytes() == old_lock and "Pinned" not in err
+    cleaned()
     # Normal execution does not consult newly edited registry records.
     updated_data = archive("updated")
     updated = dict(pin, version="2.0.0", commit="2" * 40, sha256=hashlib.sha256(updated_data).hexdigest())
