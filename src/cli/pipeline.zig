@@ -74,6 +74,24 @@ const WasmRebuildCtx = struct {
     /// the stage test below can supply the override value without touching
     /// the process environment; production never overrides the default.
     shader_preflight: *const fn (std.mem.Allocator, []const u8) anyerror!void = material_toolchain.preflight,
+    /// Provider lifecycle hooks (contract §6). A watched rebuild re-runs the
+    /// SAME `generate` and `build` plans the cold pipeline ran, in the same
+    /// before / core-or-replace / after order — hooks that generate inputs
+    /// or post-process the WASM output would otherwise serve stale or
+    /// incomplete artifacts after the first watched edit, and a `replace`
+    /// hook's step would silently fall back to the core operation (Codex P2
+    /// on #420). `hooks` is the cold pipeline's site; with no plugins every
+    /// plan is empty and no phase runs.
+    hooks: *provider_hooks.Site,
+    generate_plan: provider_hooks.Plan = .{},
+    build_plan: provider_hooks.Plan = .{},
+    /// The step output directories of the layout contract, as the cold
+    /// pipeline computed them (`provider_hooks.stepOutputDir`).
+    generate_out: []const u8 = "",
+    build_out: []const u8 = "",
+    /// The phase runner. A field only so the plumbing test below can record
+    /// the phases without a host compiler; production never overrides it.
+    run_hook_phase: *const fn (*provider_hooks.Site, []const provider_hooks.Planned, provider_contract.Step, provider_contract.Phase, []const u8) anyerror!u8 = provider_hooks.runPhase,
 
     /// Which stage a rebuild stopped at. Ordered as the stages run; the
     /// watch loop only needs the bool, but the test asserts the ORDER —
@@ -81,11 +99,24 @@ const WasmRebuildCtx = struct {
     const Stage = error{
         PrebuildFailed,
         ShaderPreflightFailed,
+        HookFailed,
         GenerateFailed,
         FingerprintFailed,
         ZigSpawnFailed,
         BuildFailed,
     };
+
+    /// One hook phase of a watched rebuild. A failing hook (nonzero exit, or
+    /// an error resolving the host/pin) stops the rebuild like a failing
+    /// core step does: reported, server kept alive, browser not reloaded.
+    fn hookPhase(self: *WasmRebuildCtx, list: []const provider_hooks.Planned, step: provider_contract.Step, phase: provider_contract.Phase, output_dir: []const u8) Stage!void {
+        if (list.len == 0) return;
+        const code = self.run_hook_phase(self.hooks, list, step, phase, output_dir) catch |err| {
+            std.debug.print("labelle: rebuild {s} {s} hook failed ({s})\n", .{ @tagName(phase), @tagName(step), @errorName(err) });
+            return error.HookFailed;
+        };
+        if (code != 0) return error.HookFailed;
+    }
 
     /// Re-run prebuild → generate → fixFingerprints → `zig build`. Returns
     /// true only on a clean rebuild; on any failure it prints the error
@@ -128,19 +159,38 @@ const WasmRebuildCtx = struct {
         };
 
         // 1. Regenerate — scene/prefab/script *structure* (new files, added
-        //    components) can change, not just @embedFile'd content.
-        assembler_proc.generate(self.asm_bin, a, self.project_dir, self.platform_tag, self.backend_tag) catch |err| {
-            std.debug.print("labelle: rebuild generate failed ({s})\n", .{@errorName(err)});
-            return error.GenerateFailed;
-        };
-        // 2. `generate` rewrites build.zig with a placeholder fingerprint;
-        //    re-fix it before building.
-        runner.fixFingerprints(a, self.project_dir, self.output_dir) catch |err| {
-            std.debug.print("labelle: rebuild fingerprint fix failed ({s})\n", .{@errorName(err)});
-            return error.FingerprintFailed;
-        };
+        //    components) can change, not just @embedFile'd content. Wrapped
+        //    in the `generate` hook phases exactly like the cold pipeline.
+        try self.hookPhase(self.generate_plan.before, .generate, .before, self.generate_out);
+        if (self.generate_plan.replace) |replacement| {
+            try self.hookPhase(&.{replacement}, .generate, .replace, self.generate_out);
+        } else {
+            assembler_proc.generate(self.asm_bin, a, self.project_dir, self.platform_tag, self.backend_tag) catch |err| {
+                std.debug.print("labelle: rebuild generate failed ({s})\n", .{@errorName(err)});
+                return error.GenerateFailed;
+            };
+            // 2. `generate` rewrites build.zig with a placeholder fingerprint;
+            //    re-fix it before building.
+            runner.fixFingerprints(a, self.project_dir, self.output_dir) catch |err| {
+                std.debug.print("labelle: rebuild fingerprint fix failed ({s})\n", .{@errorName(err)});
+                return error.FingerprintFailed;
+            };
+        }
+        try self.hookPhase(self.generate_plan.after, .generate, .after, self.generate_out);
         // 3. Rebuild the WASM bundle (captured output so a compile error
-        //    surfaces in the terminal without killing the serve loop).
+        //    surfaces in the terminal without killing the serve loop),
+        //    inside the `build` hook phases.
+        try self.hookPhase(self.build_plan.before, .build, .before, self.build_out);
+        if (self.build_plan.replace) |replacement| {
+            try self.hookPhase(&.{replacement}, .build, .replace, self.build_out);
+        } else {
+            try self.coreBuild();
+        }
+        try self.hookPhase(self.build_plan.after, .build, .after, self.build_out);
+    }
+
+    fn coreBuild(self: *WasmRebuildCtx) Stage!void {
+        const a = self.allocator;
         const res = runner.runZigWithEnv(a, self.target_dir, self.zig_args, self.zig_env) catch |err| {
             std.debug.print("labelle: rebuild could not spawn zig ({s})\n", .{@errorName(err)});
             return error.ZigSpawnFailed;
@@ -185,6 +235,7 @@ const WasmRebuildCtx = struct {
         // observable as GenerateFailed — distinct from the gate firing.
         const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
         defer a.free(asm_path);
+        var site = testSite(a, project);
         var ctx = WasmRebuildCtx{
             .allocator = a,
             .asm_bin = .{ .path = asm_path },
@@ -198,6 +249,7 @@ const WasmRebuildCtx = struct {
             .prebuild_steps = &.{},
             .prebuild_opts = .{ .fatal_on_step_failure = false },
             .shader_preflight = Fixture.invalidOverride,
+            .hooks = &site,
         };
 
         // Started WITHOUT materials/: the invalid override is not consulted
@@ -210,6 +262,175 @@ const WasmRebuildCtx = struct {
         try tmp.dir.createDirPath(io, "project/materials");
         try std.testing.expectError(error.ShaderPreflightFailed, ctx.rebuildStaged());
         try std.testing.expect(!rebuild(@ptrCast(&ctx)));
+    }
+
+    /// A hook site with no providers, for the rebuild tests: the plans are
+    /// what the tests supply; nothing here reaches a compiler or a lock.
+    fn testSite(a: std.mem.Allocator, project: []const u8) provider_hooks.Site {
+        return .{
+            .a = a,
+            .providers = &.{},
+            .root = project,
+            .cfg = .{ .name = "game" },
+            .target = "wasm",
+            .optimize = .ReleaseSafe,
+            .progress = .off,
+            .reporter = null,
+        };
+    }
+
+    // The serve loop is interactive (it blocks until Ctrl+C), so the hook
+    // phases of a WATCHED rebuild are proven here, on the context itself,
+    // rather than by the subprocess e2e: the phases run in contract order
+    // around the core steps, a `replace` plan stands in for the core step,
+    // and a failing hook stops the rebuild before the next stage.
+    test "watched rebuild runs the generate and build hook phases in order" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+
+        // Production wiring: the default runner IS the cold pipeline's.
+        const default_runner = std.meta.fieldInfo(WasmRebuildCtx, .run_hook_phase).defaultValue() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(default_runner == provider_hooks.runPhase);
+
+        const Spy = struct {
+            const Call = struct { step: provider_contract.Step, phase: provider_contract.Phase, id: []const u8, out: []const u8 };
+            var calls: [8]Call = undefined;
+            var count: usize = 0;
+            fn reset() void {
+                count = 0;
+            }
+            fn run(_: *provider_hooks.Site, list: []const provider_hooks.Planned, step: provider_contract.Step, phase: provider_contract.Phase, out: []const u8) anyerror!u8 {
+                for (list) |planned| {
+                    calls[count] = .{ .step = step, .phase = phase, .id = planned.hook.id, .out = out };
+                    count += 1;
+                    if (std.mem.eql(u8, planned.hook.id, "fail")) return 7;
+                    if (std.mem.eql(u8, planned.hook.id, "unpinned")) return error.RemoteProviderIntegrityRequired;
+                }
+                return 0;
+            }
+            fn expectCalls(expected: []const Call) !void {
+                try std.testing.expectEqual(expected.len, count);
+                for (expected, calls[0..count]) |want, got| {
+                    try std.testing.expectEqual(want.step, got.step);
+                    try std.testing.expectEqual(want.phase, got.phase);
+                    try std.testing.expectEqualStrings(want.id, got.id);
+                    try std.testing.expectEqualStrings(want.out, got.out);
+                }
+            }
+        };
+        const Fixture = struct {
+            var provider: provider_dispatch.Provider = .{
+                .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+                .dir = "/pkg",
+                .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+                .verified = true,
+            };
+            fn planned(id: []const u8, step: provider_contract.Step, when: provider_contract.Phase) provider_hooks.Planned {
+                return .{
+                    .provider = &provider,
+                    .hook = .{ .id = id, .step = step, .target = "wasm", .when = when, .build_step = "tool", .executable = "bin/tool" },
+                    .qualified = id,
+                };
+            }
+        };
+
+        // No assembler and no compiler exist at these paths, so the core
+        // steps are observable as GenerateFailed / ZigSpawnFailed —
+        // distinct from any hook outcome.
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{ "/nonexistent/zig-probe", "build" },
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+            .generate_out = "/gen-out",
+            .build_out = "/build-out",
+            .run_hook_phase = Spy.run,
+        };
+
+        // Empty plans: no phase runs, the core generate is reached.
+        Spy.reset();
+        try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+        try Spy.expectCalls(&.{});
+
+        // Before-generate hooks run ahead of the core generate, which then
+        // fails; nothing after it runs.
+        ctx.generate_plan = .{
+            .before = &.{Fixture.planned("gen-pre", .generate, .before)},
+            .after = &.{Fixture.planned("gen-post", .generate, .after)},
+        };
+        ctx.build_plan = .{
+            .before = &.{Fixture.planned("build-pre", .build, .before)},
+            .after = &.{Fixture.planned("build-post", .build, .after)},
+        };
+        Spy.reset();
+        try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+        try Spy.expectCalls(&.{.{ .step = .generate, .phase = .before, .id = "gen-pre", .out = "/gen-out" }});
+
+        // A `replace` on generate stands in for the core generate (and its
+        // fingerprint pass), so the rebuild reaches the build phases; the
+        // core build then fails to spawn, so `after build` never runs.
+        ctx.generate_plan.replace = Fixture.planned("gen-swap", .generate, .replace);
+        Spy.reset();
+        try std.testing.expectError(error.ZigSpawnFailed, ctx.rebuildStaged());
+        try Spy.expectCalls(&.{
+            .{ .step = .generate, .phase = .before, .id = "gen-pre", .out = "/gen-out" },
+            .{ .step = .generate, .phase = .replace, .id = "gen-swap", .out = "/gen-out" },
+            .{ .step = .generate, .phase = .after, .id = "gen-post", .out = "/gen-out" },
+            .{ .step = .build, .phase = .before, .id = "build-pre", .out = "/build-out" },
+        });
+
+        // A `replace` on build too: the whole rebuild is hooks, in order.
+        ctx.build_plan.replace = Fixture.planned("build-swap", .build, .replace);
+        Spy.reset();
+        try ctx.rebuildStaged();
+        try Spy.expectCalls(&.{
+            .{ .step = .generate, .phase = .before, .id = "gen-pre", .out = "/gen-out" },
+            .{ .step = .generate, .phase = .replace, .id = "gen-swap", .out = "/gen-out" },
+            .{ .step = .generate, .phase = .after, .id = "gen-post", .out = "/gen-out" },
+            .{ .step = .build, .phase = .before, .id = "build-pre", .out = "/build-out" },
+            .{ .step = .build, .phase = .replace, .id = "build-swap", .out = "/build-out" },
+            .{ .step = .build, .phase = .after, .id = "build-post", .out = "/build-out" },
+        });
+        Spy.reset();
+        try std.testing.expect(rebuild(@ptrCast(&ctx)));
+
+        // A failing hook (nonzero exit) stops the rebuild at that phase.
+        ctx.generate_plan.after = &.{ Fixture.planned("fail", .generate, .after), Fixture.planned("gen-post", .generate, .after) };
+        Spy.reset();
+        try std.testing.expectError(error.HookFailed, ctx.rebuildStaged());
+        try Spy.expectCalls(&.{
+            .{ .step = .generate, .phase = .before, .id = "gen-pre", .out = "/gen-out" },
+            .{ .step = .generate, .phase = .replace, .id = "gen-swap", .out = "/gen-out" },
+            .{ .step = .generate, .phase = .after, .id = "fail", .out = "/gen-out" },
+        });
+        Spy.reset();
+        try std.testing.expect(!rebuild(@ptrCast(&ctx)));
+
+        // So does a hook the runner cannot even start (an unpinned remote
+        // provider): the error is reported, not propagated out of the loop.
+        ctx.generate_plan.after = &.{};
+        ctx.build_plan.before = &.{Fixture.planned("unpinned", .build, .before)};
+        Spy.reset();
+        try std.testing.expectError(error.HookFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 3), Spy.count);
+        try std.testing.expectEqualStrings("unpinned", Spy.calls[2].id);
     }
 };
 
@@ -1251,6 +1472,14 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                         // Keep the serve loop alive on a failing step.
                         .fatal_on_step_failure = false,
                     },
+                    // The same hook site, plans and output directories the
+                    // cold pipeline just used; the feed is already terminal
+                    // here, so the hooks' sub-step records are no-ops.
+                    .hooks = &hook_site,
+                    .generate_plan = hook_plans.generate,
+                    .build_plan = hook_plans.build,
+                    .generate_out = generate_out,
+                    .build_out = build_out,
                 };
                 // The hooks' declared `.outputs` are excluded from the watch
                 // signature so the rebuild callback can't trip its own
