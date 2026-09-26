@@ -127,7 +127,8 @@ explicit line:
   With one, the provider generates; the core steps it does not replace
   (`build`, `run`) treat the target as the generic host baseline. The ASTC
   prepass is not among them: it keys on the requested target, and a target
-  outside the enum has no capability table (`labelle astc` refuses the name),
+  outside the enum has no `asset_compression` setting (standalone `labelle astc`
+  can read that target's backend manifest declaration),
   so the prepass is skipped rather than run with the derived `desktop` — a
   provider owns its target's asset pipeline.
 
