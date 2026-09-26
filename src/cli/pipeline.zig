@@ -1730,13 +1730,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // like it worked. So a config error stops the build, while a conversion
         // failure still degrades to PNG.
         //
-        // Only for a target the capability tables know (`target.legacy`:
+        // Only for a target the asset_compression schema knows (`target.legacy`:
         // `desktop` or a schema-named provider target). A provider target
         // outside the enum has `parsed.platform` derived as `.desktop` for the
         // legacy sites, but it is NOT the desktop target: running the desktop
-        // prepass for it would encode ASTC siblings by desktop capabilities
-        // (Codex on #421). Its provider owns its asset pipeline; `cmdAstc`
-        // itself refuses such a name.
+        // prepass for it would use the wrong compression setting (Codex on
+        // #421). Its provider owns its asset pipeline; standalone `cmdAstc`
+        // can read capabilities for any declared target name.
         if (target.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
             // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
             // sokol) and the Android backend fallback all differ from what
@@ -1748,6 +1748,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 "--backend",
                 @tagName(parsed.backend),
             }) catch |err| switch (err) {
+                error.InvalidTextureCapabilities => progress.fatalExit(
+                    1,
+                    "cannot resolve backend texture capabilities — see the error above",
+                ),
                 error.ConflictingAstcBlocks => progress.fatalExit(
                     1,
                     "conflicting .astc_block pins compile to one .astc — see the error above",
