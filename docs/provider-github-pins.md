@@ -51,8 +51,13 @@ no symlinks, hardlinks, path traversal or conflicting portable filenames. Entry
 paths must be plain ASCII: case-insensitive filesystems also fold non-ASCII
 letters (`Ä.zig` and `ä.zig` collide), the CLI only compares ASCII case, and
 provider archives are source trees, so any non-ASCII byte in a path is
-rejected. The CLI limits compressed input to 128 MiB and expanded tar data to
-512 MiB.
+rejected. Paths must also be printable and free of Windows reserved device
+names: an ASCII control character (bytes 1-31 and 127) is rejected, and so is
+any path component whose name before the first `.` is `CON`, `PRN`, `AUX`,
+`NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, `CONIN$` or `CONOUT$` in any case
+(`nul.zig` and `aux/` included). Windows cannot create such files, so the
+archive would resolve on Unix and fail extraction there. The CLI limits
+compressed input to 128 MiB and expanded tar data to 512 MiB.
 
 Compiler and Zig package dependencies must already be prepared. The project
 compiler pin is checked and the host install step uses `--system` to disable

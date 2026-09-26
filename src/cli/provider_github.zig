@@ -187,13 +187,25 @@ fn safeArchivePath(path: []const u8) bool {
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or
             std.mem.endsWith(u8, part, ".") or std.mem.endsWith(u8, part, " ")) return false;
-        const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
-        for ([_][]const u8{ "con", "prn", "aux", "nul" }) |device| {
-            if (std.ascii.eqlIgnoreCase(stem, device)) return false;
-        }
-        if (stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and stem[3] >= '1' and stem[3] <= '9') return false;
     }
     return true;
+}
+
+/// Windows cannot create these names in any directory, case-insensitively and
+/// regardless of extension (`nul.zig` is still the NUL device), so an archive
+/// containing one extracts on Unix but fails on Windows.
+fn reservedDeviceName(part: []const u8) bool {
+    const stem = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
+    for ([_][]const u8{ "con", "prn", "aux", "nul", "conin$", "conout$" }) |device| {
+        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
+    }
+    return stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and stem[3] >= '1' and stem[3] <= '9';
+}
+
+fn hasReservedDeviceName(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, path, "/"), '/');
+    while (parts.next()) |part| if (reservedDeviceName(part)) return true;
+    return false;
 }
 
 fn validateTar(a: std.mem.Allocator, bytes: []const u8) !void {
@@ -207,12 +219,22 @@ fn validateTar(a: std.mem.Allocator, bytes: []const u8) !void {
     while (try it.next()) |entry| {
         if (entry.kind == .sym_link) return error.ProviderArchiveLinkNotSupported;
         if (!safeArchivePath(entry.name)) return error.UnsafeProviderArchivePath;
+        // Windows rejects control characters in file names (NUL is already an
+        // unsafe path above), so such archives only extract on Unix.
+        for (entry.name) |c| if (std.ascii.isControl(c)) {
+            std.debug.print("provider archive entry '{f}' contains an ASCII control character (byte 0x{x:0>2}); archive paths must be printable\n", .{ std.ascii.hexEscape(entry.name, .lower), c });
+            return error.ControlCharProviderArchivePath;
+        };
         // The duplicate check below folds ASCII case only; case-insensitive
         // hosts also fold non-ASCII letters, so such paths are not portable.
         for (entry.name) |c| if (!std.ascii.isAscii(c)) {
             std.debug.print("provider archive entry '{s}' contains non-ASCII bytes; archive paths must be ASCII\n", .{entry.name});
             return error.NonAsciiProviderArchivePath;
         };
+        if (hasReservedDeviceName(entry.name)) {
+            std.debug.print("provider archive entry '{s}' uses a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, CONIN$, CONOUT$; any case, with or without extension)\n", .{entry.name});
+            return error.ReservedProviderArchiveName;
+        }
         const trimmed = std.mem.trimEnd(u8, entry.name, "/");
         const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse trimmed.len;
         if (root) |r| {
@@ -351,4 +373,41 @@ test "provider github: non-ASCII archive paths are rejected by their own rule" {
     try validateTar(a, try testArchive(a, "src/a.zig"));
     try std.testing.expectError(error.NonAsciiProviderArchivePath, validateTar(a, try testArchive(a, "src/ä.zig")));
     try std.testing.expectError(error.NonAsciiProviderArchivePath, validateTar(a, try testArchive(a, "src/Ä.zig")));
+}
+
+test "provider github: control characters in archive paths are rejected by their own rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The printable twin passes, so only the control byte differs.
+    try validateTar(a, try testArchive(a, "src/a-b.zig"));
+    try std.testing.expectError(error.ControlCharProviderArchivePath, validateTar(a, try testArchive(a, "src/a\x01b.zig")));
+    try std.testing.expectError(error.ControlCharProviderArchivePath, validateTar(a, try testArchive(a, "src/a\x1fb.zig")));
+    try std.testing.expectError(error.ControlCharProviderArchivePath, validateTar(a, try testArchive(a, "src/a\x7fb.zig")));
+    try std.testing.expectError(error.ControlCharProviderArchivePath, validateTar(a, try testArchive(a, "src\n/b.zig")));
+}
+
+test "provider github: Windows reserved device names are rejected by their own rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Each twin differs from a reserved name by one letter, so it passes every other check.
+    try validateTar(a, try testArchive(a, "src/null.zig"));
+    try validateTar(a, try testArchive(a, "src/cons.zig"));
+    try validateTar(a, try testArchive(a, "src/COMA"));
+    try validateTar(a, try testArchive(a, "src/lpt.txt"));
+    try validateTar(a, try testArchive(a, "src/conout/a.zig"));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/nul.zig")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/NUL")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/Con.tar.gz")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/prn")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/aux.h")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/COM1")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/com9.zig")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/Lpt1")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/lpt9.txt")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/CONIN$")));
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/conout$.zig")));
+    // Directory components count too.
+    try std.testing.expectError(error.ReservedProviderArchiveName, validateTar(a, try testArchive(a, "src/aux/a.zig")));
 }

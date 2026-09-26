@@ -133,9 +133,11 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
         ("fixture-commit/../escape.zig", None, "UnsafeProviderArchivePath"),
         ("fixture-commit/link", tarfile.SYMTYPE, "ProviderArchiveLinkNotSupported"),
         ("other-root/file.zig", None, "MultipleProviderArchiveRoots"),
-        ("fixture-commit/CON", None, "UnsafeProviderArchivePath"),
+        ("fixture-commit/CON", None, "ReservedProviderArchiveName"),
+        ("fixture-commit/nul.zig", None, "ReservedProviderArchiveName"),
         ("fixture-commit/MAIN.ZIG", None, "DuplicateProviderArchivePath"),
         ("fixture-commit/ä.zig", None, "NonAsciiProviderArchivePath"),
+        ("fixture-commit/ctrl\x01.zig", None, "ControlCharProviderArchivePath"),
     ):
         member = tarfile.TarInfo(name)
         if kind:
