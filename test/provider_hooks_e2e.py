@@ -28,9 +28,13 @@ fixture = Path(__file__).parent / "fixtures" / "provider"
 exe_suffix = ".exe" if os.name == "nt" else ""
 
 # The fake assembler answers the protocol probe, `install` and `generate`;
-# `generate` writes `.labelle/<backend>_desktop/{build.zig,main.zig}` — a
-# host executable named after the project, with no build.zig.zon so the
-# fingerprint pass skips it. FAKE_MAIN_BROKEN=1 makes the core build fail.
+# `generate` writes `.labelle/<backend>_desktop/{build.zig,main.zig,data.txt}`
+# — a host executable named after the project, with no build.zig.zon so the
+# fingerprint pass skips it. The build also INSTALLS `data.txt` to
+# `zig-out/bin/data.txt` and the game prints that file at launch, so a
+# post-build hook's edit to it is observable from the launched game — and a
+# redundant later build would visibly revert it. FAKE_MAIN_BROKEN=1 makes the
+# core build fail.
 FAKE_ASSEMBLER = '''import os, sys
 from pathlib import Path
 argv = sys.argv[1:]
@@ -51,8 +55,16 @@ elif argv and argv[0] == "generate":
         '        .root_source_file = b.path("main.zig"), .target = b.graph.host,\\n'
         '        .optimize = b.standardOptimizeOption(.{}) }) });\\n'
         '    b.installArtifact(exe);\\n'
+        '    b.installFile("data.txt", "bin/data.txt");\\n'
         '}\\n')
-    body = "this is not zig\\n" if os.environ.get("FAKE_MAIN_BROKEN") == "1" else "pub fn main() void {}\\n"
+    (target / "data.txt").write_text("original")
+    body = "this is not zig\\n" if os.environ.get("FAKE_MAIN_BROKEN") == "1" else (
+        'const std = @import("std");\\n'
+        'pub fn main(init: std.process.Init) !void {\\n'
+        '    const a = init.arena.allocator();\\n'
+        '    const data = std.Io.Dir.cwd().readFileAlloc(init.io, "zig-out/bin/data.txt", a, .limited(1024)) catch "missing";\\n'
+        '    std.debug.print("DATA={s}\\\\n", .{data});\\n'
+        '}\\n')
     (target / "main.zig").write_text(body)
     print("FIXTURE_GENERATE", file=sys.stderr, flush=True)
 else:
@@ -123,6 +135,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     env.pop("PROVIDER_PROBE_FAIL", None)
+    env.pop("PROVIDER_PROBE_PATCH", None)
     env.pop("FAKE_MAIN_BROKEN", None)
     checks = 0
 
@@ -261,6 +274,26 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert order(entries, "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], entries
     text = result.stderr
     assert text.index("hook 'fixture-b/b-run-pre'") < text.index("labelle: running...") < text.index("hook 'fixture-a/a-run-post'"), text
+
+    # ── run: an `after build` hook's output survives until launch ─────────
+    # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs
+    # from source. The game prints the file it finds at launch: with the
+    # redundant warm `zig build` that used to precede the launch, the install
+    # step copied the original back over the hook's edit (Codex P2 on #420).
+    reset()
+    run("build")
+    data_file = zig_out / "bin" / "data.txt"
+    assert data_file.read_text() == "original", data_file.read_text()
+    reset()
+    result = run("run", extra_env={"PROVIDER_PROBE_PATCH": "a-post"})
+    assert "DATA=patched:a-post" in result.stderr, result.stderr
+    assert data_file.read_text() == "patched:a-post", data_file.read_text()
+    assert result.stderr.count("build ok") == 1, result.stderr
+    # The mechanism, not just the value: one more `zig build` on the same
+    # tree DOES revert the edit, so the launch above proving it intact means
+    # no build ran between the hook and the game.
+    subprocess.run([zig, "build"], cwd=target_dir, check=True, capture_output=True, timeout=600)
+    assert data_file.read_text() == "original", "a warm zig build no longer re-installs data.txt; the check above is vacuous"
 
     # ── bundle ────────────────────────────────────────────────────────────
     reset()

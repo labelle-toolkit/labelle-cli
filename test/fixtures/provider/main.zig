@@ -54,6 +54,19 @@ pub fn main(init: std.process.Init) !u8 {
         .sub_path = log_path,
         .data = try std.mem.concat(a, u8, &.{ previous, line, "\n" }),
     });
+    // `PROVIDER_PROBE_PATCH=<hook id>` makes that hook post-process the step
+    // output the way a signing/stripping hook would: it overwrites
+    // `<output_dir>/bin/data.txt`, a file the fixture game's build INSTALLS
+    // from source, so any later redundant build that re-installs the
+    // original is observable from the launched game (Codex P2 on #420).
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_PATCH")) |patch_id| {
+        if (invocation == .object and std.mem.eql(u8, invocation.object.get("id").?.string, patch_id)) {
+            try std.Io.Dir.cwd().writeFile(init.io, .{
+                .sub_path = try std.fs.path.join(a, &.{ output, "bin", "data.txt" }),
+                .data = try std.fmt.allocPrint(a, "patched:{s}", .{patch_id}),
+            });
+        }
+    } else |_| {}
     // Hooks receive no argv, so a failing hook is selected by environment:
     // `PROVIDER_PROBE_FAIL=<hook id>` makes that hook exit 7.
     if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_FAIL")) |fail_id| {

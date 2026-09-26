@@ -657,11 +657,10 @@ test "a rejected shader override stops the cold build before any package is inst
 /// that completed. `main` returns it as the CLI's exit code, so automation
 /// can tell a crash from a clean run (cli#390).
 ///
-/// A build that stops the launch is always NONZERO, but only the warm
-/// rebuild in the run branch reports its own code: the primary build
-/// (docker / progress / captured) fails through `error.BuildFailed`, i.e.
-/// exit 1, because that error path is what runs this function's errdefers.
-/// The build's real code is in the `failed` progress record either way.
+/// A build that stops the launch is always NONZERO: the build (docker /
+/// progress / captured) fails through `error.BuildFailed`, i.e. exit 1,
+/// because that error path is what runs this function's errdefers. The
+/// build's real code is in the `failed` progress record.
 /// A subcommand that completed is exit 0; its error propagates unchanged.
 /// Lets `run` return a status while the subcommands it delegates to keep
 /// their `!void` signatures.
@@ -1655,30 +1654,29 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             // and only on a clean exit.
             return provider_hooks.finishRun(&hook_site, hook_plans.run.after, run_out, run_result);
         } else {
-            // Build, then run the game BINARY DIRECTLY rather than via
-            // `zig build run`. `zig build run` launches the game in its own
-            // child process group, which ESCAPES the --timeout kill: the
-            // watchdog signals labelle's direct child (the `zig build`
-            // process), the game survives in its separate group, gets
-            // reparented to init, and orphans. Run as labelle's own child and
-            // the game stays in the process group the watchdog signals, so
-            // SIGTERM→SIGKILL actually reaches it. Mirrors the --docker path.
+            // Run the game BINARY DIRECTLY rather than via `zig build run`.
+            // `zig build run` launches the game in its own child process
+            // group, which ESCAPES the --timeout kill: the watchdog signals
+            // labelle's direct child (the `zig build` process), the game
+            // survives in its separate group, gets reparented to init, and
+            // orphans. Run as labelle's own child and the game stays in the
+            // process group the watchdog signals, so SIGTERM→SIGKILL
+            // actually reaches it. Mirrors the --docker path.
             //
-            // Build with no timeout (only the run is time-limited); keep the
-            // game's cwd at `target_dir` (a target_dir-relative argv[0]) so
-            // saves land exactly where `zig build run` put them.
-            // The main compile already ran under the `compile`/`link`
-            // phases above; this re-build is a warm-cache no-op, so it
-            // stays in the compile/link phase — `run` begins when the game
-            // binary is about to spawn.
-            const build_result = try runner.runZigInheritWithEnv(allocator, target_dir, zig_args.items, null, env_map_ptr);
-            if (build_result != 0) {
-                if (reporter) |r| r.finishFailed(build_result, "zig build failed");
-                std.debug.print("\nlabelle: build failed (exit {d})\n", .{build_result});
-                // A failed prerequisite build stops the launch AND fails
-                // the command — it used to fall out of here as exit 0.
-                return build_result;
-            }
+            // Keep the game's cwd at `target_dir` (a target_dir-relative
+            // argv[0]) so saves land exactly where `zig build run` put them.
+            //
+            // There is deliberately NO second `zig build` here. The core
+            // build above (`core_build`, or its `replace` hook) is the one
+            // and only build of this command; the warm re-build that used
+            // to sit here was a leftover of translating `zig build run`
+            // into build-then-exec (cli#265) — a warm-cache no-op that
+            // nonetheless re-ran the install steps, so a `zig-out/` file an
+            // `after build` hook had signed, stripped or patched was copied
+            // back to its unhooked original right before launch, and a
+            // `replace` hook's build was quietly followed by the core one
+            // (Codex P2 on #420). `run` begins when the game binary is
+            // about to spawn.
             // Exe name: the assembler names the desktop exe after the
             // sanitized project (labelle-assembler#362); older generated
             // build.zig still emit `game`. Prefer the project name; fall back
