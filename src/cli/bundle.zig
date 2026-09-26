@@ -523,6 +523,9 @@ pub fn exeNameFromBuildZig(source: []const u8) ?[]const u8 {
     return name;
 }
 
+/// Suffix Zig gives the host-built game executable (`.exe` on Windows).
+const exe_ext = builtin.target.exeFileExt();
+
 /// The built desktop executable: `name` (what `CFBundleExecutable` gets)
 /// and its `path` under `<target>/zig-out/bin/`. Both owned.
 pub const ResolvedExe = struct {
@@ -563,11 +566,14 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     defer allocator.free(build_zig);
     if (cwd.readFileAlloc(io, build_zig, allocator, .limited(8 * 1024 * 1024))) |source| {
         defer allocator.free(source);
-        if (exeNameFromBuildZig(source)) |declared| {
+        if (exeNameFromBuildZig(source)) |declared_name| {
+            // Zig installs `<name>.exe` on a Windows host; build.zig declares `<name>`.
+            const declared = try std.mem.concat(allocator, u8, &.{ declared_name, exe_ext });
+            defer allocator.free(declared);
             const path = try std.fs.path.join(allocator, &.{ bin_dir, declared });
             errdefer allocator.free(path);
             if (util.fileExists(path)) {
-                return .{ .name = try allocator.dupe(u8, declared), .path = path };
+                return .{ .name = try allocator.dupe(u8, declared_name), .path = path };
             }
             allocator.free(path);
         }
@@ -580,7 +586,9 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     var best: ?ResolvedExe = null;
     errdefer if (best) |b| b.deinit(allocator);
     var best_mtime: i96 = 0;
-    for (candidates) |cand| {
+    for (candidates) |cand_name| {
+        const cand = try std.mem.concat(allocator, u8, &.{ cand_name, exe_ext });
+        defer allocator.free(cand);
         const path = try std.fs.path.join(allocator, &.{ bin_dir, cand });
         const st = cwd.statFile(io, path, .{}) catch {
             allocator.free(path);
@@ -588,7 +596,7 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
         };
         if (best == null or st.mtime.nanoseconds > best_mtime) {
             if (best) |b| b.deinit(allocator);
-            best = .{ .name = try allocator.dupe(u8, cand), .path = path };
+            best = .{ .name = try allocator.dupe(u8, cand_name), .path = path };
             best_mtime = st.mtime.nanoseconds;
         } else {
             allocator.free(path);
