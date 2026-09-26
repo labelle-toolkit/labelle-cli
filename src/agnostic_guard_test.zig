@@ -4,12 +4,16 @@
 //! the contract (`cli/provider_contract.zig`) and the host OS it runs on.
 //!
 //! Walks every source file under `src/` at test time (`.zig`, plus the
-//! compiled `.c`/`.h` vendored there), splits each into `[A-Za-z0-9]+` runs,
-//! splits those again at CamelCase boundaries and compares the pieces
-//! case-insensitively against `forbidden`. So `ios_cmd`, `cli/android/`,
-//! `IosConfig` and `getSDLPath` flag while `std.Io`, `biosphere` and
-//! `Iostream` do not. Comments count: the mandate is textual, so a doc
-//! comment naming a platform is a finding too. The JSON wire fixtures under
+//! compiled `.c`/`.h` vendored there), splits each into `[A-Za-z0-9]+` runs
+//! and compares each run case-insensitively against `forbidden`, first as a
+//! whole and then piece by piece at CamelCase boundaries. So `ios_cmd`,
+//! `cli/android/`, `IosConfig`, `iOS`, `iOSConfig` and `getSDLPath` flag
+//! while `std.Io`, `biosphere`, `Iostream` and `iostream` do not. The file's
+//! path relative to `src/` is scanned the same way: a file whose directory
+//! or name carries a platform (`cli/steam/upload.zig`) is a finding even
+//! when its contents are clean, so renaming and moving files stays part of
+//! the migration. Comments count: the mandate is textual, so a doc comment
+//! naming a platform is a finding too. The JSON wire fixtures under
 //! `cli/provider_contract/` are data, not source, and stay out of scope:
 //! they describe what a provider may send, so a provider name there is not
 //! core code knowing a platform.
@@ -23,11 +27,13 @@
 const std = @import("std");
 
 /// Platform, store, package and backend names the core must not mention.
-/// Canonical lowercase; a token is compared after lowercasing.
+/// Canonical lowercase; a token is compared after lowercasing. `web` is the
+/// platform the RFC moves into the `labelle-web` provider, alongside its
+/// `wasm`/`emsdk` toolchain names.
 const forbidden = [_][]const u8{
-    "android", "ios",   "wasm",   "emsdk", "emscripten", "steam",
-    "itch",    "xcode", "gradle", "apk",   "aab",        "ndk",
-    "raylib",  "sokol", "sdl",    "sdl2",  "bgfx",       "wgpu",
+    "android", "ios",   "web",    "wasm", "emsdk", "emscripten", "steam",
+    "itch",    "xcode", "gradle", "apk",  "aab",   "ndk",        "raylib",
+    "sokol",   "sdl",   "sdl2",   "bgfx", "wgpu",
 };
 
 /// Host OS names: the core legitimately branches on the OS it runs on,
@@ -38,8 +44,12 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// are relative to `src/` with `/` separators, one file per entry: there
 /// are no directory prefixes, so a new file under `cli/android/` is not
 /// exempt. Recomputed on `feat/agnostic-guard` after the CamelCase split
-/// and the C scan (53 entries). Shrink only: an entry whose file is clean
-/// fails the test until it is removed.
+/// and the C scan, and again after the path scan, the `iOS` spelling and
+/// `web` joined (still 53 entries: every file those reach was already
+/// listed). Shrink only: an entry whose file is clean fails the test until
+/// it is removed. Note the path scan: an entry under `cli/android/` or
+/// named `cli/ios.zig` stays dirty until the file is moved or renamed, not
+/// merely emptied of platform words.
 const allowed_files = [_][]const u8{
     // This file: it spells the forbidden table out.
     "agnostic_guard_test.zig",
@@ -143,36 +153,57 @@ fn classify(run: []const u8) ?[]const u8 {
 }
 
 /// True when a CamelCase boundary falls between `text[i - 1]` and
-/// `text[i]`, both word bytes: a lowercase letter or digit followed by an
-/// uppercase one (`getSDL`, `Sdl2Provision`), or the last letter of an
-/// uppercase run when a lowercase letter follows it (`SDL|Path`). Digits
-/// never start a piece, so `sdl2` and `win32` stay whole.
-fn splitsBefore(text: []const u8, i: usize) bool {
+/// `text[i]`, both word bytes of the piece starting at `start`: a lowercase
+/// letter or digit followed by an uppercase one (`getSDL`, `Sdl2Provision`),
+/// or the last letter of an uppercase run when a lowercase letter follows
+/// it (`SDL|Path`). Digits never start a piece, so `sdl2` and `win32` stay
+/// whole. A run that opens with one lowercase letter and then two or more
+/// uppercase ones is a lowercase-leading acronym (`iOS`, `iOSConfig`): no
+/// boundary after its first letter, so it splits as `iOS|Config`, not
+/// `i|OS|Config`. Only the first piece of a run can open with a lowercase
+/// letter (every later piece starts at an uppercase one), so `start` is the
+/// run's start whenever that rule can fire.
+fn splitsBefore(text: []const u8, start: usize, i: usize) bool {
     const prev = text[i - 1];
     const cur = text[i];
     if (!std.ascii.isUpper(cur)) return false;
-    if (std.ascii.isLower(prev) or std.ascii.isDigit(prev)) return true;
+    if (std.ascii.isLower(prev)) {
+        const leading_acronym = i == start + 1 and i + 1 < text.len and std.ascii.isUpper(text[i + 1]);
+        return !leading_acronym;
+    }
+    if (std.ascii.isDigit(prev)) return true;
     return i + 1 < text.len and std.ascii.isLower(text[i + 1]);
 }
 
-/// Yields the forbidden words of `text` in order of occurrence, one per
-/// CamelCase piece of each `[A-Za-z0-9]+` run.
+/// Yields the forbidden words of `text` in order of occurrence. Each
+/// `[A-Za-z0-9]+` run is classified whole first (`iOS`, `ANDROID`), then,
+/// when the whole run is not a forbidden word, once per CamelCase piece.
 const Tokenizer = struct {
     text: []const u8,
     pos: usize = 0,
+    /// End of the run currently being split into pieces; `pos == run_end`
+    /// between runs.
+    run_end: usize = 0,
 
     fn next(self: *Tokenizer) ?[]const u8 {
-        while (self.pos < self.text.len) {
-            if (!isWordByte(self.text[self.pos])) {
-                self.pos += 1;
-                continue;
+        while (true) {
+            if (self.pos >= self.run_end) {
+                while (self.pos < self.text.len and !isWordByte(self.text[self.pos])) self.pos += 1;
+                if (self.pos >= self.text.len) return null;
+                const start = self.pos;
+                var end = start;
+                while (end < self.text.len and isWordByte(self.text[end])) end += 1;
+                self.run_end = end;
+                if (classify(self.text[start..end])) |word| {
+                    self.pos = end;
+                    return word;
+                }
             }
             const start = self.pos;
             self.pos += 1;
-            while (self.pos < self.text.len and isWordByte(self.text[self.pos]) and !splitsBefore(self.text, self.pos)) self.pos += 1;
+            while (self.pos < self.run_end and !splitsBefore(self.text, start, self.pos)) self.pos += 1;
             if (classify(self.text[start..self.pos])) |word| return word;
         }
-        return null;
     }
 };
 
@@ -203,10 +234,20 @@ const Scan = struct {
         self.offenders.deinit(self.gpa);
     }
 
-    /// Note one file's contents. `path` is relative to `src/`.
+    /// Note one file: its path (relative to `src/`, scanned first, every
+    /// segment) and then its contents, line by line.
     fn file(self: *Scan, path: []const u8, bytes: []const u8) !void {
         if (std.mem.eql(u8, path, cli_root)) self.saw_cli_root = true;
         const allowed = allowedIndex(path);
+        var path_tokens: Tokenizer = .{ .text = path };
+        while (path_tokens.next()) |word| {
+            if (allowed) |i| {
+                self.dirty[i] = true;
+                return; // a platform in the name keeps the entry on its own
+            }
+            const msg = try std.fmt.allocPrint(self.gpa, "src/{s}: '{s}' in path {s}", .{ path, word, finding_note });
+            try self.offenders.append(self.gpa, msg);
+        }
         var line_no: usize = 0;
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
@@ -254,11 +295,35 @@ test "the tokenizer splits CamelCase at case transitions and acronym boundaries"
     try expectWords("std.Io Iostream biosphere wasmtime IoReader", &.{});
 }
 
+test "the tokenizer keeps lowercase-leading acronyms whole" {
+    // Whole run first: the conventional spelling is one word.
+    try expectWords("iOS", &.{"ios"});
+    try expectWords("runs on iOS and Android", &.{ "ios", "android" });
+    // `iOS|Config`, not `i|OS|Config`; plain camelCase still splits.
+    try expectWords("iOSConfig", &.{"ios"});
+    try expectWords("iosConfig", &.{"ios"});
+    try expectWords("const iOSConfig = struct {};", &.{"ios"});
+    // A one-letter lowercase prefix before a single capital is ordinary camelCase.
+    try expectWords("getSDLPath aSdl", &.{ "sdl", "sdl" });
+    // Neither an all-lowercase run nor a capitalised `Io` is the platform.
+    try expectWords("iostream std.Io IoReader Io", &.{});
+    // Host OS names keep passing under the whole-run rule too.
+    try expectWords("macOS macos MacOS", &.{});
+}
+
+test "web is forbidden alongside its toolchain names" {
+    try expectWords("web", &.{"web"});
+    try expectWords("labelle-web WebProvider WebGL web/index.html", &.{ "web", "web", "web", "web" });
+    try expectWords("wasm emsdk WasmConfig", &.{ "wasm", "emsdk", "wasm" });
+    // Substrings inside a longer lowercase run never match.
+    try expectWords("webhook website cobweb", &.{});
+}
+
 test "CamelCase pieces" {
     const Piece = struct {
         fn all(text: []const u8, out: *std.ArrayList([]const u8)) !void {
             var start: usize = 0;
-            for (1..text.len) |i| if (splitsBefore(text, i)) {
+            for (1..text.len) |i| if (splitsBefore(text, 0, i)) {
                 try out.append(std.testing.allocator, text[start..i]);
                 start = i;
             };
@@ -275,6 +340,12 @@ test "CamelCase pieces" {
     out.clearRetainingCapacity();
     try Piece.all("Iostream", &out);
     try std.testing.expectEqualDeep(&[_][]const u8{"Iostream"}, out.items);
+    out.clearRetainingCapacity();
+    try Piece.all("iOSConfig", &out);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "iOS", "Config" }, out.items);
+    out.clearRetainingCapacity();
+    try Piece.all("iosConfig", &out);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "ios", "Config" }, out.items);
 }
 
 test "host OS names never flag" {
@@ -317,20 +388,64 @@ test "a finding is reported per line and a clean allowlisted file goes stale" {
     try std.testing.expectEqual(@as(usize, 2), scan.offenders.items.len);
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:1: 'android' " ++ finding_note, scan.offenders.items[0]);
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:3: 'sokol' " ++ finding_note, scan.offenders.items[1]);
-    // Allowlisted and dirty: no finding, entry kept. Clean: entry stale.
+    // The conventional `iOS` spelling and `web` count in a clean-looking file.
+    try scan.file("cli/provider_manifest.zig", "const iOSConfig = struct {};\nconst w = labelle_web;\n");
+    try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
+    try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:1: 'ios' " ++ finding_note, scan.offenders.items[2]);
+    try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:2: 'web' " ++ finding_note, scan.offenders.items[3]);
+    // Allowlisted and dirty: no finding, entry kept. Clean name and body: stale.
     try scan.file("cli/pipeline.zig", "// wasm\n");
-    try scan.file("cli/android/run.zig", "const x = 1;\n");
-    try std.testing.expectEqual(@as(usize, 2), scan.offenders.items.len);
+    try scan.file("cli/pack.zig", "const x = 1;\n");
+    try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/pipeline.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/android/run.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/pack.zig"));
     try std.testing.expect(containsString(stale.items, "cli/serve.zig"));
     // The sentinel is only set by the CLI root itself.
     try std.testing.expect(!scan.saw_cli_root);
     try scan.file(cli_root, "// android\n");
     try std.testing.expect(scan.saw_cli_root);
+}
+
+test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
+    const gpa = std.testing.allocator;
+    var scan: Scan = .{ .gpa = gpa };
+    defer scan.deinit();
+    // Clean contents, dirty name: the directory segment is the finding.
+    try scan.file("cli/steam/upload.zig", "const x = 1;\n");
+    try std.testing.expectEqual(@as(usize, 1), scan.offenders.items.len);
+    try std.testing.expectEqualStrings("src/cli/steam/upload.zig: 'steam' in path " ++ finding_note, scan.offenders.items[0]);
+    // Every segment counts, on either separator, and `_`/`-`/`.` are boundaries.
+    try scan.file("cli\\itch_upload.zig", "");
+    try scan.file("cli/build-apk.zig", "");
+    try scan.file("cli/xcode.h", "");
+    try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
+    try std.testing.expectEqualStrings("src/cli\\itch_upload.zig: 'itch' in path " ++ finding_note, scan.offenders.items[1]);
+    try std.testing.expectEqualStrings("src/cli/build-apk.zig: 'apk' in path " ++ finding_note, scan.offenders.items[2]);
+    try std.testing.expectEqualStrings("src/cli/xcode.h: 'xcode' in path " ++ finding_note, scan.offenders.items[3]);
+    // Path hits come before content hits, once per segment hit.
+    try scan.file("cli/android/gradle.zig", "// ndk\n");
+    try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
+    try std.testing.expectEqualStrings("src/cli/android/gradle.zig: 'android' in path " ++ finding_note, scan.offenders.items[4]);
+    try std.testing.expectEqualStrings("src/cli/android/gradle.zig: 'gradle' in path " ++ finding_note, scan.offenders.items[5]);
+    try std.testing.expectEqualStrings("src/cli/android/gradle.zig:1: 'ndk' " ++ finding_note, scan.offenders.items[6]);
+    // Provider-neutral names produce nothing.
+    try scan.file("cli/provider_settings.zig", "");
+    try scan.file("cli/webhook_biosphere.zig", "");
+    try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
+    // An allowlisted file under a platform directory stays dirty with clean
+    // contents: the entry is only stale once the file is moved or renamed.
+    try scan.file("cli/android/run.zig", "const x = 1;\n");
+    try scan.file("cli\\ios.zig", "");
+    try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
+    var stale: std.ArrayList([]const u8) = .empty;
+    defer stale.deinit(gpa);
+    try scan.stale(&stale);
+    try std.testing.expect(!containsString(stale.items, "cli/android/run.zig"));
+    try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/pack.zig"));
 }
 
 fn containsString(haystack: []const []const u8, needle: []const u8) bool {
