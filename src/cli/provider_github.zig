@@ -193,12 +193,11 @@ pub const Sources = struct {
 
 /// The `plugin.labelle` of a pinned package, read straight out of its
 /// verified cached archive — nothing is extracted, downloaded or run — or
-/// null when the archive is not cached.
+/// null when the archive holds no manifest. `ProviderArchiveMissing` when
+/// the archive is not cached. Every buffer lands on `a`; callers that scan
+/// several releases pass a scratch arena.
 fn cachedManifest(a: std.mem.Allocator, pin: Pin) !?manifest.Manifest {
-    const bytes = archive(a, pin, false) catch |err| switch (err) {
-        error.ProviderArchiveMissing => return null,
-        else => return err,
-    };
+    const bytes = try archive(a, pin, false);
     defer a.free(bytes);
     var input: std.Io.Reader = .fixed(bytes);
     var buffer: [std.compress.flate.max_window_len]u8 = undefined;
@@ -224,6 +223,12 @@ fn cachedManifest(a: std.mem.Allocator, pin: Pin) !?manifest.Manifest {
     return null;
 }
 
+/// How many cached releases the registry-hint scan reads before giving up
+/// on the hint. Each read decompresses a whole archive (up to 128 MiB
+/// compressed, 512 MiB unpacked), so the scan is bounded rather than the
+/// size of the registry document.
+pub const registry_hint_scan_limit: usize = 16;
+
 fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
     const path = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir, registry_cache_file });
     const bytes = read(a, path, 1024 * 1024) catch |err| switch (err) {
@@ -231,10 +236,25 @@ fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
         else => return err,
     };
     const doc = try parse(a, bytes, false);
+    var inspected: usize = 0;
     for (doc.providers) |pin| {
+        if (inspected == registry_hint_scan_limit) break;
         // Only a verified cached archive can say what a package declares; a
         // release that is not cached, or whose bytes do not verify, says nothing.
-        const meta = (cachedManifest(a, pin) catch continue) orelse continue;
+        // The archive and its unpacked tar live on a scratch arena freed per
+        // release: the caller's arena (the pipeline's) would keep every
+        // inspected release's buffers alive until the command exits.
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const meta = cachedManifest(scratch.allocator(), pin) catch |err| switch (err) {
+            error.ProviderArchiveMissing => continue, // Not cached: nothing was read.
+            else => {
+                inspected += 1;
+                continue;
+            },
+        } orelse continue;
+        inspected += 1;
+        // `pin.package` is on the caller's allocator, unlike `meta`.
         if (std.mem.eql(u8, meta.name, pin.package) and meta.ownsTarget(target)) return pin.package;
     }
     return null;
@@ -760,6 +780,49 @@ test "provider github: the cached registry names a target owner only from a veri
     // Bytes that do not verify against the pin say nothing.
     try cwd.writeFile(io, .{ .sub_path = archive_path, .data = "not the archive" });
     try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+}
+
+test "provider github: the registry-hint scan reads a bounded number of cached releases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    // `limit` cached releases that do not declare the target, then the one
+    // that does; every archive differs so every pin verifies its own bytes.
+    var pins: std.ArrayList(Pin) = .empty;
+    var i: usize = 0;
+    while (i < registry_hint_scan_limit) : (i += 1) {
+        const text = try std.fmt.allocPrint(a, ".{{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"other-{d}\" }} }}", .{i});
+        const data = try AcceptFixture.gzipArchiveWith(a, text);
+        var pin = fx.pin;
+        pin.version = try std.fmt.allocPrint(a, "1.{d}.0", .{i});
+        pin.sha256 = try sha256Hex(a, data);
+        try cwd.writeFile(io, .{ .sub_path = try archivePath(a, pin), .data = data });
+        try pins.append(a, pin);
+    }
+    const declaring = ".{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }";
+    const data = try AcceptFixture.gzipArchiveWith(a, declaring);
+    var owner = fx.pin;
+    owner.version = "9.0.0";
+    owner.sha256 = try sha256Hex(a, data);
+    try cwd.writeFile(io, .{ .sub_path = try archivePath(a, owner), .data = data });
+    // An uncached release costs nothing and is not counted against the bound.
+    var uncached = fx.pin;
+    uncached.version = "8.0.0";
+    uncached.sha256 = "0" ** 64;
+    try pins.append(a, uncached);
+    try pins.append(a, owner);
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = pins.items }, .{}));
+    // Beyond the bound: the owner is never read, so there is no hint.
+    try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+    // Within it (one decoy fewer), the same document names the owner.
+    const trimmed = try std.mem.concat(a, Pin, &.{ pins.items[1..registry_hint_scan_limit], pins.items[registry_hint_scan_limit..] });
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = trimmed }, .{}));
+    try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "probe-target").?);
+    try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "other-1").?);
 }
 
 fn testArchive(a: std.mem.Allocator, file: []const u8) ![]u8 {
