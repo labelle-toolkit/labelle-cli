@@ -555,6 +555,21 @@ pub const ResolvedExe = struct {
 /// something the build didn't produce) fall back to probing the two
 /// candidates, and then prefer the MOST RECENTLY MODIFIED one — the one
 /// the build just wrote.
+/// `<bin_dir>/<name>` if it exists, else `<bin_dir>/<name><exe_ext>` (what Zig
+/// installs on a Windows host), else null. Caller owns the returned path.
+fn existingExe(allocator: std.mem.Allocator, bin_dir: []const u8, name: []const u8) !?[]u8 {
+    const bare = try std.fs.path.join(allocator, &.{ bin_dir, name });
+    if (util.fileExists(bare)) return bare;
+    allocator.free(bare);
+    if (exe_ext.len == 0) return null;
+    const file = try std.mem.concat(allocator, u8, &.{ name, exe_ext });
+    defer allocator.free(file);
+    const suffixed = try std.fs.path.join(allocator, &.{ bin_dir, file });
+    if (util.fileExists(suffixed)) return suffixed;
+    allocator.free(suffixed);
+    return null;
+}
+
 pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, project_name: []const u8) !ResolvedExe {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -567,15 +582,10 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     if (cwd.readFileAlloc(io, build_zig, allocator, .limited(8 * 1024 * 1024))) |source| {
         defer allocator.free(source);
         if (exeNameFromBuildZig(source)) |declared_name| {
-            // Zig installs `<name>.exe` on a Windows host; build.zig declares `<name>`.
-            const declared = try std.mem.concat(allocator, u8, &.{ declared_name, exe_ext });
-            defer allocator.free(declared);
-            const path = try std.fs.path.join(allocator, &.{ bin_dir, declared });
-            errdefer allocator.free(path);
-            if (util.fileExists(path)) {
+            if (try existingExe(allocator, bin_dir, declared_name)) |path| {
+                errdefer allocator.free(path);
                 return .{ .name = try allocator.dupe(u8, declared_name), .path = path };
             }
-            allocator.free(path);
         }
     } else |_| {}
 
@@ -587,9 +597,7 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     errdefer if (best) |b| b.deinit(allocator);
     var best_mtime: i96 = 0;
     for (candidates) |cand_name| {
-        const cand = try std.mem.concat(allocator, u8, &.{ cand_name, exe_ext });
-        defer allocator.free(cand);
-        const path = try std.fs.path.join(allocator, &.{ bin_dir, cand });
+        const path = (try existingExe(allocator, bin_dir, cand_name)) orelse continue;
         const st = cwd.statFile(io, path, .{}) catch {
             allocator.free(path);
             continue;
