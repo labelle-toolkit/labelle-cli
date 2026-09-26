@@ -69,6 +69,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Manifest {
     var ast = try std.zig.Ast.parse(allocator, source, .zon);
     defer ast.deinit(allocator);
     if (ast.errors.len != 0) return error.InvalidManifest;
+    try rejectRepeatedFields(ast);
     var zoir = try std.zig.ZonGen.generate(allocator, ast, .{ .parse_str_lits = false });
     defer zoir.deinit(allocator);
     if (zoir.hasCompileErrors()) return error.InvalidManifest;
@@ -96,6 +97,24 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Manifest {
     return result;
 }
 
+/// The manual field loop in `parse` assigns every occurrence of a recognised
+/// name, so a repeated `.command_contract`/`.namespace`/`.commands` would
+/// otherwise negotiate whichever value comes last. ZonGen also refuses a
+/// repeated struct field name, but only as an anonymous compile error; this
+/// check runs before it so the rejection is named and does not depend on
+/// ZonGen's diagnostics (cli#413 review).
+fn rejectRepeatedFields(ast: std.zig.Ast) !void {
+    var buf: [2]std.zig.Ast.Node.Index = undefined;
+    // Anything but a struct literal at the root is rejected after ZonGen.
+    const root = ast.fullStructInit(&buf, ast.rootDecls()[0]) orelse return;
+    for (root.ast.fields, 0..) |field, i| {
+        const name = ast.tokenSlice(ast.firstToken(field) - 2);
+        for (root.ast.fields[0..i]) |prev| {
+            if (std.mem.eql(u8, name, ast.tokenSlice(ast.firstToken(prev) - 2))) return error.DuplicateManifestField;
+        }
+    }
+}
+
 test "provider manifest: strict records, negotiation, defaults and runtime extension" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -111,4 +130,26 @@ test "provider manifest: strict records, negotiation, defaults and runtime exten
     const v1 = try std.mem.replaceOwned(u8, a, good, "manifest_version = 2", "manifest_version = 1");
     try std.testing.expectError(error.UnsupportedManifest, parse(a, v1));
     try std.testing.expect(!(try parse(a, ".{ .name = \"runtime\", .resources = .{} }")).isProvider());
+}
+
+test "provider manifest: a repeated top-level field is rejected, never last-wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const good = ".{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"probe\", .commands = .{ .{ .name = \"doctor\", .build_step = \"tool\", .executable = \"bin/doctor\", .help = \"Inspect\" } } }";
+    _ = try parse(a, good);
+    // Each repeat is valid on its own, so last-wins would parse cleanly with
+    // the second value; the named error proves the guard ran, not ZonGen.
+    for ([_][]const u8{
+        ".command_contract = \">=1.0.0 <2.0.0\"",
+        ".namespace = \"probe\"",
+        ".manifest_version = 2",
+        ".commands = .{ .{ .name = \"doctor\", .build_step = \"tool\", .executable = \"bin/doctor\", .help = \"Inspect\" } }",
+    }) |decl| {
+        const repeated = try std.mem.replaceOwned(u8, a, good, decl, try std.fmt.allocPrint(a, "{s}, {s}", .{ decl, decl }));
+        try std.testing.expect(!std.mem.eql(u8, good, repeated));
+        try std.testing.expectError(error.DuplicateManifestField, parse(a, repeated));
+    }
+    // Unknown runtime fields are subject to the same rule.
+    try std.testing.expectError(error.DuplicateManifestField, parse(a, ".{ .name = \"runtime\", .resources = .{}, .resources = .{} }"));
 }

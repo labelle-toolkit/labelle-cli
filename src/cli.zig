@@ -80,7 +80,9 @@ const pipeline = @import("cli/pipeline.zig");
 
 /// Handle `labelle assembler <subcommand>`.
 fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
-    const usage = "Usage: labelle providers resolve [providers.json] [--accept] [--offline]\n";
+    const usage = "Usage: labelle providers resolve [providers.json] [--accept] [--offline]\n" ++
+        "  Without --accept: preview pins and record them in .labelle/providers.preview.json.\n" ++
+        "  --accept: pin only what that preview recorded; a changed registry is rejected.\n";
     const sub = args.next() orelse {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -162,14 +164,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
     var parsed_args = ParsedArgs{ .command = .run };
 
     const first_arg = args.next();
-    if (first_arg == null) {
-        help.printHelp();
-        provider_dispatch.printHelp(allocator) catch |err| {
-            std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-            return 1;
-        };
-        return 0;
-    }
+    if (first_arg == null) return printHelpWithProviders(allocator);
 
     if (first_arg) |first| {
         if (std.mem.eql(u8, first, "providers")) {
@@ -470,14 +465,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
 
     // Standalone commands (no project.labelle needed)
     switch (command) {
-        .help_cmd => {
-            help.printHelp();
-            provider_dispatch.printHelp(allocator) catch |err| {
-                std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-                return 1;
-            };
-            return 0;
-        },
+        .help_cmd => return printHelpWithProviders(allocator),
         .version => return ok(help.printVersion()),
         .targets => return ok(help.printTargets()),
         .init_cmd => return ok(init.cmdInit(allocator, parsed_args.extra_args[0..parsed_args.extra_count])),
@@ -536,6 +524,22 @@ pub fn main(proc_init: std.process.Init) !u8 {
 /// a status.
 fn ok(result: anytype) !u8 {
     if (comptime @typeInfo(@TypeOf(result)) == .error_union) try result;
+    return 0;
+}
+
+/// Built-in usage followed by the project's provider commands, for both
+/// `labelle help` and a bare `labelle`.
+///
+/// Provider discovery is best-effort and never changes the exit status: the
+/// built-in text has already been printed, and a broken project.labelle or
+/// provider manifest is exactly the situation in which a user reaches for
+/// help (or a script relies on it being universally available). A discovery
+/// failure is a one-line stderr warning, not an error (cli#413 review).
+fn printHelpWithProviders(allocator: std.mem.Allocator) u8 {
+    help.printHelp();
+    provider_dispatch.printHelp(allocator) catch |err| {
+        std.debug.print("labelle: warning: project package commands not listed, provider discovery failed: {s}\n", .{@errorName(err)});
+    };
     return 0;
 }
 

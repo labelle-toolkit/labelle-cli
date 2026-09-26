@@ -176,6 +176,13 @@ fn executable(a: std.mem.Allocator, prefix: []const u8, relative: []const u8) ![
     return resolved;
 }
 
+/// Create `dir` if needed and return its canonical absolute path, so it means
+/// the same thing in a child that runs with a different cwd.
+fn canonicalDir(a: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
+    return real(a, dir);
+}
+
 fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
     var result: ?[]const u8 = null;
     for (cfg.provider_config) |entry| {
@@ -235,9 +242,15 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     if (version.term != .exited or version.term.exited != 0) return error.ProviderCompilerFailed;
     if (!std.mem.eql(u8, std.mem.trim(u8, version.stdout, "\r\n "), required.version)) return error.ProviderCompilerVersionMismatch;
 
+    // The build child runs with the provider as cwd, so every path handed to
+    // it is canonical: a relative LABELLE_HOME (which getCacheRoot accepts)
+    // would otherwise make Zig install beneath the provider source while this
+    // process looks for the prefix beneath its own cwd, and the stray tree
+    // would never be cleaned because only run_dir is removed (cli#413 review).
+    // `github.cacheRoot` already resolves LABELLE_HOME against this process's
+    // cwd; `canonicalDir` creates the directory and returns its real path.
     const cache_root = try github.cacheRoot(a);
-    const runs = try std.fs.path.join(a, &.{ cache_root, "provider-runs" });
-    try std.Io.Dir.cwd().createDirPath(io, runs);
+    const runs = try canonicalDir(a, try std.fs.path.join(a, &.{ cache_root, "provider-runs" }));
     var random: [16]u8 = undefined;
     io.random(&random);
     const run_dir = try std.fs.path.join(a, &.{ runs, &std.fmt.bytesToHex(random, .lower) });
@@ -258,11 +271,10 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     // Always run the install step: never trust a stale installed executable.
     // Zig's system package mode disables fetching. Its package directory is
     // explicit so a missing dependency fails instead of reaching the network.
-    const packages = try std.fs.path.join(a, &.{ global_cache, "p" });
-    try std.Io.Dir.cwd().createDirPath(io, packages);
+    const packages = try canonicalDir(a, try std.fs.path.join(a, &.{ global_cache, "p" }));
     const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ zig, "build", cmd.build_step, "--prefix", prefix, "--system", packages }, null, &env);
     if (build_code != 0) return build_code;
-    if (!contained(try real(a, run_dir), try real(a, prefix))) return error.EscapingProviderInstall;
+    if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
     const exe = try executable(a, prefix, cmd.executable);
     var output: []const u8 = root;
     for ([_][]const u8{ ".labelle", "providers", provider.meta.name }) |segment| {
@@ -306,6 +318,25 @@ test "provider dispatch: lock mismatch and duplicates fail closed" {
     changed = dep;
     changed.repo = "local:../other";
     try std.testing.expectError(error.StaleProviderPin, validatePin(dep, &.{changed}));
+}
+
+test "provider dispatch: workspace directories are canonical whatever the caller's cwd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // tmpDir lives at a cwd-relative path — the shape a relative LABELLE_HOME takes.
+    const relative = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home", "provider-runs" });
+    try std.testing.expect(!std.fs.path.isAbsolute(relative));
+    const canonical = try canonicalDir(a, relative);
+    try std.testing.expect(std.fs.path.isAbsolute(canonical));
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(config.globalIo(), &buf);
+    try std.testing.expect(contained(buf[0..n], canonical));
+    try std.testing.expectEqualStrings("provider-runs", std.fs.path.basename(canonical));
+    // Created, not merely named: the child can install into it right away.
+    try tmp.dir.access(config.globalIo(), "home/provider-runs", .{});
 }
 
 test "provider dispatch: canonical containment respects component boundaries" {

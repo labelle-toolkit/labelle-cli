@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig)
     registry = base / "providers.json"
     lock = project / "labelle.providers.lock"
+    preview = project / ".labelle/providers.preview.json"
     capture = project / ".labelle/providers/fixture/capture.json"
     data = archive()
     pin = {"package": "fixture", "repo": "example/fixture", "version": "1.0.0", "commit": "1" * 40, "sha256": hashlib.sha256(data).hexdigest()}
@@ -80,6 +81,12 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     def resolve(*flags, code=0):
         return run("providers", "resolve", registry, "--offline", *flags, code=code)
 
+    def accept(code=0):
+        # Acceptance is bound to a preview, so every accept reviews first.
+        resolve()
+        assert preview.exists(), "preview was not recorded"
+        return resolve("--accept", code=code)
+
     def cleaned():
         for name in ("provider-sources", "provider-runs"):
             directory = home / name
@@ -88,14 +95,43 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     config([pin])
     metadata([pin])
     run("providers", "resolve", "--help")
+    # Nothing reviewed yet: accept fails closed before any archive work.
+    assert "ProviderPreviewMissing" in resolve("--accept", code=1).stderr
+    assert not lock.exists() and not preview.exists() and not home.exists()
     assert "Preview: 1" in resolve().stderr
     assert not lock.exists() and not home.exists(), "preview changed state"
+    recorded = json.loads(preview.read_text())
+    assert recorded["providers"] == [dict(pin, archive_url="https://codeload.github.com/example/fixture/tar.gz/" + pin["commit"])]
+    assert recorded["source"] == str(registry) and len(recorded["digest"]) == 64
     assert "ProviderArchiveMissing" in resolve("--accept", code=1).stderr
     assert not lock.exists(), "failed preparation wrote a lock"
+    assert preview.exists(), "failed preparation consumed the preview"
     archive_path = seed(pin, data)
     resolve("--accept")
     assert json.loads(lock.read_text())["providers"] == [pin]
+    assert not preview.exists(), "successful accept kept the preview"
     assert not capture.exists(), "resolve ran package code"
+    cleaned()
+    # Acceptance is bound to the reviewed preview: a registry repointed between
+    # the two invocations is rejected by package and field, and the lock is untouched.
+    old_lock = lock.read_bytes()
+    resolve()
+    metadata([dict(pin, commit="2" * 40)])
+    err = resolve("--accept", code=1).stderr
+    assert "ProviderPreviewMismatch" in err and "provider 'fixture' commit changed since preview" in err, err
+    assert lock.read_bytes() == old_lock and preview.exists()
+    metadata([dict(pin, sha256="0" * 64)])
+    err = resolve("--accept", code=1).stderr
+    assert "ProviderPreviewMismatch" in err and "provider 'fixture' sha256 changed since preview" in err, err
+    assert lock.read_bytes() == old_lock and preview.exists()
+    # An edited preview fails its own digest instead of being trusted.
+    metadata([pin])
+    preview.write_text(preview.read_text().replace(pin["commit"], "2" * 40))
+    assert "ProviderPreviewCorrupt" in resolve("--accept", code=1).stderr
+    assert lock.read_bytes() == old_lock
+    # The registry serving the reviewed record again is accepted.
+    accept()
+    assert lock.read_bytes() == old_lock and not preview.exists()
     cleaned()
     run("probe", "inspect", "one two", "", "$literal")
     first = json.loads(capture.read_text())
@@ -116,19 +152,29 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     capture.unlink()
     archive_path.write_bytes(data + b"tampered")
     assert "ProviderArchiveHashMismatch" in run("probe", "inspect", code=1).stderr
-    assert "ProviderArchiveHashMismatch" in resolve("--accept", code=1).stderr
+    assert "ProviderArchiveHashMismatch" in accept(code=1).stderr
     assert lock.read_bytes() == old_lock and not capture.exists()
     archive_path.write_bytes(data)
     # Failed preparation of the second provider must not replace a working lock.
     broken = dict(pin, package="broken", repo="example/broken", sha256="0" * 64)
     config([pin, broken])
     metadata([pin, broken])
-    resolve("--accept", code=1)
+    accept(code=1)
     assert lock.read_bytes() == old_lock
     cleaned()
     config([pin])
     # Unsafe archives fail even when their compressed SHA-256 matches the pin.
-    for name, kind in (("fixture-commit/../escape.zig", None), ("fixture-commit/link", tarfile.SYMTYPE), ("other-root/file.zig", None), ("fixture-commit/CON", None), ("fixture-commit/MAIN.ZIG", None)):
+    # Each entry names the rule that rejects it, so a stricter earlier check cannot mask a broken later one.
+    for name, kind, reason in (
+        ("fixture-commit/../escape.zig", None, "UnsafeProviderArchivePath"),
+        ("fixture-commit/link", tarfile.SYMTYPE, "ProviderArchiveLinkNotSupported"),
+        ("other-root/file.zig", None, "MultipleProviderArchiveRoots"),
+        ("fixture-commit/CON", None, "ReservedProviderArchiveName"),
+        ("fixture-commit/nul.zig", None, "ReservedProviderArchiveName"),
+        ("fixture-commit/MAIN.ZIG", None, "DuplicateProviderArchivePath"),
+        ("fixture-commit/ä.zig", None, "NonAsciiProviderArchivePath"),
+        ("fixture-commit/ctrl\x01.zig", None, "ControlCharProviderArchivePath"),
+    ):
         member = tarfile.TarInfo(name)
         if kind:
             member.type = kind
@@ -137,7 +183,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
         unsafe_pin = dict(pin, sha256=hashlib.sha256(unsafe_data).hexdigest())
         seed(unsafe_pin, unsafe_data)
         metadata([unsafe_pin])
-        resolve("--accept", code=1)
+        assert reason in accept(code=1).stderr, name
         assert lock.read_bytes() == old_lock
         assert not (base / "escape.zig").exists()
         cleaned()
@@ -150,7 +196,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     assert json.loads(capture.read_text())["revision"] == "original"
     config([updated])
     assert "StaleProviderIntegrityPin" in run("probe", "inspect", code=1).stderr
-    resolve("--accept")
+    accept()
     run("probe", "inspect")
     assert json.loads(capture.read_text())["revision"] == "updated"
     assert json.loads(lock.read_text())["providers"] == [updated]
@@ -169,10 +215,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     assert Path(configured["context"]["config_file"]) == settings.resolve()
     assert configured["setting"] == "remote-settings"
     cleaned()
-    # Missing and duplicate release records fail before source preparation.
+    # Missing and duplicate release records fail at preview, before any accept.
     metadata([pin])
-    assert "ProviderReleaseNotInRegistry" in resolve("--accept", code=1).stderr
+    assert "ProviderReleaseNotInRegistry" in resolve(code=1).stderr
     metadata([updated, updated])
-    assert "DuplicateProviderRelease" in resolve("--accept", code=1).stderr
-    assert json.loads(lock.read_text())["providers"] == [updated]
+    assert "DuplicateProviderRelease" in resolve(code=1).stderr
+    assert not preview.exists() and json.loads(lock.read_text())["providers"] == [updated]
     print(f"GitHub provider pins: {checks} real CLI invocations passed")
