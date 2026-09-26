@@ -34,8 +34,13 @@ A hook record in `plugin.labelle` names one `(step, target)` and one phase:
 Hooks require a project. Like commands, they run only for a provider whose
 `labelle.lock` entry matches the declaration and — for a remote package —
 whose integrity pin is accepted (`MissingProviderPin`, `StaleProviderPin`,
-`RemoteProviderIntegrityRequired`). `provider_config` settings are resolved
-the same way and passed as `config_file`.
+`RemoteProviderIntegrityRequired`). Every hook of a phase has its pin
+checked **before** the host compiler is resolved, exactly as a provider
+command does: an unpinned remote hook on a machine without the pinned
+compiler is reported as the integrity failure it is, not as
+`ProviderCompilerMissing`, and the check creates no cache directory.
+`provider_config` settings are resolved the same way and passed as
+`config_file`.
 
 ## Discovery and the graph
 
@@ -68,7 +73,10 @@ accepted remote and local manifests together before writing
 | `HookPhaseOrder` | it names a hook in a later phase (`before` → `replace`/`after`, `replace` → `after`) |
 | `HookCycle` | a cycle among same-phase references |
 
-Each prints one `labelle: hooks: …` line naming the hooks involved.
+Each prints one `labelle: hooks: …` line naming the hooks involved. The
+cycle check orders each distinct `(step, target, phase)` group once, so
+validation stays quadratic in the size of a phase rather than cubic — a
+manifest within the size limit cannot make `help` or a build hang on it.
 
 The metadata-only callers — `labelle help` and provider command dispatch —
 run before any installer, so a declared remote package that is in neither
@@ -93,7 +101,21 @@ that cost is accepted (it is the integrity model of #414).
 ## Order
 
 Within one `(step, target)`: every `before` hook, then the core step or its
-unique `replace` hook, then every `after` hook. Inside a phase the order is a
+unique `replace` hook, then every `after` hook. For `generate`, the core step
+includes its input pre-passes — the ASTC conversion of declared atlases and
+the opt-in `--bake` — so a `before generate` hook runs ahead of every reader
+of the generation inputs: a hook that emits a declared PNG is seen by both
+pre-passes and by the assembler. (The pre-passes used to run before the
+hooks; `generate --bake` then failed on a PNG the hook had not yet written.)
+A `replace generate` hook stands in for the pre-passes as well as for the
+assembler: whatever preprocessing its generation needs is its own to do.
+Likewise for `build`, the core step ends with the command's finalization —
+for `labelle build`, the Linux `.desktop` entry and, on a platform that
+packages one, the installable package — so an `after build` hook sees the
+final artifact and never reports success over a packaging step that has
+not run yet; and a `replace build` hook owns that finalization too: the
+replacement produces the artifact its target needs, packaging included.
+Inside a phase the order is a
 topological sort of the `after_hooks` edges that land in that phase; whenever
 several hooks are ready, the lexicographically smallest fully qualified ID
 runs first. A reference to an earlier phase is accepted and creates no edge.
@@ -204,27 +226,47 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   `--watch` rebuild re-runs the `generate` and `build` hook phases around its
   core steps exactly as the cold pipeline did (the feed is already terminal,
   so the hooks' sub-step records are not emitted there); a failing hook stops
-  that rebuild and keeps the server alive, like a failing core step. Each hook
-  phase allocates on a scratch arena freed when the phase returns — only the
-  resolved host compiler outlives it — so a long watch session with hooks does
-  not grow on every saved edit.
+  that rebuild and keeps the server alive, like a failing core step. Every
+  rebuild first re-reads `project.labelle`, rediscovers the providers (with
+  the cache `.populated`, as the cold pipeline did) and replans both phases,
+  so a watched edit to the project, to a provider manifest or to a
+  `provider_config` file reaches the next rebuild — the plans computed at
+  startup are only the initial state, never reused for a rebuild. A replan
+  that fails (a manifest saved mid-edit, say) stops that rebuild before any
+  hook or core step and leaves the last good plans installed. Each hook
+  phase allocates on a scratch arena freed when the phase returns, and each
+  replan lives on its own arena released once the next one is installed —
+  only the resolved host compiler outlives them — so a long watch session
+  with hooks does not grow on every saved edit.
 - A `--docker` run whose binary was cross-compiled skips the launch and its
   `after run` hooks with it (nothing ran).
+- `wasm serve|export --no-build` skips only `generate` and `build`: serving
+  or exporting the existing artifact is the `run` step, and its `before`,
+  `replace` and `after run` hooks run as on the building path (`after`
+  once the export is on disk, or once the server returns). No installer
+  runs there, so discovery is the metadata-only kind that `labelle help`
+  uses: a declared remote package absent from every cache is not listed
+  rather than reported as a failed install.
 
 ## Verification
 
 `zig build test-provider-dispatch` (also collected by `zig build test`)
 covers manifest validation, the planner's order independence, every graph
-error, the deferral of references into an unread package (at the graph and
+error, that validation orders each phase group once (a call counter on the
+sort), the deferral of references into an unread package (at the graph and
 at discovery, against a real cache layout in both cache states), the
 per-phase scratch arena (a counting allocator proves two phases on one site
-leave nothing live), the `run` outcomes (only `exited_clean` reaches the
-hook machinery), the output-layout contract and the hook wire context;
-`zig build test` also covers the watched-rebuild hook plumbing, the serve
-loop's stop flag and the waker's poke (the signal handler itself is
-interactive, so the Ctrl+C path is not driven end to end — it is the flag
-the handler sets that is tested) and the `link`-phase sub-step. The
-real-process regression is:
+leave nothing live), the pin-before-compiler order (an unpinned provider is
+refused with the host resolver never reached), the `run` outcomes (only
+`exited_clean` reaches the hook machinery), the output-layout contract and
+the hook wire context; `zig build test` also covers the watched-rebuild
+hook plumbing (the phases, and the per-rebuild replan: invoked on every
+rebuild, its plans are the ones that run, a failing replan stops the
+rebuild before any phase, and the production replan against a real project
+follows manifest and project edits), the serve loop's stop flag and the
+waker's poke (the signal handler itself is interactive, so the Ctrl+C path
+is not driven end to end — it is the flag the handler sets that is tested)
+and the `link`-phase sub-step. The real-process regression is:
 
 ```
 zig build
@@ -239,14 +281,21 @@ code with no core build and no `after` hook, a failing core build skipping
 `after`, discovery errors (`ReplaceRequiresOwnedTarget`, `DuplicateReplaceHook`,
 `MissingHookReference`, `HookPhaseOrder`) at `labelle help` before any
 compiler and at `labelle build` after the install but before generation,
-`generate` hooks seeing the lock, `run` hooks around the game, a `--timeout`
-kill running no `after run` hook (and printing the skip line) while a clean
-exit still does, an `after build` edit to `zig-out/` reaching the launched
-game intact, a cold package cache failing closed or running a pinned
-provider's hooks (never skipping them), a reference into an uncached remote
-package leaving `help` intact while a typo is still reported, `bundle` hooks
-and the `.app` location on macOS, and the desktop refusal elsewhere.
-`test/provider_github_e2e.py` checks that `--accept` refuses a broken hook
-graph without writing the lock. Provider-target resolution and bundling are
-covered by `test/provider_targets_e2e.py`. CI runs them on Windows, macOS
-and Linux.
+`generate` hooks seeing the lock, a `before generate` hook's PNG being seen
+by the `--bake` pre-pass (and the same command failing on the missing PNG
+without the hook), `after build` hooks seeing the finalized artifact (the
+`--linux-desktop` entry is in their snapshot of `zig-out/` and not in the
+before hooks'), `run` hooks around the game, a `--timeout` kill running no
+`after run` hook (and printing the skip line) while a clean exit still
+does, the `run` hooks wrapping `wasm export --no-build` with nothing
+installed, generated or built, an `after build` edit to `zig-out/` reaching
+the launched game intact, a cold package cache failing closed or running a
+pinned provider's hooks (never skipping them) — with an unpinned remote hook
+refused as `RemoteProviderIntegrityRequired` while `LABELLE_ZIG` points
+nowhere, and the same dead compiler being the failure once the pin is
+accepted — a reference into an uncached remote package leaving `help` intact
+while a typo is still reported, `bundle` hooks and the `.app` location on
+macOS, and the refusal elsewhere. `test/provider_github_e2e.py` checks that `--accept` refuses a
+broken hook graph without writing the lock. Provider-target resolution and
+bundling are covered by `test/provider_targets_e2e.py`. CI runs them on
+Windows, macOS and Linux.

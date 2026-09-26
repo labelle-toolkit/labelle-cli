@@ -15,10 +15,12 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--zig", default=shutil.which("zig"))
@@ -105,7 +107,8 @@ def manifest(name, hooks, targets=()):
 A_HOOKS = [hook("a-pre", "build", "before", after=["fixture-b/b-pre"]), hook("a-post", "build", "after"),
            hook("a-gen-pre", "generate", "before"), hook("a-gen-post", "generate", "after"),
            hook("a-bundle-pre", "bundle", "before"), hook("a-bundle-post", "bundle", "after"),
-           hook("a-run-pre", "run", "before"), hook("a-run-post", "run", "after")]
+           hook("a-run-pre", "run", "before"), hook("a-run-post", "run", "after"),
+           hook("a-wasm-run-pre", "run", "before", target="wasm"), hook("a-wasm-run-post", "run", "after", target="wasm")]
 B_HOOKS = [hook("b-pre", "build", "before"), hook("b-post", "build", "after"),
            hook("b-gen-pre", "generate", "before"), hook("b-gen-post", "generate", "after"),
            hook("b-bundle-pre", "bundle", "before"), hook("b-bundle-post", "bundle", "after"),
@@ -135,9 +138,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     dep_a = '.{ .name = "fixture-a", .repo = "local:../fixture-a", .version = "1.0.0" }'
     dep_b = '.{ .name = "fixture-b", .repo = "local:../fixture-b", .version = "1.0.0" }'
 
-    def declare(*deps):
+    def declare(*deps, resources=""):
         (project / "project.labelle").write_text(
-            f'.{{ .name = "game", .zig_version = "{version}", .plugins = .{{ {", ".join(deps)} }} }}')
+            f'.{{ .name = "game", .zig_version = "{version}", .plugins = .{{ {", ".join(deps)} }}{resources} }}')
 
     # Reverse alphabetical declaration order is the default for the suite.
     declare(dep_b, dep_a)
@@ -148,7 +151,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     home = base / "home"
     env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
-    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN", "FAKE_GAME_HANG"):
+    for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "PROVIDER_PROBE_COPY", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN",
+                 "FAKE_GAME_HANG"):
         env.pop(knob, None)
     checks = 0
 
@@ -272,6 +276,26 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert exe.exists()
     assert order(log(zig_out), "build") == [("before", "b-pre"), ("before", "a-pre"), ("after", "a-post")], log(zig_out)
 
+    # ── build: after hooks see the command's FINAL artifact ───────────────
+    # `labelle build` finalizes the compiled tree (the Linux `.desktop` entry
+    # here; the APK on the platform that packages one) and the `after build`
+    # hooks used to run before that finalization, so a signing or publishing
+    # hook never saw the artifact (Codex P2 on #420). `--linux-desktop` emits
+    # the entry on every host: the hook's snapshot of `zig-out/` lists it,
+    # and the entry was written before the hook ran.
+    reset()
+    finalized = run("build", "--linux-desktop")
+    entry = zig_out / ("game" + ".desktop")
+    assert entry.exists(), list(zig_out.iterdir())
+    text = finalized.stderr
+    assert text.index("build ok") < text.index("desktop entry written to") < text.index("hook 'fixture-a/a-post'"), text
+    seen = {e["invocation"]["id"]: e["output_entries"] for e in log(zig_out) if e["invocation"]["step"] == "build"}
+    assert "game.desktop" in seen["a-post"] and "game.desktop" in seen["b-post"], seen
+    # The mechanism: the before hooks ran on the pre-finalization tree, so
+    # the entry's presence in the after snapshot is the ordering, not a
+    # leftover from an earlier command.
+    assert "game.desktop" not in seen["b-pre"] and "game.desktop" not in seen["a-pre"], seen
+
     # ── generate: the lock exists when the before hook runs ───────────────
     reset()
     lock_file.unlink(missing_ok=True)
@@ -285,6 +309,39 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert lock_file.exists() and "fixture-a" in lock_file.read_text()
     assert not exe.exists(), "generate built the project"
     assert not zig_out.exists() or not (zig_out / "hooks.log").exists(), "generate ran build hooks"
+
+    # ── generate: a before-generate hook's output feeds the pre-passes ────
+    # The `--bake` pre-pass reads every declared PNG. `a-gen-pre` is what
+    # writes `assets/hook.png` here (a 1x1 PNG staged outside the project);
+    # the pre-pass used to run before the hook and fail on the missing file
+    # (Codex P2 on #420). Now the hook runs first, the bake sees the PNG and
+    # writes its `.rgba` sibling, and only then does generation run.
+    png = base / "hook.png"
+    raw = zlib.compress(b"\x00\xff\x00\x00\xff")  # one filter byte + one RGBA pixel
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", raw) + chunk(b"IEND", b""))
+    assets = project / "assets"
+    declare(dep_b, dep_a, resources=', .resources = .{ .{ .name = "hook", .json = "assets/hook.json", .texture = "assets/hook.png" } }')
+    reset()
+    shutil.rmtree(assets, ignore_errors=True)
+    baked = run("generate", "--bake", extra_env={"PROVIDER_PROBE_COPY": f"a-gen-pre|{png}|assets/hook.png"})
+    assert (assets / "hook.png").read_bytes() == png.read_bytes(), "the hook did not write the PNG"
+    assert (assets / "hook.rgba").exists(), "the bake pre-pass did not see the hook's PNG"
+    text = baked.stderr
+    assert "baked 1 atlas(es)" in text and "FIXTURE_GENERATE" in text, text
+    assert text.index("hook 'fixture-a/a-gen-pre'") < text.index("baked 1 atlas(es)") < text.index("FIXTURE_GENERATE"), text
+    # The mechanism: the pre-pass genuinely needs the file. With no hook
+    # writing it, the same command fails on the missing PNG, before
+    # generation — so the success above is the hook running first.
+    reset()
+    shutil.rmtree(assets, ignore_errors=True)
+    unfed = run("generate", "--bake", code=1)
+    assert "bake 'assets/hook.png' failed: FileNotFound" in unfed.stderr, unfed.stderr
+    assert "hook 'fixture-a/a-gen-pre'" in unfed.stderr and "FIXTURE_GENERATE" not in unfed.stderr, unfed.stderr
+    shutil.rmtree(assets, ignore_errors=True)
+    declare(dep_b, dep_a)
 
     # ── run: before/after around the game ─────────────────────────────────
     reset()
@@ -316,6 +373,43 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "labelle: timed out" not in inside.stderr and "after-run hooks skipped" not in inside.stderr, inside.stderr
     assert order(log(zig_out), "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], log(zig_out)
 
+    # ── wasm export --no-build: the run hooks still run ───────────────────
+    # `--no-build` returned before discovery, so every declared run hook was
+    # silently skipped although exporting the existing artifact is the same
+    # run step the building path hooks (Codex P2 on #420). A pre-existing
+    # web dir stands in for the build; nothing is installed or generated,
+    # and the `run` hooks for the `wasm` target wrap the export.
+    #
+    # `wasm` is a provider target (docs/provider-targets.md): the no-build
+    # path confirms it against the providers discoverable as-is before any
+    # hook, so with nothing declaring it the export is refused. fixture-a
+    # declares it for this section; its run hooks are the ones that wrap.
+    reset()
+    wasm_target_dir = project / ".labelle" / "raylib_wasm"
+    wasm_web = wasm_target_dir / "zig-out" / "web"
+    wasm_web.mkdir(parents=True)
+    (wasm_web / "index.html").write_text("<html>fixture</html>")
+    release = project / "release"
+    undeclared = run("wasm", "export", "--no-build", "--output", "release", code=1)
+    assert "no provider for target 'wasm'" in undeclared.stderr and not release.exists(), undeclared.stderr
+    assert not log(wasm_target_dir / "zig-out"), "a run hook ran for a refused target"
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS, targets=["wasm"]))
+    exported = run("wasm", "export", "--no-build", "--output", "release")
+    assert (release / "index.html").exists() and (release / ".labelle-export").exists(), list(release.iterdir())
+    text = exported.stderr
+    assert "FIXTURE_INSTALL_DONE" not in text and "FIXTURE_GENERATE" not in text and "build ok" not in text, text
+    assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre"), ("after", "a-wasm-run-post")], text
+    assert text.index("hook 'fixture-a/a-wasm-run-pre'") < text.index("WASM Export Complete") < text.index("hook 'fixture-a/a-wasm-run-post'"), text
+    # A failing before hook stops the export: the hook's code is the CLI's
+    # and the output directory is never created.
+    shutil.rmtree(release)
+    (wasm_target_dir / "zig-out" / "hooks.log").unlink()
+    refused = run("wasm", "export", "--no-build", "--output", "release", code=7, extra_env={"PROVIDER_PROBE_FAIL": "a-wasm-run-pre"})
+    assert not release.exists() and "WASM Export Complete" not in refused.stderr, refused.stderr
+    assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre")], refused.stderr
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+    reset()
+
     # ── run: an `after build` hook's output survives until launch ─────────
     # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs
     # from source. The game prints the file it finds at launch: with the
@@ -344,7 +438,12 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     # package is an error.
     remote_src = base / "fixture-c"
     shutil.copytree(fixture, remote_src)
-    (remote_src / "plugin.labelle").write_text(manifest("fixture-c", [hook("c-pre", "build", "before")]))
+    # A `generate` hook too: the pipeline resolves its managed compiler for
+    # the core build before any `build` hook, so only a hook that runs
+    # BEFORE generation can show that the pin check itself never touches a
+    # compiler (see (2) below).
+    (remote_src / "plugin.labelle").write_text(manifest("fixture-c", [hook("c-pre", "build", "before"),
+                                                                       hook("c-gen-pre", "generate", "before")]))
     remote_cache = home / "packages" / "plugins" / "example" / "fixture-c" / "1.0.0"
     dep_c = '.{ .name = "fixture-c", .repo = "example/fixture-c", .version = "1.0.0" }'
     declare(dep_c)
@@ -363,16 +462,28 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert not exe.exists() and not remote_cache.exists()
     # (2) The installer delivers it (cold ordinary cache, populated by this
     #     very install): the provider IS discovered, and being unpinned its
-    #     hook is refused — the same outcome a warm cache always had.
+    #     hook is refused — the same outcome a warm cache always had. The
+    #     refusal comes from the pin check, BEFORE the host compiler is
+    #     resolved: LABELLE_ZIG points nowhere, so reaching the compiler
+    #     would have reported ProviderCompilerMissing ("install Zig")
+    #     instead of the integrity failure (Codex P2 on #420) — and the
+    #     `before generate` hook is what fails, so nothing was generated.
     cold()
-    unpinned = run("build", code=1, extra_env=populate)
+    unpinned = run("build", code=1, extra_env=dict(populate, LABELLE_ZIG=dead["LABELLE_ZIG"]))
     assert "RemoteProviderIntegrityRequired" in unpinned.stderr and "'fixture-c' is unpinned" in unpinned.stderr, unpinned.stderr
-    assert "FIXTURE_GENERATE" in unpinned.stderr and "build ok" not in unpinned.stderr and not exe.exists(), unpinned.stderr
+    assert "ProviderCompilerMissing" not in unpinned.stderr and "install the pinned host compiler" not in unpinned.stderr, unpinned.stderr
+    assert "FIXTURE_INSTALL_DONE" in unpinned.stderr and "FIXTURE_GENERATE" not in unpinned.stderr, unpinned.stderr
+    assert "build ok" not in unpinned.stderr and not exe.exists(), unpinned.stderr
     assert remote_cache.exists()
+    # The mechanism: the same dead compiler IS fatal once a pinned hook runs,
+    # so the clean integrity error above means the compiler was never
+    # consulted for the unpinned one (the pin-first order), not that a dead
+    # LABELLE_ZIG goes unnoticed. (4) below pins fixture-c the same way.
     # (3) Warm cache, same command: identical outcome, so cold and warm agree.
     reset()
     warm = run("build", code=1)
     assert "RemoteProviderIntegrityRequired" in warm.stderr and "build ok" not in warm.stderr, warm.stderr
+    assert "FIXTURE_GENERATE" not in warm.stderr, warm.stderr
     # (4) Pinned (the integrity model of cli#414) with a cold ORDINARY cache:
     #     the provider comes from the verified archive and its hook runs.
     payload = io.BytesIO()
@@ -391,8 +502,14 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     (project / "labelle.providers.lock").write_text(json.dumps({"schema_version": 1, "providers": [pin]}))
     pinned = run("build")
     assert order(log(zig_out), "build") == [("before", "c-pre")], log(zig_out)
+    assert order(log(target_dir), "generate") == [("before", "c-gen-pre")], log(target_dir)
     assert exe.exists() and not remote_cache.exists(), "the pinned provider needed the ordinary cache"
     assert "hook 'fixture-c/c-pre'" in pinned.stderr, pinned.stderr
+    # The compiler-order mechanism for (2): with the pin accepted, the same
+    # dead LABELLE_ZIG is reached by the first hook and IS the failure.
+    reset()
+    no_compiler = run("build", code=1, extra_env={"LABELLE_ZIG": dead["LABELLE_ZIG"]})
+    assert "ProviderCompilerMissing" in no_compiler.stderr and "RemoteProviderIntegrityRequired" not in no_compiler.stderr, no_compiler.stderr
     (project / "labelle.providers.lock").unlink()
 
     # ── Cold cache: a reference into the unread package is unresolved ─────

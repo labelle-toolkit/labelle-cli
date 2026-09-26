@@ -86,6 +86,17 @@ const WasmRebuildCtx = struct {
     hooks: *provider_hooks.Site,
     generate_plan: provider_hooks.Plan = .{},
     build_plan: provider_hooks.Plan = .{},
+    /// Rediscovers the providers and replans both phases at the start of
+    /// EVERY rebuild, so a watched edit to `project.labelle`, to a provider
+    /// manifest or to `provider_config` reaches the next rebuild. The
+    /// startup plans above are only the initial state; with a replan
+    /// installed they never run a rebuild themselves (they were captured
+    /// once and reused for every rebuild, so removed hooks kept running and
+    /// added ones were skipped until the server restarted — Codex P2 on
+    /// #420). Production installs `WatchReplan`; `null` keeps the startup
+    /// plans (the plumbing tests' shape). A failing replan stops the rebuild
+    /// before any phase and leaves the previous plans installed.
+    replan: ?Replan = null,
     /// The step output directories of the layout contract, as the cold
     /// pipeline computed them (`provider_hooks.stepOutputDir`).
     generate_out: []const u8 = "",
@@ -99,12 +110,21 @@ const WasmRebuildCtx = struct {
     /// that the shader preflight fires before generation is attempted.
     const Stage = error{
         PrebuildFailed,
+        ReplanFailed,
         ShaderPreflightFailed,
         HookFailed,
         GenerateFailed,
         FingerprintFailed,
         ZigSpawnFailed,
         BuildFailed,
+    };
+
+    /// The per-rebuild replan seam: `run` receives `ctx` and the context it
+    /// must update (`hooks.providers`, `hooks.cfg`, `generate_plan`,
+    /// `build_plan`).
+    pub const Replan = struct {
+        ctx: *anyopaque,
+        run: *const fn (*anyopaque, *WasmRebuildCtx) anyerror!void,
     };
 
     /// One hook phase of a watched rebuild. A failing hook (nonzero exit, or
@@ -148,6 +168,17 @@ const WasmRebuildCtx = struct {
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
             return error.PrebuildFailed;
         };
+
+        // 0a. Re-read the project, rediscover the providers and replan the
+        //     hook phases for THIS rebuild (see `replan`). A failing replan
+        //     — a malformed manifest saved mid-session, say — is reported
+        //     like a failing core step and stops here, before any phase.
+        if (self.replan) |replan| {
+            replan.run(replan.ctx, self) catch |err| {
+                std.debug.print("labelle: rebuild stopped before generate: provider replan failed ({s})\n", .{@errorName(err)});
+                return error.ReplanFailed;
+            };
+        }
 
         // 0b. Gate the shader-compiler override AFTER the hooks (a hook may
         //     be what creates `materials/`) and BEFORE generation. The cold
@@ -433,6 +464,262 @@ const WasmRebuildCtx = struct {
         try std.testing.expectError(error.HookFailed, ctx.rebuildStaged());
         try std.testing.expectEqual(@as(usize, 3), Spy.count);
         try std.testing.expectEqualStrings("unpinned", Spy.calls[2].id);
+    }
+
+    // The replan seam: every rebuild replans before its first phase, the
+    // plans the replan installs are the ones that run, and a failing replan
+    // stops the rebuild ahead of every phase with the previous plans intact.
+    test "watched rebuild replans the hook phases on every rebuild" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+
+        const Fixture = struct {
+            var provider: provider_dispatch.Provider = .{
+                .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+                .dir = "/pkg",
+                .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+                .verified = true,
+            };
+            fn planned(id: []const u8, step: provider_contract.Step, when: provider_contract.Phase) provider_hooks.Planned {
+                return .{
+                    .provider = &provider,
+                    .hook = .{ .id = id, .step = step, .target = "wasm", .when = when, .build_step = "tool", .executable = "bin/tool" },
+                    .qualified = id,
+                };
+            }
+        };
+        const Spy = struct {
+            var phases: [8][]const u8 = undefined;
+            var phase_count: usize = 0;
+            var replans: usize = 0;
+            var fail_next = false;
+            fn run(_: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+                for (list) |planned| {
+                    phases[phase_count] = planned.hook.id;
+                    phase_count += 1;
+                }
+                return 0;
+            }
+            fn replan(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
+                const counter: *usize = @ptrCast(@alignCast(ptr));
+                counter.* += 1;
+                replans += 1;
+                if (fail_next) return error.ProviderManifestBroken;
+                // What production does: a fresh plan replaces the installed one.
+                ctx.generate_plan = .{ .replace = Fixture.planned("gen-fresh", .generate, .replace) };
+                ctx.build_plan = .{ .replace = Fixture.planned("build-fresh", .build, .replace) };
+            }
+            fn reset() void {
+                phase_count = 0;
+            }
+        };
+        var counter: usize = 0;
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{ "/nonexistent/zig-probe", "build" },
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+            // The startup plans: a `replace` on both steps, so if they ran
+            // the rebuild would succeed on "gen-stale"/"build-stale".
+            .generate_plan = .{ .replace = Fixture.planned("gen-stale", .generate, .replace) },
+            .build_plan = .{ .replace = Fixture.planned("build-stale", .build, .replace) },
+            .run_hook_phase = Spy.run,
+            .replan = .{ .ctx = &counter, .run = Spy.replan },
+        };
+
+        // Rebuild 1: replanned once; the FRESH plans ran, the startup plans
+        // did not.
+        Spy.reset();
+        try ctx.rebuildStaged();
+        try std.testing.expectEqual(@as(usize, 1), counter);
+        try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
+        try std.testing.expectEqualStrings("gen-fresh", Spy.phases[0]);
+        try std.testing.expectEqualStrings("build-fresh", Spy.phases[1]);
+        // Rebuild 2: replanned again — once per rebuild, not once per session.
+        Spy.reset();
+        try std.testing.expect(rebuild(@ptrCast(&ctx)));
+        try std.testing.expectEqual(@as(usize, 2), counter);
+        try std.testing.expectEqual(@as(usize, 2), Spy.phase_count);
+        // A failing replan stops the rebuild before any phase, and the plans
+        // installed by the last good replan stay in place.
+        Spy.fail_next = true;
+        Spy.reset();
+        try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
+        try std.testing.expectEqual(@as(usize, 3), counter);
+        try std.testing.expectEqual(@as(usize, 0), Spy.phase_count);
+        try std.testing.expectEqualStrings("gen-fresh", ctx.generate_plan.replace.?.hook.id);
+        try std.testing.expectEqualStrings("build-fresh", ctx.build_plan.replace.?.hook.id);
+        Spy.fail_next = false;
+        // Without a replan the startup plans are what run (the earlier tests'
+        // shape), so the fresh plans above came from the seam.
+        ctx.replan = null;
+        ctx.generate_plan = .{ .replace = Fixture.planned("gen-stale", .generate, .replace) };
+        ctx.build_plan = .{ .replace = Fixture.planned("build-stale", .build, .replace) };
+        Spy.reset();
+        try ctx.rebuildStaged();
+        try std.testing.expectEqual(@as(usize, 3), counter);
+        try std.testing.expectEqualStrings("gen-stale", Spy.phases[0]);
+        try std.testing.expectEqualStrings("build-stale", Spy.phases[1]);
+    }
+};
+
+/// The production replan for `wasm serve --watch` (`WasmRebuildCtx.replan`):
+/// re-reads `project.labelle`, rediscovers the providers with the package
+/// cache `.populated` (the cold pipeline's install ran before the server
+/// started) and replans the `generate` and `build` phases for the target
+/// being served. Each successful replan lives on its own arena; the
+/// previous generation — its arena and any pinned provider sources it
+/// extracted — is released only once the new one is installed, so a failed
+/// replan leaves the context pointing at intact storage.
+const WatchReplan = struct {
+    backing: std.mem.Allocator,
+    project_dir: []const u8,
+    /// Storage of the plans currently installed on the context. `null`
+    /// until the first replan: the startup plans live on the pipeline's
+    /// hook arena, which outlives the server.
+    current: ?*Generation = null,
+
+    const Generation = struct {
+        arena: std.heap.ArenaAllocator,
+        sources: provider_github.Sources,
+
+        /// Heap-allocated so the arena's address is stable: every allocator
+        /// handle carved from it (the sources' included) points at it.
+        fn create(backing: std.mem.Allocator) !*Generation {
+            const generation = try backing.create(Generation);
+            generation.* = .{ .arena = std.heap.ArenaAllocator.init(backing), .sources = undefined };
+            generation.sources = .{ .a = generation.arena.allocator() };
+            return generation;
+        }
+
+        fn destroy(self: *Generation, backing: std.mem.Allocator) void {
+            self.sources.deinit();
+            self.arena.deinit();
+            backing.destroy(self);
+        }
+    };
+
+    fn run(ptr: *anyopaque, ctx: *WasmRebuildCtx) anyerror!void {
+        const self: *WatchReplan = @ptrCast(@alignCast(ptr));
+        const next = try Generation.create(self.backing);
+        errdefer next.destroy(self.backing);
+        const a = next.arena.allocator();
+        var cfg = try config.readProjectConfig(a, self.project_dir);
+        // The served target's platform and backend are the pipeline's
+        // resolved ones (`wasm serve` overrides what the file declares).
+        cfg.platform = ctx.hooks.cfg.platform;
+        cfg.backend = ctx.hooks.cfg.backend;
+        const providers: []const provider_dispatch.Provider = if (cfg.plugins.len == 0)
+            &.{}
+        else
+            try provider_dispatch.discover(a, ctx.hooks.root, cfg, &next.sources, .populated);
+        const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
+        const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
+        // Install only now, so a failure above leaves the previous plans —
+        // and their storage — untouched.
+        ctx.hooks.providers = providers;
+        ctx.hooks.cfg = cfg;
+        ctx.generate_plan = generate_plan;
+        ctx.build_plan = build_plan;
+        if (self.current) |previous| previous.destroy(self.backing);
+        self.current = next;
+    }
+
+    fn deinit(self: *WatchReplan) void {
+        if (self.current) |generation| generation.destroy(self.backing);
+        self.current = null;
+    }
+
+    // Against a real project: edits to the manifest between rebuilds change
+    // the installed plans; a broken manifest fails the replan and keeps the
+    // last good plans; nothing leaks across generations.
+    test "watch replan re-reads the project and provider manifests on every call" {
+        if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "project");
+        try tmp.dir.createDirPath(io, "pkg");
+        const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+        defer a.free(project);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "project/project.labelle",
+            .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
+        });
+        const Manifest = struct {
+            fn write(dir: std.Io.Dir, hooks: []const u8) !void {
+                var buf: [1024]u8 = undefined;
+                const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{{ {s} }} }}", .{hooks});
+                try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = text });
+            }
+        };
+        const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
+        const build_hook = ".{ .id = \"post\", .step = .build, .target = \"wasm\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+        try Manifest.write(tmp.dir, gen_hook);
+
+        const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+        defer a.free(asm_path);
+        var site = WasmRebuildCtx.testSite(a, project);
+        var ctx = WasmRebuildCtx{
+            .allocator = a,
+            .asm_bin = .{ .path = asm_path },
+            .project_dir = project,
+            .platform_tag = "wasm",
+            .backend_tag = "bgfx",
+            .output_dir = project,
+            .target_dir = project,
+            .zig_args = &.{},
+            .zig_env = null,
+            .prebuild_steps = &.{},
+            .prebuild_opts = .{ .fatal_on_step_failure = false },
+            .hooks = &site,
+        };
+        var replan = WatchReplan{ .backing = a, .project_dir = project };
+        defer replan.deinit();
+
+        // First replan: the manifest's generate hook is planned; the site
+        // now knows the provider and the re-read config.
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expectEqual(@as(usize, 1), ctx.generate_plan.before.len);
+        try std.testing.expectEqualStrings("pkg/gen", ctx.generate_plan.before[0].qualified);
+        try std.testing.expect(ctx.build_plan.isEmpty());
+        try std.testing.expectEqual(@as(usize, 1), site.providers.len);
+        try std.testing.expectEqual(@as(usize, 1), site.cfg.plugins.len);
+        // The manifest changes between rebuilds: the next replan sees it.
+        try Manifest.write(tmp.dir, build_hook);
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expect(ctx.generate_plan.isEmpty());
+        try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
+        // A broken manifest fails the replan; the last good plans stay
+        // installed and remain readable (their generation was kept).
+        try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = "not a manifest" });
+        try std.testing.expectError(error.InvalidManifest, WatchReplan.run(&replan, &ctx));
+        try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
+        // The project itself changes: the plugin is dropped, so nothing is
+        // planned and the site's config follows.
+        try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
+        try WatchReplan.run(&replan, &ctx);
+        try std.testing.expect(ctx.generate_plan.isEmpty() and ctx.build_plan.isEmpty());
+        try std.testing.expectEqual(@as(usize, 0), site.providers.len);
+        try std.testing.expectEqual(@as(usize, 0), site.cfg.plugins.len);
     }
 };
 
@@ -876,8 +1163,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     }
 
     // `labelle wasm serve|export --no-build` — skip the generate+build
-    // pipeline entirely and serve/package the existing build output. The
-    // web dir lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
+    // pipeline and serve/package the existing build output. The web dir
+    // lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
+    //
+    // Only generate and build are skipped: serving or exporting the existing
+    // artifact IS the `run` step, so the `run` hook plan (contract §6) runs
+    // here exactly as on the building path — `--no-build` used to return
+    // before discovery and silently dropped every declared run hook (Codex
+    // P2 on #420). No installer runs on this path, so discovery is the
+    // metadata-only kind (`.unknown`, as `labelle help`): a declared remote
+    // package absent from every cache is not listed rather than reported as
+    // a broken install that never happened.
     if (command == .wasm_cmd and parsed_args.serve_no_build) {
         // Nothing is installed on this path, so the provisional target is
         // confirmed against the providers discoverable as-is (`.unknown`,
@@ -895,9 +1191,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         };
         const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
         defer allocator.free(wasm_target);
-        const web_dir = try std.fs.path.join(allocator, &.{
-            project_dir, ".labelle", wasm_target, "zig-out", "web",
-        });
+        const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
+        defer allocator.free(wasm_target_dir);
+        const web_dir = try std.fs.path.join(allocator, &.{ wasm_target_dir, "zig-out", "web" });
         defer allocator.free(web_dir);
         if (std.Io.Dir.cwd().access(config.globalIo(), web_dir, .{})) |_| {} else |_| {
             const verb = if (parsed_args.wasm_export) "export" else "serve";
@@ -910,18 +1206,57 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         }
         const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
         defer allocator.free(project_web_dir);
+
+        // The run hooks are planned from the same discovery (`known`) the
+        // served target was just confirmed against, for the served name.
+        const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
+        // The same wire `optimize` the building path reports for this
+        // platform; there is no progress feed on this path.
+        const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {
+            std.debug.print("labelle: unknown optimize mode '{s}'\n", .{parsed_args.optimize_override.?});
+            return 1;
+        };
+        var no_build_site: provider_hooks.Site = .{
+            .a = hook_arena,
+            .backing = allocator,
+            .providers = known,
+            .root = project_root,
+            .cfg = parsed,
+            .target = served.name,
+            .optimize = no_build_optimize,
+            .progress = switch (parsed_args.progress_mode) {
+                .human => .human,
+                .json => .json,
+                .off => .off,
+            },
+            .reporter = null,
+        };
+        const no_build_out = try provider_hooks.stepOutputDir(hook_arena, wasm_target_dir, .run, served.name, null);
+        {
+            const code = try provider_hooks.runPhase(&no_build_site, no_build_plan.before, .run, .before, no_build_out);
+            if (code != 0) return code;
+        }
+        if (no_build_plan.replace) |replacement| {
+            const code = try provider_hooks.runPhase(&no_build_site, &.{replacement}, .run, .replace, no_build_out);
+            if (code != 0) return code;
+            return provider_hooks.finishRun(&no_build_site, no_build_plan.after, no_build_out, .exited_clean);
+        }
         if (parsed_args.wasm_export) {
             const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
             defer allocator.free(out_abs);
-            return ok(export_mod.packageExport(allocator, web_dir, project_web_dir, .{
+            try export_mod.packageExport(allocator, web_dir, project_web_dir, .{
                 .output_dir = out_abs,
                 .zip = parsed_args.export_zip,
                 .platform = parsed_args.export_pkg_platform,
-            }));
+            });
+            return provider_hooks.finishRun(&no_build_site, no_build_plan.after, no_build_out, .exited_clean);
         }
         // No watch in the `--no-build` path (the parser already rejects the
         // `--watch --no-build` combination, so `serve_watch` is false here).
-        return ok(serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null));
+        // The server returns on Ctrl+C / SIGTERM, the serve's clean end, and
+        // the after hooks run then — as on the building path.
+        try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
+        return provider_hooks.runPhase(&no_build_site, no_build_plan.after, .run, .after, no_build_out);
     }
 
     // (Provider discovery, the ownership check of the provisional target
@@ -1054,55 +1389,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
 
-    // ASTC build-time conversion (#340): when this platform ships ASTC atlases
-    // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
-    // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
-    // before the assembler steps (it only needs project.labelle + the PNGs +
-    // astcenc). Non-fatal — on any failure the assembler finds no sibling and
-    // falls back to the source PNG, so the build still succeeds.
-    //
-    // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
-    // compile to one `.astc` with disagreeing block pins; falling back would
-    // hand BOTH of them whatever `.astc` is on disk — including a STALE one
-    // from an earlier build, which is worse than no atlas because it looks
-    // like it worked. So a config error stops the build, while a conversion
-    // failure still degrades to PNG.
-    //
-    // Only for a target the capability tables know (`provisional.legacy`:
-    // `desktop` or a schema-named provider target). A provider target
-    // outside the enum has `parsed.platform` derived as `.desktop` for the
-    // legacy sites, but it is NOT the desktop target: running the desktop
-    // prepass for it would encode ASTC siblings by desktop capabilities for
-    // a provider's own `generate` to pick up (Codex on #421). Its provider
-    // owns its asset pipeline; `cmdAstc` itself refuses such a name.
-    if (provisional.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-        // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
-        // sokol) and the Android backend fallback all differ from what
-        // project.labelle declares, and the loadable blocks depend on both.
-        astc_cmd.cmdAstc(allocator, &.{
-            project_dir,
-            "--platform",
-            @tagName(parsed.platform),
-            "--backend",
-            @tagName(parsed.backend),
-        }) catch |err| switch (err) {
-            error.ConflictingAstcBlocks => progress.fatalExit(
-                1,
-                "conflicting .astc_block pins compile to one .astc — see the error above",
-            ),
-            // A stale `.astc` (wrong block for this target) that could not be
-            // deleted would be swapped in by the assembler — the PNG fallback
-            // below would be a lie. Stop instead (labelle-bgfx#134).
-            error.StaleAstcSiblingUndeletable => progress.fatalExit(
-                1,
-                "a stale .astc sibling could not be deleted — see the error above",
-            ),
-            else => std.debug.print(
-                "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
-                .{@errorName(err)},
-            ),
-        };
-    }
+    // (The ASTC conversion pre-pass used to run here, before the install.
+    // It is a generation-input reader — it consumes the declared PNGs — so
+    // it now runs inside the core `generate` step below, AFTER the `before
+    // generate` provider hooks; see the note there.)
 
     // Ensure the package cache is populated. The assembler's `generate`
     // subcommand assumes a populated cache (it does not fetch packages
@@ -1256,19 +1546,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .reporter = reporter,
     };
 
-    // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
-    // @embedFile path picks up the fresh `.rgba` files. Skipped unless
-    // `--bake` is passed: raw RGBA expands heavily-transparent atlases
-    // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
-    // APK size sane. Use for projects whose atlases are nearly opaque
-    // and PNG decode dominates cold start.
-    if (parsed_args.bake) {
-        bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
-            std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
-            return err;
-        };
-    }
-
     // Issue #217 phase 2: delegate code generation to the standalone
     // labelle-assembler binary via the shared subprocess harness, instead
     // of calling an in-process generator. The binary was located above
@@ -1294,6 +1571,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // core generation — or its unique `replace` hook — then `after` hooks.
     // `output_dir` is the generated tree itself. A failing hook ends the
     // command with the hook's own exit code; nothing past it runs.
+    //
+    // The `before` phase runs ahead of EVERY generation-input reader: the
+    // ASTC conversion pre-pass and the `--bake` pre-pass both consume the
+    // declared PNGs, so a hook that produces one of them used to run too
+    // late for them — `generate --bake` failed on the not-yet-written PNG
+    // and a hook-generated PNG never got its `.astc` sibling (Codex P2 on
+    // #420). Both pre-passes are part of the core generation they feed, so
+    // a `replace generate` hook stands in for them too: the replacement
+    // owns whatever preprocessing its generation needs.
     const generate_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .generate, target.name, null);
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.generate.before, .generate, .before, generate_out);
@@ -1305,6 +1591,70 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             if (code != 0) return code;
             break :core_generate;
         }
+
+        // ASTC build-time conversion (#340): when this platform ships ASTC atlases
+        // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
+        // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
+        // before the assembler's `generate` (it only needs project.labelle + the
+        // PNGs + astcenc). Non-fatal — on any failure the assembler finds no
+        // sibling and falls back to the source PNG, so the build still succeeds.
+        //
+        // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
+        // compile to one `.astc` with disagreeing block pins; falling back would
+        // hand BOTH of them whatever `.astc` is on disk — including a STALE one
+        // from an earlier build, which is worse than no atlas because it looks
+        // like it worked. So a config error stops the build, while a conversion
+        // failure still degrades to PNG.
+        //
+        // Only for a target the capability tables know (`target.legacy`:
+        // `desktop` or a schema-named provider target). A provider target
+        // outside the enum has `parsed.platform` derived as `.desktop` for the
+        // legacy sites, but it is NOT the desktop target: running the desktop
+        // prepass for it would encode ASTC siblings by desktop capabilities
+        // (Codex on #421). Its provider owns its asset pipeline; `cmdAstc`
+        // itself refuses such a name.
+        if (target.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
+            // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
+            // sokol) and the Android backend fallback all differ from what
+            // project.labelle declares, and the loadable blocks depend on both.
+            astc_cmd.cmdAstc(allocator, &.{
+                project_dir,
+                "--platform",
+                @tagName(parsed.platform),
+                "--backend",
+                @tagName(parsed.backend),
+            }) catch |err| switch (err) {
+                error.ConflictingAstcBlocks => progress.fatalExit(
+                    1,
+                    "conflicting .astc_block pins compile to one .astc — see the error above",
+                ),
+                // A stale `.astc` (wrong block for this target) that could not be
+                // deleted would be swapped in by the assembler — the PNG fallback
+                // below would be a lie. Stop instead (labelle-bgfx#134).
+                error.StaleAstcSiblingUndeletable => progress.fatalExit(
+                    1,
+                    "a stale .astc sibling could not be deleted — see the error above",
+                ),
+                else => std.debug.print(
+                    "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
+                    .{@errorName(err)},
+                ),
+            };
+        }
+
+        // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
+        // @embedFile path picks up the fresh `.rgba` files. Skipped unless
+        // `--bake` is passed: raw RGBA expands heavily-transparent atlases
+        // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
+        // APK size sane. Use for projects whose atlases are nearly opaque
+        // and PNG decode dominates cold start.
+        if (parsed_args.bake) {
+            bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
+                std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+        }
+
         // The assembler receives the resolved target NAME; the #378 gate above
         // guarantees it is one the pinned assembler can take.
         try assembler_proc.generate(
@@ -1506,6 +1856,41 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             defer allocator.free(bin_dir);
             sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
         }
+
+        // `labelle build` finalization — everything that turns the compiled
+        // tree into the command's final artifact. It sits INSIDE the core
+        // build so the `after build` hooks below see the finished artifact
+        // (a signing, inspecting or publishing hook used to run before the
+        // APK existed, and reported success even when packaging then
+        // failed — Codex P2 on #420), and so that a `replace build` hook
+        // owns it: the replacement produces the artifact its target needs,
+        // packaging included.
+        if (command == .build) {
+            // Linux `.desktop` entry + icon (cli#359): after a desktop build,
+            // write `zig-out/<exe>.desktop` + `zig-out/<exe>.png` beside `bin/`
+            // — automatically on a Linux host, or anywhere with
+            // `--linux-desktop`. Skipped under `--docker`: that exe was built
+            // for the container's target and the entry's absolute paths would
+            // describe this host, not the one that will run it. `run` is
+            // deliberately left alone — the entry is a packaging artifact.
+            // Core desktop only: a provider target is packaged by its provider.
+            if (!parsed_args.docker and target.provider == null and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
+                const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
+                allocator.free(entry_path);
+            }
+            // `labelle build --platform=android` builds the shared library
+            // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
+            // but, unlike `labelle android build`, used to stop there and leave
+            // a bare `.so`. Package it into a signed APK so the artifact is
+            // installable — backend-agnostic, so it covers sokol and bgfx alike.
+            if (parsed.platform == .android) {
+                const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{}, .{
+                    .strip_native = android.stripForOptimize(effective_optimize),
+                });
+                defer allocator.free(apk_path);
+                std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
+            }
+        }
     }
     {
         const code = try provider_hooks.runPhase(&hook_site, hook_plans.build.after, .build, .after, build_out);
@@ -1563,30 +1948,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     }
 
     if (command == .build) {
-        // Linux `.desktop` entry + icon (cli#359): after a desktop build,
-        // write `zig-out/<exe>.desktop` + `zig-out/<exe>.png` beside `bin/`
-        // — automatically on a Linux host, or anywhere with
-        // `--linux-desktop`. Skipped under `--docker`: that exe was built
-        // for the container's target and the entry's absolute paths would
-        // describe this host, not the one that will run it. `run` is
-        // deliberately left alone — the entry is a packaging artifact.
-        // Core desktop only: a provider target is packaged by its provider.
-        if (!parsed_args.docker and target.provider == null and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
-            const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
-            allocator.free(entry_path);
-        }
-        // `labelle build --platform=android` builds the shared library
-        // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
-        // but, unlike `labelle android build`, used to stop there and leave
-        // a bare `.so`. Package it into a signed APK so the artifact is
-        // installable — backend-agnostic, so it covers sokol and bgfx alike.
-        if (parsed.platform == .android) {
-            const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{}, .{
-                .strip_native = android.stripForOptimize(effective_optimize),
-            });
-            defer allocator.free(apk_path);
-            std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
-        }
+        // (The build's finalization — the Linux `.desktop` entry and the
+        // APK packaging — ran inside the core build above, ahead of the
+        // `after build` hooks.)
         if (reporter) |r| r.finishDone(0);
         return 0;
     }
@@ -1649,6 +2013,14 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                 // that re-runs the same generate→fingerprint→zig-build steps
                 // this pipeline just did. The context borrows locals that stay
                 // alive because `serveAndOpen` blocks until Ctrl+C.
+                //
+                // The hook plans are NOT borrowed for the session: every
+                // rebuild re-reads the project and replans through
+                // `watch_replan`, so an edited manifest or `provider_config`
+                // reaches the next rebuild; the plans computed above are only
+                // the initial state.
+                var watch_replan = WatchReplan{ .backing = allocator, .project_dir = project_dir };
+                defer watch_replan.deinit();
                 var rebuild_ctx = WasmRebuildCtx{
                     .allocator = allocator,
                     .asm_bin = asm_bin,
@@ -1673,6 +2045,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
                     .build_plan = hook_plans.build,
                     .generate_out = generate_out,
                     .build_out = build_out,
+                    .replan = .{ .ctx = &watch_replan, .run = WatchReplan.run },
                 };
                 // The hooks' declared `.outputs` are excluded from the watch
                 // signature so the rebuild callback can't trip its own
