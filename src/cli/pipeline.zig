@@ -1517,8 +1517,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             } else {
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
             }
-            // The server returned (Ctrl+C): the feed is already terminal, so
-            // only the hooks themselves run here.
+            // The server returned (Ctrl+C / SIGTERM): the feed is already
+            // terminal, so only the hooks themselves run here. The stop was
+            // asked for, so this is the serve's clean end.
             return provider_hooks.runPhase(&hook_site, hook_plans.run.after, .run, .after, run_out);
         }
     } else if (parsed.platform == .ios) {
