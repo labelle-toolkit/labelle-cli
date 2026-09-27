@@ -32,7 +32,7 @@ pub fn printHelp() void {
         \\  plugins [dir]        List attached plugins with version, license, and author
         \\  providers resolve [providers.json] [--accept] [--offline]  Preview or pin GitHub providers for this project
         \\  providers fetch [--offline]  Inside a project, download the provider archives its labelle.providers.lock pins (only verified bytes are cached, each archive atomically; no registry, no lock change); `--offline` only verifies the cache
-        \\  doctor [dir] [--fix] [--json] [--core-only]  Check build requirements (SDL2, Zig, emsdk), then, inside a project, run each pinned provider's `doctor` command (as `labelle <ns> doctor`, by namespace; exit non-zero if any check fails); `--fix` provisions, `--json` emits a capability report (core only), `--core-only` skips the providers
+        \\  doctor [dir] [--fix] [--json] [--core-only] [--zig <path>]  Check build requirements (SDL2, Zig, emsdk), then, inside a project, run each pinned provider's `doctor` command (as `labelle <ns> doctor`, by namespace; exit non-zero if any check fails); `--fix` provisions, `--json` emits a capability report (core only), `--core-only` skips the providers, `--zig <path>` (or `--zig=<path>`) checks and builds the provider doctors with that compiler, as `labelle build` takes it (`LABELLE_ZIG` still wins)
         \\  help                 Show this help
         \\  version              Show CLI version
         \\
@@ -45,13 +45,16 @@ pub fn printHelp() void {
         \\  Upgrading a 1.x project: docs/migrating-to-2.0.md
         \\  (https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md)
         \\
-        \\Legacy `wasm` commands (not built in since 2.0: each needs a pinned provider of target `wasm`):
+        \\Legacy `wasm` commands (not built in since 2.0: both need a pinned provider of target `wasm`):
         \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]  Build the `wasm` target, serve it locally (default port 8080), open the browser (`--watch` rebuilds + live-reloads on source changes)
         \\  wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]  Build the `wasm` target and package a deployment-ready dir (default ./release; `--zip` archives it; `--platform` adds host-specific touches; best-effort `wasm-opt -O3`)
         \\  A provider that replaces `run` for `wasm` (the registry's `web` package does) refuses
         \\  `wasm serve/export`: use its own commands instead (`labelle web serve`, `labelle web
         \\  export`, listed under "Project package commands" inside the project) or
         \\  `labelle run --platform=wasm` / `labelle bundle --platform=wasm`.
+        \\
+        \\`wasm` toolchain installers (standalone: they work anywhere, with or without a provider;
+        \\a `wasm` build still needs the provider):
         \\  install emsdk <ver>  Provision the emsdk toolchain a `wasm` build compiles with into ~/.labelle
         \\  install python       Provision managed Python for `wasm` builds (pinned version, ~25 MB)
         \\

@@ -37,15 +37,60 @@ pub fn cachedRegistry(a: std.mem.Allocator) !?registry.Registry {
     return try registry.parse(a, bytes);
 }
 
+/// Where the cached document came from: the source the accept that cached
+/// it resolved against, bound to the document's digest so a stale sidecar
+/// never labels a newer document.
+pub const registry_source_file = "source.json";
+
+const CacheSource = struct { source: []const u8, document_sha256: []const u8 };
+
+/// The source the cached document was accepted from (an https URL or an
+/// absolute file path), or null when it is not recorded, or recorded for
+/// other bytes (a cache written before sources were kept, or by hand).
+pub fn cachedRegistrySource(a: std.mem.Allocator) ?[]const u8 {
+    const dir = std.fs.path.join(a, &.{ cacheRoot(a) catch return null, registry_cache_dir }) catch return null;
+    const bytes = read(a, std.fs.path.join(a, &.{ dir, registry_cache_file }) catch return null, 1024 * 1024) catch return null;
+    const side = read(a, std.fs.path.join(a, &.{ dir, registry_source_file }) catch return null, 64 * 1024) catch return null;
+    const record = std.json.parseFromSliceLeaky(CacheSource, a, side, .{ .allocate = .alloc_always }) catch return null;
+    const digest = sha256Hex(a, bytes) catch return null;
+    if (!std.mem.eql(u8, digest, record.document_sha256)) return null;
+    return record.source;
+}
+
 fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
     const doc = try cachedRegistry(a) orelse return null;
-    // Schema 2 publishes target ownership (#411): the lookup is by name and
-    // reads no archive at all. Only a schema-1 document, whose records claim
-    // nothing, falls back to the bounded scan of cached archives.
+    var budget: ScanBudget = .{};
+    return scanOwner(a, doc, target, &budget);
+}
+
+/// One lookup's archive-scan allowance, shared by every document it scans
+/// (a fresh read and its fallbacks): at most `registry_hint_scan_limit`
+/// archive reads in total, and never the same archive twice.
+pub const ScanBudget = struct {
+    remaining: usize = registry_hint_scan_limit,
+    /// sha256 of every archive already read by this lookup.
+    seen: std.ArrayList([]const u8) = .empty,
+
+    fn inspected(self: *const ScanBudget, sha256: []const u8) bool {
+        for (self.seen.items) |done| if (std.mem.eql(u8, done, sha256)) return true;
+        return false;
+    }
+};
+
+/// Every archive read by an owner scan (test seam: the scan's cost).
+pub var archive_inspections: usize = 0;
+
+/// The package `doc` names as the owner of `target`. Schema 2 publishes
+/// target ownership (#411): the lookup is by name and reads no archive at
+/// all. Only a schema-1 document, whose records claim nothing, falls back to
+/// the scan of verified cached archives, bounded by `budget` (which the
+/// caller may share across documents; `a` holds its record).
+pub fn scanOwner(a: std.mem.Allocator, doc: registry.Registry, target: []const u8, budget: *ScanBudget) !?[]const u8 {
     if (doc.claimsOwnership()) return doc.targetOwner(target);
-    var inspected: usize = 0;
     for (doc.pins) |pin| {
-        if (inspected == registry_hint_scan_limit) break;
+        if (budget.remaining == 0) break;
+        // Already read by this lookup (it did not name an owner then).
+        if (budget.inspected(pin.sha256)) continue;
         // Only a verified cached archive can say what a package declares; a
         // release that is not cached, or whose bytes do not verify, says nothing.
         // The archive and its unpacked tar live on a scratch arena freed per
@@ -56,7 +101,7 @@ fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
         const read_manifest = cachedManifest(scratch.allocator(), pin) catch |err| switch (err) {
             error.ProviderArchiveMissing => continue, // Not cached: nothing was read.
             else => {
-                inspected += 1;
+                try spend(a, budget, pin.sha256);
                 continue;
             },
         };
@@ -64,12 +109,18 @@ fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
         // bytes were read, verified and decompressed either way, and a
         // registry of manifest-less releases must not read past the bound
         // (Codex on #421).
-        inspected += 1;
+        try spend(a, budget, pin.sha256);
         const meta = read_manifest orelse continue;
         // `pin.package` is on the caller's allocator, unlike `meta`.
         if (std.mem.eql(u8, meta.name, pin.package) and meta.ownsTarget(target)) return pin.package;
     }
     return null;
+}
+
+fn spend(a: std.mem.Allocator, budget: *ScanBudget, sha256: []const u8) !void {
+    budget.remaining -= 1;
+    archive_inspections += 1;
+    try budget.seen.append(a, sha256);
 }
 
 /// The package the cached registry document names as the owner of `target`,
@@ -99,11 +150,40 @@ fn cachedNamespaceOwner(a: std.mem.Allocator, namespace: []const u8) !?[]const u
     return doc.namespaceOwner(namespace);
 }
 
-/// Keep the document an accept just resolved against, for `cachedRegistryOwner`.
+/// Keep the document an accept just resolved against, for `cachedRegistryOwner`,
+/// with no recorded source.
 pub fn cacheRegistry(a: std.mem.Allocator, data: []const u8) !void {
+    return cacheRegistryFrom(a, data, null);
+}
+
+/// Test seam: make the next sidecar write fail, as a crash between the
+/// document and its sidecar would.
+pub var fail_next_sidecar_write: bool = false;
+
+/// Keep the document an accept just resolved against and, when known, the
+/// source it came from (`cachedRegistrySource`). The old sidecar is removed
+/// BEFORE the document is replaced and the new one written after it, so a
+/// failure or crash in between leaves an unrecorded origin, never another
+/// source's label on these bytes (the digest alone cannot tell two sources
+/// of identical documents apart).
+pub fn cacheRegistryFrom(a: std.mem.Allocator, data: []const u8, source: ?[]const u8) !void {
+    const io = config.globalIo();
     const dir = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir });
-    try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const side_path = try std.fs.path.join(a, &.{ dir, registry_source_file });
+    std.Io.Dir.cwd().deleteFile(io, side_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     try writeAtomically(a, try std.fs.path.join(a, &.{ dir, registry_cache_file }), data);
+    if (source) |from| {
+        if (fail_next_sidecar_write) {
+            fail_next_sidecar_write = false;
+            return error.InjectedSidecarWriteFailure;
+        }
+        const side: CacheSource = .{ .source = from, .document_sha256 = try sha256Hex(a, data) };
+        try writeAtomically(a, try std.fs.path.join(a, &.{ dir, registry_source_file }), try std.json.Stringify.valueAlloc(a, side, .{}));
+    }
 }
 
 test "provider github: the cached registry names a target owner only from a verified cached archive" {
@@ -248,4 +328,23 @@ test "provider github: the registry-hint scan counts manifest-less cached releas
     // the bound: each manifest-less archive cost exactly one read.
     try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = pins.items[1..] }, .{}));
     try std.testing.expectEqualStrings("fixture", cachedRegistryOwner(a, "probe-target").?);
+}
+
+test "provider github: a failed sidecar write leaves an unrecorded origin, never the previous source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const doc = try AcceptFixture.schemaTwo(a, fx.pin, "\"probe\"", "\"probe-target\"");
+    try cacheRegistryFrom(a, doc, "/first/providers.json");
+    try std.testing.expectEqualStrings("/first/providers.json", cachedRegistrySource(a).?);
+    // The same bytes from another source; the sidecar write fails. The old
+    // sidecar's digest still matches, so only removing it first keeps it
+    // from labelling the document with the wrong source.
+    fail_next_sidecar_write = true;
+    try std.testing.expectError(error.InjectedSidecarWriteFailure, cacheRegistryFrom(a, doc, "/second/providers.json"));
+    try std.testing.expect(cachedRegistrySource(a) == null);
+    try cacheRegistryFrom(a, doc, "/second/providers.json");
+    try std.testing.expectEqualStrings("/second/providers.json", cachedRegistrySource(a).?);
 }

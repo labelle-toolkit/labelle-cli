@@ -87,7 +87,18 @@ one target, in two halves, before anything is generated, locked or built:
      ties a release to the declaration.
    - **Custom sources are passed on.** When the hint came from a custom
      source, steps 2 and 3 read `labelle providers resolve <source>` and
-     `labelle providers resolve <source> --accept`.
+     `labelle providers resolve <source> --accept`, the source quoted for the
+     user's shell when it needs it (single quotes on POSIX, double quotes
+     with `\"` escapes on Windows).
+   - **The global cache keeps its source.** An accept writes
+     `registry/source.json` next to the cached document, bound to its
+     SHA-256. A cached answer from another project's custom registry names
+     that source (and passes it to the steps); a cached document whose
+     source is not recorded is shown as "a cached registry of unrecorded
+     origin", never as the public registry.
+   - **Schema 1 everywhere.** A schema-1 document (live, cached, or a custom
+     source the project accepted) names its owner through the same bounded
+     scan of verified cached archives, without a version.
    - Every download, the hint's and `providers resolve`'s, is capped at
      1 MiB by the CLI itself (the captured output), not only by curl's
      `--max-filesize`, which curl before 8.4.0 ignores for a response of
