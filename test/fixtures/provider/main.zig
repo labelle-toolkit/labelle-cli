@@ -103,6 +103,25 @@ pub fn main(init: std.process.Init) !u8 {
             try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = dest, .data = copied });
         }
     } else |_| {}
+    // `PROVIDER_PROBE_SAY=1` makes every invocation print numbered lines to
+    // stdout and stderr, the way a real provider reports progress, so a suite
+    // can check the CLI's and the provider's output interleave intact when
+    // both land in one redirected FILE (cli#446). The writers are STREAMING,
+    // as every provider's must be: a positional `File.writer` pwrite()s at
+    // its own offset from 0 and overwrites whatever the CLI already wrote.
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_SAY")) |_| {
+        const id = if (invocation == .object) invocation.object.get("id").?.string else "?";
+        var out_buf: [64]u8 = undefined;
+        var err_buf: [64]u8 = undefined;
+        var out = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
+        var err = std.Io.File.stderr().writerStreaming(init.io, &err_buf);
+        for (1..4) |n| {
+            try out.interface.print("PROBE_SAY {s} stdout line {d} of 3\n", .{ id, n });
+            try out.interface.flush();
+            try err.interface.print("PROBE_SAY {s} stderr line {d} of 3\n", .{ id, n });
+            try err.interface.flush();
+        }
+    } else |_| {}
     // Hooks receive no argv, so a failing hook is selected by environment:
     // `PROVIDER_PROBE_FAIL=<hook id>` makes that hook exit 7.
     if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_FAIL")) |fail_id| {
