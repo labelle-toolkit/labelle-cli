@@ -295,28 +295,35 @@ registry and prints the entry to add, for example:
 ```
 labelle: no provider for target 'android' in this project; add and pin the package that declares target 'android'
   (registry: android)
-  the provider registry lists package 'android' 0.2.1 as the provider of target 'android'. To use it:
+  The provider registry lists package 'android' as the provider of target 'android'.
+  Its newest release that declares the target, 0.2.1, is a candidate: `labelle providers resolve --accept`
+  checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the target).
+  To use it:
     1. add it to .plugins in project.labelle:
          .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.1" },
     2. labelle providers resolve            # preview the pin
     3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;
                                             # fresh clones and CI run `labelle providers fetch`)
-  If --accept reports UnsupportedContract, that release needs a newer CLI: choose an older release.
 ```
+
+The suggested release is a candidate, not a promise: the registry does not
+yet say which CLI a release needs, so `labelle providers resolve --accept`
+is what checks it. If it reports `UnsupportedContract`, pick an older release
+of the package that declares the target.
 
 The lookup reads registry metadata only (nothing is pinned, cached or run)
 and gives up after a few seconds. A project that last accepted from its own
-`providers.json` (a fork URL or a local file) is answered by that source,
-never the public registry. `LABELLE_OFFLINE=1` skips any download; then, or
-when no registry can be read, the last accepted copy is used if it names the
-owner, and otherwise the steps are generic and say why. The failure itself is
-the same either way.
+`providers.json` (a fork URL or a local file) is answered from the copy of
+that document recorded at the accept, never the public registry; the hint
+prints that source on a line of its own for you to pass to both resolve
+steps. With `LABELLE_OFFLINE=1`, when the registry cannot be read, when it
+is a schema-1 registry, or when the project's record of its custom source
+does not verify, the steps are generic (no package, version or source) and
+say why. The failure itself is the same either way.
 
-Two limitations: the registry does not say which CLI a release needs, so if
-`--accept` reports `UnsupportedContract`, choose an older release of the
-package. And the record of a custom registry source lives in `.labelle/`;
-deleting that directory makes the hint ask the public registry again until
-you re-run `labelle providers resolve <source> --accept`.
+The record of a custom registry source lives in `.labelle/`; deleting that
+directory makes the hint ask the public registry again until you re-run
+`labelle providers resolve <source> --accept`.
 
 **`target 'android' is declared by remote package 'android', which is unpinned`.**
 The package is in `.plugins` but not in `labelle.providers.lock`: run

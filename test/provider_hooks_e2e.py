@@ -149,8 +149,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     exe = zig_out / "bin" / ("game" + exe_suffix)
     lock_file = project / "labelle.lock"
     home = base / "home"
-    # Hermetic: the no-provider diagnostic's live registry lookup is off
-    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    # Hermetic: the no-provider diagnostic's registry download is off
+    # (LABELLE_OFFLINE), so no public owner is named here.
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "PROVIDER_PROBE_COPY", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN",

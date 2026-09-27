@@ -1,9 +1,7 @@
 //! Verified archive download and cache reads, tar validation (one root,
-//! portable ASCII paths, no device names, no case-folded collisions) and the
-//! read-only manifest lookup inside a cached archive.
+//! portable ASCII paths, no device names, no case-folded collisions).
 const std = @import("std");
 const config = @import("../config.zig");
-const manifest = @import("../provider_manifest.zig");
 const contract = @import("../provider_contract.zig");
 const util = @import("../util.zig");
 const Pin = @import("pin.zig").Pin;
@@ -62,38 +60,6 @@ pub fn archive(a: std.mem.Allocator, pin: Pin, allow_download: bool) ![]u8 {
     };
     if (!util.sha256Matches(bytes, pin.sha256)) return error.ProviderArchiveHashMismatch;
     return bytes;
-}
-
-/// The `plugin.labelle` of a pinned package, read straight out of its
-/// verified cached archive — nothing is extracted, downloaded or run — or
-/// null when the archive holds no manifest. `ProviderArchiveMissing` when
-/// the archive is not cached. Every buffer lands on `a`; callers that scan
-/// several releases pass a scratch arena.
-pub fn cachedManifest(a: std.mem.Allocator, pin: Pin) !?manifest.Manifest {
-    const bytes = try archive(a, pin, false);
-    defer a.free(bytes);
-    var input: std.Io.Reader = .fixed(bytes);
-    var buffer: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompressor = std.compress.flate.Decompress.init(&input, .gzip, &buffer);
-    const tar = try decompressor.reader.allocRemaining(a, .limited(512 * 1024 * 1024));
-    defer a.free(tar);
-    try validateTar(a, tar);
-    var reader: std.Io.Reader = .fixed(tar);
-    var name: [4096]u8 = undefined;
-    var link: [4096]u8 = undefined;
-    var it = std.tar.Iterator.init(&reader, .{ .file_name_buffer = &name, .link_name_buffer = &link });
-    while (try it.next()) |entry| {
-        if (entry.kind != .file) continue;
-        // One root directory (validateTar), so the manifest is `<root>/plugin.labelle`.
-        const slash = std.mem.indexOfScalar(u8, entry.name, '/') orelse continue;
-        if (!std.mem.eql(u8, entry.name[slash + 1 ..], "plugin.labelle")) continue;
-        if (entry.size > 1024 * 1024) return error.StreamTooLong;
-        var out: std.Io.Writer.Allocating = .init(a);
-        defer out.deinit();
-        try it.streamRemaining(entry, &out.writer);
-        return try manifest.parse(a, out.written());
-    }
-    return null;
 }
 
 pub fn safeArchivePath(path: []const u8) bool {

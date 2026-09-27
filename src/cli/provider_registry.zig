@@ -87,18 +87,6 @@ pub const Registry = struct {
         return pins;
     }
 
-    /// The newest listed release of `package` in semver order (`0.10.0`
-    /// beats `0.9.0`; pins are plain `x.y.z`, `checkPins`), or null when none
-    /// is listed. Used only to suggest a `.plugins` entry, never to pin.
-    pub fn latestRelease(self: Registry, package: []const u8) ?github.Pin {
-        var best: ?github.Pin = null;
-        for (self.pins) |pin| {
-            if (!std.mem.eql(u8, pin.package, package)) continue;
-            if (best == null or releaseNewer(pin.version, best.?.version)) best = pin;
-        }
-        return best;
-    }
-
     /// The newest release of `package` whose OWN record declares `target`,
     /// or null. The ownership table is the union of a package's releases, so
     /// the package's newest release may have dropped a target an older one
@@ -151,7 +139,8 @@ pub const Registry = struct {
     }
 };
 
-/// `latestRelease`'s order: is `candidate` newer than `current`?
+/// Semver order (`0.10.0` beats `0.9.0`; pins are plain `x.y.z`,
+/// `checkPins`): is `candidate` newer than `current`?
 fn releaseNewer(candidate: []const u8, current: []const u8) bool {
     const cand = std.SemanticVersion.parse(candidate) catch return false;
     const cur = std.SemanticVersion.parse(current) catch return true;
@@ -324,11 +313,11 @@ test "provider registry: the suggested release is the newest one in semver order
     defer arena.deinit();
     const a = arena.allocator();
     const doc = try parse(a, "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++
-        testRecord("fixture", "0.9.0", "null", "") ++ "," ++ testRecord("fixture", "0.10.0", "null", "") ++ "," ++
-        testRecord("fixture", "0.2.1", "null", "") ++ "," ++ testRecord("other", "9.0.0", "null", "") ++ "]}");
-    try std.testing.expectEqualStrings("0.10.0", doc.latestRelease("fixture").?.version);
-    try std.testing.expectEqualStrings("9.0.0", doc.latestRelease("other").?.version);
-    try std.testing.expect(doc.latestRelease("absent") == null);
+        testRecord("fixture", "0.9.0", "null", "\"t\"") ++ "," ++ testRecord("fixture", "0.10.0", "null", "\"t\"") ++ "," ++
+        testRecord("fixture", "0.2.1", "null", "\"t\"") ++ "," ++ testRecord("other", "9.0.0", "null", "\"u\"") ++ "]}");
+    try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", "t").?.version);
+    try std.testing.expectEqualStrings("9.0.0", doc.latestDeclaring("other", "u").?.version);
+    try std.testing.expect(doc.latestDeclaring("absent", "t") == null);
 }
 
 test "provider registry: the suggested release for a target is the newest one that still declares it" {
@@ -340,7 +329,6 @@ test "provider registry: the suggested release for a target is the newest one th
         testRecord("fixture", "0.2.0", "null", "\"probe-target\"") ++ "," ++ testRecord("fixture", "0.9.0", "null", "\"probe-target\"") ++ "," ++
         testRecord("fixture", "0.10.0", "null", "\"second-target\"") ++ "]}");
     try std.testing.expectEqualStrings("fixture", doc.targetOwner("probe-target").?);
-    try std.testing.expectEqualStrings("0.10.0", doc.latestRelease("fixture").?.version);
     try std.testing.expectEqualStrings("0.9.0", doc.latestDeclaring("fixture", "probe-target").?.version);
     try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", "second-target").?.version);
     try std.testing.expect(doc.latestDeclaring("fixture", "absent-target") == null);
