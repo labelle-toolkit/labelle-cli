@@ -6,7 +6,7 @@ Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
 do not weaken the normative contract below; full phase-2 acceptance is pending.
 
-This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the exact CLI contract version; it never warns and proceeds. The v1 context below uses the exact wire version `1.0.0`; additional wire versions require explicit decoder support.
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.2.0` and still speaks `1.1.0` and `1.0.0`, and every context carries the negotiated version.
 
 ## 1. Package declarations and installed tools
 
@@ -31,11 +31,11 @@ Commands require a namespace and unique names. Resolve-time validation rejects r
 
 The CLI creates a UTF-8 JSON file and passes its absolute filename in `LABELLE_CONTEXT`. There is no argument-encoded alternative. The provider receives trailing user arguments verbatim through argv, without shell interpolation; the context path is not inserted into argv. The CLI owns the context-file lifetime through process exit and removes it afterward. Providers treat it as read-only.
 
-Every field below is required, except `build_number`. Nullable fields must be present as JSON null. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
+Every field below is required on the wires that define it, except the optional `build_number` and `run`. Nullable fields must be present as JSON null. A key is never emitted on a wire older than the one that added it. Unknown fields, duplicate keys, malformed enums, unsupported versions and inconsistent project fields are errors. The tested decoder is `src/cli/provider_contract.zig`.
 
 | Field | Type / rule |
 | --- | --- |
-| `contract_version` | Exactly `"1.0.0"` for this decoder |
+| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"` or `"1.2.0"` for this decoder |
 | `invocation` | Object containing `kind`, `id`, `step`, `phase` |
 | `invocation.kind` | `"command"` or `"hook"` |
 | `invocation.id` | Command name or hook ID |
@@ -49,7 +49,37 @@ Every field below is required, except `build_number`. Nullable fields must be pr
 | `zig_executable` | Absolute host compiler filename |
 | `optimize` | `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
 | `progress` | `human`, `json`, or `off` |
-| `build_number` | **Optional** (the only optional key): the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it; absent (never null) otherwise, and an error on any other invocation |
+| `build_number` | **Optional**, **wire `1.1.0`+**: the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it and the negotiated wire is `1.1.0` or newer; absent (never null) otherwise, and an error on any other invocation or on a `1.0.0` context |
+| `target_dir` | **Wire `1.2.0`+, required there**: on a hook, the absolute generated target directory (`.labelle/<backend>_<target>/`), the same for every step whatever `output_dir` is; null on a command. The key doesn't exist below `1.2.0`, not even as null |
+| `run` | **Optional**, **wire `1.2.0`+**: present on every `run`-step hook context (any phase) and absent (never null) everywhere else. An object with three required keys, `env`, `args` and `timeout_ms` (see below) |
+
+The `run` object holds the `labelle run` options for a hook that wraps or replaces the launch:
+
+| Key | Type / rule |
+| --- | --- |
+| `env` | Array of `{ "name", "value" }`. These are the platform-neutral `LABELLE_*` variables the core launch sets for `--scene`, `--profile`, `--screenshot` and `--after` (`LABELLE_SCENE`, `LABELLE_PROFILE`, `LABELLE_SCREENSHOT_PATH`, `LABELLE_SCREENSHOT_AFTER_SEC`), in that order. An option the user didn't pass adds nothing. Names match `[A-Za-z_][A-Za-z0-9_]*` and are unique; values contain no NUL |
+| `args` | The tokens after `--`, verbatim, as an array of strings |
+| `timeout_ms` | `--timeout` in milliseconds, or null |
+
+The CLI doesn't map these to any platform. The provider decides how they reach its game, for example as launch extras on a device. A hook on another step, or a command, that carries `run` is an error, and so is a `1.2.0` `run`-step hook without it.
+
+### Wire versions and negotiation
+
+The CLI implements contract `1.2.0` and speaks every wire version listed here, newest first:
+
+| Wire | Adds |
+| --- | --- |
+| `1.2.0` | `target_dir` on every context and the optional `run` key on `run`-step hooks (additive minor). |
+| `1.1.0` | The optional `build_number` key (additive minor). |
+| `1.0.0` | The original v1 context. |
+
+For each invocation the CLI negotiates the **newest** wire version the provider's `command_contract` range admits and writes it as `contract_version`; a range that admits none of them is `UnsupportedContract` at discovery. Keys a wire version does not define are never emitted in it, so a provider decoding strictly (unknown fields are errors, as above) keeps working:
+
+- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.2.0` and must accept the keys `1.1.0` and `1.2.0` add. A provider declaring such a range promises exactly that.
+- `>=1.0.0 <1.2.0` receives the exact `1.1.0` wire, without `target_dir` or `run`. If one of its `run` hooks would have received run options the user passed, the CLI prints one `note:` line per hook (`run options not passed to '<package>/<id>' (provider contract 1.1.0 < 1.2.0)`) instead of dropping them silently.
+- `>=1.0.0 <1.1.0` (or `1.0.0`) receives the exact `1.0.0` wire. `labelle bundle --build-number=N` is then not passed to it; the CLI prints one `note:` line saying so instead of dropping it silently. The `1.2.0` rule above applies too.
+
+A provider that rejects unknown fields should cap its range at the newest minor it decodes. New optional keys arrive only with a new minor wire version; the major stays `1` until a key is removed or changes meaning.
 
 Paths use host syntax and must be absolute (on Windows, drive-qualified or UNC, not current-drive-rooted). Structural validation does not perform filesystem existence/containment checks; the resolver performs those before launching.
 
@@ -65,7 +95,7 @@ Introduce one generic project field mapping package identity to a provider-owned
 
 ```zig
 .provider_config = .{
-    .{ .package = "labelle-android", .file = "providers/android.json" },
+    .{ .package = "android", .file = "providers/android.json" },
 },
 ```
 
@@ -107,10 +137,17 @@ contains at most one version per package. Releases are stable exact semver.
 
 `labelle providers resolve [providers.json]` previews the exact project-declared
 versions, commits and hashes and records them, with a digest, in
-`.labelle/providers.preview.json`. `--accept` requires the registry to still
-equal that recorded preview (any changed field aborts with
-`ProviderPreviewMismatch`; no preview aborts with `ProviderPreviewMissing`),
-verifies archives against the previewed hashes and provider manifests, checks
+`.labelle/providers.preview.json`. The preview binds the whole registry
+document, not only the selected pins: it also records the registry
+`schema_version`, the `defaults` list, each selected record's
+`namespace`/`targets` claims, and the SHA-256 of the normalised document
+(compact JSON of exactly the fields its schema defines, records in document
+order, so whitespace and key order do not matter). `--accept` requires the
+registry to still equal that recorded preview. Any changed field aborts with
+`ProviderPreviewMismatch` and names it: source, `schema_version`, `defaults`,
+a selected release's pin fields or claims, or, when none of those changed, an
+unselected release record. No preview aborts with `ProviderPreviewMissing`.
+It then verifies archives against the previewed hashes and provider manifests, checks
 ownership, then atomically writes `labelle.providers.lock` and removes the
 preview.
 Commit it alongside `labelle.lock`, which remains the ordinary dependency lock
@@ -125,7 +162,8 @@ or corrupted archives fail closed. Repair the cached archive and explicitly
 resolve again; a changed GitHub archive is not automatically accepted.
 
 Namespace, target and command-contract declarations come from the verified
-`plugin.labelle`, rather than duplicated registry metadata. Source archives
+`plugin.labelle`. The registry's ownership tables (schema 2, below) are a
+lookup index over those declarations, not a second authority. Source archives
 must be self-contained and have one root directory. Unsafe paths, links,
 case-insensitive duplicate paths and unsupported entry types are rejected.
 Compiler and Zig dependencies still require explicit preparation; host builds
@@ -136,11 +174,68 @@ bootstrap and default-package selection remain later work using GitHub data;
 they do not require a separate publishing service. CLI self-update never
 changes provider pins.
 
+### Registry schema 2: ownership tables and defaults
+
+The lock stays at schema 1. The registry document may use `schema_version: 2`,
+which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
+
+```json
+{
+  "schema_version": 2,
+  "defaults": [ { "package": "labelle-example", "version": "1.0.0" } ],
+  "providers": [
+    {
+      "package": "labelle-example",
+      "repo": "labelle-toolkit/labelle-example",
+      "version": "1.0.0",
+      "commit": "<40 lowercase hex characters>",
+      "sha256": "<64 lowercase hex characters>",
+      "namespace": "example",
+      "targets": [ "example-target" ]
+    }
+  ]
+}
+```
+
+- **Every key is required.** `namespace` is explicitly `null` for a release
+  that declares none, `targets` is `[]`, and `defaults` is `[]` when there are
+  none. A schema-1 document must not carry any of these keys. Unknown keys,
+  duplicate keys and schemas other than 1 and 2 are errors. All schema-1 pin
+  rules still apply.
+- **Each release record repeats the declarations of that release's
+  `plugin.labelle`.** Names follow the manifest rules: identifiers, no
+  duplicates, no Windows reserved device name as a target, and never
+  `desktop`.
+- **Target and namespace ownership** is the union of a package's releases.
+  Two packages claiming one name is an error, because lookup must name exactly
+  one package. Namespaces the running CLI reserves are not checked here, since
+  one registry serves every CLI version; dispatch refuses them.
+- **Lookup by target and by namespace** answers "which package provides
+  `<t>`" without downloading or extracting anything. The no-provider
+  diagnostic reads it from the cached registry the last `--accept` used
+  (see [provider targets](provider-targets.md#resolution)). That cache holds
+  the normalised document bound to the accepted preview, so its bytes hash to
+  the preview's registry digest; a later fetch nobody reviewed never reaches it. Projectless
+  bootstrap (phase 5) uses the same table for namespaces.
+- **The claims are checked, not trusted.** `labelle providers resolve --accept`
+  compares every release it pins against that release's verified manifest.
+  Any difference in namespace or target set fails with
+  `RegistryDeclarationMismatch` before the lock is written. So a pinned
+  release never disagrees with the table that pointed at it, and a wrong claim
+  can only affect a diagnostic about a package that was never pinned.
+- **`defaults`** lists exact releases (`package` + `version`, one entry per
+  package), each matching exactly one record. It resolves to those exact
+  records (`Registry.defaultPins`), which are what the §5 consent prompt shows:
+  package, version, repository, commit, hash. It is never a bare name, a range
+  or "latest".
+
 ## 5. Default-package consent
 
 Whether defaults come from the online index or an offline stamped scaffold, `init` presents their exact resolved package/version/source/hash records before writing pins or executing package code. Accept explicitly; noninteractive automation supplies an explicit acceptance option, otherwise fail rather than hang. Declining leaves no initialized project or provider pins. Offline initialization requires complete cached release metadata/content and compiler prerequisites for any work it executes.
 
 Index defaults are suggestions, not automatically trusted project declarations. Initial acceptance covers the complete resolved dependency graph; changes to that graph require explicit resolution. Merely fetching/parsing metadata is allowed before consent, but compiling or executing package build scripts is not.
+
+The online defaults are the registry's schema-2 `defaults` list (§4), resolved to exact records. The `providers resolve` preview already binds that list together with the rest of the registry document (§4), so a defaults change between preview and accept is a mismatch there too. The offline source is the release-stamped scaffold template, which is data the assembler's `init` ships, not CLI code. Consent uses the same binding as `labelle providers resolve`: what is written is exactly what was shown. `init` presents the resolved default records. Only after explicit acceptance (interactive, or the explicit noninteractive option) does it write `.plugins` and `labelle.providers.lock` from those same records. A registry that changes in between is a mismatch, not a new default. Today `labelle init` (delegated to `labelle-assembler init`) scaffolds only the core/engine/gfx pins, and no default package is added. This section is the rule the first default package must follow; it does not describe current behaviour.
 
 ## 6. Hook execution
 
@@ -150,7 +245,7 @@ Stop on any failed hook/operation; after hooks run only after success. For `run`
 
 ## 7. Backend agnosticism migration
 
-Keep the mandate: backend names must also leave core. Add an explicit migration deliverable coordinated with assembler #378: replace the fixed backend enum with a resolved manifest identity, move target-support declarations out of `compatibility.zig`, and replace backend-name branches in `pipeline.zig` with declared capabilities. The shared project schema must accept the identity before consumers switch.
+Keep the mandate: backend names must also leave core. The guard already flags them (`raylib`, `sokol`, `sdl`/`sdl2`, `bgfx`, `wgpu`); their current sites are allowlisted. #411 considered narrowing the mandate and guard to platform and store names until backends are manifest-declared, and rejected it. Narrowing would let new backend branches into core unflagged, and the allowlist already expresses "not yet". The deliverable is [CLI #432](https://github.com/labelle-toolkit/labelle-cli/issues/432), coordinated with assembler #378 and blocked on it: replace the fixed backend enum with a resolved manifest identity, move target-support declarations out of `compatibility.zig`, and replace backend-name branches in `pipeline.zig` with declared capabilities. The shared project schema must accept the identity before consumers switch.
 
 Keep specific existing sites on the shrinking migration allowlist until replaced; do not claim the guard is complete after moving platform commands alone. Desktop stays a core target, but its renderer is still a manifest-resolved backend. No backward aliases for removed enum/config forms.
 
@@ -162,4 +257,4 @@ Phase 2 implements manifest/range parsing, GitHub integrity pins, config mapping
 
 Hook planning and execution (§6) are implemented for the four core steps; [provider hooks](provider-hooks.md) documents the ordering rules, the step output-directory layout, the hook context and the remaining limitations.
 
-Before #411 closes, review all six decisions against the architecture RFC. Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.
+#411's review of the six decisions against the architecture RFC: default-package consent (§5, with the §4 `defaults` list), one declared executable per `build_step` (§1), one context wire format (§2), provider-owned settings (§3, [provider configuration](provider-configuration.md)), backend names (§7, [#432](https://github.com/labelle-toolkit/labelle-cli/issues/432)), and target lookup in the index (§4 schema 2). Before the feature is called implemented, exercise actual provider subprocesses, artifact discovery, consent failures, hash failures, host/toolchain cache separation, offline execution and atomic-update recovery. Passing the phase-1 pure tests does not claim those later behaviors work.

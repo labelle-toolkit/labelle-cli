@@ -95,9 +95,9 @@ def hook(id, step, when, target="desktop", after=None):
     return f'.{{ .id = "{id}", .step = .{step}, .target = "{target}", .when = .{when}, {TOOL}{ref} }}'
 
 
-def manifest(name, hooks, targets=()):
+def manifest(name, hooks, targets=(), contract=">=1.0.0 <2.0.0"):
     declared = f', .targets = .{{ {", ".join(json.dumps(t) for t in targets)} }}' if targets else ""
-    return (f'.{{ .name = "{name}", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0"{declared},\n'
+    return (f'.{{ .name = "{name}", .manifest_version = 2, .command_contract = "{contract}"{declared},\n'
             f'    .hooks = .{{ {", ".join(hooks)} }} }}')
 
 
@@ -160,7 +160,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         global checks
         merged = dict(env, **(extra_env or {}))
         quiet = [] if args[0] == "help" else ["--progress=off"]
-        result = subprocess.run([cli, *args, *quiet], cwd=project, env=merged, text=True,
+        # Everything after `--` is the game's, verbatim: the flag goes before.
+        split = args.index("--") if "--" in args else len(args)
+        argv = [*args[:split], *quiet, *args[split:]]
+        result = subprocess.run([cli, *argv], cwd=project, env=merged, text=True,
                                 capture_output=True, timeout=600)
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
         assert "leaked" not in result.stderr, result.stderr
@@ -249,6 +252,11 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         assert Path(e["lock_file"]) == lock_file.resolve() and e["lock_file_exists"], e
         assert e["optimize"] == "ReleaseSmall" and e["progress"] == "off", e
         assert Path(e["package_dir"]).name in ("fixture-a", "fixture-b"), e
+        # Contract 1.2.0: every hook names the generated target dir; only
+        # `run`-step hooks carry the run options.
+        assert e["context"]["contract_version"] == "1.2.0", e
+        assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
+        assert "run" not in e["context"], e
     ids = {e["invocation"]["id"]: e for e in entries}
     assert Path(ids["a-pre"]["package_dir"]) == providers["fixture-a"].resolve()
     capture = json.loads((zig_out / "capture.json").read_text())
@@ -343,6 +351,49 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     shutil.rmtree(assets, ignore_errors=True)
     declare(dep_b, dep_a)
 
+    # ── generate: the shader override is re-gated after the before hooks ──
+    # A relative LABELLE_SHADERC is unusable, but the gate only consults it
+    # once `materials/` exists. Here `a-gen-pre` is what creates it, so the
+    # startup gate (before the install) passes; the re-check right after the
+    # before-generate hooks must stop the command before generation (Codex
+    # P2 on #420), naming the override instead of failing opaquely later.
+    materials = project / "materials"
+    shutil.rmtree(materials, ignore_errors=True)
+    bad_shaderc = {"LABELLE_SHADERC": "shaderc"}
+    reset()
+    control = run("generate", extra_env=bad_shaderc)
+    assert "FIXTURE_GENERATE" in control.stderr, control.stderr
+    reset()
+    gated = run("generate", code=1, extra_env=dict(bad_shaderc, PROVIDER_PROBE_COPY=f"a-gen-pre|{png}|materials/probe.png"))
+    assert (materials / "probe.png").exists(), "the hook did not create materials/"
+    assert "FIXTURE_INSTALL_DONE" in gated.stderr, gated.stderr  # the startup gate passed
+    assert "ShadercOverrideMustBeAbsolute" in gated.stderr and "FIXTURE_GENERATE" not in gated.stderr, gated.stderr
+    assert gated.stderr.index("hook 'fixture-a/a-gen-pre'") < gated.stderr.index("ShadercOverrideMustBeAbsolute"), gated.stderr
+    shutil.rmtree(materials, ignore_errors=True)
+
+    # ── progress: hook sub-steps hand the detail back to the core step ────
+    # After the before-generate hooks the feed must report the core
+    # generation again, not the last hook "running" through it (Codex P2 on
+    # #420); a hook sub-step never carries the compiler's counters.
+    reset()
+    streamed = subprocess.run([cli, "build", "--progress=json"], cwd=project, env=env, text=True,
+                              capture_output=True, timeout=600)
+    assert streamed.returncode == 0, (streamed.returncode, streamed.stdout, streamed.stderr)
+    checks += 1
+    records = []
+    for line in streamed.stdout.splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            pass
+    details = [(r["phase"], r["detail"]) for r in records]
+    last_gen_hook = max(i for i, (_, d) in enumerate(details) if d in ("hook fixture-a/a-gen-pre", "hook fixture-b/b-gen-pre"))
+    assert ("generate", "assembler generate") in details[last_gen_hook + 1:], details
+    for r in records:
+        if r["detail"].startswith("hook "):
+            assert r["step"] is None and r["total"] is None and r["percent"] is None, r
+    assert records[-1]["phase"] == "done", records[-1]
+
     # ── run: before/after around the game ─────────────────────────────────
     reset()
     result = run("run")
@@ -352,6 +403,11 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     text = result.stderr
     assert text.index("hook 'fixture-b/b-run-pre'") < text.index("labelle: running...") < text.index("hook 'fixture-a/a-run-post'"), text
     assert "after-run hooks skipped" not in text, text
+    # A run with no options: every run-step hook still carries `run`, empty.
+    for e in entries:
+        if e["invocation"]["step"] == "run":
+            assert e["context"]["run"] == {"env": [], "args": [], "timeout_ms": None}, e
+            assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
 
     # ── run: the --timeout kill is not a clean exit ───────────────────────
     # The watchdog reports exit 0 after killing the game (cli#390), which
@@ -409,6 +465,25 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre")], refused.stderr
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     reset()
+
+    # A provider server replacement must never turn legacy export into serve,
+    # or silently discard the old serve flags. Refuse before any hook/build.
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS + [hook("web-server", "run", "replace", target="wasm")], targets=["wasm"]))
+    marker_script = base / "prebuild-marker.py"
+    marker_script.write_text("from pathlib import Path; Path('prebuild-ran').write_text('unexpected')")
+    declare(dep_b, dep_a, resources=f', .prebuild = .{{ .{{ .run = .{{ {json.dumps(sys.executable)}, {json.dumps(str(marker_script))} }} }} }}')
+    for verb in ("serve", "export"):
+        for flags in (("--no-build",), ()):
+            refused = run("wasm", verb, *flags, code=1, extra_env={"LABELLE_NO_PREBUILD": "0"})
+            assert not (project / "prebuild-ran").exists(), "prebuild ran before migration refusal"
+            assert "legacy `wasm serve/export`" in refused.stderr, refused.stderr
+            assert "fixture-a/web-server" in refused.stderr, refused.stderr
+            assert "FIXTURE_GENERATE" not in refused.stderr and "WASM Export Complete" not in refused.stderr, refused.stderr
+            assert not log(wasm_target_dir / "zig-out"), "a hook ran before migration refusal"
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+    reset()
+
+    declare(dep_b, dep_a)
 
     # ── run: an `after build` hook's output survives until launch ─────────
     # `a-post` overwrites `zig-out/bin/data.txt` — a file the build installs
@@ -544,6 +619,106 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "MissingHookReference" in present.stderr and "fixture-c/nope" in present.stderr, present.stderr
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     declare(dep_b, dep_a)
+
+    # ── contract 1.2.0: target_dir and the run options on a provider target
+    # fixture-a owns `probe-target` and replaces all four steps on it. The
+    # replacement `run` hook stands in for the core launch, so it is what
+    # receives `labelle run`'s options: the same `LABELLE_*` pairs the core
+    # launch would set, the tokens after `--`, and the timeout. The CLI maps
+    # nothing to any platform; the provider decides how they reach its game.
+    probe_dir = project / ".labelle" / "raylib_probe-target"
+    probe_out = probe_dir / "zig-out"
+    marker = probe_dir / "sentinel-ran"
+    PROBE = [hook("gen", "generate", "replace", target="probe-target"),
+             hook("build", "build", "replace", target="probe-target"),
+             hook("pack", "bundle", "replace", target="probe-target")]
+    DEPLOY = hook("deploy", "run", "replace", target="probe-target")
+    # The host launch sentinel: a binary at the path the core launch would
+    # execute, which leaves a marker in its cwd when it runs.
+    sentinel_src = base / "sentinel.zig"
+    sentinel_src.write_text('const std = @import("std");\n'
+                            'pub fn main(init: std.process.Init) !void {\n'
+                            '    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "sentinel-ran", .data = "1" });\n'
+                            '}\n')
+    sentinel_bin = base / ("sentinel" + exe_suffix)
+    subprocess.run([zig, "build-exe", str(sentinel_src), f"-femit-bin={sentinel_bin}"], cwd=base, check=True,
+                   capture_output=True, timeout=600)
+
+    def plant():
+        reset()
+        (probe_out / "bin").mkdir(parents=True)
+        shutil.copy2(sentinel_bin, probe_out / "bin" / ("game" + exe_suffix))
+
+    def probe_context(step_dir, hook_id):
+        found = [e["context"] for e in log(step_dir) if e["invocation"]["id"] == hook_id]
+        assert len(found) == 1, (hook_id, log(step_dir))
+        return found[0]
+
+    run_flags = ("--platform=probe-target", "--scene=x", "--screenshot=s", "--after=2s", "--timeout=30s", "--", "a", "b")
+    expected_env = [{"name": "LABELLE_SCENE", "value": "x"}, {"name": "LABELLE_SCREENSHOT_PATH", "value": "s"},
+                    {"name": "LABELLE_SCREENSHOT_AFTER_SEC", "value": "2.000"}]
+    # The control: the planted sentinel, run from the launch's cwd (the
+    # target dir), DOES leave the marker, so its absence below is the
+    # replacement standing in.
+    a_manifest.write_text(manifest("fixture-a", PROBE, targets=["probe-target"]))
+    plant()
+    subprocess.run([str(probe_out / "bin" / ("game" + exe_suffix))], cwd=probe_dir, check=True, timeout=60)
+    assert marker.exists(), "the planted sentinel left no marker; the checks below would be vacuous"
+    marker.unlink()
+    # With no run replacement the CLI has no launch for a provider target: it
+    # refuses before the build (`NoRunReplacement`, cli#405) instead of
+    # falling through to the host launch.
+    plant()
+    refused = run("run", *run_flags, code=1)
+    assert "target 'probe-target' has no run replacement; package 'fixture-a' must declare a `.when = .replace` hook on `run`" in refused.stderr, refused.stderr
+    assert "NoRunReplacement" in refused.stderr, refused.stderr
+    assert not marker.exists(), "the core launch ran for a provider target with no run replacement"
+    assert not log(probe_out) and not log(probe_dir), "a hook ran although the run was refused before the build"
+    a_manifest.write_text(manifest("fixture-a", PROBE + [DEPLOY], targets=["probe-target"]))
+    plant()
+    replaced = run("run", *run_flags)
+    assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
+    ctx = probe_context(probe_out, "deploy")
+    assert ctx["contract_version"] == "1.2.0", ctx
+    assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000}, ctx
+    assert Path(ctx["target_dir"]) == probe_dir.resolve() and Path(ctx["output_dir"]) == probe_out.resolve(), ctx
+    assert "run options not passed" not in replaced.stderr, replaced.stderr
+    # The same command's generate and build replacements: the target dir,
+    # and no run options off the run step.
+    for step_dir, hook_id in ((probe_dir, "gen"), (probe_out, "build")):
+        ctx = probe_context(step_dir, hook_id)
+        assert Path(ctx["target_dir"]) == probe_dir.resolve() and "run" not in ctx, ctx
+    # build and bundle: the target dir, wherever the output goes.
+    reset()
+    run("build", "--platform=probe-target")
+    ctx = probe_context(probe_out, "build")
+    assert Path(ctx["target_dir"]) == probe_dir.resolve() and "run" not in ctx, ctx
+    reset()
+    run("bundle", "--platform=probe-target")
+    ctx = probe_context(probe_out / "bundle" / "probe-target", "pack")
+    assert Path(ctx["target_dir"]) == probe_dir.resolve() and "run" not in ctx, ctx
+    elsewhere = base / "elsewhere"
+    reset()
+    run("bundle", "--platform=probe-target", "--output", str(elsewhere))
+    ctx = probe_context(elsewhere, "pack")
+    assert Path(ctx["output_dir"]) == elsewhere.resolve(), ctx
+    assert Path(ctx["target_dir"]) == probe_dir.resolve(), ctx
+    shutil.rmtree(elsewhere)
+    # A provider capped below 1.2.0 receives the exact 1.1.0 wire — neither
+    # key — and the dropped run options are announced once, not silently.
+    a_manifest.write_text(manifest("fixture-a", PROBE + [DEPLOY], targets=["probe-target"], contract=">=1.0.0 <1.2.0"))
+    plant()
+    capped = run("run", *run_flags)
+    ctx = probe_context(probe_out, "deploy")
+    assert ctx["contract_version"] == "1.1.0" and "run" not in ctx and "target_dir" not in ctx, ctx
+    note = "labelle: note: run options not passed to 'fixture-a/deploy' (provider contract 1.1.0 < 1.2.0)"
+    assert capped.stderr.count(note) == 1, capped.stderr
+    assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
+    # No run options given: nothing was dropped, so there is no note.
+    plant()
+    plain = run("run", "--platform=probe-target")
+    assert "run options not passed" not in plain.stderr, plain.stderr
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
 
     # ── bundle ────────────────────────────────────────────────────────────
     reset()

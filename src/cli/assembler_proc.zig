@@ -165,8 +165,8 @@ pub fn runSubcommand(
 /// delegate code generation to the assembler binary instead of calling
 /// the in-process `generate()`. `build` / `run` then invoke `zig build`
 /// (and launch the binary) themselves — those steps stay CLI-side because
-/// the CLI owns docker orchestration, WASM serve, the iOS/Android deploy
-/// paths and `--timeout`; only the generation step is delegated.
+/// the CLI owns docker orchestration, WASM serve, the iOS deploy
+/// path and `--timeout`; only the generation step is delegated.
 ///
 /// `platform` / `backend` are forwarded as plain strings (`@tagName` of
 /// the CLI's enums) so this module needs no dependency on the assembler's

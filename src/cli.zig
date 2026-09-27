@@ -2,7 +2,7 @@
 ///
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game; on `--platform=android`, `--scene`/`--profile`/`--screenshot`/`--after` travel as `am start --es LABELLE_*` intent extras (cli#397)
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game; on a provider target whose package replaces `run`, the options travel to its hook as `run.env` (docs/provider-hooks.md)
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] [--linux-desktop] — generate + build (no run); on Linux (or with `--linux-desktop`) also writes `zig-out/<exe>.desktop` + `zig-out/<exe>.png` for the desktop target (cli#359)
 ///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] [--platform=<t>] — generate + build the resolved target, then package it: for `desktop`, wrap the exe in a self-contained macOS `<Title>.app` (Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it; macOS only, cli#359/#364/#363); for a provider target, run the provider's `replace` hook on `bundle` (RFC #406, docs/provider-targets.md)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
@@ -46,7 +46,6 @@ const docker = @import("cli/docker.zig");
 const serve = @import("cli/serve.zig");
 const export_mod = @import("cli/export.zig");
 const ios = @import("cli/ios.zig");
-const android = @import("cli/android.zig");
 const util = @import("cli/util.zig");
 const pack = @import("cli/pack.zig");
 const progress = @import("cli/progress.zig");
@@ -67,7 +66,6 @@ const sdl_provision = @import("cli/sdl_provision.zig");
 // bodies stay unchanged.
 const args_mod = @import("cli/args.zig");
 const ParsedArgs = args_mod.ParsedArgs;
-const resolveAndroidBackend = args_mod.resolveAndroidBackend;
 const parseDirAndScene = args_mod.parseDirAndScene;
 const parseRunArgs = args_mod.parseRunArgs;
 const parseWasmServeArgs = args_mod.parseWasmServeArgs;
@@ -331,43 +329,6 @@ pub fn main(proc_init: std.process.Init) !u8 {
                     parsed_args.project_dir = arg;
                 }
             }
-        } else if (std.mem.eql(u8, first, "android")) {
-            parsed_args.command = .android_cmd;
-            // Same rule as `ios`: the target is resolved against the pinned
-            // providers, never assumed.
-            parsed_args.platform_override = "android";
-            // Android value-bearing flags: the NEXT token after one of
-            // these is the flag's value, not the project directory.
-            var expect_value = false;
-            while (args.next()) |arg| {
-                if (expect_value) {
-                    try appendExtraArg(&parsed_args, arg);
-                    expect_value = false;
-                    continue;
-                }
-                if (std.mem.startsWith(u8, arg, "-") or
-                    std.mem.eql(u8, arg, "build") or
-                    std.mem.eql(u8, arg, "run") or
-                    std.mem.eql(u8, arg, "studio") or
-                    std.mem.eql(u8, arg, "deploy") or
-                    std.mem.eql(u8, arg, "doctor") or
-                    std.mem.eql(u8, arg, "help"))
-                {
-                    try appendExtraArg(&parsed_args, arg);
-                    if (std.mem.eql(u8, arg, "--keystore") or
-                        std.mem.eql(u8, arg, "--keystore-pass") or
-                        std.mem.eql(u8, arg, "--key-alias") or
-                        std.mem.eql(u8, arg, "--key-pass") or
-                        std.mem.eql(u8, arg, "--tag") or
-                        std.mem.eql(u8, arg, "--channel") or
-                        std.mem.eql(u8, arg, "--notes-file"))
-                    {
-                        expect_value = true;
-                    }
-                } else {
-                    parsed_args.project_dir = arg;
-                }
-            }
         } else if (std.mem.eql(u8, first, "wasm")) {
             // `labelle wasm <subcommand>` — `serve` and `export`.
             const sub = args.next();
@@ -428,8 +389,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
             // directory. An arbitrary token is much more likely to be a
             // misspelled command than a project path.
             if (!isDirectoryShorthand(first)) {
-                std.debug.print("labelle: unknown command '{s}'\n", .{first});
-                std.debug.print("Run 'labelle help' to see available commands.\n", .{});
+                reportUnknownCommand(allocator, first);
                 std.process.exit(1);
             }
             const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return 0;
@@ -447,27 +407,22 @@ pub fn main(proc_init: std.process.Init) !u8 {
     }
 
     const command = parsed_args.command;
-    const project_dir = parsed_args.project_dir;
 
     // ── Help resolution — BEFORE any dispatch ────────────────────────
     //
     // A usage request must never reach a handler that DOES something.
     // This is the one place that decides "this invocation can only print
     // usage", and it sits above EVERY dispatch below it: the standalone
-    // switch, the `android doctor` fast path, and `pipeline.run`. Any
-    // fast path added later lands underneath it by construction, so the
-    // bug cannot recur at a new site.
+    // switch and `pipeline.run`. Any fast path added later lands
+    // underneath it by construction, so the bug cannot recur at a new
+    // site.
     //
-    // That ordering is the whole point. This same blind spot was fixed
-    // three times at three different sites during cli#355 review — first
-    // `labelle android --help`, then `labelle android build --help` and
-    // the iOS forms — and each fix was a check placed after some earlier
-    // `return`. `labelle android doctor --help` was the fourth: the
-    // doctor fast path returned before the help predicate was ever
-    // consulted, so asking for usage probed the Android toolchain and
-    // exited 1 when the SDK was missing (cli#361 review). Hoisting the
-    // decision above the fast paths retires the pattern instead of
-    // patching a fourth site.
+    // That ordering is the whole point. The same blind spot was fixed at
+    // several sites during cli#355 and cli#361 review, each time as a
+    // check placed after some earlier `return` (a legacy platform
+    // subcommand's `--help` ran a whole build, or probed a toolchain).
+    // Hoisting the decision above every fast path retires the pattern
+    // instead of patching one more site.
     if (helpOnlyPrinter(command, parsed_args.extra_args[0..parsed_args.extra_count])) |printUsage| {
         printUsage();
         return 0;
@@ -497,35 +452,6 @@ pub fn main(proc_init: std.process.Init) !u8 {
         else => {},
     }
 
-    // `labelle android doctor` is standalone — it doesn't need a
-    // project.labelle. Intercept here so running it from any directory
-    // works without the "No project.labelle found" bail below.
-    //
-    // Doctor still *uses* the project's android config when available
-    // so the probe targets the right `target_sdk_version`. The read
-    // is quiet: if there's no project (or it fails to parse), we fall
-    // through to the defaults instead of erroring out.
-    //
-    // `AndroidToolsMissing` is caught and turned into `exit(1)` so
-    // the Zig error-return trace stays out of the user's terminal —
-    // the report was already printed.
-    if (command == .android_cmd and parsed_args.extra_count > 0) {
-        const first = parsed_args.extra_args[0];
-        if (std.mem.eql(u8, first, "doctor")) {
-            var doctor_arena = std.heap.ArenaAllocator.init(allocator);
-            defer doctor_arena.deinit();
-            const project_cfg: ?project_config.AndroidConfig = blk: {
-                const parsed_cfg = config.readProjectConfigQuiet(doctor_arena.allocator(), project_dir) catch break :blk null;
-                break :blk parsed_cfg.android;
-            };
-            android.runDoctor(allocator, project_cfg) catch |err| {
-                if (err == error.AndroidToolsMissing) std.process.exit(1);
-                return err;
-            };
-            return 0;
-        }
-    }
-
     return pipeline.run(allocator, parsed_args);
 }
 
@@ -553,6 +479,22 @@ fn printHelpWithProviders(allocator: std.mem.Allocator) u8 {
     return 0;
 }
 
+/// A first token that is no built-in command, no pinned provider's
+/// namespace and no directory. When the cached registry names a package that
+/// declares it as a namespace (schema 2, cache only), say so: the command
+/// exists once that package is added and pinned — the namespace twin of the
+/// no-provider target diagnostic (`provider_targets.reportNoProvider`).
+fn reportUnknownCommand(allocator: std.mem.Allocator, first: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    if (provider_github.cachedRegistryNamespaceOwner(arena.allocator(), first)) |package| {
+        std.debug.print("labelle: no provider for namespace '{s}' in this project; add and pin the package that declares namespace '{s}'\n  (registry: {s})\n", .{ first, first, package });
+        return;
+    }
+    std.debug.print("labelle: unknown command '{s}'\n", .{first});
+    std.debug.print("Run 'labelle help' to see available commands.\n", .{});
+}
+
 fn isDirectoryShorthand(path: []const u8) bool {
     return util.dirExists(path);
 }
@@ -562,29 +504,22 @@ fn isDirectoryShorthand(path: []const u8) bool {
 /// `main` consults before any dispatch, so a new fast path cannot be
 /// ordered ahead of it.
 ///
-/// Help-only invocations of `android`/`ios` must not enter the build
-/// pipeline (cli#355). Both handlers print usage for a missing subcommand
-/// and for `--help`/`-h`, but they are only reached at the END of
-/// `pipeline.run` — so merely asking for usage executed the project's
-/// declared `.prebuild` commands plus a whole generate+build. Nor must
-/// they reach the `android doctor` fast path, which probes the Android
-/// toolchain and exits 1 when it is incomplete (cli#361). Neither needs a
+/// Help-only invocations of the legacy `ios` subcommand must not enter the
+/// build pipeline (cli#355). Its handler prints usage for a missing
+/// subcommand and for `--help`/`-h`, but it is only reached at the END of
+/// `pipeline.run`, so merely asking for usage executed the project's
+/// declared `.prebuild` commands plus a whole generate+build. It needs no
 /// project.labelle.
 ///
-/// The per-command predicates live beside each handler's own parse loop
-/// (`android.wantsHelpOnly`, `ios.wantsHelpOnly`) so the two stay in step,
-/// and cover EVERY help form — not just a token in the first
-/// extra-argument position: `labelle android`, `labelle android build
-/// --help`, `labelle android doctor --help` and `labelle ios build --help`
-/// all did work before printing usage at some point in this feature's
-/// history.
+/// The per-command predicate lives beside the handler's own parse loop
+/// (`ios.wantsHelpOnly`) so the two stay in step, and covers EVERY help
+/// form, not just a token in the first extra-argument position.
 ///
 /// Commands whose handler is already a pure printer, or which parse their
 /// own `--help` before doing anything, are absent by design: this is for
 /// commands whose help would otherwise be reached only after work.
 fn helpOnlyPrinter(command: args_mod.Command, extra_args: []const []const u8) ?*const fn () void {
     return switch (command) {
-        .android_cmd => if (android.wantsHelpOnly(extra_args)) &android.printHelp else null,
         .ios_cmd => if (ios.wantsHelpOnly(extra_args)) &ios.printIosHelp else null,
         else => null,
     };
@@ -593,27 +528,10 @@ fn helpOnlyPrinter(command: args_mod.Command, extra_args: []const []const u8) ?*
 // --- Tests ---
 
 /// `main` consults `helpOnlyPrinter` before EVERY dispatch, so these cases
-/// pin the whole "a usage request does no work" contract in one place —
-/// including `android doctor --help`, which used to be swallowed by the
-/// doctor fast path and probe the Android toolchain (cli#361 review).
+/// pin the whole "a usage request does no work" contract in one place
+/// (cli#355, cli#361 review).
 pub const HelpOnlyPrinterSpec = struct {
     pub const resolves_to_usage = struct {
-        test "android doctor --help prints usage instead of probing" {
-            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{ "doctor", "--help" }) != null);
-        }
-
-        test "android doctor -h prints usage instead of probing" {
-            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{ "doctor", "-h" }) != null);
-        }
-
-        test "android with no subcommand prints usage" {
-            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{}) != null);
-        }
-
-        test "android build --help prints usage" {
-            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{ "build", "--help" }) != null);
-        }
-
         test "ios build --help prints usage" {
             try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{ "build", "--help" }) != null);
         }
@@ -630,14 +548,6 @@ pub const HelpOnlyPrinterSpec = struct {
     };
 
     pub const falls_through_to_work = struct {
-        test "android doctor without a help token still runs the doctor" {
-            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{"doctor"}) == null);
-        }
-
-        test "android build without a help token still builds" {
-            try std.testing.expect(helpOnlyPrinter(.android_cmd, &.{"build"}) == null);
-        }
-
         test "ios run without a help token still runs" {
             try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{"run"}) == null);
         }
@@ -663,7 +573,6 @@ pub const ArgsParseSceneFlagSpec = args_tests_mod.ParseSceneFlagSpec;
 pub const ArgsSceneOverridePipelineSpec = args_tests_mod.SceneOverridePipelineSpec;
 pub const ArgsParseOptimizeFlagSpec = args_tests_mod.ParseOptimizeFlagSpec;
 pub const ArgsParsePlatformValueSpec = args_tests_mod.ParsePlatformValueSpec;
-pub const ArgsResolveAndroidBackendSpec = args_tests_mod.ResolveAndroidBackendSpec;
 pub const ArgsParseRunArgsPassthroughSpec = args_tests_mod.ParseRunArgsPassthroughSpec;
 pub const ArgsParseHeadlessFlagsSpec = args_tests_mod.ParseHeadlessFlagsSpec;
 pub const ArgsParseWasmServeArgsSpec = args_tests_mod.ParseWasmServeArgsSpec;
@@ -683,16 +592,6 @@ pub const LinuxDesktopStageIconSpec = linux_desktop_mod.StageIconSpec;
 pub const LinuxDesktopCreateFromBuildSpec = linux_desktop_mod.CreateFromBuildSpec;
 pub const LinuxDesktopShouldEmitSpec = linux_desktop_mod.ShouldEmitSpec;
 pub const ArgsAppendRunForwardedArgsSpec = args_tests_mod.AppendRunForwardedArgsSpec;
-
-// APK size controls (labelle-assembler#755): release strip, asset-staging
-// exclusions and the size report. Private import, so re-exported here.
-const apk_slim_mod = @import("cli/android/apk_slim.zig");
-pub const ApkSlimStripDecisionSpec = apk_slim_mod.StripDecisionSpec;
-pub const ApkSlimStageNativeLibSpec = apk_slim_mod.StageNativeLibSpec;
-pub const ApkSlimScanEmbeddedAssetsSpec = apk_slim_mod.ScanEmbeddedAssetsSpec;
-pub const ApkSlimSkipReasonSpec = apk_slim_mod.SkipReasonSpec;
-pub const ApkSlimStageAssetsSpec = apk_slim_mod.StageAssetsSpec;
-pub const ApkSlimSizeReportSpec = apk_slim_mod.SizeReportSpec;
 
 pub const TestCmdIsSkipDirSpec = test_cmd_mod.IsSkipDirSpec;
 pub const TestCmdFileHasTestBlockSpec = test_cmd_mod.FileHasTestBlockSpec;

@@ -5,8 +5,8 @@
 //! (`.app/Contents/Info.plist` → `CFBundleIconFile` →
 //! `Contents/Resources/*.icns`), so a bare binary shows the generic
 //! executable glyph in the Dock, Finder and Launchpad no matter what
-//! `project.labelle` `.app_icon` says. Android has had the icon since
-//! cli#340; this module gives desktop macOS parity.
+//! `project.labelle` `.app_icon` says. This module gives desktop macOS
+//! the icon a platform packager already stages (cli#340).
 //!
 //! It runs AFTER the normal generate+build pipeline (see `pipeline.zig`)
 //! and wraps the built exe:
@@ -60,8 +60,8 @@
 //! Apple documents it: write an `AppIcon.iconset/` holding the ten
 //! standard PNGs (16…512 at @1x/@2x, i.e. 16…1024 px) and run
 //! `iconutil -c icns` (the iconset is scratch under `~/.labelle/tmp/`,
-//! never under the output dir). Sizes at or below the master use the same box
-//! filter as Android; sizes ABOVE it use nearest-neighbour so a
+//! never under the output dir). Sizes at or below the master use the shared
+//! box filter (`app_icon.zig`); sizes ABOVE it use nearest-neighbour so a
 //! pixel-art master (flying-platform: 576×576 on a 24-px grid) is not
 //! blurred into the 1024 slot. 1024 is not a multiple of 24, so a 1152
 //! or 1536 master (24×48 / 24×64) gives integer ratios for most entries.
@@ -156,12 +156,12 @@ pub fn printUnsupported() void {
 }
 
 /// `CFBundleIdentifier` from the project `.name`, following the
-/// `com.labelle.<name>` scheme the Android manifest and the iOS plist
-/// already use (`android/package.zig` `defaultPackageName`, `ios.zig`
-/// `defaultBundleId`) so one project is the same "app" everywhere.
+/// `com.labelle.<name>` scheme the other platform packagers use (`ios.zig`
+/// `defaultBundleId`, and the providers' package ids) so one project is
+/// the same "app" everywhere.
 ///
-/// Apple's allowed alphabet is narrower than Android's: `[A-Za-z0-9-.]`
-/// — no underscore, while Android REQUIRES underscore over hyphen. So
+/// Apple's allowed alphabet is narrow: `[A-Za-z0-9-.]` — no underscore,
+/// though other platforms require underscore over hyphen. So
 /// the map is `_`/space → `-` and any other disallowed byte dropped,
 /// falling back to `game` (like `sanitizeExeName`) if nothing survives.
 /// Caller owns the slice.
@@ -643,8 +643,8 @@ pub fn escapeXml(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 /// Everything `renderInfoPlist` needs. Raw (unescaped) strings — the
 /// renderer escapes. `icon_file` null omits `CFBundleIconFile` entirely,
-/// mirroring the Android manifest dropping `android:icon` when there is
-/// no icon to stage: a dangling reference makes Finder show a broken
+/// as a platform manifest drops its icon attribute when there is no icon
+/// to stage: a dangling reference makes Finder show a broken
 /// document glyph, which is worse than the generic app icon.
 pub const PlistInfo = struct {
     bundle_id: []const u8,
@@ -731,7 +731,7 @@ pub fn renderInfoPlist(allocator: std.mem.Allocator, info: PlistInfo) ![]u8 {
 /// Scale a decoded RGBA master to one square iconset size.
 ///
 /// At or below the master's smaller edge → box filter (area average,
-/// same as Android — crisp AND alias-free on non-integer ratios). Above
+/// `app_icon.resampleBox` — crisp AND alias-free on non-integer ratios). Above
 /// it → nearest-neighbour, because a box UPSCALE blends neighbours into
 /// every output pixel and smears pixel art. Caller owns the buffer.
 pub fn scaleForEntry(

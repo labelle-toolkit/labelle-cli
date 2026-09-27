@@ -161,6 +161,51 @@ A `bundle` hook's context also carries `build_number` when the user passed
 core packager): the provider that packages its target is the one that stamps
 the number, so it would otherwise be dropped. The key is **absent** — not
 null — for every other step's hooks and for a `bundle` without the flag.
+`build_number` is a contract `1.1.0` key: a provider whose `command_contract`
+range stops below `1.1.0` receives the `1.0.0` wire without it (see
+[wire versions and negotiation](provider-contract-v1.md#wire-versions-and-negotiation)).
+
+On wire `1.2.0` every hook's context also carries **`target_dir`**: the
+absolute generated target directory, `.labelle/<backend>_<target>/`. It is
+the same directory for every step, whatever `output_dir` is, so a `bundle`
+hook still finds the generated tree and the build output when `--output`
+moves its `output_dir` somewhere else.
+
+A **`run`**-step hook (`before`, `replace` or `after`) also gets the
+**`run`** object on wire `1.2.0`. It holds the `labelle run` options that a
+replacement launch needs:
+
+```json
+"run": {
+  "env": [
+    { "name": "LABELLE_SCENE", "value": "intro" },
+    { "name": "LABELLE_SCREENSHOT_PATH", "value": "shot.png" },
+    { "name": "LABELLE_SCREENSHOT_AFTER_SEC", "value": "2.000" }
+  ],
+  "args": ["a", "b"],
+  "timeout_ms": 30000
+}
+```
+
+- `env` is exactly the list the core launch sets for `--scene`, `--profile`,
+  `--screenshot` and `--after`, with the same names, values and order. An
+  option the user didn't pass adds nothing. The desktop-only headless knobs
+  aren't run options and never appear here.
+- `args` are the tokens after `--`, verbatim.
+- `timeout_ms` is `--timeout` in milliseconds, or null.
+
+The CLI maps none of this to a platform. The provider decides how the pairs
+reach its game, for example as launch extras on a device.
+
+The object is present, and possibly empty, on every `run`-step hook of a
+`1.2.0` wire. That includes `wasm serve`'s `run` hooks, which have no
+`labelle run` options, so their object is empty. It's absent on every other
+step.
+
+A provider whose range stops below `1.2.0` gets the older wire, without
+either key. If its `run` hook would have received options the user passed,
+the CLI prints one line per hook:
+`labelle: note: run options not passed to '<package>/<id>' (provider contract <wire> < 1.2.0)`.
 
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
@@ -200,7 +245,14 @@ Hooks report under the progress phase of the step they wrap (`generate`,
 `compile` for `build`, `run` for `bundle` and `run`) as sub-steps named
 `hook <package>/<id>`. When Zig's progress stream has already advanced the
 feed from `compile` to `link`, an `after build` hook is a sub-step of `link`
-(the phase never moves backward).
+(the phase never moves backward). A hook sub-step carries no `step`/`total`
+counters (the compiler's are cleared), and once a `before generate` or
+`before bundle` phase succeeds the feed returns to the core step's detail
+(`assembler generate`, `packaging bundle`).
+
+The shader-compiler override (`LABELLE_SHADERC`) is validated before the
+package install and again right after the `before generate` hooks, since a
+hook may be what creates `materials/`.
 
 For `run`, the core build is the one and only build of the command: the
 desktop run path launches the binary the `build` step (or its `replace`
@@ -211,10 +263,15 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
 
 - No JSON progress relay or validation for hook (or command) stdout yet: the
   child's stdio is inherited exactly as for provider commands.
-- The legacy `labelle ios …` and `labelle android …` subcommand handlers are
-  not hook points for `build`/`run`; they only share the `generate` hooks.
-  They leave with platform extraction (their target already goes through
-  the resolver, so they need the pinned provider like `--platform=<t>`).
+- The legacy `labelle ios …` subcommand handler is not a hook point for
+  `build`/`run`; it only shares the `generate` hooks. It leaves with platform
+  extraction (its target already goes through the resolver, so it needs the
+  pinned provider like `--platform=<t>`). `labelle android …` left with
+  cli#405: it is the `android` provider's namespace, and `--platform=android`
+  runs the ordinary hook points.
+- A provider target other than the legacy `wasm`/`ios` run branches must
+  replace `run` (`NoRunReplacement`, [provider
+  targets](provider-targets.md#labelle-run)).
 - `labelle bundle` for the core `desktop` target is still refused on Linux
   and Windows — before any install or build — because the core packager is
   macOS-only and no hook can replace it (nobody may own `desktop`). A
@@ -222,7 +279,9 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   checked with the plans after discovery; see [provider
   targets](provider-targets.md#labelle-bundle).
 - `wasm serve` is interactive: its `done` record lands before the serve loop
-  and the `after run` hooks run once the server returns. The server returns
+  and the `after run` hooks run once the server returns; a failing one is
+  followed by a `failed` record carrying the exit code the CLI returns, so
+  the status file ends with the real outcome. The server returns
   on Ctrl+C or SIGTERM: the handler sets a flag, a waker thread pokes the
   listener so the blocked `accept` returns, the loop exits cleanly and the
   hooks run before the process ends (a second Ctrl+C while a hook is still
@@ -233,8 +292,11 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   core steps exactly as the cold pipeline did (the feed is already terminal,
   so the hooks' sub-step records are not emitted there); a failing hook stops
   that rebuild and keeps the server alive, like a failing core step. Every
-  rebuild first re-reads `project.labelle`, rediscovers the providers (with
-  the cache `.populated`, as the cold pipeline did) and replans both phases,
+  rebuild first — before its prebuild steps — re-reads `project.labelle`,
+  re-runs the package install and rewrites `labelle.lock` when that file
+  changed, rediscovers the providers (with the cache `.populated`, as the
+  cold pipeline did), re-checks that the served target still has a pinned
+  owner and replans both phases,
   so a watched edit to the project, to a provider manifest or to a
   `provider_config` file reaches the next rebuild — the plans computed at
   startup are only the initial state, never reused for a rebuild. A replan
@@ -243,9 +305,15 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   phase allocates on a scratch arena freed when the phase returns, and each
   replan lives on its own arena released once the next one is installed —
   only the resolved host compiler outlives them — so a long watch session
-  with hooks does not grow on every saved edit.
-- A `--docker` run whose binary was cross-compiled skips the launch and its
-  `after run` hooks with it (nothing ran).
+  with hooks does not grow on every saved edit. The replan's storage is
+  kept until the shutdown `after run` hooks have run. A hook that writes
+  into the watched tree (hooks declare no outputs) costs one follow-up
+  rebuild per edit, after which the watcher takes the tree as built — it
+  does not rebuild in a loop.
+- A `--docker` run whose binary was cross-compiled skips the launch and
+  every `run` hook with it — decided before the `before run` hooks, so none
+  of them prepares (or fails) a launch that never happens. A `replace run`
+  hook is not skipped: it launches its own way.
 - `wasm serve|export --no-build` skips only `generate` and `build`: serving
   or exporting the existing artifact is the `run` step, and its `before`,
   `replace` and `after run` hooks run as on the building path (`after`
@@ -263,7 +331,8 @@ sort), the deferral of references into an unread package (at the graph and
 at discovery, against a real cache layout in both cache states), the
 per-phase scratch arena (a counting allocator proves two phases on one site
 leave nothing live), the pin-before-compiler order (an unpinned provider is
-refused with the host resolver never reached), the `run` outcomes (only
+refused with the host resolver never reached), `target_dir` on every
+hook and the `run` options on `run`-step hooks only, the `run` outcomes (only
 `exited_clean` reaches the hook machinery), the output-layout contract and
 the hook wire context; `zig build test` also covers the watched-rebuild
 hook plumbing (the phases, and the per-rebuild replan: invoked on every
@@ -295,7 +364,13 @@ before hooks'), `run` hooks around the game, a `--timeout` kill running no
 `after run` hook (and printing the skip line) while a clean exit still
 does, the `run` hooks wrapping `wasm export --no-build` with nothing
 installed, generated or built, an `after build` edit to `zig-out/` reaching
-the launched game intact, a cold package cache failing closed or running a
+the launched game intact, contract `1.2.0` on a provider target (every
+hook's `target_dir` for `build`, `run` and `bundle`, including `bundle
+--output` elsewhere; a `replace run` hook receiving the three `LABELLE_*`
+pairs of `--scene`/`--screenshot`/`--after`, the `--` arguments and the
+timeout, while a planted host-launch sentinel that the unreplaced run does
+execute never runs; a provider capped below `1.2.0` getting neither key and
+the one `note:` line), a cold package cache failing closed or running a
 pinned provider's hooks (never skipping them) — with an unpinned remote hook
 refused as `RemoteProviderIntegrityRequired` while `LABELLE_ZIG` points
 nowhere, and the same dead compiler being the failure once the pin is
@@ -305,3 +380,16 @@ macOS, and the refusal elsewhere. `test/provider_github_e2e.py` checks that `--a
 broken hook graph without writing the lock. Provider-target resolution and
 bundling are covered by `test/provider_targets_e2e.py`. CI runs them on
 Windows, macOS and Linux.
+
+## Legacy wasm commands
+
+`labelle wasm serve/export` historically shares the `run` phase. When a pinned
+provider declares a run replacement, both legacy verbs are refused before
+generation or hooks (also with `--no-build`). Known declarations are checked
+before project prebuild commands; post-install discovery checks again for newly
+available providers. Watched manifest edits are checked before prebuild and
+before replacing the active plans, keeping the last good plans on refusal. This prevents export from starting
+a server and prevents serve flags from being silently discarded. Use the
+provider's namespaced commands shown by `labelle help`, or the generic
+`labelle run/bundle --platform=wasm` pipeline. Existing before/after hooks around
+the legacy implementation continue to work when no run replacement exists.

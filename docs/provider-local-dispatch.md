@@ -3,7 +3,8 @@
 This documents the first executable part of phase 2 of CLI #406, stacked on the
 [v1 contract](provider-contract-v1.md). **Phase 2 is not complete.** This slice
 lets a project's explicitly declared local package expose a host command. It
-does not migrate Android/web commands or change the core target/backend enums.
+did not migrate Android/web commands or change the core target/backend enums
+(Android has since moved into its provider, cli#405).
 
 ## Invocation and resolution
 
@@ -11,10 +12,15 @@ Run `labelle <namespace> <command> [arguments...]` from a project directory or
 one of its descendants. Discovery walks to the nearest `project.labelle` and
 reads manifests from that project's `.plugins`; it never searches global pins.
 Built-ins take precedence, followed by package namespaces, then directory
-shorthand. A package cannot claim a built-in namespace. Existing `android`,
-`ios`, and `wasm` commands remain reserved until their extraction lands;
-their target already resolves like `--platform=<t>` does, through the
-pinned provider that declares it ([provider targets](provider-targets.md)).
+shorthand. A package cannot claim a built-in namespace. The existing `ios`
+and `wasm` commands remain reserved until their extraction lands; their
+target already resolves like `--platform=<t>` does, through the pinned
+provider that declares it ([provider targets](provider-targets.md)).
+`android` left the reserved list with its extraction (cli#405): the
+`android` package declares it as its namespace. A first word that is no
+built-in, no pinned package's namespace and no directory is an unknown
+command; when the cached schema-2 registry names a package declaring it as
+a namespace, the diagnostic says so instead (`(registry: <package>)`).
 
 `labelle help`, a namespace with no command, `<namespace> --help`, and
 `<namespace> <command> --help` print manifest metadata without resolving Zig,

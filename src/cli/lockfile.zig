@@ -48,10 +48,9 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     try w.print("        .labelle = .{{ .version = \"{s}\" }},\n", .{cfg.labelle_version});
     // NOTE: `backend` (both `name` and `platform`) is intentionally not persisted.
     // Both fields are invocation state, not resolved dependencies:
-    //   - `platform` is the build target from CLI args (e.g. `labelle android run`).
-    //   - `name` is forced by the same CLI commands — `ios`/`android` pin `.sokol`
-    //     while a desktop run uses whatever the project config picks (could be
-    //     `.raylib`).
+    //   - `platform` is the build target from CLI args (e.g. `--platform=<t>`).
+    //   - `name` can be forced by a legacy platform subcommand, while a
+    //     desktop run uses whatever the project config picks.
     // Writing either caused the lock file to flap on every cross-deploy. The lock
     // file is a manifest of resolved package versions, not build-target state.
 

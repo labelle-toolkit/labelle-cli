@@ -223,7 +223,7 @@ pub fn cmdPlugins(allocator: std.mem.Allocator, args: []const []const u8) !void 
     if (!config.projectExists(project_dir)) {
         config.printNoProjectError(project_dir);
         // Non-zero outcome without a Zig error-return trace (same pattern
-        // as `add` / `android doctor`).
+        // as `add`).
         std.process.exit(1);
     }
 

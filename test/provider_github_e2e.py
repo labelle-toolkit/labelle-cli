@@ -105,8 +105,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     assert "Preview: 1" in resolve().stderr
     assert not lock.exists() and not home.exists(), "preview changed state"
     recorded = json.loads(preview.read_text())
-    assert recorded["providers"] == [dict(pin, archive_url="https://codeload.github.com/example/fixture/tar.gz/" + pin["commit"])]
+    assert recorded["providers"] == [dict(pin, archive_url="https://codeload.github.com/example/fixture/tar.gz/" + pin["commit"], namespace=None, targets=[])]
     assert recorded["source"] == str(registry) and len(recorded["digest"]) == 64
+    assert recorded["registry_schema"] == 1 and recorded["defaults"] == [] and len(recorded["registry_digest"]) == 64
     assert "ProviderArchiveMissing" in resolve("--accept", code=1).stderr
     assert not lock.exists(), "failed preparation wrote a lock"
     assert preview.exists(), "failed preparation consumed the preview"
@@ -265,4 +266,64 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
         assert json.loads(lock.read_text())["providers"] == [pin], "exit 0 but the new lock is not in place"
         assert preview.exists(), "the removal fault did not fire"
         cleaned()
+    # Registry schema 2 (#411): release records carry namespace/target claims
+    # that --accept checks against the verified manifest, and the cached
+    # document answers "who provides target <t>" by lookup, with no archive.
+    config([pin])
+    old_lock = lock.read_bytes()
+    other = {"package": "other", "repo": "example/other", "version": "1.0.0", "commit": "3" * 40, "sha256": "0" * 64}
+
+    def schema_two(claims):
+        registry.write_text(json.dumps({"schema_version": 2, "defaults": [],
+                                        "providers": [dict(p, namespace=ns, targets=ts) for p, ns, ts in claims]}))
+
+    schema_two([(pin, "probe", ["probe-target"]), (other, None, ["other-target"])])
+    err = accept(code=1).stderr
+    assert "RegistryDeclarationMismatch" in err and "registry record fixture 1.0.0" in err, err
+    assert lock.read_bytes() == old_lock and "Pinned" not in err
+    schema_two([(pin, "probe", []), (other, None, ["other-target"])])
+    accept()
+    assert json.loads(lock.read_text()) == {"schema_version": 1, "providers": [pin]}
+    cleaned()
+    # `other` was never cached (its hash is not even real), so only the table can name it.
+    err = run("build", "--platform=other-target", code=1).stderr
+    assert "no provider for target 'other-target'" in err and "(registry: other)" in err, err
+    err = run("build", "--platform=unknown-target", code=1).stderr
+    assert "no provider for target 'unknown-target'" in err and "(registry:" not in err, err
+    # The preview binds the whole registry document (#433), not just the
+    # selected pins: each change below leaves the fixture pin intact, and each
+    # is refused by name with the lock untouched.
+    claims = [(pin, "probe", []), (other, None, ["other-target"])]
+    old_lock = lock.read_bytes()
+
+    def refused(change, expected):
+        schema_two(claims)
+        resolve()
+        change()
+        err = resolve("--accept", code=1).stderr
+        assert "ProviderPreviewMismatch" in err and expected in err, err
+        assert lock.read_bytes() == old_lock and preview.exists() and "Pinned" not in err, err
+
+    # Schema 2 swapped for the same pins as schema 1 (the claim check would be a no-op).
+    refused(lambda: metadata([pin]), "registry schema_version changed since preview: 2 -> 1")
+    # A selected record's claim: the served claim is even true, only the binding refuses.
+    refused(lambda: schema_two([(pin, None, []), (other, None, ["other-target"])]), "provider 'fixture' namespace changed since preview")
+    # An unselected record's claim, which would otherwise reach the target-hint cache.
+    refused(lambda: schema_two([(pin, "probe", []), (other, None, ["moved-target"])]), "outside the selected releases")
+    # The defaults list.
+    refused(lambda: registry.write_text(json.dumps({"schema_version": 2, "defaults": [{"package": "fixture", "version": "1.0.0"}],
+                                                    "providers": [dict(p, namespace=ns, targets=ts) for p, ns, ts in claims]})),
+            "registry defaults changed since preview")
+    err = run("build", "--platform=moved-target", code=1).stderr
+    assert "(registry:" not in err, "an unreviewed document reached the target-hint cache: " + err
+    # Layout-only changes are the same normalised document, and are accepted.
+    schema_two(claims)
+    resolve()
+    registry.write_text(json.dumps(json.loads(registry.read_text()), indent=4))
+    resolve("--accept")
+    cleaned()
+    # A schema-1 document may not carry schema-2 claims.
+    registry.write_text(json.dumps({"schema_version": 1, "providers": [dict(pin, namespace="probe", targets=[])]}))
+    assert "UnknownField" in resolve(code=1).stderr
+    cleaned()
     print(f"GitHub provider pins: {checks} real CLI invocations passed")

@@ -62,6 +62,9 @@ pub fn main(init: std.process.Init) !u8 {
         .optimize = ctx.value.object.get("optimize").?,
         .progress = ctx.value.object.get("progress").?,
         .package_dir = ctx.value.object.get("package_dir").?,
+        // The whole context, so a suite can assert any key a wire version
+        // adds (`target_dir`, `run`) and that an older wire lacks it.
+        .context = ctx.value,
         .nanoseconds = std.Io.Timestamp.now(init.io, .awake).nanoseconds,
     }, .{});
     const log_path = try std.fs.path.join(a, &.{ output, "hooks.log" });

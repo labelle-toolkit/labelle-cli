@@ -256,6 +256,19 @@ pub const Site = struct {
     /// (contract §2 `build_number`), since a provider replacement packages
     /// the target instead of the core packager that would stamp it.
     build_number: ?[]const u8 = null,
+    /// The generated target directory (`.labelle/<backend>_<target>/`),
+    /// handed to every hook as contract §2 `target_dir` (wire `1.2.0`+):
+    /// a hook's `output_dir` may sit elsewhere (`bundle --output`), and a
+    /// packaging hook still needs the generated tree. Canonicalised (and
+    /// created) per phase, like the output directory.
+    target_dir: []const u8,
+    /// `labelle run`'s options, handed to the `run`-step hooks only as
+    /// contract §2 `run` (wire `1.2.0`+). The pipeline sets it for the
+    /// `run` command; any other command's `run` hooks (a `wasm serve`)
+    /// receive the empty set. The CLI passes the platform-neutral
+    /// `LABELLE_*` pairs and maps nothing: how they reach the game on a
+    /// provider's target is the provider's decision.
+    run_options: ?contract.RunContext = null,
     host: ?dispatch.Host = null,
     /// The tool launcher. A field only so the scratch-arena test below can
     /// observe which allocator a hook invocation receives without a host
@@ -288,6 +301,9 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     for (list, locks) |planned, *lock| lock.* = try dispatch.requirePinned(a, site.root, planned.provider.*);
     if (site.host == null) site.host = try site.resolve_host(site.a, site.root);
     const output = try dispatch.canonicalDir(a, output_dir);
+    const target_dir = try dispatch.canonicalDir(a, site.target_dir);
+    const no_run_options: contract.RunContext = .{ .env = &.{}, .args = &.{}, .timeout_ms = null };
+    const run_options: ?contract.RunContext = if (step == .run) site.run_options orelse no_run_options else null;
     for (list, locks) |planned, lock| {
         const provider = planned.provider.*;
         const settings = try dispatch.resolveSettings(a, site.root, site.cfg, site.providers, provider.meta.name);
@@ -305,6 +321,8 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
             .trailing = &.{},
             .cwd = site.root,
             .build_number = if (step == .bundle) site.build_number else null,
+            .target_dir = target_dir,
+            .run_options = run_options,
         });
         if (site.reporter) |r| r.clearSpinner();
         if (code != 0) {
@@ -314,6 +332,39 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
         }
     }
     return 0;
+}
+
+/// A `before` phase whose core step reports under the same progress phase
+/// with its own detail (`assembler generate`, `packaging bundle`). Each hook
+/// renames the live sub-step to `hook <package>/<id>`; once the phase
+/// succeeds the core step's `core_detail` is re-entered, so status and JSON
+/// consumers do not keep seeing the last hook "running" throughout the
+/// potentially long core operation (Codex P2 on #420). With no hooks nothing
+/// is emitted: the detail never changed.
+pub fn runBefore(site: *Site, list: []const Planned, step: contract.Step, output_dir: []const u8, core_detail: []const u8) !u8 {
+    const code = try runPhase(site, list, step, .before, output_dir);
+    if (code == 0 and list.len != 0) {
+        if (site.reporter) |r| r.beginPhaseOrStep(progressPhase(step), core_detail);
+    }
+    return code;
+}
+
+/// The end of an interactive serve session: the server returned (Ctrl+C /
+/// SIGTERM, the serve's clean end), and the `after run` hooks run now. The
+/// feed's `done` record landed BEFORE the loop, so a failing hook — a
+/// nonzero exit, or an error before it could run — revises that `done` to
+/// `failed` with the code the CLI exits with (`reviseDoneAsFailed`); plain
+/// `finishFailed` is absorbed by the terminal state and left the status file
+/// and the NDJSON stream reporting success (Codex P2 on #420).
+pub fn finishServe(site: *Site, after: []const Planned, output_dir: []const u8) !u8 {
+    const code = runPhase(site, after, .run, .after, output_dir) catch |err| {
+        if (site.reporter) |r| r.reviseDoneAsFailed(1, "hook failed");
+        return err;
+    };
+    if (code != 0) {
+        if (site.reporter) |r| r.reviseDoneAsFailed(code, "hook failed");
+    }
+    return code;
 }
 
 /// How the core `run` step ended. A status of 0 alone does not mean the
@@ -331,7 +382,8 @@ pub const RunOutcome = union(enum) {
     /// The watchdog killed the game at the `--timeout` deadline.
     timed_out,
     /// The launch returned while the app runs elsewhere (`simctl launch`,
-    /// `adb shell am start`): its exit is never observed.
+    /// or any launcher that hands the app to a device): its exit is never
+    /// observed.
     launched_detached,
 
     pub fn fromExit(code: u8) RunOutcome {
@@ -563,6 +615,7 @@ test "provider hooks: an unpinned provider is refused before the host compiler i
         .root = root,
         .cfg = .{ .name = "game" },
         .target = "desktop",
+        .target_dir = root,
         .optimize = .Debug,
         .progress = .off,
         .reporter = null,
@@ -710,6 +763,7 @@ test "provider hooks: each phase runs on a scratch arena that is freed on return
         .root = root,
         .cfg = .{ .name = "game" },
         .target = "desktop",
+        .target_dir = root,
         .optimize = .Debug,
         .progress = .off,
         .reporter = null,
@@ -739,6 +793,76 @@ test "provider hooks: each phase runs on a scratch arena that is freed on return
     try std.testing.expectEqual(@as(usize, 0), counting.live);
 }
 
+test "provider hooks: every hook gets the target dir; only run-step hooks get the run options" {
+    const io = @import("config.zig").globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "project");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/labelle.lock",
+        .data = ".{ .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../x\", .version = \"1.0.0\" } } }",
+    });
+    const Spy = struct {
+        var target_dir: [std.fs.max_path_bytes]u8 = undefined;
+        var target_dir_len: usize = 0;
+        var run_options: ?contract.RunContext = null;
+        var scene: [32]u8 = undefined;
+        var calls: usize = 0;
+        fn run(_: std.mem.Allocator, _: dispatch.Host, _: []const u8, _: dispatch.Provider, _: contract.Tool, tool_run: dispatch.ToolRun) anyerror!u8 {
+            calls += 1;
+            const dir = tool_run.target_dir.?;
+            @memcpy(target_dir[0..dir.len], dir);
+            target_dir_len = dir.len;
+            run_options = tool_run.run_options;
+            if (tool_run.run_options) |options| {
+                if (options.env.len != 0) @memcpy(scene[0..options.env[0].value.len], options.env[0].value);
+            }
+            return 0;
+        }
+    };
+    const provider = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .build, "desktop", .after, &.{})});
+    const planned: Planned = .{ .provider = &provider, .hook = provider.meta.hooks[0], .qualified = "pkg/h" };
+    // Not yet created: the phase creates and canonicalises it.
+    const target_dir = try std.fs.path.join(a, &.{ root, ".labelle", "probe_desktop" });
+    const env = [_]contract.RunEnv{.{ .name = "LABELLE_SCENE", .value = "intro" }};
+    var site: Site = .{
+        .a = a,
+        .backing = std.testing.allocator,
+        .providers = &.{provider},
+        .root = root,
+        .cfg = .{ .name = "game" },
+        .target = "desktop",
+        .target_dir = target_dir,
+        .run_options = .{ .env = &env, .args = &.{"a"}, .timeout_ms = null },
+        .optimize = .Debug,
+        .progress = .off,
+        .reporter = null,
+        .host = .{ .zig = "/z", .cache_root = root, .global_cache = root, .packages = root },
+        .run_tool = Spy.run,
+    };
+    const elsewhere = try std.fs.path.join(a, &.{ root, "elsewhere" });
+    for ([_]contract.Step{ .generate, .build, .bundle }) |step| {
+        try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, step, .after, elsewhere));
+        // The target dir, not the (different) output dir, and never the
+        // run options off the run step.
+        try std.testing.expectEqualStrings(target_dir, Spy.target_dir[0..Spy.target_dir_len]);
+        try std.testing.expect(Spy.run_options == null);
+    }
+    try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .run, .replace, elsewhere));
+    try std.testing.expectEqualStrings("intro", Spy.scene[0..5]);
+    try std.testing.expectEqual(@as(usize, 1), Spy.run_options.?.args.len);
+    // A run step with no options set (a `wasm serve`): the empty set, never
+    // an absent key, so a 1.2.0 run hook always finds it.
+    site.run_options = null;
+    try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .run, .before, elsewhere));
+    try std.testing.expect(Spy.run_options != null and !Spy.run_options.?.given());
+    try std.testing.expectEqual(@as(usize, 5), Spy.calls);
+}
+
 test "provider hooks: after-run hooks run only when the game itself exited clean" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -757,6 +881,7 @@ test "provider hooks: after-run hooks run only when the game itself exited clean
         .root = root,
         .cfg = .{ .name = "game" },
         .target = "desktop",
+        .target_dir = root,
         .optimize = .Debug,
         .progress = .off,
         .reporter = null,
@@ -774,4 +899,143 @@ test "provider hooks: after-run hooks run only when the game itself exited clean
     try std.testing.expectEqual(@as(u8, 7), try finishRun(&site, &.{planned}, out, .{ .exited_error = 7 }));
     // With no after hooks a clean exit is simply done.
     try std.testing.expectEqual(@as(u8, 0), try finishRun(&site, &.{}, out, .exited_clean));
+}
+
+/// A reporter over a fresh status directory, for the progress tests below.
+const TestFeed = struct {
+    tmp: std.testing.TmpDir,
+    dir: []const u8,
+    reporter: progress.Reporter,
+
+    fn init(self: *TestFeed, a: std.mem.Allocator) !void {
+        const io = @import("config.zig").globalIo();
+        self.tmp = std.testing.tmpDir(.{});
+        try self.tmp.dir.createDirPath(io, "project");
+        self.dir = try self.tmp.dir.realPathFileAlloc(io, "project", a);
+        const target_dir = try std.fs.path.join(a, &.{ self.dir, ".labelle", "probe_desktop" });
+        self.reporter = try progress.Reporter.init(a, io, .off, target_dir);
+        try self.tmp.dir.writeFile(io, .{
+            .sub_path = "project/labelle.lock",
+            .data = ".{ .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../x\", .version = \"1.0.0\" } } }",
+        });
+    }
+
+    fn deinit(self: *TestFeed) void {
+        self.reporter.deinit();
+        self.tmp.cleanup();
+    }
+
+    fn detail(self: *const TestFeed) []const u8 {
+        return self.reporter.detail_buf[0..self.reporter.detail_len];
+    }
+
+    fn site(self: *TestFeed, a: std.mem.Allocator, provider: *const dispatch.Provider, run_tool: @FieldType(Site, "run_tool")) Site {
+        return .{
+            .a = a,
+            .backing = std.testing.allocator,
+            .providers = provider[0..1],
+            .root = self.dir,
+            .cfg = .{ .name = "game" },
+            .target = "desktop",
+            .target_dir = self.dir,
+            .optimize = .Debug,
+            .progress = .off,
+            .reporter = &self.reporter,
+            .host = .{ .zig = "/z", .cache_root = self.dir, .global_cache = self.dir, .packages = self.dir },
+            .run_tool = run_tool,
+        };
+    }
+};
+
+test "provider hooks: a before phase hands the progress detail back to the core step" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var feed: TestFeed = undefined;
+    try feed.init(a);
+    defer feed.deinit();
+    const Spy = struct {
+        var seen: [progress.max_detail_len]u8 = undefined;
+        var seen_len: usize = 0;
+        var reporter: ?*progress.Reporter = null;
+        fn run(_: std.mem.Allocator, _: dispatch.Host, _: []const u8, _: dispatch.Provider, _: contract.Tool, _: dispatch.ToolRun) anyerror!u8 {
+            const r = reporter.?;
+            seen_len = r.detail_len;
+            @memcpy(seen[0..seen_len], r.detail_buf[0..seen_len]);
+            return 0;
+        }
+    };
+    Spy.reporter = &feed.reporter;
+    const provider = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .generate, "desktop", .before, &.{})});
+    const planned: Planned = .{ .provider = &provider, .hook = provider.meta.hooks[0], .qualified = "pkg/h" };
+    var site = feed.site(a, &provider, Spy.run);
+    feed.reporter.beginPhase(.generate, "assembler generate");
+    try std.testing.expectEqual(@as(u8, 0), try runBefore(&site, &.{planned}, .generate, feed.dir, "assembler generate"));
+    // While the hook ran, the feed named it...
+    try std.testing.expectEqualStrings("hook pkg/h", Spy.seen[0..Spy.seen_len]);
+    // ...and once the phase is over the core step is what is reported.
+    try std.testing.expectEqualStrings("assembler generate", feed.detail());
+    try std.testing.expectEqual(progress.Phase.generate, feed.reporter.machine.current.?);
+    // The plain phase runner leaves the hook's detail behind: the
+    // restoration above is `runBefore`'s doing.
+    try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .generate, .before, feed.dir));
+    try std.testing.expectEqualStrings("hook pkg/h", feed.detail());
+    // A bundle's before hooks report under `run` and hand it back likewise.
+    feed.reporter.beginPhaseOrStep(.run, "packaging bundle");
+    try std.testing.expectEqual(@as(u8, 0), try runBefore(&site, &.{planned}, .bundle, feed.dir, "packaging bundle"));
+    try std.testing.expectEqualStrings("packaging bundle", feed.detail());
+    feed.reporter.finishDone(0);
+}
+
+test "provider hooks: a failing after hook at the serve's end revises the provisional done" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var feed: TestFeed = undefined;
+    try feed.init(a);
+    defer feed.deinit();
+    const Spy = struct {
+        var code: u8 = 0;
+        fn run(_: std.mem.Allocator, _: dispatch.Host, _: []const u8, _: dispatch.Provider, _: contract.Tool, _: dispatch.ToolRun) anyerror!u8 {
+            return code;
+        }
+    };
+    const provider = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .run, "probe-target", .after, &.{})});
+    const planned: Planned = .{ .provider = &provider, .hook = provider.meta.hooks[0], .qualified = "pkg/h" };
+    var site = feed.site(a, &provider, Spy.run);
+    // The serve reported `done` before its loop; a passing hook keeps it.
+    feed.reporter.beginPhase(.run, "serving");
+    feed.reporter.finishDone(0);
+    Spy.code = 0;
+    try std.testing.expectEqual(@as(u8, 0), try finishServe(&site, &.{planned}, feed.dir));
+    try std.testing.expectEqual(progress.Phase.done, feed.reporter.machine.current.?);
+    // A failing hook: the CLI exits with its code, and the feed says so.
+    Spy.code = 5;
+    try std.testing.expectEqual(@as(u8, 5), try finishServe(&site, &.{planned}, feed.dir));
+    try std.testing.expectEqual(progress.Phase.failed, feed.reporter.machine.current.?);
+    try std.testing.expectEqual(@as(u8, 5), feed.reporter.exit_code.?);
+}
+
+test "provider hooks: a serve hook that cannot start also revises the provisional done" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var feed: TestFeed = undefined;
+    try feed.init(a);
+    defer feed.deinit();
+    const Never = struct {
+        fn run(_: std.mem.Allocator, _: dispatch.Host, _: []const u8, _: dispatch.Provider, _: contract.Tool, _: dispatch.ToolRun) anyerror!u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    // A provider the lock does not name: refused before any tool runs.
+    var provider = Fixture.provider("pkg", &.{}, &.{Fixture.hook("h", .run, "probe-target", .after, &.{})});
+    provider.dep.version = "2.0.0";
+    const planned: Planned = .{ .provider = &provider, .hook = provider.meta.hooks[0], .qualified = "pkg/h" };
+    var site = feed.site(a, &provider, Never.run);
+    feed.reporter.beginPhase(.run, "serving");
+    feed.reporter.finishDone(0);
+    try std.testing.expectError(error.StaleProviderPin, finishServe(&site, &.{planned}, feed.dir));
+    try std.testing.expectEqual(progress.Phase.failed, feed.reporter.machine.current.?);
+    try std.testing.expectEqual(@as(u8, 1), feed.reporter.exit_code.?);
 }
