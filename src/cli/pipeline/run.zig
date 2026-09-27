@@ -62,7 +62,7 @@ pub fn serveNoBuild(
         std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
         return 1;
     };
-    const served = switch (try confirmTarget(hook_arena, known, requested_target)) {
+    const served = switch (try confirmTarget(hook_arena, project_root, known, requested_target)) {
         .resolved => |resolved| resolved,
         .refused => return 1,
     };

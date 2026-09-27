@@ -58,18 +58,28 @@ one target, in two halves, before anything is generated, locked or built:
    CLI knows. They come from a best-effort lookup made only on this failure
    path (`provider_github/registry_lookup.zig`):
 
-   - **Live registry first.** One download of the registry document
-     (`curl`, 3 s connect / 5 s total), parsed and queried by target; the
-     version is the newest release listed for the owner (semver order). This
-     is registry metadata only ([contract §4](provider-contract-v1.md)):
-     nothing is pinned, cached, extracted or run, and the result is a
-     suggestion the user still adds, resolves and accepts. The download is
-     never written to the registry cache, which keeps holding only the
-     document an accepted preview bound.
-   - **Then the cached registry**, the one the last `labelle providers
-     resolve --accept` was resolved against (the normalised document its
-     preview bound and the user reviewed, [pins](provider-github-pins.md)),
-     when the live lookup is skipped, fails, or finds no owner.
+   - **The source this project accepted from.** Every `providers resolve
+     --accept` records its registry source (an https URL, or the absolute
+     path of a local `providers.json`) and the normalised document it bound
+     in `.labelle/providers.registry.json`. When that source is not the
+     public registry, the lookup asks it — a fresh download of the URL, or a
+     read of the file — and falls back to the recorded copy; the public
+     registry is never fetched, since it may assign the target differently.
+     The hint names that source.
+   - **Otherwise the public registry, live first.** One download of the
+     registry document (`curl`, 3 s connect / 5 s total), parsed and queried
+     by target. This is registry metadata only
+     ([contract §4](provider-contract-v1.md)): nothing is pinned, cached,
+     extracted or run, and the result is a suggestion the user still adds,
+     resolves and accepts. The download is never written to the registry
+     cache, which keeps holding only the document an accepted preview bound.
+   - **Then the accepted public document**: the project's recorded copy, or
+     without one the cached registry the last `labelle providers resolve
+     --accept` of any project bound (the normalised document its preview
+     bound and the user reviewed, [pins](provider-github-pins.md)).
+   - **The release suggested** is the owner's newest release whose own
+     record declares the target (the ownership table is the union of a
+     package's releases, so the newest release may have dropped it).
    - **`LABELLE_OFFLINE=1`** (any value but empty or `0`) skips the
      download; the cache is still read.
    - **A miss** prints the same steps with a placeholder `.plugins` entry and
@@ -257,10 +267,11 @@ Unit tests (`zig build test-provider-dispatch`, also collected by `zig build
 test`) cover `provider_targets.resolve` (core with no providers, a provider
 target, an undeclared target, an unpinned remote owner, the schema-name
 mapping through a provider only, the diagnostic's steps on a registry hit
-and on each kind of miss), `registry_lookup.lookupOwner` (live hit with the
-newest release by semver, not listed, unreachable, unparseable, offline with
-no fetch, and the cached-registry fallback, each asserting whether the
-fetcher ran), `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
+and on each kind of miss), `registry_lookup.lookupOwner` (live hit naming the newest release that
+still declares the target, not listed, unreachable, unparseable, offline with
+no fetch, the cached fallback, and a project accepted from a local file or a
+fork URL answered by that source with no public fetch, each asserting which
+URLs the fetcher was asked for), `Registry.latestDeclaring`, `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
 archive cached; for schema 1, a hint only from a verified cached archive,
 and the bounded scan), `provider_github.cachedRegistryNamespaceOwner`
 (schema 2 only), the `NoRunReplacement` decision table

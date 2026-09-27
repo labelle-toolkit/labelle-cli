@@ -163,6 +163,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     cacheRegistry(a, reviewed) catch |err| {
         std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
     };
+    // Which source this project accepted from, with the same reviewed
+    // document: the no-provider diagnostic asks that source, not the public
+    // registry, when it is a custom or local one. Best effort, like the cache.
+    registry_lookup.recordAccepted(a, root, source, reviewed) catch |err| {
+        std.debug.print("labelle: warning: could not record the accepted registry source: {s}\n", .{@errorName(err)});
+    };
 }
 
 test "provider github: accept is bound to the whole registry document, not only the selected pins" {

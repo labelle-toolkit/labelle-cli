@@ -303,11 +303,13 @@ labelle: no provider for target 'android' in this project; add and pin the packa
                                             # fresh clones and CI run `labelle providers fetch`)
 ```
 
-The lookup reads registry metadata only (nothing is pinned, cached or run),
-gives up after a few seconds, and is skipped when `LABELLE_OFFLINE=1` is set;
-then, or when the registry cannot be reached, the steps are generic and say
-why, and the last registry you accepted is used if it names the owner. The
-failure itself is the same either way.
+The lookup reads registry metadata only (nothing is pinned, cached or run)
+and gives up after a few seconds. A project that last accepted from its own
+`providers.json` (a fork URL or a local file) is answered by that source,
+never the public registry. `LABELLE_OFFLINE=1` skips any download; then, or
+when no registry can be read, the last accepted copy is used if it names the
+owner, and otherwise the steps are generic and say why. The failure itself is
+the same either way.
 
 **`target 'android' is declared by remote package 'android', which is unpinned`.**
 The package is in `.plugins` but not in `labelle.providers.lock`: run

@@ -293,6 +293,47 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     assert "no provider for target 'other-target'" in err and "(registry: other)" in err, err
     err = run("build", "--platform=unknown-target", code=1).stderr
     assert "no provider for target 'unknown-target'" in err and "(registry:" not in err, err
+    # The project accepted from a LOCAL providers.json, so the no-provider
+    # lookup asks that file (named in the hint), never the public registry,
+    # even online. A stand-in `curl` that would serve a public document
+    # assigning `other-target` elsewhere logs any request. POSIX only.
+    accepted_record = json.loads((project / ".labelle/providers.registry.json").read_text())
+    assert accepted_record["source"] == str(registry.resolve()), accepted_record
+    if os.name != "nt":
+        public_shim = base / "public-shim"
+        public_shim.mkdir()
+        public_log = base / "public-requests.log"
+        public_doc = base / "public-providers.json"
+        public_doc.write_text(json.dumps({"schema_version": 2, "defaults": [], "providers": [
+            dict(other, package="public-owner", repo="example/public-owner", namespace=None, targets=["other-target"])]}))
+        (public_shim / "curl").write_text(f"""#!{sys.executable}
+import sys
+open({str(public_log)!r}, "a").write(sys.argv[-1] + "\\n")
+sys.stdout.write(open({str(public_doc)!r}).read())
+""")
+        (public_shim / "curl").chmod(0o755)
+        online = {"LABELLE_OFFLINE": "", "PATH": str(public_shim) + os.pathsep + env.get("PATH", "")}
+        saved = dict(env)
+        env.update(online)
+        try:
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "(registry: other)" in err and "public-owner" not in err, err
+            assert f"the registry this project last accepted from, {registry.resolve()}, lists package 'other' 1.0.0" in err, err
+            assert '.{ .name = "other", .repo = "github.com/example/other", .version = "1.0.0" },' in err, err
+            # The custom source changes: the fresh read answers, not the recorded copy.
+            schema_two([(pin, "probe", []), (dict(other, version="1.1.0"), None, ["other-target"])])
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "lists package 'other' 1.1.0" in err, err
+            assert not public_log.exists(), public_log.read_text()
+            # Control: without the project's record the public registry IS asked.
+            (project / ".labelle/providers.registry.json").rename(base / "accepted-record.json")
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "(registry: public-owner)" in err and public_log.read_text().count("\n") == 1, err
+            (base / "accepted-record.json").rename(project / ".labelle/providers.registry.json")
+            schema_two([(pin, "probe", []), (other, None, ["other-target"])])
+        finally:
+            env.clear()
+            env.update(saved)
     # The preview binds the whole registry document (#433), not just the
     # selected pins: each change below leaves the fixture pin intact, and each
     # is refused by name with the lock untouched.

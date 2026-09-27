@@ -187,7 +187,7 @@ pub fn discoverAndPlan(
     // target becomes a resolved one; nothing has been generated, locked or
     // compiled yet, and the `failed` progress record names the reason —
     // which of the two refusals it was, since each calls for a different fix.
-    const target = switch (try confirmTarget(hook_arena, providers, requested_target)) {
+    const target = switch (try confirmTarget(hook_arena, project_root, providers, requested_target)) {
         .resolved => |resolved| resolved,
         .refused => |why| {
             if (reporter) |r| r.finishFailed(1, why.detail());

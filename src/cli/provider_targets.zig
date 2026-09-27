@@ -114,21 +114,32 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
     switch (lookup) {
         .hit => |hint| {
             try w.print("  (registry: {s})\n", .{hint.package});
-            const from: []const u8 = switch (hint.source) {
-                .online => "the provider registry",
-                .cache => "the cached provider registry (last `providers resolve --accept`)",
-            };
-            try w.print("  {s} lists package '{s}' {s} as the provider of target '{s}'. To use it:\n", .{ from, hint.package, hint.version, target });
+            switch (hint.source) {
+                .online => try w.writeAll("  the provider registry"),
+                .cache => try w.writeAll("  the cached provider registry (last `providers resolve --accept`)"),
+                .accepted_source => try w.print("  the registry this project last accepted from, {s},", .{hint.registry.?}),
+                .accepted_copy => try w.print("  the recorded copy of the registry this project last accepted from, {s},", .{hint.registry.?}),
+            }
+            try w.print(" lists package '{s}' {s} as the provider of target '{s}'. To use it:\n", .{ hint.package, hint.version, target });
             try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, hint.version });
         },
         .miss => |why| {
-            const reason: []const u8 = switch (why) {
-                .offline => "registry not consulted: " ++ github.registry_offline_env ++ " is set",
-                .unreachable_registry => "the provider registry could not be read",
-                .not_listed => "the provider registry lists no package for this target",
-            };
-            try w.print("  ({s})\n  To add one:\n", .{reason});
-            try w.print("    1. add the package that declares target '{s}' to .plugins in project.labelle\n       (the registry lists each package's targets: {s}):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ target, github.registry_url });
+            if (why.registry) |from| {
+                switch (why.reason) {
+                    .offline => try w.print("  (the registry this project last accepted from, {s}, was not consulted: " ++ github.registry_offline_env ++ " is set)\n", .{from}),
+                    .unreachable_registry => try w.print("  (the registry this project last accepted from, {s}, could not be read)\n", .{from}),
+                    .not_listed => try w.print("  (the registry this project last accepted from, {s}, lists no package for this target)\n", .{from}),
+                }
+            } else {
+                const reason: []const u8 = switch (why.reason) {
+                    .offline => "registry not consulted: " ++ github.registry_offline_env ++ " is set",
+                    .unreachable_registry => "the provider registry could not be read",
+                    .not_listed => "the provider registry lists no package for this target",
+                };
+                try w.print("  ({s})\n", .{reason});
+            }
+            try w.writeAll("  To add one:\n");
+            try w.print("    1. add the package that declares target '{s}' to .plugins in project.labelle\n       (the registry lists each package's targets: {s}):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ target, why.registry orelse github.registry_url });
         },
     }
     try w.writeAll("    2. labelle providers resolve            # preview the pin\n");
@@ -138,12 +149,13 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
     return out.toOwnedSlice();
 }
 
-/// Print the no-provider diagnostic. The registry lookup is best-effort
-/// metadata (a short-timeout download, skipped under `LABELLE_OFFLINE`, then
-/// the cached document): nothing is pinned or run, and a failed lookup only
-/// makes the steps generic.
-pub fn reportNoProvider(a: std.mem.Allocator, target: []const u8) void {
-    const lookup = github.lookupRegistryOwner(a, target);
+/// Print the no-provider diagnostic for the project at `root`. The registry
+/// lookup is best-effort metadata (the source the project last accepted from
+/// when that is a custom one, else the public registry; a short-timeout
+/// download skipped under `LABELLE_OFFLINE`, then the accepted copy):
+/// nothing is pinned or run, and a failed lookup only makes the steps generic.
+pub fn reportNoProvider(a: std.mem.Allocator, root: ?[]const u8, target: []const u8) void {
+    const lookup = github.lookupRegistryOwner(a, root, target);
     const text = noProviderDiagnostic(a, target, lookup) catch return;
     std.debug.print("{s}", .{text});
 }
@@ -301,15 +313,21 @@ test "provider targets: the no-provider diagnostic names the registry owner on a
     for (steps) |step| try std.testing.expect(std.mem.indexOf(u8, hit, step) != null);
     const cached = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.0.0", .source = .cache } });
     try std.testing.expect(std.mem.indexOf(u8, cached, "the cached provider registry") != null);
+    // A custom source the project accepted from is named, on a hit and a miss.
+    const custom = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "2.0.0", .source = .accepted_source, .registry = "/abs/providers.json" } });
+    try std.testing.expect(std.mem.indexOf(u8, custom, "the registry this project last accepted from, /abs/providers.json, lists package 'fixture' 2.0.0") != null);
+    const custom_miss = try noProviderDiagnostic(a, "probe-target", .{ .miss = .{ .reason = .not_listed, .registry = "/abs/providers.json" } });
+    try std.testing.expect(std.mem.indexOf(u8, custom_miss, "(the registry this project last accepted from, /abs/providers.json, lists no package for this target)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, custom_miss, "(the registry lists each package's targets: /abs/providers.json)") != null);
     // Every miss: the same head and steps, the placeholder entry, no owner,
     // and the reason that says which path ran.
-    const reasons = [_]struct { github.RegistryMiss, []const u8 }{
+    const reasons = [_]struct { github.RegistryMissReason, []const u8 }{
         .{ .offline, "registry not consulted: LABELLE_OFFLINE is set" },
         .{ .unreachable_registry, "the provider registry could not be read" },
         .{ .not_listed, "the provider registry lists no package for this target" },
     };
     for (reasons) |case| {
-        const text = try noProviderDiagnostic(a, "probe-target", .{ .miss = case[0] });
+        const text = try noProviderDiagnostic(a, "probe-target", .{ .miss = .{ .reason = case[0] } });
         try std.testing.expect(std.mem.startsWith(u8, text, head));
         try std.testing.expect(std.mem.indexOf(u8, text, "(registry:") == null);
         try std.testing.expect(std.mem.indexOf(u8, text, case[1]) != null);
