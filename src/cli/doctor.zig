@@ -29,6 +29,7 @@ const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const emsdk_cache = @import("emsdk_cache.zig");
 const python_provision = @import("python_provision.zig");
 const provider_doctor = @import("provider_doctor.zig");
+const provider_dispatch = @import("provider_dispatch.zig");
 
 const Check = struct {
     name: []const u8,
@@ -165,8 +166,12 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         }
     }
 
+    // One project root for both halves: the core checks (config, backend,
+    // Zig/emsdk versions) and the provider doctors read the same project.
+    const scope = resolveScope(arena, project_dir);
+
     // Best-effort read of project.labelle to scope what's actually required.
-    const cfg = readProjectConfig(arena, project_dir);
+    const cfg = readProjectConfig(arena, scope.dir);
     const effective_backend = cfg.backend orelse project_config.default_backend;
 
     const needs_sdl_render = effective_backend == .sdl;
@@ -188,9 +193,9 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     };
     const needs_sdl = needs_sdl_render or needs_sdl_gamepad;
 
-    const zig_check = checkZig(arena, project_dir);
+    const zig_check = checkZig(arena, scope.dir);
     const python_check = checkPython(arena);
-    const emsdk_check = checkEmsdk(arena, project_dir);
+    const emsdk_check = checkEmsdk(arena, scope.dir);
 
     // `--json`: emit the studio's capability report from the toolchain
     // checks and stop — no human report, no SDL provisioning. The wasm
@@ -242,7 +247,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         \\  backend: {s}   gamepad: {s}
         \\
         \\
-    , .{ project_dir, backend_label, gamepad_label });
+    , .{ scope.dir, backend_label, gamepad_label });
 
     if (!needs_sdl) {
         std.debug.print("  This backend needs no manual system libraries — everything is fetched + built by Zig.\n", .{});
@@ -275,12 +280,37 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     // The pinned providers' doctors, after the core checks and whatever they
     // found: a core failure does not hide a provider's report, and one
     // provider failing does not stop the next.
-    const providers = if (core_only) null else try provider_doctor.runForProject(arena, project_dir);
+    const providers: ?provider_doctor.Report = if (core_only) null else if (scope.root) |root|
+        try provider_doctor.runForRoot(arena, root)
+    else blk: {
+        provider_doctor.printOutsideProject(project_dir);
+        break :blk null;
+    };
     std.debug.print("\n", .{});
     const code = provider_doctor.exitCode(failures == 0, providers);
     // Clean non-zero exit (scriptable) without a Zig error-return trace —
     // this is a user-facing diagnostic, not an internal failure.
     if (code != 0) std.process.exit(code);
+}
+
+// ── Project scope ───────────────────────────────────────────────────────
+
+const Scope = struct {
+    /// The directory every check reads: the project root, or the given
+    /// directory outside a project.
+    dir: []const u8,
+    /// The canonical project root, null outside a project.
+    root: ?[]const u8,
+};
+
+/// The nearest project at or above `start`, found the way the provider
+/// commands find it (`provider_dispatch.projectRootFrom`), so `labelle
+/// doctor` run from a project's subdirectory checks that project in full.
+/// Outside a project (or when `start` cannot be resolved) the core checks
+/// read `start` as before and there is no provider part.
+fn resolveScope(arena: std.mem.Allocator, start: []const u8) Scope {
+    const root = provider_dispatch.projectRootFrom(arena, start) catch null;
+    return .{ .dir = root orelse start, .root = root };
 }
 
 // ── Project config (textual, dependency-free) ───────────────────────────
@@ -545,6 +575,39 @@ fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "doctor: run from a project subdirectory, both halves use the project root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/src/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/project.labelle", .data = ".{ .name = \"x\", .backend = .sokol, .zig_version = \"0.16.0\" }" });
+    const root = try tmp.dir.realPathFileAlloc(io, "game", a);
+    const nested = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "game", "src", "deep" });
+    const scope = resolveScope(a, nested);
+    // The walked-up root, not the subdirectory, for the core checks too ...
+    try std.testing.expectEqualStrings(root, scope.dir);
+    try std.testing.expectEqualStrings(root, scope.root.?);
+    // ... so they see the project's own settings.
+    const cfg = readProjectConfig(a, scope.dir);
+    try std.testing.expect(cfg.found);
+    try std.testing.expectEqual(@as(?project_config.Backend, .sokol), cfg.backend);
+    // The Zig version comes from the project's own pin, not the default.
+    const zig = try zig_toolchain.resolveRequiredVersion(a, scope.dir);
+    try std.testing.expectEqual(.project_pin, zig.source);
+    try std.testing.expectEqual(.default, (try zig_toolchain.resolveRequiredVersion(a, nested)).source);
+    // The subdirectory alone has no project.labelle: reading it would have
+    // fallen back to the defaults.
+    try std.testing.expect(!readProjectConfig(a, nested).found);
+    // Outside a project: the given directory, no provider part.
+    try tmp.dir.createDirPath(io, "loose");
+    const loose = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "loose" });
+    const outside = resolveScope(a, loose);
+    if (outside.root == null) try std.testing.expectEqualStrings(loose, outside.dir);
+}
 
 test "doctor: a project.labelle without .backend is checked as the default backend" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

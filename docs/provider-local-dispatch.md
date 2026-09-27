@@ -75,8 +75,12 @@ provider must treat its context as read-only. Its exit status is preserved.
 
 ## `labelle doctor` runs the providers' doctors
 
-`labelle doctor [dir]` runs the core checks first, as before. Then, when `dir`
-(default: the current directory) is inside a project, it runs the `doctor`
+`labelle doctor [dir]` resolves the project root once, the way provider
+commands do: the nearest `project.labelle` at or above `dir` (default: the
+current directory). The core checks (backend, gamepad, Zig and emsdk
+versions) and the provider doctors both read that root, so running it from a
+project's subdirectory checks that project in full. It runs the core checks
+first, as before. Then, inside a project, it runs the `doctor`
 command of every pinned provider whose manifest declares a command named
 exactly `doctor`, sorted by namespace, whatever their order in `.plugins`.
 Each goes through the same path as `labelle <namespace> doctor`
@@ -96,6 +100,13 @@ declare no `doctor` command.
   A `provider_config` entry naming a package the doctor could not read is set
   aside while resolving the other providers' settings, so one unreadable
   package does not fail every provider's doctor.
+- A declared remote package with no integrity pin is a failed check with the
+  `labelle providers resolve` hint, and its code is never run. The report is
+  the same whether the ordinary package cache holds the package or not: an
+  uncached one cannot be told apart from a provider, so it fails closed. A
+  runtime-only package needs no pin; once it is in the package cache
+  (`labelle install`) its manifest shows it is no provider and the check
+  clears. A stale pin gets the same `providers resolve` hint.
 - Outside a project only the core checks run, followed by one line saying that
   provider doctors run inside a project. Projectless provider commands are a
   later phase (decision D8).
