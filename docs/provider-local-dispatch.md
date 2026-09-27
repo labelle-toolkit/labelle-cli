@@ -97,9 +97,21 @@ declare no `doctor` command.
 - A pinned provider whose archive is not cached, or does not match its pin,
   is a failed check with the `labelle providers fetch` hint. The doctor never
   downloads ([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock)).
-  A `provider_config` entry naming a package the doctor could not read is set
-  aside while resolving the other providers' settings, so one unreadable
-  package does not fail every provider's doctor.
+- One package never fails the others. A pinned or local provider whose
+  manifest cannot be read, parsed or matched to its name is a failed check of
+  its own. An unpinned package's manifest is read only to tell a runtime-only
+  package from a provider; if it is unreadable or malformed, the package is
+  reported as unverified (below), the same as when it is not cached at all.
+- Settings are resolved per provider: each provider's doctor opens only its
+  own `provider_config` file, so a missing or invalid settings file fails
+  that provider alone. The project-wide mapping (every entry names a
+  resolved, verified provider) is checked once and, if broken, reported once
+  as a failed `provider_config` check; the doctors still run. Entries naming
+  a package the doctor could not read or verify are left out of that check,
+  since the package already has a failed check of its own. Duplicate or
+  undeclared entries and malformed paths are refused when `project.labelle`
+  is read, which fails the provider part as a whole. `labelle <ns> <cmd>`
+  and hooks keep validating every settings file before they run.
 - A declared remote package with no integrity pin is a failed check with the
   `labelle providers resolve` hint, and its code is never run. The report is
   the same whether the ordinary package cache holds the package or not: an

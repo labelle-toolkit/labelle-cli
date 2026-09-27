@@ -63,10 +63,10 @@ pub const Plan = struct {
 /// with a namespace and a command named exactly `doctor`, plus a failed check
 /// for every declared package that cannot be verified: a pinned one whose
 /// source could not be obtained (`unavailable`), and a remote one with no
-/// integrity pin, cached (`providers[i].verified == false`) or not
-/// (`unresolved`, minus the `unavailable` ones). Sorted by label; declaration
-/// order in `project.labelle` does not matter.
-pub fn plan(a: std.mem.Allocator, providers: []const dispatch.Provider, unavailable: []const dispatch.Unavailable, unresolved: []const []const u8) !Plan {
+/// integrity pin, cached (`unverified`, or `providers[i].verified == false`)
+/// or not (`unresolved`, minus the `unavailable` ones). Sorted by label;
+/// declaration order in `project.labelle` does not matter.
+pub fn plan(a: std.mem.Allocator, providers: []const dispatch.Provider, unavailable: []const dispatch.Unavailable, unresolved: []const []const u8, unverified: []const []const u8) !Plan {
     var steps: std.ArrayList(Step) = .empty;
     var skipped: std.ArrayList([]const u8) = .empty;
     for (providers, 0..) |provider, index| {
@@ -88,6 +88,9 @@ pub fn plan(a: std.mem.Allocator, providers: []const dispatch.Provider, unavaila
     }
     for (unavailable) |entry| {
         try steps.append(a, .{ .label = entry.package, .package = entry.package, .action = .{ .unavailable = entry.err } });
+    }
+    for (unverified) |name| {
+        try steps.append(a, .{ .label = name, .package = name, .action = .{ .unverified = .cached } });
     }
     unread: for (unresolved) |name| {
         for (unavailable) |entry| if (std.mem.eql(u8, entry.package, name)) continue :unread;
@@ -240,7 +243,9 @@ const DispatchRunner = struct {
 
     pub fn run(self: DispatchRunner, step: Step) anyerror!u8 {
         const action = step.action.run;
-        return dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, &.{});
+        // `.selected`: only this provider's settings file is opened, so a
+        // bad file of another provider fails that provider alone.
+        return dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, &.{}, .selected);
     }
 };
 
@@ -266,17 +271,28 @@ pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8) !Report {
         outcomes[0] = .{ .label = "provider discovery", .package = "", .code = null, .err = err };
         return .{ .outcomes = outcomes };
     };
-    const p = try plan(a, discovered.survey.providers, discovered.survey.unavailable, discovered.survey.unresolved);
-    if (p.steps.len == 0 and p.skipped.len == 0) {
+    const survey = discovered.survey;
+    const p = try plan(a, survey.providers, survey.unavailable, survey.unresolved, survey.unverified);
+    // The project-wide settings mapping is checked once and reported once;
+    // each provider then opens only its own settings file, so neither a bad
+    // mapping nor another provider's bad file stops a provider's doctor.
+    const mapping: ?Outcome = if (dispatch.checkSettingsMapping(discovered.cfg, survey.providers)) |_| null else |err| blk: {
+        std.debug.print("\nprovider_config\n", .{});
+        std.debug.print("------------------------------------------------------------\n", .{});
+        std.debug.print("  [ FAIL ] provider_config mapping: {s}\n", .{@errorName(err)});
+        break :blk .{ .label = "provider_config", .package = "", .code = null, .err = err };
+    };
+    if (p.steps.len == 0 and p.skipped.len == 0 and mapping == null) {
         std.debug.print("  No providers declared in this project.\n", .{});
         return .{ .outcomes = &.{} };
     }
-    const report = try execute(a, p, DispatchRunner{
+    var report = try execute(a, p, DispatchRunner{
         .a = a,
         .root = root,
         .cfg = discovered.cfg,
-        .providers = discovered.survey.providers,
+        .providers = survey.providers,
     });
+    if (mapping) |outcome| report.outcomes = try std.mem.concat(a, Outcome, &.{ &.{outcome}, report.outcomes });
     printSummary(report);
     return report;
 }
@@ -292,7 +308,7 @@ fn discover(a: std.mem.Allocator, root: []const u8, sources: *github.Sources) !D
     // resolved, verified provider).
     var entries: std.ArrayList(@import("provider_settings.zig").Entry) = .empty;
     for (cfg.provider_config) |entry| {
-        if (named(found.unresolved, entry.package)) continue;
+        if (named(found.unresolved, entry.package) or named(found.unverified, entry.package)) continue;
         var unverified = false;
         for (found.providers) |provider| {
             if (!provider.verified and std.mem.eql(u8, provider.meta.name, entry.package)) unverified = true;
@@ -356,7 +372,7 @@ test "provider doctor: selects providers declaring `doctor`, by namespace, skipp
         fake("hooks-only", null, &.{}),
         fake("mid-pkg", "mid", &.{cmd("doctor", "bin/mid-doctor")}),
     };
-    const p = try plan(a, &providers, &.{}, &.{});
+    const p = try plan(a, &providers, &.{}, &.{}, &.{});
     try testing.expectEqual(@as(usize, 3), p.steps.len);
     const expected = [_][3][]const u8{
         .{ "alpha", "alpha-pkg", "bin/alpha-doctor" },
@@ -385,7 +401,7 @@ test "provider doctor: one failure still runs the others, in order, and fails th
         fake("b-pkg", "beta", &.{cmd("doctor", "bin/b")}),
         fake("a-pkg", "alpha", &.{cmd("doctor", "bin/a")}),
     };
-    const p = try plan(a, &providers, &.{}, &.{});
+    const p = try plan(a, &providers, &.{}, &.{}, &.{});
     var calls: std.ArrayList([]const u8) = .empty;
     // The first one exits non-zero and the second cannot even be built: the
     // third still runs.
@@ -424,7 +440,7 @@ test "provider doctor: an unavailable provider is a failed check that runs nothi
         fake("able", "able", &.{cmd("doctor", "bin/able")}),
     };
     const unavailable = [_]dispatch.Unavailable{.{ .package = "missing", .err = error.ProviderArchiveMissing }};
-    const p = try plan(a, &providers, &unavailable, &.{"missing"});
+    const p = try plan(a, &providers, &unavailable, &.{"missing"}, &.{});
     try testing.expectEqual(@as(usize, 3), p.steps.len);
     try testing.expectEqualStrings("missing", p.steps[1].label);
     try testing.expectEqual(@as(anyerror, error.ProviderArchiveMissing), p.steps[1].action.unavailable);
@@ -447,10 +463,14 @@ test "provider doctor: an unpinned remote package fails the same way cached or n
     var unpinned = fake("remote", "remote-ns", &.{cmd("doctor", "bin/remote")});
     unpinned.verified = false;
     const pinned = fake("local", "local-ns", &.{cmd("doctor", "bin/local")});
-    // Warm: the ordinary cache holds its (unverified) manifest.
-    const warm = try plan(a, &.{ unpinned, pinned }, &.{}, &.{});
+    // Warm: the ordinary cache holds its (unverified) manifest; `survey`
+    // reports it in `unverified` and never as a provider.
+    const warm = try plan(a, &.{pinned}, &.{}, &.{}, &.{"remote"});
+    // A discovery that did list it as an unverified provider plans the same.
+    const listed = try plan(a, &.{ unpinned, pinned }, &.{}, &.{}, &.{});
+    try testing.expectEqual(Unverified.cached, listed.steps[1].action.unverified);
     // Cold: nothing to read, only the declaration.
-    const cold = try plan(a, &.{pinned}, &.{}, &.{"remote"});
+    const cold = try plan(a, &.{pinned}, &.{}, &.{"remote"}, &.{});
     var outcomes: [2]Outcome = undefined;
     for ([_]Plan{ warm, cold }, [_]Unverified{ .cached, .uncached }, 0..) |p, path, i| {
         try testing.expectEqual(@as(usize, 2), p.steps.len);
@@ -472,4 +492,57 @@ test "provider doctor: an unpinned remote package fails the same way cached or n
     try testing.expectEqual(outcomes[0].code, outcomes[1].code);
     try testing.expectEqual(outcomes[0].err, outcomes[1].err);
     try testing.expectEqual(@as(?anyerror, error.RemoteProviderIntegrityRequired), outcomes[0].err);
+}
+
+test "provider doctor: a malformed manifest fails only its own package, cold or warm, and the others run" {
+    const asm_cache = @import("asm_cache.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    for ([_][]const u8{ "project", "pkg-ok", "pkg-bad" }) |dir| try tmp.dir.createDirPath(io, dir);
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    asm_cache.setCacheRootOverride(try tmp.dir.realPathFileAlloc(io, ".", a));
+    defer asm_cache.clearCacheRootOverride();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-ok/plugin.labelle", .data = ".{ .name = \"pkg-ok\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"ok\", .commands = .{ .{ .name = \"doctor\", .build_step = \"t\", .executable = \"bin/ok\", .help = \"h\" } } }" });
+    // A verified (local) provider with a malformed manifest.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-bad/plugin.labelle", .data = ".{ .name = \"pkg-bad\", .manifest_version = 2, .command_contract = " });
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "rem", .repo = "example/rem", .version = "1.0.0" },
+        .{ .name = "pkg-bad", .repo = "local:../pkg-bad", .version = "1.0.0" },
+        .{ .name = "pkg-ok", .repo = "local:../pkg-ok", .version = "1.0.0" },
+    } };
+    const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "rem", "1.0.0" });
+    var results: [2]Outcome = undefined;
+    for ([_]Unverified{ .uncached, .cached }, 0..) |state, i| {
+        if (state == .cached) {
+            // Warm: the unpinned package is cached, with a malformed manifest.
+            try tmp.dir.createDirPath(io, cached);
+            try tmp.dir.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ cached, "plugin.labelle" }), .data = ".{ .name = " });
+        }
+        var sources: github.Sources = .{ .a = a };
+        defer sources.deinit();
+        const found = try dispatch.survey(a, root, cfg, &sources);
+        try testing.expectEqual(@as(usize, 1), found.providers.len);
+        try testing.expectEqualStrings("pkg-ok", found.providers[0].meta.name);
+        try testing.expectEqual(@as(usize, 1), found.unavailable.len);
+        try testing.expectEqualStrings("pkg-bad", found.unavailable[0].package);
+        const p = try plan(a, found.providers, found.unavailable, found.unresolved, found.unverified);
+        try testing.expectEqual(@as(usize, 3), p.steps.len);
+        // The path taken: `unresolved` cold, `unverified` warm.
+        const rem = p.steps[2];
+        try testing.expectEqualStrings("rem", rem.label);
+        try testing.expectEqual(state, rem.action.unverified);
+        var calls: std.ArrayList([]const u8) = .empty;
+        const report = try execute(a, p, Recorder{ .a = a, .calls = &calls });
+        // Only the valid provider's doctor ran, in both states.
+        try testing.expectEqual(@as(usize, 1), calls.items.len);
+        try testing.expectEqualStrings("ok:bin/ok", calls.items[0]);
+        try testing.expectEqual(@as(usize, 2), report.failed());
+        results[i] = report.outcomes[2];
+    }
+    try testing.expectEqualStrings(results[0].label, results[1].label);
+    try testing.expectEqual(results[0].err, results[1].err);
 }

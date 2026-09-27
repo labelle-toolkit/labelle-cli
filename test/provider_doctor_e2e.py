@@ -9,7 +9,9 @@ is pinned in labelle.providers.lock but its archive is never cached: it must
 be a failed check with the fetch hint, without a download and without
 stopping the others. A fifth, remote and unpinned, must fail closed with the
 same report whether the ordinary package cache holds it or not, and never
-run. Run from a subdirectory, both halves use the project root. No assembler, network or game dependencies; every
+run, and a malformed cached manifest of it changes nothing. Run from a
+subdirectory, both halves use the project root. An invalid settings file
+fails only its own provider's doctor. No assembler, network or game dependencies; every
 workspace is temporary. Runs on Windows, macOS and Linux.
 """
 import argparse
@@ -60,10 +62,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     # library here, so whether they pass depends only on the host's Python
     # (checked below). The explicit backend also shows which project the
     # core half read.
-    def write_project(extra_deps=()):
+    def write_project(extra_deps=(), extra=""):
         all_deps = ", ".join([*deps, *extra_deps])
         (project / "project.labelle").write_text(
-            f'.{{ .name = "game", .zig_version = "{version}", .backend = .wgpu, .gamepad = .none, .plugins = .{{ {all_deps} }} }}'
+            f'.{{ .name = "game", .zig_version = "{version}", .backend = .wgpu, .gamepad = .none, .plugins = .{{ {all_deps} }}{extra} }}'
         )
         (project / "labelle.lock").write_text(f".{{ .plugins = .{{ {all_deps} }} }}")
 
@@ -204,5 +206,34 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert "labelle epsilon doctor" not in warm.stderr, warm.stderr
     assert not (outputs / "epsilon").exists(), "an unverified package's tool ran"
     assert len(invocations("alpha-pkg")) == 7 and len(invocations("beta-pkg")) == 7
+
+    # A MALFORMED cached manifest of the unpinned package reads the same as
+    # cold too, and does not stop the valid providers' doctors.
+    (cached / "plugin.labelle").write_text(".{ .name = ")
+    broken = run()
+    assert broken.returncode == 1, (broken.returncode, broken.stderr)
+    assert section(broken.stderr, "epsilon") == cold_section, (section(broken.stderr, "epsilon"), cold_section)
+    assert "provider discovery" not in broken.stderr, broken.stderr
+    assert "Provider doctors: 4 checked, 2 failed (delta, epsilon)" in broken.stderr, broken.stderr
+    assert len(invocations("alpha-pkg")) == 8 and len(invocations("beta-pkg")) == 8
+
+    # Settings are resolved per provider: alpha's settings file is invalid
+    # JSON, so alpha's doctor fails and beta's (valid settings) still runs.
+    write_project(extra=', .provider_config = .{ .{ .package = "alpha-pkg", .file = "providers/alpha.json" }, .{ .package = "beta-pkg", .file = "providers/beta.json" } }')
+    (project / "providers").mkdir()
+    (project / "providers" / "alpha.json").write_text("{not json")
+    (project / "providers" / "beta.json").write_text('{"label": "beta settings"}')
+    settings = run()
+    err = settings.stderr
+    assert settings.returncode == 1, (settings.returncode, err)
+    assert "[ FAIL ] labelle alpha doctor: InvalidProviderConfigJson" in err, err
+    assert "[  OK  ] labelle beta doctor" in err, err
+    assert "Provider doctors: 2 checked, 1 failed (alpha)" in err, err
+    assert len(invocations("alpha-pkg")) == 8 and len(invocations("beta-pkg")) == 9
+    assert json.loads((outputs / "beta-pkg" / "capture.json").read_text())["setting"] == "beta settings"
+    # `labelle <ns> <cmd>` keeps validating every settings file.
+    direct = subprocess.run([cli, "beta", "doctor"], cwd=project, env=env, text=True, capture_output=True, timeout=600)
+    assert direct.returncode == 1 and "InvalidProviderConfigJson" in direct.stderr, (direct.returncode, direct.stderr)
+    assert len(invocations("beta-pkg")) == 9
 
     print(f"provider doctor e2e: {checks} invocations OK")
