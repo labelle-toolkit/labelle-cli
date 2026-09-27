@@ -278,14 +278,15 @@ pub const RelayOwnershipSpec = struct {
     const Fixture = struct {
         hooks: Relay.TestHooks = .{},
         relay: *Relay = undefined,
-        sink: std.Io.File = std.Io.File.stderr(),
+        /// Null means the CLI's stderr (not a comptime default on Windows).
+        sink: ?std.Io.File = null,
 
         fn begin(f: *Fixture) !void {
             if (builtin.os.tag == .windows) return error.SkipZigTest;
             const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
             const read_end: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
             f.hooks.write_end = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
-            f.relay = try Relay.prepareWithHooks(std.testing.allocator, std.testing.io, f.sink, &f.hooks);
+            f.relay = try Relay.prepareWithHooks(std.testing.allocator, std.testing.io, f.sink orelse std.Io.File.stderr(), &f.hooks);
             f.relay.begin(read_end);
         }
 
@@ -345,7 +346,7 @@ pub const RelayOwnershipSpec = struct {
         const sink_read: std.Io.File = .{ .handle = sink_fds[0], .flags = .{ .nonblocking = false } };
         defer sink_read.close(io);
         var f: Fixture = .{ .sink = .{ .handle = sink_fds[1], .flags = .{ .nonblocking = false } } };
-        defer f.sink.close(io);
+        defer f.sink.?.close(io);
         try f.begin();
         // No newline, and the write end stays open (a descendant holds it).
         try f.hooks.write_end.?.writeStreamingAll(io, "trailing diagnostic");
