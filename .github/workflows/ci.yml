@@ -77,6 +77,9 @@ jobs:
       - name: Provider output redirected to a file (cli#446)
         run: python test/provider_output_e2e.py
 
+      - name: Prebuild output under --progress=json redirected to a file (cli#448)
+        run: python test/prebuild_stdio_e2e.py
+
       - name: GitHub provider integrity subprocess regression
         run: python test/provider_github_e2e.py
 
