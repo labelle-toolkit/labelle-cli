@@ -105,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
         declared = f', .platform = .{platform}' if platform else ""
         plugins = f', .plugins = .{{ {", ".join(deps)} }}' if deps else ""
         (project / "project.labelle").write_text(
-            f'.{{ .name = "game", .zig_version = "{version}"{declared}{plugins}{extra} }}')
+            f'.{{ .name = "game", .zig_version = "{version}", .backend = .raylib{declared}{plugins}{extra} }}')
 
     # LABELLE_ZIG and LABELLE_ASSEMBLER pointing nowhere: reaching either
     # would fail differently, so a success under `dead` proves neither ran.

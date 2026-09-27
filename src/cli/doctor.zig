@@ -167,7 +167,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     // Best-effort read of project.labelle to scope what's actually required.
     const cfg = readProjectConfig(arena, project_dir);
-    const effective_backend = cfg.backend orelse .raylib;
+    const effective_backend = cfg.backend orelse project_config.default_backend;
 
     const needs_sdl_render = effective_backend == .sdl;
     // Which backends pull in SDL2 for the shared desktop gamepad source. This
@@ -227,7 +227,12 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     }
 
     // ── Report ──────────────────────────────────────────────────────────
-    const backend_label = if (cfg.backend) |b| @tagName(b) else "unknown (no project.labelle)";
+    const backend_label = if (cfg.backend) |b|
+        @tagName(b)
+    else if (cfg.found)
+        try std.fmt.allocPrint(arena, "{s} (default)", .{@tagName(project_config.default_backend)})
+    else
+        "unknown (no project.labelle)";
     const gamepad_label = if (needs_sdl_gamepad) "on" else if (needs_sdl) "off" else "n/a";
     std.debug.print(
         \\
@@ -281,6 +286,10 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 // ── Project config (textual, dependency-free) ───────────────────────────
 
 const Cfg = struct {
+    /// A `project.labelle` was read.
+    found: bool = false,
+    /// The declared `.backend`, or null when the field is absent (the
+    /// project then builds with `project_config.default_backend`).
     backend: ?project_config.Backend = null,
     gamepad_off: bool = false,
 };
@@ -293,7 +302,7 @@ fn readProjectConfig(arena: std.mem.Allocator, project_dir: []const u8) Cfg {
     const path = std.fs.path.join(arena, &.{ project_dir, "project.labelle" }) catch return .{};
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return .{};
 
-    var cfg: Cfg = .{};
+    var cfg: Cfg = .{ .found = true };
     if (std.mem.indexOf(u8, content, ".backend = .")) |idx| {
         const start = idx + ".backend = .".len;
         var end = start;
@@ -536,6 +545,24 @@ fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "doctor: a project.labelle without .backend is checked as the default backend" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\" }" });
+    const cfg = readProjectConfig(a, dir);
+    try std.testing.expect(cfg.found);
+    try std.testing.expectEqual(@as(?project_config.Backend, null), cfg.backend);
+    // Read as the full schema does, so doctor and build cannot disagree.
+    const parsed = try config.readProjectConfigQuiet(a, dir);
+    try std.testing.expectEqual(parsed.backend, cfg.backend orelse project_config.default_backend);
+    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\", .backend = .sokol }" });
+    try std.testing.expectEqual(@as(?project_config.Backend, .sokol), readProjectConfig(a, dir).backend);
+}
 
 /// The `--json` capability report is a cross-repo contract with
 /// labelle-studio's ToolchainGate (src/services/doctor.ts zod schema). Pin

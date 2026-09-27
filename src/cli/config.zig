@@ -168,6 +168,26 @@ pub const ProjectExistsSpec = struct {
 /// keys off the CLI version the project was locked with, which is the
 /// fact that actually predicts "this binary may not understand this
 /// project", rather than guessing from field names.
+/// A `project.labelle` with no `.backend` field builds with bgfx, the
+/// assembler's default since assembler#768 (it was raylib before).
+pub const DefaultBackendSpec = struct {
+    test "a project without .backend resolves to bgfx" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"demo\" }" });
+        const dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+        const cfg = try readProjectConfigQuiet(alloc, dir);
+        try std.testing.expectEqual(project_config.Backend.bgfx, cfg.backend);
+        try std.testing.expectEqual(project_config.Backend.bgfx, project_config.default_backend);
+        // An explicit field still wins.
+        try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"demo\", .backend = .raylib }" });
+        try std.testing.expectEqual(project_config.Backend.raylib, (try readProjectConfigQuiet(alloc, dir)).backend);
+    }
+};
+
 pub const CliMirrorToleranceSpec = struct {
     test "a resource carrying assembler-only fields still parses" {
         // Arena: the real callers parse into one too (the config strings

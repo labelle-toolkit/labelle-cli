@@ -140,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
 
     def declare(*deps, resources=""):
         (project / "project.labelle").write_text(
-            f'.{{ .name = "game", .zig_version = "{version}", .plugins = .{{ {", ".join(deps)} }}{resources} }}')
+            f'.{{ .name = "game", .zig_version = "{version}", .backend = .raylib, .plugins = .{{ {", ".join(deps)} }}{resources} }}')
 
     # Reverse alphabetical declaration order is the default for the suite.
     declare(dep_b, dep_a)
