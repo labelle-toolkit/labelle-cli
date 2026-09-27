@@ -19,7 +19,7 @@ suite runs once as-is and once with LABELLE_PREBUILD_FORCE_RELAY=1, which
 forces the relay on every OS, and adds two relay cases: a stdout line
 longer than one 4096-byte read stays whole next to the step's stderr, and
 (POSIX) a step that leaves `sleep 30` holding the pipe does not hang the
-build.
+build and its trailing partial line is still written out.
 """
 import argparse
 import json
@@ -180,12 +180,18 @@ def main(base):
     if os.name != "nt":
         # The step exits but leaves `sleep 30` holding its stdout pipe: the
         # relay must stop waiting for EOF once the direct child is reaped.
-        daemon = project("daemon", [["sh", "-c", "sleep 30 & echo PREBUILD_DAEMON_STARTED"]])
+        # Its last output is a partial line (no newline): it must still be
+        # written out when the relay stops waiting (cli#452).
+        daemon = project("daemon", [["sh", "-c", "sleep 30 & echo PREBUILD_DAEMON_STARTED; printf PREBUILD_DAEMON_PARTIAL"]])
         env = dict(base_env, LABELLE_PREBUILD_FORCE_RELAY="1")
         began = time.monotonic()
         lines = split(daemon, env, "daemon")
         elapsed = time.monotonic() - began
         find(lines, "PREBUILD_DAEMON_STARTED", "daemon")
+        # The partial line has no newline, so the CLI's next output follows
+        # on the same line; the step header also names it, mid-line.
+        partial = [line for line in lines if line.startswith("PREBUILD_DAEMON_PARTIAL")]
+        assert len(partial) == 1, ("daemon partial line", "\n".join(lines))
         assert elapsed < 20, ("a background process holding the pipe stalled the build", elapsed)
         checks += 1
 

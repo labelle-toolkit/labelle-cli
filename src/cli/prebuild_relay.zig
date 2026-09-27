@@ -22,9 +22,13 @@
 //!   the relay runs on its own thread. A step that leaves a background
 //!   process holding the pipe open never produces EOF, so once the child
 //!   has exited `finish` gives the relay `drain_grace_ns` to empty what is
-//!   already buffered and then detaches it rather than blocking the build.
-//!   A detached relay keeps copying until the pipe really ends, then frees
-//!   itself.
+//!   already buffered, writes out any partial line it still holds, and
+//!   detaches it rather than blocking the build. A detached relay keeps
+//!   copying until the pipe really ends, then frees itself.
+//! - **Started before the child.** `prepare` allocates the relay and starts
+//!   its thread before the step is spawned, so if either fails the step is
+//!   simply handed the stderr file instead. There is no synchronous relay
+//!   to fall back to, which a background process could hang (cli#452).
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -54,7 +58,7 @@ pub const max_line: usize = 1 << 20;
 
 /// Ownership protocol for a threaded `Relay` (the heap object `self`):
 ///
-/// - `state` starts `running`; `start`'s caller owns `self`.
+/// - `state` starts `running`; `prepare`'s caller owns `self`.
 /// - The worker, at EOF, does ONE cmpxchg `running -> finished`. On success
 ///   it never touches `self` again (the owner frees it). On failure the
 ///   state was `detached`, ownership is the worker's, and it frees `self`.
@@ -74,11 +78,16 @@ const detached: u8 = 2;
 
 pub const Relay = struct {
     io: std.Io,
-    pipe: std.Io.File,
+    /// Set by `begin` before `handoff`; null after `cancel`.
+    pipe: ?std.Io.File = null,
     sink: std.Io.File,
     gpa: std.mem.Allocator,
+    /// Guards `line`, `sink_ok` and every write to `sink`: the worker feeds
+    /// under it, and `finish` flushes a pending partial line under it.
+    mutex: std.Io.Mutex = .init,
     line: std.ArrayList(u8) = .empty,
     sink_ok: bool = true,
+    handoff: std.Io.Event = .unset,
     state: std.atomic.Value(u8) = .init(running),
     thread: std.Thread = undefined,
     /// Test-only interleaving hooks; always null in the CLI.
@@ -94,33 +103,56 @@ pub const Relay = struct {
         write_end: ?std.Io.File = null,
     };
 
-    /// Take ownership of `pipe` and start copying it to `sink` on a new
-    /// thread. On error nothing was started and `pipe` is still the
-    /// caller's. `gpa` must be thread-safe: the worker may free `self`.
-    pub fn start(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: std.Io.File) !*Relay {
-        return startWithHooks(gpa, io, pipe, sink, null);
+    /// Allocate the relay and start its thread BEFORE the child is spawned;
+    /// the thread waits for `begin` (or `cancel`). A failure here leaves
+    /// nothing running, so the caller can still spawn the step another way
+    /// instead of relaying synchronously (which a descendant holding the
+    /// pipe could hang). `gpa` must be thread-safe: the worker may free
+    /// `self`.
+    pub fn prepare(gpa: std.mem.Allocator, io: std.Io, sink: std.Io.File) !*Relay {
+        return prepareWithHooks(gpa, io, sink, null);
     }
 
-    fn startWithHooks(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: std.Io.File, hooks: ?*TestHooks) !*Relay {
+    fn prepareWithHooks(gpa: std.mem.Allocator, io: std.Io, sink: std.Io.File, hooks: ?*TestHooks) !*Relay {
         const self = try gpa.create(Relay);
         errdefer gpa.destroy(self);
-        self.* = .{ .io = io, .pipe = pipe, .sink = sink, .gpa = gpa, .hooks = hooks };
+        self.* = .{ .io = io, .sink = sink, .gpa = gpa, .hooks = hooks };
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
     }
 
+    /// Hand the child's stdout pipe to the waiting thread; the relay owns
+    /// and closes it from here on. Follow with `finish`.
+    pub fn begin(self: *Relay, pipe: std.Io.File) void {
+        self.pipe = pipe;
+        self.handoff.set(self.io);
+    }
+
+    /// The child was never spawned: stop the waiting thread and free.
+    pub fn cancel(self: *Relay) void {
+        self.handoff.set(self.io);
+        self.thread.join();
+        self.destroy();
+    }
+
     /// Call once the direct child has exited. Joins the relay if the pipe
-    /// ends within `grace_ns`; otherwise detaches it. `self` is invalid
-    /// afterwards either way (protocol above).
+    /// ends within `grace_ns`; otherwise writes out any partial line still
+    /// buffered (so a trailing diagnostic without a newline is not lost
+    /// when the CLI exits) and detaches it. `self` is invalid afterwards
+    /// either way (protocol above).
     pub fn finish(self: *Relay, grace_ns: u64) void {
-        const step_ns = 10 * std.time.ns_per_ms;
-        var waited: u64 = 0;
-        while (self.state.load(.acquire) == running and waited < grace_ns) : (waited += step_ns) {
-            sleep(self.io, step_ns);
+        // Wall-clock deadline: counting sleep iterations overshoots on a
+        // loaded machine, where each short sleep can run long.
+        const began = std.Io.Timestamp.now(self.io, .awake);
+        while (self.state.load(.acquire) == running and
+            began.untilNow(self.io, .awake).toNanoseconds() < grace_ns)
+        {
+            sleep(self.io, 10 * std.time.ns_per_ms);
         }
         if (self.state.load(.acquire) == running) {
-            // A descendant still holds the pipe. Detach through a local
-            // copy BEFORE handing `self` to the worker.
+            // A descendant still holds the pipe. `self` is still ours here.
+            self.flushPartial();
+            // Detach through a local copy BEFORE handing `self` over.
             const thread = self.thread;
             thread.detach();
             if (self.hooks) |h| if (h.after_detach) |f| f(h, self);
@@ -135,14 +167,6 @@ pub const Relay = struct {
         self.destroy();
     }
 
-    /// Copy the whole pipe on the calling thread, then release it. The
-    /// fallback when no thread could be started.
-    pub fn runInline(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: std.Io.File) void {
-        var self: Relay = .{ .io = io, .pipe = pipe, .sink = sink, .gpa = gpa };
-        self.pump();
-        self.line.deinit(gpa);
-    }
-
     fn destroy(self: *Relay) void {
         const gpa = self.gpa;
         self.line.deinit(gpa);
@@ -151,7 +175,8 @@ pub const Relay = struct {
 
     fn threadMain(self: *Relay) void {
         const hooks = self.hooks; // `self` may be gone by the end.
-        self.pump();
+        self.handoff.waitUncancelable(self.io);
+        if (self.pipe != null) self.pump();
         if (self.state.cmpxchgStrong(running, finished, .acq_rel, .acquire) != null) {
             // `finish` handed `self` over (`detached`): nobody else frees it.
             self.destroy();
@@ -160,17 +185,26 @@ pub const Relay = struct {
     }
 
     fn pump(self: *Relay) void {
+        const pipe = self.pipe.?;
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = self.pipe.readStreaming(self.io, &.{&buf}) catch break;
+            const n = pipe.readStreaming(self.io, &.{&buf}) catch break;
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.feed(buf[0..n]);
         }
-        self.write(self.line.items);
-        self.line.clearRetainingCapacity();
-        self.pipe.close(self.io);
+        self.flushPartial();
+        pipe.close(self.io);
     }
 
-    /// Buffer `bytes` and write out every complete line, each in one write.
+    /// Write out whatever partial line is buffered.
+    fn flushPartial(self: *Relay) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.write(self.line.items);
+        self.line.clearRetainingCapacity();
+    }
+
     fn feed(self: *Relay, bytes: []const u8) void {
         self.line.appendSlice(self.gpa, bytes) catch {
             // Out of memory: keep the bytes flowing, unaligned.
@@ -247,13 +281,16 @@ pub const RelayOwnershipSpec = struct {
     const Fixture = struct {
         hooks: Relay.TestHooks = .{},
         relay: *Relay = undefined,
+        /// Null means the CLI's stderr (not a comptime default on Windows).
+        sink: ?std.Io.File = null,
 
         fn begin(f: *Fixture) !void {
             if (builtin.os.tag == .windows) return error.SkipZigTest;
             const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
             const read_end: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
             f.hooks.write_end = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
-            f.relay = try Relay.startWithHooks(std.testing.allocator, std.testing.io, read_end, std.Io.File.stderr(), &f.hooks);
+            f.relay = try Relay.prepareWithHooks(std.testing.allocator, std.testing.io, f.sink orelse std.Io.File.stderr(), &f.hooks);
+            f.relay.begin(read_end);
         }
 
         /// EOF for the worker.
@@ -298,5 +335,40 @@ pub const RelayOwnershipSpec = struct {
         Fixture.closeWriteEnd(&f.hooks);
         f.relay.finish(10 * std.time.ns_per_s);
         try std.testing.expect(f.hooks.worker_done.load(.acquire));
+    }
+
+    test "cancel before any pipe: the waiting thread stops and nothing leaks" {
+        const r = try Relay.prepare(std.testing.allocator, std.testing.io, std.Io.File.stderr());
+        r.cancel();
+    }
+
+    test "a partial line is written out at finish, before the handover" {
+        if (builtin.os.tag == .windows) return error.SkipZigTest;
+        const io = std.testing.io;
+        const sink_fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        const sink_read: std.Io.File = .{ .handle = sink_fds[0], .flags = .{ .nonblocking = false } };
+        defer sink_read.close(io);
+        var f: Fixture = .{ .sink = .{ .handle = sink_fds[1], .flags = .{ .nonblocking = false } } };
+        defer f.sink.?.close(io);
+        try f.begin();
+        // No newline, and the write end stays open (a descendant holds it).
+        try f.hooks.write_end.?.writeStreamingAll(io, "trailing diagnostic");
+        while (true) {
+            f.relay.mutex.lockUncancelable(io);
+            const buffered = f.relay.line.items.len;
+            f.relay.mutex.unlock(io);
+            if (buffered == "trailing diagnostic".len) break;
+            sleep(io, std.time.ns_per_ms);
+        }
+        f.relay.finish(0);
+        // Read it back while the write end is STILL open, so only `finish`
+        // can have written it; poll so a missing flush fails, not hangs.
+        var fds = [_]std.posix.pollfd{.{ .fd = sink_read.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 2000));
+        var buf: [64]u8 = undefined;
+        const n = try std.posix.read(sink_read.handle, &buf);
+        try std.testing.expectEqualStrings("trailing diagnostic", buf[0..n]);
+        Fixture.closeWriteEnd(&f.hooks);
+        f.awaitWorker();
     }
 };
