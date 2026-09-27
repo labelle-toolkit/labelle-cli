@@ -274,6 +274,25 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         if (parsed.platform == .wasm) "ReleaseSafe" else null,
     ).mode;
 
+    // A path that cannot carry a provider's environment contribution or its
+    // optimize default refuses here, before any hook, generation or build,
+    // rather than silently bypassing the provider (`install.providerBypass`).
+    if (install.providerBypass(
+        command,
+        parsed_args.docker,
+        provider_hooks.planContributor(hook_plans.generate, hook_plans.build) != null,
+        optimize_mod.ownerDefault(providers, target.name) != null,
+    )) |bypass| {
+        if (provider_hooks.planContributor(hook_plans.generate, hook_plans.build)) |hook| {
+            std.debug.print("labelle: hook '{s}' may contribute an environment for target '{s}'\n", .{ hook.qualified, target.name });
+        } else {
+            std.debug.print("labelle: '{s}' declares an optimize default for target '{s}'\n", .{ target.providerName(), target.name });
+        }
+        std.debug.print("labelle: {s}\n", .{bypass.message()});
+        if (reporter) |r| r.finishFailed(1, "the build path cannot carry the provider's inputs");
+        return 1;
+    }
+
     // Everything a provider hook run needs. The host compiler is resolved by
     // the first hook that runs (never for an empty plan), and hooks report
     // under the phase of the core step they wrap; the wire `optimize` and

@@ -264,6 +264,59 @@ pub fn discoverAndPlan(
 /// provider target is launched by its provider's `replace run` hook. The
 /// set only shrinks: a platform leaves it when its launch moves into a
 /// provider (cli#405 removed `android`).
+/// A build path that cannot carry what a provider supplies for the target.
+/// Such a path refuses before anything runs rather than silently bypassing
+/// the provider (RFC cli#466 A1):
+/// - `--docker` builds inside a container that never sees a hook's
+///   environment contribution (contract §2 `env_file`); it does pass the
+///   effective optimize mode through as `-Doptimize`, so a target default
+///   is honoured there;
+/// - `labelle ios` runs its own `zig build` after generation, with neither
+///   the contributions nor the effective optimize mode.
+pub const Bypass = enum {
+    docker_env,
+    ios_env,
+    ios_default,
+
+    pub fn message(self: Bypass) []const u8 {
+        return switch (self) {
+            .docker_env => "--docker doesn't carry provider environment contributions; build without --docker",
+            .ios_env => "`labelle ios` runs its own build, which doesn't carry provider environment contributions; use `labelle build --platform=ios`",
+            .ios_default => "`labelle ios` runs its own build, which ignores the target owner's optimize default; use `labelle build --platform=ios`",
+        };
+    }
+};
+
+/// Pure. `contributor` is the plan's first hook that can contribute an
+/// environment (`provider_hooks.planContributor`); `owner_default` the
+/// target owner's `.target_defaults` optimize mode.
+pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool, owner_default: bool) ?Bypass {
+    if (command == .ios_cmd) {
+        if (contributor) return .ios_env;
+        if (owner_default) return .ios_default;
+    }
+    if (docker and contributor) return .docker_env;
+    return null;
+}
+
+test "providerBypass: a path that cannot carry a provider's input refuses instead of bypassing it" {
+    // Nothing to carry: every path keeps today's behaviour.
+    for ([_]args_mod.Command{ .build, .run, .generate, .bundle_cmd, .ios_cmd }) |command| {
+        try std.testing.expect(providerBypass(command, false, false, false) == null);
+        try std.testing.expect(providerBypass(command, true, false, false) == null);
+    }
+    // --docker: contributions are refused; a default is passed through.
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, true).?);
+    try std.testing.expect(providerBypass(.build, true, false, true) == null);
+    // Without --docker the shared pipeline carries both.
+    try std.testing.expect(providerBypass(.build, false, true, true) == null);
+    // `labelle ios`: its own build carries neither.
+    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, false).?);
+    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, true).?);
+    try std.testing.expectEqual(Bypass.ios_default, providerBypass(.ios_cmd, false, false, true).?);
+}
+
 pub fn legacyRunBranch(platform: ?project_config.Platform) bool {
     const p = platform orelse return false;
     return switch (p) {

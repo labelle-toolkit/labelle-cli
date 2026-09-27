@@ -186,3 +186,33 @@ test "provider hooks env: a failed hook's file is ignored; a malformed or confli
     try std.testing.expectEqual(@as(u8, 0), try hooks.runPhase(&h.site, &.{ h.planned(0), h.planned(1) }, .build, .before, h.out()));
     try h.envDirsGone();
 }
+
+test "provider hooks env: the contributing hook of a plan is found by slot and negotiated wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = [_]manifest.Hook{ hook("gen", .generate, .before), hook("stamp", .build, .after), hook("pre", .build, .before) };
+    var provider: dispatch.Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../x", .version = "1.0.0" },
+        .dir = "/x",
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0", .hooks = &list },
+        .verified = true,
+    };
+    const providers = [_]dispatch.Provider{provider};
+    _ = &providers;
+    const plan_for = struct {
+        fn get(al: std.mem.Allocator, p: *const dispatch.Provider, step: contract.Step) !hooks.Plan {
+            return hooks.plan(al, p[0..1], step, "desktop");
+        }
+    }.get;
+    // A before-generate hook on an open range can contribute.
+    try std.testing.expectEqualStrings("pkg/gen", hooks.planContributor(try plan_for(a, &provider, .generate), try plan_for(a, &provider, .build)).?.qualified);
+    // Only an after-build hook: no contributing slot.
+    const after_only = [_]manifest.Hook{hook("stamp", .build, .after)};
+    provider.meta.hooks = &after_only;
+    try std.testing.expect(hooks.planContributor(try plan_for(a, &provider, .generate), try plan_for(a, &provider, .build)) == null);
+    // A contributing slot on a provider capped below 1.3.0 has no env_file.
+    provider.meta.hooks = &list;
+    provider.meta.command_contract = "<1.3.0";
+    try std.testing.expect(hooks.planContributor(try plan_for(a, &provider, .generate), try plan_for(a, &provider, .build)) == null);
+}

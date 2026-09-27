@@ -12,6 +12,7 @@ const serve = @import("../serve.zig");
 const provider_contract = @import("../provider_contract.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_hooks = @import("../provider_hooks.zig");
+const provider_env = @import("../provider_env.zig");
 const testing = @import("testing.zig");
 
 /// Rebuild context for `wasm serve --watch` (cli#208). Bundles the
@@ -151,12 +152,27 @@ pub const WasmRebuildCtx = struct {
         return true;
     }
 
+    /// One watched rebuild. Its environment is built fresh from the
+    /// inherited one plus the contributions of the hooks that run in THIS
+    /// rebuild (contract §2), so a hook a replan removed leaves nothing
+    /// behind. It replaces the last successful build's environment only if
+    /// the whole rebuild succeeds: one that fails at any stage (the
+    /// pre-check, a prebuild step, the replan, a hook, the compile) puts the
+    /// previous one back, so the served build and the `after run` hooks at
+    /// the session's end keep the environment that build was made with.
     pub fn rebuildStaged(self: *WasmRebuildCtx) Stage!void {
+        var previous = self.hooks.env;
+        self.hooks.env = .{ .windows = previous.windows };
+        self.rebuildStages() catch |err| {
+            self.hooks.env.deinit();
+            self.hooks.env = previous;
+            return err;
+        };
+        previous.deinit();
+    }
+
+    fn rebuildStages(self: *WasmRebuildCtx) Stage!void {
         const a = self.allocator;
-        // Every rebuild's environment is built fresh from the inherited one
-        // plus the contributions of the hooks that run in THIS rebuild
-        // (contract §2): a hook a replan removed leaves nothing behind.
-        self.hooks.env.reset();
 
         // 0. The served target's ownership pre-check (`Replan.precheck`),
         //    FIRST, ahead of every side-effecting stage: a watched edit that
@@ -768,3 +784,102 @@ pub const CollectPrebuildIgnorePathsSpec = struct {
         }
     };
 };
+
+test "watched rebuild keeps the last good hook environment unless the whole rebuild succeeds" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    const Spy = struct {
+        /// The hook that fails this rebuild, if any.
+        var fail_id: []const u8 = "";
+        var precheck_fails = false;
+        // A contributing hook adds NEW=<value> to the rebuild's environment,
+        // the way `runPhase` absorbs an env_file.
+        var value: []const u8 = "";
+        fn run(site: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+            for (list) |entry| {
+                if (std.mem.eql(u8, entry.hook.id, fail_id)) return 7;
+                if (std.mem.eql(u8, entry.hook.id, "tc")) {
+                    var diag: provider_env.Diagnostic = .{};
+                    try site.env.add(site.backing, site.backing, entry.qualified, .{ .set = &.{.{ .name = "NEW", .value = value }} }, &diag);
+                }
+            }
+            return 0;
+        }
+        fn precheck(_: *anyopaque, _: *WasmRebuildCtx) anyerror!void {
+            if (precheck_fails) return error.NoProviderForTarget;
+        }
+        fn replan(_: *anyopaque, _: *WasmRebuildCtx) anyerror!void {}
+        var provider: provider_dispatch.Provider = .{
+            .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+            .dir = "/pkg",
+            .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+            .verified = true,
+        };
+        fn planned(id: []const u8, step: provider_contract.Step, when: provider_contract.Phase) provider_hooks.Planned {
+            return .{
+                .provider = &provider,
+                .hook = .{ .id = id, .step = step, .target = "wasm", .when = when, .build_step = "tool", .executable = "bin/tool" },
+                .qualified = id,
+            };
+        }
+        fn value_of(site: *const provider_hooks.Site, name: []const u8) ?[]const u8 {
+            for (site.env.vars.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
+            return null;
+        }
+    };
+    var site = testing.testSite(a, project);
+    defer site.env.deinit();
+    var dummy: u8 = 0;
+    // Every step is a hook, so a whole rebuild can succeed without an
+    // assembler or a compiler: `tc` contributes before generate, the
+    // replacements stand in for the core steps.
+    var ctx = WasmRebuildCtx{
+        .allocator = a,
+        .asm_bin = .{ .path = "" },
+        .project_dir = project,
+        .platform_tag = "wasm",
+        .backend_tag = "bgfx",
+        .output_dir = project,
+        .target_dir = project,
+        .zig_args = &.{},
+        .zig_env = null,
+        .prebuild_steps = &.{},
+        .prebuild_opts = .{ .fatal_on_step_failure = false },
+        .hooks = &site,
+        .run_hook_phase = Spy.run,
+        .replan = .{ .ctx = &dummy, .precheck = Spy.precheck, .run = Spy.replan },
+        .generate_plan = .{ .before = &.{Spy.planned("tc", .generate, .before)}, .replace = Spy.planned("gen", .generate, .replace) },
+        .build_plan = .{ .replace = Spy.planned("build", .build, .replace) },
+    };
+    // A first successful rebuild installs its environment.
+    Spy.value = "first";
+    try ctx.rebuildStaged();
+    try std.testing.expectEqualStrings("first", Spy.value_of(&site, "NEW").?);
+    // Failing before any hook (the ownership pre-check): the last good
+    // environment stays.
+    Spy.precheck_fails = true;
+    Spy.value = "second";
+    try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
+    try std.testing.expectEqualStrings("first", Spy.value_of(&site, "NEW").?);
+    Spy.precheck_fails = false;
+    // Failing AFTER the contributing hook ran (the build replacement): its
+    // contribution is discarded and the last good one stays.
+    Spy.fail_id = "build";
+    try std.testing.expectError(error.HookFailed, ctx.rebuildStaged());
+    try std.testing.expectEqualStrings("first", Spy.value_of(&site, "NEW").?);
+    try std.testing.expectEqual(@as(usize, 1), site.env.vars.items.len);
+    // A rebuild that succeeds replaces it...
+    Spy.fail_id = "";
+    try ctx.rebuildStaged();
+    try std.testing.expectEqualStrings("second", Spy.value_of(&site, "NEW").?);
+    // ...and one whose plan no longer has the contributing hook leaves
+    // nothing behind.
+    ctx.generate_plan.before = &.{};
+    try ctx.rebuildStaged();
+    try std.testing.expect(site.env.isEmpty());
+}

@@ -211,6 +211,29 @@ pub fn plan(a: std.mem.Allocator, providers: []const dispatch.Provider, step: co
     };
 }
 
+/// The first hook among `lists` that can contribute an environment
+/// (contract §2 `env_file`): one in a `contract.envFileSlot` whose provider
+/// negotiates wire `1.3.0` or newer (an older wire has no `env_file`, so its
+/// hook cannot). A build path that cannot carry contributions refuses when
+/// this finds one, rather than silently bypassing the provider.
+pub fn firstContributor(lists: []const []const Planned, step_of: []const contract.Step) ?Planned {
+    for (lists, step_of) |list, step| {
+        for (list) |planned| {
+            const invocation: contract.Invocation = .{ .kind = .hook, .id = planned.hook.id, .step = step, .phase = planned.hook.when };
+            if (!contract.envFileSlot(invocation)) continue;
+            const wire = manifest.negotiate(planned.provider.meta.command_contract orelse continue) catch continue;
+            if (contract.carriesToolchainContext(wire)) return planned;
+        }
+    }
+    return null;
+}
+
+/// `firstContributor` over the three contributing slots of one target's
+/// plans: `before`/`after generate` and `before build`.
+pub fn planContributor(generate: Plan, build: Plan) ?Planned {
+    return firstContributor(&.{ generate.before, generate.after, build.before }, &.{ .generate, .generate, .build });
+}
+
 /// The step output-directory contract every hook and the core packager
 /// agree on. `bundle_override` is the already-resolved `--output` directory,
 /// when one was given. Caller creates it and canonicalises before use.

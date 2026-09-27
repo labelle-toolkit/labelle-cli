@@ -145,7 +145,13 @@ pub fn autoWireEnv(gpa: std.mem.Allocator) void {
 ///
 /// No-op off Windows, when no `SDL2.dll` can be located, or when it is already
 /// staged. `bin_dir` is the exe's output dir (`.labelle/<target>/zig-out/bin`).
-pub fn stageSdl2DllBesideExe(gpa: std.mem.Allocator, bin_dir: []const u8) void {
+///
+/// `build_env` is the environment the compile ran with: the inherited one
+/// plus the provider hooks' contributions (contract §2 `env_file`). A hook
+/// that provisions SDL2 sets `LABELLE_SDL2_LIB` there, so the DLL is looked
+/// up where the build linked it from, not only in this process's own
+/// environment. Null means the inherited environment.
+pub fn stageSdl2DllBesideExe(gpa: std.mem.Allocator, bin_dir: []const u8, build_env: ?*const std.process.Environ.Map) void {
     if (builtin.os.tag != .windows) return;
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
@@ -155,7 +161,7 @@ pub fn stageSdl2DllBesideExe(gpa: std.mem.Allocator, bin_dir: []const u8) void {
     const dst = join(a, &.{ bin_dir, "SDL2.dll" }) orelse return;
     if (util.fileExists(dst)) return; // already staged — leave it in place
 
-    const src = locateSdl2Dll(a) orelse return; // nothing to stage
+    const src = locateSdl2Dll(a, sdl2LibDir(a, build_env)) orelse return; // nothing to stage
     copyFileVia(a, io, src, dst);
     if (util.fileExists(dst)) {
         std.debug.print("labelle: staged SDL2.dll next to the game exe ({s})\n", .{dst});
@@ -167,14 +173,23 @@ pub fn stageSdl2DllBesideExe(gpa: std.mem.Allocator, bin_dir: []const u8) void {
     }
 }
 
+/// The `LABELLE_SDL2_LIB` the build saw: from `build_env` (which already
+/// holds the inherited environment with the hooks' contributions merged on
+/// top, so a contribution wins) when given, else this process's own
+/// environment. Arena-allocated or borrowed from `build_env`.
+pub fn sdl2LibDir(a: std.mem.Allocator, build_env: ?*const std.process.Environ.Map) ?[]const u8 {
+    if (build_env) |map| return map.get("LABELLE_SDL2_LIB");
+    return config.globalEnviron().getAlloc(a, "LABELLE_SDL2_LIB") catch null;
+}
+
 /// Locate a runtime `SDL2.dll`, mirroring the linker's own SDL2 resolution:
-///   1. `LABELLE_SDL2_LIB`/SDL2.dll   (the provisioner drops the DLL in lib/)
-///   2. `LABELLE_SDL2_LIB`/../bin/SDL2.dll   (upstream MinGW package layout)
+///   1. `<lib>`/SDL2.dll   (the provisioner drops the DLL in lib/)
+///   2. `<lib>`/../bin/SDL2.dll   (upstream MinGW package layout)
 ///   3. the labelle SDL2 cache lib dir (`findCachedLibDir`, holds SDL2.dll)
+/// where `<lib>` is `LABELLE_SDL2_LIB` as the build saw it (`sdl2LibDir`).
 /// Arena-allocated; returns null when none is present.
-fn locateSdl2Dll(a: std.mem.Allocator) ?[]const u8 {
-    const env = config.globalEnviron();
-    if (env.getAlloc(a, "LABELLE_SDL2_LIB") catch null) |lib| {
+fn locateSdl2Dll(a: std.mem.Allocator, lib_dir: ?[]const u8) ?[]const u8 {
+    if (lib_dir) |lib| {
         if (lib.len > 0) {
             if (join(a, &.{ lib, "SDL2.dll" })) |p| {
                 if (util.fileExists(p)) return p;
@@ -280,4 +295,35 @@ fn copyFileVia(a: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u
 
 fn deleteIfPresent(io: std.Io, path: ?[]const u8) void {
     if (path) |p| std.Io.Dir.cwd().deleteFile(io, p) catch {};
+}
+
+test "SDL2 DLL staging reads LABELLE_SDL2_LIB from the build's merged environment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A contributed SDL2 install: lib/ holds the DLL.
+    try tmp.dir.createDirPath(io, "contributed/lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "contributed/lib/SDL2.dll", .data = "dll" });
+    const lib = try tmp.dir.realPathFileAlloc(io, "contributed/lib", a);
+    // The build env holds the inherited environment with the contribution
+    // merged on top: that value is the one used.
+    var build_env = std.process.Environ.Map.init(a);
+    try build_env.put("LABELLE_SDL2_LIB", lib);
+    try std.testing.expectEqualStrings(lib, sdl2LibDir(a, &build_env).?);
+    const found = locateSdl2Dll(a, sdl2LibDir(a, &build_env)).?;
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ lib, "SDL2.dll" }), found);
+    // The upstream layout: lib/../bin/SDL2.dll.
+    try tmp.dir.createDirPath(io, "upstream/lib");
+    try tmp.dir.createDirPath(io, "upstream/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "upstream/bin/SDL2.dll", .data = "dll" });
+    const upstream = try tmp.dir.realPathFileAlloc(io, "upstream/lib", a);
+    try build_env.put("LABELLE_SDL2_LIB", upstream);
+    try std.testing.expect(std.mem.endsWith(u8, locateSdl2Dll(a, sdl2LibDir(a, &build_env)).?, "SDL2.dll"));
+    // A build env without the variable: nothing from it (the inherited
+    // environment is already folded into the map, so it is not consulted).
+    var bare = std.process.Environ.Map.init(a);
+    try std.testing.expect(sdl2LibDir(a, &bare) == null);
 }

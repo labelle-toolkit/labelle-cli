@@ -881,6 +881,33 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     failed = run("build", code=7, extra_env=dict(probe_env, PROVIDER_PROBE_ENV=f"pre|{malformed}", PROVIDER_PROBE_FAIL="pre"))
     assert "hook 'fixture-a/pre' failed (exit 7)" in failed.stderr and "invalid env_file" not in failed.stderr, failed.stderr
 
+    # ── Paths that cannot carry a provider's inputs refuse, never bypass ──
+    # `--docker` builds in a container the contributions never reach, so a
+    # plan with a hook that may contribute is refused before anything runs:
+    # no hook, no generation, no build.
+    reset()
+    refused = run("build", "--docker", code=1, extra_env=probe_env)
+    assert "hook 'fixture-a/tc' may contribute an environment for target 'desktop'" in refused.stderr, refused.stderr
+    assert "--docker doesn't carry provider environment contributions; build without --docker" in refused.stderr, refused.stderr
+    assert "FIXTURE_GENERATE" not in refused.stderr and not log(target_dir) and not log(zig_out), refused.stderr
+    # The legacy `labelle ios` runs its own zig build after generation, with
+    # neither the contributions nor the optimize default: refused for either,
+    # before any hook or generation.
+    ios_dir = project / ".labelle" / "sokol_ios"
+    a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="ios")], targets=["ios"]))
+    reset()
+    refused = run("ios", "build", code=1)
+    assert "hook 'fixture-a/tc' may contribute an environment for target 'ios'" in refused.stderr, refused.stderr
+    assert "`labelle ios` runs its own build, which doesn't carry provider environment contributions" in refused.stderr, refused.stderr
+    assert "FIXTURE_GENERATE" not in refused.stderr and not log(ios_dir), refused.stderr
+    a_manifest.write_text(manifest("fixture-a", [], targets=["ios"], defaults=(("ios", "ReleaseSafe"),)))
+    reset()
+    refused = run("ios", "build", code=1)
+    assert "'fixture-a' declares an optimize default for target 'ios'" in refused.stderr, refused.stderr
+    assert "`labelle ios` runs its own build, which ignores the target owner's optimize default" in refused.stderr, refused.stderr
+    assert "FIXTURE_GENERATE" not in refused.stderr, refused.stderr
+    a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
+
     # ── contract 1.3.0: the target owner's optimize default ───────────────
     # fixture-a owns `android` (a name the pinned assembler generates for, so
     # the core compile runs) and declares `.target_defaults`: the compile

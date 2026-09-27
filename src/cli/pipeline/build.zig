@@ -111,7 +111,9 @@ pub fn run(
         if (!parsed_args.docker and parsed.platform == .desktop and wants_sdl2) {
             const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
             defer allocator.free(bin_dir);
-            sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
+            // `compile_env`: the SDL2 the build linked, including a hook's
+            // `LABELLE_SDL2_LIB` contribution (contract §2).
+            sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir, compile_env);
         }
 
         // `labelle build` finalization — everything that turns the compiled
