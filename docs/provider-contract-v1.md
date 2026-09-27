@@ -176,16 +176,23 @@ GitHub archive is not automatically accepted.
 
 `labelle providers fetch [--offline]` is the explicit way to obtain the
 archives a committed lock pins (a fresh clone, a CI runner, an emptied
-cache). It reads `labelle.providers.lock` only, with no registry lookup and
-no preview, and downloads each pinned
-`https://codeload.github.com/<repo>/tar.gz/<commit>` that is not already
-cached and valid into `<LABELLE_HOME>/provider-archives/<sha256>.tar.gz`
-(`LABELLE_HOME` defaults to `~/.labelle`). Every download is verified
-against the lock's sha256 before anything is cached, and the run is all or
-nothing: one mismatch or failed download names the package, fails, and
-caches nothing. A cached archive that verifies is left alone, so a second run
-is a no-op; a damaged one is replaced only by bytes that verify. It never
-writes the lock, extracts nothing and runs no package code. `--offline`
+cache). It runs inside a project: `project.labelle` only locates the project
+root (it is not parsed), and the project's `labelle.providers.lock`, which
+always sits next to it, is the one input. There is no registry lookup and no
+preview. Outside a project it fails with `ProjectRequired`. It downloads each
+pinned `https://codeload.github.com/<repo>/tar.gz/<commit>` that is not
+already cached and valid into `<LABELLE_HOME>/provider-archives/<sha256>.tar.gz`
+(`LABELLE_HOME` defaults to `~/.labelle`). The cache is per-archive atomic
+and verified-only: only bytes that hash to the lock's sha256 are ever cached,
+each archive by one rename of a verified temporary file. Every download is
+verified before the first rename, so a mismatch or a failed download names
+the package, fails, and adds nothing to the cache. A failure while moving
+verified archives into place can leave the set partly fetched; that is
+harmless, since every cached archive verifies, and the next run fetches the
+rest. A cached archive that verifies is left alone, so a second run is a
+no-op; a damaged one (wrong hash, or larger than any archive) is replaced
+only by bytes that verify. It never writes the lock, extracts nothing and
+runs no package code. `--offline`
 downloads nothing and only verifies the cache. A bare `labelle install` in a
 project that has a providers lock runs the same fetch after the assembler's
 package install.

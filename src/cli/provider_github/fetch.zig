@@ -8,12 +8,16 @@
 //! and is kept only if its bytes hash to the pinned sha256. It never writes
 //! the lock, never extracts an archive and never runs package code.
 //!
-//! All or nothing: every needed archive is downloaded to a temporary file
-//! and verified first; only when all of them verify are they renamed into
-//! the cache. One failure (a download error or a hash mismatch) removes every
-//! temporary file, names the package and caches nothing. An archive that is
-//! already cached and verifies is left alone, so a second run is a no-op; a
-//! cached archive that does not verify is replaced by the verified bytes.
+//! Per-archive atomic, verified-only: only bytes that hash to the lock's
+//! sha256 ever reach the cache, and each archive lands there by one rename
+//! of a verified temporary file, so a cached archive is never partial or
+//! unverified. Every needed archive is downloaded and verified before the
+//! first rename, so a failed download or a hash mismatch names the package
+//! and adds nothing to the cache. A failed rename can leave the set partly
+//! fetched; that is harmless (every cached archive verifies) and the next
+//! run fetches the rest. An archive that is already cached and verifies is
+//! left alone, so a second run is a no-op; a cached archive that does not
+//! verify is replaced by the verified bytes.
 const std = @import("std");
 const config = @import("../config.zig");
 const util = @import("../util.zig");
@@ -62,7 +66,7 @@ pub fn plan(a: std.mem.Allocator, pins: []const Pin) ![]Step {
         // the caller's arena would keep every archive read alive.
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
-        const action: Action = if (read(scratch.allocator(), path, max_archive_size)) |bytes|
+        const action: Action = if (read(scratch.allocator(), path, archive_mod.cache_read_limit)) |bytes|
             (if (util.sha256Matches(bytes, pin.sha256)) .cached else .replace)
         else |err| switch (err) {
             error.FileNotFound => .download,
@@ -119,16 +123,16 @@ pub fn fetch(a: std.mem.Allocator, root: []const u8, offline: bool, download: Do
     if (!missing and !damaged) return summary;
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    var temps: std.ArrayList(struct { tmp: []const u8, path: []const u8 }) = .empty;
-    // Until the commit below, every temporary file is removed on any exit:
-    // a failed fetch caches nothing.
+    var temps: std.ArrayList(struct { tmp: []const u8, path: []const u8, pin: Pin }) = .empty;
+    // Until the renames below, every temporary file is removed on any exit:
+    // a failed download or verification adds nothing to the cache.
     var committed = false;
     defer if (!committed) for (temps.items) |t| cwd.deleteFile(io, t.tmp) catch {};
     for (steps) |step| {
         if (step.action == .cached) continue;
         try cwd.createDirPath(io, std.fs.path.dirname(step.path).?);
         const tmp = try uniqueName(a, step.path);
-        try temps.append(a, .{ .tmp = tmp, .path = step.path });
+        try temps.append(a, .{ .tmp = tmp, .path = step.path, .pin = step.pin });
         const url = try step.pin.archiveUrl(a);
         std.debug.print("  fetching {s} {s}: {s}\n", .{ step.pin.package, step.pin.version, url });
         download(a, url, tmp) catch |err| {
@@ -147,11 +151,14 @@ pub fn fetch(a: std.mem.Allocator, root: []const u8, offline: bool, download: Do
             return error.ProviderArchiveHashMismatch;
         }
     }
-    // Every archive verified: commit them. A rename replaces a damaged
-    // cached archive in one step.
+    // Every archive verified: commit each by one rename (which also replaces
+    // a damaged cached archive in one step). A failed rename stops here with
+    // the earlier archives cached: each of them verified, so nothing is rolled
+    // back, and the temporaries not yet renamed are removed.
     committed = true;
     for (temps.items) |t| {
         std.Io.Dir.renameAbsolute(t.tmp, t.path, io) catch |err| {
+            std.debug.print("labelle: provider '{s}' {s}: the verified archive could not be moved into the cache at {s} ({s}); the {d} archive(s) cached before it are verified and kept. Run `labelle providers fetch` again.\n", .{ t.pin.package, t.pin.version, t.path, @errorName(err), summary.fetched });
             for (temps.items) |left| cwd.deleteFile(io, left.tmp) catch {};
             return err;
         };
@@ -375,4 +382,66 @@ test "provider fetch: offline only verifies, and a project without a lock has no
     const verified = try fetch(a, fx.root, true, Served.download);
     try std.testing.expectEqual(@as(usize, 1), verified.cached);
     try std.testing.expectEqual(@as(usize, 1), Served.requests);
+}
+
+const Blocked = struct {
+    /// The archive path `download` turns into a non-empty directory, so its
+    /// commit rename fails after every archive verified.
+    var path: ?[]const u8 = null;
+
+    fn download(a: std.mem.Allocator, url: []const u8, dest: []const u8) anyerror!void {
+        try Served.download(a, url, dest);
+        if (path) |blocked| {
+            const io = config.globalIo();
+            try std.Io.Dir.cwd().createDirPath(io, blocked);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ blocked, "occupied" }), .data = "" });
+        }
+    }
+};
+
+test "provider fetch: a failed commit keeps only verified archives, each whole, and no temporaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+    defer Blocked.path = null;
+    const first = try Fixture.pin(a, "first", '1', "first bytes");
+    const second = try Fixture.pin(a, "second", '2', "second bytes");
+    try Fixture.serve(a, first, "first bytes");
+    try Fixture.serve(a, second, "second bytes");
+    const lock = try fx.writeLock(a, &.{ first, second });
+    Blocked.path = try archivePath(a, second);
+    // Both downloads verify; the second rename then fails on the directory.
+    if (fetch(a, fx.root, false, Blocked.download)) |_| return error.TestExpectedError else |_| {}
+    try std.testing.expectEqual(@as(usize, 2), Served.requests);
+    // The first archive is cached whole and verified; nothing else is in the
+    // cache (the blocking directory aside): no temporary survived.
+    const kept = (try Fixture.cachedBytes(a, first)).?;
+    try std.testing.expect(util.sha256Matches(kept, first.sha256));
+    try std.testing.expectEqual(@as(usize, 2), try fx.cacheEntries(a));
+    try std.testing.expectEqualStrings(lock, try read(a, try std.fs.path.join(a, &.{ fx.root, lock_name }), 1024 * 1024));
+    // Once the obstruction is gone the next run fetches only the rest.
+    try std.Io.Dir.cwd().deleteTree(config.globalIo(), Blocked.path.?);
+    Blocked.path = null;
+    const rest = try fetch(a, fx.root, false, Served.download);
+    try std.testing.expectEqual(@as(usize, 1), rest.fetched);
+    try std.testing.expectEqual(@as(usize, 1), rest.cached);
+    try std.testing.expectEqualStrings("second bytes", (try Fixture.cachedBytes(a, second)).?);
+}
+
+test "provider fetch: a cached archive over the size bound is damaged, like a hash mismatch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+    const big = try Fixture.pin(a, "big", '1', "sixteen bytes!!!");
+    try Fixture.seed(a, big, "sixteen bytes!!!");
+    // The bytes verify, so only the size bound can classify them.
+    try std.testing.expectEqual(Action.cached, (try plan(a, &.{big}))[0].action);
+    const saved = archive_mod.cache_read_limit;
+    defer archive_mod.cache_read_limit = saved;
+    archive_mod.cache_read_limit = 8;
+    try std.testing.expectEqual(Action.replace, (try plan(a, &.{big}))[0].action);
 }

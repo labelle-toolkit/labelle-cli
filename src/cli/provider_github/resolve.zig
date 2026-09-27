@@ -305,3 +305,29 @@ test "provider github: a pinned archive missing from the cache fails closed unti
     const dep: @import("../project_config.zig").PluginDep = .{ .name = "fixture", .repo = "example/fixture", .version = "1.0.0" };
     try std.testing.expectError(error.ProviderArchiveMissing, sources.projectDir(fx.root, dep));
 }
+
+test "provider github: an oversized cached archive is a hash mismatch in normal commands, not StreamTooLong" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    try fx.run(a, false);
+    try fx.run(a, true);
+    const archive_mod = @import("archive.zig");
+    const dep: @import("../project_config.zig").PluginDep = .{ .name = "fixture", .repo = "github.com/example/fixture", .version = "1.0.0" };
+    const saved = archive_mod.cache_read_limit;
+    defer archive_mod.cache_read_limit = saved;
+    // The cached bytes verify; only the lowered bound makes them oversized,
+    // so the size path is the one taken, and it reports as damage.
+    archive_mod.cache_read_limit = 16;
+    {
+        var sources: Sources = .{ .a = a };
+        defer sources.deinit();
+        try std.testing.expectError(error.ProviderArchiveHashMismatch, sources.projectDir(fx.root, dep));
+    }
+    archive_mod.cache_read_limit = saved;
+    var sources: Sources = .{ .a = a };
+    defer sources.deinit();
+    try std.testing.expect((try sources.projectDir(fx.root, dep)) != null);
+}

@@ -113,7 +113,7 @@ pub const Sources = struct {
             return self.fromPin(pin, false) catch |err| {
                 switch (err) {
                     error.ProviderArchiveMissing => std.debug.print("labelle: provider '{s}' {s} is pinned in {s} but its archive is not cached; run `labelle providers fetch` to download the pinned archives\n", .{ pin.package, pin.version, lock_name }),
-                    error.ProviderArchiveHashMismatch => std.debug.print("labelle: the cached archive of provider '{s}' {s} does not match its pinned sha256; run `labelle providers fetch` to replace it with the pinned bytes\n", .{ pin.package, pin.version }),
+                    error.ProviderArchiveHashMismatch => std.debug.print("labelle: the cached archive of provider '{s}' {s} does not match its pinned sha256 (or is larger than any provider archive); run `labelle providers fetch` to replace it with the pinned bytes\n", .{ pin.package, pin.version }),
                     else => {},
                 }
                 return err;

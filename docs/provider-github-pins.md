@@ -92,16 +92,23 @@ labelle providers fetch            # download what is missing, verify, cache
 labelle providers fetch --offline  # download nothing; verify the cache only
 ```
 
-It reads the lock only (no registry, no preview, no `project.labelle`),
+Run it inside the project (the lock always sits next to `project.labelle`,
+which only locates the root and is not parsed; outside a project it fails
+with `ProjectRequired`). It reads the lock only (no registry, no preview),
 downloads each pin's `https://codeload.github.com/<repo>/tar.gz/<commit>`
 that is not already cached and valid, and verifies it against the pinned
 sha256 before caching it at `<LABELLE_HOME>/provider-archives/<sha256>.tar.gz`.
-One mismatch or failed download fails the whole run, names the package and
-caches nothing; the lock is never rewritten and no package code runs. An
-archive that is cached and verifies is not downloaded again, so the command is
-idempotent and safe to run on every CI job. A damaged cached archive is
-replaced by verified bytes (normal commands report it as
-`ProviderArchiveHashMismatch` and point here).
+The cache is per-archive atomic and verified-only: only bytes matching the
+lock are ever cached, each archive by one rename of a verified temporary
+file. Every download is verified before the first rename, so a mismatch or
+failed download names the package and adds nothing to the cache; a failure
+while moving verified archives into place may leave some of them cached,
+which is harmless (they verify) and the next run fetches the rest. The lock
+is never rewritten and no package code runs. An archive that is cached and
+verifies is not downloaded again, so the command is idempotent and safe to
+run on every CI job. A damaged cached archive (wrong hash, or larger than any
+provider archive) is replaced by verified bytes; normal commands report it
+as `ProviderArchiveHashMismatch` and point here.
 
 `labelle install` (no arguments, in a project) runs the same fetch after the
 assembler has installed the project's packages, when the project has a
@@ -181,8 +188,8 @@ temporary-source cleanup, old-cache isolation, failed-resolution atomicity,
 unsafe entries, stale pins and explicit version updates. It also covers the
 project repo forms (`github.com/<owner>/<name>` and the bare form write the
 same lock; another host is `NonGitHubProviderRepository`) and
-`labelle providers fetch` on an empty cache (fail-closed hash mismatch that
-caches nothing, verified fetch, idempotent re-run, `--offline`, the damaged
+`labelle providers fetch` on an empty cache (running outside a project,
+fail-closed hash mismatch that caches nothing, verified fetch, idempotent re-run, `--offline`, the damaged
 archive repair and `labelle install`), with a stand-in `curl` on `PATH`
 serving the codeload URL from a local file on POSIX hosts. Both subprocess suites
 run on all three CI hosts. `zig build test-provider-dispatch` runs the

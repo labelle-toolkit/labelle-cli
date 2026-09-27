@@ -34,7 +34,7 @@ pub fn printHelp() void {
         \\  check [dir]          Lint packs for §6 convention violations (Packs RFC)
         \\  plugins [dir]        List attached plugins with version, license, and author
         \\  providers resolve [providers.json] [--accept] [--offline]  Preview or pin GitHub providers for this project
-        \\  providers fetch [--offline]  Download the provider archives labelle.providers.lock pins (verified against the lock; no registry, no lock change); `--offline` only verifies the cache
+        \\  providers fetch [--offline]  Inside a project, download the provider archives its labelle.providers.lock pins (only verified bytes are cached, each archive atomically; no registry, no lock change); `--offline` only verifies the cache
         \\  doctor [dir] [--fix] [--json]  Check build requirements (SDL2, Zig, emsdk); `--fix` provisions, `--json` emits a capability report
         \\  help                 Show this help
         \\  version              Show CLI version

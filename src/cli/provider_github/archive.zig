@@ -33,13 +33,22 @@ pub fn download(a: std.mem.Allocator, url: []const u8, dest: []const u8, max_siz
     }
 }
 
+/// The bound the cache reads apply: `max_archive_size`, lowered only by
+/// tests so an oversized archive needs no 128 MiB fixture.
+pub var cache_read_limit: usize = max_archive_size;
+
 /// Verify bytes on every read, including cache hits. A mismatch never refetches
-/// silently and never changes a pin. Delete the damaged archive and resolve again.
+/// silently and never changes a pin; `labelle providers fetch` replaces a
+/// damaged cached archive with the pinned bytes. A cached file over the size
+/// bound cannot be the pinned archive, so it is the same
+/// `ProviderArchiveHashMismatch` (as `fetch.plan` classifies it), never a
+/// bare `StreamTooLong`.
 pub fn archive(a: std.mem.Allocator, pin: Pin, allow_download: bool) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     const path = try archivePath(a, pin);
-    const bytes = read(a, path, max_archive_size) catch |err| blk: {
+    const bytes = read(a, path, cache_read_limit) catch |err| blk: {
+        if (err == error.StreamTooLong) return error.ProviderArchiveHashMismatch;
         if (err != error.FileNotFound) return err;
         if (!allow_download) return error.ProviderArchiveMissing;
         try cwd.createDirPath(io, std.fs.path.dirname(path).?);

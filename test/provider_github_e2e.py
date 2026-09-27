@@ -364,6 +364,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     err = run("providers", "fetch", "extra", code=1).stderr
     assert "InvalidProviderArguments" in err, err
     run("providers", "fetch", "--help")
+    # The lock lives next to project.labelle: outside a project, fetch says so.
+    outside = subprocess.run([cli, "providers", "fetch"], cwd=base, env=env, capture_output=True, text=True, timeout=180)
+    assert outside.returncode == 1 and "ProjectRequired" in outside.stderr and "not inside a labelle project" in outside.stderr, outside.stderr
+    checks += 1
     if os.name != "nt":
         # A stand-in `curl` first on PATH serves the codeload URL from a local
         # file, so the CLI's real download path runs without the network.

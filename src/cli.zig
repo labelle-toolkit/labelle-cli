@@ -82,9 +82,10 @@ fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterato
         "  Without --accept: preview pins and record them in .labelle/providers.preview.json.\n" ++
         "  --accept: pin only what that preview recorded; a changed registry is rejected.\n" ++
         "Usage: labelle providers fetch [--offline]\n" ++
-        "  Download the archives labelle.providers.lock pins that are not cached yet, verified\n" ++
-        "  against the lock's sha256 (no registry, no lock change, no package code); a mismatch\n" ++
-        "  caches nothing. --offline downloads nothing and only verifies the cache.\n";
+        "  Inside a project: download the archives its labelle.providers.lock pins that are not\n" ++
+        "  cached and valid. Only bytes verified against the lock's sha256 are cached, each archive\n" ++
+        "  atomically (no registry, no lock change, no package code; project.labelle only locates\n" ++
+        "  the project root). --offline downloads nothing and only verifies the cache.\n";
     const sub = args.next() orelse {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -112,7 +113,12 @@ fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterato
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const root = try provider_dispatch.projectRoot(a) orelse return error.ProjectRequired;
+    const root = try provider_dispatch.projectRoot(a) orelse {
+        // The providers lock lives next to project.labelle, so both
+        // operations run inside a project; `fetch` parses nothing of it.
+        std.debug.print("labelle providers {s}: not inside a labelle project (no project.labelle here or in any parent directory). Run it from the project whose {s} it should use.\n", .{ sub, provider_github.lock_name });
+        return error.ProjectRequired;
+    };
     if (is_fetch) {
         _ = try provider_github.fetchCommand(a, root, offline, true);
         return 0;
