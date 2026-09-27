@@ -134,6 +134,11 @@ pub fn setFlagOverride(path: ?[]const u8) void {
     _flag_override = path;
 }
 
+/// The recorded `--zig <path>` flag, or null.
+pub fn flagOverride() ?[]const u8 {
+    return _flag_override;
+}
+
 /// Look up the `LABELLE_ZIG` path override. Heap-owned on success (caller
 /// frees), null when unset. Mirrors `assembler.lookupOverride`.
 pub fn lookupEnvOverride(allocator: std.mem.Allocator) !?[]u8 {
@@ -1025,7 +1030,8 @@ const MiniFixture = struct {
         var gsig_b64: [100]u8 = undefined;
         const gsig_b64_s = Enc.encode(&gsig_b64, &gsig.toBytes());
 
-        const sig_text = try std.fmt.allocPrint(alloc,
+        const sig_text = try std.fmt.allocPrint(
+            alloc,
             "untrusted comment: x\n{s}\ntrusted comment: {s}\n{s}\n",
             .{ sig_b64_s, trusted_comment, gsig_b64_s },
         );

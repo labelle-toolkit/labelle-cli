@@ -147,8 +147,16 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     var do_fix = false;
     var as_json = false;
     var core_only = false;
-    for (cmd_args) |arg| {
-        if (std.mem.eql(u8, arg, "--fix")) {
+    var i: usize = 0;
+    while (i < cmd_args.len) : (i += 1) {
+        const arg = cmd_args[i];
+        if (try zigFlag(cmd_args, &i)) |path| {
+            // `--zig <path>` / `--zig=<path>`, as `labelle build` takes it:
+            // the compiler the core check reports and the provider doctors'
+            // tools build with. `LABELLE_ZIG` still wins. The slice borrows
+            // argv, which lives for the whole process.
+            zig_toolchain.setFlagOverride(path);
+        } else if (std.mem.eql(u8, arg, "--fix")) {
             do_fix = true;
         } else if (std.mem.eql(u8, arg, "--core-only")) {
             // Skip the pinned providers' doctors (see provider_doctor.zig).
@@ -159,7 +167,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
             // single-line `{"capabilities":[…]}` and nothing else.
             as_json = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("labelle doctor: unknown option '{s}'\n  usage: labelle doctor [dir] [--fix] [--json] [--core-only]\n", .{arg});
+            std.debug.print("labelle doctor: unknown option '{s}'\n  usage: labelle doctor [dir] [--fix] [--json] [--core-only] [--zig <path>]\n", .{arg});
             return error.InvalidArgument;
         } else {
             project_dir = arg;
@@ -293,6 +301,27 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     if (code != 0) std.process.exit(code);
 }
 
+// ── `--zig` ─────────────────────────────────────────────────────────────
+
+/// `--zig <path>` or `--zig=<path>` at `args[i.*]`: the path (advancing `i`
+/// past a separate value), or null when the argument is something else.
+/// A missing or empty path is `error.InvalidArgument`.
+fn zigFlag(args: []const []const u8, i: *usize) !?[]const u8 {
+    const arg = args[i.*];
+    const path = if (std.mem.startsWith(u8, arg, "--zig="))
+        arg["--zig=".len..]
+    else if (std.mem.eql(u8, arg, "--zig")) blk: {
+        if (i.* + 1 >= args.len) break :blk "";
+        i.* += 1;
+        break :blk args[i.*];
+    } else return null;
+    if (path.len == 0) {
+        std.debug.print("labelle doctor: --zig requires a path (e.g. --zig /opt/zig/zig)\n", .{});
+        return error.InvalidArgument;
+    }
+    return path;
+}
+
 // ── Project scope ───────────────────────────────────────────────────────
 
 const Scope = struct {
@@ -354,6 +383,9 @@ fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
     // reports the target project's Zig, not the CWD's (cli#279 review).
     if (zig_toolchain.lookupEnvOverride(arena) catch null) |path| {
         return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "LABELLE_ZIG override: {s}", .{path}) catch "LABELLE_ZIG override" };
+    }
+    if (zig_toolchain.flagOverride()) |path| {
+        return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "--zig override: {s}", .{path}) catch "--zig override" };
     }
     const resolved = zig_toolchain.resolveRequiredVersion(arena, project_dir) catch {
         return .{ .name = "Zig toolchain", .ok = false, .hint = "could not resolve the required Zig version" };
@@ -575,6 +607,25 @@ fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "doctor: --zig is consumed with its value, in both spellings, and never read as the project dir" {
+    const args = [_][]const u8{ "some/dir", "--zig", "/opt/zig/zig", "--zig=/other/zig", "--fix" };
+    var i: usize = 0;
+    try std.testing.expectEqual(@as(?[]const u8, null), try zigFlag(&args, &i));
+    i = 1;
+    try std.testing.expectEqualStrings("/opt/zig/zig", (try zigFlag(&args, &i)).?);
+    // The separate value was consumed: the loop resumes after it.
+    try std.testing.expectEqual(@as(usize, 2), i);
+    i = 3;
+    try std.testing.expectEqualStrings("/other/zig", (try zigFlag(&args, &i)).?);
+    try std.testing.expectEqual(@as(usize, 3), i);
+    i = 4;
+    try std.testing.expectEqual(@as(?[]const u8, null), try zigFlag(&args, &i));
+    for ([_][]const []const u8{ &.{"--zig"}, &.{"--zig="} }) |bad| {
+        i = 0;
+        try std.testing.expectError(error.InvalidArgument, zigFlag(bad, &i));
+    }
+}
 
 test "doctor: run from a project subdirectory, both halves use the project root" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -253,4 +253,44 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert direct.returncode == 1 and "InvalidProviderConfigJson" in direct.stderr, (direct.returncode, direct.stderr)
     assert len(invocations("beta-pkg")) == 11
 
+    # An uncached unpinned package the project already uses as a provider
+    # (a provider_config entry names it) is a FAIL, not a WARN.
+    (project / "providers" / "alpha.json").write_text('{"label": "alpha settings"}')
+    shutil.rmtree(cached)
+    write_project([unpinned])
+    referenced = run()
+    assert "[ WARN ] not installed yet" in section(referenced.stderr, "epsilon", "package")
+    write_project([unpinned], extra=', .provider_config = .{ .{ .package = "epsilon", .file = "providers/epsilon.json" } }')
+    referenced = run()
+    assert referenced.returncode == 1, (referenced.returncode, referenced.stderr)
+    ref_section = section(referenced.stderr, "epsilon")
+    assert "[ FAIL ] not verified: remote package the project uses as a provider" in ref_section, ref_section
+    assert "labelle providers resolve" in ref_section, ref_section
+    assert "Provider doctors: 3 checked, 1 failed (epsilon)" in referenced.stderr, referenced.stderr
+    write_project()
+
+    # `labelle doctor --zig <path>` is the compiler for both halves, as for
+    # `labelle build` (LABELLE_ZIG unset here; it would win).
+    no_env_zig = {k: v for k, v in env.items() if k != "LABELLE_ZIG"}
+    flag_home = base / "flag-home"
+    before = (len(invocations("alpha-pkg")), len(invocations("beta-pkg")))
+    flagged = subprocess.run([cli, "doctor", f"--zig={zig}"], cwd=project, env=dict(no_env_zig, LABELLE_HOME=str(flag_home)), text=True, capture_output=True, timeout=600)
+    assert "--zig override: " + zig in flagged.stderr, flagged.stderr
+    assert "Provider doctors: 2 checked, 0 failed" in flagged.stderr, flagged.stderr
+    assert not (flag_home / "zig").exists(), "a managed Zig was provisioned despite --zig"
+    assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (before[0] + 1, before[1] + 1)
+    # A --zig path that does not exist fails every provider doctor, and the
+    # host is resolved once for all of them.
+    dead_zig = str(base / "nonexistent-zig")
+    dead = subprocess.run([cli, "doctor", "--zig", dead_zig], cwd=project, env=no_env_zig, text=True, capture_output=True, timeout=600)
+    assert dead.returncode == 1, (dead.returncode, dead.stderr)
+    assert dead.stderr.count("[ FAIL ] labelle alpha doctor: ProviderCompilerMissing") == 1, dead.stderr
+    assert dead.stderr.count("[ FAIL ] labelle beta doctor: ProviderCompilerMissing") == 1, dead.stderr
+    assert dead.stderr.count("host compiler override does not exist") == 1, dead.stderr
+    # `labelle <ns> <cmd>` honours LABELLE_ZIG only: everything after the
+    # command, `--zig` included, belongs to the provider.
+    passthrough = subprocess.run([cli, "alpha", "doctor", "--zig", dead_zig], cwd=project, env=env, text=True, capture_output=True, timeout=600)
+    assert passthrough.returncode == 0, (passthrough.returncode, passthrough.stderr)
+    assert json.loads((outputs / "alpha-pkg" / "capture.json").read_text())["args"] == ["--zig", dead_zig]
+
     print(f"provider doctor e2e: {checks} invocations OK")

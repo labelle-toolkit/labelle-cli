@@ -307,7 +307,7 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
                 std.debug.print("labelle {s} {s} — {s}\n", .{ namespace, name, cmd.help });
                 return 0;
             }
-            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items, .all);
+            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items, .all, null);
         }
         std.debug.print("labelle: unknown command '{s}' in provider namespace '{s}'\n", .{ name, namespace });
         printCommands(provider);
@@ -319,13 +319,13 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
 /// Run one provider command: the lock/integrity check, the provider settings,
 /// then the tool build and invocation. `labelle <ns> <cmd>` and the provider
 /// part of `labelle doctor` both come through here, so they cannot drift.
-pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8, scope: SettingsScope) !u8 {
+pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8, scope: SettingsScope, hosts: ?*HostCache) !u8 {
     const lock_path = try requirePinned(a, root, provider);
     const settings = switch (scope) {
         .all => try resolveSettings(a, root, cfg, providers, provider.meta.name),
         .selected => try resolveOwnSettings(a, root, cfg, provider.meta.name),
     };
-    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing);
+    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing, hosts);
 }
 
 /// Execution (a command or a hook) needs the project's ordinary lock to name
@@ -483,6 +483,31 @@ fn provisionZig(a: std.mem.Allocator, root: []const u8) anyerror![]u8 {
     return toolchain.resolveZig(a, root);
 }
 
+/// One host resolution per invocation, shared by several provider runs (the
+/// provider part of `labelle doctor`). The first `get` resolves; every later
+/// one returns the same host, or the same error, so a failed or offline
+/// provisioning is attempted once, not once per provider. `a` must outlive
+/// the cache (the host's paths live in it).
+pub const HostCache = struct {
+    resolve: *const fn (std.mem.Allocator, []const u8) anyerror!Host = resolveHost,
+    host: ?Host = null,
+    failure: ?anyerror = null,
+    /// Resolutions attempted (0 or 1).
+    calls: usize = 0,
+
+    pub fn get(self: *HostCache, a: std.mem.Allocator, root: []const u8) anyerror!Host {
+        if (self.host) |host| return host;
+        if (self.failure) |err| return err;
+        self.calls += 1;
+        const host = self.resolve(a, root) catch |err| {
+            self.failure = err;
+            return err;
+        };
+        self.host = host;
+        return host;
+    }
+};
+
 /// `resolveHost` over an injected provisioner (tests).
 pub fn resolveHostWith(a: std.mem.Allocator, root: []const u8, provision: *const fn (std.mem.Allocator, []const u8) anyerror![]u8) !Host {
     const io = config.globalIo();
@@ -621,8 +646,8 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
 
 /// A project command: Debug, human progress, output under
 /// `.labelle/providers/<package>`, trailing arguments verbatim.
-fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8) !u8 {
-    const host = try resolveHost(a, root);
+fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8, hosts: ?*HostCache) !u8 {
+    const host = if (hosts) |cache| try cache.get(a, root) else try resolveHost(a, root);
     var output: []const u8 = root;
     for ([_][]const u8{ ".labelle", "providers", provider.meta.name }) |segment| {
         output = try canonicalDir(a, try std.fs.path.join(a, &.{ output, segment }));
@@ -1012,5 +1037,24 @@ test "provider dispatch: the host compiler is provisioned like `labelle build`, 
     try std.testing.expectEqualStrings(root, Probe.seen);
     // An override naming no file is the one `ProviderCompilerMissing`.
     try std.testing.expectError(error.ProviderCompilerMissing, resolveHostWith(a, root, Probe.missing));
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "provider dispatch: a HostCache resolves once, and keeps a success or a failure" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var fail = true;
+        fn resolve(_: std.mem.Allocator, _: []const u8) anyerror!Host {
+            calls += 1;
+            if (fail) return error.ProbeOffline;
+            return .{ .zig = "/z", .cache_root = "/c", .global_cache = "/g", .packages = "/p" };
+        }
+    };
+    var failing: HostCache = .{ .resolve = Probe.resolve };
+    for (0..3) |_| try std.testing.expectError(error.ProbeOffline, failing.get(std.testing.allocator, "/proj"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    Probe.fail = false;
+    var working: HostCache = .{ .resolve = Probe.resolve };
+    for (0..3) |_| try std.testing.expectEqualStrings("/z", (try working.get(std.testing.allocator, "/proj")).zig);
     try std.testing.expectEqual(@as(usize, 2), Probe.calls);
 }
