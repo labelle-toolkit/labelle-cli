@@ -90,6 +90,14 @@ test "watch replan re-reads the project and provider manifests on every call" {
     try Manifest.write(tmp.dir, build_hook);
     try WatchReplan.run(&replan, &ctx);
     const good = replan.current.?;
+    // A manifest edit cannot silently add a server replacement to a
+    // running legacy watch session. Both checks keep the old plans.
+    try Manifest.write(tmp.dir, ".{ .id = \"server\", .step = .run, .target = \"wasm\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\" }");
+    try std.testing.expectError(error.LegacyWasmReplacement, WatchReplan.precheck(&replan, &ctx));
+    try std.testing.expectError(error.LegacyWasmReplacement, WatchReplan.run(&replan, &ctx));
+    try std.testing.expectEqual(good, replan.current.?);
+    try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
+    try Manifest.write(tmp.dir, build_hook);
 
     // The served target loses its owner (Codex P1 on #421). Each case
     // fails the replan with the cold pipeline's error and keeps the

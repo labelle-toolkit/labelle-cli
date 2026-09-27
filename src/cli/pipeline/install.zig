@@ -200,6 +200,10 @@ pub fn discoverAndPlan(
         .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
         .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
     };
+    if (command == .wasm_cmd and @import("args_resolve.zig").refuseLegacyWasmReplacement(hook_plans.run)) {
+        if (reporter) |r| r.finishFailed(1, "legacy wasm command conflicts with a provider run replacement");
+        return .{ .exit = 1 };
+    }
     // The labelle-assembler#378 boundary: the assembler generates only for
     // the schema platforms, so a provider target outside that enum can be
     // generated for only by its provider's `replace` hook on `generate`.

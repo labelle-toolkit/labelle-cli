@@ -18,6 +18,7 @@ const provider_contract = @import("../provider_contract.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
 const provider_hooks = @import("../provider_hooks.zig");
+const refuseLegacyWasmReplacement = @import("args_resolve.zig").refuseLegacyWasmReplacement;
 const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
 const resolveExportOutput = @import("export_output.zig").resolveExportOutput;
@@ -65,6 +66,8 @@ pub fn serveNoBuild(
         .resolved => |resolved| resolved,
         .refused => return 1,
     };
+    const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
+    if (refuseLegacyWasmReplacement(no_build_plan)) return 1;
     const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
     defer allocator.free(wasm_target);
     const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
@@ -83,9 +86,6 @@ pub fn serveNoBuild(
     const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
     defer allocator.free(project_web_dir);
 
-    // The run hooks are planned from the same discovery (`known`) the
-    // served target was just confirmed against, for the served name.
-    const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
     // The same wire `optimize` the building path reports for this
     // platform; there is no progress feed on this path.
     const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {

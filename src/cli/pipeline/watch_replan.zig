@@ -10,6 +10,8 @@ const provider_github = @import("../provider_github.zig");
 const provider_hooks = @import("../provider_hooks.zig");
 const provider_targets = @import("../provider_targets.zig");
 const WasmRebuildCtx = @import("watch.zig").WasmRebuildCtx;
+const refuseLegacyWasmReplacement = @import("args_resolve.zig").refuseLegacyWasmReplacement;
+const refuseKnownLegacyWasmReplacement = @import("args_resolve.zig").refuseKnownLegacyWasmReplacement;
 const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
 
@@ -173,6 +175,7 @@ pub const WatchReplan = struct {
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         const run_plan = try provider_hooks.plan(a, providers, .run, ctx.hooks.target);
+        if (refuseLegacyWasmReplacement(run_plan)) return error.LegacyWasmReplacement;
         // The lock follows the re-read project once the target is confirmed
         // and the plans are good — the cold pipeline's order — and before
         // any hook runs, since each hook verifies its pin against it.
@@ -206,7 +209,9 @@ pub const WatchReplan = struct {
     /// (`earlyTargetCheck`), on a scratch arena freed before returning: no
     /// install, no lock write, no plan, nothing installed on `ctx`.
     ///
-    /// It refuses only what no prebuild step can mend:
+    /// Known run replacements are refused before prebuild because a legacy
+    /// watch session cannot switch server implementations while running.
+    /// Ownership refusals are limited to what no prebuild step can mend:
     /// - an owner that is a remote package without an integrity pin
     ///   (`UnverifiedTargetOwner`) — a pin lives in `project.labelle`;
     /// - no owner at all (`NoProviderForTarget`) while the project declares
@@ -243,6 +248,7 @@ pub const WatchReplan = struct {
         var sources: provider_github.Sources = .{ .a = a, .shared = self.extractionCache(), .extract = false };
         defer sources.deinit();
         const view = try provider_dispatch.discoverAll(a, ctx.hooks.root, cfg, &sources, .unknown);
+        if (try refuseKnownLegacyWasmReplacement(a, view.providers, ctx.hooks.target)) return error.LegacyWasmReplacement;
         if (view.unresolved.len != 0) return;
         if (provider_targets.resolve(view.providers, ctx.hooks.target)) |_| {
             return;
