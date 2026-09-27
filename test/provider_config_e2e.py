@@ -71,6 +71,27 @@ with tempfile.TemporaryDirectory(prefix="labelle-settings-") as temp:
         finally:
             build.write_text(original)
 
+    def reject_pipeline(entries, error, *needles):
+        """A project-scoped pipeline command (`generate`, `build`, `run`)
+        reads project.labelle verbosely: an invalid mapping must fail with
+        the project path, the error and what is wrong, never silently
+        (Codex P2 on #460)."""
+        config(entries)
+        for command in ("generate", "build"):
+            result = run(command, str(project), code=1)
+            assert error in result.stderr, (command, result.stderr)
+            assert "'" + str(project / "project.labelle") + "'" in result.stderr, (command, result.stderr)
+            assert "invalid .provider_config" in result.stderr, (command, result.stderr)
+            for needle in needles:
+                assert needle in result.stderr, (command, needle, result.stderr)
+
+    reject_pipeline([entry(), entry()], "DuplicateProviderConfig", "package 'fixture' is mapped more than once")
+    reject_pipeline([entry(package="undeclared")], "UndeclaredProviderConfig", "package 'undeclared' is not declared in .plugins")
+    reject_pipeline([entry(package="")], "InvalidProviderConfigPackage", "entry #1 has an empty .package")
+    reject_pipeline([entry(extra=", .typo = true")], "ParseZon", "malformed mapping record", "typo")
+    for bad in ("../outside.json", "/absolute.json", "C:/absolute.json", "a//b.json"):
+        reject_pipeline([entry(file=bad)], "InvalidProviderConfigPath", "package 'fixture' has invalid .file '" + bad + "'")
+
     config([entry()])
     run("probe", "inspect")
     first = json.loads(capture.read_text())

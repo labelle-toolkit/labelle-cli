@@ -185,6 +185,12 @@ pub const WatchReplan = struct {
         // and their storage — untouched.
         ctx.hooks.providers = providers;
         ctx.hooks.cfg = cfg;
+        // The re-read `.prebuild` steps too, or a removed or changed step
+        // keeps running from the startup config on every later rebuild
+        // (Codex P2 on #460). They live on `next`'s arena, like `cfg`; the
+        // slice they replace (the startup parse, or `previous`'s arena) is
+        // not read again once this assignment lands.
+        ctx.prebuild_steps = cfg.prebuild;
         ctx.generate_plan = generate_plan;
         ctx.build_plan = build_plan;
         next.run_after = run_plan.after;
