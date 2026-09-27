@@ -44,8 +44,13 @@ exe_suffix = ".exe" if os.name == "nt" else ""
 # it sleep forever, so a `--timeout` run ends in the watchdog's kill. `install`
 # populates the package cache from
 # FAKE_INSTALL_PLUGIN="<src>|<dest>" when set (a remote package landing in
-# the ordinary cache), and only prints otherwise.
-FAKE_ASSEMBLER = '''import os, shutil, sys
+# the ordinary cache), and only prints otherwise. FAKE_WITH_ZON=1 adds a
+# `build.zig.zon` with a valid fingerprint, so the CLI's generation-time
+# fingerprint pass configures the build; PROBE_CONFIGURE_LOG=1 in a zig
+# invocation's environment makes the build's configure step append
+# `<optimize>|<PROBE_TOOLCHAIN or ->|<first PATH entry>` to
+# `<target>/configure.log`, one line per zig invocation that configured it.
+FAKE_ASSEMBLER = '''import os, shutil, sys, zlib
 from pathlib import Path
 argv = sys.argv[1:]
 if argv and argv[0] == "--protocol-version":
@@ -64,12 +69,30 @@ elif argv and argv[0] == "generate":
     (target / "build.zig").write_text(
         'const std = @import("std");\\n'
         'pub fn build(b: *std.Build) void {\\n'
+        '    const optimize = b.standardOptimizeOption(.{});\\n'
+        '    if (b.graph.environ_map.get("PROBE_CONFIGURE_LOG") != null) {\\n'
+        '        const log_path = b.pathFromRoot("configure.log");\\n'
+        '        const previous = std.Io.Dir.cwd().readFileAlloc(b.graph.io, log_path, b.allocator, .limited(65536)) catch "";\\n'
+        '        const value = b.graph.environ_map.get("PROBE_TOOLCHAIN") orelse "-";\\n'
+        '        const path_env = b.graph.environ_map.get("PATH") orelse "";\\n'
+        '        const head = path_env[0 .. std.mem.indexOfScalar(u8, path_env, std.fs.path.delimiter) orelse path_env.len];\\n'
+        '        const line = b.fmt("{s}{s}|{s}|{s}\\\\n", .{ previous, @tagName(optimize), value, head });\\n'
+        '        std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = log_path, .data = line }) catch @panic("configure.log");\\n'
+        '    }\\n'
         '    const exe = b.addExecutable(.{ .name = "game", .root_module = b.createModule(.{\\n'
         '        .root_source_file = b.path("main.zig"), .target = b.graph.host,\\n'
-        '        .optimize = b.standardOptimizeOption(.{}) }) });\\n'
+        '        .optimize = optimize }) });\\n'
         '    b.installArtifact(exe);\\n'
         '    b.installFile("data.txt", "bin/data.txt");\\n'
         '}\\n')
+    if os.environ.get("FAKE_WITH_ZON") == "1":
+        # A manifest with a VALID fingerprint for the name `game` (the CRC32
+        # of the name in the high half), so the CLI's fingerprint pass
+        # (`zig build --list-steps`) configures this build instead of
+        # stopping at the manifest check.
+        fingerprint = (zlib.crc32(b"game") << 32) | 0x1234ABCD
+        (target / "build.zig.zon").write_text(
+            '.{ .name = .game, .version = "0.0.0", .fingerprint = 0x%x, .paths = .{""} }\\n' % fingerprint)
     (target / "data.txt").write_text("original")
     body = "this is not zig\\n" if os.environ.get("FAKE_MAIN_BROKEN") == "1" else (
         'const std = @import("std");\\n'
@@ -95,8 +118,11 @@ def hook(id, step, when, target="desktop", after=None):
     return f'.{{ .id = "{id}", .step = .{step}, .target = "{target}", .when = .{when}, {TOOL}{ref} }}'
 
 
-def manifest(name, hooks, targets=(), contract=">=1.0.0 <2.0.0"):
+def manifest(name, hooks, targets=(), contract=">=1.0.0 <2.0.0", defaults=()):
     declared = f', .targets = .{{ {", ".join(json.dumps(t) for t in targets)} }}' if targets else ""
+    if defaults:
+        records = ", ".join(".{ .target = %s, .optimize = .%s }" % (json.dumps(t), o) for t, o in defaults)
+        declared += ", .target_defaults = .{ " + records + " }"
     return (f'.{{ .name = "{name}", .manifest_version = 2, .command_contract = "{contract}"{declared},\n'
             f'    .hooks = .{{ {", ".join(hooks)} }} }}')
 
@@ -154,7 +180,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "PROVIDER_PROBE_COPY", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN",
-                 "FAKE_GAME_HANG"):
+                 "FAKE_GAME_HANG", "PROVIDER_PROBE_ENV", "PROBE_TOOLCHAIN", "PROBE_CONFIGURE_LOG", "FAKE_WITH_ZON"):
         env.pop(knob, None)
     checks = 0
 
@@ -255,8 +281,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         assert e["optimize"] == "ReleaseSmall" and e["progress"] == "off", e
         assert Path(e["package_dir"]).name in ("fixture-a", "fixture-b"), e
         # Contract 1.2.0: every hook names the generated target dir; only
-        # `run`-step hooks carry the run options.
-        assert e["context"]["contract_version"] == "1.2.0", e
+        # `run`-step hooks carry the run options. 1.3.0 (the negotiated wire)
+        # adds the cache dir everywhere and an env_file on `before build`.
+        assert e["context"]["contract_version"] == "1.3.0", e
+        assert (e["context"]["env_file"] is not None) == (e["invocation"]["phase"] == "before"), e
         assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
         assert "run" not in e["context"], e
     ids = {e["invocation"]["id"]: e for e in entries}
@@ -596,6 +624,21 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert order(log(target_dir), "generate") == [("before", "c-gen-pre")], log(target_dir)
     assert exe.exists() and not remote_cache.exists(), "the pinned provider needed the ordinary cache"
     assert "hook 'fixture-c/c-pre'" in pinned.stderr, pinned.stderr
+    # Contract 1.3.0 `cache_dir`: keyed by the pinned repository, not by the
+    # project's spelling of it, created by the CLI and persistent. A second
+    # spelling of the same repository reaches the same directory, with what
+    # the provider left there intact.
+    pinned_cache = home / "providers" / "github.com" / "example" / "fixture-c"
+    c_ctx = [e for e in log(zig_out) if e["invocation"]["id"] == "c-pre"][0]["context"]
+    assert Path(c_ctx["cache_dir"]) == pinned_cache.resolve() and pinned_cache.is_dir(), c_ctx
+    (pinned_cache / "provider-state").write_text("kept")
+    declare('.{ .name = "fixture-c", .repo = "https://github.com/example/fixture-c.git", .version = "1.0.0" }')
+    reset()
+    run("build")
+    c_ctx = [e for e in log(zig_out) if e["invocation"]["id"] == "c-pre"][0]["context"]
+    assert Path(c_ctx["cache_dir"]) == pinned_cache.resolve(), c_ctx
+    assert (pinned_cache / "provider-state").read_text() == "kept"
+    declare(dep_c)
     # The compiler-order mechanism for (2): with the pin accepted, the same
     # dead LABELLE_ZIG is reached by the first hook and IS the failure.
     reset()
@@ -695,7 +738,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     replaced = run("run", *run_flags)
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     ctx = probe_context(probe_out, "deploy")
-    assert ctx["contract_version"] == "1.2.0", ctx
+    assert ctx["contract_version"] == "1.3.0", ctx
     assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000}, ctx
     assert Path(ctx["target_dir"]) == probe_dir.resolve() and Path(ctx["output_dir"]) == probe_out.resolve(), ctx
     assert "run options not passed" not in replaced.stderr, replaced.stderr
@@ -735,6 +778,137 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     plain = run("run", "--platform=probe-target")
     assert "run options not passed" not in plain.stderr, plain.stderr
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+
+    # ── contract 1.3.0: environment contributions (env_file) ──────────────
+    # fixture-a's `tc` hook runs `before generate` and, through the env_file
+    # its context names, contributes PROBE_TOOLCHAIN plus a PATH entry. The
+    # contribution must reach the generation-time fingerprint pass (`zig
+    # build --list-steps`, which configures the generated build and so is
+    # the first toolchain consumer), the compile and every later hook — and
+    # never a provider tool's own build: the fixture's build.zig panics when
+    # it sees PROBE_TOOLCHAIN, so every hook below running at all proves it.
+    toolbin = base / "probe-toolchain-bin"
+    toolbin.mkdir()
+    contribution = base / "contribution.json"
+    contribution.write_text(json.dumps({"set": [{"name": "PROBE_TOOLCHAIN", "value": "from-tc"}], "path_prepend": [str(toolbin)]}))
+    ENV_HOOKS = [hook("tc", "generate", "before"), hook("gen-post", "generate", "after"),
+                 hook("pre", "build", "before"), hook("stamp", "build", "after")]
+    a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
+    declare(dep_a)
+    configure_log = target_dir / "configure.log"
+    probe_env = {"FAKE_WITH_ZON": "1", "PROBE_CONFIGURE_LOG": "1"}
+    contributing = dict(probe_env, PROVIDER_PROBE_ENV=f"tc|{contribution}")
+
+    def configured():
+        return [line.split("|") for line in configure_log.read_text().splitlines()] if configure_log.exists() else []
+
+    def same_dir(got, want):
+        return got is not None and os.path.normcase(os.path.normpath(got)) == os.path.normcase(os.path.normpath(str(want)))
+
+    def by_id(step_dir):
+        return {e["invocation"]["id"]: e for e in log(step_dir)}
+
+    # The control: with nothing contributed the fingerprint pass configures
+    # the build with the variable unset, so every value below is the hook's.
+    reset()
+    run("generate", extra_env=probe_env)
+    assert [c[:2] for c in configured()] == [["Debug", "-"]], configured()
+    # `labelle generate`: the fingerprint pass is its only zig invocation.
+    reset()
+    generated = run("generate", extra_env=contributing)
+    lines = configured()
+    assert [c[:2] for c in lines] == [["Debug", "from-tc"]], lines
+    assert same_dir(lines[0][2], toolbin), lines
+    assert generated.stderr.index("hook 'fixture-a/tc'") < generated.stderr.index("FIXTURE_GENERATE"), generated.stderr
+    gen_hooks = by_id(target_dir)
+    assert gen_hooks["tc"]["probe_toolchain"] is None, gen_hooks["tc"]  # ran before its own contribution
+    assert gen_hooks["gen-post"]["probe_toolchain"] == "from-tc" and same_dir(gen_hooks["gen-post"]["path_head"], toolbin), gen_hooks
+    # The env_file slots: before/after generate and before build; the path
+    # is a per-invocation temporary, gone once the hook's file was read.
+    for hook_id in ("tc", "gen-post"):
+        env_file = gen_hooks[hook_id]["context"]["env_file"]
+        assert env_file and os.path.isabs(env_file) and not os.path.exists(env_file), gen_hooks[hook_id]
+    # The provider's persistent cache dir: LABELLE_HOME/providers/<canonical
+    # id>, which for a local provider is keyed by its directory.
+    local_cache = Path(gen_hooks["tc"]["context"]["cache_dir"])
+    assert local_cache.is_dir() and local_cache.parent == (home / "providers" / "local").resolve(), local_cache
+    assert local_cache.name.startswith("fixture-a-"), local_cache
+    # `labelle build`: the fingerprint pass AND the compile see it, and so
+    # do the build hooks that run after the contributing one.
+    reset()
+    run("build", extra_env=contributing)
+    assert [c[:2] for c in configured()] == [["Debug", "from-tc"], ["Debug", "from-tc"]], configured()
+    assert all(same_dir(c[2], toolbin) for c in configured()), configured()
+    build_hooks = by_id(zig_out)
+    assert build_hooks["pre"]["probe_toolchain"] == "from-tc" and build_hooks["stamp"]["probe_toolchain"] == "from-tc", build_hooks
+    assert build_hooks["pre"]["context"]["env_file"] and build_hooks["stamp"]["context"]["env_file"] is None, build_hooks
+    assert Path(by_id(target_dir)["tc"]["context"]["cache_dir"]) == local_cache, "the cache dir moved between builds"
+    leftovers = home / "provider-env"
+    assert not leftovers.exists() or not list(leftovers.iterdir()), "an env_file directory was left behind"
+    # A hook removed between two builds leaves no value behind: the same
+    # command and knobs, only the manifest changed.
+    a_manifest.write_text(manifest("fixture-a", ENV_HOOKS[1:]))
+    reset()
+    run("build", extra_env=contributing)
+    assert [c[:2] for c in configured()] == [["Debug", "-"], ["Debug", "-"]], configured()
+    assert all(e["probe_toolchain"] is None for e in log(zig_out)), log(zig_out)
+    a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
+    # A malformed env_file fails before any compile, naming the hook.
+    malformed = base / "malformed.json"
+    malformed.write_text('{"set": [')
+    reset()
+    bad = run("build", code=1, extra_env=dict(probe_env, PROVIDER_PROBE_ENV=f"pre|{malformed}"))
+    assert "labelle: hook 'fixture-a/pre' wrote an invalid env_file: not a valid env_file document" in bad.stderr, bad.stderr
+    assert "build ok" not in bad.stderr and not exe.exists(), bad.stderr
+    assert [c[:2] for c in configured()] == [["Debug", "-"]], configured()  # the fingerprint pass only
+    assert "stamp" not in by_id(zig_out), log(zig_out)
+    # Before generation: an empty file stops the command before the assembler.
+    empty = base / "empty.json"
+    empty.write_text("")
+    reset()
+    bad = run("build", code=1, extra_env=dict(probe_env, PROVIDER_PROBE_ENV=f"tc|{empty}"))
+    assert "labelle: hook 'fixture-a/tc' wrote an invalid env_file: the file is empty" in bad.stderr, bad.stderr
+    assert "FIXTURE_GENERATE" not in bad.stderr and not configure_log.exists(), bad.stderr
+    # A reserved name is refused the same way.
+    reserved = base / "reserved.json"
+    reserved.write_text(json.dumps({"set": [{"name": "LABELLE_HOME", "value": str(base)}]}))
+    reset()
+    bad = run("build", code=1, extra_env=dict(probe_env, PROVIDER_PROBE_ENV=f"tc|{reserved}"))
+    assert "'LABELLE_HOME' is reserved by the CLI" in bad.stderr and "FIXTURE_GENERATE" not in bad.stderr, bad.stderr
+    # A hook that wrote a malformed file and then failed: its exit code is
+    # the outcome, and the file is not even read.
+    reset()
+    failed = run("build", code=7, extra_env=dict(probe_env, PROVIDER_PROBE_ENV=f"pre|{malformed}", PROVIDER_PROBE_FAIL="pre"))
+    assert "hook 'fixture-a/pre' failed (exit 7)" in failed.stderr and "invalid env_file" not in failed.stderr, failed.stderr
+
+    # ── contract 1.3.0: the target owner's optimize default ───────────────
+    # fixture-a owns `android` (a name the pinned assembler generates for, so
+    # the core compile runs) and declares `.target_defaults`: the compile
+    # gets `-Doptimize=ReleaseSafe` and every hook the same wire `optimize`.
+    # An explicit `--optimize` wins; without the default the mode is Zig's.
+    owned_dir = project / ".labelle" / "raylib_android"
+    owned_log = owned_dir / "configure.log"
+    OWNED = [hook("stamp-owned", "build", "after", target="android")]
+
+    def owned_build(*flags, defaults=(("android", "ReleaseSafe"),)):
+        a_manifest.write_text(manifest("fixture-a", OWNED, targets=["android"], defaults=defaults))
+        reset()
+        run("build", "--platform=android", *flags, extra_env={"PROBE_CONFIGURE_LOG": "1"})
+        lines = [line.split("|")[0] for line in owned_log.read_text().splitlines()]
+        wire = by_id(owned_dir / "zig-out")["stamp-owned"]["optimize"]
+        return lines, wire
+
+    assert owned_build() == (["ReleaseSafe"], "ReleaseSafe")
+    assert owned_build("--optimize=Debug") == (["Debug"], "Debug")
+    assert owned_build("--optimize=ReleaseFast") == (["ReleaseFast"], "ReleaseFast")
+    assert owned_build(defaults=()) == (["Debug"], "Debug"), "without the default the mode is Zig's"
+    # Only the target's owner declares its defaults, once per target.
+    a_manifest.write_text(manifest("fixture-a", OWNED, targets=["android"], defaults=(("desktop", "ReleaseSafe"),)))
+    assert "TargetDefaultRequiresOwnedTarget" in run("help").stderr
+    a_manifest.write_text(manifest("fixture-a", OWNED, targets=["android"], defaults=(("android", "ReleaseSafe"), ("android", "ReleaseFast"))))
+    assert "DuplicateTargetDefault" in run("help").stderr
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+    declare(dep_b, dep_a)
 
     # ── bundle ────────────────────────────────────────────────────────────
     reset()

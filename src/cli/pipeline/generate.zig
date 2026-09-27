@@ -173,14 +173,14 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         // would leave `labelle test` broken on the host after `labelle build
         // --docker`. Patch `tests/` directly when present.
         if (!parsed_args.docker) {
-            try runner.fixFingerprints(allocator, project_dir, cx.output_dir);
+            try runner.fixFingerprints(allocator, project_dir, cx.output_dir, &hook_site.env);
         } else {
             const tests_dir = try std.fs.path.join(allocator, &.{ cx.output_dir, "tests" });
             defer allocator.free(tests_dir);
             const tests_build_zig = try std.fs.path.join(allocator, &.{ tests_dir, "build.zig" });
             defer allocator.free(tests_build_zig);
             if (std.Io.Dir.cwd().access(config.globalIo(), tests_build_zig, .{})) |_| {
-                try runner.fixFingerprint(allocator, project_dir, tests_dir);
+                try runner.fixFingerprint(allocator, project_dir, tests_dir, &hook_site.env);
             } else |_| {}
         }
         // (`labelle.lock` was written before generation — see the provider

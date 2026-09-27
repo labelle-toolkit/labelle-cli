@@ -71,9 +71,13 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     assert Path(first["cwd"]) == project
     ctx = first["context"]
     # `>=1.0.0 <2.0.0` admits every additive v1 minor: the newest wire.
-    assert ctx["contract_version"] == "1.2.0" and ctx["target"] == "desktop"
+    assert ctx["contract_version"] == "1.3.0" and ctx["target"] == "desktop"
     # A command's 1.2.0 `target_dir` is an explicit null; `run` is hook-only.
     assert "target_dir" in ctx and ctx["target_dir"] is None and "run" not in ctx, ctx
+    # 1.3.0: a command gets its provider's persistent cache dir, created,
+    # under LABELLE_HOME; `env_file` is a hook-only key, null here.
+    assert "env_file" in ctx and ctx["env_file"] is None, ctx
+    assert Path(ctx["cache_dir"]).is_dir() and Path(ctx["cache_dir"]).parent.parent.resolve() == (home / "providers").resolve(), ctx
     assert ctx["invocation"] == {"kind": "command", "id": "inspect", "step": None, "phase": None}
     assert Path(ctx["package_dir"]) == provider
     assert Path(ctx["lock_file"]) == lock_file

@@ -17,6 +17,8 @@ const manifest = @import("provider_manifest.zig");
 const dispatch = @import("provider_dispatch.zig");
 const project = @import("project_config.zig");
 const progress = @import("progress.zig");
+const provider_env = @import("provider_env.zig");
+const config = @import("config.zig");
 
 pub const Planned = struct { provider: *const dispatch.Provider, hook: manifest.Hook, qualified: []const u8 };
 
@@ -264,12 +266,19 @@ pub const Site = struct {
     target_dir: []const u8,
     /// `labelle run`'s options, handed to the `run`-step hooks only as
     /// contract §2 `run` (wire `1.2.0`+). The pipeline sets it for the
-    /// `run` command; any other command's `run` hooks (a `wasm serve`)
-    /// receive the empty set. The CLI passes the platform-neutral
+    /// `run` command; any other command's `run` hooks (a legacy serve
+    /// subcommand) receive the empty set. The CLI passes the platform-neutral
     /// `LABELLE_*` pairs and maps nothing: how they reach the game on a
     /// provider's target is the provider's decision.
     run_options: ?contract.RunContext = null,
     host: ?dispatch.Host = null,
+    /// The environment the hooks of the CURRENT build contributed through
+    /// their `env_file` (contract §2, wire `1.3.0`+), merged in hook
+    /// execution order. Every later hook and replacement runs with it, and
+    /// the pipeline applies it to the fingerprint pass and the compile. A
+    /// rebuild `reset`s it first, so a hook that no longer runs leaves
+    /// nothing behind. The pipeline deinits it.
+    env: provider_env.Accumulator = .{},
     /// The tool launcher. A field only so the scratch-arena test below can
     /// observe which allocator a hook invocation receives without a host
     /// compiler; production never overrides it.
@@ -307,10 +316,19 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     for (list, locks) |planned, lock| {
         const provider = planned.provider.*;
         const settings = try dispatch.resolveSettings(a, site.root, site.cfg, site.providers, provider.meta.name);
+        const invocation: contract.Invocation = .{ .kind = .hook, .id = planned.hook.id, .step = step, .phase = phase };
+        // A fresh, private directory per invocation for the hook's
+        // `env_file`; the file itself does not exist until the hook writes
+        // it. Removed whatever happens.
+        const env_dir: ?[]const u8 = if (contract.envFileSlot(invocation)) try envDir(a, site.host.?) else null;
+        defer if (env_dir) |dir| std.Io.Dir.cwd().deleteTree(config.globalIo(), dir) catch |err| {
+            std.debug.print("labelle: could not remove hook environment directory '{s}': {s}\n", .{ dir, @errorName(err) });
+        };
+        const env_file: ?[]const u8 = if (env_dir) |dir| try std.fs.path.join(a, &.{ dir, "env.json" }) else null;
         if (site.reporter) |r| r.beginPhaseOrStep(progressPhase(step), try std.fmt.allocPrint(a, "hook {s}", .{planned.qualified}));
         std.debug.print("labelle: running {s} hook '{s}' for {s} ({s})\n", .{ @tagName(phase), planned.qualified, @tagName(step), site.target });
         const code = try site.run_tool(a, site.host.?, site.root, provider, .{ .build_step = planned.hook.build_step, .executable = planned.hook.executable }, .{
-            .invocation = .{ .kind = .hook, .id = planned.hook.id, .step = step, .phase = phase },
+            .invocation = invocation,
             .needs_project = true,
             .target = site.target,
             .lock_file = lock,
@@ -323,15 +341,55 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
             .build_number = if (step == .bundle) site.build_number else null,
             .target_dir = target_dir,
             .run_options = run_options,
+            .env_file = env_file,
+            .env = &site.env,
         });
         if (site.reporter) |r| r.clearSpinner();
         if (code != 0) {
+            // Whatever a failed hook wrote to its env_file is ignored: the
+            // hook's failure is the outcome.
             std.debug.print("labelle: hook '{s}' failed (exit {d})\n", .{ planned.qualified, code });
             if (site.reporter) |r| r.finishFailed(code, "hook failed");
             return code;
         }
+        if (env_file) |path| try absorbEnvFile(site, a, planned.qualified, path);
     }
     return 0;
+}
+
+/// `<LABELLE_HOME>/provider-env/<random>/`, created empty.
+fn envDir(a: std.mem.Allocator, host: dispatch.Host) ![]const u8 {
+    const parent = try dispatch.canonicalDir(a, try std.fs.path.join(a, &.{ host.cache_root, "provider-env" }));
+    var random: [16]u8 = undefined;
+    config.globalIo().random(&random);
+    const dir = try std.fs.path.join(a, &.{ parent, &std.fmt.bytesToHex(random, .lower) });
+    try std.Io.Dir.cwd().createDir(config.globalIo(), dir, .default_dir);
+    return dir;
+}
+
+/// Merge the env_file a successful hook left at `path` into the build's
+/// environment (contract §2): absent is no contribution; empty, malformed
+/// or conflicting fails the command here, before any later zig invocation,
+/// naming the hook.
+fn absorbEnvFile(site: *Site, a: std.mem.Allocator, qualified: []const u8, path: []const u8) !void {
+    const bytes = try provider_env.readFile(a, path) orelse return;
+    var diag: provider_env.Diagnostic = .{};
+    const file = provider_env.parseFile(a, bytes, site.env.windows, &diag) catch |err| switch (err) {
+        error.InvalidEnvFile => {
+            std.debug.print("labelle: hook '{s}' wrote an invalid env_file: {s}\n", .{ qualified, diag.message });
+            if (site.reporter) |r| r.finishFailed(1, "invalid hook env_file");
+            return error.InvalidHookEnvFile;
+        },
+        else => return err,
+    };
+    site.env.add(site.backing, a, qualified, file, &diag) catch |err| switch (err) {
+        error.InvalidEnvFile => {
+            std.debug.print("labelle: hook environment conflict: {s}\n", .{diag.message});
+            if (site.reporter) |r| r.finishFailed(1, "hook environment conflict");
+            return error.HookEnvConflict;
+        },
+        else => return err,
+    };
 }
 
 /// A `before` phase whose core step reports under the same progress phase
@@ -427,6 +485,10 @@ pub fn finishRun(site: *Site, after: []const Planned, output_dir: []const u8, ou
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+test {
+    _ = @import("provider_hooks_env_test.zig");
+}
 
 const Fixture = struct {
     fn hook(id: []const u8, step: contract.Step, target: []const u8, when: contract.Phase, after: []const []const u8) manifest.Hook {
@@ -855,7 +917,7 @@ test "provider hooks: every hook gets the target dir; only run-step hooks get th
     try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .run, .replace, elsewhere));
     try std.testing.expectEqualStrings("intro", Spy.scene[0..5]);
     try std.testing.expectEqual(@as(usize, 1), Spy.run_options.?.args.len);
-    // A run step with no options set (a `wasm serve`): the empty set, never
+    // A run step with no options set (a legacy serve): the empty set, never
     // an absent key, so a 1.2.0 run hook always finds it.
     site.run_options = null;
     try std.testing.expectEqual(@as(u8, 0), try runPhase(&site, &.{planned}, .run, .before, elsewhere));

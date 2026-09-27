@@ -6,11 +6,11 @@ Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
 do not weaken the normative contract below; full phase-2 acceptance is pending.
 
-This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.2.0` and still speaks `1.1.0` and `1.0.0`, and every context carries the negotiated version.
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.3.0` and still speaks `1.2.0`, `1.1.0` and `1.0.0`, and every context carries the negotiated version.
 
 ## 1. Package declarations and installed tools
 
-The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, and `targets`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive. A target name (declared or a hook's) is additionally never a Windows reserved device name (`con`, `nul`, `prn`, `aux`, `com1`-`com9`, `lpt1`-`lpt9`), because the CLI names directories after it.
+The package's existing ZON `plugin.labelle` remains the declaration source. Runtime-only packages need no command fields. A provider uses `manifest_version = 2`, declares `command_contract`, and may declare `namespace`, `commands`, `hooks`, `targets` and `target_defaults`. Names use `[a-z][a-z0-9_-]*`; names are case-sensitive. A target name (declared or a hook's) is additionally never a Windows reserved device name (`con`, `nul`, `prn`, `aux`, `com1`-`com9`, `lpt1`-`lpt9`), because the CLI names directories after it.
 
 A command has required `name`, `build_step`, `executable`, and `help`, with optional `needs_project` (default true). A hook has required `id`, `step`, `target`, `when`, `build_step`, and `executable`, with optional `after_hooks` (default empty). Valid steps are `generate`, `build`, `bundle`, `run`; phases are `before`, `replace`, `after`. There is no separate package lifecycle step: `bundle` produces the target distributable.
 
@@ -29,6 +29,19 @@ A command named exactly `doctor` has one extra caller: inside a project, `labell
 
 Commands require a namespace and unique names. Resolve-time validation rejects reserved CLI namespaces and duplicate namespace/target owners. Core owns `desktop`; no package may claim it. Hooks may attach to it without owning it.
 
+### Target defaults
+
+A target's owner may declare defaults for the targets it declares in `.targets` (CLI 2.1.0+; manifest data, not a wire key, so any `command_contract` range may use it):
+
+```zig
+.targets = .{"sample-target"},
+.target_defaults = .{ .{ .target = "sample-target", .optimize = .ReleaseSafe } },
+```
+
+Each record has exactly the keys `target` and `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast` or `ReleaseSmall`); unknown keys are a parse error. A record for a target the same manifest does not declare in `.targets` is `TargetDefaultRequiresOwnedTarget` (only the owner speaks for a target, so no two packages can disagree), and two records for one target are `DuplicateTargetDefault`, even when they agree.
+
+The effective optimize mode of a build is, in order: an explicit `--optimize=<mode>`; else the owner's `target_defaults` entry for the resolved target; else the core's own fallback for that target, if it has one; else none (Zig's default, Debug). The chosen mode is what the core `zig build` gets as `-Doptimize=<mode>` and what every hook receives as the wire `optimize`. A watched rebuild's replan recomputes it from the providers it rediscovers, so an edited default reaches the next rebuild, and an explicit flag still wins.
+
 ## 2. One command-context wire format
 
 The CLI creates a UTF-8 JSON file and passes its absolute filename in `LABELLE_CONTEXT`. There is no argument-encoded alternative. The provider receives trailing user arguments verbatim through argv, without shell interpolation; the context path is not inserted into argv. The CLI owns the context-file lifetime through process exit and removes it afterward. Providers treat it as read-only.
@@ -37,7 +50,7 @@ Every field below is required on the wires that define it, except the optional `
 
 | Field | Type / rule |
 | --- | --- |
-| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"` or `"1.2.0"` for this decoder |
+| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"`, `"1.2.0"` or `"1.3.0"` for this decoder |
 | `invocation` | Object containing `kind`, `id`, `step`, `phase` |
 | `invocation.kind` | `"command"` or `"hook"` |
 | `invocation.id` | Command name or hook ID |
@@ -54,6 +67,8 @@ Every field below is required on the wires that define it, except the optional `
 | `build_number` | **Optional**, **wire `1.1.0`+**: the non-empty `labelle bundle --build-number` value, present only in a `bundle`-step hook's context when the user passed it and the negotiated wire is `1.1.0` or newer; absent (never null) otherwise, and an error on any other invocation or on a `1.0.0` context |
 | `target_dir` | **Wire `1.2.0`+, required there**: on a hook, the absolute generated target directory (`.labelle/<backend>_<target>/`), the same for every step whatever `output_dir` is; null on a command. The key doesn't exist below `1.2.0`, not even as null |
 | `run` | **Optional**, **wire `1.2.0`+**: present on every `run`-step hook context (any phase) and absent (never null) everywhere else. An object with three required keys, `env`, `args` and `timeout_ms` (see below) |
+| `cache_dir` | **Wire `1.3.0`+, required there, never null**: the provider's persistent cache directory, on every context (commands and hooks). See [Provider cache](#provider-cache). The key doesn't exist below `1.3.0` |
+| `env_file` | **Wire `1.3.0`+, required there**: on a `before generate`, `after generate` or `before build` hook, an absolute path the hook may write its environment contribution to; null on every other hook and on commands. See [Environment contributions](#environment-contributions). The key doesn't exist below `1.3.0` |
 
 The `run` object holds the `labelle run` options for a hook that wraps or replaces the launch:
 
@@ -65,19 +80,62 @@ The `run` object holds the `labelle run` options for a hook that wraps or replac
 
 The CLI doesn't map these to any platform. The provider decides how they reach its game, for example as launch extras on a device. A hook on another step, or a command, that carries `run` is an error, and so is a `1.2.0` `run`-step hook without it.
 
+### Provider cache
+
+`cache_dir` is `<LABELLE_HOME>/providers/<canonical provider id>/` (`LABELLE_HOME` defaults to `~/.labelle`). The CLI creates it before the invocation and never deletes it; it persists across provider versions and projects.
+
+The canonical id names what the provider is, not what a project calls it, so every project that pins the same provider shares one cache:
+
+- A pinned GitHub provider: `github.com/<owner>/<name>`, from its `.repo` normalised the way pins are compared (`git+`, a scheme, `user@`, the `github.com` host in any case, `?ref`/`#sha`, trailing slashes and `.git` dropped) and lowercased, because GitHub names are case-insensitive. A segment Windows cannot create (a reserved device name such as `con`, or a trailing `.`) gets `~` appended; no GitHub name contains `~`, so the escape never collides with another repository.
+- A local provider (`local:<path>`, `@<path>`): `local/<name>-<hash>`, where `<hash>` is the first 32 hex digits of the SHA-256 of the provider directory's canonical real path (lowercased on Windows) and `<name>` is that directory's basename reduced to `[a-z0-9._-]`. Two projects pointing at one checkout share it; a moved checkout gets a new one.
+
+The provider owns everything inside. A provider that installs toolchains there must:
+
+- key each install by host (OS and architecture) and by SDK identity (version plus the pinned commit or hash), since one cache may serve several machines through a shared home directory and several SDK versions across projects;
+- make installation safe under concurrency: two builds installing the same SDK at once must end with one valid install and no partial tree. Take a lock (for example an exclusive file lock beside the install) and install into a temporary sibling that is atomically renamed into place once complete; treat a directory without its completion marker as absent;
+- version its own layout, so a later release can tell an old layout from a new one.
+
+The CLI does not migrate, prune or garbage-collect the cache.
+
+### Environment contributions
+
+A `before generate`, `after generate` or `before build` hook receives `env_file` (wire `1.3.0`+): an absolute path in a fresh, private, per-invocation directory. The file does not exist when the hook starts; the hook may create it. After the hook exits 0 the CLI reads it and deletes the directory:
+
+```json
+{ "set": [ { "name": "SDK_ROOT", "value": "/abs/sdk" } ], "path_prepend": [ "/abs/sdk/bin" ] }
+```
+
+- **Format.** Strict JSON; both keys are optional; unknown keys, duplicate keys and wrong types are errors. Each `set` entry has exactly `name` and `value`.
+- **Names** match `[A-Za-z_][A-Za-z0-9_]*`, appear once per file, and are not CLI-owned. The CLI-owned names are a fixed table (`config.reserved_env` in `src/cli/config.zig`), not a `LABELLE_*` prefix ban: `PATH` (extend it with `path_prepend`), `ZIG_GLOBAL_CACHE_DIR`, `ZIG_LOCAL_CACHE_DIR`, every `LABELLE_*` variable the CLI reads (`LABELLE_HOME`, `LABELLE_CONTEXT`, `LABELLE_OFFLINE`, `LABELLE_ZIG`, `LABELLE_ASSEMBLER`, …) and the `labelle run` options it sets for the game. Any other name may be set, `LABELLE_*` or not; a toolchain library directory such as `LABELLE_SDL2_LIB` stays settable. A test fails when the CLI source spells a `LABELLE_*` name the table does not classify.
+- **`path_prepend`** entries are absolute paths for the host (drive-qualified or UNC on Windows) and contain no PATH separator.
+- **File states.** Missing: no contribution, which is normal. Empty or malformed (including a reserved name, a bad name or a relative PATH entry): the command fails right after that hook, before any later zig invocation, with `labelle: hook '<package>/<id>' wrote an invalid env_file: <reason>`. Written by a hook that then failed: ignored; the hook's failure is the outcome.
+
+**Merge.** Contributions apply in hook execution order (phases, `after_hooks` edges, then qualified ID) and accumulate across the phases of one build:
+
+- A contributed variable overrides the inherited environment (a provisioned toolchain must win over a stale shell value; a provider that wants to honour the user's value reads it from its own environment and writes it back).
+- Two hooks setting one name to different values fail the command with `labelle: hook environment conflict: '<name>' is set to different values by hooks '<a>' and '<b>'`; the same value twice is fine.
+- `path_prepend` entries go in front of the inherited `PATH` in hook order, then list order, deduplicated keeping the first occurrence. The inherited `PATH` itself is not rewritten.
+- On Windows names compare case-insensitively (`Path` is `PATH`), for conflicts and overrides alike, and an inherited key keeps its spelling; PATH entries also deduplicate case-insensitively.
+
+**Freshness.** The environment is built for each build from the inherited environment plus the contributions of the hooks that ran in that build; a watched rebuild starts over. A hook a replan removed leaves nothing behind.
+
+**Scope.** The merged environment reaches every later zig invocation and hook process of the same command: the generation-time fingerprint pass (`zig build --list-steps`, which configures the generated build and so is the first toolchain consumer: a `before generate` contribution reaches it, an `after generate` one does not), the core `zig build` compile, and every later hook and replacement (`after generate`, `before`/`replace`/`after build`, `bundle` and `run` hooks). It never reaches the build of a provider's own tool (`zig build <build_step>` in the provider's package), which runs on the plain inherited environment plus the CLI's cache variables, so a provider cannot change how other providers' tools are built. The game the core `labelle run` launches keeps its own environment (the inherited one plus the run options); a provider that must reach the game uses a `run` replacement.
+
 ### Wire versions and negotiation
 
-The CLI implements contract `1.2.0` and speaks every wire version listed here, newest first:
+The CLI implements contract `1.3.0` and speaks every wire version listed here, newest first:
 
 | Wire | Adds |
 | --- | --- |
+| `1.3.0` | `cache_dir` and `env_file` on every context (additive minor, CLI 2.1.0). |
 | `1.2.0` | `target_dir` on every context and the optional `run` key on `run`-step hooks (additive minor). |
 | `1.1.0` | The optional `build_number` key (additive minor). |
 | `1.0.0` | The original v1 context. |
 
 For each invocation the CLI negotiates the **newest** wire version the provider's `command_contract` range admits and writes it as `contract_version`; a range that admits none of them is `UnsupportedContract` at discovery. Keys a wire version does not define are never emitted in it, so a provider decoding strictly (unknown fields are errors, as above) keeps working:
 
-- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.2.0` and must accept the keys `1.1.0` and `1.2.0` add. A provider declaring such a range promises exactly that.
+- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.3.0` and must accept the keys `1.1.0`, `1.2.0` and `1.3.0` add. A provider declaring such a range promises exactly that.
+- `<1.3.0` (for example `>=1.0.0 <1.3.0`) receives the exact `1.2.0` wire, without `cache_dir` or `env_file`: its hooks cannot contribute an environment.
 - `>=1.0.0 <1.2.0` receives the exact `1.1.0` wire, without `target_dir` or `run`. If one of its `run` hooks would have received run options the user passed, the CLI prints one `note:` line per hook (`run options not passed to '<package>/<id>' (provider contract 1.1.0 < 1.2.0)`) instead of dropping them silently.
 - `>=1.0.0 <1.1.0` (or `1.0.0`) receives the exact `1.0.0` wire. `labelle bundle --build-number=N` is then not passed to it; the CLI prints one `note:` line saying so instead of dropping it silently. The `1.2.0` rule above applies too.
 

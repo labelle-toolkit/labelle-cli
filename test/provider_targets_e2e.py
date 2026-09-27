@@ -456,8 +456,8 @@ sys.stdout.write(data)
     assert packed["context"]["invocation"]["step"] == "bundle", packed
     assert packed["context"]["build_number"] == "42", packed
     # `build_number` is a contract 1.1.0 key, negotiated from the range: an
-    # open v1 range gets the newest wire (1.2.0), which carries it...
-    assert packed["context"]["contract_version"] == "1.2.0", packed
+    # open v1 range gets the newest wire (1.3.0), which carries it...
+    assert packed["context"]["contract_version"] == "1.3.0", packed
     # ...while a provider capped below 1.1.0 gets the exact 1.0.0 wire with
     # no such key — a strict 1.0.0 decoder would reject it as unknown and fail
     # the bundle (Codex P2 on #421) — and the drop is said once, not silent.

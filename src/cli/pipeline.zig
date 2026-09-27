@@ -17,6 +17,8 @@
 //!   pipeline/run.zig                 run branches, `RunOutcome` plumbing,
 //!                                    `wasm serve|export --no-build`
 //!   pipeline/context.zig             `Context` + `HookPlans` the stages share
+//!   pipeline/optimize.zig            the effective optimize mode (flag, the
+//!                                    target owner's default, core fallback)
 //!   pipeline/watch.zig               `WasmRebuildCtx`, the watch ignore set
 //!   pipeline/watch_replan.zig        `WatchReplan` and its generations
 //!   pipeline/watch_replan_tests.zig  the replan's tests
@@ -47,6 +49,7 @@ const context = @import("pipeline/context.zig");
 const watch = @import("pipeline/watch.zig");
 const watch_replan = @import("pipeline/watch_replan.zig");
 const watch_replan_tests = @import("pipeline/watch_replan_tests.zig");
+const optimize_mod = @import("pipeline/optimize.zig");
 const screenshot = @import("pipeline/screenshot.zig");
 const export_output = @import("pipeline/export_output.zig");
 const testing = @import("pipeline/testing.zig");
@@ -260,8 +263,16 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     });
 
     // Scenes and prefabs are always embedded via @embedFile
-    const effective_optimize = parsed_args.optimize_override orelse
-        if (parsed.platform == .wasm) @as(?[]const u8, "ReleaseSafe") else null;
+    //
+    // The effective optimize mode (`pipeline/optimize.zig`): an explicit
+    // `--optimize` wins; else the target owner's `.target_defaults`; else
+    // the core's legacy ReleaseSafe for a wasm build (Debug exceeds browser
+    // local variable limits), which a provider's declared default replaces.
+    const effective_optimize = optimize_mod.effective(
+        parsed_args.optimize_override,
+        optimize_mod.ownerDefault(providers, target.name),
+        if (parsed.platform == .wasm) "ReleaseSafe" else null,
+    ).mode;
 
     // Everything a provider hook run needs. The host compiler is resolved by
     // the first hook that runs (never for an empty plan), and hooks report
@@ -296,6 +307,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // core launch would set, for a replacement standing in for it.
         .run_options = if (command == .run) try run_stage.hookRunOptions(hook_arena, &parsed_args) else null,
     };
+    // The hooks' environment contributions (contract §2) live until the
+    // command ends: the run and bundle hooks after the build still see them.
+    defer hook_site.env.deinit();
 
     const cx: context.Context = .{
         .allocator = allocator,
@@ -333,7 +347,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         std.debug.print("labelle: warning: --target has no effect without --docker\n", .{});
     }
 
-    // Build — default to ReleaseSafe for WASM (Debug exceeds browser local variable limits)
+    // Build with the effective optimize mode computed above.
     const optimize_flag: ?[]const u8 = if (effective_optimize) |opt|
         try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{opt})
     else
@@ -400,6 +414,7 @@ test {
     _ = watch;
     _ = watch_replan;
     _ = watch_replan_tests;
+    _ = optimize_mod;
     _ = screenshot;
     _ = export_output;
     _ = testing;

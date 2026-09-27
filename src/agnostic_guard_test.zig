@@ -81,7 +81,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// Android left the CLI for its provider (cli#405): the ten `cli/android*`
 /// entries went with their files, and `cli/add.zig`, `cli/app_icon.zig`,
 /// `cli/check.zig`, `cli/lockfile.zig` and `cli/plugins.zig` came clean
-/// once their comments stopped citing it: 54 entries.
+/// once their comments stopped citing it: 53 entries (counted on `main`).
+/// RFC cli#466 PR A1 (contract 1.3.0) scrubbed the legacy serve wording from
+/// `cli/material_toolchain.zig`, `cli/prebuild.zig` and
+/// `cli/provider_hooks.zig`: 50 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -109,7 +112,6 @@ const allowed_files = [_][]const u8{
     "cli/ios.zig",
     "cli/launcher_manifest.zig",
     "cli/linux_desktop.zig",
-    "cli/material_toolchain.zig",
     "cli/pack.zig",
     "cli/pipeline.zig",
     // Split out of `cli/pipeline.zig` (moves only): the stage code they
@@ -125,12 +127,9 @@ const allowed_files = [_][]const u8{
     "cli/pipeline/watch.zig",
     "cli/pipeline/watch_replan.zig",
     "cli/pipeline/watch_replan_tests.zig",
-    "cli/prebuild.zig",
     "cli/progress.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
-    // Added with the RFC tool names (#419): a doc comment cites `adb shell am start`.
-    "cli/provider_hooks.zig",
     "cli/python_provision.zig",
     "cli/runner.zig",
     "cli/screenshot_format.zig",

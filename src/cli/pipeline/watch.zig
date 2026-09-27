@@ -28,7 +28,17 @@ pub const WasmRebuildCtx = struct {
     output_dir: []const u8,
     target_dir: []const u8,
     zig_args: []const []const u8,
+    /// The base environment of the compile, without any hook contribution:
+    /// each rebuild composes its own contributions onto it (`coreBuild`).
     zig_env: ?*const std.process.Environ.Map,
+    /// The inputs of the effective optimize mode (`optimize.zig`), which the
+    /// replan recomputes from the providers it rediscovers: the explicit
+    /// `--optimize`, and the core's fallback for the served target. A
+    /// provider edit that adds, changes or removes the owner's
+    /// `.target_defaults` reaches the next rebuild's `-Doptimize` and wire
+    /// `optimize`; an explicit flag always wins.
+    optimize_flag: ?[]const u8 = null,
+    fallback_optimize: ?[]const u8 = null,
     /// The project's declared `.prebuild` steps (cli#355), borrowed from
     /// the parse arena. A watched rebuild must re-run them: they are what
     /// turn an edited `.tsx`/generator into the atlas or `.zig` table the
@@ -143,6 +153,10 @@ pub const WasmRebuildCtx = struct {
 
     pub fn rebuildStaged(self: *WasmRebuildCtx) Stage!void {
         const a = self.allocator;
+        // Every rebuild's environment is built fresh from the inherited one
+        // plus the contributions of the hooks that run in THIS rebuild
+        // (contract §2): a hook a replan removed leaves nothing behind.
+        self.hooks.env.reset();
 
         // 0. The served target's ownership pre-check (`Replan.precheck`),
         //    FIRST, ahead of every side-effecting stage: a watched edit that
@@ -217,7 +231,7 @@ pub const WasmRebuildCtx = struct {
             };
             // 2. `generate` rewrites build.zig with a placeholder fingerprint;
             //    re-fix it before building.
-            runner.fixFingerprints(a, self.project_dir, self.output_dir) catch |err| {
+            runner.fixFingerprints(a, self.project_dir, self.output_dir, &self.hooks.env) catch |err| {
                 std.debug.print("labelle: rebuild fingerprint fix failed ({s})\n", .{@errorName(err)});
                 return error.FingerprintFailed;
             };
@@ -237,7 +251,16 @@ pub const WasmRebuildCtx = struct {
 
     fn coreBuild(self: *WasmRebuildCtx) Stage!void {
         const a = self.allocator;
-        const res = runner.runZigWithEnv(a, self.target_dir, self.zig_args, self.zig_env) catch |err| {
+        var composed: ?std.process.Environ.Map = if (self.zig_env) |base|
+            (if (self.hooks.env.isEmpty()) null else self.hooks.env.compose(a, base) catch |err| {
+                std.debug.print("labelle: rebuild could not compose the hook environment ({s})\n", .{@errorName(err)});
+                return error.ZigSpawnFailed;
+            })
+        else
+            null;
+        defer if (composed) |*m| m.deinit();
+        const env: ?*const std.process.Environ.Map = if (composed) |*m| m else self.zig_env;
+        const res = runner.runZigWithEnv(a, self.target_dir, self.zig_args, env) catch |err| {
             std.debug.print("labelle: rebuild could not spawn zig ({s})\n", .{@errorName(err)});
             return error.ZigSpawnFailed;
         };

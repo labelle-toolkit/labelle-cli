@@ -885,3 +885,90 @@ test "watch replan installs the re-read prebuild steps" {
     try WatchReplan.run(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 0), ctx.prebuild_steps.len);
 }
+
+// Contract §1 `.target_defaults`: every replan recomputes the effective
+// optimize mode from the providers it rediscovers, so an edited default
+// reaches the next rebuild's `-Doptimize` and wire `optimize`, and an
+// explicit `--optimize` still wins.
+test "watch replan recomputes the effective optimize mode from the owner's defaults" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project/project.labelle",
+        .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
+    });
+    const Manifest = struct {
+        fn write(dir: std.Io.Dir, defaults: []const u8) !void {
+            var buf: [512]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"wasm\" }}, .target_defaults = .{{ {s} }} }}", .{defaults});
+            try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = text });
+        }
+        fn flags(args: []const []const u8) usize {
+            var n: usize = 0;
+            for (args) |arg| n += @intFromBool(std.mem.startsWith(u8, arg, "-Doptimize="));
+            return n;
+        }
+    };
+    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    defer a.free(asm_path);
+    var site = testing.testSite(a, project);
+    var ctx = WasmRebuildCtx{
+        .allocator = a,
+        .asm_bin = .{ .path = asm_path },
+        .project_dir = project,
+        .platform_tag = "wasm",
+        .backend_tag = "bgfx",
+        .output_dir = project,
+        .target_dir = project,
+        // The startup plan: the core fallback, before any replan.
+        .zig_args = &.{ "zig", "build", "-Doptimize=ReleaseSafe" },
+        .zig_env = null,
+        .fallback_optimize = "ReleaseSafe",
+        .prebuild_steps = &.{},
+        .prebuild_opts = .{ .fatal_on_step_failure = false },
+        .hooks = &site,
+    };
+    var replan = WatchReplan{ .backing = a, .project_dir = project };
+    const startup_cfg = site.cfg;
+    defer replan.deinit(&site, &.{}, startup_cfg);
+
+    // The owner declares a default: it replaces the core fallback.
+    try Manifest.write(tmp.dir, ".{ .target = \"wasm\", .optimize = .ReleaseSmall }");
+    try WatchReplan.run(&replan, &ctx);
+    try std.testing.expectEqual(provider_contract.Optimize.ReleaseSmall, site.optimize);
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", ctx.zig_args[ctx.zig_args.len - 1]);
+    try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
+    try std.testing.expectEqualStrings("build", ctx.zig_args[1]);
+    // The default is edited away: back to the core fallback.
+    try Manifest.write(tmp.dir, "");
+    try WatchReplan.run(&replan, &ctx);
+    try std.testing.expectEqual(provider_contract.Optimize.ReleaseSafe, site.optimize);
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", ctx.zig_args[ctx.zig_args.len - 1]);
+    try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
+    // An explicit flag wins over a declared default.
+    ctx.optimize_flag = "Debug";
+    try Manifest.write(tmp.dir, ".{ .target = \"wasm\", .optimize = .ReleaseFast }");
+    try WatchReplan.run(&replan, &ctx);
+    try std.testing.expectEqual(provider_contract.Optimize.Debug, site.optimize);
+    try std.testing.expectEqualStrings("-Doptimize=Debug", ctx.zig_args[ctx.zig_args.len - 1]);
+    try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
+}
+
+test "watch replan: withOptimize replaces or drops the flag, keeping every other argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const replaced = try WatchReplan.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug", "-Dother=1" }, "ReleaseFast");
+    try std.testing.expectEqual(@as(usize, 4), replaced.len);
+    try std.testing.expectEqualStrings("-Dother=1", replaced[2]);
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseFast", replaced[3]);
+    const dropped = try WatchReplan.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug" }, null);
+    try std.testing.expectEqual(@as(usize, 2), dropped.len);
+}

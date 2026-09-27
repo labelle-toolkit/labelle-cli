@@ -152,9 +152,11 @@ The wire context (§2) for a hook carries `invocation = { "kind": "hook",
 pinned provider declares),
 the project's `lock_file`, the provider's `config_file` or null, the step's
 `output_dir`, the pinned `zig_executable`, and this invocation's `optimize`
-and `progress` (`--optimize` and `--progress` as the user passed them, so a
-hook builds what the core step builds and speaks the mode the user asked
-for). The tool runs with the project root as cwd and no trailing arguments.
+and `progress` (the effective optimize mode, which is `--optimize` when the
+user passed it and otherwise the target owner's
+[`target_defaults`](provider-targets.md#optimize-defaults), and `--progress`
+as the user passed it, so a hook builds what the core step builds and speaks
+the mode the user asked for). The tool runs with the project root as cwd and no trailing arguments.
 
 A `bundle` hook's context also carries `build_number` when the user passed
 `labelle bundle --build-number=<N>` (validated before the build, as for the
@@ -206,6 +208,51 @@ A provider whose range stops below `1.2.0` gets the older wire, without
 either key. If its `run` hook would have received options the user passed,
 the CLI prints one line per hook:
 `labelle: note: run options not passed to '<package>/<id>' (provider contract <wire> < 1.2.0)`.
+
+On wire `1.3.0` every hook's context also carries **`cache_dir`**, the
+provider's persistent cache directory under
+`<LABELLE_HOME>/providers/<canonical provider id>/`, created by the CLI and
+shared by every project that pins the same provider
+([provider cache](provider-contract-v1.md#provider-cache)).
+
+### Environment contributions
+
+A `before generate`, `after generate` or `before build` hook also gets
+**`env_file`** on wire `1.3.0` (null on every other hook): an absolute path,
+in a fresh per-invocation directory, where it may write
+
+```json
+{ "set": [ { "name": "SDK_ROOT", "value": "/abs/sdk" } ], "path_prepend": [ "/abs/sdk/bin" ] }
+```
+
+to contribute to the environment of everything that runs after it in the
+same command: the generation-time fingerprint pass (`zig build
+--list-steps`), the core compile, and every later hook and replacement. The
+build of a provider's own tool never sees it. This is how a provider that
+provisions a toolchain hands it to the build without the CLI knowing the
+toolchain: a `before generate` hook is early enough for the fingerprint
+pass, which already configures the generated build; an `after generate` hook
+(which can see the fetched dependency tree) reaches the compile onward.
+
+- Contributions merge in hook execution order and override the inherited
+  environment; two hooks setting one name to different values is an error
+  naming both; `path_prepend` entries go in front of `PATH`, in hook then
+  list order, deduplicated. On Windows names compare case-insensitively
+  and an inherited key keeps its spelling.
+- CLI-owned names (`PATH`, the Zig cache variables, the `LABELLE_*`
+  variables the CLI reads or sets) can't be set; other names, `LABELLE_*`
+  or not, can.
+- No file is no contribution. An empty or malformed file fails the command
+  right after the hook, before any later zig invocation:
+  `labelle: hook '<package>/<id>' wrote an invalid env_file: <reason>`. A
+  file written by a hook that then failed is ignored.
+- The environment is rebuilt for every build, including every watched
+  rebuild, so a hook that stops running leaves nothing behind.
+
+The full rules are in the contract:
+[environment contributions](provider-contract-v1.md#environment-contributions).
+A provider capped below `1.3.0` gets neither key, so its hooks can't
+contribute.
 
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —
@@ -370,7 +417,18 @@ hook's `target_dir` for `build`, `run` and `bundle`, including `bundle
 pairs of `--scene`/`--screenshot`/`--after`, the `--` arguments and the
 timeout, while a planted host-launch sentinel that the unreplaced run does
 execute never runs; a provider capped below `1.2.0` getting neither key and
-the one `note:` line), a cold package cache failing closed or running a
+the one `note:` line), contract `1.3.0` environment contributions (a
+`before generate` hook's `env_file` reaching the fingerprint pass — the
+generated build's configure step logs what it sees, under a `labelle
+generate` that runs no compile — then the compile and the later hooks,
+never the provider's own tool build, which panics if it does; a hook
+removed between two builds leaving nothing; a malformed, empty or reserved
+contribution failing before any compile and naming the hook; a failing
+hook's file ignored), the owner's `target_defaults` giving
+`-Doptimize=ReleaseSafe` and wire `optimize` ReleaseSafe while an explicit
+`--optimize` wins, `cache_dir` under `LABELLE_HOME/providers/` keyed by the
+canonical provider id (a local provider's directory; a pinned provider's
+repository, shared by two spellings of it with its contents kept), a cold package cache failing closed or running a
 pinned provider's hooks (never skipping them) — with an unpinned remote hook
 refused as `RemoteProviderIntegrityRequired` while `LABELLE_ZIG` points
 nowhere, and the same dead compiler being the failure once the pin is
