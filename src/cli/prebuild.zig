@@ -107,7 +107,7 @@ pub const Error = error{
     PrebuildSpawnFailed,
     /// A step ran and exited non-zero, in a caller that asked NOT to be
     /// terminated (`Options.fatal_on_step_failure = false` — the
-    /// `wasm serve --watch` rebuild, which must keep the server alive).
+    /// watched serve's rebuild, which must keep the server alive).
     /// The default, process-exiting path never returns this.
     PrebuildStepFailed,
 };
@@ -128,7 +128,7 @@ pub const Options = struct {
     route_stdout_to_stderr: bool = false,
     /// Whether a non-zero step terminates the process with the child's
     /// exact exit code (the build pipeline's contract) or merely returns
-    /// `error.PrebuildStepFailed`. The `wasm serve --watch` rebuild sets
+    /// `error.PrebuildStepFailed`. The watched serve's rebuild sets
     /// this false: a failed step there must report and keep the server
     /// alive, exactly like a failed `generate` or `zig build` does.
     fatal_on_step_failure: bool = true,
@@ -259,8 +259,8 @@ fn mtimeNs(allocator: std.mem.Allocator, project_dir: []const u8, rel: []const u
 /// project-local scratch dir (build targets, the live build-status file).
 /// It is already git-ignored, `labelle clean` (a global package-cache
 /// command) does not touch it, and `serve.skipWatchDir` skips every
-/// dot-directory, so writing here can never retrigger `wasm serve
-/// --watch`.
+/// dot-directory, so writing here can never retrigger a `--watch`
+/// session.
 pub const state_dir_name = ".labelle";
 pub const state_file_name = "prebuild-recipes";
 
@@ -639,7 +639,7 @@ fn validateAll(steps: []const Step) Error!void {
 /// file `failed`), after printing which step failed and why. This mirrors
 /// `assembler_proc.spawnAndWait`: collapsing every distinct tool failure
 /// to a single status 1 makes the CLI a lying proxy for the step it ran.
-/// Callers that must survive a failure (`wasm serve --watch`) pass
+/// Callers that must survive a failure (a `--watch` rebuild) pass
 /// `Options.fatal_on_step_failure = false` and get
 /// `error.PrebuildStepFailed` instead.
 pub fn runAll(
@@ -1473,7 +1473,7 @@ pub const RunAllSpec = struct {
         }
     };
 
-    /// `wasm serve --watch` re-runs the steps on every watched rebuild and
+    /// A `--watch` serve re-runs the steps on every watched rebuild and
     /// must survive a failing one — the server stays up and the browser is
     /// not reloaded onto a stale bundle.
     pub const non_fatal_mode = struct {

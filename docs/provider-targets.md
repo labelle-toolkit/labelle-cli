@@ -223,6 +223,30 @@ a platform leaves it when its launch moves into a provider (`android` left
 with cli#405). The replacement receives the run options as `run.env`
 (contract 1.2.0, [provider hooks](provider-hooks.md)).
 
+## Optimize defaults
+
+The owner of a target may declare the optimize mode its builds default to,
+in its manifest (CLI 2.1.0+):
+
+```zig
+.targets = .{"sample-target"},
+.target_defaults = .{ .{ .target = "sample-target", .optimize = .ReleaseSafe } },
+```
+
+Only the owner may: a default for a target the same manifest doesn't declare
+in `.targets` is `TargetDefaultRequiresOwnedTarget`, and two defaults for one
+target are `DuplicateTargetDefault`. Both are discovery errors, reported at
+`labelle help` like every manifest error.
+
+The effective mode is an explicit `--optimize=<mode>` when given, else the
+owner's default, else the core's own fallback for the target (the legacy
+ReleaseSafe for a `wasm` build, until that policy moves into its provider),
+else none. The core `zig build` gets it as `-Doptimize=<mode>`, every hook
+receives it as the wire `optimize`, and a watched rebuild's replan
+recomputes it from the providers it rediscovers. The core `desktop` target
+has no owner, so no provider can change its default. See the contract's
+[target defaults](provider-contract-v1.md#target-defaults).
+
 ## `labelle bundle`
 
 `labelle bundle [--platform=<t>]` bundles the resolved target (the old

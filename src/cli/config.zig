@@ -218,3 +218,161 @@ pub const CliMirrorToleranceSpec = struct {
         try std.testing.expectEqualStrings("4x4", @tagName(cfg.resources[1].astc_block.?));
     }
 };
+
+/// Environment names a provider's `env_file` may not set (provider contract
+/// §2, "Environment contributions"): the ones the CLI owns. `PATH` is
+/// extended only through `path_prepend`; the Zig cache variables are the
+/// ones the CLI points at its own cache tree; and every `LABELLE_*` name here
+/// is one the CLI itself reads, or sets for the game it launches. A fixed
+/// table, not a `LABELLE_*` prefix ban: any other name, `LABELLE_*` or not,
+/// may be set. `src/reserved_env_guard_test.zig` fails when a `LABELLE_*`
+/// name the CLI source spells is in neither this table nor
+/// `unreserved_labelle_env`, and when an entry here is no longer spelled
+/// anywhere, so the table cannot silently drift from what the CLI reads.
+pub const reserved_env = [_][]const u8{
+    "PATH",
+    "ZIG_GLOBAL_CACHE_DIR",
+    "ZIG_LOCAL_CACHE_DIR",
+    // Read by the CLI.
+    "LABELLE_HOME",
+    "LABELLE_CONTEXT",
+    "LABELLE_OFFLINE",
+    "LABELLE_ZIG",
+    "LABELLE_ZIG_SEED",
+    "LABELLE_ZIG_SEED_SIG",
+    "LABELLE_ASSEMBLER",
+    "LABELLE_SHADERC",
+    "LABELLE_EMSDK",
+    "LABELLE_NO_PREBUILD",
+    "LABELLE_PREBUILD_FORCE_RELAY",
+    "LABELLE_PROGRESS_DEBUG",
+    "LABELLE_ALLOW_OLDER_CLI",
+    // Set by the CLI for the game it launches (the `labelle run` options).
+    "LABELLE_SCENE",
+    "LABELLE_PROFILE",
+    "LABELLE_SCREENSHOT_PATH",
+    "LABELLE_SCREENSHOT_AFTER_SEC",
+    "LABELLE_HEADLESS",
+    "LABELLE_HEADLESS_UNCAPPED",
+    "LABELLE_HEADLESS_TICKS",
+};
+
+/// `LABELLE_*` names the CLI source spells that a provider MAY set, each
+/// with the reason it is not CLI-owned. Kept beside `reserved_env` so the
+/// guard can tell a deliberate decision from a forgotten name.
+pub const unreserved_labelle_env = [_][]const u8{
+    // The SDL2 library directory. The CLI reads it only to find a user's
+    // install; a package that provisions SDL2 is meant to set it for the
+    // build (RFC cli#466 §9).
+    "LABELLE_SDL2_LIB",
+    // Written into a bundle's launcher script for the game; never read by
+    // the CLI.
+    "LABELLE_DATA_DIR",
+};
+
+/// True when an `env_file` may not set `name`. Under Windows rules names
+/// compare case-insensitively (`Path` is `PATH`), as the host does.
+pub fn reservedEnvName(name: []const u8, windows: bool) bool {
+    for (reserved_env) |reserved| {
+        if (if (windows) std.ascii.eqlIgnoreCase(name, reserved) else std.mem.eql(u8, name, reserved)) return true;
+    }
+    return false;
+}
+
+test "provider env reserved names: a fixed CLI-owned table, case-folded under Windows rules only" {
+    for ([_][]const u8{ "PATH", "ZIG_GLOBAL_CACHE_DIR", "ZIG_LOCAL_CACHE_DIR", "LABELLE_HOME", "LABELLE_CONTEXT", "LABELLE_OFFLINE", "LABELLE_ZIG", "LABELLE_ASSEMBLER" }) |name| {
+        try std.testing.expect(reservedEnvName(name, false));
+        try std.testing.expect(reservedEnvName(name, true));
+    }
+    // Not a prefix ban: the SDL2 library variable and any other name stay
+    // settable, and an env_file setting it parses.
+    for ([_][]const u8{ "LABELLE_SDL2_LIB", "LABELLE_ANYTHING", "TOOLCHAIN_ROOT" }) |name| {
+        try std.testing.expect(!reservedEnvName(name, false));
+        try std.testing.expect(!reservedEnvName(name, true));
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: @import("provider_env.zig").Diagnostic = .{};
+    const file = try @import("provider_env.zig").parseFile(arena.allocator(), "{\"set\":[{\"name\":\"LABELLE_SDL2_LIB\",\"value\":\"/sdl/lib\"}]}", false, &diag);
+    try std.testing.expectEqualStrings("LABELLE_SDL2_LIB", file.set[0].name);
+    // `Path` is PATH under Windows rules only.
+    try std.testing.expect(reservedEnvName("Path", true));
+    try std.testing.expect(!reservedEnvName("Path", false));
+    // The two tables never overlap.
+    for (unreserved_labelle_env) |name| try std.testing.expect(!reservedEnvName(name, true));
+}
+
+/// Every `"LABELLE_<NAME>"` string literal in `bytes`, appended to `out`.
+fn collectLabelleLiterals(a: std.mem.Allocator, bytes: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const prefix = "\"LABELLE_";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, prefix)) |start| {
+        var end = start + prefix.len;
+        while (end < bytes.len and (std.ascii.isUpper(bytes[end]) or std.ascii.isDigit(bytes[end]) or bytes[end] == '_')) end += 1;
+        i = end;
+        if (end == start + prefix.len or end >= bytes.len or bytes[end] != '"') continue;
+        const name = bytes[start + 1 .. end];
+        const seen = for (out.items) |known| {
+            if (std.mem.eql(u8, known, name)) break true;
+        } else false;
+        if (!seen) try out.append(a, try a.dupe(u8, name));
+    }
+}
+
+test "provider env reserved names: every LABELLE_* name the CLI spells is classified, and no entry is stale" {
+    // The guard for `reserved_env`: a new CLI-read `LABELLE_*` variable must
+    // be added to the table (or, deliberately, to `unreserved_labelle_env`)
+    // before this passes. The tables themselves (this file) are not scanned,
+    // so an entry nothing else spells any more is caught as stale.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = globalIo();
+    var src = try std.Io.Dir.cwd().openDir(io, @import("test_fixtures").src_dir, .{ .iterate = true });
+    defer src.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var files: usize = 0;
+    var walker = try src.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const rel = try std.mem.replaceOwned(u8, a, entry.path, "\\", "/");
+        if (std.mem.eql(u8, rel, "cli/config.zig")) continue;
+        files += 1;
+        try collectLabelleLiterals(a, try entry.dir.readFileAlloc(io, entry.basename, a, .limited(4 << 20)), &names);
+    }
+    // The walk reached the tree (a wrong directory would pass vacuously).
+    try std.testing.expect(files > 100);
+    var unclassified = false;
+    for (names.items) |name| {
+        var known = false;
+        for (reserved_env) |r| known = known or std.mem.eql(u8, r, name);
+        for (unreserved_labelle_env) |u| known = known or std.mem.eql(u8, u, name);
+        if (!known) {
+            std.debug.print("config.zig: '{s}' is spelled by the CLI but is in neither reserved_env nor unreserved_labelle_env\n", .{name});
+            unclassified = true;
+        }
+    }
+    var stale = false;
+    for (reserved_env ++ unreserved_labelle_env) |entry| {
+        if (!std.mem.startsWith(u8, entry, "LABELLE_")) continue;
+        var found = false;
+        for (names.items) |name| found = found or std.mem.eql(u8, name, entry);
+        if (!found) {
+            std.debug.print("config.zig: '{s}' is classified but no longer spelled anywhere in src/; remove it\n", .{entry});
+            stale = true;
+        }
+    }
+    try std.testing.expect(!unclassified and !stale);
+}
+
+test "provider env reserved names: the literal scanner finds whole quoted names only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    try collectLabelleLiterals(a, "get(\"LABELLE_ONE\") \"LABELLE_TWO=x\" LABELLE_THREE \"LABELLE_\" \"LABELLE_ONE\" \"LABELLE_FOUR_4\"", &names);
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqualStrings("LABELLE_ONE", names.items[0]);
+    try std.testing.expectEqualStrings("LABELLE_FOUR_4", names.items[1]);
+}

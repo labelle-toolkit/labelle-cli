@@ -27,6 +27,7 @@ const watch = @import("watch.zig");
 const WasmRebuildCtx = watch.WasmRebuildCtx;
 const collectPrebuildIgnorePaths = watch.collectPrebuildIgnorePaths;
 const WatchReplan = @import("watch_replan.zig").WatchReplan;
+const optimize_mod = @import("optimize.zig");
 const Context = @import("context.zig").Context;
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
@@ -88,7 +89,11 @@ pub fn serveNoBuild(
 
     // The same wire `optimize` the building path reports for this
     // platform; there is no progress feed on this path.
-    const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, parsed_args.optimize_override orelse "ReleaseSafe") orelse {
+    const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, optimize_mod.effective(
+        parsed_args.optimize_override,
+        optimize_mod.ownerDefault(known, served.name),
+        "ReleaseSafe",
+    ).mode.?) orelse {
         std.debug.print("labelle: unknown optimize mode '{s}'\n", .{parsed_args.optimize_override.?});
         return 1;
     };
@@ -266,6 +271,9 @@ pub fn launch(
                     .target_dir = target_dir,
                     .zig_args = zig_args,
                     .zig_env = zig_env_ptr,
+                    // What the replan recomputes the optimize mode from.
+                    .optimize_flag = parsed_args.optimize_override,
+                    .fallback_optimize = "ReleaseSafe",
                     .prebuild_steps = parsed.prebuild,
                     .prebuild_opts = .{
                         .route_stdout_to_stderr = parsed_args.progress_mode == .json,

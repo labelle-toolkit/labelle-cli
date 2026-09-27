@@ -39,6 +39,15 @@ pub fn run(
         const code = try provider_hooks.runPhase(hook_site, hook_plans.build.before, .build, .before, build_out);
         if (code != 0) return code;
     }
+    // The compile runs with the environment the hooks contributed so far
+    // (contract §2): the base map plus every `env_file` merged in hook
+    // order, composed afresh here so the base is never modified.
+    var composed_env: ?std.process.Environ.Map = if (zig_env_ptr) |base|
+        (if (hook_site.env.isEmpty()) null else try hook_site.env.compose(allocator, base))
+    else
+        null;
+    defer if (composed_env) |*m| m.deinit();
+    const compile_env: ?*const std.process.Environ.Map = if (composed_env) |*m| m else zig_env_ptr;
     core_build: {
         if (hook_plans.build.replace) |replacement| {
             const code = try provider_hooks.runPhase(hook_site, &.{replacement}, .build, .replace, build_out);
@@ -65,7 +74,7 @@ pub fn run(
             // terminal unaltered (nothing is captured or eaten).
             std.debug.print("labelle: building...\n", .{});
             r.beginPhaseOrStep(.compile, "zig build");
-            const build_code = try runner.runZigInheritProgress(allocator, target_dir, zig_args, zig_env_ptr, r);
+            const build_code = try runner.runZigInheritProgress(allocator, target_dir, zig_args, compile_env, r);
             // Wipe the spinner line before anything else prints on it.
             r.clearSpinner();
             if (build_code != 0) {
@@ -75,7 +84,7 @@ pub fn run(
             }
         } else {
             std.debug.print("labelle: building...\n", .{});
-            const build_result = try runner.runZigWithEnv(allocator, target_dir, zig_args, zig_env_ptr);
+            const build_result = try runner.runZigWithEnv(allocator, target_dir, zig_args, compile_env);
             defer allocator.free(build_result.stdout);
             defer allocator.free(build_result.stderr);
 
@@ -102,7 +111,9 @@ pub fn run(
         if (!parsed_args.docker and parsed.platform == .desktop and wants_sdl2) {
             const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
             defer allocator.free(bin_dir);
-            sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir);
+            // `compile_env`: the SDL2 the build linked, including a hook's
+            // `LABELLE_SDL2_LIB` contribution (contract §2).
+            sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir, compile_env);
         }
 
         // `labelle build` finalization — everything that turns the compiled

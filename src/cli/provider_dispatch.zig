@@ -13,6 +13,8 @@ const github = @import("provider_github.zig");
 const hooks = @import("provider_hooks.zig");
 const asm_cache = @import("asm_cache.zig");
 const settings_mod = @import("provider_settings.zig");
+const provider_env = @import("provider_env.zig");
+const provider_cache = @import("provider_cache.zig");
 
 // Existing platform commands remain reserved until their extraction lands;
 // an extracted one leaves the list and its namespace becomes dispatchable
@@ -565,6 +567,15 @@ pub const ToolRun = struct {
     /// `run`-step hooks only: the `labelle run` options (contract §2 `run`,
     /// wire `1.2.0`+). Null on every other invocation.
     run_options: ?contract.RunContext = null,
+    /// Hooks in a `contract.envFileSlot` only: where the hook may write its
+    /// environment contribution (contract §2 `env_file`, wire `1.3.0`+).
+    /// The caller owns the path and reads it back after the run. Dropped
+    /// for a provider whose negotiated wire predates the key.
+    env_file: ?[]const u8 = null,
+    /// The environment the earlier hooks of this build contributed. Applied
+    /// to the provider tool's own process only, never to the `zig build`
+    /// that compiles the tool (contract §2 "Scope").
+    env: ?*const provider_env.Accumulator = null,
 };
 
 /// The wire context for one invocation (contract §2), in the wire version
@@ -577,7 +588,11 @@ pub const ToolRun = struct {
 /// `1.2.0` keys and follow the same rule: a provider capped below `1.2.0`
 /// gets neither, and a `run` hook of one that the user passed run options
 /// for gets one `note:` line saying they did not reach it.
-pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRun) !contract.Context {
+///
+/// `cache_dir` and `env_file` are `1.3.0` keys: a provider capped below it
+/// gets neither, so its hooks cannot contribute an environment. `cache_dir`
+/// is the provider's `ensureCacheDir`.
+pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRun, cache_dir: []const u8) !contract.Context {
     const wire = try manifest.negotiate(provider.meta.command_contract orelse return error.MissingCommandContract);
     const build_number = if (run.build_number) |number| blk: {
         if (contract.carriesBuildNumber(wire)) break :blk number;
@@ -607,7 +622,16 @@ pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRu
         .build_number = build_number,
         .target_dir = if (run_context) run.target_dir else null,
         .run = run_options,
+        .cache_dir = if (contract.carriesToolchainContext(wire)) cache_dir else null,
+        .env_file = if (contract.carriesToolchainContext(wire)) run.env_file else null,
     };
+}
+
+/// The provider's persistent cache directory (contract §2 `cache_dir`),
+/// created: `<LABELLE_HOME>/providers/<canonical provider id>/`
+/// (`provider_cache`). `host.cache_root` is the canonical LABELLE_HOME.
+pub fn ensureCacheDir(a: std.mem.Allocator, host: Host, provider: Provider) ![]const u8 {
+    return canonicalDir(a, try provider_cache.dirPath(a, host.cache_root, provider.dep, provider.dir));
 }
 
 /// Build the tool in a fresh isolated prefix, verify the declared executable,
@@ -637,12 +661,18 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     if (build_code != 0) return build_code;
     if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
     const exe = try executable(a, prefix, tool.executable);
-    const ctx = try wireContext(provider, host, root, run);
+    const wire = try manifest.negotiate(provider.meta.command_contract orelse return error.MissingCommandContract);
+    // Created only for a provider that receives it.
+    const cache_dir = if (contract.carriesToolchainContext(wire)) try ensureCacheDir(a, host, provider) else "";
+    const ctx = try wireContext(provider, host, root, run, cache_dir);
     try ctx.validate(run.needs_project);
     const context_path = try std.fs.path.join(a, &.{ run_dir, "context.json" });
     const data = try std.json.Stringify.valueAlloc(a, ctx, .{});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = context_path, .data = data });
     try env.put(contract.context_env, context_path);
+    // The earlier hooks' contributions reach the tool itself, after its
+    // own build above ran on the plain environment.
+    if (run.env) |contributed| try contributed.apply(&env);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, exe);
     try argv.appendSlice(a, run.trailing);
@@ -698,7 +728,7 @@ test "provider dispatch: a hook ToolRun yields a valid hook context, and none wi
         .verified = true,
     };
     const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
-    var ctx = try wireContext(provider, host, abs, run);
+    var ctx = try wireContext(provider, host, abs, run, try std.fs.path.join(a, &.{ abs, "cache" }));
     try ctx.validate(run.needs_project);
     try std.testing.expectEqualStrings(run.target_dir.?, ctx.target_dir.?);
     try std.testing.expect(ctx.run == null);
@@ -726,6 +756,7 @@ test "provider dispatch: build_number reaches only a provider whose range admits
         .target_dir = try std.fs.path.join(a, &.{ abs, ".labelle", "probe_probe-target" }),
     };
     const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    const cache = try std.fs.path.join(a, &.{ abs, "cache" });
     var provider: Provider = .{
         .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
         .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
@@ -733,16 +764,16 @@ test "provider dispatch: build_number reaches only a provider whose range admits
         .verified = true,
     };
     // An open v1 range: negotiated to the newest wire, which carries the key.
-    const open = try wireContext(provider, host, abs, run);
+    const open = try wireContext(provider, host, abs, run, cache);
     try open.validate(true);
-    try std.testing.expectEqualStrings("1.2.0", open.contract_version);
+    try std.testing.expectEqualStrings("1.3.0", open.contract_version);
     try std.testing.expectEqualStrings("42", open.build_number.?);
     const open_wire = try std.json.Stringify.valueAlloc(a, open, .{});
     try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"build_number\":\"42\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"contract_version\":\"1.2.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"contract_version\":\"1.3.0\"") != null);
     // A range capped at the 1.1 wire still gets the key, and nothing newer.
     provider.meta.command_contract = ">=1.0.0 <1.2.0";
-    const mid = try wireContext(provider, host, abs, run);
+    const mid = try wireContext(provider, host, abs, run, cache);
     try mid.validate(true);
     try std.testing.expectEqualStrings("1.1.0", mid.contract_version);
     try std.testing.expectEqualStrings("42", mid.build_number.?);
@@ -750,7 +781,7 @@ test "provider dispatch: build_number reaches only a provider whose range admits
     // A provider capped at the 1.0 wire: the exact 1.0.0 wire, no key — so
     // its strict decoder sees nothing unknown.
     provider.meta.command_contract = ">=1.0.0 <1.1.0";
-    const capped = try wireContext(provider, host, abs, run);
+    const capped = try wireContext(provider, host, abs, run, cache);
     try capped.validate(true);
     try std.testing.expectEqualStrings("1.0.0", capped.contract_version);
     try std.testing.expect(capped.build_number == null);
@@ -759,7 +790,7 @@ test "provider dispatch: build_number reaches only a provider whose range admits
     try std.testing.expect(std.mem.indexOf(u8, capped_wire, "\"contract_version\":\"1.0.0\"") != null);
     // A range the CLI cannot speak at all is refused, never guessed.
     provider.meta.command_contract = ">=2.0.0";
-    try std.testing.expectError(error.UnsupportedContract, wireContext(provider, host, abs, run));
+    try std.testing.expectError(error.UnsupportedContract, wireContext(provider, host, abs, run, cache));
 }
 
 test "provider dispatch: target_dir and run options reach only a provider whose range admits the 1.2 wire" {
@@ -786,15 +817,16 @@ test "provider dispatch: target_dir and run options reach only a provider whose 
         .run_options = .{ .env = &env, .args = &.{ "a", "b" }, .timeout_ms = 1500 },
     };
     const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    const cache = try std.fs.path.join(a, &.{ abs, "cache" });
     var provider: Provider = .{
         .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
         .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
         .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
         .verified = true,
     };
-    const open = try wireContext(provider, host, abs, run);
+    const open = try wireContext(provider, host, abs, run, cache);
     try open.validate(true);
-    try std.testing.expectEqualStrings("1.2.0", open.contract_version);
+    try std.testing.expectEqualStrings("1.3.0", open.contract_version);
     try std.testing.expectEqualStrings(run.target_dir.?, open.target_dir.?);
     try std.testing.expectEqual(@as(usize, 2), open.run.?.env.len);
     try std.testing.expectEqualStrings("b", open.run.?.args[1]);
@@ -804,7 +836,7 @@ test "provider dispatch: target_dir and run options reach only a provider whose 
     // Capped below 1.2.0: the exact older wire, neither key.
     for ([_][2][]const u8{ .{ ">=1.0.0 <1.2.0", "1.1.0" }, .{ ">=1.0.0 <1.1.0", "1.0.0" } }) |case| {
         provider.meta.command_contract = case[0];
-        const capped = try wireContext(provider, host, abs, run);
+        const capped = try wireContext(provider, host, abs, run, cache);
         try capped.validate(true);
         try std.testing.expectEqualStrings(case[1], capped.contract_version);
         try std.testing.expect(capped.target_dir == null and capped.run == null);
@@ -813,16 +845,69 @@ test "provider dispatch: target_dir and run options reach only a provider whose 
         // (`"step":"run"` is the invocation; the key would be `"run":`.)
         try std.testing.expect(std.mem.indexOf(u8, capped_wire, "\"run\":") == null);
     }
-    // A command on 1.2.0: `target_dir` is written as null.
+    // A command on the open range: `target_dir` is written as null.
     provider.meta.command_contract = ">=1.0.0 <2.0.0";
     var command = run;
     command.invocation = .{ .kind = .command, .id = "doctor", .step = null, .phase = null };
     command.target_dir = null;
     command.run_options = null;
-    const cmd_ctx = try wireContext(provider, host, abs, command);
+    const cmd_ctx = try wireContext(provider, host, abs, command, cache);
     try cmd_ctx.validate(true);
     const cmd_wire = try std.json.Stringify.valueAlloc(a, cmd_ctx, .{});
     try std.testing.expect(std.mem.indexOf(u8, cmd_wire, "\"target_dir\":null") != null);
+}
+
+test "provider dispatch: cache_dir and env_file reach only a provider whose range admits the 1.3 wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const abs = if (builtin.os.tag == .windows) "C:\\proj" else "/proj";
+    const run: ToolRun = .{
+        .invocation = .{ .kind = .hook, .id = "toolchain", .step = .generate, .phase = .before },
+        .needs_project = true,
+        .target = "probe-target",
+        .lock_file = try std.fs.path.join(a, &.{ abs, "labelle.lock" }),
+        .output_dir = try std.fs.path.join(a, &.{ abs, "gen" }),
+        .optimize = .ReleaseSafe,
+        .progress = .off,
+        .settings = null,
+        .trailing = &.{},
+        .cwd = abs,
+        .target_dir = try std.fs.path.join(a, &.{ abs, ".labelle", "probe_probe-target" }),
+        .env_file = try std.fs.path.join(a, &.{ abs, "env", "env.json" }),
+    };
+    const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    const cache = try std.fs.path.join(a, &.{ abs, "providers", "local", "pkg" });
+    var provider: Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+        .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+        .verified = true,
+    };
+    const open = try wireContext(provider, host, abs, run, cache);
+    try open.validate(true);
+    try std.testing.expectEqualStrings("1.3.0", open.contract_version);
+    try std.testing.expectEqualStrings(cache, open.cache_dir.?);
+    try std.testing.expectEqualStrings(run.env_file.?, open.env_file.?);
+    // Capped below 1.3.0 (`<1.3.0`): the exact 1.2.0 wire, neither key, so
+    // the hook cannot contribute an environment.
+    provider.meta.command_contract = "<1.3.0";
+    const capped = try wireContext(provider, host, abs, run, cache);
+    try capped.validate(true);
+    try std.testing.expectEqualStrings("1.2.0", capped.contract_version);
+    try std.testing.expect(capped.cache_dir == null and capped.env_file == null);
+    const capped_wire = try std.json.Stringify.valueAlloc(a, capped, .{});
+    try std.testing.expect(std.mem.indexOf(u8, capped_wire, "cache_dir") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped_wire, "env_file") == null);
+    // A hook outside the contributing slots: the key is null on 1.3.0.
+    provider.meta.command_contract = ">=1.0.0 <2.0.0";
+    var after_build = run;
+    after_build.invocation = .{ .kind = .hook, .id = "stamp", .step = .build, .phase = .after };
+    after_build.env_file = null;
+    const plain = try wireContext(provider, host, abs, after_build, cache);
+    try plain.validate(true);
+    const plain_wire = try std.json.Stringify.valueAlloc(a, plain, .{});
+    try std.testing.expect(std.mem.indexOf(u8, plain_wire, "\"env_file\":null") != null);
 }
 
 test "provider dispatch: an extracted platform's namespace is no longer reserved" {

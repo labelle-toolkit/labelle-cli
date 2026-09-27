@@ -7,6 +7,7 @@ const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const emsdk_cache = @import("emsdk_cache.zig");
 const progress = @import("progress.zig");
 const zig_progress = @import("zig_progress.zig");
+const provider_env = @import("provider_env.zig");
 const is_windows = builtin.os.tag == .windows;
 
 /// Resolve the managed `zig` binary for `project_dir` (labelle-cli#279).
@@ -764,7 +765,12 @@ fn taskkillTree(allocator: std.mem.Allocator, pid: std.os.windows.DWORD) void {
 /// dir per target (e.g. `raylib_desktop/`, plus `tests/` from 0.14.0),
 /// and each generated zon ships a placeholder fingerprint that needs
 /// replacing with the value Zig computes from the dir's actual path.
-pub fn fixFingerprints(allocator: std.mem.Allocator, project_dir: []const u8, output_dir: []const u8) !void {
+///
+/// `contributed` is the environment the provider hooks of this build have
+/// contributed so far (contract §2): the `--list-steps` probe evaluates the
+/// generated build graph's configuration, so a toolchain a `before
+/// generate` hook provisioned must be visible to it, not only to the compile.
+pub fn fixFingerprints(allocator: std.mem.Allocator, project_dir: []const u8, output_dir: []const u8, contributed: ?*const provider_env.Accumulator) !void {
     const io = config.globalIo();
     var dir = std.Io.Dir.cwd().openDir(io, output_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -780,12 +786,12 @@ pub fn fixFingerprints(allocator: std.mem.Allocator, project_dir: []const u8, ou
         const zon_path = try std.fs.path.join(allocator, &.{ sub_path, "build.zig.zon" });
         defer allocator.free(zon_path);
         std.Io.Dir.cwd().access(io, zon_path, .{}) catch continue;
-        try fixFingerprint(allocator, project_dir, sub_path);
+        try fixFingerprint(allocator, project_dir, sub_path, contributed);
     }
 }
 
 /// Run `zig build` in output_dir, parse the fingerprint error, and patch build.zig.zon.
-pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, output_dir: []const u8) !void {
+pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, output_dir: []const u8, contributed: ?*const provider_env.Accumulator) !void {
     const io = config.globalIo();
     const zon_path = try std.fs.path.join(allocator, &.{ output_dir, "build.zig.zon" });
     defer allocator.free(zon_path);
@@ -796,6 +802,7 @@ pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, out
     // other managed spawn, so its compiler cache lands in user-writable space.
     var zig_env = try buildZigEnv(allocator, &.{});
     defer zig_env.deinit();
+    if (contributed) |env| try env.apply(&zig_env);
     // `--list-steps`: the probe only exists to trigger the manifest
     // fingerprint validation (which happens during configuration, before
     // any step runs) and read the `use this value:` hint. A bare `zig

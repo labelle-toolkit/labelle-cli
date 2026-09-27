@@ -23,6 +23,13 @@ pub const Hook = struct {
     executable: []const u8,
     after_hooks: []const []const u8 = &.{},
 };
+/// A default the target's owner declares for it (contract §1
+/// `.target_defaults`). Applied only when the user gave no explicit flag.
+pub const TargetDefault = struct {
+    target: []const u8,
+    optimize: contract.Optimize,
+};
+
 /// The newest wire version this CLI speaks (`contract.supported_versions`)
 /// that `range_text` admits, or `error.UnsupportedContract` when it admits
 /// none. The result is static storage.
@@ -42,10 +49,11 @@ pub const Manifest = struct {
     commands: []const Command = &.{},
     hooks: []const Hook = &.{},
     targets: []const []const u8 = &.{},
+    target_defaults: []const TargetDefault = &.{},
 
     pub fn isProvider(self: Manifest) bool {
         return self.command_contract != null or self.namespace != null or
-            self.commands.len != 0 or self.hooks.len != 0 or self.targets.len != 0;
+            self.commands.len != 0 or self.hooks.len != 0 or self.targets.len != 0 or self.target_defaults.len != 0;
     }
     pub fn validate(self: Manifest) !void {
         if (!self.isProvider()) return;
@@ -63,6 +71,16 @@ pub const Manifest = struct {
         for (self.targets) |target| {
             if (!contract.identifier(target)) return error.InvalidTarget;
             if (!contract.targetName(target)) return error.ReservedDeviceTarget;
+        }
+        // Only the target's owner may declare its defaults, once per target
+        // (contract §1): a default for someone else's target, or two for
+        // one, would make the effective optimize depend on which provider
+        // the CLI happened to read.
+        for (self.target_defaults, 0..) |default, i| {
+            if (!self.ownsTarget(default.target)) return error.TargetDefaultRequiresOwnedTarget;
+            for (self.target_defaults[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.target, default.target)) return error.DuplicateTargetDefault;
+            }
         }
         for (self.commands, 0..) |cmd, i| {
             if (!contract.identifier(cmd.name) or cmd.help.len == 0) return error.InvalidCommand;
@@ -88,6 +106,13 @@ pub const Manifest = struct {
                     return error.InvalidHookReference;
             }
         }
+    }
+    /// The owner's default optimize mode for `target`, if it declares one.
+    pub fn defaultOptimize(self: Manifest, target: []const u8) ?contract.Optimize {
+        for (self.target_defaults) |default| {
+            if (std.mem.eql(u8, default.target, target)) return default.optimize;
+        }
+        return null;
     }
     pub fn ownsTarget(self: Manifest, target: []const u8) bool {
         for (self.targets) |declared| {
@@ -296,11 +321,17 @@ test "provider manifest: a repeated top-level field is rejected, never last-wins
 }
 
 test "provider manifest: contract negotiation picks the newest wire the provider's range admits" {
-    try std.testing.expectEqualStrings("1.2.0", contract.version);
+    try std.testing.expectEqualStrings("1.3.0", contract.version);
     // An open v1 range admits every additive minor, so it gets the newest.
-    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.0.0 <2.0.0"));
-    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.1.0"));
-    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.2.0"));
+    try std.testing.expectEqualStrings("1.3.0", try negotiate(">=1.0.0 <2.0.0"));
+    try std.testing.expectEqualStrings("1.3.0", try negotiate(">=1.1.0"));
+    try std.testing.expectEqualStrings("1.3.0", try negotiate(">=1.2.0"));
+    try std.testing.expectEqualStrings("1.3.0", try negotiate(">=1.3.0 <1.4.0"));
+    // A provider capped below 1.3.0 keeps the exact 1.2.0 wire, without
+    // `cache_dir` or `env_file`.
+    try std.testing.expectEqualStrings("1.2.0", try negotiate("<1.3.0"));
+    try std.testing.expectEqualStrings("1.2.0", try negotiate(">=1.0.0 <1.3.0"));
+    try std.testing.expectEqualStrings("1.2.0", try negotiate("1.2.0"));
     // A provider capped below 1.2.0 keeps the exact 1.1.0 wire, without
     // `target_dir` or `run`.
     try std.testing.expectEqualStrings("1.1.0", try negotiate(">=1.0.0 <1.2.0"));
@@ -311,4 +342,24 @@ test "provider manifest: contract negotiation picks the newest wire the provider
     // Nothing this CLI speaks: refused, never downgraded to a guess.
     try std.testing.expectError(error.UnsupportedContract, negotiate(">=2.0.0"));
     try std.testing.expectError(error.UnsupportedContract, negotiate("1.0.5"));
+}
+
+test "provider manifest: target defaults belong to the target's owner, once per target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".{{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ {s} }}, .target_defaults = .{{ {s} }} }}";
+    const owned = try parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"probe-target\", .optimize = .ReleaseSafe }" }));
+    try std.testing.expectEqual(contract.Optimize.ReleaseSafe, owned.defaultOptimize("probe-target").?);
+    try std.testing.expect(owned.defaultOptimize("desktop") == null);
+    // A defaults-only manifest is still a provider manifest.
+    try std.testing.expect(owned.isProvider());
+    // Someone else's target, including core's `desktop`: refused.
+    try std.testing.expectError(error.TargetDefaultRequiresOwnedTarget, parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"other\", .optimize = .ReleaseSafe }" })));
+    try std.testing.expectError(error.TargetDefaultRequiresOwnedTarget, parse(a, try std.fmt.allocPrint(a, base, .{ "", ".{ .target = \"desktop\", .optimize = .ReleaseFast }" })));
+    // Two defaults for one target, even agreeing: refused.
+    try std.testing.expectError(error.DuplicateTargetDefault, parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"probe-target\", .optimize = .ReleaseSafe }, .{ .target = \"probe-target\", .optimize = .ReleaseSafe }" })));
+    // Strict records: an unknown field or mode is a parse error.
+    try std.testing.expectError(error.ParseZon, parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"probe-target\", .optimize = .ReleaseSafe, .typo = 1 }" })));
+    try std.testing.expectError(error.ParseZon, parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"probe-target\", .optimize = .Fastest }" })));
 }

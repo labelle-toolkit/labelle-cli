@@ -52,6 +52,14 @@ pub fn main(init: std.process.Init) !u8 {
             return std.mem.lessThan(u8, x, y);
         }
     }.lessThan);
+    // What this invocation's own process sees of an environment an earlier
+    // hook contributed (contract §2 `env_file`, wire 1.3.0+): the probe
+    // variable the suites contribute, and the first PATH entry.
+    const probe_toolchain: ?[]const u8 = init.minimal.environ.getAlloc(a, "PROBE_TOOLCHAIN") catch null;
+    const path_head: ?[]const u8 = if (init.minimal.environ.getAlloc(a, "PATH")) |path_value|
+        path_value[0 .. std.mem.indexOfScalar(u8, path_value, std.fs.path.delimiter) orelse path_value.len]
+    else |_|
+        null;
     const line = try std.json.Stringify.valueAlloc(a, .{
         .invocation = invocation,
         .target = ctx.value.object.get("target").?,
@@ -65,6 +73,8 @@ pub fn main(init: std.process.Init) !u8 {
         // The whole context, so a suite can assert any key a wire version
         // adds (`target_dir`, `run`) and that an older wire lacks it.
         .context = ctx.value,
+        .probe_toolchain = probe_toolchain,
+        .path_head = path_head,
         .nanoseconds = std.Io.Timestamp.now(init.io, .awake).nanoseconds,
     }, .{});
     const log_path = try std.fs.path.join(a, &.{ output, "hooks.log" });
@@ -101,6 +111,20 @@ pub fn main(init: std.process.Init) !u8 {
             if (std.fs.path.dirname(dest)) |dir| try std.Io.Dir.cwd().createDirPath(init.io, dir);
             const copied = try std.Io.Dir.cwd().readFileAlloc(init.io, src, a, .limited(16 * 1024 * 1024));
             try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = dest, .data = copied });
+        }
+    } else |_| {}
+    // `PROVIDER_PROBE_ENV=<hook id>|<file>` makes that hook contribute an
+    // environment (contract §2 `env_file`, wire 1.3.0+): it copies `<file>`'s
+    // bytes, verbatim, to the `env_file` its context names, so a suite can
+    // hand it a valid, empty or malformed document alike. A hook whose
+    // context has no env_file exits 9 instead: the slot is wrong.
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_ENV")) |spec| {
+        const bar = std.mem.indexOfScalar(u8, spec, '|') orelse return error.BadProbeEnvSpec;
+        if (invocation == .object and std.mem.eql(u8, invocation.object.get("id").?.string, spec[0..bar])) {
+            const env_file = ctx.value.object.get("env_file") orelse return 9;
+            if (env_file != .string) return 9;
+            const contribution = try std.Io.Dir.cwd().readFileAlloc(init.io, spec[bar + 1 ..], a, .limited(1024 * 1024));
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = env_file.string, .data = contribution });
         }
     } else |_| {}
     // `PROVIDER_PROBE_SAY=1` makes every invocation print numbered lines to

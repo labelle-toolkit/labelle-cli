@@ -78,6 +78,9 @@ pub fn build(b: *std.Build) void {
     const child_fixture_install = b.addInstallArtifact(child_fixture, .{});
     const test_fixtures = b.addOptions();
     test_fixtures.addOption([]const u8, "child_exe", b.getInstallPath(.bin, child_fixture.out_filename));
+    // The source tree, for the reserved-environment-name guard
+    // (`config.zig`), which checks every `LABELLE_*` name the CLI spells.
+    test_fixtures.addOption([]const u8, "src_dir", b.pathFromRoot("src"));
     cli_tests.root_module.addOptions("test_fixtures", test_fixtures);
     // `docs/shader-materials.md` quotes material_toolchain.zig's diagnostics
     // and its Windows extension lists verbatim. The toolchain tests embed the

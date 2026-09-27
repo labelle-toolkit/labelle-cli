@@ -14,6 +14,8 @@ const refuseLegacyWasmReplacement = @import("args_resolve.zig").refuseLegacyWasm
 const refuseKnownLegacyWasmReplacement = @import("args_resolve.zig").refuseKnownLegacyWasmReplacement;
 const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
+const provider_contract = @import("../provider_contract.zig");
+const optimize_mod = @import("optimize.zig");
 
 /// The production replan for `wasm serve --watch` (`WasmRebuildCtx.replan`):
 /// re-reads `project.labelle`, brings the package cache and `labelle.lock`
@@ -172,6 +174,12 @@ pub const WatchReplan = struct {
                 .unpinned_owner => error.UnverifiedTargetOwner,
             },
         }
+        // The effective optimize mode, recomputed against the NEW providers:
+        // an edited `.target_defaults` changes this rebuild's `-Doptimize`
+        // and wire `optimize`, and an explicit flag still wins.
+        const optimize = optimize_mod.effective(ctx.optimize_flag, optimize_mod.ownerDefault(providers, ctx.hooks.target), ctx.fallback_optimize);
+        const wire_optimize = std.meta.stringToEnum(provider_contract.Optimize, optimize.mode orelse "Debug") orelse return error.InvalidOptimizeMode;
+        const zig_args = try withOptimize(a, ctx.zig_args, optimize.mode);
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         const run_plan = try provider_hooks.plan(a, providers, .run, ctx.hooks.target);
@@ -193,10 +201,25 @@ pub const WatchReplan = struct {
         ctx.prebuild_steps = cfg.prebuild;
         ctx.generate_plan = generate_plan;
         ctx.build_plan = build_plan;
+        if (ctx.hooks.optimize != wire_optimize)
+            std.debug.print("labelle: rebuild optimize mode is now {s} (was {s})\n", .{ @tagName(wire_optimize), @tagName(ctx.hooks.optimize) });
+        ctx.hooks.optimize = wire_optimize;
+        ctx.zig_args = zig_args;
         next.run_after = run_plan.after;
         if (self.current) |previous| previous.destroy(self.backing);
         self.current = next;
         self.pruneExtractions();
+    }
+
+    /// `args` (a `zig build` argv) with its `-Doptimize=` flag replaced by
+    /// `mode`'s, or dropped when there is none. Allocated with `a`.
+    pub fn withOptimize(a: std.mem.Allocator, args: []const []const u8, mode: ?[]const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (args) |arg| {
+            if (!std.mem.startsWith(u8, arg, "-Doptimize=")) try out.append(a, arg);
+        }
+        if (mode) |m| try out.append(a, try std.fmt.allocPrint(a, "-Doptimize={s}", .{m}));
+        return out.items;
     }
 
     /// The `after run` hooks the serve's shutdown runs: the current
