@@ -1236,8 +1236,10 @@ pub const RunStepSpec = struct {
 
     /// cli#452: a step that leaves a background process holding its stdout
     /// must not hang the build on the relay path, including when the relay
-    /// cannot start. `sleep 3` (not 30): in the fallback it holds the test
-    /// runner's stderr, which the build runner drains to EOF.
+    /// cannot start. `sleep 8` (not 30): in the fallback it holds the test
+    /// runner's stderr, which the build runner drains to EOF. The 5 s bound
+    /// leaves room for a loaded CI runner over the 0.5 s drain grace while
+    /// still failing a relay that waits for the descendant.
     pub const relay_is_bounded = struct {
         fn elapsedNs(relay_test: RelayTest) !u64 {
             if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -1248,18 +1250,18 @@ pub const RunStepSpec = struct {
             const root = buf[0..try tmp.dir.realPath(io, &buf)];
             const began = std.Io.Timestamp.now(io, .awake);
             const code = try runStep(std.testing.allocator, root, .{
-                .run = &.{ "/bin/sh", "-c", "sleep 3 & printf 'relay-bound-test partial'" },
+                .run = &.{ "/bin/sh", "-c", "sleep 8 & printf 'relay-bound-test partial'" },
             }, .{ .route_stdout_to_stderr = true, .relay_test = relay_test });
             try std.testing.expectEqual(@as(u8, 0), code);
             return @intCast(began.untilNow(io, .awake).toNanoseconds());
         }
 
         test "the relay stops waiting once the direct child exits" {
-            try std.testing.expect(try elapsedNs(.forced) < 2500 * std.time.ns_per_ms);
+            try std.testing.expect(try elapsedNs(.forced) < 5 * std.time.ns_per_s);
         }
 
         test "a relay that cannot start falls back without relaying synchronously" {
-            try std.testing.expect(try elapsedNs(.forced_prepare_fails) < 2500 * std.time.ns_per_ms);
+            try std.testing.expect(try elapsedNs(.forced_prepare_fails) < 5 * std.time.ns_per_s);
         }
     };
 

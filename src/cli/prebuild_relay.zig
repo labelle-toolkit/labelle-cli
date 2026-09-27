@@ -141,10 +141,13 @@ pub const Relay = struct {
     /// when the CLI exits) and detaches it. `self` is invalid afterwards
     /// either way (protocol above).
     pub fn finish(self: *Relay, grace_ns: u64) void {
-        const step_ns = 10 * std.time.ns_per_ms;
-        var waited: u64 = 0;
-        while (self.state.load(.acquire) == running and waited < grace_ns) : (waited += step_ns) {
-            sleep(self.io, step_ns);
+        // Wall-clock deadline: counting sleep iterations overshoots on a
+        // loaded machine, where each short sleep can run long.
+        const began = std.Io.Timestamp.now(self.io, .awake);
+        while (self.state.load(.acquire) == running and
+            began.untilNow(self.io, .awake).toNanoseconds() < grace_ns)
+        {
+            sleep(self.io, 10 * std.time.ns_per_ms);
         }
         if (self.state.load(.acquire) == running) {
             // A descendant still holds the pipe. `self` is still ours here.
