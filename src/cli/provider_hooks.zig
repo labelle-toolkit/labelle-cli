@@ -302,6 +302,9 @@ pub const Site = struct {
     /// rebuild `reset`s it first, so a hook that no longer runs leaves
     /// nothing behind. The pipeline deinits it.
     env: provider_env.Accumulator = .{},
+    /// The largest `env_file` read back. A field only so a test can lower
+    /// it; production never overrides it.
+    env_file_cap: usize = provider_env.max_file_bytes,
     /// The tool launcher. A field only so the scratch-arena test below can
     /// observe which allocator a hook invocation receives without a host
     /// compiler; production never overrides it.
@@ -380,6 +383,14 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     return 0;
 }
 
+/// The one way an invalid `env_file` ends the command: the diagnostic that
+/// names the hook, and the progress feed marked failed.
+fn rejectEnvFile(site: *Site, qualified: []const u8, reason: []const u8) error{InvalidHookEnvFile} {
+    std.debug.print("labelle: hook '{s}' wrote an invalid env_file: {s}\n", .{ qualified, reason });
+    if (site.reporter) |r| r.finishFailed(1, "invalid hook env_file");
+    return error.InvalidHookEnvFile;
+}
+
 /// `<LABELLE_HOME>/provider-env/<random>/`, created empty.
 fn envDir(a: std.mem.Allocator, host: dispatch.Host) ![]const u8 {
     const parent = try dispatch.canonicalDir(a, try std.fs.path.join(a, &.{ host.cache_root, "provider-env" }));
@@ -395,14 +406,14 @@ fn envDir(a: std.mem.Allocator, host: dispatch.Host) ![]const u8 {
 /// or conflicting fails the command here, before any later zig invocation,
 /// naming the hook.
 fn absorbEnvFile(site: *Site, a: std.mem.Allocator, qualified: []const u8, path: []const u8) !void {
-    const bytes = try provider_env.readFile(a, path) orelse return;
+    const read = provider_env.readFile(a, path, site.env_file_cap) catch |err| switch (err) {
+        error.StreamTooLong => return rejectEnvFile(site, qualified, try std.fmt.allocPrint(a, "the file is larger than the {d}-byte cap", .{site.env_file_cap})),
+        else => return err,
+    };
+    const bytes = read orelse return;
     var diag: provider_env.Diagnostic = .{};
     const file = provider_env.parseFile(a, bytes, site.env.windows, &diag) catch |err| switch (err) {
-        error.InvalidEnvFile => {
-            std.debug.print("labelle: hook '{s}' wrote an invalid env_file: {s}\n", .{ qualified, diag.message });
-            if (site.reporter) |r| r.finishFailed(1, "invalid hook env_file");
-            return error.InvalidHookEnvFile;
-        },
+        error.InvalidEnvFile => return rejectEnvFile(site, qualified, diag.message),
         else => return err,
     };
     site.env.add(site.backing, a, qualified, file, &diag) catch |err| switch (err) {

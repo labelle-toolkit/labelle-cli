@@ -890,6 +890,13 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "hook 'fixture-a/tc' may contribute an environment for target 'desktop'" in refused.stderr, refused.stderr
     assert "--docker doesn't carry provider environment contributions; build without --docker" in refused.stderr, refused.stderr
     assert "FIXTURE_GENERATE" not in refused.stderr and not log(target_dir) and not log(zig_out), refused.stderr
+    # `labelle generate --docker` stops after generation and never reaches
+    # the container build, so it is not refused: the hooks run and the
+    # contribution reaches the later ones on the host.
+    reset()
+    generated = run("generate", "--docker", extra_env=contributing)
+    assert "--docker doesn't carry" not in generated.stderr and "FIXTURE_GENERATE" in generated.stderr, generated.stderr
+    assert by_id(target_dir)["gen-post"]["probe_toolchain"] == "from-tc", log(target_dir)
     # The legacy `labelle ios` runs its own zig build after generation, with
     # neither the contributions nor the optimize default: refused for either,
     # before any hook or generation.

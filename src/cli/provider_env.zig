@@ -88,10 +88,15 @@ pub fn parseFile(a: std.mem.Allocator, bytes: []const u8, windows: bool, diag: *
     return parsed;
 }
 
+/// The largest `env_file` the CLI reads. A bigger one is an invalid file,
+/// reported like a malformed one.
+pub const max_file_bytes: usize = 1024 * 1024;
+
 /// Read an `env_file` a hook may have written: null when it does not exist
-/// (the hook contributed nothing).
-pub fn readFile(a: std.mem.Allocator, path: []const u8) !?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(1024 * 1024)) catch |err| switch (err) {
+/// (the hook contributed nothing). `error.StreamTooLong` when it exceeds
+/// `cap` bytes (`max_file_bytes` in production).
+pub fn readFile(a: std.mem.Allocator, path: []const u8, cap: usize) !?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(cap)) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
     };
@@ -395,9 +400,10 @@ test "provider env: a missing file is no contribution" {
     defer std.testing.allocator.free(dir);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "env.json" });
     defer std.testing.allocator.free(path);
-    try std.testing.expect((try readFile(std.testing.allocator, path)) == null);
+    try std.testing.expect((try readFile(std.testing.allocator, path, max_file_bytes)) == null);
     try tmp.dir.writeFile(io, .{ .sub_path = "env.json", .data = "{}" });
-    const bytes = (try readFile(std.testing.allocator, path)).?;
+    try std.testing.expectError(error.StreamTooLong, readFile(std.testing.allocator, path, 1));
+    const bytes = (try readFile(std.testing.allocator, path, max_file_bytes)).?;
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("{}", bytes);
 }

@@ -8,10 +8,12 @@
 //!   `provider_github.projectRepo` (every spelling the assembler fetches as
 //!   the same repository) and lowercased, since GitHub names are
 //!   case-insensitive: `github.com/<owner>/<name>`. Each segment keeps its
-//!   characters (GitHub allows only `[A-Za-z0-9._-]`); one that Windows
-//!   cannot create (a reserved device name such as `con`, or a trailing
-//!   `.`) gets a `~` appended, a character no GitHub name contains, so the
-//!   escape never collides with another repository.
+//!   characters (GitHub allows only `[A-Za-z0-9._-]`), except that a segment
+//!   Windows cannot create is escaped with `~`, a character no GitHub name
+//!   contains, so the escape never collides with another repository: a
+//!   reserved device stem gets `~` before its first dot (`con` -> `con~`,
+//!   `con.tools` -> `con~.tools`, whose stem `con~` is not a device), and a
+//!   trailing `.` gets `~` after it (`name.` -> `name.~`).
 //! - A local provider (`local:<path>`, `@<path>`) has no repository; its id
 //!   is its canonical directory: `local/<name>-<hash>`, where `<hash>` is
 //!   the first 32 hex digits of the SHA-256 of the provider's real path
@@ -74,10 +76,13 @@ fn readableName(a: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 fn segment(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    const lower = try std.ascii.allocLowerString(a, raw);
-    if (contract.windowsReservedDeviceName(lower) or std.mem.endsWith(u8, lower, "."))
-        return std.fmt.allocPrint(a, "{s}~", .{lower});
-    return lower;
+    var out = try std.ascii.allocLowerString(a, raw);
+    if (contract.windowsReservedDeviceName(out)) {
+        const dot = std.mem.indexOfScalar(u8, out, '.') orelse out.len;
+        out = try std.fmt.allocPrint(a, "{s}~{s}", .{ out[0..dot], out[dot..] });
+    }
+    if (std.mem.endsWith(u8, out, ".")) out = try std.fmt.allocPrint(a, "{s}~", .{out});
+    return out;
 }
 
 /// `<cache_root>/providers/<canonical id>/`, with the host's separators.
@@ -89,6 +94,10 @@ pub fn dirPath(a: std.mem.Allocator, cache_root: []const u8, dep: project.Plugin
     var it = std.mem.splitScalar(u8, id, '/');
     while (it.next()) |part| try parts.append(a, part);
     return std.fs.path.join(a, parts.items);
+}
+
+fn segmentPath(a: std.mem.Allocator, repo: []const u8) ![]const u8 {
+    return canonicalId(a, .{ .name = "x", .repo = repo, .version = "1.0.0" }, "/unused", false);
 }
 
 test "provider cache: a pinned provider is keyed by its normalised repository" {
@@ -111,6 +120,35 @@ test "provider cache: a pinned provider is keyed by its normalised repository" {
     // name holds, so it cannot collide with a real repository.
     try std.testing.expectEqualStrings("github.com/con~/aux~", try canonicalId(a, .{ .name = "x", .repo = "github.com/CON/aux", .version = "1.0.0" }, "/unused", false));
     try std.testing.expectEqualStrings("github.com/owner/name.~", try canonicalId(a, .{ .name = "x", .repo = "owner/name.", .version = "1.0.0" }, "/unused", false));
+    try std.testing.expectEqualStrings("github.com/owner/con~.tools", try canonicalId(a, .{ .name = "x", .repo = "owner/con.tools", .version = "1.0.0" }, "/unused", false));
+    try std.testing.expectEqualStrings("github.com/owner/con~.~", try segmentPath(a, "owner/con."));
+    // Every reserved device name, bare, with an extension, with two and with
+    // a trailing dot, in any case: the escaped segment is creatable on
+    // Windows (its stem is no device, it has no trailing dot) and keeps the
+    // original characters apart from the inserted `~`s.
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(a, &.{ "con", "prn", "aux", "nul", "conin$", "conout$" });
+    for (1..10) |n| {
+        try names.append(a, try std.fmt.allocPrint(a, "com{d}", .{n}));
+        try names.append(a, try std.fmt.allocPrint(a, "lpt{d}", .{n}));
+    }
+    for (names.items) |name| {
+        for ([_][]const u8{ "", ".tools", ".tar.gz", "." }) |suffix| {
+            for ([_]bool{ false, true }) |upper| {
+                const raw = try std.fmt.allocPrint(a, "{s}{s}", .{ name, suffix });
+                if (upper) _ = std.ascii.upperString(raw, raw);
+                const escaped = try segment(a, raw);
+                try std.testing.expect(!contract.windowsReservedDeviceName(escaped));
+                try std.testing.expect(!std.mem.endsWith(u8, escaped, "."));
+                const without = try std.mem.replaceOwned(u8, a, escaped, "~", "");
+                try std.testing.expect(std.ascii.eqlIgnoreCase(without, raw));
+            }
+        }
+    }
+    // Near misses are not escaped.
+    for ([_][]const u8{ "console", "com10", "lpt", "nul0", "tools.con" }) |name| {
+        try std.testing.expectEqualStrings(name, try segment(a, name));
+    }
     try std.testing.expectEqualStrings("github.com/owner/console", try canonicalId(a, .{ .name = "x", .repo = "owner/console", .version = "1.0.0" }, "/unused", false));
     // Another host is refused, never keyed.
     try std.testing.expectError(error.NonGitHubProviderRepository, canonicalId(a, .{ .name = "x", .repo = "gitlab.com/o/n", .version = "1.0.0" }, "/unused", false));

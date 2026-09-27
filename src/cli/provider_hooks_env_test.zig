@@ -170,6 +170,19 @@ test "provider hooks env: a failed hook's file is ignored; a malformed or confli
         try std.testing.expectError(error.InvalidHookEnvFile, hooks.runPhase(&h.site, &.{ h.planned(0), h.planned(1) }, .build, .before, h.out()));
         try std.testing.expectEqual(@as(usize, 1), Spy.calls);
     }
+    // A file over the size cap is an invalid file too (the cap is lowered
+    // here; production reads up to `provider_env.max_file_bytes`).
+    Spy.calls = 0;
+    Spy.writes = &.{.{ .id = "a", .bytes = "{\"set\":[{\"name\":\"PROBE_VAR\",\"value\":\"x\"}]}" }};
+    h.site.env_file_cap = 8;
+    try std.testing.expectError(error.InvalidHookEnvFile, hooks.runPhase(&h.site, &.{ h.planned(0), h.planned(1) }, .build, .before, h.out()));
+    try std.testing.expectEqual(@as(usize, 1), Spy.calls);
+    try std.testing.expect(h.site.env.isEmpty());
+    // The same file under the cap is accepted: the cap is what refused it.
+    h.site.env_file_cap = @import("provider_env.zig").max_file_bytes;
+    try std.testing.expectEqual(@as(u8, 0), try hooks.runPhase(&h.site, &.{h.planned(0)}, .build, .before, h.out()));
+    try std.testing.expect(!h.site.env.isEmpty());
+    h.site.env.reset();
     // Two hooks disagreeing on a name: a conflict naming both.
     Spy.calls = 0;
     Spy.writes = &.{

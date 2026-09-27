@@ -270,7 +270,10 @@ pub fn discoverAndPlan(
 /// - `--docker` builds inside a container that never sees a hook's
 ///   environment contribution (contract §2 `env_file`); it does pass the
 ///   effective optimize mode through as `-Doptimize`, so a target default
-///   is honoured there;
+///   is honoured there. Only a command that reaches that container build
+///   refuses: `labelle generate --docker` stops after generation, and its
+///   one zig invocation (the host-side fingerprint pass of `tests/`) does
+///   receive the contributions;
 /// - `labelle ios` runs its own `zig build` after generation, with neither
 ///   the contributions nor the effective optimize mode.
 pub const Bypass = enum {
@@ -295,8 +298,17 @@ pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool
         if (contributor) return .ios_env;
         if (owner_default) return .ios_default;
     }
-    if (docker and contributor) return .docker_env;
+    if (docker and contributor and reachesContainerBuild(command)) return .docker_env;
     return null;
+}
+
+/// The commands whose `--docker` run reaches `docker.runBuild`: every one
+/// that goes on past generation into the shared build step.
+fn reachesContainerBuild(command: args_mod.Command) bool {
+    return switch (command) {
+        .build, .run, .bundle_cmd, .wasm_cmd => true,
+        else => false,
+    };
 }
 
 test "providerBypass: a path that cannot carry a provider's input refuses instead of bypassing it" {
@@ -308,6 +320,12 @@ test "providerBypass: a path that cannot carry a provider's input refuses instea
     // --docker: contributions are refused; a default is passed through.
     try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false).?);
     try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, true).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.bundle_cmd, true, true, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.wasm_cmd, true, true, false).?);
+    // `labelle generate --docker` never reaches the container build: its
+    // fingerprint pass runs on the host with the contributions.
+    try std.testing.expect(providerBypass(.generate, true, true, false) == null);
+    try std.testing.expect(providerBypass(.generate, true, true, true) == null);
     try std.testing.expect(providerBypass(.build, true, false, true) == null);
     // Without --docker the shared pipeline carries both.
     try std.testing.expect(providerBypass(.build, false, true, true) == null);
