@@ -89,6 +89,8 @@ Inside projects, `target` and `lock_file` are required and non-null. Outside pro
 
 Progress uses standard streams rather than invented OS handles: in JSON mode stdout carries the existing CLI NDJSON progress protocol and stderr carries diagnostics; in human/off modes normal command output is permitted. The CLI parses/relays JSON events and owns the single final command outcome. Nonzero provider exit or abnormal termination is failure. No secret values belong in the context or progress stream.
 
+The provider inherits the CLI's stdout and stderr, and when a user redirects them to a file (`labelle build > log 2>&1`) both processes share ONE open file description and its offset. A provider must therefore write both streams in streaming (append) mode — in Zig 0.16, `File.stdout().writerStreaming(...)` / `File.stderr().writerStreaming(...)` or `std.debug.print`, never the positional `File.writer(...)`, which pwrite()s at its own offset starting from 0 and overwrites what the CLI already wrote ([#446](https://github.com/labelle-toolkit/labelle-cli/issues/446)). Pipes hide the bug because they are unseekable; `test/provider_output_e2e.py` checks the redirected-file case.
+
 There is **no credentials-helper RPC in v1**. Providers use explicitly configured environment-variable names or their own OS credential integration. Provider configuration stores references, not secret values. This avoids promising a helper endpoint before its protocol exists.
 
 ## 3. Provider-owned project settings
