@@ -53,8 +53,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     project = base / "project"
     project.mkdir()
     home = base / "home"
-    # Hermetic: the no-provider diagnostic's live registry lookup is off
-    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    # Hermetic: the no-provider diagnostic's registry download is off
+    # (LABELLE_OFFLINE); only the recorded document of a custom registry the
+    # project accepted from can name an owner here.
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig)
     registry = base / "providers.json"
     lock = project / "labelle.providers.lock"
@@ -294,11 +295,14 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     err = run("build", "--platform=unknown-target", code=1).stderr
     assert "no provider for target 'unknown-target'" in err and "(registry:" not in err, err
     # The project accepted from a LOCAL providers.json, so the no-provider
-    # lookup asks that file (named in the hint), never the public registry,
-    # even online. A stand-in `curl` that would serve a public document
-    # assigning `other-target` elsewhere logs any request. POSIX only.
-    accepted_record = json.loads((project / ".labelle/providers.registry.json").read_text())
+    # lookup answers from the document recorded with that source (named in
+    # the hint, on a line of its own), never the public registry, even
+    # online. A stand-in `curl` that would serve a public document assigning
+    # `other-target` elsewhere logs any request. POSIX only.
+    record_path = project / ".labelle/providers.registry.json"
+    accepted_record = json.loads(record_path.read_text())
     assert accepted_record["source"] == str(registry.resolve()), accepted_record
+    assert accepted_record["schema_version"] == 2 and len(accepted_record["document_sha256"]) == 64, accepted_record
     if os.name != "nt":
         public_shim = base / "public-shim"
         public_shim.mkdir()
@@ -318,22 +322,37 @@ sys.stdout.write(open({str(public_doc)!r}).read())
         try:
             err = run("build", "--platform=other-target", code=1).stderr
             assert "(registry: other)" in err and "public-owner" not in err, err
-            assert f"the registry this project last accepted from, {registry.resolve()}, lists package 'other' 1.0.0" in err, err
+            assert "The registry this project last accepted from lists package 'other' as the provider of target 'other-target'." in err, err
+            assert "1.0.0, is a candidate: `labelle providers resolve --accept`" in err, err
             assert '.{ .name = "other", .repo = "github.com/example/other", .version = "1.0.0" },' in err, err
-            # Both resolve steps name that source, or resolve would read the public registry.
-            assert f"labelle providers resolve {registry.resolve()} --accept" in err, err
-            assert f"2. labelle providers resolve {registry.resolve()} " in err, err
-            # The custom source changes: the fresh read answers, not the recorded copy.
+            # The source is printed once, alone on its line, and no command
+            # carries it: the steps say where it goes.
+            assert f"(copy it as is):\n    {registry.resolve()}\n" in err and err.count(str(registry.resolve())) == 1, err
+            assert "run `labelle providers resolve` with the source above as its argument" in err, err
+            # The custom source changes: the recorded snapshot still answers
+            # (nothing is re-read), until the next accept records a new one.
             schema_two([(pin, "probe", []), (dict(other, version="1.1.0"), None, ["other-target"])])
             err = run("build", "--platform=other-target", code=1).stderr
-            assert "lists package 'other' 1.1.0" in err, err
+            assert "1.0.0, is a candidate" in err and "1.1.0" not in err, err
+            schema_two([(pin, "probe", []), (other, None, ["other-target"])])
+            # A record whose document no longer matches its digest does not
+            # verify: generic steps, and the public registry is not asked in
+            # the project's name.
+            good_record = record_path.read_text()
+            tampered = dict(accepted_record, document=accepted_record["document"].replace('"1.0.0"', '"9.9.9"'))
+            record_path.write_text(json.dumps(tampered))
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "no provider for target 'other-target'" in err, err
+            assert "(the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)" in err, err
+            assert "(registry:" not in err and "9.9.9" not in err and "public-owner" not in err, err
+            assert '.{ .name = "<package>", .repo = "github.com/<owner>/<repo>", .version = "<version>" },' in err, err
             assert not public_log.exists(), public_log.read_text()
             # Control: without the project's record the public registry IS asked.
-            (project / ".labelle/providers.registry.json").rename(base / "accepted-record.json")
+            record_path.unlink()
             err = run("build", "--platform=other-target", code=1).stderr
-            assert "(registry: public-owner)" in err and public_log.read_text().count("\n") == 1, err
-            (base / "accepted-record.json").rename(project / ".labelle/providers.registry.json")
-            schema_two([(pin, "probe", []), (other, None, ["other-target"])])
+            assert "(registry: public-owner)" in err and "The provider registry lists package 'public-owner'" in err, err
+            assert public_log.read_text().count("\n") == 1, err
+            record_path.write_text(good_record)
         finally:
             env.clear()
             env.update(saved)

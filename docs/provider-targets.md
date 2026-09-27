@@ -45,99 +45,79 @@ one target, in two halves, before anything is generated, locked or built:
    ```
    labelle: no provider for target 'wasm' in this project; add and pin the package that declares target 'wasm'
      (registry: web)
-     the provider registry lists package 'web' 0.2.0 as the provider of target 'wasm'. To use it:
+     The provider registry lists package 'web' as the provider of target 'wasm'.
+     Its newest release that declares the target, 0.2.0, is a candidate: `labelle providers resolve --accept`
+     checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the target).
+     To use it:
        1. add it to .plugins in project.labelle:
             .{ .name = "web", .repo = "github.com/labelle-toolkit/labelle-web", .version = "0.2.0" },
        2. labelle providers resolve            # preview the pin
        3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;
                                                # fresh clones and CI run `labelle providers fetch`)
-     If --accept reports UnsupportedContract, that release needs a newer CLI: choose an older release.
      Upgrading a project from CLI 1.x? See https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md
    ```
 
    The package, repository and version are registry data, never names the
    CLI knows. They come from a best-effort lookup made only on this failure
-   path (`provider_github/registry_lookup.zig`):
+   path (`provider_github/registry_lookup.zig`). The hint is advisory and
+   deliberately simple (#459): it reads **one** document, and only a
+   **schema-2** document names an owner.
 
-   - **The source this project accepted from.** Every `providers resolve
-     --accept` records its registry source (an https URL, or the absolute
-     path of a local `providers.json`) and the normalised document it bound
-     in `.labelle/providers.registry.json`. When that source is not the
-     public registry, the lookup asks it — a fresh download of the URL, or a
-     read of the file — and falls back to the recorded copy; the public
-     registry is never fetched, since it may assign the target differently.
-     The hint names that source.
-   - **Otherwise the public registry, live first.** One download of the
-     registry document (`curl`, 3 s connect / 5 s total), parsed and queried
-     by target. This is registry metadata only
+   - **A custom source this project accepted from.** Every `providers
+     resolve --accept` records its registry source (an https URL, or the
+     absolute path of a local `providers.json`), the normalised document it
+     bound and that document's SHA-256 in `.labelle/providers.registry.json`,
+     one file written atomically. The lookup reads it once and checks the
+     document against the digest in that same snapshot. When it verifies and
+     the source is not the public registry, the recorded document answers —
+     nothing is downloaded or re-read — and the hint names that source. The
+     source is printed on a line of its own, to copy as is, and steps 2 and
+     3 say to pass it to `labelle providers resolve`; it is never
+     interpolated into a shell command, since quoting differs per shell
+     (`cmd.exe` expands `%…%` even inside double quotes).
+   - **A record that does not verify** (unreadable, the CLI 2.0.0 layout
+     without a digest, a document that does not match its digest, a source
+     with control characters) means the project's source is unknown: the
+     steps are generic, and the public registry is **not** asked in its place.
+   - **Otherwise the public registry**: one download of the registry
+     document (`curl`, 3 s connect / 5 s total), parsed and queried by
+     target. This is registry metadata only
      ([contract §4](provider-contract-v1.md)): nothing is pinned, cached,
-     extracted or run, and the result is a suggestion the user still adds,
-     resolves and accepts. The download is never written to the registry
-     cache, which keeps holding only the document an accepted preview bound.
-   - **Then the accepted public document**: the project's recorded copy, or
-     without one the cached registry the last `labelle providers resolve
-     --accept` of any project bound (the normalised document its preview
-     bound and the user reviewed, [pins](provider-github-pins.md)).
+     extracted or run. The download is never written to the registry cache.
    - **The release suggested** is the owner's newest release whose own
      record declares the target (the ownership table is the union of a
-     package's releases, so the newest release may have dropped it). A
-     schema-2 document that answers is authoritative: a target it no longer
-     lists is not revived from older cached metadata. A schema-1 owner (found
-     through a cached archive) is named without a version, since no record
-     ties a release to the declaration.
-   - **Custom sources are passed on.** When the hint came from a custom
-     source, steps 2 and 3 read `labelle providers resolve <source>` and
-     `labelle providers resolve <source> --accept`, the source quoted for the
-     user's shell when it needs it (single quotes on POSIX, double quotes
-     with `\"` escapes on Windows).
-   - **The global cache keeps its source.** An accept writes
-     `registry/source.json` next to the cached document, bound to its
-     SHA-256. A cached answer from another project's custom registry names
-     that source (and passes it to the steps); a cached document whose
-     source is not recorded is shown as "a cached registry of unrecorded
-     origin", never as the public registry.
-   - **Schema 1 everywhere.** A schema-1 document (live, cached, or a custom
-     source the project accepted) names its owner through the same bounded
-     scan of verified cached archives, without a version.
+     package's releases, so the newest release may have dropped it). It is a
+     **candidate**: the registry carries no command-contract metadata, so
+     `labelle providers resolve --accept` is what checks that this CLI
+     supports it. Contract-aware selection is tracked in #456.
    - Every download, the hint's and `providers resolve`'s, is capped at
      1 MiB by the CLI itself (the captured output), not only by curl's
      `--max-filesize`, which curl before 8.4.0 ignores for a response of
      unknown size. Oversize is a failed download.
+   - **Everything else is generic**: `LABELLE_OFFLINE=1` (any value but
+     empty or `0`; no download is made), a failed, oversize or unparseable
+     download, a schema-1 document, a record that does not verify, or a
+     schema-2 document that lists no package for the target. The steps then
+     name no package, version or source; they carry a placeholder `.plugins`
+     entry, the note that both resolve steps read the public registry unless
+     given a `providers.json` path or URL, and one line saying why:
+     `registry not consulted: LABELLE_OFFLINE is set`, `the provider registry
+     could not be read`, `… does not publish target owners: registry schema
+     1`, `… lists no package for this target`, or `the registry this project
+     last accepted from is unknown: .labelle/providers.registry.json does not
+     verify`.
 
-   Known limitations:
+   Missing information only makes the hint less specific; it never changes
+   which source the hint recommends. The global registry cache (which any
+   project's accept may have written) is never read for this hint, and no
+   archive is scanned. The lookup never changes how the command fails: same
+   first line, same exit status, same `failed` progress record, and nothing
+   generated.
 
-   - The accepted-source record lives in `.labelle/`, which is generated
-     output and safe to delete. Deleting it forgets the custom source: the
-     next hint asks the public registry, which may name a different owner,
-     until the next `providers resolve <source> --accept` records it again.
-   - The registry carries no command-contract metadata, so the suggested
-     release may need a newer CLI than the running one; `--accept` then
-     fails with `UnsupportedContract`. The hint says to choose an older
-     release in that case.
-   - **`LABELLE_OFFLINE=1`** (any value but empty or `0`) skips the
-     download; the cache is still read.
-   - **A miss** prints the same steps with a placeholder `.plugins` entry and
-     a note saying why no package was named: `registry not consulted:
-     LABELLE_OFFLINE is set`, `the provider registry could not be read`, or
-     `the provider registry lists no package for this target`.
-
-   The lookup never changes how the command fails: same first line, same
-   exit status, same `failed` progress record, and nothing generated.
-
-   - A **schema-2** document publishes target ownership
-     ([contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults)),
-     so the hint is a lookup by target in that table and reads no archive.
-     This works even when none of the owner's releases is cached, which is
-     the usual case for a package the project has never added.
-     `--accept` checked each claim against the verified manifest of every
-     release it pinned.
-   - A **schema-1** record carries no declarations, so the CLI falls back
-     to scanning cached archives. It reads the manifest out of each one
-     without extracting or running anything. Each archive read decompresses
-     a whole release on a scratch arena freed before the next. The scan
-     stops at the first owner or after `registry_hint_scan_limit` cached
-     releases, so a large registry bounds the cost of a diagnostic rather
-     than the other way round.
+   Known limitation (#456): the accepted-source record lives in `.labelle/`,
+   which is generated output and safe to delete. Deleting it forgets the
+   custom source: the next hint asks the public registry, until the next
+   `providers resolve <source> --accept` records it again.
 
 The two halves are the **name** and the **ownership**. The name is settled
 from the string alone, first thing: `desktop` is core, any other name is
@@ -301,13 +281,14 @@ Unit tests (`zig build test-provider-dispatch`, also collected by `zig build
 test`) cover `provider_targets.resolve` (core with no providers, a provider
 target, an undeclared target, an unpinned remote owner, the schema-name
 mapping through a provider only, the diagnostic's steps on a registry hit
-and on each kind of miss), `registry_lookup.lookupOwner` (live hit naming the newest release that
-still declares the target, not listed, unreachable, unparseable, offline with
-no fetch, the cached fallback, and a project accepted from a local file or a
-fork URL answered by that source with no public fetch, each asserting which
-URLs the fetcher was asked for), `Registry.latestDeclaring`, `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
-archive cached; for schema 1, a hint only from a verified cached archive,
-and the bounded scan), `provider_github.cachedRegistryNamespaceOwner`
+(public and custom, the custom source never inside a command) and on each
+kind of miss, identical past the reason line), `registry_lookup.lookupOwner` (a
+public schema-2 hit naming the newest release that still declares the target,
+not listed, schema 1, unreachable, unparseable, oversize, offline with no
+fetch, a verified custom record answered from its document with no fetch, and
+records that do not verify answered generically with no public fetch, each
+asserting which URLs the fetcher was asked for), `Registry.latestDeclaring`,
+`provider_github.cachedRegistryNamespaceOwner`
 (schema 2 only), the `NoRunReplacement` decision table
 (`pipeline/install.zig`), `provider_registry` (schema-2 parsing, ownership
 conflicts, lookup by target and namespace), `provider_dispatch.discoverAll` (the
@@ -336,13 +317,15 @@ contract's `output_dir`; the ASTC prepass running for `desktop` and not for
 `probe-target`; a provider owning `wasm` making the assembler receive
 `--platform wasm`; the `labelle targets` listing; and, on POSIX, the
 no-provider registry lookup through a stand-in `curl` that logs each request
-(a hit naming the package and its newest release, a registry that lists no
-owner, an unreachable registry, and `LABELLE_OFFLINE=1` making no request),
+(a hit naming the package and its newest declaring release as a candidate, a
+registry that lists no owner, a schema-1 registry, an unreachable or oversize
+registry, and `LABELLE_OFFLINE=1` making no request),
 each failing exactly as the hermetic runs do. Every other run sets
 `LABELLE_OFFLINE=1`, so no suite touches the network. CI runs it on Windows,
 macOS and Linux. `test/provider_android_like_e2e.py` drives an
-android-shaped fixture package the same way (no NDK): the no-provider and
-no-namespace diagnostics with and without a cached registry hint, the
+android-shaped fixture package the same way (no NDK): the no-provider
+diagnostic staying generic offline even with a cached registry, and the
+no-namespace diagnostic with and without that cached hint, the
 assembler receiving `--platform android`, the after-build hook seeing the
 built library and the target dir, the run replacement receiving `run.env`
 with no host launch, `NoRunReplacement` before any build, `labelle android

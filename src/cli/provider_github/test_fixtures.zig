@@ -37,13 +37,6 @@ pub const AcceptFixture = struct {
         return gzipArchiveOf(a, plugin_manifest, "// fixture\n");
     }
 
-    /// A valid archive with no `plugin.labelle` at all (`cachedManifest`
-    /// reads it whole and returns null); `build_zig` varies the bytes so
-    /// every pin verifies its own archive.
-    pub fn gzipArchiveWithoutManifest(a: std.mem.Allocator, build_zig: []const u8) ![]u8 {
-        return gzipArchiveOf(a, null, build_zig);
-    }
-
     pub fn gzipArchiveOf(a: std.mem.Allocator, plugin_manifest: ?[]const u8, build_zig: []const u8) ![]u8 {
         var tar_out: std.Io.Writer.Allocating = .init(a);
         var tar: std.tar.Writer = .{ .underlying_writer = &tar_out.writer };

@@ -96,8 +96,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     project.mkdir()
     dep = '.{ .name = "fixture", .repo = "local:../fixture", .version = "1.0.0" }'
     home = base / "home"
-    # Hermetic: the no-provider diagnostic's live registry lookup is off
-    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    # Hermetic: the no-provider diagnostic's registry download is off
+    # (LABELLE_OFFLINE), so no owner is named here.
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     env.pop("PROVIDER_PROBE_FAIL", None)
@@ -232,12 +232,13 @@ sys.stdout.write(data)
         shim.chmod(0o755)
         registry_url = "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json"
 
-        def release(version):
+        def release(version, target="probe-far"):
             return {"package": "fixture-owner", "repo": "example/fixture-owner", "version": version,
-                    "commit": "1" * 40, "sha256": "a" * 64, "namespace": None, "targets": ["probe-far"]}
+                    "commit": "1" * 40, "sha256": "a" * 64, "namespace": None, "targets": [target]}
 
+        # The newest release (0.11.0) dropped `probe-far`.
         served.write_text(json.dumps({"schema_version": 2, "defaults": [],
-                                      "providers": [release("0.9.0"), release("0.10.0")]}))
+                                      "providers": [release("0.9.0"), release("0.10.0"), release("0.11.0", "probe-later")]}))
         online = {"PATH": str(shim_dir) + os.pathsep + env.get("PATH", ""), "LABELLE_OFFLINE": ""}
 
         def lookup(target, extra, requested):
@@ -253,11 +254,16 @@ sys.stdout.write(data)
             return refused.stderr
 
         generic = '.{ .name = "<package>", .repo = "github.com/<owner>/<repo>", .version = "<version>" },'
-        # Hit: the owner and its newest release (semver: 0.10.0 > 0.9.0), from registry data.
+        # Hit: the owner and, as a candidate --accept checks, its newest
+        # release that still declares the target (semver: 0.10.0 > 0.9.0;
+        # 0.11.0 dropped it), from registry data.
         err = lookup("probe-far", online, True)
-        assert "(registry: fixture-owner)" in err and "the provider registry lists package 'fixture-owner' 0.10.0" in err, err
+        assert "(registry: fixture-owner)" in err, err
+        assert "The provider registry lists package 'fixture-owner' as the provider of target 'probe-far'." in err, err
+        assert "0.10.0, is a candidate: `labelle providers resolve --accept`\n  checks whether this CLI supports it" in err, err
         assert '.{ .name = "fixture-owner", .repo = "github.com/example/fixture-owner", .version = "0.10.0" },' in err, err
-        assert generic not in err, err
+        assert generic not in err and "0.11.0" not in err, err
+        assert "0.11.0, is a candidate" in lookup("probe-later", online, True)
         # Reached, but nobody declares the target: generic steps.
         err = lookup("probe-nowhere", online, True)
         assert "(the provider registry lists no package for this target)" in err and generic in err, err
@@ -274,6 +280,13 @@ sys.stdout.write(data)
         served.write_text(real_doc + " " * (1024 * 1024))
         err = lookup("probe-far", online, True)
         assert "(the provider registry could not be read)" in err and generic in err and "(registry:" not in err, err
+        served.write_text(real_doc)
+        # Schema 1 publishes no owners: generic steps, whatever it lists.
+        served.write_text(json.dumps({"schema_version": 1, "providers": [
+            {k: v for k, v in release("0.10.0").items() if k not in ("namespace", "targets")}]}))
+        err = lookup("probe-far", online, True)
+        assert "(the provider registry does not publish target owners: registry schema 1)" in err, err
+        assert generic in err and "(registry:" not in err and "fixture-owner" not in err, err
         served.write_text(real_doc)
         # Offline: no request at all, even though the registry would answer.
         err = lookup("probe-far", dict(online, LABELLE_OFFLINE="1"), False)

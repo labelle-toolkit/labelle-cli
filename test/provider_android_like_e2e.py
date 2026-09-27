@@ -110,8 +110,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
     project = base / "project"
     project.mkdir()
     home = base / "home"
-    # Hermetic: the no-provider diagnostic's live registry lookup is off
-    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    # Hermetic: the no-provider diagnostic's registry download is off
+    # (LABELLE_OFFLINE); only the unknown-namespace hint reads the cached registry.
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for leftover in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_COPY", "PROVIDER_PROBE_PATCH"):
@@ -159,7 +159,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
         assert not marker.exists(), "the host launch ran"
 
     # A cached schema-2 registry whose `android` release declares the
-    # namespace and the target: the only source of the diagnostics' hint.
+    # namespace and the target. It names the namespace's owner; the target
+    # hint never reads it (another project's accept may have written it), so
+    # offline the target steps stay generic (#459).
     registry_doc = {"schema_version": 2, "defaults": [], "providers": [{
         "package": "android", "repo": "labelle-toolkit/labelle-android", "version": "0.2.0",
         "commit": "1" * 40, "sha256": "0" * 64, "namespace": "android", "targets": ["android"]}]}
@@ -175,7 +177,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
         for args in (("run", "--platform=android"), ("build", "--platform=android"), ("bundle", "--platform=android")):
             refused = run(*args, code=1)
             assert NO_PROVIDER in refused.stderr, (args, refused.stderr)
-            assert (hint in refused.stderr) == with_registry, (args, with_registry, refused.stderr)
+            assert hint not in refused.stderr, (args, with_registry, refused.stderr)
+            assert "(registry not consulted: LABELLE_OFFLINE is set)" in refused.stderr, (args, refused.stderr)
             nothing_generated(refused)
         refused = run("android", "run", code=1)
         if with_registry:
