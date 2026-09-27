@@ -469,13 +469,29 @@ pub fn resolveOwnSettings(a: std.mem.Allocator, root: []const u8, cfg: project.P
 /// without hooks never touches the compiler check.
 pub const Host = struct { zig: []const u8, cache_root: []const u8, global_cache: []const u8, packages: []const u8 };
 
-/// Unlike the game runner, provider execution must never download a compiler.
+/// The host compiler comes from the same resolution `labelle build` uses
+/// (`zig_toolchain.resolveZig`): the `LABELLE_ZIG` / `--zig` override, else
+/// the managed toolchain for the project's required version, provisioned on
+/// a cache miss (bundled seed first, else download + minisign verification,
+/// installed atomically). Callers check the provider's pins first, so an
+/// unpinned provider never triggers a download.
 pub fn resolveHost(a: std.mem.Allocator, root: []const u8) !Host {
+    return resolveHostWith(a, root, provisionZig);
+}
+
+fn provisionZig(a: std.mem.Allocator, root: []const u8) anyerror![]u8 {
+    return toolchain.resolveZig(a, root);
+}
+
+/// `resolveHost` over an injected provisioner (tests).
+pub fn resolveHostWith(a: std.mem.Allocator, root: []const u8, provision: *const fn (std.mem.Allocator, []const u8) anyerror![]u8) !Host {
     const io = config.globalIo();
     const required = try toolchain.resolveRequiredVersion(a, root);
-    const zig_candidate = (try toolchain.lookupEnvOverride(a)) orelse try zig_cache.binaryPath(a, required.version);
+    const zig_candidate = try provision(a, root);
+    // Only an override can name a path that does not exist: the managed
+    // path exists once `provision` returned.
     const zig = real(a, zig_candidate) catch {
-        std.debug.print("labelle: install the pinned host compiler first: labelle install zig {s}\n", .{required.version});
+        std.debug.print("labelle: the host compiler override does not exist: {s} (LABELLE_ZIG / --zig)\n", .{zig_candidate});
         return error.ProviderCompilerMissing;
     };
     const version = try std.process.run(a, io, .{ .argv = &.{ zig, "version" } });
@@ -965,4 +981,36 @@ test "provider dispatch: own-settings resolution opens only the selected provide
     // The mapping check alone: an entry naming no verified provider.
     providers[1].verified = false;
     try std.testing.expectError(error.UnresolvedProviderConfig, checkSettingsMapping(cfg, &providers));
+}
+
+test "provider dispatch: the host compiler is provisioned like `labelle build`, not refused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.writeFile(io, .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\", .zig_version = \"0.16.0\" }" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Probe = struct {
+        var calls: usize = 0;
+        var seen: []const u8 = "";
+        fn provision(_: std.mem.Allocator, project_dir: []const u8) anyerror![]u8 {
+            calls += 1;
+            seen = project_dir;
+            return error.ProbeProvisioned;
+        }
+        fn missing(pa: std.mem.Allocator, _: []const u8) anyerror![]u8 {
+            calls += 1;
+            return pa.dupe(u8, "/nonexistent/zig-override");
+        }
+    };
+    // The resolution goes through the provisioner, for this project's root,
+    // and its outcome is the result (a download failure, not a refusal).
+    try std.testing.expectError(error.ProbeProvisioned, resolveHostWith(a, root, Probe.provision));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqualStrings(root, Probe.seen);
+    // An override naming no file is the one `ProviderCompilerMissing`.
+    try std.testing.expectError(error.ProviderCompilerMissing, resolveHostWith(a, root, Probe.missing));
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
 }

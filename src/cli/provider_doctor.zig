@@ -9,10 +9,13 @@
 //! A provider that fails does not stop the others; the report counts it and
 //! `labelle doctor` exits non-zero. A pinned provider whose archive is not
 //! cached (or does not match its pin) is reported as a failed check with the
-//! `labelle providers fetch` hint; the doctor never downloads. A declared
-//! remote package with no integrity pin fails closed with the `labelle
-//! providers resolve` hint, and reads the same whether the ordinary package
-//! cache holds it or not; its code is never run. Projectless
+//! `labelle providers fetch` hint; the doctor never downloads a provider
+//! archive (the host compiler is provisioned as `labelle build` does). An
+//! unpinned remote package runs no code: cached with a manifest declaring
+//! provider features, it fails with the `labelle providers resolve` hint;
+//! cached and runtime-only, it is not listed; not cached, it is a WARN ("not
+//! installed yet; run `labelle install`") that leaves the exit code alone,
+//! since only its manifest could tell whether it is a provider. Projectless
 //! provider commands are a later phase (decision D8), so outside a project
 //! only the core checks run.
 const std = @import("std");
@@ -42,14 +45,18 @@ pub const Step = struct {
     };
 };
 
-/// How an unpinned remote package was found; the report is the same either
-/// way, so the result does not depend on the ordinary package cache.
+/// How an unpinned remote package was found. Neither case runs any of its
+/// code; what differs is what the doctor can know.
 pub const Unverified = enum {
-    /// Not in the package cache: its manifest cannot be read, so it may be a
-    /// provider, and nothing proves otherwise. Fails closed.
+    /// Not in the package cache: nothing to read, so the doctor cannot tell
+    /// a runtime-only package from a provider. A WARN ("not installed yet;
+    /// run `labelle install`") that leaves the exit code alone: a build
+    /// installs it first and fails loudly if it is an unpinned provider.
     uncached,
-    /// In the package cache, and its (unverified) manifest declares a
-    /// provider.
+    /// In the package cache, and its (unverified) manifest declares provider
+    /// features (or cannot be read). A FAIL with the `labelle providers
+    /// resolve` hint, since it would need a pin to run. A cached
+    /// runtime-only package is not listed at all.
     cached,
 };
 
@@ -129,9 +136,11 @@ pub const Outcome = struct {
     code: ?u8,
     /// Why it never ran (an error name), when `code` is null.
     err: ?anyerror = null,
+    /// A WARN: reported, never a failure (an uninstalled package).
+    warning: bool = false,
 
     pub fn ok(self: Outcome) bool {
-        return self.code == 0;
+        return self.code == 0 or self.warning;
     }
 };
 
@@ -142,6 +151,12 @@ pub const Report = struct {
     pub fn failed(self: Report) usize {
         var count: usize = 0;
         for (self.outcomes) |outcome| count += @intFromBool(!outcome.ok());
+        return count;
+    }
+
+    pub fn warnings(self: Report) usize {
+        var count: usize = 0;
+        for (self.outcomes) |outcome| count += @intFromBool(outcome.warning);
         return count;
     }
 };
@@ -163,13 +178,17 @@ pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
                 }
                 break :blk .{ .label = step.label, .package = step.package, .code = null, .err = err };
             },
-            // Both paths print the same lines: the cache must not change
-            // the result.
-            .unverified => blk: {
-                std.debug.print("  [ FAIL ] not verified: remote package with no integrity pin in labelle.providers.lock; its code is not run\n", .{});
-                std.debug.print("           -> run `labelle providers resolve`, review the pins, then repeat with --accept\n", .{});
-                std.debug.print("              (a runtime-only package needs no pin, but must be in the package cache, `labelle install`, for the doctor to tell)\n", .{});
-                break :blk .{ .label = step.label, .package = step.package, .code = null, .err = error.RemoteProviderIntegrityRequired };
+            .unverified => |found| switch (found) {
+                .uncached => blk: {
+                    std.debug.print("  [ WARN ] not installed yet: remote package not in the package cache, so the doctor cannot tell whether it is a provider\n", .{});
+                    std.debug.print("           -> run `labelle install`\n", .{});
+                    break :blk .{ .label = step.label, .package = step.package, .code = null, .err = error.PackageNotInstalled, .warning = true };
+                },
+                .cached => blk: {
+                    std.debug.print("  [ FAIL ] not verified: remote provider with no integrity pin in labelle.providers.lock; its code is not run\n", .{});
+                    std.debug.print("           -> run `labelle providers resolve`, review the pins, then repeat with --accept\n", .{});
+                    break :blk .{ .label = step.label, .package = step.package, .code = null, .err = error.RemoteProviderIntegrityRequired };
+                },
             },
             .run => if (runner.run(step)) |code|
                 .{ .label = step.label, .package = step.package, .code = code }
@@ -200,7 +219,12 @@ fn fetchable(err: anyerror) bool {
 fn printHeader(step: Step) void {
     switch (step.action) {
         .run => std.debug.print("\nlabelle {s} {s}  (provider '{s}')\n", .{ step.label, command_name, step.package }),
-        .unavailable, .unverified => std.debug.print("\nprovider '{s}'\n", .{step.package}),
+        .unavailable => std.debug.print("\nprovider '{s}'\n", .{step.package}),
+        .unverified => |found| switch (found) {
+            .cached => std.debug.print("\nprovider '{s}'\n", .{step.package}),
+            // Not known to be a provider.
+            .uncached => std.debug.print("\npackage '{s}'\n", .{step.package}),
+        },
     }
     std.debug.print("------------------------------------------------------------\n", .{});
 }
@@ -208,15 +232,10 @@ fn printHeader(step: Step) void {
 /// The closing summary of the provider part.
 pub fn printSummary(report: Report) void {
     std.debug.print("\nProvider doctors: {d} checked, {d} failed", .{ report.outcomes.len, report.failed() });
-    if (report.failed() != 0) {
-        std.debug.print(" (", .{});
-        var first = true;
-        for (report.outcomes) |outcome| {
-            if (outcome.ok()) continue;
-            std.debug.print("{s}{s}", .{ if (first) "" else ", ", outcome.label });
-            first = false;
-        }
-        std.debug.print(")", .{});
+    if (report.failed() != 0) printLabels(report, false);
+    if (report.warnings() != 0) {
+        std.debug.print(", {d} not installed yet", .{report.warnings()});
+        printLabels(report, true);
     }
     std.debug.print("\n", .{});
     if (report.skipped.len != 0) {
@@ -224,6 +243,18 @@ pub fn printSummary(report: Report) void {
         for (report.skipped, 0..) |name, i| std.debug.print("{s}{s}", .{ if (i == 0) "" else ", ", name });
         std.debug.print("\n", .{});
     }
+}
+
+fn printLabels(report: Report, warnings: bool) void {
+    std.debug.print(" (", .{});
+    var first = true;
+    for (report.outcomes) |outcome| {
+        const listed = if (warnings) outcome.warning else !outcome.ok();
+        if (!listed) continue;
+        std.debug.print("{s}{s}", .{ if (first) "" else ", ", outcome.label });
+        first = false;
+    }
+    std.debug.print(")", .{});
 }
 
 /// The exit status of `labelle doctor`: non-zero when the core checks or
@@ -456,14 +487,14 @@ test "provider doctor: an unavailable provider is a failed check that runs nothi
     try testing.expectEqual(@as(u8, 1), exitCode(true, report));
 }
 
-test "provider doctor: an unpinned remote package fails the same way cached or not, and never runs" {
+test "provider doctor: an unpinned remote package warns uncached, fails as a cached provider, and never runs" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var unpinned = fake("remote", "remote-ns", &.{cmd("doctor", "bin/remote")});
     unpinned.verified = false;
     const pinned = fake("local", "local-ns", &.{cmd("doctor", "bin/local")});
-    // Warm: the ordinary cache holds its (unverified) manifest; `survey`
+    // Warm: its cached (unverified) manifest declares a provider; `survey`
     // reports it in `unverified` and never as a provider.
     const warm = try plan(a, &.{pinned}, &.{}, &.{}, &.{"remote"});
     // A discovery that did list it as an unverified provider plans the same.
@@ -471,30 +502,33 @@ test "provider doctor: an unpinned remote package fails the same way cached or n
     try testing.expectEqual(Unverified.cached, listed.steps[1].action.unverified);
     // Cold: nothing to read, only the declaration.
     const cold = try plan(a, &.{pinned}, &.{}, &.{"remote"}, &.{});
-    var outcomes: [2]Outcome = undefined;
-    for ([_]Plan{ warm, cold }, [_]Unverified{ .cached, .uncached }, 0..) |p, path, i| {
+    const Expect = struct { path: Unverified, failed: usize, warnings: usize, exit: u8 };
+    const cases = [_]Expect{
+        .{ .path = .cached, .failed = 1, .warnings = 0, .exit = 1 },
+        .{ .path = .uncached, .failed = 0, .warnings = 1, .exit = 0 },
+    };
+    for ([_]Plan{ warm, cold }, cases) |p, want| {
         try testing.expectEqual(@as(usize, 2), p.steps.len);
         const step = p.steps[1];
-        // The path taken differs ...
-        try testing.expectEqual(path, step.action.unverified);
+        try testing.expectEqual(want.path, step.action.unverified);
         try testing.expectEqualStrings("remote", step.label);
         var calls: std.ArrayList([]const u8) = .empty;
         const report = try execute(a, p, Recorder{ .a = a, .calls = &calls });
-        // ... the verified provider still runs, the unpinned one never does ...
+        // Either way no unverified code runs: only the verified provider does.
         try testing.expectEqual(@as(usize, 1), calls.items.len);
         try testing.expectEqualStrings("local-ns:bin/local", calls.items[0]);
-        try testing.expectEqual(@as(usize, 1), report.failed());
-        try testing.expectEqual(@as(u8, 1), exitCode(true, report));
-        outcomes[i] = report.outcomes[1];
+        try testing.expectEqual(want.failed, report.failed());
+        try testing.expectEqual(want.warnings, report.warnings());
+        // A WARN never changes the exit code; a cached unverified provider fails it.
+        try testing.expectEqual(want.exit, exitCode(true, report));
+        try testing.expectEqual(@as(u8, 1), exitCode(false, report));
+        const outcome = report.outcomes[1];
+        try testing.expectEqual(@as(?u8, null), outcome.code);
+        try testing.expectEqual(@as(?anyerror, if (want.path == .cached) error.RemoteProviderIntegrityRequired else error.PackageNotInstalled), outcome.err);
     }
-    // ... and the result is the same.
-    try testing.expectEqualStrings(outcomes[0].label, outcomes[1].label);
-    try testing.expectEqual(outcomes[0].code, outcomes[1].code);
-    try testing.expectEqual(outcomes[0].err, outcomes[1].err);
-    try testing.expectEqual(@as(?anyerror, error.RemoteProviderIntegrityRequired), outcomes[0].err);
 }
 
-test "provider doctor: a malformed manifest fails only its own package, cold or warm, and the others run" {
+test "provider doctor: real discovery classifies each unpinned cache state, and bad manifests stay isolated" {
     const asm_cache = @import("asm_cache.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -515,12 +549,28 @@ test "provider doctor: a malformed manifest fails only its own package, cold or 
         .{ .name = "pkg-ok", .repo = "local:../pkg-ok", .version = "1.0.0" },
     } };
     const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "rem", "1.0.0" });
-    var results: [2]Outcome = undefined;
-    for ([_]Unverified{ .uncached, .cached }, 0..) |state, i| {
-        if (state == .cached) {
-            // Warm: the unpinned package is cached, with a malformed manifest.
-            try tmp.dir.createDirPath(io, cached);
-            try tmp.dir.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ cached, "plugin.labelle" }), .data = ".{ .name = " });
+    const manifest_path = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
+    const State = enum { cold, runtime_only, provider, malformed };
+    const Expect = struct { state: State, rem: ?Unverified, failed: usize, warnings: usize };
+    const cases = [_]Expect{
+        // Not installed: a WARN, the exit code is pkg-bad's alone.
+        .{ .state = .cold, .rem = .uncached, .failed = 1, .warnings = 1 },
+        // Cached runtime-only: not listed at all.
+        .{ .state = .runtime_only, .rem = null, .failed = 1, .warnings = 0 },
+        // Cached with provider features: FAIL.
+        .{ .state = .provider, .rem = .cached, .failed = 2, .warnings = 0 },
+        // Cached but unreadable: cannot be cleared as runtime-only, FAIL.
+        .{ .state = .malformed, .rem = .cached, .failed = 2, .warnings = 0 },
+    };
+    for (cases) |want| {
+        switch (want.state) {
+            .cold => {},
+            .runtime_only => {
+                try tmp.dir.createDirPath(io, cached);
+                try tmp.dir.writeFile(io, .{ .sub_path = manifest_path, .data = ".{ .name = \"rem\" }" });
+            },
+            .provider => try tmp.dir.writeFile(io, .{ .sub_path = manifest_path, .data = ".{ .name = \"rem\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"rem\" }" }),
+            .malformed => try tmp.dir.writeFile(io, .{ .sub_path = manifest_path, .data = ".{ .name = " }),
         }
         var sources: github.Sources = .{ .a = a };
         defer sources.deinit();
@@ -530,19 +580,19 @@ test "provider doctor: a malformed manifest fails only its own package, cold or 
         try testing.expectEqual(@as(usize, 1), found.unavailable.len);
         try testing.expectEqualStrings("pkg-bad", found.unavailable[0].package);
         const p = try plan(a, found.providers, found.unavailable, found.unresolved, found.unverified);
-        try testing.expectEqual(@as(usize, 3), p.steps.len);
-        // The path taken: `unresolved` cold, `unverified` warm.
-        const rem = p.steps[2];
-        try testing.expectEqualStrings("rem", rem.label);
-        try testing.expectEqual(state, rem.action.unverified);
+        var rem_step: ?Step = null;
+        for (p.steps) |step| if (std.mem.eql(u8, step.package, "rem")) {
+            rem_step = step;
+        };
+        if (want.rem) |path| {
+            try testing.expectEqual(path, rem_step.?.action.unverified);
+        } else try testing.expect(rem_step == null);
         var calls: std.ArrayList([]const u8) = .empty;
         const report = try execute(a, p, Recorder{ .a = a, .calls = &calls });
-        // Only the valid provider's doctor ran, in both states.
+        // Only the valid provider's doctor ran, in every state.
         try testing.expectEqual(@as(usize, 1), calls.items.len);
         try testing.expectEqualStrings("ok:bin/ok", calls.items[0]);
-        try testing.expectEqual(@as(usize, 2), report.failed());
-        results[i] = report.outcomes[2];
+        try testing.expectEqual(want.failed, report.failed());
+        try testing.expectEqual(want.warnings, report.warnings());
     }
-    try testing.expectEqualStrings(results[0].label, results[1].label);
-    try testing.expectEqual(results[0].err, results[1].err);
 }
