@@ -51,6 +51,7 @@ one target, in two halves, before anything is generated, locked or built:
        2. labelle providers resolve            # preview the pin
        3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;
                                                # fresh clones and CI run `labelle providers fetch`)
+     If --accept reports UnsupportedContract, that release needs a newer CLI: choose an older release.
      Upgrading a project from CLI 1.x? See https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md
    ```
 
@@ -79,7 +80,29 @@ one target, in two halves, before anything is generated, locked or built:
      bound and the user reviewed, [pins](provider-github-pins.md)).
    - **The release suggested** is the owner's newest release whose own
      record declares the target (the ownership table is the union of a
-     package's releases, so the newest release may have dropped it).
+     package's releases, so the newest release may have dropped it). A
+     schema-2 document that answers is authoritative: a target it no longer
+     lists is not revived from older cached metadata. A schema-1 owner (found
+     through a cached archive) is named without a version, since no record
+     ties a release to the declaration.
+   - **Custom sources are passed on.** When the hint came from a custom
+     source, steps 2 and 3 read `labelle providers resolve <source>` and
+     `labelle providers resolve <source> --accept`.
+   - Every download, the hint's and `providers resolve`'s, is capped at
+     1 MiB by the CLI itself (the captured output), not only by curl's
+     `--max-filesize`, which curl before 8.4.0 ignores for a response of
+     unknown size. Oversize is a failed download.
+
+   Known limitations:
+
+   - The accepted-source record lives in `.labelle/`, which is generated
+     output and safe to delete. Deleting it forgets the custom source: the
+     next hint asks the public registry, which may name a different owner,
+     until the next `providers resolve <source> --accept` records it again.
+   - The registry carries no command-contract metadata, so the suggested
+     release may need a newer CLI than the running one; `--accept` then
+     fails with `UnsupportedContract`. The hint says to choose an older
+     release in that case.
    - **`LABELLE_OFFLINE=1`** (any value but empty or `0`) skips the
      download; the cache is still read.
    - **A miss** prints the same steps with a placeholder `.plugins` entry and

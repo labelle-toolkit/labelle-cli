@@ -320,6 +320,9 @@ sys.stdout.write(open({str(public_doc)!r}).read())
             assert "(registry: other)" in err and "public-owner" not in err, err
             assert f"the registry this project last accepted from, {registry.resolve()}, lists package 'other' 1.0.0" in err, err
             assert '.{ .name = "other", .repo = "github.com/example/other", .version = "1.0.0" },' in err, err
+            # Both resolve steps name that source, or resolve would read the public registry.
+            assert f"labelle providers resolve {registry.resolve()} --accept" in err, err
+            assert f"2. labelle providers resolve {registry.resolve()} " in err, err
             # The custom source changes: the fresh read answers, not the recorded copy.
             schema_two([(pin, "probe", []), (dict(other, version="1.1.0"), None, ["other-target"])])
             err = run("build", "--platform=other-target", code=1).stderr

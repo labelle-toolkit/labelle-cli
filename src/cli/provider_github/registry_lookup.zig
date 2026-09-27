@@ -13,7 +13,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("../config.zig");
-const util = @import("../util.zig");
 const registry = @import("../provider_registry.zig");
 const registry_cache = @import("registry_cache.zig");
 const files = @import("files.zig");
@@ -34,10 +33,29 @@ pub const Limits = struct {
     pub const hint: Limits = .{ .connect_timeout = "3", .max_time = "5" };
 };
 
-/// Download a registry document over HTTPS with curl. stdout capture is
-/// bounded (1 MiB); curl cannot execute the returned document.
+/// The largest registry document the CLI accepts, from a download or a file.
+pub const max_document_bytes: usize = 1024 * 1024;
+
+/// Download a registry document over HTTPS with curl; curl cannot execute
+/// the returned document. The 1 MiB cap is enforced here, on the captured
+/// stdout, not only by `--max-filesize`: curl before 8.4.0 ignores that flag
+/// when the response size is unknown (chunked). Oversize is a failed download.
 pub fn download(a: std.mem.Allocator, source: []const u8, limits: Limits) ![]const u8 {
-    const result = try util.runCmd(a, &.{ "curl", "--fail", "--silent", "--show-error", "--proto", "=https", "--connect-timeout", limits.connect_timeout, "--max-time", limits.max_time, "--max-filesize", "1048576", source });
+    return capture(a, &.{ "curl", "--fail", "--silent", "--show-error", "--proto", "=https", "--connect-timeout", limits.connect_timeout, "--max-time", limits.max_time, "--max-filesize", "1048576", source }, max_document_bytes);
+}
+
+/// Run `argv` and return its stdout, failing with
+/// `ProviderRegistryDownloadFailed` on a non-zero exit or when stdout grows
+/// past `limit` bytes (the child is killed as soon as it does).
+fn capture(a: std.mem.Allocator, argv: []const []const u8, limit: usize) ![]const u8 {
+    const result = std.process.run(a, config.globalIo(), .{
+        .argv = argv,
+        .stdout_limit = .limited(limit),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| switch (err) {
+        error.StreamTooLong => return error.ProviderRegistryDownloadFailed,
+        else => return err,
+    };
     if (result.term != .exited or result.term.exited != 0) return error.ProviderRegistryDownloadFailed;
     return result.stdout;
 }
@@ -101,7 +119,11 @@ pub const OwnerHint = struct {
     /// `<owner>/<name>` (the registry's form; `.plugins` takes it with a
     /// `github.com/` prefix).
     repo: []const u8,
-    version: []const u8,
+    /// The newest release whose record declares the target; null when the
+    /// document cannot tie a release to the declaration (schema 1: the owner
+    /// was found through a cached archive), so the user picks the version
+    /// from the `providers resolve` preview instead.
+    version: ?[]const u8,
     source: Source,
     /// The custom registry source that answered; null for the public one.
     registry: ?[]const u8 = null,
@@ -134,7 +156,8 @@ pub const Lookup = union(enum) {
 /// newest release whose own record declares the target (schema 2: the
 /// owner is the union of its releases, and the newest may have dropped it).
 /// A schema-1 document claims nothing, so only `named` (an owner found
-/// through a verified cached archive) resolves it there, at its newest release.
+/// through a verified cached archive) resolves it there, and without a
+/// version: no record ties a release to the declaration.
 pub fn ownerIn(doc: registry.Registry, target: []const u8, named: ?[]const u8, source: Source, from: ?[]const u8) ?OwnerHint {
     const package = named orelse doc.targetOwner(target) orelse return null;
     if (doc.claimsOwnership()) {
@@ -142,7 +165,7 @@ pub fn ownerIn(doc: registry.Registry, target: []const u8, named: ?[]const u8, s
         return .{ .package = package, .repo = record.repo, .version = record.version, .source = source, .registry = from };
     }
     const latest = doc.latestRelease(package) orelse return null;
-    return .{ .package = package, .repo = latest.repo, .version = latest.version, .source = source, .registry = from };
+    return .{ .package = package, .repo = latest.repo, .version = null, .source = source, .registry = from };
 }
 
 /// The download the lookup uses: the real one, or a test's stand-in.
@@ -172,6 +195,9 @@ pub fn lookupOwner(a: std.mem.Allocator, root: ?[]const u8, target: []const u8, 
         const doc = registry.parse(a, bytes) catch break :live;
         reached = true;
         if (ownerIn(doc, target, null, .online, null)) |hint| return .{ .hit = hint };
+        // A schema-2 document that answered is authoritative: a target it
+        // no longer lists is not revived from older cached metadata.
+        if (doc.claimsOwnership()) return .{ .miss = .{ .reason = .not_listed } };
     }
     if (accepted) |record| {
         if (registry.parse(a, record.document)) |doc| {
@@ -187,12 +213,12 @@ fn lookupCustom(a: std.mem.Allocator, record: Accepted, target: []const u8, offl
     const fresh: ?[]const u8 = if (isUrl(from))
         (if (offline) null else fetch(a, from) catch null)
     else
-        files.read(a, from, 1024 * 1024) catch null;
+        files.read(a, from, max_document_bytes) catch null;
     if (fresh) |bytes| {
         if (registry.parse(a, bytes)) |doc| {
-            // The source answered: it is authoritative, even when it lists nobody.
+            // A schema-2 answer is authoritative, even when it lists nobody.
             if (ownerIn(doc, target, null, .accepted_source, from)) |hint| return .{ .hit = hint };
-            return .{ .miss = .{ .reason = .not_listed, .registry = from } };
+            if (doc.claimsOwnership()) return .{ .miss = .{ .reason = .not_listed, .registry = from } };
         } else |_| {}
     }
     if (registry.parse(a, record.document)) |doc| {
@@ -262,6 +288,16 @@ fn fetchFails(_: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
     return error.ProviderRegistryDownloadFailed;
 }
 
+fn fetchWithoutProbe(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
+    note(url);
+    return a.dupe(u8, comptime "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++ testRecord("other", "3.0.0", "\"other-target\"") ++ "]}");
+}
+
+fn fetchSchemaOne(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
+    note(url);
+    return a.dupe(u8, "{\"schema_version\":1,\"providers\":[]}");
+}
+
 fn fetchGarbage(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
     note(url);
     return a.dupe(u8, "<html>not json</html>");
@@ -280,12 +316,12 @@ test "provider registry lookup: a live hit names the owner and its newest declar
     const hint = found.hit;
     try std.testing.expectEqualStrings("fixture", hint.package);
     try std.testing.expectEqualStrings("owner/fixture", hint.repo);
-    try std.testing.expectEqualStrings("0.10.0", hint.version);
+    try std.testing.expectEqualStrings("0.10.0", hint.version.?);
     try std.testing.expectEqual(Source.online, hint.source);
     try std.testing.expect(hint.registry == null);
     // The package's newest release (0.11.0) dropped `probe-target`: the
     // suggestion pins the newest release that still declares it.
-    try std.testing.expectEqualStrings("0.11.0", lookupOwner(a, fx.root, "later-target", false, fetchLiveDoc).hit.version);
+    try std.testing.expectEqualStrings("0.11.0", lookupOwner(a, fx.root, "later-target", false, fetchLiveDoc).hit.version.?);
     // The registry was reached and lists nobody for this target.
     try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, "absent-target", false, fetchLiveDoc).miss.reason);
     try std.testing.expectEqual(@as(usize, 3), fetch_calls);
@@ -318,12 +354,53 @@ test "provider registry lookup: the cached public registry answers when the live
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
     try std.testing.expectEqual(Source.cache, offline.source);
     try std.testing.expectEqualStrings("fixture", offline.package);
-    try std.testing.expectEqualStrings(fx.pin.version, offline.version);
+    try std.testing.expectEqualStrings(fx.pin.version, offline.version.?);
     try std.testing.expectEqual(Source.cache, lookupOwner(a, fx.root, "probe-target", false, fetchFails).hit.source);
     // Online wins when it answers: its newer release, not the cached one.
     const live = lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit;
     try std.testing.expectEqual(Source.online, live.source);
-    try std.testing.expectEqualStrings("0.10.0", live.version);
+    try std.testing.expectEqualStrings("0.10.0", live.version.?);
+    // A live schema-2 document that no longer lists the target is
+    // authoritative: the stale cached owner is not revived.
+    try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, "probe-target", false, fetchWithoutProbe).miss.reason);
+    // A live schema-1 document claims nothing, so the cache still answers.
+    try std.testing.expectEqual(Source.cache, lookupOwner(a, fx.root, "probe-target", false, fetchSchemaOne).hit.source);
+}
+
+test "provider registry lookup: a schema-1 owner is named without a version it cannot tie to the declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    // A verified cached archive (fx.pin, 1.0.0) declares the target; the
+    // schema-1 document also lists a newer 2.0.0 that says nothing.
+    const declaring = ".{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }";
+    const data = try AcceptFixture.gzipArchiveWith(a, declaring);
+    var owner = fx.pin;
+    owner.sha256 = try files.sha256Hex(a, data);
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = try @import("archive.zig").archivePath(a, owner), .data = data });
+    var newer = fx.pin;
+    newer.version = "2.0.0";
+    newer.sha256 = "0" ** 64;
+    try registry_cache.cacheRegistry(a, try std.json.Stringify.valueAlloc(a, @import("pin.zig").Document{ .schema_version = 1, .providers = &.{ owner, newer } }, .{}));
+    const hint = lookupOwner(a, null, "probe-target", true, fetchLiveDoc).hit;
+    try std.testing.expectEqualStrings("fixture", hint.package);
+    try std.testing.expect(hint.version == null);
+    try std.testing.expectEqual(Source.cache, hint.source);
+}
+
+test "provider registry lookup: the download capture is capped in the CLI, not only by curl" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A stand-in for a curl that ignores --max-filesize on a chunked
+    // response: it writes past the cap, and the capture fails like a bad download.
+    try std.testing.expectError(error.ProviderRegistryDownloadFailed, capture(a, &.{ "/bin/sh", "-c", "head -c 1048577 /dev/zero" }, max_document_bytes));
+    const exact = try capture(a, &.{ "/bin/sh", "-c", "head -c 1048576 /dev/zero" }, max_document_bytes);
+    try std.testing.expectEqual(max_document_bytes, exact.len);
+    try std.testing.expectError(error.ProviderRegistryDownloadFailed, capture(a, &.{ "/bin/sh", "-c", "exit 22" }, max_document_bytes));
 }
 
 test "provider registry lookup: a project accepted from a custom source is answered by that source, never the public registry" {
@@ -348,7 +425,7 @@ test "provider registry lookup: a project accepted from a custom source is answe
     const hint = lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit;
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
     try std.testing.expectEqualStrings("custom-owner", hint.package);
-    try std.testing.expectEqualStrings("2.0.0", hint.version);
+    try std.testing.expectEqualStrings("2.0.0", hint.version.?);
     try std.testing.expectEqual(Source.accepted_source, hint.source);
     try std.testing.expectEqualStrings(accepted.source, hint.registry.?);
     // Listed by the public registry but not by the custom source: not listed

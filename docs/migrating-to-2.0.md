@@ -301,6 +301,7 @@ labelle: no provider for target 'android' in this project; add and pin the packa
     2. labelle providers resolve            # preview the pin
     3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;
                                             # fresh clones and CI run `labelle providers fetch`)
+  If --accept reports UnsupportedContract, that release needs a newer CLI: choose an older release.
 ```
 
 The lookup reads registry metadata only (nothing is pinned, cached or run)
@@ -310,6 +311,12 @@ never the public registry. `LABELLE_OFFLINE=1` skips any download; then, or
 when no registry can be read, the last accepted copy is used if it names the
 owner, and otherwise the steps are generic and say why. The failure itself is
 the same either way.
+
+Two limitations: the registry does not say which CLI a release needs, so if
+`--accept` reports `UnsupportedContract`, choose an older release of the
+package. And the record of a custom registry source lives in `.labelle/`;
+deleting that directory makes the hint ask the public registry again until
+you re-run `labelle providers resolve <source> --accept`.
 
 **`target 'android' is declared by remote package 'android', which is unpinned`.**
 The package is in `.plugins` but not in `labelle.providers.lock`: run

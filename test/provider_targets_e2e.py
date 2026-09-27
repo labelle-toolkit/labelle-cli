@@ -267,6 +267,14 @@ sys.stdout.write(data)
         err = lookup("probe-far", online, True)
         assert "(the provider registry could not be read)" in err and generic in err and "(registry:" not in err, err
         (base / "registry-hidden.json").rename(served)
+        # Oversize: a response past the 1 MiB cap (as from a curl older than
+        # 8.4.0, which ignores --max-filesize on a chunked response) is a
+        # failed download, capped by the CLI itself.
+        real_doc = served.read_text()
+        served.write_text(real_doc + " " * (1024 * 1024))
+        err = lookup("probe-far", online, True)
+        assert "(the provider registry could not be read)" in err and generic in err and "(registry:" not in err, err
+        served.write_text(real_doc)
         # Offline: no request at all, even though the registry would answer.
         err = lookup("probe-far", dict(online, LABELLE_OFFLINE="1"), False)
         assert "(registry not consulted: LABELLE_OFFLINE is set)" in err and generic in err and "(registry:" not in err, err

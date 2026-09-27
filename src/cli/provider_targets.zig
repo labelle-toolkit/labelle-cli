@@ -111,8 +111,12 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     try w.print("labelle: no provider for target '{s}' in this project; add and pin the package that declares target '{s}'\n", .{ target, target });
+    // A custom source the project accepted from is passed to both resolve
+    // steps: without it `providers resolve` reads the public registry.
+    var custom: ?[]const u8 = null;
     switch (lookup) {
         .hit => |hint| {
+            custom = hint.registry;
             try w.print("  (registry: {s})\n", .{hint.package});
             switch (hint.source) {
                 .online => try w.writeAll("  the provider registry"),
@@ -120,10 +124,18 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
                 .accepted_source => try w.print("  the registry this project last accepted from, {s},", .{hint.registry.?}),
                 .accepted_copy => try w.print("  the recorded copy of the registry this project last accepted from, {s},", .{hint.registry.?}),
             }
-            try w.print(" lists package '{s}' {s} as the provider of target '{s}'. To use it:\n", .{ hint.package, hint.version, target });
-            try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, hint.version });
+            if (hint.version) |version| {
+                try w.print(" lists package '{s}' {s} as the provider of target '{s}'. To use it:\n", .{ hint.package, version, target });
+                try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, version });
+            } else {
+                // Schema 1: the owner is known from a cached archive, but no
+                // record ties a release to the declaration.
+                try w.print(" lists package '{s}' as the provider of target '{s}'. To use it:\n", .{ hint.package, target });
+                try w.print("    1. add it to .plugins in project.labelle, with a release of it that declares target '{s}'\n       (the registry lists its releases: {s}):\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"<version>\" }},\n", .{ target, hint.registry orelse github.registry_url, hint.package, hint.repo });
+            }
         },
         .miss => |why| {
+            custom = why.registry;
             if (why.registry) |from| {
                 switch (why.reason) {
                     .offline => try w.print("  (the registry this project last accepted from, {s}, was not consulted: " ++ github.registry_offline_env ++ " is set)\n", .{from}),
@@ -142,11 +154,28 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
             try w.print("    1. add the package that declares target '{s}' to .plugins in project.labelle\n       (the registry lists each package's targets: {s}):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ target, why.registry orelse github.registry_url });
         },
     }
-    try w.writeAll("    2. labelle providers resolve            # preview the pin\n");
-    try w.writeAll("    3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;\n");
+    const arg: []const u8 = if (custom) |from| try std.fmt.allocPrint(a, " {s}", .{try shellWord(a, from)}) else "";
+    try w.print("    2. labelle providers resolve{s}            # preview the pin\n", .{arg});
+    try w.print("    3. labelle providers resolve{s} --accept   # verify it and write labelle.providers.lock (commit it;\n", .{arg});
     try w.writeAll("                                            # fresh clones and CI run `labelle providers fetch`)\n");
+    if (lookup == .hit) {
+        // The registry carries no command-contract metadata, so the suggested
+        // release may need a newer CLI than this one.
+        try w.writeAll("  If --accept reports UnsupportedContract, that release needs a newer CLI: choose an older release.\n");
+    }
     try w.print("  Upgrading a project from CLI 1.x? See {s}\n", .{migration_guide_url});
     return out.toOwnedSlice();
+}
+
+/// `text` as one POSIX shell word: as is when it holds only safe bytes,
+/// else single-quoted.
+fn shellWord(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const safe = for (text) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "/._-:~+@%=,", c) != null)) break false;
+    } else text.len > 0;
+    if (safe) return text;
+    const escaped = try std.mem.replaceOwned(u8, a, text, "'", "'\\''");
+    return std.fmt.allocPrint(a, "'{s}'", .{escaped});
 }
 
 /// Print the no-provider diagnostic for the project at `root`. The registry
@@ -319,6 +348,22 @@ test "provider targets: the no-provider diagnostic names the registry owner on a
     const custom_miss = try noProviderDiagnostic(a, "probe-target", .{ .miss = .{ .reason = .not_listed, .registry = "/abs/providers.json" } });
     try std.testing.expect(std.mem.indexOf(u8, custom_miss, "(the registry this project last accepted from, /abs/providers.json, lists no package for this target)") != null);
     try std.testing.expect(std.mem.indexOf(u8, custom_miss, "(the registry lists each package's targets: /abs/providers.json)") != null);
+    // The custom source is passed to both resolve steps; the public path passes none.
+    for ([_][]const u8{ custom, custom_miss }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, text, "2. labelle providers resolve /abs/providers.json ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "3. labelle providers resolve /abs/providers.json --accept") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, hit, "2. labelle providers resolve            #") != null);
+    const spaced = try noProviderDiagnostic(a, "probe-target", .{ .miss = .{ .reason = .not_listed, .registry = "/my dir/it's.json" } });
+    try std.testing.expect(std.mem.indexOf(u8, spaced, "labelle providers resolve '/my dir/it'\\''s.json' --accept") != null);
+    // Only a hit names a release, so only a hit carries the contract note.
+    try std.testing.expect(std.mem.indexOf(u8, hit, "If --accept reports UnsupportedContract") != null);
+    try std.testing.expect(std.mem.indexOf(u8, custom_miss, "UnsupportedContract") == null);
+    // Schema 1: the owner without a version it cannot tie to the declaration.
+    const unversioned = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = null, .source = .cache } });
+    try std.testing.expect(std.mem.indexOf(u8, unversioned, "lists package 'fixture' as the provider of target 'probe-target'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unversioned, ".{ .name = \"fixture\", .repo = \"github.com/owner/fixture\", .version = \"<version>\" },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unversioned, "with a release of it that declares target 'probe-target'") != null);
     // Every miss: the same head and steps, the placeholder entry, no owner,
     // and the reason that says which path ran.
     const reasons = [_]struct { github.RegistryMissReason, []const u8 }{
