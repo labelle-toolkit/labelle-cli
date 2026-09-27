@@ -7,9 +7,9 @@ Three local copies of the probe provider (test/fixtures/provider): `beta` and
 namespace order, so the run order proves the sort. A fourth, remote provider
 is pinned in labelle.providers.lock but its archive is never cached: it must
 be a failed check with the fetch hint, without a download and without
-stopping the others. A fifth, remote and unpinned, must fail closed with the
-same report whether the ordinary package cache holds it or not, and never
-run, and a malformed cached manifest of it changes nothing. Run from a
+stopping the others. A fifth, remote and unpinned, never runs: uncached it is
+a WARN that leaves the exit code alone, cached runtime-only it is not listed,
+cached as a provider (or with a malformed manifest) it fails. Run from a
 subdirectory, both halves use the project root. An invalid settings file
 fails only its own provider's doctor. No assembler, network or game dependencies; every
 workspace is temporary. Runs on Windows, macOS and Linux.
@@ -179,43 +179,60 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     archives = home / "provider-archives"
     assert not archives.exists() or not any(archives.iterdir()), "the doctor downloaded an archive"
 
-    # A declared remote package with no integrity pin fails closed, and the
-    # same way whether the ordinary package cache holds it or not.
+    # A declared remote package with no integrity pin never runs. Not cached,
+    # it is a WARN that leaves the exit code alone; cached runtime-only, it is
+    # not listed; cached with provider features (or an unreadable manifest),
+    # it FAILS with the resolve hint.
     unpinned = '.{ .name = "epsilon", .repo = "example/epsilon", .version = "1.0.0" }'
-    write_project([remote, unpinned])
 
-    def section(text, package):
-        start = text.index(f"\nprovider '{package}'\n")
+    def section(text, package, kind="provider"):
+        start = text.index(f"\n{kind} '{package}'\n")
         return text[start:text.index("\n\n", start + 1)]
 
+    # Cold, and the only other finding a WARN: the exit code is the core's.
+    write_project([unpinned])
     cold = run()
-    assert cold.returncode == 1, (cold.returncode, cold.stderr)
-    cold_section = section(cold.stderr, "epsilon")
-    assert "not verified: remote package with no integrity pin" in cold_section, cold_section
-    assert "labelle providers resolve" in cold_section, cold_section
-    assert "Provider doctors: 4 checked, 2 failed (delta, epsilon)" in cold.stderr, cold.stderr
-    # Warm: the ordinary cache holds a provider manifest with a `doctor` command.
+    assert cold.returncode == (0 if core_ok(cold) else 1), (cold.returncode, cold.stderr)
+    cold_section = section(cold.stderr, "epsilon", "package")
+    assert "[ WARN ] not installed yet" in cold_section and "labelle install" in cold_section, cold_section
+    assert "FAIL" not in cold_section, cold_section
+    assert "Provider doctors: 3 checked, 0 failed, 1 not installed yet (epsilon)" in cold.stderr, cold.stderr
+    assert len(invocations("alpha-pkg")) == 6 and len(invocations("beta-pkg")) == 6
+    # With a real failure beside it, the failure alone decides.
+    write_project([remote, unpinned])
+    mixed = run()
+    assert mixed.returncode == 1, (mixed.returncode, mixed.stderr)
+    assert section(mixed.stderr, "epsilon", "package") == cold_section
+    assert "Provider doctors: 4 checked, 1 failed (delta), 1 not installed yet (epsilon)" in mixed.stderr, mixed.stderr
+    # Warm, runtime-only (no provider features): not listed at all.
     cached = home / "packages" / "plugins" / "example" / "epsilon" / "1.0.0"
     shutil.copytree(fixture, cached)
+    (cached / "plugin.labelle").write_text('.{ .name = "epsilon" }')
+    runtime = run()
+    assert "epsilon" not in runtime.stderr, runtime.stderr
+    assert "Provider doctors: 3 checked, 1 failed (delta)" in runtime.stderr, runtime.stderr
+    # Warm, a provider manifest with a `doctor` command: FAIL, never run.
     (cached / "plugin.labelle").write_text(manifest("epsilon", "epsilon", ["doctor"]))
     warm = run()
     assert warm.returncode == 1, (warm.returncode, warm.stderr)
-    assert section(warm.stderr, "epsilon") == cold_section, (section(warm.stderr, "epsilon"), cold_section)
+    warm_section = section(warm.stderr, "epsilon")
+    assert "[ FAIL ] not verified: remote provider with no integrity pin" in warm_section, warm_section
+    assert "labelle providers resolve" in warm_section, warm_section
     assert "Provider doctors: 4 checked, 2 failed (delta, epsilon)" in warm.stderr, warm.stderr
     # Its code never ran: no build, no output directory, no header of a run.
     assert "labelle epsilon doctor" not in warm.stderr, warm.stderr
     assert not (outputs / "epsilon").exists(), "an unverified package's tool ran"
-    assert len(invocations("alpha-pkg")) == 7 and len(invocations("beta-pkg")) == 7
+    assert len(invocations("alpha-pkg")) == 9 and len(invocations("beta-pkg")) == 9
 
-    # A MALFORMED cached manifest of the unpinned package reads the same as
-    # cold too, and does not stop the valid providers' doctors.
+    # A MALFORMED cached manifest can't be cleared as runtime-only: the same
+    # FAIL as a cached provider, and the valid providers' doctors still run.
     (cached / "plugin.labelle").write_text(".{ .name = ")
     broken = run()
     assert broken.returncode == 1, (broken.returncode, broken.stderr)
-    assert section(broken.stderr, "epsilon") == cold_section, (section(broken.stderr, "epsilon"), cold_section)
+    assert section(broken.stderr, "epsilon") == warm_section, (section(broken.stderr, "epsilon"), warm_section)
     assert "provider discovery" not in broken.stderr, broken.stderr
     assert "Provider doctors: 4 checked, 2 failed (delta, epsilon)" in broken.stderr, broken.stderr
-    assert len(invocations("alpha-pkg")) == 8 and len(invocations("beta-pkg")) == 8
+    assert len(invocations("alpha-pkg")) == 10 and len(invocations("beta-pkg")) == 10
 
     # Settings are resolved per provider: alpha's settings file is invalid
     # JSON, so alpha's doctor fails and beta's (valid settings) still runs.
@@ -229,11 +246,61 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert "[ FAIL ] labelle alpha doctor: InvalidProviderConfigJson" in err, err
     assert "[  OK  ] labelle beta doctor" in err, err
     assert "Provider doctors: 2 checked, 1 failed (alpha)" in err, err
-    assert len(invocations("alpha-pkg")) == 8 and len(invocations("beta-pkg")) == 9
+    assert len(invocations("alpha-pkg")) == 10 and len(invocations("beta-pkg")) == 11
     assert json.loads((outputs / "beta-pkg" / "capture.json").read_text())["setting"] == "beta settings"
     # `labelle <ns> <cmd>` keeps validating every settings file.
     direct = subprocess.run([cli, "beta", "doctor"], cwd=project, env=env, text=True, capture_output=True, timeout=600)
     assert direct.returncode == 1 and "InvalidProviderConfigJson" in direct.stderr, (direct.returncode, direct.stderr)
-    assert len(invocations("beta-pkg")) == 9
+    assert len(invocations("beta-pkg")) == 11
+
+    # An uncached unpinned package the project already uses as a provider
+    # (a provider_config entry names it) is a FAIL, not a WARN.
+    (project / "providers" / "alpha.json").write_text('{"label": "alpha settings"}')
+    shutil.rmtree(cached)
+    write_project([unpinned])
+    referenced = run()
+    assert "[ WARN ] not installed yet" in section(referenced.stderr, "epsilon", "package")
+    write_project([unpinned], extra=', .provider_config = .{ .{ .package = "epsilon", .file = "providers/epsilon.json" } }')
+    referenced = run()
+    assert referenced.returncode == 1, (referenced.returncode, referenced.stderr)
+    ref_section = section(referenced.stderr, "epsilon")
+    assert "[ FAIL ] not verified: remote package the project uses as a provider" in ref_section, ref_section
+    assert "labelle providers resolve" in ref_section, ref_section
+    assert "Provider doctors: 3 checked, 1 failed (epsilon)" in referenced.stderr, referenced.stderr
+    write_project()
+
+    # `labelle doctor --zig <path>` is the compiler for both halves, as for
+    # `labelle build` (LABELLE_ZIG unset here; it would win).
+    no_env_zig = {k: v for k, v in env.items() if k != "LABELLE_ZIG"}
+    flag_home = base / "flag-home"
+    before = (len(invocations("alpha-pkg")), len(invocations("beta-pkg")))
+    flagged = subprocess.run([cli, "doctor", f"--zig={zig}"], cwd=project, env=dict(no_env_zig, LABELLE_HOME=str(flag_home)), text=True, capture_output=True, timeout=600)
+    assert "--zig override: " + zig in flagged.stderr, flagged.stderr
+    assert "Provider doctors: 2 checked, 0 failed" in flagged.stderr, flagged.stderr
+    assert not (flag_home / "zig").exists(), "a managed Zig was provisioned despite --zig"
+    assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (before[0] + 1, before[1] + 1)
+    # A --zig path that does not exist fails every provider doctor, and the
+    # host is resolved once for all of them.
+    dead_zig = str(base / "nonexistent-zig")
+    dead = subprocess.run([cli, "doctor", "--zig", dead_zig], cwd=project, env=no_env_zig, text=True, capture_output=True, timeout=600)
+    assert dead.returncode == 1, (dead.returncode, dead.stderr)
+    assert dead.stderr.count("[ FAIL ] labelle alpha doctor: ProviderCompilerMissing") == 1, dead.stderr
+    assert dead.stderr.count("[ FAIL ] labelle beta doctor: ProviderCompilerMissing") == 1, dead.stderr
+    assert dead.stderr.count("host compiler override does not exist") == 1, dead.stderr
+    # The core check verifies the override too, providers or not, and so
+    # does the studio's --json report.
+    assert "[ FAIL ] Zig toolchain" in dead.stderr, dead.stderr
+    core_dead = subprocess.run([cli, "doctor", "--core-only", "--zig", dead_zig], cwd=project, env=no_env_zig, text=True, capture_output=True, timeout=600)
+    assert core_dead.returncode == 1 and "--zig override '" + dead_zig + "' does not exist" in core_dead.stderr, (core_dead.returncode, core_dead.stderr)
+    json_dead = subprocess.run([cli, "doctor", "--json", f"--zig={dead_zig}"], cwd=project, env=no_env_zig, text=True, capture_output=True, timeout=600)
+    items = {item["id"]: item for item in json.loads(json_dead.stdout)["capabilities"][0]["items"]}
+    assert items["zig"]["ok"] is False and "does not exist" in items["zig"]["hint"], json_dead.stdout
+    # The real compiler passes the same check.
+    assert "--zig override: " + zig in flagged.stderr and "verified" in flagged.stderr, flagged.stderr
+    # `labelle <ns> <cmd>` honours LABELLE_ZIG only: everything after the
+    # command, `--zig` included, belongs to the provider.
+    passthrough = subprocess.run([cli, "alpha", "doctor", "--zig", dead_zig], cwd=project, env=env, text=True, capture_output=True, timeout=600)
+    assert passthrough.returncode == 0, (passthrough.returncode, passthrough.stderr)
+    assert json.loads((outputs / "alpha-pkg" / "capture.json").read_text())["args"] == ["--zig", dead_zig]
 
     print(f"provider doctor e2e: {checks} invocations OK")

@@ -42,10 +42,34 @@ alone never authorize remote execution.
 
 ## Host build and cache
 
-The compiler must already be installed for the project's resolved Zig version.
-An explicit `LABELLE_ZIG` path is supported, but its reported version must
-match. Missing tools fail with installation guidance; invocation never calls
-the downloader.
+The host compiler is resolved exactly as `labelle build` resolves it
+(`zig_toolchain.resolveZig`): an explicit override wins (its reported
+version must match the project's, and a path that does not exist is
+`ProviderCompilerMissing`), otherwise the managed toolchain for the project's
+resolved Zig version is used, provisioned on a cache miss the same way (a
+bundled seed first, else download with minisign verification, installed
+atomically). This applies to commands, the provider part of `labelle doctor`
+and hooks. The provider's pins are checked first, so an unpinned provider
+never triggers a download. Provider archives are still never downloaded by
+an invocation.
+
+Which overrides apply depends on who owns the arguments:
+
+- `labelle <namespace> <command>` honours `LABELLE_ZIG` only. Every argument
+  after the command belongs to the provider, `--zig` included, so the
+  passthrough is never ambiguous.
+- `labelle doctor` takes `--zig <path>` / `--zig=<path>` as `labelle build`
+  does (`LABELLE_ZIG` still wins); the core check reports it and every
+  provider doctor's tool builds with it. The core check verifies either
+  override with the same check the provider host resolution uses
+  (`zig_toolchain.verifyBinary`: exists, executable, `zig version` equals
+  the project's required version) and reports a FAIL, also in `--json`,
+  when it does not pass.
+- Hooks run inside `labelle build|run|bundle`, whose own `--zig` applies.
+
+`labelle doctor` resolves the host once for all its provider doctors: a
+failed or offline provisioning is attempted once, and every provider after
+it reports the same error as its own failed line.
 
 The runner executes the manifest's install-only step using:
 
@@ -96,12 +120,13 @@ declare no `doctor` command.
   core checks or any provider doctor failed.
 - A pinned provider whose archive is not cached, or does not match its pin,
   is a failed check with the `labelle providers fetch` hint. The doctor never
-  downloads ([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock)).
+  downloads a provider archive ([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock));
+  the host compiler a provider's doctor needs is provisioned as for a build.
 - One package never fails the others. A pinned or local provider whose
   manifest cannot be read, parsed or matched to its name is a failed check of
   its own. An unpinned package's manifest is read only to tell a runtime-only
-  package from a provider; if it is unreadable or malformed, the package is
-  reported as unverified (below), the same as when it is not cached at all.
+  package from a provider; if it is unreadable or malformed, it cannot be
+  cleared as runtime-only and is reported as an unverified provider (below).
 - Settings are resolved per provider: each provider's doctor opens only its
   own `provider_config` file, so a missing or invalid settings file fails
   that provider alone. The project-wide mapping (every entry names a
@@ -112,13 +137,22 @@ declare no `doctor` command.
   undeclared entries and malformed paths are refused when `project.labelle`
   is read, which fails the provider part as a whole. `labelle <ns> <cmd>`
   and hooks keep validating every settings file before they run.
-- A declared remote package with no integrity pin is a failed check with the
-  `labelle providers resolve` hint, and its code is never run. The report is
-  the same whether the ordinary package cache holds the package or not: an
-  uncached one cannot be told apart from a provider, so it fails closed. A
-  runtime-only package needs no pin; once it is in the package cache
-  (`labelle install`) its manifest shows it is no provider and the check
-  clears. A stale pin gets the same `providers resolve` hint.
+- A declared remote package with no integrity pin never runs any code, and
+  is classified by what the package cache shows:
+  - not cached, and nothing references it as a provider: a WARN, "not
+    installed yet; run `labelle install`", which does not change the exit
+    code. Only its manifest could tell whether it is
+    a provider, and a build installs it first and fails loudly if it is an
+    unpinned provider;
+  - cached, runtime-only (no commands, hooks, targets, namespace or contract):
+    not listed;
+  - cached, declaring provider features (or with an unreadable manifest): a
+    FAIL with the `labelle providers resolve` hint;
+  - not cached, but the project already uses it as a provider (a
+    `provider_config` entry, or a verified provider's `after_hooks`, names
+    it): the same FAIL, since installing it cannot make it pass.
+  A stale pin also gets the `providers resolve` hint. The summary counts the
+  WARNs separately (`N not installed yet (…)`).
 - Outside a project only the core checks run, followed by one line saying that
   provider doctors run inside a project. Projectless provider commands are a
   later phase (decision D8).

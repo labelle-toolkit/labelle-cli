@@ -35,10 +35,10 @@ Hooks require a project. Like commands, they run only for a provider whose
 `labelle.lock` entry matches the declaration and — for a remote package —
 whose integrity pin is accepted (`MissingProviderPin`, `StaleProviderPin`,
 `RemoteProviderIntegrityRequired`). Every hook of a phase has its pin
-checked **before** the host compiler is resolved, exactly as a provider
-command does: an unpinned remote hook on a machine without the pinned
-compiler is reported as the integrity failure it is, not as
-`ProviderCompilerMissing`, and the check creates no cache directory.
+checked **before** the host compiler is resolved (and, like `labelle build`,
+provisioned on a cache miss), exactly as a provider command does: an
+unpinned remote hook is reported as the integrity failure it is, never
+triggers a compiler download, and the check creates no cache directory.
 `provider_config` settings are resolved the same way and passed as
 `config_file`.
 
