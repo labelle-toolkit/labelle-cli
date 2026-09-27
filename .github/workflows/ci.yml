@@ -92,6 +92,9 @@ jobs:
       - name: Android-shaped provider subprocess regression
         run: python test/provider_android_like_e2e.py
 
+      - name: Provider doctor aggregation subprocess regression
+        run: python test/provider_doctor_e2e.py
+
       - name: CLI tests
         run: zig build test
 

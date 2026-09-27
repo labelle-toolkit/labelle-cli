@@ -1,0 +1,548 @@
+//! The provider half of `labelle doctor` (RFC #406, "unified help and
+//! doctor"). Inside a project, every pinned provider whose manifest declares
+//! a command named exactly `doctor` has it run after the core checks, in
+//! namespace order, through the same path as `labelle <namespace> doctor`
+//! (`provider_dispatch.runCommand`: the lock and integrity checks, the
+//! provider settings, the isolated tool build and the wire context). Nothing
+//! here names a provider: the manifests decide who takes part.
+//!
+//! A provider that fails does not stop the others; the report counts it and
+//! `labelle doctor` exits non-zero. A pinned provider whose archive is not
+//! cached (or does not match its pin) is reported as a failed check with the
+//! `labelle providers fetch` hint; the doctor never downloads. A declared
+//! remote package with no integrity pin fails closed with the `labelle
+//! providers resolve` hint, and reads the same whether the ordinary package
+//! cache holds it or not; its code is never run. Projectless
+//! provider commands are a later phase (decision D8), so outside a project
+//! only the core checks run.
+const std = @import("std");
+const config = @import("config.zig");
+const project = @import("project_config.zig");
+const manifest = @import("provider_manifest.zig");
+const dispatch = @import("provider_dispatch.zig");
+const github = @import("provider_github.zig");
+
+/// The command a provider declares to take part.
+pub const command_name = "doctor";
+
+pub const Step = struct {
+    /// The namespace (the header and the order key); the package name for a
+    /// provider whose manifest could not be read.
+    label: []const u8,
+    package: []const u8,
+    action: Action,
+
+    pub const Action = union(enum) {
+        /// Run `command` of `providers[provider]`.
+        run: struct { provider: usize, command: manifest.Command },
+        /// The provider's source could not be obtained (`Sources.projectDir`).
+        unavailable: anyerror,
+        /// A declared remote package with no integrity pin. Never run.
+        unverified: Unverified,
+    };
+};
+
+/// How an unpinned remote package was found; the report is the same either
+/// way, so the result does not depend on the ordinary package cache.
+pub const Unverified = enum {
+    /// Not in the package cache: its manifest cannot be read, so it may be a
+    /// provider, and nothing proves otherwise. Fails closed.
+    uncached,
+    /// In the package cache, and its (unverified) manifest declares a
+    /// provider.
+    cached,
+};
+
+pub const Plan = struct {
+    steps: []const Step,
+    /// Providers that declare no `doctor` command, by package name, sorted.
+    skipped: []const []const u8,
+};
+
+/// Which provider doctors run, and in what order: every verified provider
+/// with a namespace and a command named exactly `doctor`, plus a failed check
+/// for every declared package that cannot be verified: a pinned one whose
+/// source could not be obtained (`unavailable`), and a remote one with no
+/// integrity pin, cached (`unverified`, or `providers[i].verified == false`)
+/// or not (`unresolved`, minus the `unavailable` ones). Sorted by label;
+/// declaration order in `project.labelle` does not matter.
+pub fn plan(a: std.mem.Allocator, providers: []const dispatch.Provider, unavailable: []const dispatch.Unavailable, unresolved: []const []const u8, unverified: []const []const u8) !Plan {
+    var steps: std.ArrayList(Step) = .empty;
+    var skipped: std.ArrayList([]const u8) = .empty;
+    for (providers, 0..) |provider, index| {
+        if (!provider.verified) {
+            // Labelled by package, not namespace: the uncached case cannot
+            // know the namespace, and both must read the same.
+            try steps.append(a, .{ .label = provider.meta.name, .package = provider.meta.name, .action = .{ .unverified = .cached } });
+            continue;
+        }
+        const command = find(provider.meta) orelse {
+            try skipped.append(a, provider.meta.name);
+            continue;
+        };
+        try steps.append(a, .{
+            .label = provider.meta.namespace.?,
+            .package = provider.meta.name,
+            .action = .{ .run = .{ .provider = index, .command = command } },
+        });
+    }
+    for (unavailable) |entry| {
+        try steps.append(a, .{ .label = entry.package, .package = entry.package, .action = .{ .unavailable = entry.err } });
+    }
+    for (unverified) |name| {
+        try steps.append(a, .{ .label = name, .package = name, .action = .{ .unverified = .cached } });
+    }
+    unread: for (unresolved) |name| {
+        for (unavailable) |entry| if (std.mem.eql(u8, entry.package, name)) continue :unread;
+        try steps.append(a, .{ .label = name, .package = name, .action = .{ .unverified = .uncached } });
+    }
+    std.mem.sort(Step, steps.items, {}, struct {
+        fn lessThan(_: void, x: Step, y: Step) bool {
+            return switch (std.mem.order(u8, x.label, y.label)) {
+                .lt => true,
+                .gt => false,
+                .eq => std.mem.lessThan(u8, x.package, y.package),
+            };
+        }
+    }.lessThan);
+    std.mem.sort([]const u8, skipped.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+    return .{ .steps = steps.items, .skipped = skipped.items };
+}
+
+fn find(meta: manifest.Manifest) ?manifest.Command {
+    // A command is only reachable under a namespace (`labelle <ns> doctor`).
+    if (meta.namespace == null) return null;
+    for (meta.commands) |command| {
+        if (std.mem.eql(u8, command.name, command_name)) return command;
+    }
+    return null;
+}
+
+pub const Outcome = struct {
+    label: []const u8,
+    package: []const u8,
+    /// The tool's exit status, or null when it never ran.
+    code: ?u8,
+    /// Why it never ran (an error name), when `code` is null.
+    err: ?anyerror = null,
+
+    pub fn ok(self: Outcome) bool {
+        return self.code == 0;
+    }
+};
+
+pub const Report = struct {
+    outcomes: []const Outcome,
+    skipped: []const []const u8 = &.{},
+
+    pub fn failed(self: Report) usize {
+        var count: usize = 0;
+        for (self.outcomes) |outcome| count += @intFromBool(!outcome.ok());
+        return count;
+    }
+};
+
+/// Run every step with `runner.run(step) anyerror!u8`, one after another,
+/// whatever the previous ones returned. Prints a header per provider and
+/// its result line to stderr.
+pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
+    var outcomes: std.ArrayList(Outcome) = .empty;
+    for (p.steps) |step| {
+        printHeader(step);
+        const outcome: Outcome = switch (step.action) {
+            .unavailable => |err| blk: {
+                std.debug.print("  [ FAIL ] provider source unavailable: {s}\n", .{@errorName(err)});
+                if (fetchable(err)) {
+                    std.debug.print("           -> run `labelle providers fetch` to download the pinned archives\n", .{});
+                } else if (err == error.StaleProviderIntegrityPin) {
+                    std.debug.print("           -> run `labelle providers resolve` to re-pin it, then repeat with --accept\n", .{});
+                }
+                break :blk .{ .label = step.label, .package = step.package, .code = null, .err = err };
+            },
+            // Both paths print the same lines: the cache must not change
+            // the result.
+            .unverified => blk: {
+                std.debug.print("  [ FAIL ] not verified: remote package with no integrity pin in labelle.providers.lock; its code is not run\n", .{});
+                std.debug.print("           -> run `labelle providers resolve`, review the pins, then repeat with --accept\n", .{});
+                std.debug.print("              (a runtime-only package needs no pin, but must be in the package cache, `labelle install`, for the doctor to tell)\n", .{});
+                break :blk .{ .label = step.label, .package = step.package, .code = null, .err = error.RemoteProviderIntegrityRequired };
+            },
+            .run => if (runner.run(step)) |code|
+                .{ .label = step.label, .package = step.package, .code = code }
+            else |err|
+                .{ .label = step.label, .package = step.package, .code = null, .err = err },
+        };
+        switch (step.action) {
+            .unavailable, .unverified => {},
+            .run => if (outcome.code) |code| {
+                if (code == 0) {
+                    std.debug.print("  [  OK  ] labelle {s} {s}\n", .{ step.label, command_name });
+                } else {
+                    std.debug.print("  [ FAIL ] labelle {s} {s} exited {d}\n", .{ step.label, command_name, code });
+                }
+            } else {
+                std.debug.print("  [ FAIL ] labelle {s} {s}: {s}\n", .{ step.label, command_name, @errorName(outcome.err.?) });
+            },
+        }
+        try outcomes.append(a, outcome);
+    }
+    return .{ .outcomes = outcomes.items, .skipped = p.skipped };
+}
+
+fn fetchable(err: anyerror) bool {
+    return err == error.ProviderArchiveMissing or err == error.ProviderArchiveHashMismatch;
+}
+
+fn printHeader(step: Step) void {
+    switch (step.action) {
+        .run => std.debug.print("\nlabelle {s} {s}  (provider '{s}')\n", .{ step.label, command_name, step.package }),
+        .unavailable, .unverified => std.debug.print("\nprovider '{s}'\n", .{step.package}),
+    }
+    std.debug.print("------------------------------------------------------------\n", .{});
+}
+
+/// The closing summary of the provider part.
+pub fn printSummary(report: Report) void {
+    std.debug.print("\nProvider doctors: {d} checked, {d} failed", .{ report.outcomes.len, report.failed() });
+    if (report.failed() != 0) {
+        std.debug.print(" (", .{});
+        var first = true;
+        for (report.outcomes) |outcome| {
+            if (outcome.ok()) continue;
+            std.debug.print("{s}{s}", .{ if (first) "" else ", ", outcome.label });
+            first = false;
+        }
+        std.debug.print(")", .{});
+    }
+    std.debug.print("\n", .{});
+    if (report.skipped.len != 0) {
+        std.debug.print("  no `{s}` command: ", .{command_name});
+        for (report.skipped, 0..) |name, i| std.debug.print("{s}{s}", .{ if (i == 0) "" else ", ", name });
+        std.debug.print("\n", .{});
+    }
+}
+
+/// The exit status of `labelle doctor`: non-zero when the core checks or
+/// any provider doctor failed.
+pub fn exitCode(core_ok: bool, report: ?Report) u8 {
+    if (!core_ok) return 1;
+    if (report) |r| if (r.failed() != 0) return 1;
+    return 0;
+}
+
+/// Runs a planned step through the dispatch path of `labelle <ns> doctor`.
+const DispatchRunner = struct {
+    a: std.mem.Allocator,
+    root: []const u8,
+    cfg: project.ProjectConfig,
+    providers: []const dispatch.Provider,
+
+    pub fn run(self: DispatchRunner, step: Step) anyerror!u8 {
+        const action = step.action.run;
+        // `.selected`: only this provider's settings file is opened, so a
+        // bad file of another provider fails that provider alone.
+        return dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, &.{}, .selected);
+    }
+};
+
+/// The line `labelle doctor` prints instead of the provider part outside a
+/// project (projectless provider commands are decision D8's later phase).
+pub fn printOutsideProject(start: []const u8) void {
+    std.debug.print("  Provider doctors run inside a project; no project.labelle at or above '{s}'.\n", .{start});
+}
+
+/// The provider part of `labelle doctor` for the project at `root` (the
+/// canonical project root the core checks used too).
+pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8) !Report {
+    // The report outlives this call; its strings live in `allocator`'s arena
+    // owned by the caller.
+    const a = allocator;
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const discovered = discover(a, root, &sources) catch |err| {
+        std.debug.print("\nProvider doctors\n", .{});
+        std.debug.print("------------------------------------------------------------\n", .{});
+        std.debug.print("  [ FAIL ] provider discovery: {s}\n", .{@errorName(err)});
+        const outcomes = try a.alloc(Outcome, 1);
+        outcomes[0] = .{ .label = "provider discovery", .package = "", .code = null, .err = err };
+        return .{ .outcomes = outcomes };
+    };
+    const survey = discovered.survey;
+    const p = try plan(a, survey.providers, survey.unavailable, survey.unresolved, survey.unverified);
+    // The project-wide settings mapping is checked once and reported once;
+    // each provider then opens only its own settings file, so neither a bad
+    // mapping nor another provider's bad file stops a provider's doctor.
+    const mapping: ?Outcome = if (dispatch.checkSettingsMapping(discovered.cfg, survey.providers)) |_| null else |err| blk: {
+        std.debug.print("\nprovider_config\n", .{});
+        std.debug.print("------------------------------------------------------------\n", .{});
+        std.debug.print("  [ FAIL ] provider_config mapping: {s}\n", .{@errorName(err)});
+        break :blk .{ .label = "provider_config", .package = "", .code = null, .err = err };
+    };
+    if (p.steps.len == 0 and p.skipped.len == 0 and mapping == null) {
+        std.debug.print("  No providers declared in this project.\n", .{});
+        return .{ .outcomes = &.{} };
+    }
+    var report = try execute(a, p, DispatchRunner{
+        .a = a,
+        .root = root,
+        .cfg = discovered.cfg,
+        .providers = survey.providers,
+    });
+    if (mapping) |outcome| report.outcomes = try std.mem.concat(a, Outcome, &.{ &.{outcome}, report.outcomes });
+    printSummary(report);
+    return report;
+}
+
+const Discovered = struct { cfg: project.ProjectConfig, survey: dispatch.Survey };
+
+fn discover(a: std.mem.Allocator, root: []const u8, sources: *github.Sources) !Discovered {
+    var cfg = try config.readProjectConfigQuiet(a, root);
+    const found = try dispatch.survey(a, root, cfg, sources);
+    // A settings entry for a package that could not be read or verified is
+    // already a failed check of its own; it must not also fail every other
+    // provider's settings resolution (which requires each entry to name a
+    // resolved, verified provider).
+    var entries: std.ArrayList(@import("provider_settings.zig").Entry) = .empty;
+    for (cfg.provider_config) |entry| {
+        if (named(found.unresolved, entry.package) or named(found.unverified, entry.package)) continue;
+        var unverified = false;
+        for (found.providers) |provider| {
+            if (!provider.verified and std.mem.eql(u8, provider.meta.name, entry.package)) unverified = true;
+        }
+        if (!unverified) try entries.append(a, entry);
+    }
+    cfg.provider_config = entries.items;
+    return .{ .cfg = cfg, .survey = found };
+}
+
+fn named(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+    return false;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn fake(name: []const u8, namespace: ?[]const u8, commands: []const manifest.Command) dispatch.Provider {
+    return .{
+        .dep = .{ .name = name, .repo = "local:../x", .version = "1.0.0" },
+        .dir = "/x",
+        .meta = .{ .name = name, .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0", .namespace = namespace, .commands = commands },
+        .verified = true,
+    };
+}
+
+fn cmd(name: []const u8, executable: []const u8) manifest.Command {
+    return .{ .name = name, .build_step = "install-tool", .executable = executable, .help = "h" };
+}
+
+/// Records every invocation (namespace + the tool it would build and run)
+/// and fails the namespaces it is told to.
+const Recorder = struct {
+    a: std.mem.Allocator,
+    calls: *std.ArrayList([]const u8),
+    exit_codes: []const struct { []const u8, u8 } = &.{},
+    errors: []const []const u8 = &.{},
+
+    pub fn run(self: Recorder, step: Step) anyerror!u8 {
+        const command = step.action.run.command;
+        try self.calls.append(self.a, try std.fmt.allocPrint(self.a, "{s}:{s}", .{ step.label, command.executable }));
+        for (self.errors) |label| if (std.mem.eql(u8, label, step.label)) return error.ProviderCompilerMissing;
+        for (self.exit_codes) |entry| if (std.mem.eql(u8, entry[0], step.label)) return entry[1];
+        return 0;
+    }
+};
+
+test "provider doctor: selects providers declaring `doctor`, by namespace, skipping the rest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Declared out of order; one without `doctor`, one with a near miss, one
+    // with no namespace at all.
+    const providers = [_]dispatch.Provider{
+        fake("zeta-pkg", "zeta", &.{ cmd("run", "bin/zeta-run"), cmd("doctor", "bin/zeta-doctor") }),
+        fake("plain", "plain", &.{cmd("serve", "bin/plain")}),
+        fake("alpha-pkg", "alpha", &.{cmd("doctor", "bin/alpha-doctor")}),
+        fake("near", "near", &.{cmd("doctors", "bin/near")}),
+        fake("hooks-only", null, &.{}),
+        fake("mid-pkg", "mid", &.{cmd("doctor", "bin/mid-doctor")}),
+    };
+    const p = try plan(a, &providers, &.{}, &.{}, &.{});
+    try testing.expectEqual(@as(usize, 3), p.steps.len);
+    const expected = [_][3][]const u8{
+        .{ "alpha", "alpha-pkg", "bin/alpha-doctor" },
+        .{ "mid", "mid-pkg", "bin/mid-doctor" },
+        .{ "zeta", "zeta-pkg", "bin/zeta-doctor" },
+    };
+    for (expected, p.steps) |want, step| {
+        try testing.expectEqualStrings(want[0], step.label);
+        try testing.expectEqualStrings(want[1], step.package);
+        // The step points at the provider's own `doctor` record, not its first command.
+        try testing.expectEqualStrings(want[2], step.action.run.command.executable);
+        try testing.expectEqualStrings(want[1], providers[step.action.run.provider].meta.name);
+    }
+    try testing.expectEqual(@as(usize, 3), p.skipped.len);
+    try testing.expectEqualStrings("hooks-only", p.skipped[0]);
+    try testing.expectEqualStrings("near", p.skipped[1]);
+    try testing.expectEqualStrings("plain", p.skipped[2]);
+}
+
+test "provider doctor: one failure still runs the others, in order, and fails the aggregate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]dispatch.Provider{
+        fake("c-pkg", "gamma", &.{cmd("doctor", "bin/c")}),
+        fake("b-pkg", "beta", &.{cmd("doctor", "bin/b")}),
+        fake("a-pkg", "alpha", &.{cmd("doctor", "bin/a")}),
+    };
+    const p = try plan(a, &providers, &.{}, &.{}, &.{});
+    var calls: std.ArrayList([]const u8) = .empty;
+    // The first one exits non-zero and the second cannot even be built: the
+    // third still runs.
+    const report = try execute(a, p, Recorder{ .a = a, .calls = &calls, .exit_codes = &.{.{ "alpha", 7 }}, .errors = &.{"beta"} });
+    try testing.expectEqual(@as(usize, 3), calls.items.len);
+    try testing.expectEqualStrings("alpha:bin/a", calls.items[0]);
+    try testing.expectEqualStrings("beta:bin/b", calls.items[1]);
+    try testing.expectEqualStrings("gamma:bin/c", calls.items[2]);
+    try testing.expectEqual(@as(usize, 2), report.failed());
+    try testing.expectEqual(@as(?u8, 7), report.outcomes[0].code);
+    try testing.expectEqual(@as(?u8, null), report.outcomes[1].code);
+    try testing.expectEqual(@as(?anyerror, error.ProviderCompilerMissing), report.outcomes[1].err);
+    try testing.expect(report.outcomes[2].ok());
+    try testing.expectEqual(@as(u8, 1), exitCode(true, report));
+}
+
+test "provider doctor: the exit code aggregates the core and every provider" {
+    const pass = [_]Outcome{ .{ .label = "a", .package = "a", .code = 0 }, .{ .label = "b", .package = "b", .code = 0 } };
+    const fail = [_]Outcome{ .{ .label = "a", .package = "a", .code = 0 }, .{ .label = "b", .package = "b", .code = 3 } };
+    try testing.expectEqual(@as(u8, 0), exitCode(true, .{ .outcomes = &pass }));
+    try testing.expectEqual(@as(u8, 1), exitCode(true, .{ .outcomes = &fail }));
+    try testing.expectEqual(@as(u8, 1), exitCode(false, .{ .outcomes = &pass }));
+    // Outside a project (or --core-only) only the core decides.
+    try testing.expectEqual(@as(u8, 0), exitCode(true, null));
+    try testing.expectEqual(@as(u8, 1), exitCode(false, null));
+    // No provider doctors at all is not a failure.
+    try testing.expectEqual(@as(u8, 0), exitCode(true, .{ .outcomes = &.{} }));
+}
+
+test "provider doctor: an unavailable provider is a failed check that runs nothing and stops nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]dispatch.Provider{
+        fake("zed", "zed", &.{cmd("doctor", "bin/zed")}),
+        fake("able", "able", &.{cmd("doctor", "bin/able")}),
+    };
+    const unavailable = [_]dispatch.Unavailable{.{ .package = "missing", .err = error.ProviderArchiveMissing }};
+    const p = try plan(a, &providers, &unavailable, &.{"missing"}, &.{});
+    try testing.expectEqual(@as(usize, 3), p.steps.len);
+    try testing.expectEqualStrings("missing", p.steps[1].label);
+    try testing.expectEqual(@as(anyerror, error.ProviderArchiveMissing), p.steps[1].action.unavailable);
+    var calls: std.ArrayList([]const u8) = .empty;
+    const report = try execute(a, p, Recorder{ .a = a, .calls = &calls });
+    // The runner is never asked to run the unavailable one.
+    try testing.expectEqual(@as(usize, 2), calls.items.len);
+    try testing.expectEqualStrings("able:bin/able", calls.items[0]);
+    try testing.expectEqualStrings("zed:bin/zed", calls.items[1]);
+    try testing.expectEqual(@as(usize, 1), report.failed());
+    try testing.expect(!report.outcomes[1].ok());
+    try testing.expect(fetchable(report.outcomes[1].err.?));
+    try testing.expectEqual(@as(u8, 1), exitCode(true, report));
+}
+
+test "provider doctor: an unpinned remote package fails the same way cached or not, and never runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var unpinned = fake("remote", "remote-ns", &.{cmd("doctor", "bin/remote")});
+    unpinned.verified = false;
+    const pinned = fake("local", "local-ns", &.{cmd("doctor", "bin/local")});
+    // Warm: the ordinary cache holds its (unverified) manifest; `survey`
+    // reports it in `unverified` and never as a provider.
+    const warm = try plan(a, &.{pinned}, &.{}, &.{}, &.{"remote"});
+    // A discovery that did list it as an unverified provider plans the same.
+    const listed = try plan(a, &.{ unpinned, pinned }, &.{}, &.{}, &.{});
+    try testing.expectEqual(Unverified.cached, listed.steps[1].action.unverified);
+    // Cold: nothing to read, only the declaration.
+    const cold = try plan(a, &.{pinned}, &.{}, &.{"remote"}, &.{});
+    var outcomes: [2]Outcome = undefined;
+    for ([_]Plan{ warm, cold }, [_]Unverified{ .cached, .uncached }, 0..) |p, path, i| {
+        try testing.expectEqual(@as(usize, 2), p.steps.len);
+        const step = p.steps[1];
+        // The path taken differs ...
+        try testing.expectEqual(path, step.action.unverified);
+        try testing.expectEqualStrings("remote", step.label);
+        var calls: std.ArrayList([]const u8) = .empty;
+        const report = try execute(a, p, Recorder{ .a = a, .calls = &calls });
+        // ... the verified provider still runs, the unpinned one never does ...
+        try testing.expectEqual(@as(usize, 1), calls.items.len);
+        try testing.expectEqualStrings("local-ns:bin/local", calls.items[0]);
+        try testing.expectEqual(@as(usize, 1), report.failed());
+        try testing.expectEqual(@as(u8, 1), exitCode(true, report));
+        outcomes[i] = report.outcomes[1];
+    }
+    // ... and the result is the same.
+    try testing.expectEqualStrings(outcomes[0].label, outcomes[1].label);
+    try testing.expectEqual(outcomes[0].code, outcomes[1].code);
+    try testing.expectEqual(outcomes[0].err, outcomes[1].err);
+    try testing.expectEqual(@as(?anyerror, error.RemoteProviderIntegrityRequired), outcomes[0].err);
+}
+
+test "provider doctor: a malformed manifest fails only its own package, cold or warm, and the others run" {
+    const asm_cache = @import("asm_cache.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    for ([_][]const u8{ "project", "pkg-ok", "pkg-bad" }) |dir| try tmp.dir.createDirPath(io, dir);
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    asm_cache.setCacheRootOverride(try tmp.dir.realPathFileAlloc(io, ".", a));
+    defer asm_cache.clearCacheRootOverride();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-ok/plugin.labelle", .data = ".{ .name = \"pkg-ok\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"ok\", .commands = .{ .{ .name = \"doctor\", .build_step = \"t\", .executable = \"bin/ok\", .help = \"h\" } } }" });
+    // A verified (local) provider with a malformed manifest.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-bad/plugin.labelle", .data = ".{ .name = \"pkg-bad\", .manifest_version = 2, .command_contract = " });
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "rem", .repo = "example/rem", .version = "1.0.0" },
+        .{ .name = "pkg-bad", .repo = "local:../pkg-bad", .version = "1.0.0" },
+        .{ .name = "pkg-ok", .repo = "local:../pkg-ok", .version = "1.0.0" },
+    } };
+    const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "rem", "1.0.0" });
+    var results: [2]Outcome = undefined;
+    for ([_]Unverified{ .uncached, .cached }, 0..) |state, i| {
+        if (state == .cached) {
+            // Warm: the unpinned package is cached, with a malformed manifest.
+            try tmp.dir.createDirPath(io, cached);
+            try tmp.dir.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ cached, "plugin.labelle" }), .data = ".{ .name = " });
+        }
+        var sources: github.Sources = .{ .a = a };
+        defer sources.deinit();
+        const found = try dispatch.survey(a, root, cfg, &sources);
+        try testing.expectEqual(@as(usize, 1), found.providers.len);
+        try testing.expectEqualStrings("pkg-ok", found.providers[0].meta.name);
+        try testing.expectEqual(@as(usize, 1), found.unavailable.len);
+        try testing.expectEqualStrings("pkg-bad", found.unavailable[0].package);
+        const p = try plan(a, found.providers, found.unavailable, found.unresolved, found.unverified);
+        try testing.expectEqual(@as(usize, 3), p.steps.len);
+        // The path taken: `unresolved` cold, `unverified` warm.
+        const rem = p.steps[2];
+        try testing.expectEqualStrings("rem", rem.label);
+        try testing.expectEqual(state, rem.action.unverified);
+        var calls: std.ArrayList([]const u8) = .empty;
+        const report = try execute(a, p, Recorder{ .a = a, .calls = &calls });
+        // Only the valid provider's doctor ran, in both states.
+        try testing.expectEqual(@as(usize, 1), calls.items.len);
+        try testing.expectEqualStrings("ok:bin/ok", calls.items[0]);
+        try testing.expectEqual(@as(usize, 2), report.failed());
+        results[i] = report.outcomes[2];
+    }
+    try testing.expectEqualStrings(results[0].label, results[1].label);
+    try testing.expectEqual(results[0].err, results[1].err);
+}

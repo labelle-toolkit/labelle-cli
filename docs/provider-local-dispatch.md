@@ -73,6 +73,60 @@ human progress, and the selected provider configuration path (or null). Output p
 after child exit, including failed builds, nonzero exits and crashes. The
 provider must treat its context as read-only. Its exit status is preserved.
 
+## `labelle doctor` runs the providers' doctors
+
+`labelle doctor [dir]` resolves the project root once, the way provider
+commands do: the nearest `project.labelle` at or above `dir` (default: the
+current directory). The core checks (backend, gamepad, Zig and emsdk
+versions) and the provider doctors both read that root, so running it from a
+project's subdirectory checks that project in full. It runs the core checks
+first, as before. Then, inside a project, it runs the `doctor`
+command of every pinned provider whose manifest declares a command named
+exactly `doctor`, sorted by namespace, whatever their order in `.plugins`.
+Each goes through the same path as `labelle <namespace> doctor`
+(`provider_dispatch.runCommand`): the `labelle.lock` pin and the remote
+integrity pin, the provider settings, the isolated tool build and the command
+context, with no trailing arguments. Each provider gets a header
+(`labelle <namespace> doctor  (provider '<package>')`) and an OK/FAIL line;
+a closing line counts them and names the failed ones and the providers that
+declare no `doctor` command.
+
+- One provider failing (a non-zero exit, or a tool that cannot be built or
+  started) does not stop the others. `labelle doctor` exits non-zero when the
+  core checks or any provider doctor failed.
+- A pinned provider whose archive is not cached, or does not match its pin,
+  is a failed check with the `labelle providers fetch` hint. The doctor never
+  downloads ([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock)).
+- One package never fails the others. A pinned or local provider whose
+  manifest cannot be read, parsed or matched to its name is a failed check of
+  its own. An unpinned package's manifest is read only to tell a runtime-only
+  package from a provider; if it is unreadable or malformed, the package is
+  reported as unverified (below), the same as when it is not cached at all.
+- Settings are resolved per provider: each provider's doctor opens only its
+  own `provider_config` file, so a missing or invalid settings file fails
+  that provider alone. The project-wide mapping (every entry names a
+  resolved, verified provider) is checked once and, if broken, reported once
+  as a failed `provider_config` check; the doctors still run. Entries naming
+  a package the doctor could not read or verify are left out of that check,
+  since the package already has a failed check of its own. Duplicate or
+  undeclared entries and malformed paths are refused when `project.labelle`
+  is read, which fails the provider part as a whole. `labelle <ns> <cmd>`
+  and hooks keep validating every settings file before they run.
+- A declared remote package with no integrity pin is a failed check with the
+  `labelle providers resolve` hint, and its code is never run. The report is
+  the same whether the ordinary package cache holds the package or not: an
+  uncached one cannot be told apart from a provider, so it fails closed. A
+  runtime-only package needs no pin; once it is in the package cache
+  (`labelle install`) its manifest shows it is no provider and the check
+  clears. A stale pin gets the same `providers resolve` hint.
+- Outside a project only the core checks run, followed by one line saying that
+  provider doctors run inside a project. Projectless provider commands are a
+  later phase (decision D8).
+- `--core-only` skips the provider part. `--json` (the studio capability
+  report) stays core-only.
+
+Nothing in the core names a provider: who takes part comes from the manifests.
+
 ## Remaining phase-2 work
 
 - GitHub archive integrity records and explicit project resolution are now

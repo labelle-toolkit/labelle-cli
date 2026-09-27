@@ -128,6 +128,13 @@ pub fn main(init: std.process.Init) !u8 {
         if (invocation == .object and invocation.object.get("id").?.string.len > 0 and
             std.mem.eql(u8, invocation.object.get("id").?.string, fail_id)) return 7;
     } else |_| {}
+    // Commands run with no argv under `labelle doctor`, so a failing package
+    // is selected by environment too: `PROVIDER_PROBE_FAIL_PACKAGE=<package>`
+    // makes the tool exit 7 when its output directory is that package's
+    // (`.labelle/providers/<package>`).
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_FAIL_PACKAGE")) |fail_package| {
+        if (std.mem.eql(u8, std.fs.path.basename(output), fail_package)) return 7;
+    } else |_| {}
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "fail")) return 7;
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "crash")) @panic("provider fixture crash");
     return 0;

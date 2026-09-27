@@ -30,6 +30,10 @@ const astc = @import("../astc/convert.zig");
 
 /// Graphics / windowing backend selection. `null` is a headless backend.
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
+/// The backend of a `project.labelle` that declares no `.backend` field,
+/// mirroring the assembler's default (assembler#768). Every CLI site that
+/// needs "the backend when none is declared" reads this, never a literal.
+pub const default_backend: Backend = .bgfx;
 /// The legacy codegen platform: the strict schema type of `project.labelle`'s
 /// `.platform` (mirrored by the assembler's `config.zig`; `provider_settings.zig`
 /// is untouched). The RESOLVED target is a string — see `provider_targets.zig`
@@ -349,7 +353,7 @@ pub const ProjectConfig = struct {
     width: u32 = 800,
     height: u32 = 600,
     target_fps: u32 = 60,
-    backend: Backend = .raylib,
+    backend: Backend = default_backend,
     platform: Platform = .desktop,
     ecs: EcsChoice = .mock,
     /// Gamepad input mode (assembler#274 opt-out flag): `.auto` (default)

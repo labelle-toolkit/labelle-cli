@@ -12,6 +12,7 @@ const zig_cache = @import("zig_cache.zig");
 const github = @import("provider_github.zig");
 const hooks = @import("provider_hooks.zig");
 const asm_cache = @import("asm_cache.zig");
+const settings_mod = @import("provider_settings.zig");
 
 // Existing platform commands remain reserved until their extraction lands;
 // an extracted one leaves the list and its namespace becomes dispatchable
@@ -32,7 +33,12 @@ fn real(a: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
-    var dir: []const u8 = try real(a, ".");
+    return projectRootFrom(a, ".");
+}
+
+/// The nearest directory at or above `start` holding a `project.labelle`.
+pub fn projectRootFrom(a: std.mem.Allocator, start: []const u8) !?[]const u8 {
+    var dir: []const u8 = try real(a, start);
     while (true) {
         const path = try std.fs.path.join(a, &.{ dir, "project.labelle" });
         std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch |err| switch (err) {
@@ -84,6 +90,54 @@ pub const Discovery = struct {
 
 /// `discover`, also reporting the declared packages it could not read.
 pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) !Discovery {
+    return discoverImpl(a, root, cfg, sources, cache_state, null);
+}
+
+/// A pinned provider whose source could not be obtained from its lock
+/// entry: its archive is not cached, does not match its pin, or the pin
+/// itself is stale. `err` is what `Sources.projectDir` returned.
+pub const Unavailable = struct { package: []const u8, err: anyerror };
+
+pub const Survey = struct {
+    providers: []Provider,
+    /// As `Discovery.unresolved`.
+    unresolved: []const []const u8,
+    /// Verified (pinned or local) providers whose source or manifest could
+    /// not be read, in declaration order.
+    unavailable: []const Unavailable,
+    /// Cached remote packages with no integrity pin whose manifest is a
+    /// provider's or could not be read or parsed. Never in `providers`, and
+    /// never validated against the others: unverified bytes cannot fail the
+    /// verified providers' discovery.
+    unverified: []const []const u8,
+};
+
+const SurveyLists = struct {
+    unavailable: std.ArrayList(Unavailable) = .empty,
+    unverified: std.ArrayList([]const u8) = .empty,
+};
+
+/// Metadata-only discovery (`.unknown`) that, unlike `discoverAll`, does not
+/// abort on one provider's missing or mismatched pinned archive: that
+/// package is reported in `unavailable` (after `Sources.projectDir` printed
+/// its `labelle providers fetch` hint) and treated like an unread package, so
+/// the others stay usable. `labelle doctor` reads the project this way, so a
+/// provider it cannot obtain is a failed check rather than the end of the
+/// report. It never downloads.
+///
+/// One package never fails the others' discovery: a verified provider whose
+/// manifest is unreadable, malformed or misnamed is `unavailable`, and a
+/// cached unpinned package whose manifest is a provider's (or unreadable) is
+/// `unverified`, exactly as it would be `unresolved` with a cold cache. An
+/// unpinned manifest is read only to tell a runtime-only package (skipped)
+/// from a provider; nothing it declares is validated or used.
+pub fn survey(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) !Survey {
+    var lists: SurveyLists = .{};
+    const found = try discoverImpl(a, root, cfg, sources, .unknown, &lists);
+    return .{ .providers = found.providers, .unresolved = found.unresolved, .unavailable = lists.unavailable.items, .unverified = lists.unverified.items };
+}
+
+fn discoverImpl(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState, lists: ?*SurveyLists) !Discovery {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
     // Declared remote packages with no directory to read while the cache
@@ -103,7 +157,14 @@ pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectC
                 },
                 .populated => return err,
             },
-            else => return err,
+            error.OutOfMemory => return err,
+            else => if (lists) |l| {
+                // Unread, so a hook reference into it is deferred like an
+                // uncached package's rather than reported missing.
+                try l.unavailable.append(a, .{ .package = dep.name, .err = err });
+                try unresolved.append(a, dep.name);
+                continue;
+            } else return err,
         };
         const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
         if (pinned == null and !dep.isLocal()) {
@@ -121,25 +182,69 @@ pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectC
                 else => return err,
             };
         }
+        const verified = dep.isLocal() or pinned != null;
         const path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
         const bytes = read(a, path) catch |err| switch (err) {
             error.FileNotFound => continue, // Runtime plugins may have no manifest.
-            else => return err,
+            error.OutOfMemory => return err,
+            else => {
+                if (lists) |l| {
+                    try isolate(a, l, &unresolved, dep.name, verified, err);
+                    continue;
+                }
+                return err;
+            },
         };
         const meta = manifest.parse(a, bytes) catch |err| {
+            // Unverified bytes: recorded without a diagnostic of their own.
+            if (lists != null and !verified) {
+                try isolate(a, lists.?, &unresolved, dep.name, verified, err);
+                continue;
+            }
             std.debug.print("labelle: provider manifest '{s}': {s} (CLI contract {s})\n", .{ path, @errorName(err), contract.version });
+            if (lists) |l| {
+                try isolate(a, l, &unresolved, dep.name, verified, err);
+                continue;
+            }
             return err;
         };
         if (!meta.isProvider()) continue;
-        if (!std.mem.eql(u8, dep.name, meta.name)) return error.ProviderNameMismatch;
+        if (lists != null and !verified) {
+            try isolate(a, lists.?, &unresolved, dep.name, verified, error.RemoteProviderIntegrityRequired);
+            continue;
+        }
+        if (!std.mem.eql(u8, dep.name, meta.name)) {
+            if (lists) |l| {
+                try isolate(a, l, &unresolved, dep.name, verified, error.ProviderNameMismatch);
+                continue;
+            }
+            return error.ProviderNameMismatch;
+        }
         const names = try a.alloc([]const u8, if (meta.namespace != null) 1 else 0);
         if (meta.namespace) |ns| names[0] = ns;
         try owners.append(a, .{ .package = meta.name, .namespaces = names, .targets = meta.targets });
-        try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta, .verified = dep.isLocal() or pinned != null });
+        try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta, .verified = verified });
     }
     try contract.validateOwnership(owners.items, &reserved);
-    try hooks.validateAll(a, providers.items, unresolved.items);
+    // Hook references into an unverified package are deferred like ones into
+    // an unread package: neither can be checked.
+    var deferred: std.ArrayList([]const u8) = .empty;
+    try deferred.appendSlice(a, unresolved.items);
+    if (lists) |l| try deferred.appendSlice(a, l.unverified.items);
+    try hooks.validateAll(a, providers.items, deferred.items);
     return .{ .providers = providers.items, .unresolved = unresolved.items };
+}
+
+/// Survey mode: record one package's failure against that package only. A
+/// verified one is `unavailable` (and unread, so references into it are
+/// deferred); an unverified one is `unverified`, whatever the reason.
+fn isolate(a: std.mem.Allocator, lists: *SurveyLists, unresolved: *std.ArrayList([]const u8), name: []const u8, verified: bool, err: anyerror) !void {
+    if (verified) {
+        try lists.unavailable.append(a, .{ .package = name, .err = err });
+        try unresolved.append(a, name);
+    } else {
+        try lists.unverified.append(a, name);
+    }
 }
 
 fn printCommands(provider: Provider) void {
@@ -202,15 +307,25 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
                 std.debug.print("labelle {s} {s} — {s}\n", .{ namespace, name, cmd.help });
                 return 0;
             }
-            const lock_path = try requirePinned(a, root, provider);
-            const settings = try resolveSettings(a, root, cfg, providers, provider.meta.name);
-            return try execute(a, root, cfg, provider, cmd, lock_path, settings, trailing.items);
+            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items, .all);
         }
         std.debug.print("labelle: unknown command '{s}' in provider namespace '{s}'\n", .{ name, namespace });
         printCommands(provider);
         return 1;
     }
     return null;
+}
+
+/// Run one provider command: the lock/integrity check, the provider settings,
+/// then the tool build and invocation. `labelle <ns> <cmd>` and the provider
+/// part of `labelle doctor` both come through here, so they cannot drift.
+pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8, scope: SettingsScope) !u8 {
+    const lock_path = try requirePinned(a, root, provider);
+    const settings = switch (scope) {
+        .all => try resolveSettings(a, root, cfg, providers, provider.meta.name),
+        .selected => try resolveOwnSettings(a, root, cfg, provider.meta.name),
+    };
+    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing);
 }
 
 /// Execution (a command or a hook) needs the project's ordinary lock to name
@@ -265,8 +380,11 @@ pub fn canonicalDir(a: std.mem.Allocator, dir: []const u8) ![]const u8 {
     return real(a, dir);
 }
 
-pub fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
-    var result: ?[]const u8 = null;
+/// Every `provider_config` entry names a resolved, verified provider. The
+/// project-wide mapping check; it opens no file. (Duplicates, undeclared
+/// packages and the lexical path shape are already refused when
+/// project.labelle is read, `provider_settings.validateProject`.)
+pub fn checkSettingsMapping(cfg: project.ProjectConfig, providers: []const Provider) !void {
     for (cfg.provider_config) |entry| {
         var resolved = false;
         for (providers) |provider| {
@@ -276,39 +394,74 @@ pub fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.Proj
             std.debug.print("labelle: provider_config '{s}' must name a resolved command/hook provider\n", .{entry.package});
             return error.UnresolvedProviderConfig;
         }
-        const requested = try std.fs.path.join(a, &.{ root, entry.file });
-        const path = real(a, requested) catch |err| {
-            std.debug.print("labelle: provider_config '{s}' cannot open '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
-            return error.MissingProviderConfig;
-        };
-        if (!contained(root, path)) {
-            std.debug.print("labelle: provider_config '{s}' resolves outside the project: {s}\n", .{ entry.package, entry.file });
-            return error.EscapingProviderConfig;
-        }
-        const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch |err| {
-            std.debug.print("labelle: provider_config '{s}' cannot stat '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
-            return err;
-        };
-        if (stat.kind != .file) {
-            std.debug.print("labelle: provider_config '{s}' is not a regular file: {s}\n", .{ entry.package, entry.file });
-            return error.InvalidProviderConfigFile;
-        }
-        // Covers the 1 MiB input limit (StreamTooLong) and unreadable files.
-        const bytes = read(a, path) catch |err| {
-            std.debug.print("labelle: provider_config '{s}' cannot read '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
-            return err;
-        };
-        defer a.free(bytes);
-        // Check JSON syntax only. The provider owns its settings schema and
-        // must validate semantic requirements before producing side effects.
-        const json = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch {
-            std.debug.print("labelle: provider_config '{s}' is not valid JSON: {s}\n", .{ entry.package, entry.file });
-            return error.InvalidProviderConfigJson;
-        };
-        json.deinit();
+    }
+}
+
+/// Open and check one settings file: contained in the project, a regular
+/// file, at most 1 MiB, valid JSON. Returns its canonical path.
+fn openSettings(a: std.mem.Allocator, root: []const u8, entry: settings_mod.Entry) ![]const u8 {
+    const requested = try std.fs.path.join(a, &.{ root, entry.file });
+    const path = real(a, requested) catch |err| {
+        std.debug.print("labelle: provider_config '{s}' cannot open '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+        return error.MissingProviderConfig;
+    };
+    if (!contained(root, path)) {
+        std.debug.print("labelle: provider_config '{s}' resolves outside the project: {s}\n", .{ entry.package, entry.file });
+        return error.EscapingProviderConfig;
+    }
+    const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch |err| {
+        std.debug.print("labelle: provider_config '{s}' cannot stat '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+        return err;
+    };
+    if (stat.kind != .file) {
+        std.debug.print("labelle: provider_config '{s}' is not a regular file: {s}\n", .{ entry.package, entry.file });
+        return error.InvalidProviderConfigFile;
+    }
+    // Covers the 1 MiB input limit (StreamTooLong) and unreadable files.
+    const bytes = read(a, path) catch |err| {
+        std.debug.print("labelle: provider_config '{s}' cannot read '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+        return err;
+    };
+    defer a.free(bytes);
+    // Check JSON syntax only. The provider owns its settings schema and
+    // must validate semantic requirements before producing side effects.
+    const json = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch {
+        std.debug.print("labelle: provider_config '{s}' is not valid JSON: {s}\n", .{ entry.package, entry.file });
+        return error.InvalidProviderConfigJson;
+    };
+    json.deinit();
+    return path;
+}
+
+/// Which settings files an invocation opens.
+pub const SettingsScope = enum {
+    /// Every `provider_config` entry (`labelle <ns> <cmd>`, hooks): one bad
+    /// settings file anywhere in the project stops the invocation.
+    all,
+    /// Only the selected provider's entry (`labelle doctor`, where each
+    /// provider's run must stand alone). The caller checks the mapping
+    /// (`checkSettingsMapping`) once for the whole project.
+    selected,
+};
+
+/// The mapping check plus every settings file (`.all`), returning the
+/// selected provider's settings path, or null when it has none.
+pub fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
+    try checkSettingsMapping(cfg, providers);
+    var result: ?[]const u8 = null;
+    for (cfg.provider_config) |entry| {
+        const path = try openSettings(a, root, entry);
         if (std.mem.eql(u8, entry.package, selected)) result = path;
     }
     return result;
+}
+
+/// Only the selected provider's entry is opened (`SettingsScope.selected`).
+pub fn resolveOwnSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, selected: []const u8) !?[]const u8 {
+    for (cfg.provider_config) |entry| {
+        if (std.mem.eql(u8, entry.package, selected)) return try openSettings(a, root, entry);
+    }
+    return null;
 }
 
 /// The pinned host compiler and the canonical cache tree every provider tool
@@ -744,4 +897,72 @@ test "provider dispatch: an unread remote package defers its references under .u
     for ([_]CacheState{ .unknown, .populated }) |state| {
         try std.testing.expectError(error.MissingHookReference, discover(a, root, cfg, &sources, state));
     }
+}
+
+test "provider dispatch: survey reports a pinned provider with no cached archive and keeps the others" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg-a");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // No archive is ever cached under this root.
+    asm_cache.setCacheRootOverride(try tmp.dir.realPathFileAlloc(io, ".", a));
+    defer asm_cache.clearCacheRootOverride();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-a/plugin.labelle", .data = ".{ .name = \"pkg-a\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"alpha\", .commands = .{ .{ .name = \"doctor\", .build_step = \"t\", .executable = \"bin/t\", .help = \"h\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/labelle.providers.lock", .data = "{\"schema_version\":1,\"providers\":[{\"package\":\"pkg-b\",\"repo\":\"example/pkg-b\",\"version\":\"1.0.0\",\"commit\":\"1111111111111111111111111111111111111111\",\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}" });
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg-b", .repo = "github.com/example/pkg-b", .version = "1.0.0" },
+        .{ .name = "pkg-a", .repo = "local:../pkg-a", .version = "1.0.0" },
+    } };
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    // Plain discovery stops at the missing archive ...
+    try std.testing.expectError(error.ProviderArchiveMissing, discoverAll(a, root, cfg, &sources, .unknown));
+    // ... the survey names it and still reads the provider after it.
+    const found = try survey(a, root, cfg, &sources);
+    try std.testing.expectEqual(@as(usize, 1), found.providers.len);
+    try std.testing.expectEqualStrings("pkg-a", found.providers[0].meta.name);
+    try std.testing.expectEqual(@as(usize, 1), found.unavailable.len);
+    try std.testing.expectEqualStrings("pkg-b", found.unavailable[0].package);
+    try std.testing.expectEqual(@as(anyerror, error.ProviderArchiveMissing), found.unavailable[0].err);
+    try std.testing.expectEqualStrings("pkg-b", found.unresolved[0]);
+}
+
+test "provider dispatch: own-settings resolution opens only the selected provider's file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project/providers");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/providers/good.json", .data = "{\"label\":\"x\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/providers/bad.json", .data = "{not json" });
+    const cfg: project.ProjectConfig = .{ .name = "game", .provider_config = &.{
+        .{ .package = "bad", .file = "providers/bad.json" },
+        .{ .package = "good", .file = "providers/good.json" },
+    } };
+    const meta: manifest.Manifest = .{ .name = "", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" };
+    var providers = [_]Provider{
+        .{ .dep = .{ .name = "bad", .repo = "local:../bad", .version = "1.0.0" }, .dir = root, .meta = meta, .verified = true },
+        .{ .dep = .{ .name = "good", .repo = "local:../good", .version = "1.0.0" }, .dir = root, .meta = meta, .verified = true },
+    };
+    providers[0].meta.name = "bad";
+    providers[1].meta.name = "good";
+    try checkSettingsMapping(cfg, &providers);
+    // `labelle <ns> <cmd>` (`.all`): the other provider's bad file stops it.
+    try std.testing.expectError(error.InvalidProviderConfigJson, resolveSettings(a, root, cfg, &providers, "good"));
+    // `labelle doctor` (`.selected`): each provider stands alone.
+    const own = (try resolveOwnSettings(a, root, cfg, "good")).?;
+    try std.testing.expectEqualStrings("good.json", std.fs.path.basename(own));
+    try std.testing.expectError(error.InvalidProviderConfigJson, resolveOwnSettings(a, root, cfg, "bad"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try resolveOwnSettings(a, root, cfg, "other"));
+    // The mapping check alone: an entry naming no verified provider.
+    providers[1].verified = false;
+    try std.testing.expectError(error.UnresolvedProviderConfig, checkSettingsMapping(cfg, &providers));
 }
