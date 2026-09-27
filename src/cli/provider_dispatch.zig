@@ -32,7 +32,12 @@ fn real(a: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
-    var dir: []const u8 = try real(a, ".");
+    return projectRootFrom(a, ".");
+}
+
+/// The nearest directory at or above `start` holding a `project.labelle`.
+pub fn projectRootFrom(a: std.mem.Allocator, start: []const u8) !?[]const u8 {
+    var dir: []const u8 = try real(a, start);
     while (true) {
         const path = try std.fs.path.join(a, &.{ dir, "project.labelle" });
         std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch |err| switch (err) {
@@ -84,6 +89,36 @@ pub const Discovery = struct {
 
 /// `discover`, also reporting the declared packages it could not read.
 pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) !Discovery {
+    return discoverImpl(a, root, cfg, sources, cache_state, null);
+}
+
+/// A pinned provider whose source could not be obtained from its lock
+/// entry: its archive is not cached, does not match its pin, or the pin
+/// itself is stale. `err` is what `Sources.projectDir` returned.
+pub const Unavailable = struct { package: []const u8, err: anyerror };
+
+pub const Survey = struct {
+    providers: []Provider,
+    /// As `Discovery.unresolved`.
+    unresolved: []const []const u8,
+    /// Pinned providers whose source could not be read, in declaration order.
+    unavailable: []const Unavailable,
+};
+
+/// Metadata-only discovery (`.unknown`) that, unlike `discoverAll`, does not
+/// abort on one provider's missing or mismatched pinned archive: that
+/// package is reported in `unavailable` (after `Sources.projectDir` printed
+/// its `labelle providers fetch` hint) and treated like an unread package, so
+/// the others stay usable. `labelle doctor` reads the project this way, so a
+/// provider it cannot obtain is a failed check rather than the end of the
+/// report. It never downloads.
+pub fn survey(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) !Survey {
+    var unavailable: std.ArrayList(Unavailable) = .empty;
+    const found = try discoverImpl(a, root, cfg, sources, .unknown, &unavailable);
+    return .{ .providers = found.providers, .unresolved = found.unresolved, .unavailable = unavailable.items };
+}
+
+fn discoverImpl(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState, unavailable: ?*std.ArrayList(Unavailable)) !Discovery {
     var providers: std.ArrayList(Provider) = .empty;
     var owners: std.ArrayList(contract.Ownership) = .empty;
     // Declared remote packages with no directory to read while the cache
@@ -103,7 +138,14 @@ pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectC
                 },
                 .populated => return err,
             },
-            else => return err,
+            error.OutOfMemory => return err,
+            else => if (unavailable) |list| {
+                // Unread, so a hook reference into it is deferred like an
+                // uncached package's rather than reported missing.
+                try list.append(a, .{ .package = dep.name, .err = err });
+                try unresolved.append(a, dep.name);
+                continue;
+            } else return err,
         };
         const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
         if (pinned == null and !dep.isLocal()) {
@@ -202,15 +244,22 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
                 std.debug.print("labelle {s} {s} — {s}\n", .{ namespace, name, cmd.help });
                 return 0;
             }
-            const lock_path = try requirePinned(a, root, provider);
-            const settings = try resolveSettings(a, root, cfg, providers, provider.meta.name);
-            return try execute(a, root, cfg, provider, cmd, lock_path, settings, trailing.items);
+            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items);
         }
         std.debug.print("labelle: unknown command '{s}' in provider namespace '{s}'\n", .{ name, namespace });
         printCommands(provider);
         return 1;
     }
     return null;
+}
+
+/// Run one provider command: the lock/integrity check, the provider settings,
+/// then the tool build and invocation. `labelle <ns> <cmd>` and the provider
+/// part of `labelle doctor` both come through here, so they cannot drift.
+pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8) !u8 {
+    const lock_path = try requirePinned(a, root, provider);
+    const settings = try resolveSettings(a, root, cfg, providers, provider.meta.name);
+    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing);
 }
 
 /// Execution (a command or a hook) needs the project's ordinary lock to name
@@ -744,4 +793,37 @@ test "provider dispatch: an unread remote package defers its references under .u
     for ([_]CacheState{ .unknown, .populated }) |state| {
         try std.testing.expectError(error.MissingHookReference, discover(a, root, cfg, &sources, state));
     }
+}
+
+test "provider dispatch: survey reports a pinned provider with no cached archive and keeps the others" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg-a");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // No archive is ever cached under this root.
+    asm_cache.setCacheRootOverride(try tmp.dir.realPathFileAlloc(io, ".", a));
+    defer asm_cache.clearCacheRootOverride();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-a/plugin.labelle", .data = ".{ .name = \"pkg-a\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"alpha\", .commands = .{ .{ .name = \"doctor\", .build_step = \"t\", .executable = \"bin/t\", .help = \"h\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/labelle.providers.lock", .data = "{\"schema_version\":1,\"providers\":[{\"package\":\"pkg-b\",\"repo\":\"example/pkg-b\",\"version\":\"1.0.0\",\"commit\":\"1111111111111111111111111111111111111111\",\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}" });
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg-b", .repo = "github.com/example/pkg-b", .version = "1.0.0" },
+        .{ .name = "pkg-a", .repo = "local:../pkg-a", .version = "1.0.0" },
+    } };
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    // Plain discovery stops at the missing archive ...
+    try std.testing.expectError(error.ProviderArchiveMissing, discoverAll(a, root, cfg, &sources, .unknown));
+    // ... the survey names it and still reads the provider after it.
+    const found = try survey(a, root, cfg, &sources);
+    try std.testing.expectEqual(@as(usize, 1), found.providers.len);
+    try std.testing.expectEqualStrings("pkg-a", found.providers[0].meta.name);
+    try std.testing.expectEqual(@as(usize, 1), found.unavailable.len);
+    try std.testing.expectEqualStrings("pkg-b", found.unavailable[0].package);
+    try std.testing.expectEqual(@as(anyerror, error.ProviderArchiveMissing), found.unavailable[0].err);
+    try std.testing.expectEqualStrings("pkg-b", found.unresolved[0]);
 }

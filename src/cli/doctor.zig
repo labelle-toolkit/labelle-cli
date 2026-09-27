@@ -1,8 +1,11 @@
 //! `labelle doctor` — preflight the desktop build/run requirements and report
 //! missing system dependencies with actionable fixes.
 //!
-//! The core target's doctor; a provider target has its own (`labelle
-//! <namespace> doctor`, when its package declares one). Almost everything a
+//! The core target's checks come first. Inside a project, `labelle doctor`
+//! then runs the doctor of every pinned provider whose manifest declares one
+//! (the same run as `labelle <namespace> doctor`; see `provider_doctor.zig`),
+//! and exits non-zero if the core or any provider fails. `--core-only` skips
+//! the provider part. Almost everything a
 //! labelle game needs is fetched + compiled by Zig automatically (raylib,
 //! sokol, cimgui, glfw, wgpu-native, the labelle packages). The one genuine
 //! manual system dependency is **SDL2** — used by the raylib/sokol backends
@@ -25,6 +28,7 @@ const zig_cache = @import("zig_cache.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const emsdk_cache = @import("emsdk_cache.zig");
 const python_provision = @import("python_provision.zig");
+const provider_doctor = @import("provider_doctor.zig");
 
 const Check = struct {
     name: []const u8,
@@ -141,16 +145,20 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     var project_dir: []const u8 = ".";
     var do_fix = false;
     var as_json = false;
+    var core_only = false;
     for (cmd_args) |arg| {
         if (std.mem.eql(u8, arg, "--fix")) {
             do_fix = true;
+        } else if (std.mem.eql(u8, arg, "--core-only")) {
+            // Skip the pinned providers' doctors (see provider_doctor.zig).
+            core_only = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             // Machine-readable capability report for labelle-studio's
             // ToolchainGate (`doctor_check` in src-tauri/src/lib.rs). Emits a
             // single-line `{"capabilities":[…]}` and nothing else.
             as_json = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("labelle doctor: unknown option '{s}'\n  usage: labelle doctor [dir] [--fix] [--json]\n", .{arg});
+            std.debug.print("labelle doctor: unknown option '{s}'\n  usage: labelle doctor [dir] [--fix] [--json] [--core-only]\n", .{arg});
             return error.InvalidArgument;
         } else {
             project_dir = arg;
@@ -254,13 +262,20 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     std.debug.print("\n", .{});
     if (failures == 0) {
-        std.debug.print("  All required desktop build dependencies are present.\n\n", .{});
+        std.debug.print("  All required desktop build dependencies are present.\n", .{});
     } else {
-        std.debug.print("  {d} required dependency(ies) missing — see FAIL lines above.\n\n", .{failures});
-        // Clean non-zero exit (scriptable) without a Zig error-return trace —
-        // this is a user-facing diagnostic, not an internal failure.
-        std.process.exit(1);
+        std.debug.print("  {d} required dependency(ies) missing — see FAIL lines above.\n", .{failures});
     }
+
+    // The pinned providers' doctors, after the core checks and whatever they
+    // found: a core failure does not hide a provider's report, and one
+    // provider failing does not stop the next.
+    const providers = if (core_only) null else try provider_doctor.runForProject(arena, project_dir);
+    std.debug.print("\n", .{});
+    const code = provider_doctor.exitCode(failures == 0, providers);
+    // Clean non-zero exit (scriptable) without a Zig error-return trace —
+    // this is a user-facing diagnostic, not an internal failure.
+    if (code != 0) std.process.exit(code);
 }
 
 // ── Project config (textual, dependency-free) ───────────────────────────

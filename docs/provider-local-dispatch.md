@@ -73,6 +73,37 @@ human progress, and the selected provider configuration path (or null). Output p
 after child exit, including failed builds, nonzero exits and crashes. The
 provider must treat its context as read-only. Its exit status is preserved.
 
+## `labelle doctor` runs the providers' doctors
+
+`labelle doctor [dir]` runs the core checks first, as before. Then, when `dir`
+(default: the current directory) is inside a project, it runs the `doctor`
+command of every pinned provider whose manifest declares a command named
+exactly `doctor`, sorted by namespace, whatever their order in `.plugins`.
+Each goes through the same path as `labelle <namespace> doctor`
+(`provider_dispatch.runCommand`): the `labelle.lock` pin and the remote
+integrity pin, the provider settings, the isolated tool build and the command
+context, with no trailing arguments. Each provider gets a header
+(`labelle <namespace> doctor  (provider '<package>')`) and an OK/FAIL line;
+a closing line counts them and names the failed ones and the providers that
+declare no `doctor` command.
+
+- One provider failing (a non-zero exit, or a tool that cannot be built or
+  started) does not stop the others. `labelle doctor` exits non-zero when the
+  core checks or any provider doctor failed.
+- A pinned provider whose archive is not cached, or does not match its pin,
+  is a failed check with the `labelle providers fetch` hint. The doctor never
+  downloads ([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock)).
+  A `provider_config` entry naming a package the doctor could not read is set
+  aside while resolving the other providers' settings, so one unreadable
+  package does not fail every provider's doctor.
+- Outside a project only the core checks run, followed by one line saying that
+  provider doctors run inside a project. Projectless provider commands are a
+  later phase (decision D8).
+- `--core-only` skips the provider part. `--json` (the studio capability
+  report) stays core-only.
+
+Nothing in the core names a provider: who takes part comes from the manifests.
+
 ## Remaining phase-2 work
 
 - GitHub archive integrity records and explicit project resolution are now

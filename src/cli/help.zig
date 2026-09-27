@@ -35,7 +35,7 @@ pub fn printHelp() void {
         \\  plugins [dir]        List attached plugins with version, license, and author
         \\  providers resolve [providers.json] [--accept] [--offline]  Preview or pin GitHub providers for this project
         \\  providers fetch [--offline]  Inside a project, download the provider archives its labelle.providers.lock pins (only verified bytes are cached, each archive atomically; no registry, no lock change); `--offline` only verifies the cache
-        \\  doctor [dir] [--fix] [--json]  Check build requirements (SDL2, Zig, emsdk); `--fix` provisions, `--json` emits a capability report
+        \\  doctor [dir] [--fix] [--json] [--core-only]  Check build requirements (SDL2, Zig, emsdk), then, inside a project, run each pinned provider's `doctor` command (as `labelle <ns> doctor`, by namespace; exit non-zero if any check fails); `--fix` provisions, `--json` emits a capability report (core only), `--core-only` skips the providers
         \\  help                 Show this help
         \\  version              Show CLI version
         \\

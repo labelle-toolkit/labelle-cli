@@ -14,7 +14,7 @@ The game repo needs to be where releases live. If it already has GitHub Releases
 
 Requirements on the dev's machine:
 - [`gh`](https://cli.github.com/) installed and authenticated (`gh auth login`).
-- Android SDK + NDK + JDK configured (see `labelle android doctor`, run inside the project).
+- Android SDK + NDK + JDK configured (see `labelle android doctor`, run inside the project; a plain `labelle doctor` there runs it too, after the core checks).
 - A keystore. For internal testing, the debug keystore the provider generates on first use is fine. For production distribution, configure `signing` in `providers/android.json`; its passwords are `env:VAR` or `file:PATH` sources, never literals.
 
 Typical deploy commands:
