@@ -88,7 +88,22 @@ pub fn build(b: *std.Build) void {
     run_cli_tests.step.dependOn(&child_fixture_install.step);
     const test_step = b.step("test", "Run CLI unit tests");
     test_step.dependOn(&run_cli_tests.step);
+
+    // Provider wire-contract tests are independent of CLI/package resolution.
+    const provider_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cli/provider_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_provider_tests = b.addRunArtifact(provider_tests);
+    test_step.dependOn(&run_provider_tests.step);
+    const provider_step = b.step("test-provider-contract", "Validate provider contract v1");
+    provider_step.dependOn(&run_provider_tests.step);
+    const capability_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"texture capabilities"} });
+    b.step("test-texture-caps", "Validate texture capability resolution").dependOn(&b.addRunArtifact(capability_tests).step);
     const material_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"shader tool override"} });
+    const dispatch_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"provider "} });
+    b.step("test-provider-dispatch", "Validate provider manifest and dispatch rules").dependOn(&b.addRunArtifact(dispatch_tests).step);
     b.step("test-material-toolchain", "Validate shader compiler override diagnostics").dependOn(&b.addRunArtifact(material_tests).step);
 
     // ── Progress-feed subprocess e2e (cli#319) ───────────────────────
@@ -167,6 +182,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(astc_tests).step);
+
+    addAgnosticGuard(b, test_step, optimize);
+}
+
+/// Guard: no platform, store, package or backend names in `src/` outside
+/// the shrinking migration allowlist (RFC #406, docs/rfc-package-commands.md
+/// "Enforcement"). The test walks src/, so it always runs on the HOST, from
+/// the repo root. Part of `zig build test`; `zig build test-guard` runs it alone.
+fn addAgnosticGuard(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agnostic_guard_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const guard_run = b.addRunArtifact(guard_tests);
+    guard_run.setCwd(b.path("."));
+    test_step.dependOn(&guard_run.step);
+    b.step("test-guard", "Check src/ for platform, store and package names (RFC #406 agnosticism guard)").dependOn(&guard_run.step);
 }
 
 /// Compile the vendored stb implementation (PNG/TGA/BMP decode, and

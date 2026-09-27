@@ -1,10 +1,9 @@
-//! Platform-neutral app-icon plumbing shared by every packager that
-//! turns `project.labelle` `.app_icon` into a platform artifact — the
-//! Android launcher mipmaps (`android/launcher_icon.zig`, cli#340) and
-//! the macOS `.app` bundle's `.icns` (`bundle.zig`, cli#359).
+//! Platform-neutral app-icon plumbing for the packaging the CLI owns —
+//! the macOS `.app` bundle's `.icns` (`bundle.zig`, cli#359). A provider
+//! that packages its own target keeps its own copy of these rules.
 //!
-//! It was factored out of `android/launcher_icon.zig` when the macOS
-//! path arrived (cli#359): the icon-source precedence, the failure
+//! It was factored out of the first launcher-icon packager (cli#340) when
+//! the macOS path arrived (cli#359): the icon-source precedence, the failure
 //! policy and the PNG decode / resample / encode helpers are identical
 //! for every platform, and a second copy would let the two drift — the
 //! exact "custom icon set, stock icon shipped anyway" bug cli#340 fixed.
@@ -431,7 +430,7 @@ fn expectResolvedPath(a: std.mem.Allocator, r: Resolved, parts: []const []const 
 
 test "resolve prefers a non-empty app_icon, joined against the project root" {
     const a = testing.allocator;
-    const r = try resolve(a, "/proj", "/proj/.labelle/bgfx_android", "art/icon.png");
+    const r = try resolve(a, "/proj", "/proj/.labelle/core_target", "art/icon.png");
     defer r.deinit(a);
     try testing.expectEqual(Source.custom, r.source);
     try expectResolvedPath(a, r, &.{ "/proj", "art/icon.png" });
@@ -439,10 +438,10 @@ test "resolve prefers a non-empty app_icon, joined against the project root" {
 
 test "resolve falls back to the assembler default when app_icon is null" {
     const a = testing.allocator;
-    const r = try resolve(a, "/proj", "/proj/.labelle/bgfx_android", null);
+    const r = try resolve(a, "/proj", "/proj/.labelle/core_target", null);
     defer r.deinit(a);
     try testing.expectEqual(Source.default, r.source);
-    try expectResolvedPath(a, r, &.{ "/proj/.labelle/bgfx_android", default_icon_name });
+    try expectResolvedPath(a, r, &.{ "/proj/.labelle/core_target", default_icon_name });
 }
 
 test "resolve treats an empty app_icon as unset (matches the assembler)" {

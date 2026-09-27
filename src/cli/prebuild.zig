@@ -72,11 +72,16 @@
 //!
 //! `labelle build --progress=json` promises PURE NDJSON on stdout
 //! (cli#320). A prebuild tool that prints to stdout would corrupt that
-//! stream. In json mode the child's stdout is therefore handed the CLI's
-//! **stderr** file directly (`StdIo.file`) — the user still sees every
-//! line, live, interleaved with the tool's own stderr, and the NDJSON
-//! feed stays machine-parseable. No pumping, no buffering, no reordering.
-//! In human/off mode stdout is inherited unchanged.
+//! stream. In json mode the child's stdout is therefore routed to the
+//! CLI's **stderr** — the user still sees every line, live, interleaved
+//! with the tool's own stderr, and the NDJSON feed stays
+//! machine-parseable. In human/off mode stdout is inherited unchanged.
+//!
+//! The routing is `prebuild_relay.zig` (cli#448): the child is handed the
+//! stderr file directly (`StdIo.file`), except on Windows with a
+//! redirected stderr, where Zig 0.16 re-opens that handle at offset 0 and
+//! the step's stdout is instead piped and relayed line by line.
+//! `RELAY_ENV` forces the relay on any OS so the POSIX e2e can exercise it.
 //!
 //! Prebuild runs inside the existing `resolve` phase and emits no new
 //! record kind, so the progress schema is untouched (studio#28 consumes
@@ -87,6 +92,7 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const progress = @import("progress.zig");
 const project_config = @import("project_config.zig");
+const prebuild_relay = @import("prebuild_relay.zig");
 
 /// One declared step. Re-exported from the CLI's `project.labelle` mirror
 /// so callers need only this module.
@@ -111,6 +117,11 @@ pub const Error = error{
 /// `LABELLE_ZIG`, `LABELLE_PROGRESS_DEBUG`).
 pub const SKIP_ENV = "LABELLE_NO_PREBUILD";
 
+/// Test hook: set to anything but empty/`0` to force the json-mode stdout
+/// relay (`prebuild_relay.zig`) on every OS, so the POSIX e2e exercises
+/// the path that otherwise only runs on Windows with a redirected stderr.
+pub const RELAY_ENV = "LABELLE_PREBUILD_FORCE_RELAY";
+
 pub const Options = struct {
     /// `--progress=json`: give the child our stderr as its stdout so the
     /// NDJSON feed on stdout stays pure (module doc).
@@ -121,7 +132,12 @@ pub const Options = struct {
     /// this false: a failed step there must report and keep the server
     /// alive, exactly like a failed `generate` or `zig build` does.
     fatal_on_step_failure: bool = true,
+    /// Test-only: force the stdout relay (as `RELAY_ENV` does), optionally
+    /// making `Relay.prepare` fail so the fallback route is exercised.
+    relay_test: RelayTest = .off,
 };
+
+pub const RelayTest = enum { off, forced, forced_prepare_fails };
 
 // ── Validation ───────────────────────────────────────────────────────
 
@@ -475,7 +491,12 @@ pub fn failureDetail(buf: []u8, index: usize, total: usize) []const u8 {
 
 /// True when `LABELLE_NO_PREBUILD` is set to anything but empty or `0`.
 pub fn skipRequested(allocator: std.mem.Allocator) bool {
-    const v = config.globalEnviron().getAlloc(allocator, SKIP_ENV) catch return false;
+    return envFlag(allocator, SKIP_ENV);
+}
+
+/// True when env var `name` is set to anything but empty or `0`.
+fn envFlag(allocator: std.mem.Allocator, name: []const u8) bool {
+    const v = config.globalEnviron().getAlloc(allocator, name) catch return false;
     defer allocator.free(v);
     return v.len > 0 and !std.mem.eql(u8, v, "0");
 }
@@ -495,12 +516,40 @@ pub fn runStep(
 ) Error!u8 {
     const io = config.globalIo();
 
-    // In json mode the child's stdout is the CLI's stderr FILE, so its
-    // output streams live without ever touching the NDJSON stdout feed.
-    const child_stdout: std.process.SpawnOptions.StdIo = if (opts.route_stdout_to_stderr)
-        .{ .file = std.Io.File.stderr() }
+    // In json mode the child's stdout goes to the CLI's stderr, so its
+    // output streams live without ever touching the NDJSON stdout feed
+    // (module doc; the routing table is `prebuild_relay.stdoutRoute`).
+    const forced = opts.relay_test != .off or envFlag(allocator, RELAY_ENV);
+    var route = if (opts.route_stdout_to_stderr and forced)
+        prebuild_relay.StdoutRoute.relay
     else
-        .inherit;
+        prebuild_relay.stdoutRoute(
+            opts.route_stdout_to_stderr,
+            builtin.os.tag,
+            std.Io.File.stderr().isTty(io) catch false,
+        );
+
+    // The relay's thread starts BEFORE the child, so a failure to start it
+    // can still fall back to handing over the stderr file (the pre-cli#448
+    // route) instead of relaying synchronously, which a background process
+    // holding the pipe could hang (cli#452).
+    var relay: ?*prebuild_relay.Relay = null;
+    if (route == .relay) {
+        relay = if (opts.relay_test == .forced_prepare_fails)
+            null
+        else
+            prebuild_relay.Relay.prepare(std.heap.smp_allocator, io, std.Io.File.stderr()) catch null;
+        if (relay == null) {
+            std.debug.print("labelle: note: prebuild could not start its output relay; passing stderr to the step directly\n", .{});
+            route = .stderr_file;
+        }
+    }
+
+    const child_stdout: std.process.SpawnOptions.StdIo = switch (route) {
+        .inherit => .inherit,
+        .stderr_file => .{ .file = std.Io.File.stderr() },
+        .relay => .pipe,
+    };
 
     var child = std.process.spawn(io, .{
         .argv = step.run,
@@ -509,6 +558,7 @@ pub fn runStep(
         .stdout = child_stdout,
         .stderr = .inherit,
     }) catch |err| {
+        if (relay) |r| r.cancel();
         const owned = renderArgv(allocator, step.run) catch null;
         defer if (owned) |o| allocator.free(o);
         const rendered: []const u8 = owned orelse "<command>";
@@ -521,7 +571,18 @@ pub fn runStep(
         return error.PrebuildSpawnFailed;
     };
 
-    const term = child.wait(io) catch |err| {
+    // The relay copies on its own thread while this one reaps the direct
+    // child: a background process the step leaves holding the pipe must
+    // not hang the build. `wait` would close the pipe, so the relay takes
+    // it first.
+    if (relay) |r| {
+        r.begin(child.stdout.?);
+        child.stdout = null;
+    }
+    const waited = child.wait(io);
+    if (relay) |r| r.finish(prebuild_relay.drain_grace_ns);
+
+    const term = waited catch |err| {
         std.debug.print("labelle: prebuild could not wait on the step ({s})\n", .{@errorName(err)});
         return error.PrebuildSpawnFailed;
     };
@@ -1170,6 +1231,37 @@ pub const RunStepSpec = struct {
                 .run = &.{ "/bin/sh", "-c", "exit 3" },
             }, .{});
             try std.testing.expectEqual(@as(u8, 3), code);
+        }
+    };
+
+    /// cli#452: a step that leaves a background process holding its stdout
+    /// must not hang the build on the relay path, including when the relay
+    /// cannot start. `sleep 8` (not 30): in the fallback it holds the test
+    /// runner's stderr, which the build runner drains to EOF. The 5 s bound
+    /// leaves room for a loaded CI runner over the 0.5 s drain grace while
+    /// still failing a relay that waits for the descendant.
+    pub const relay_is_bounded = struct {
+        fn elapsedNs(relay_test: RelayTest) !u64 {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+            const began = std.Io.Timestamp.now(io, .awake);
+            const code = try runStep(std.testing.allocator, root, .{
+                .run = &.{ "/bin/sh", "-c", "sleep 8 & printf 'relay-bound-test partial'" },
+            }, .{ .route_stdout_to_stderr = true, .relay_test = relay_test });
+            try std.testing.expectEqual(@as(u8, 0), code);
+            return @intCast(began.untilNow(io, .awake).toNanoseconds());
+        }
+
+        test "the relay stops waiting once the direct child exits" {
+            try std.testing.expect(try elapsedNs(.forced) < 5 * std.time.ns_per_s);
+        }
+
+        test "a relay that cannot start falls back without relaying synchronously" {
+            try std.testing.expect(try elapsedNs(.forced_prepare_fails) < 5 * std.time.ns_per_s);
         }
     };
 

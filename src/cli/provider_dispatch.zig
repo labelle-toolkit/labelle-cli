@@ -1,0 +1,1065 @@
+//! Project-local command dispatch. No registry/global fallback or downloads.
+const std = @import("std");
+const builtin = @import("builtin");
+const config = @import("config.zig");
+const project = @import("project_config.zig");
+const plugins = @import("plugins.zig");
+const manifest = @import("provider_manifest.zig");
+const contract = @import("provider_contract.zig");
+const runner = @import("runner.zig");
+const toolchain = @import("zig_toolchain.zig");
+const zig_cache = @import("zig_cache.zig");
+const github = @import("provider_github.zig");
+const hooks = @import("provider_hooks.zig");
+const asm_cache = @import("asm_cache.zig");
+const settings_mod = @import("provider_settings.zig");
+
+// Existing platform commands remain reserved until their extraction lands;
+// an extracted one leaves the list and its namespace becomes dispatchable
+// (cli#405).
+pub const reserved = [_][]const u8{
+    "generate", "build",   "bundle",    "run",       "init",   "add",   "install", "update",
+    "upgrade",  "clean",   "test",      "pack",      "astc",   "audit", "migrate", "check",
+    "plugins",  "doctor",  "assembler", "toolchain", "status", "ios",   "wasm",    "help",
+    "version",  "targets", "providers",
+};
+pub const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
+
+fn read(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(1024 * 1024));
+}
+fn real(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), path, a);
+}
+
+pub fn projectRoot(a: std.mem.Allocator) !?[]const u8 {
+    return projectRootFrom(a, ".");
+}
+
+/// The nearest directory at or above `start` holding a `project.labelle`.
+pub fn projectRootFrom(a: std.mem.Allocator, start: []const u8) !?[]const u8 {
+    var dir: []const u8 = try real(a, start);
+    while (true) {
+        const path = try std.fs.path.join(a, &.{ dir, "project.labelle" });
+        std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                dir = std.fs.path.dirname(dir) orelse return null;
+                continue;
+            },
+            else => return err,
+        };
+        return dir;
+    }
+}
+
+/// What an absent non-local package means to `discover`. A remote package
+/// that is neither pinned (provider cache) nor in the ordinary package cache
+/// cannot be told apart from a runtime-only package by its manifest, because
+/// there is nothing to read.
+pub const CacheState = enum {
+    /// Metadata-only callers (`labelle help`, command dispatch) run before
+    /// any installer: an absent package is simply not listed, and a hook
+    /// reference into it is deferred rather than reported missing, so the
+    /// providers that ARE present keep their commands (Codex P2 on #420).
+    unknown,
+    /// The pipeline discovers AFTER the assembler populated the cache, so an
+    /// absent package is a broken install and fails closed — otherwise a cold
+    /// cache would silently build without the package's hooks while a warm
+    /// one runs them (Codex P1 on #420).
+    populated,
+};
+
+/// Every provider the project declares, with ownership and the cross-provider
+/// hook graph validated. Metadata only: no compiler, lock or build script.
+///
+/// A package directory WITHOUT a `plugin.labelle` is a runtime-only package
+/// (the assembler's light packs ship no manifest); only a missing directory
+/// is an error, and only once the cache is `populated`.
+pub fn discover(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) ![]Provider {
+    return (try discoverAll(a, root, cfg, sources, cache_state)).providers;
+}
+
+pub const Discovery = struct {
+    providers: []Provider,
+    /// Declared remote packages with no directory to read (`.unknown` only;
+    /// `.populated` makes them an error). While this is non-empty the
+    /// providers are a partial view: nothing that needs every declared
+    /// package — target ownership above all — can be decided from them.
+    unresolved: []const []const u8,
+};
+
+/// `discover`, also reporting the declared packages it could not read.
+pub fn discoverAll(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState) !Discovery {
+    return discoverImpl(a, root, cfg, sources, cache_state, null);
+}
+
+/// A pinned provider whose source could not be obtained from its lock
+/// entry: its archive is not cached, does not match its pin, or the pin
+/// itself is stale. `err` is what `Sources.projectDir` returned.
+pub const Unavailable = struct { package: []const u8, err: anyerror };
+
+pub const Survey = struct {
+    providers: []Provider,
+    /// As `Discovery.unresolved`.
+    unresolved: []const []const u8,
+    /// Verified (pinned or local) providers whose source or manifest could
+    /// not be read, in declaration order.
+    unavailable: []const Unavailable,
+    /// Cached remote packages with no integrity pin whose manifest is a
+    /// provider's or could not be read or parsed. Never in `providers`, and
+    /// never validated against the others: unverified bytes cannot fail the
+    /// verified providers' discovery.
+    unverified: []const []const u8,
+};
+
+const SurveyLists = struct {
+    unavailable: std.ArrayList(Unavailable) = .empty,
+    unverified: std.ArrayList([]const u8) = .empty,
+};
+
+/// Metadata-only discovery (`.unknown`) that, unlike `discoverAll`, does not
+/// abort on one provider's missing or mismatched pinned archive: that
+/// package is reported in `unavailable` (after `Sources.projectDir` printed
+/// its `labelle providers fetch` hint) and treated like an unread package, so
+/// the others stay usable. `labelle doctor` reads the project this way, so a
+/// provider it cannot obtain is a failed check rather than the end of the
+/// report. It never downloads.
+///
+/// One package never fails the others' discovery: a verified provider whose
+/// manifest is unreadable, malformed or misnamed is `unavailable`, and a
+/// cached unpinned package whose manifest is a provider's (or unreadable) is
+/// `unverified`, exactly as it would be `unresolved` with a cold cache. An
+/// unpinned manifest is read only to tell a runtime-only package (skipped)
+/// from a provider; nothing it declares is validated or used.
+pub fn survey(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources) !Survey {
+    var lists: SurveyLists = .{};
+    const found = try discoverImpl(a, root, cfg, sources, .unknown, &lists);
+    return .{ .providers = found.providers, .unresolved = found.unresolved, .unavailable = lists.unavailable.items, .unverified = lists.unverified.items };
+}
+
+fn discoverImpl(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, sources: *github.Sources, cache_state: CacheState, lists: ?*SurveyLists) !Discovery {
+    var providers: std.ArrayList(Provider) = .empty;
+    var owners: std.ArrayList(contract.Ownership) = .empty;
+    // Declared remote packages with no directory to read while the cache
+    // state is `unknown`. They are neither providers nor runtime-only
+    // packages yet, so a hook reference into one is deferred rather than
+    // reported missing (`hooks.validateAll`).
+    var unresolved: std.ArrayList([]const u8) = .empty;
+    for (cfg.plugins) |dep| {
+        // A lookup-only view (`Sources.extract = false`) has no directory for
+        // a pin nothing extracted yet: under `.unknown` that package is
+        // unread, like an uncached one, never mistaken for an unpinned one.
+        const pinned = if (dep.isLocal()) null else sources.projectDir(root, dep) catch |err| switch (err) {
+            error.ProviderSourceNotExtracted => switch (cache_state) {
+                .unknown => {
+                    try unresolved.append(a, dep.name);
+                    continue;
+                },
+                .populated => return err,
+            },
+            error.OutOfMemory => return err,
+            else => if (lists) |l| {
+                // Unread, so a hook reference into it is deferred like an
+                // uncached package's rather than reported missing.
+                try l.unavailable.append(a, .{ .package = dep.name, .err = err });
+                try unresolved.append(a, dep.name);
+                continue;
+            } else return err,
+        };
+        const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
+        if (pinned == null and !dep.isLocal()) {
+            std.Io.Dir.cwd().access(config.globalIo(), dir, .{}) catch |err| switch (err) {
+                error.FileNotFound => switch (cache_state) {
+                    .populated => {
+                        std.debug.print("labelle: package '{s}' ({s}@{s}) is not in the package cache after install: {s}\n", .{ dep.name, dep.repo, dep.version, dir });
+                        return error.ProviderPackageMissing;
+                    },
+                    .unknown => {
+                        try unresolved.append(a, dep.name);
+                        continue;
+                    },
+                },
+                else => return err,
+            };
+        }
+        const verified = dep.isLocal() or pinned != null;
+        const path = try std.fs.path.join(a, &.{ dir, "plugin.labelle" });
+        const bytes = read(a, path) catch |err| switch (err) {
+            error.FileNotFound => continue, // Runtime plugins may have no manifest.
+            error.OutOfMemory => return err,
+            else => {
+                if (lists) |l| {
+                    try isolate(a, l, &unresolved, dep.name, verified, err);
+                    continue;
+                }
+                return err;
+            },
+        };
+        const meta = manifest.parse(a, bytes) catch |err| {
+            // Unverified bytes: recorded without a diagnostic of their own.
+            if (lists != null and !verified) {
+                try isolate(a, lists.?, &unresolved, dep.name, verified, err);
+                continue;
+            }
+            std.debug.print("labelle: provider manifest '{s}': {s} (CLI contract {s})\n", .{ path, @errorName(err), contract.version });
+            if (lists) |l| {
+                try isolate(a, l, &unresolved, dep.name, verified, err);
+                continue;
+            }
+            return err;
+        };
+        if (!meta.isProvider()) continue;
+        if (lists != null and !verified) {
+            try isolate(a, lists.?, &unresolved, dep.name, verified, error.RemoteProviderIntegrityRequired);
+            continue;
+        }
+        if (!std.mem.eql(u8, dep.name, meta.name)) {
+            if (lists) |l| {
+                try isolate(a, l, &unresolved, dep.name, verified, error.ProviderNameMismatch);
+                continue;
+            }
+            return error.ProviderNameMismatch;
+        }
+        const names = try a.alloc([]const u8, if (meta.namespace != null) 1 else 0);
+        if (meta.namespace) |ns| names[0] = ns;
+        try owners.append(a, .{ .package = meta.name, .namespaces = names, .targets = meta.targets });
+        try providers.append(a, .{ .dep = dep, .dir = try real(a, dir), .meta = meta, .verified = verified });
+    }
+    try contract.validateOwnership(owners.items, &reserved);
+    // Hook references into an unverified package are deferred like ones into
+    // an unread package: neither can be checked.
+    var deferred: std.ArrayList([]const u8) = .empty;
+    try deferred.appendSlice(a, unresolved.items);
+    if (lists) |l| try deferred.appendSlice(a, l.unverified.items);
+    try hooks.validateAll(a, providers.items, deferred.items);
+    return .{ .providers = providers.items, .unresolved = unresolved.items };
+}
+
+/// Survey mode: record one package's failure against that package only. A
+/// verified one is `unavailable` (and unread, so references into it are
+/// deferred); an unverified one is `unverified`, whatever the reason.
+fn isolate(a: std.mem.Allocator, lists: *SurveyLists, unresolved: *std.ArrayList([]const u8), name: []const u8, verified: bool, err: anyerror) !void {
+    if (verified) {
+        try lists.unavailable.append(a, .{ .package = name, .err = err });
+        try unresolved.append(a, name);
+    } else {
+        try lists.unverified.append(a, name);
+    }
+}
+
+fn printCommands(provider: Provider) void {
+    if (provider.meta.namespace) |ns| {
+        for (provider.meta.commands) |cmd| std.debug.print("  labelle {s} {s} — {s}\n", .{ ns, cmd.name, cmd.help });
+    }
+}
+
+/// Metadata-only help never reads a lock, resolves a compiler or runs build code.
+pub fn printHelp(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try projectRoot(a) orelse return;
+    const cfg = try config.readProjectConfigQuiet(a, root);
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const providers = try discover(a, root, cfg, &sources, .unknown);
+    if (providers.len != 0) std.debug.print("\nProject package commands:\n", .{});
+    for (providers) |provider| printCommands(provider);
+}
+
+pub fn validatePin(dep: project.PluginDep, pins: []const project.PluginDep) !void {
+    var found = false;
+    for (pins) |pin| {
+        if (!std.mem.eql(u8, pin.name, dep.name)) continue;
+        if (found) return error.DuplicateProviderPin;
+        found = true;
+        if (!std.mem.eql(u8, pin.repo, dep.repo) or !std.mem.eql(u8, pin.version, dep.version))
+            return error.StaleProviderPin;
+    }
+    if (!found) return error.MissingProviderPin;
+}
+
+/// null means the namespace is unknown; callers can then try directory shorthand.
+pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.process.Args.Iterator) !?u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try projectRoot(a) orelse return null;
+    const cfg = try config.readProjectConfigQuiet(a, root);
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const providers = try discover(a, root, cfg, &sources, .unknown);
+    for (providers) |provider| {
+        if (!std.mem.eql(u8, namespace, provider.meta.namespace orelse continue)) continue;
+        const name = args.next() orelse {
+            printCommands(provider);
+            return 0;
+        };
+        if (isHelp(name)) {
+            printCommands(provider);
+            return 0;
+        }
+        for (provider.meta.commands) |cmd| {
+            if (!std.mem.eql(u8, name, cmd.name)) continue;
+            var trailing: std.ArrayList([]const u8) = .empty;
+            while (args.next()) |arg| try trailing.append(a, arg);
+            if (trailing.items.len == 1 and isHelp(trailing.items[0])) {
+                std.debug.print("labelle {s} {s} — {s}\n", .{ namespace, name, cmd.help });
+                return 0;
+            }
+            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items, .all, null);
+        }
+        std.debug.print("labelle: unknown command '{s}' in provider namespace '{s}'\n", .{ name, namespace });
+        printCommands(provider);
+        return 1;
+    }
+    return null;
+}
+
+/// Run one provider command: the lock/integrity check, the provider settings,
+/// then the tool build and invocation. `labelle <ns> <cmd>` and the provider
+/// part of `labelle doctor` both come through here, so they cannot drift.
+pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8, scope: SettingsScope, hosts: ?*HostCache) !u8 {
+    const lock_path = try requirePinned(a, root, provider);
+    const settings = switch (scope) {
+        .all => try resolveSettings(a, root, cfg, providers, provider.meta.name),
+        .selected => try resolveOwnSettings(a, root, cfg, provider.meta.name),
+    };
+    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing, hosts);
+}
+
+/// Execution (a command or a hook) needs the project's ordinary lock to name
+/// this exact provider, and a remote provider to carry an integrity pin.
+/// Returns the lock's real path for the wire context.
+pub fn requirePinned(a: std.mem.Allocator, root: []const u8, provider: Provider) ![]const u8 {
+    const lock_path = try std.fs.path.join(a, &.{ root, "labelle.lock" });
+    const lock_bytes = read(a, lock_path) catch |err| {
+        std.debug.print("labelle: provider execution requires the project's labelle.lock: {s}\n", .{@errorName(err)});
+        return error.MissingProjectLock;
+    };
+    const Lock = struct { plugins: []const project.PluginDep = &.{} };
+    const lock = try std.zon.parse.fromSliceAlloc(Lock, a, try a.dupeZ(u8, lock_bytes), null, .{ .ignore_unknown_fields = true });
+    try validatePin(provider.dep, lock.plugins);
+    if (!provider.verified) {
+        std.debug.print("labelle: remote provider '{s}' is unpinned. Run labelle providers resolve, review the pins, then repeat with --accept.\n", .{provider.dep.name});
+        return error.RemoteProviderIntegrityRequired;
+    }
+    return real(a, lock_path);
+}
+
+fn isHelp(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+/// A canonical child must be strictly beneath its canonical parent.
+pub fn contained(parent: []const u8, child: []const u8) bool {
+    if (parent.len == 0) return false;
+    const prefix = if (builtin.os.tag == .windows)
+        child.len > parent.len and std.ascii.eqlIgnoreCase(parent, child[0..parent.len])
+    else
+        std.mem.startsWith(u8, child, parent) and child.len > parent.len;
+    if (!prefix) return false;
+    return std.fs.path.isSep(child[parent.len]) or std.fs.path.isSep(parent[parent.len - 1]);
+}
+
+fn executable(a: std.mem.Allocator, prefix: []const u8, relative: []const u8) ![]const u8 {
+    const suffix = if (builtin.os.tag == .windows) ".exe" else "";
+    const path = try std.fs.path.join(a, &.{ prefix, try std.fmt.allocPrint(a, "{s}{s}", .{ relative, suffix }) });
+    const resolved = try real(a, path);
+    if (!contained(try real(a, prefix), resolved)) return error.EscapingProviderExecutable;
+    const stat = try std.Io.Dir.cwd().statFile(config.globalIo(), resolved, .{});
+    if (stat.kind != .file) return error.InvalidProviderExecutable;
+    try std.Io.Dir.cwd().access(config.globalIo(), resolved, .{ .execute = true });
+    return resolved;
+}
+
+/// Create `dir` if needed and return its canonical absolute path, so it means
+/// the same thing in a child that runs with a different cwd.
+pub fn canonicalDir(a: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
+    return real(a, dir);
+}
+
+/// Every `provider_config` entry names a resolved, verified provider. The
+/// project-wide mapping check; it opens no file. (Duplicates, undeclared
+/// packages and the lexical path shape are already refused when
+/// project.labelle is read, `provider_settings.validateProject`.)
+pub fn checkSettingsMapping(cfg: project.ProjectConfig, providers: []const Provider) !void {
+    for (cfg.provider_config) |entry| {
+        var resolved = false;
+        for (providers) |provider| {
+            if (std.mem.eql(u8, provider.meta.name, entry.package) and provider.verified) resolved = true;
+        }
+        if (!resolved) {
+            std.debug.print("labelle: provider_config '{s}' must name a resolved command/hook provider\n", .{entry.package});
+            return error.UnresolvedProviderConfig;
+        }
+    }
+}
+
+/// Open and check one settings file: contained in the project, a regular
+/// file, at most 1 MiB, valid JSON. Returns its canonical path.
+fn openSettings(a: std.mem.Allocator, root: []const u8, entry: settings_mod.Entry) ![]const u8 {
+    const requested = try std.fs.path.join(a, &.{ root, entry.file });
+    const path = real(a, requested) catch |err| {
+        std.debug.print("labelle: provider_config '{s}' cannot open '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+        return error.MissingProviderConfig;
+    };
+    if (!contained(root, path)) {
+        std.debug.print("labelle: provider_config '{s}' resolves outside the project: {s}\n", .{ entry.package, entry.file });
+        return error.EscapingProviderConfig;
+    }
+    const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch |err| {
+        std.debug.print("labelle: provider_config '{s}' cannot stat '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+        return err;
+    };
+    if (stat.kind != .file) {
+        std.debug.print("labelle: provider_config '{s}' is not a regular file: {s}\n", .{ entry.package, entry.file });
+        return error.InvalidProviderConfigFile;
+    }
+    // Covers the 1 MiB input limit (StreamTooLong) and unreadable files.
+    const bytes = read(a, path) catch |err| {
+        std.debug.print("labelle: provider_config '{s}' cannot read '{s}': {s}\n", .{ entry.package, entry.file, @errorName(err) });
+        return err;
+    };
+    defer a.free(bytes);
+    // Check JSON syntax only. The provider owns its settings schema and
+    // must validate semantic requirements before producing side effects.
+    const json = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch {
+        std.debug.print("labelle: provider_config '{s}' is not valid JSON: {s}\n", .{ entry.package, entry.file });
+        return error.InvalidProviderConfigJson;
+    };
+    json.deinit();
+    return path;
+}
+
+/// Which settings files an invocation opens.
+pub const SettingsScope = enum {
+    /// Every `provider_config` entry (`labelle <ns> <cmd>`, hooks): one bad
+    /// settings file anywhere in the project stops the invocation.
+    all,
+    /// Only the selected provider's entry (`labelle doctor`, where each
+    /// provider's run must stand alone). The caller checks the mapping
+    /// (`checkSettingsMapping`) once for the whole project.
+    selected,
+};
+
+/// The mapping check plus every settings file (`.all`), returning the
+/// selected provider's settings path, or null when it has none.
+pub fn resolveSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, selected: []const u8) !?[]const u8 {
+    try checkSettingsMapping(cfg, providers);
+    var result: ?[]const u8 = null;
+    for (cfg.provider_config) |entry| {
+        const path = try openSettings(a, root, entry);
+        if (std.mem.eql(u8, entry.package, selected)) result = path;
+    }
+    return result;
+}
+
+/// Only the selected provider's entry is opened (`SettingsScope.selected`).
+pub fn resolveOwnSettings(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, selected: []const u8) !?[]const u8 {
+    for (cfg.provider_config) |entry| {
+        if (std.mem.eql(u8, entry.package, selected)) return try openSettings(a, root, entry);
+    }
+    return null;
+}
+
+/// The pinned host compiler and the canonical cache tree every provider tool
+/// build shares. Resolved once per CLI invocation, lazily, so a project
+/// without hooks never touches the compiler check.
+pub const Host = struct { zig: []const u8, cache_root: []const u8, global_cache: []const u8, packages: []const u8 };
+
+/// The host compiler comes from the same resolution `labelle build` uses
+/// (`zig_toolchain.resolveZig`): the `LABELLE_ZIG` / `--zig` override, else
+/// the managed toolchain for the project's required version, provisioned on
+/// a cache miss (bundled seed first, else download + minisign verification,
+/// installed atomically). Callers check the provider's pins first, so an
+/// unpinned provider never triggers a download.
+pub fn resolveHost(a: std.mem.Allocator, root: []const u8) !Host {
+    return resolveHostWith(a, root, provisionZig);
+}
+
+fn provisionZig(a: std.mem.Allocator, root: []const u8) anyerror![]u8 {
+    return toolchain.resolveZig(a, root);
+}
+
+/// One host resolution per invocation, shared by several provider runs (the
+/// provider part of `labelle doctor`). The first `get` resolves; every later
+/// one returns the same host, or the same error, so a failed or offline
+/// provisioning is attempted once, not once per provider. `a` must outlive
+/// the cache (the host's paths live in it).
+pub const HostCache = struct {
+    resolve: *const fn (std.mem.Allocator, []const u8) anyerror!Host = resolveHost,
+    host: ?Host = null,
+    failure: ?anyerror = null,
+    /// Resolutions attempted (0 or 1).
+    calls: usize = 0,
+
+    pub fn get(self: *HostCache, a: std.mem.Allocator, root: []const u8) anyerror!Host {
+        if (self.host) |host| return host;
+        if (self.failure) |err| return err;
+        self.calls += 1;
+        const host = self.resolve(a, root) catch |err| {
+            self.failure = err;
+            return err;
+        };
+        self.host = host;
+        return host;
+    }
+};
+
+/// `resolveHost` over an injected provisioner (tests).
+pub fn resolveHostWith(a: std.mem.Allocator, root: []const u8, provision: *const fn (std.mem.Allocator, []const u8) anyerror![]u8) !Host {
+    const required = try toolchain.resolveRequiredVersion(a, root);
+    const zig_candidate = try provision(a, root);
+    // The same check `labelle doctor` reports for an override. Only an
+    // override can name a path that does not exist: the managed path exists
+    // once `provision` returned.
+    const zig = switch (try toolchain.verifyBinary(a, zig_candidate, required.version)) {
+        .ok => |path| path,
+        .missing => {
+            std.debug.print("labelle: the host compiler override does not exist: {s} (LABELLE_ZIG / --zig)\n", .{zig_candidate});
+            return error.ProviderCompilerMissing;
+        },
+        .not_executable, .failed => return error.ProviderCompilerFailed,
+        .version => |reported| {
+            std.debug.print("labelle: the host compiler {s} is Zig {s}; this project requires {s}\n", .{ zig_candidate, reported, required.version });
+            return error.ProviderCompilerVersionMismatch;
+        },
+    };
+
+    // The build child runs with the provider as cwd, so every path handed to
+    // it is canonical: a relative LABELLE_HOME (which getCacheRoot accepts)
+    // would otherwise make Zig install beneath the provider source while this
+    // process looks for the prefix beneath its own cwd, and the stray tree
+    // would never be cleaned because only run_dir is removed (cli#413 review).
+    // `github.cacheRoot` already resolves LABELLE_HOME against this process's
+    // cwd; `canonicalDir` creates the directory and returns its real path.
+    const cache_root = try github.cacheRoot(a);
+    const global_cache = try std.fs.path.join(a, &.{ cache_root, zig_cache.GLOBAL_CACHE_SUBDIR });
+    // Zig's system package mode disables fetching. Its package directory is
+    // explicit so a missing dependency fails instead of reaching the network.
+    const packages = try canonicalDir(a, try std.fs.path.join(a, &.{ global_cache, "p" }));
+    return .{ .zig = zig, .cache_root = cache_root, .global_cache = global_cache, .packages = packages };
+}
+
+/// One invocation of a provider tool: the wire-context fields the caller
+/// decides (contract §2) plus how the child is launched.
+pub const ToolRun = struct {
+    invocation: contract.Invocation,
+    needs_project: bool,
+    target: ?[]const u8,
+    lock_file: ?[]const u8,
+    /// Absolute; created by the caller.
+    output_dir: []const u8,
+    optimize: contract.Optimize,
+    progress: contract.Progress,
+    settings: ?[]const u8,
+    trailing: []const []const u8,
+    cwd: []const u8,
+    /// `bundle` hooks only: `labelle bundle --build-number` (contract §2).
+    build_number: ?[]const u8 = null,
+    /// Hooks only: the absolute generated target directory (contract §2
+    /// `target_dir`, wire `1.2.0`+). Null for commands.
+    target_dir: ?[]const u8 = null,
+    /// `run`-step hooks only: the `labelle run` options (contract §2 `run`,
+    /// wire `1.2.0`+). Null on every other invocation.
+    run_options: ?contract.RunContext = null,
+};
+
+/// The wire context for one invocation (contract §2), in the wire version
+/// negotiated from the provider's `command_contract` range: the newest one
+/// this CLI speaks that the range admits. `build_number` is a `1.1.0` key, so
+/// a provider capped below it (`>=1.0.0 <1.1.0`) gets the exact `1.0.0` wire
+/// without it — its strict decoder would reject the unknown key and fail
+/// the bundle instead of packaging (Codex P2 on #421) — and the drop is
+/// reported once on stderr rather than silently. `target_dir` and `run` are
+/// `1.2.0` keys and follow the same rule: a provider capped below `1.2.0`
+/// gets neither, and a `run` hook of one that the user passed run options
+/// for gets one `note:` line saying they did not reach it.
+pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRun) !contract.Context {
+    const wire = try manifest.negotiate(provider.meta.command_contract orelse return error.MissingCommandContract);
+    const build_number = if (run.build_number) |number| blk: {
+        if (contract.carriesBuildNumber(wire)) break :blk number;
+        std.debug.print("labelle: note: '{s}' speaks provider contract {s}, which has no build_number; --build-number={s} is not passed to it\n", .{ provider.meta.name, wire, number });
+        break :blk null;
+    } else null;
+    const run_context = contract.carriesRunContext(wire);
+    const run_options = if (run.run_options) |options| blk: {
+        if (run_context) break :blk options;
+        if (options.given()) std.debug.print("labelle: note: run options not passed to '{s}/{s}' (provider contract {s} < {s})\n", .{
+            provider.meta.name, run.invocation.id, wire, contract.run_context_since,
+        });
+        break :blk null;
+    } else null;
+    return .{
+        .contract_version = wire,
+        .invocation = run.invocation,
+        .package_dir = provider.dir,
+        .project_dir = root,
+        .target = run.target,
+        .lock_file = run.lock_file,
+        .config_file = run.settings,
+        .output_dir = run.output_dir,
+        .zig_executable = host.zig,
+        .optimize = run.optimize,
+        .progress = run.progress,
+        .build_number = build_number,
+        .target_dir = if (run_context) run.target_dir else null,
+        .run = run_options,
+    };
+}
+
+/// Build the tool in a fresh isolated prefix, verify the declared executable,
+/// write the context file and run it. Returns the tool's exit status; the
+/// workspace is removed whatever happens.
+pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Provider, tool: contract.Tool, run: ToolRun) !u8 {
+    const io = config.globalIo();
+    const runs = try canonicalDir(a, try std.fs.path.join(a, &.{ host.cache_root, "provider-runs" }));
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    const run_dir = try std.fs.path.join(a, &.{ runs, &std.fmt.bytesToHex(random, .lower) });
+    try std.Io.Dir.cwd().createDir(io, run_dir, .default_dir);
+    // Only the freshly-created per-invocation directory is ever removed.
+    defer std.Io.Dir.cwd().deleteTree(io, run_dir) catch |err| {
+        std.debug.print("labelle: could not remove provider workspace '{s}': {s}\n", .{ run_dir, @errorName(err) });
+    };
+    const prefix = try std.fs.path.join(a, &.{ run_dir, "install" });
+    var env = try runner.buildZigEnv(a, &.{});
+    defer env.deinit();
+    // Keep relative LABELLE_HOME stable when child cwd changes to the package.
+    try env.put("ZIG_GLOBAL_CACHE_DIR", host.global_cache);
+    try env.put("ZIG_LOCAL_CACHE_DIR", try std.fs.path.join(a, &.{ host.cache_root, zig_cache.LOCAL_CACHE_SUBDIR }));
+    try env.put("LABELLE_HOME", host.cache_root);
+    // Zig owns the complete source/dependency/compiler/options cache identity.
+    // Always run the install step: never trust a stale installed executable.
+    const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ host.zig, "build", tool.build_step, "--prefix", prefix, "--system", host.packages }, null, &env);
+    if (build_code != 0) return build_code;
+    if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
+    const exe = try executable(a, prefix, tool.executable);
+    const ctx = try wireContext(provider, host, root, run);
+    try ctx.validate(run.needs_project);
+    const context_path = try std.fs.path.join(a, &.{ run_dir, "context.json" });
+    const data = try std.json.Stringify.valueAlloc(a, ctx, .{});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = context_path, .data = data });
+    try env.put(contract.context_env, context_path);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(a, exe);
+    try argv.appendSlice(a, run.trailing);
+    return runner.runZigInheritWithEnv(a, run.cwd, argv.items, null, &env);
+}
+
+/// A project command: Debug, human progress, output under
+/// `.labelle/providers/<package>`, trailing arguments verbatim.
+fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8, hosts: ?*HostCache) !u8 {
+    const host = if (hosts) |cache| try cache.get(a, root) else try resolveHost(a, root);
+    var output: []const u8 = root;
+    for ([_][]const u8{ ".labelle", "providers", provider.meta.name }) |segment| {
+        output = try canonicalDir(a, try std.fs.path.join(a, &.{ output, segment }));
+        if (!contained(root, output)) return error.EscapingProviderOutput;
+    }
+    return runTool(a, host, root, provider, cmd.tool(), .{
+        .invocation = .{ .kind = .command, .id = cmd.name, .step = null, .phase = null },
+        .needs_project = cmd.needs_project,
+        .target = @tagName(cfg.platform),
+        .lock_file = lock_path,
+        .output_dir = output,
+        .optimize = .Debug,
+        .progress = .human,
+        .settings = settings,
+        .trailing = trailing,
+        .cwd = root,
+    });
+}
+
+test "provider dispatch: a hook ToolRun yields a valid hook context, and none without a phase" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const abs = if (builtin.os.tag == .windows) "C:\\proj" else "/proj";
+    const run: ToolRun = .{
+        .invocation = .{ .kind = .hook, .id = "stamp", .step = .build, .phase = .after },
+        .needs_project = true,
+        .target = "desktop",
+        .lock_file = try std.fs.path.join(a, &.{ abs, "labelle.lock" }),
+        .output_dir = try std.fs.path.join(a, &.{ abs, "zig-out" }),
+        .optimize = .ReleaseFast,
+        .progress = .json,
+        .settings = null,
+        .trailing = &.{},
+        .cwd = abs,
+        .target_dir = try std.fs.path.join(a, &.{ abs, ".labelle", "probe_desktop" }),
+    };
+    // The same construction `runTool` performs from a ToolRun.
+    const provider: Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+        .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+        .verified = true,
+    };
+    const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    var ctx = try wireContext(provider, host, abs, run);
+    try ctx.validate(run.needs_project);
+    try std.testing.expectEqualStrings(run.target_dir.?, ctx.target_dir.?);
+    try std.testing.expect(ctx.run == null);
+    ctx.invocation.phase = null;
+    try std.testing.expectError(error.InvalidInvocation, ctx.validate(true));
+}
+
+test "provider dispatch: build_number reaches only a provider whose range admits the 1.1 wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const abs = if (builtin.os.tag == .windows) "C:\\proj" else "/proj";
+    const run: ToolRun = .{
+        .invocation = .{ .kind = .hook, .id = "pack", .step = .bundle, .phase = .replace },
+        .needs_project = true,
+        .target = "probe-target",
+        .lock_file = try std.fs.path.join(a, &.{ abs, "labelle.lock" }),
+        .output_dir = try std.fs.path.join(a, &.{ abs, "dist" }),
+        .optimize = .ReleaseSafe,
+        .progress = .off,
+        .settings = null,
+        .trailing = &.{},
+        .cwd = abs,
+        .build_number = "42",
+        .target_dir = try std.fs.path.join(a, &.{ abs, ".labelle", "probe_probe-target" }),
+    };
+    const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    var provider: Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+        .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+        .verified = true,
+    };
+    // An open v1 range: negotiated to the newest wire, which carries the key.
+    const open = try wireContext(provider, host, abs, run);
+    try open.validate(true);
+    try std.testing.expectEqualStrings("1.2.0", open.contract_version);
+    try std.testing.expectEqualStrings("42", open.build_number.?);
+    const open_wire = try std.json.Stringify.valueAlloc(a, open, .{});
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"build_number\":\"42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"contract_version\":\"1.2.0\"") != null);
+    // A range capped at the 1.1 wire still gets the key, and nothing newer.
+    provider.meta.command_contract = ">=1.0.0 <1.2.0";
+    const mid = try wireContext(provider, host, abs, run);
+    try mid.validate(true);
+    try std.testing.expectEqualStrings("1.1.0", mid.contract_version);
+    try std.testing.expectEqualStrings("42", mid.build_number.?);
+    try std.testing.expect(mid.target_dir == null);
+    // A provider capped at the 1.0 wire: the exact 1.0.0 wire, no key — so
+    // its strict decoder sees nothing unknown.
+    provider.meta.command_contract = ">=1.0.0 <1.1.0";
+    const capped = try wireContext(provider, host, abs, run);
+    try capped.validate(true);
+    try std.testing.expectEqualStrings("1.0.0", capped.contract_version);
+    try std.testing.expect(capped.build_number == null);
+    const capped_wire = try std.json.Stringify.valueAlloc(a, capped, .{});
+    try std.testing.expect(std.mem.indexOf(u8, capped_wire, "build_number") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped_wire, "\"contract_version\":\"1.0.0\"") != null);
+    // A range the CLI cannot speak at all is refused, never guessed.
+    provider.meta.command_contract = ">=2.0.0";
+    try std.testing.expectError(error.UnsupportedContract, wireContext(provider, host, abs, run));
+}
+
+test "provider dispatch: target_dir and run options reach only a provider whose range admits the 1.2 wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const abs = if (builtin.os.tag == .windows) "C:\\proj" else "/proj";
+    const env = [_]contract.RunEnv{
+        .{ .name = "LABELLE_SCENE", .value = "x" },
+        .{ .name = "LABELLE_SCREENSHOT_PATH", .value = "s" },
+    };
+    const run: ToolRun = .{
+        .invocation = .{ .kind = .hook, .id = "deploy", .step = .run, .phase = .replace },
+        .needs_project = true,
+        .target = "probe-target",
+        .lock_file = try std.fs.path.join(a, &.{ abs, "labelle.lock" }),
+        .output_dir = try std.fs.path.join(a, &.{ abs, "zig-out" }),
+        .optimize = .Debug,
+        .progress = .off,
+        .settings = null,
+        .trailing = &.{},
+        .cwd = abs,
+        .target_dir = try std.fs.path.join(a, &.{ abs, ".labelle", "probe_probe-target" }),
+        .run_options = .{ .env = &env, .args = &.{ "a", "b" }, .timeout_ms = 1500 },
+    };
+    const host: Host = .{ .zig = try std.fs.path.join(a, &.{ abs, "zig" }), .cache_root = abs, .global_cache = abs, .packages = abs };
+    var provider: Provider = .{
+        .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+        .dir = try std.fs.path.join(a, &.{ abs, "pkg" }),
+        .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+        .verified = true,
+    };
+    const open = try wireContext(provider, host, abs, run);
+    try open.validate(true);
+    try std.testing.expectEqualStrings("1.2.0", open.contract_version);
+    try std.testing.expectEqualStrings(run.target_dir.?, open.target_dir.?);
+    try std.testing.expectEqual(@as(usize, 2), open.run.?.env.len);
+    try std.testing.expectEqualStrings("b", open.run.?.args[1]);
+    try std.testing.expectEqual(@as(?u64, 1500), open.run.?.timeout_ms);
+    const open_wire = try std.json.Stringify.valueAlloc(a, open, .{});
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"run\":{\"env\":[{\"name\":\"LABELLE_SCENE\",\"value\":\"x\"}") != null);
+    // Capped below 1.2.0: the exact older wire, neither key.
+    for ([_][2][]const u8{ .{ ">=1.0.0 <1.2.0", "1.1.0" }, .{ ">=1.0.0 <1.1.0", "1.0.0" } }) |case| {
+        provider.meta.command_contract = case[0];
+        const capped = try wireContext(provider, host, abs, run);
+        try capped.validate(true);
+        try std.testing.expectEqualStrings(case[1], capped.contract_version);
+        try std.testing.expect(capped.target_dir == null and capped.run == null);
+        const capped_wire = try std.json.Stringify.valueAlloc(a, capped, .{});
+        try std.testing.expect(std.mem.indexOf(u8, capped_wire, "target_dir") == null);
+        // (`"step":"run"` is the invocation; the key would be `"run":`.)
+        try std.testing.expect(std.mem.indexOf(u8, capped_wire, "\"run\":") == null);
+    }
+    // A command on 1.2.0: `target_dir` is written as null.
+    provider.meta.command_contract = ">=1.0.0 <2.0.0";
+    var command = run;
+    command.invocation = .{ .kind = .command, .id = "doctor", .step = null, .phase = null };
+    command.target_dir = null;
+    command.run_options = null;
+    const cmd_ctx = try wireContext(provider, host, abs, command);
+    try cmd_ctx.validate(true);
+    const cmd_wire = try std.json.Stringify.valueAlloc(a, cmd_ctx, .{});
+    try std.testing.expect(std.mem.indexOf(u8, cmd_wire, "\"target_dir\":null") != null);
+}
+
+test "provider dispatch: an extracted platform's namespace is no longer reserved" {
+    // `android` moved into its provider (cli#405): a package may declare the
+    // namespace. The legacy subcommands still built in stay reserved.
+    for (reserved) |name| try std.testing.expect(!std.mem.eql(u8, name, "android"));
+    for ([_][]const u8{ "ios", "wasm", "run", "build", "bundle" }) |kept| {
+        var found = false;
+        for (reserved) |name| found = found or std.mem.eql(u8, name, kept);
+        try std.testing.expect(found);
+    }
+}
+
+test "provider dispatch: lock mismatch and duplicates fail closed" {
+    const dep: project.PluginDep = .{ .name = "fixture", .repo = "local:../fixture", .version = "1.0.0" };
+    try validatePin(dep, &.{dep});
+    try std.testing.expectError(error.MissingProviderPin, validatePin(dep, &.{}));
+    try std.testing.expectError(error.DuplicateProviderPin, validatePin(dep, &.{ dep, dep }));
+    var changed = dep;
+    changed.version = "2.0.0";
+    try std.testing.expectError(error.StaleProviderPin, validatePin(dep, &.{changed}));
+    changed = dep;
+    changed.repo = "local:../other";
+    try std.testing.expectError(error.StaleProviderPin, validatePin(dep, &.{changed}));
+}
+
+test "provider dispatch: workspace directories are canonical whatever the caller's cwd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // tmpDir lives at a cwd-relative path — the shape a relative LABELLE_HOME takes.
+    const relative = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home", "provider-runs" });
+    try std.testing.expect(!std.fs.path.isAbsolute(relative));
+    const canonical = try canonicalDir(a, relative);
+    try std.testing.expect(std.fs.path.isAbsolute(canonical));
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(config.globalIo(), &buf);
+    try std.testing.expect(contained(buf[0..n], canonical));
+    try std.testing.expectEqualStrings("provider-runs", std.fs.path.basename(canonical));
+    // Created, not merely named: the child can install into it right away.
+    try tmp.dir.access(config.globalIo(), "home/provider-runs", .{});
+}
+
+test "provider dispatch: canonical containment respects component boundaries" {
+    try std.testing.expect(contained("/tmp/install", "/tmp/install/bin/tool"));
+    try std.testing.expect(!contained("/tmp/install", "/tmp/install-evil/bin/tool"));
+    try std.testing.expect(!contained("/tmp/install", "/tmp/install"));
+}
+
+test "provider dispatch: an unread remote package defers its references under .unknown and fails .populated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg-a");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // The ordinary package cache lives under this tmp dir, so the remote
+    // package is absent until the test writes it there.
+    const home = try tmp.dir.realPathFileAlloc(io, ".", a);
+    asm_cache.setCacheRootOverride(home);
+    defer asm_cache.clearCacheRootOverride();
+    const Manifests = struct {
+        fn write(dir: std.Io.Dir, sub_path: []const u8, name: []const u8, hook: []const u8) !void {
+            var buf: [512]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"{s}\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{{ {s} }} }}", .{ name, hook });
+            try dir.writeFile(config.globalIo(), .{ .sub_path = sub_path, .data = text });
+        }
+    };
+    const a_hook = ".{ .id = \"a\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\", .after_hooks = .{ \"pkg-b/b\" } }";
+    try Manifests.write(tmp.dir, "pkg-a/plugin.labelle", "pkg-a", a_hook);
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg-a", .repo = "local:../pkg-a", .version = "1.0.0" },
+        .{ .name = "pkg-b", .repo = "example/pkg-b", .version = "1.0.0" },
+    } };
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+
+    // Cold: metadata-only discovery lists the provider it can read and
+    // defers the reference into the one it cannot; the pipeline's
+    // populated discovery fails closed on the same absence.
+    const partial = try discoverAll(a, root, cfg, &sources, .unknown);
+    try std.testing.expectEqual(@as(usize, 1), partial.providers.len);
+    try std.testing.expectEqualStrings("pkg-a", partial.providers[0].meta.name);
+    // The unread package is named, so a caller knows the view is partial.
+    try std.testing.expectEqual(@as(usize, 1), partial.unresolved.len);
+    try std.testing.expectEqualStrings("pkg-b", partial.unresolved[0]);
+    try std.testing.expectError(error.ProviderPackageMissing, discover(a, root, cfg, &sources, .populated));
+    // A reference into a package the project never declared is a typo
+    // even while pkg-b is unread.
+    const typo = ".{ .id = \"a\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\", .after_hooks = .{ \"pkg-c/b\" } }";
+    try Manifests.write(tmp.dir, "pkg-a/plugin.labelle", "pkg-a", typo);
+    try std.testing.expectError(error.MissingHookReference, discover(a, root, cfg, &sources, .unknown));
+    try Manifests.write(tmp.dir, "pkg-a/plugin.labelle", "pkg-a", a_hook);
+
+    // Warm: the package is in the ordinary cache. Both states read it, and
+    // a reference it does not satisfy is missing in both.
+    const cached = try std.fs.path.join(a, &.{ "packages", "plugins", "example", "pkg-b", "1.0.0" });
+    try tmp.dir.createDirPath(io, cached);
+    const manifest_path = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
+    const b_hook = ".{ .id = \"b\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    try Manifests.write(tmp.dir, manifest_path, "pkg-b", b_hook);
+    for ([_]CacheState{ .unknown, .populated }) |state| {
+        const both = try discoverAll(a, root, cfg, &sources, state);
+        try std.testing.expectEqual(@as(usize, 2), both.providers.len);
+        try std.testing.expectEqualStrings("pkg-b", both.providers[1].meta.name);
+        try std.testing.expectEqual(@as(usize, 0), both.unresolved.len);
+        // Read from the ordinary cache without a pin: present, but unverified.
+        try std.testing.expect(both.providers[0].verified);
+        try std.testing.expect(!both.providers[1].verified);
+    }
+    const other = ".{ .id = \"other\", .step = .build, .target = \"desktop\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    try Manifests.write(tmp.dir, manifest_path, "pkg-b", other);
+    for ([_]CacheState{ .unknown, .populated }) |state| {
+        try std.testing.expectError(error.MissingHookReference, discover(a, root, cfg, &sources, state));
+    }
+}
+
+test "provider dispatch: survey reports a pinned provider with no cached archive and keeps the others" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg-a");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    // No archive is ever cached under this root.
+    asm_cache.setCacheRootOverride(try tmp.dir.realPathFileAlloc(io, ".", a));
+    defer asm_cache.clearCacheRootOverride();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-a/plugin.labelle", .data = ".{ .name = \"pkg-a\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"alpha\", .commands = .{ .{ .name = \"doctor\", .build_step = \"t\", .executable = \"bin/t\", .help = \"h\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/labelle.providers.lock", .data = "{\"schema_version\":1,\"providers\":[{\"package\":\"pkg-b\",\"repo\":\"example/pkg-b\",\"version\":\"1.0.0\",\"commit\":\"1111111111111111111111111111111111111111\",\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}" });
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "pkg-b", .repo = "github.com/example/pkg-b", .version = "1.0.0" },
+        .{ .name = "pkg-a", .repo = "local:../pkg-a", .version = "1.0.0" },
+    } };
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    // Plain discovery stops at the missing archive ...
+    try std.testing.expectError(error.ProviderArchiveMissing, discoverAll(a, root, cfg, &sources, .unknown));
+    // ... the survey names it and still reads the provider after it.
+    const found = try survey(a, root, cfg, &sources);
+    try std.testing.expectEqual(@as(usize, 1), found.providers.len);
+    try std.testing.expectEqualStrings("pkg-a", found.providers[0].meta.name);
+    try std.testing.expectEqual(@as(usize, 1), found.unavailable.len);
+    try std.testing.expectEqualStrings("pkg-b", found.unavailable[0].package);
+    try std.testing.expectEqual(@as(anyerror, error.ProviderArchiveMissing), found.unavailable[0].err);
+    try std.testing.expectEqualStrings("pkg-b", found.unresolved[0]);
+}
+
+test "provider dispatch: own-settings resolution opens only the selected provider's file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project/providers");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/providers/good.json", .data = "{\"label\":\"x\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/providers/bad.json", .data = "{not json" });
+    const cfg: project.ProjectConfig = .{ .name = "game", .provider_config = &.{
+        .{ .package = "bad", .file = "providers/bad.json" },
+        .{ .package = "good", .file = "providers/good.json" },
+    } };
+    const meta: manifest.Manifest = .{ .name = "", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" };
+    var providers = [_]Provider{
+        .{ .dep = .{ .name = "bad", .repo = "local:../bad", .version = "1.0.0" }, .dir = root, .meta = meta, .verified = true },
+        .{ .dep = .{ .name = "good", .repo = "local:../good", .version = "1.0.0" }, .dir = root, .meta = meta, .verified = true },
+    };
+    providers[0].meta.name = "bad";
+    providers[1].meta.name = "good";
+    try checkSettingsMapping(cfg, &providers);
+    // `labelle <ns> <cmd>` (`.all`): the other provider's bad file stops it.
+    try std.testing.expectError(error.InvalidProviderConfigJson, resolveSettings(a, root, cfg, &providers, "good"));
+    // `labelle doctor` (`.selected`): each provider stands alone.
+    const own = (try resolveOwnSettings(a, root, cfg, "good")).?;
+    try std.testing.expectEqualStrings("good.json", std.fs.path.basename(own));
+    try std.testing.expectError(error.InvalidProviderConfigJson, resolveOwnSettings(a, root, cfg, "bad"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try resolveOwnSettings(a, root, cfg, "other"));
+    // The mapping check alone: an entry naming no verified provider.
+    providers[1].verified = false;
+    try std.testing.expectError(error.UnresolvedProviderConfig, checkSettingsMapping(cfg, &providers));
+}
+
+test "provider dispatch: the host compiler is provisioned like `labelle build`, not refused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.writeFile(io, .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\", .zig_version = \"0.16.0\" }" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Probe = struct {
+        var calls: usize = 0;
+        var seen: []const u8 = "";
+        fn provision(_: std.mem.Allocator, project_dir: []const u8) anyerror![]u8 {
+            calls += 1;
+            seen = project_dir;
+            return error.ProbeProvisioned;
+        }
+        fn missing(pa: std.mem.Allocator, _: []const u8) anyerror![]u8 {
+            calls += 1;
+            return pa.dupe(u8, "/nonexistent/zig-override");
+        }
+    };
+    // The resolution goes through the provisioner, for this project's root,
+    // and its outcome is the result (a download failure, not a refusal).
+    try std.testing.expectError(error.ProbeProvisioned, resolveHostWith(a, root, Probe.provision));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqualStrings(root, Probe.seen);
+    // An override naming no file is the one `ProviderCompilerMissing`.
+    try std.testing.expectError(error.ProviderCompilerMissing, resolveHostWith(a, root, Probe.missing));
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}
+
+test "provider dispatch: a HostCache resolves once, and keeps a success or a failure" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var fail = true;
+        fn resolve(_: std.mem.Allocator, _: []const u8) anyerror!Host {
+            calls += 1;
+            if (fail) return error.ProbeOffline;
+            return .{ .zig = "/z", .cache_root = "/c", .global_cache = "/g", .packages = "/p" };
+        }
+    };
+    var failing: HostCache = .{ .resolve = Probe.resolve };
+    for (0..3) |_| try std.testing.expectError(error.ProbeOffline, failing.get(std.testing.allocator, "/proj"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    Probe.fail = false;
+    var working: HostCache = .{ .resolve = Probe.resolve };
+    for (0..3) |_| try std.testing.expectEqualStrings("/z", (try working.get(std.testing.allocator, "/proj")).zig);
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+}

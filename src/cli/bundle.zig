@@ -5,8 +5,8 @@
 //! (`.app/Contents/Info.plist` → `CFBundleIconFile` →
 //! `Contents/Resources/*.icns`), so a bare binary shows the generic
 //! executable glyph in the Dock, Finder and Launchpad no matter what
-//! `project.labelle` `.app_icon` says. Android has had the icon since
-//! cli#340; this module gives desktop macOS parity.
+//! `project.labelle` `.app_icon` says. This module gives desktop macOS
+//! the icon a platform packager already stages (cli#340).
 //!
 //! It runs AFTER the normal generate+build pipeline (see `pipeline.zig`)
 //! and wraps the built exe:
@@ -20,8 +20,9 @@
 //!         Resources/AppIcon.icns      from the resolved icon PNG, via iconutil
 //!         Resources/assets/           copy of the project's `assets/` tree
 //!
-//! `<out>` defaults to the target dir's `zig-out/` (next to `bin/`), or
-//! `--output <dir>`. The exe keeps the name the generated build.zig
+//! `<out>` defaults to the target dir's `zig-out/bundle/desktop/` (the
+//! step output-directory contract shared with provider `bundle` hooks,
+//! see `docs/provider-hooks.md`), or `--output <dir>`. The exe keeps the name the generated build.zig
 //! produced (`util.sanitizeExeName(project.name)`, labelle-assembler#362)
 //! so `CFBundleExecutable` and `pgrep -f <name>` agree with `labelle run`.
 //!
@@ -59,8 +60,8 @@
 //! Apple documents it: write an `AppIcon.iconset/` holding the ten
 //! standard PNGs (16…512 at @1x/@2x, i.e. 16…1024 px) and run
 //! `iconutil -c icns` (the iconset is scratch under `~/.labelle/tmp/`,
-//! never under the output dir). Sizes at or below the master use the same box
-//! filter as Android; sizes ABOVE it use nearest-neighbour so a
+//! never under the output dir). Sizes at or below the master use the shared
+//! box filter (`app_icon.zig`); sizes ABOVE it use nearest-neighbour so a
 //! pixel-art master (flying-platform: 576×576 on a 24-px grid) is not
 //! blurred into the 1024 slot. 1024 is not a multiple of 24, so a 1152
 //! or 1536 master (24×48 / 24×64) gives integer ratios for most entries.
@@ -155,12 +156,12 @@ pub fn printUnsupported() void {
 }
 
 /// `CFBundleIdentifier` from the project `.name`, following the
-/// `com.labelle.<name>` scheme the Android manifest and the iOS plist
-/// already use (`android/package.zig` `defaultPackageName`, `ios.zig`
-/// `defaultBundleId`) so one project is the same "app" everywhere.
+/// `com.labelle.<name>` scheme the other platform packagers use (`ios.zig`
+/// `defaultBundleId`, and the providers' package ids) so one project is
+/// the same "app" everywhere.
 ///
-/// Apple's allowed alphabet is narrower than Android's: `[A-Za-z0-9-.]`
-/// — no underscore, while Android REQUIRES underscore over hyphen. So
+/// Apple's allowed alphabet is narrow: `[A-Za-z0-9-.]` — no underscore,
+/// though other platforms require underscore over hyphen. So
 /// the map is `_`/space → `-` and any other disallowed byte dropped,
 /// falling back to `game` (like `sanitizeExeName`) if nothing survives.
 /// Caller owns the slice.
@@ -522,6 +523,9 @@ pub fn exeNameFromBuildZig(source: []const u8) ?[]const u8 {
     return name;
 }
 
+/// Suffix Zig gives the host-built game executable (`.exe` on Windows).
+const exe_ext = builtin.target.exeFileExt();
+
 /// The built desktop executable: `name` (what `CFBundleExecutable` gets)
 /// and its `path` under `<target>/zig-out/bin/`. Both owned.
 pub const ResolvedExe = struct {
@@ -551,6 +555,21 @@ pub const ResolvedExe = struct {
 /// something the build didn't produce) fall back to probing the two
 /// candidates, and then prefer the MOST RECENTLY MODIFIED one — the one
 /// the build just wrote.
+/// `<bin_dir>/<name>` if it exists, else `<bin_dir>/<name><exe_ext>` (what Zig
+/// installs on a Windows host), else null. Caller owns the returned path.
+fn existingExe(allocator: std.mem.Allocator, bin_dir: []const u8, name: []const u8) !?[]u8 {
+    const bare = try std.fs.path.join(allocator, &.{ bin_dir, name });
+    if (util.fileExists(bare)) return bare;
+    allocator.free(bare);
+    if (exe_ext.len == 0) return null;
+    const file = try std.mem.concat(allocator, u8, &.{ name, exe_ext });
+    defer allocator.free(file);
+    const suffixed = try std.fs.path.join(allocator, &.{ bin_dir, file });
+    if (util.fileExists(suffixed)) return suffixed;
+    allocator.free(suffixed);
+    return null;
+}
+
 pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, project_name: []const u8) !ResolvedExe {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -562,13 +581,11 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     defer allocator.free(build_zig);
     if (cwd.readFileAlloc(io, build_zig, allocator, .limited(8 * 1024 * 1024))) |source| {
         defer allocator.free(source);
-        if (exeNameFromBuildZig(source)) |declared| {
-            const path = try std.fs.path.join(allocator, &.{ bin_dir, declared });
-            errdefer allocator.free(path);
-            if (util.fileExists(path)) {
-                return .{ .name = try allocator.dupe(u8, declared), .path = path };
+        if (exeNameFromBuildZig(source)) |declared_name| {
+            if (try existingExe(allocator, bin_dir, declared_name)) |path| {
+                errdefer allocator.free(path);
+                return .{ .name = try allocator.dupe(u8, declared_name), .path = path };
             }
-            allocator.free(path);
         }
     } else |_| {}
 
@@ -579,15 +596,15 @@ pub fn resolveBuiltExe(allocator: std.mem.Allocator, target_dir: []const u8, pro
     var best: ?ResolvedExe = null;
     errdefer if (best) |b| b.deinit(allocator);
     var best_mtime: i96 = 0;
-    for (candidates) |cand| {
-        const path = try std.fs.path.join(allocator, &.{ bin_dir, cand });
+    for (candidates) |cand_name| {
+        const path = (try existingExe(allocator, bin_dir, cand_name)) orelse continue;
         const st = cwd.statFile(io, path, .{}) catch {
             allocator.free(path);
             continue;
         };
         if (best == null or st.mtime.nanoseconds > best_mtime) {
             if (best) |b| b.deinit(allocator);
-            best = .{ .name = try allocator.dupe(u8, cand), .path = path };
+            best = .{ .name = try allocator.dupe(u8, cand_name), .path = path };
             best_mtime = st.mtime.nanoseconds;
         } else {
             allocator.free(path);
@@ -626,8 +643,8 @@ pub fn escapeXml(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 /// Everything `renderInfoPlist` needs. Raw (unescaped) strings — the
 /// renderer escapes. `icon_file` null omits `CFBundleIconFile` entirely,
-/// mirroring the Android manifest dropping `android:icon` when there is
-/// no icon to stage: a dangling reference makes Finder show a broken
+/// as a platform manifest drops its icon attribute when there is no icon
+/// to stage: a dangling reference makes Finder show a broken
 /// document glyph, which is worse than the generic app icon.
 pub const PlistInfo = struct {
     bundle_id: []const u8,
@@ -714,7 +731,7 @@ pub fn renderInfoPlist(allocator: std.mem.Allocator, info: PlistInfo) ![]u8 {
 /// Scale a decoded RGBA master to one square iconset size.
 ///
 /// At or below the master's smaller edge → box filter (area average,
-/// same as Android — crisp AND alias-free on non-integer ratios). Above
+/// `app_icon.resampleBox` — crisp AND alias-free on non-integer ratios). Above
 /// it → nearest-neighbour, because a box UPSCALE blends neighbours into
 /// every output pixel and smears pixel art. Caller owns the buffer.
 pub fn scaleForEntry(
@@ -795,7 +812,10 @@ pub fn buildIcns(allocator: std.mem.Allocator, iconset_dir: []const u8, icns_pat
 /// anchored to the PROJECT dir (same rule as `wasm export --output`, so
 /// `labelle bundle ../game --output dist` lands under the game, next to
 /// where its build output already lives); none → the target dir's
-/// `zig-out/`, beside `bin/`. Caller owns the slice.
+/// `zig-out/bundle/desktop/`, the step output directory provider `bundle`
+/// hooks receive as `output_dir` (`provider_hooks.stepOutputDir`), so the
+/// core packager and every hook agree on where the artifact is. Caller
+/// owns the slice.
 ///
 /// Unlike `wasm export` this never wipes the output dir itself — only
 /// the one `<Title>.app` inside it — so no destructive-path guard is
@@ -810,7 +830,7 @@ pub fn resolveOutputDir(
         if (std.fs.path.isAbsolute(o)) return allocator.dupe(u8, o);
         return std.fs.path.join(allocator, &.{ project_dir, o });
     }
-    return std.fs.path.join(allocator, &.{ target_dir, "zig-out" });
+    return std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bundle", "desktop" });
 }
 
 /// `child` is `parent` itself or lies below it. A plain prefix test is not
@@ -1285,8 +1305,8 @@ pub fn makeScratchIconset(allocator: std.mem.Allocator) ![]u8 {
 /// `labelle bundle` land here (`args.parseBundleArgs`).
 pub const Overrides = struct {
     /// `--output <dir>` (cli#359): where `<Title>.app` lands. `null` = the
-    /// target dir's `zig-out/`; a relative path anchors to the project
-    /// dir — see `resolveOutputDir`.
+    /// target dir's `zig-out/bundle/desktop/`; a relative path anchors to
+    /// the project dir — see `resolveOutputDir`.
     output: ?[]const u8 = null,
     /// `--build-number <n>` (cli#363): the `CFBundleVersion` to write,
     /// already validated by the parser. `null` = the derived rule on
@@ -1922,7 +1942,7 @@ test "writeIconset emits all ten PNGs at their sizes, upscaling a small master" 
     }
 }
 
-test "resolveOutputDir: absolute passes through, relative anchors to the project, default is target zig-out" {
+test "resolveOutputDir: absolute passes through, relative anchors to the project, default is target zig-out/bundle/desktop" {
     const a = testing.allocator;
     const abs_in = if (builtin.os.tag == .windows) "C:\\dist" else "/dist";
     const abs = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", abs_in);
@@ -1937,7 +1957,7 @@ test "resolveOutputDir: absolute passes through, relative anchors to the project
 
     const def = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", null);
     defer a.free(def);
-    const want_def = try std.fs.path.join(a, &.{ "/proj/.labelle/bgfx_desktop", "zig-out" });
+    const want_def = try std.fs.path.join(a, &.{ "/proj/.labelle/bgfx_desktop", "zig-out", "bundle", "desktop" });
     defer a.free(want_def);
     try testing.expectEqualStrings(want_def, def);
 }
@@ -2701,7 +2721,7 @@ test "createFromBuild fails loudly on a missing custom icon before writing anyth
 
     // Precedence: the custom path is fatal even though nothing else is
     // wrong — and no half-written bundle is left behind.
-    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "My Game.app" });
+    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "bundle", "desktop", "My Game.app" });
     defer a.free(bundle);
     try testing.expect(!util.dirExists(bundle));
 }
@@ -2906,7 +2926,7 @@ test "createFromBuild re-checks a --build-number that bypassed the parser, befor
     try testing.expectError(error.InvalidBuildNumber, createFromBuild(a, work, target, cfg, .{ .build_number = "1.2." }));
     try testing.expectError(error.BuildNumberTooLarge, createFromBuild(a, work, target, cfg, .{ .build_number = "10000" }));
 
-    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "My Game.app" });
+    const bundle = try std.fs.path.join(a, &.{ target, "zig-out", "bundle", "desktop", "My Game.app" });
     defer a.free(bundle);
     try testing.expect(!util.dirExists(bundle));
 }

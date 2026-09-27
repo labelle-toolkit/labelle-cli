@@ -87,13 +87,14 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    errdefer allocator.free(source);
+    defer allocator.free(source);
 
     // `ignore_unknown_fields`: the CLI's `project_config.ProjectConfig`
     // is a deliberately minimal copy of the assembler's schema (#217).
     // The assembler owns the schema and may add fields the CLI does not
     // mirror — without this, a newer project.labelle would fail to parse
     // and break the CLI for no good reason.
+    try @import("provider_settings.zig").validateProject(allocator, source, if (verbose) labelle_path else null);
     return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
@@ -167,6 +168,26 @@ pub const ProjectExistsSpec = struct {
 /// keys off the CLI version the project was locked with, which is the
 /// fact that actually predicts "this binary may not understand this
 /// project", rather than guessing from field names.
+/// A `project.labelle` with no `.backend` field builds with bgfx, the
+/// assembler's default since assembler#768 (it was raylib before).
+pub const DefaultBackendSpec = struct {
+    test "a project without .backend resolves to bgfx" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"demo\" }" });
+        const dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+        const cfg = try readProjectConfigQuiet(alloc, dir);
+        try std.testing.expectEqual(project_config.Backend.bgfx, cfg.backend);
+        try std.testing.expectEqual(project_config.Backend.bgfx, project_config.default_backend);
+        // An explicit field still wins.
+        try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"demo\", .backend = .raylib }" });
+        try std.testing.expectEqual(project_config.Backend.raylib, (try readProjectConfigQuiet(alloc, dir)).backend);
+    }
+};
+
 pub const CliMirrorToleranceSpec = struct {
     test "a resource carrying assembler-only fields still parses" {
         // Arena: the real callers parse into one too (the config strings

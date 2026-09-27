@@ -4,7 +4,9 @@ on:
   push:
     branches: [main, development]
   pull_request:
-    branches: [main, development]
+    # `feat/**` so a PR stacked on a feature branch (its base is the
+    # feature branch, not main/development) still gets CI.
+    branches: [main, development, 'feat/**']
 
 jobs:
   build:
@@ -63,6 +65,38 @@ jobs:
 
       - name: Build CLI
         run: zig build
+
+      - name: Setup Python for provider subprocess tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Provider dispatch subprocess regression
+        run: python test/provider_dispatch_e2e.py
+
+      - name: Provider output redirected to a file (cli#446)
+        run: python test/provider_output_e2e.py
+
+      - name: Prebuild output under --progress=json redirected to a file (cli#448)
+        run: python test/prebuild_stdio_e2e.py
+
+      - name: GitHub provider integrity subprocess regression
+        run: python test/provider_github_e2e.py
+
+      - name: Provider configuration subprocess regression
+        run: python test/provider_config_e2e.py
+
+      - name: Provider lifecycle hooks subprocess regression
+        run: python test/provider_hooks_e2e.py
+
+      - name: Provider targets subprocess regression
+        run: python test/provider_targets_e2e.py
+
+      - name: Android-shaped provider subprocess regression
+        run: python test/provider_android_like_e2e.py
+
+      - name: Provider doctor aggregation subprocess regression
+        run: python test/provider_doctor_e2e.py
 
       - name: CLI tests
         run: zig build test
@@ -230,6 +264,14 @@ jobs:
               --labelle-version="local:../../labelle-cli" \
               --assembler-version="local:../../labelle-assembler" &&
             cd docker_test &&
+            # `--platform=wasm` resolves only to a provider that declares the
+            # target (docs/provider-targets.md); the platform packages are not
+            # extracted yet, so declare the repo's own `wasm` fixture provider.
+            # The scaffold's empty `.plugins` is the seam: a template change
+            # that removes it must fail here, not as a "no provider" error.
+            grep -q '\.plugins = \.{},' project.labelle &&
+            sed -i 's|\.plugins = \.{},|.plugins = .{ .{ .name = "wasm_fixture", .repo = "local:../../labelle-cli/test/fixtures/wasm-provider", .version = "1.0.0" } },|' project.labelle &&
+            grep -q 'wasm_fixture' project.labelle &&
             ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm &&
             test -f .labelle/raylib_wasm/zig-out/web/game.wasm &&
             echo "Docker WASM build produced game.wasm"

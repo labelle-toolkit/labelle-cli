@@ -1,0 +1,497 @@
+"""Real CLI, GitHub-shaped archives, no network. Run after zig build."""
+import argparse
+import gzip
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--zig", default=shutil.which("zig"))
+parser.add_argument("--cli", default=str(Path(__file__).resolve().parents[1] / "zig-out/bin" / ("labelle.exe" if os.name == "nt" else "labelle")))
+options = parser.parse_args()
+assert options.zig
+zig = str(Path(options.zig).resolve())
+cli = str(Path(options.cli).resolve())
+version = subprocess.check_output([zig, "version"], text=True).strip()
+fixture = Path(__file__).parent / "fixtures/provider"
+manifest = '''.{ .name = "fixture", .manifest_version = 2,
+ .command_contract = ">=1.0.0 <2.0.0", .namespace = "probe",
+ .commands = .{ .{ .name = "inspect", .build_step = "probe-tool",
+ .executable = "bin/provider-probe", .help = "Inspect" } } }'''
+checks = 0
+
+def archive(revision="original", extra=None, text=manifest, before=None):
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        if before:
+            info, content = before
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        files = {p.name: p.read_bytes() for p in fixture.glob("*.zig")}
+        files["plugin.labelle"] = text.encode()
+        files["revision.zig"] = f'pub const value = "{revision}";\n'.encode()
+        for name, content in files.items():
+            info = tarfile.TarInfo("fixture-commit/" + name)
+            info.size = len(content)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(content))
+        if extra:
+            info, content = extra
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return gzip.compress(payload.getvalue(), mtime=0)
+
+with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
+    base = Path(temp).resolve()
+    project = base / "project"
+    project.mkdir()
+    home = base / "home"
+    # Hermetic: the no-provider diagnostic's live registry lookup is off
+    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig)
+    registry = base / "providers.json"
+    lock = project / "labelle.providers.lock"
+    preview = project / ".labelle/providers.preview.json"
+    capture = project / ".labelle/providers/fixture/capture.json"
+    data = archive()
+    pin = {"package": "fixture", "repo": "example/fixture", "version": "1.0.0", "commit": "1" * 40, "sha256": hashlib.sha256(data).hexdigest()}
+
+    def config(pins):
+        deps = ",".join('.{ .name = "%s", .repo = "%s", .version = "%s" }' % (p["package"], p["repo"], p["version"]) for p in pins)
+        (project / "project.labelle").write_text('.{ .name = "game", .zig_version = "%s", .plugins = .{ %s } }' % (version, deps))
+        (project / "labelle.lock").write_text('.{ .plugins = .{ %s } }' % deps)
+
+    def metadata(pins):
+        registry.write_text(json.dumps({"schema_version": 1, "providers": pins}))
+
+    def seed(pin, payload):
+        path = home / "provider-archives" / (pin["sha256"] + ".tar.gz")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return path
+
+    def run(*args, code=0):
+        global checks
+        result = subprocess.run([cli, *map(str, args)], cwd=project, env=env, capture_output=True, text=True, timeout=180)
+        assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
+        assert "leaked" not in result.stderr, result.stderr
+        checks += 1
+        return result
+
+    def resolve(*flags, code=0):
+        return run("providers", "resolve", registry, "--offline", *flags, code=code)
+
+    def accept(code=0):
+        # Acceptance is bound to a preview, so every accept reviews first.
+        resolve()
+        assert preview.exists(), "preview was not recorded"
+        return resolve("--accept", code=code)
+
+    def cleaned():
+        for name in ("provider-sources", "provider-runs"):
+            directory = home / name
+            assert not directory.exists() or not list(directory.iterdir()), f"workspace leaked: {directory}"
+
+    config([pin])
+    metadata([pin])
+    run("providers", "resolve", "--help")
+    # Nothing reviewed yet: accept fails closed before any archive work.
+    assert "ProviderPreviewMissing" in resolve("--accept", code=1).stderr
+    assert not lock.exists() and not preview.exists() and not home.exists()
+    assert "Preview: 1" in resolve().stderr
+    assert not lock.exists() and not home.exists(), "preview changed state"
+    recorded = json.loads(preview.read_text())
+    assert recorded["providers"] == [dict(pin, archive_url="https://codeload.github.com/example/fixture/tar.gz/" + pin["commit"], namespace=None, targets=[])]
+    assert recorded["source"] == str(registry) and len(recorded["digest"]) == 64
+    assert recorded["registry_schema"] == 1 and recorded["defaults"] == [] and len(recorded["registry_digest"]) == 64
+    assert "ProviderArchiveMissing" in resolve("--accept", code=1).stderr
+    assert not lock.exists(), "failed preparation wrote a lock"
+    assert preview.exists(), "failed preparation consumed the preview"
+    archive_path = seed(pin, data)
+    resolve("--accept")
+    assert json.loads(lock.read_text())["providers"] == [pin]
+    assert not preview.exists(), "successful accept kept the preview"
+    assert not capture.exists(), "resolve ran package code"
+    cleaned()
+    # Acceptance is bound to the reviewed preview: a registry repointed between
+    # the two invocations is rejected by package and field, and the lock is untouched.
+    old_lock = lock.read_bytes()
+    resolve()
+    metadata([dict(pin, commit="2" * 40)])
+    err = resolve("--accept", code=1).stderr
+    assert "ProviderPreviewMismatch" in err and "provider 'fixture' commit changed since preview" in err, err
+    assert lock.read_bytes() == old_lock and preview.exists()
+    metadata([dict(pin, sha256="0" * 64)])
+    err = resolve("--accept", code=1).stderr
+    assert "ProviderPreviewMismatch" in err and "provider 'fixture' sha256 changed since preview" in err, err
+    assert lock.read_bytes() == old_lock and preview.exists()
+    # An edited preview fails its own digest instead of being trusted.
+    metadata([pin])
+    preview.write_text(preview.read_text().replace(pin["commit"], "2" * 40))
+    assert "ProviderPreviewCorrupt" in resolve("--accept", code=1).stderr
+    assert lock.read_bytes() == old_lock
+    # The registry serving the reviewed record again is accepted.
+    accept()
+    assert lock.read_bytes() == old_lock and not preview.exists()
+    cleaned()
+    run("probe", "inspect", "one two", "", "$literal")
+    first = json.loads(capture.read_text())
+    assert first["args"] == ["one two", "", "$literal"] and first["revision"] == "original"
+    assert not Path(first["context"]["package_dir"]).exists(), "source survived invocation"
+    cleaned()
+    # Changes to the old unverified extraction cache cannot supply executable code.
+    legacy = home / "packages/plugins/example/fixture/1.0.0"
+    legacy.mkdir(parents=True)
+    (legacy / "plugin.labelle").write_text("not a manifest")
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["revision"] == "original"
+    # Metadata help verifies sources without resolving/building a compiler.
+    env["LABELLE_ZIG"] = str(base / "nonexistent-zig")
+    run("probe", "--help")
+    env["LABELLE_ZIG"] = zig
+    old_lock = lock.read_bytes()
+    capture.unlink()
+    archive_path.write_bytes(data + b"tampered")
+    assert "ProviderArchiveHashMismatch" in run("probe", "inspect", code=1).stderr
+    assert "ProviderArchiveHashMismatch" in accept(code=1).stderr
+    assert lock.read_bytes() == old_lock and not capture.exists()
+    archive_path.write_bytes(data)
+    # Failed preparation of the second provider must not replace a working lock.
+    broken = dict(pin, package="broken", repo="example/broken", sha256="0" * 64)
+    config([pin, broken])
+    metadata([pin, broken])
+    accept(code=1)
+    assert lock.read_bytes() == old_lock
+    cleaned()
+    config([pin])
+    # Unsafe archives fail even when their compressed SHA-256 matches the pin.
+    # Each entry names the rule that rejects it, so a stricter earlier check cannot mask a broken later one.
+    for name, kind, reason in (
+        ("fixture-commit/../escape.zig", None, "UnsafeProviderArchivePath"),
+        ("fixture-commit/link", tarfile.SYMTYPE, "ProviderArchiveLinkNotSupported"),
+        ("other-root/file.zig", None, "MultipleProviderArchiveRoots"),
+        ("fixture-commit/CON", None, "ReservedProviderArchiveName"),
+        ("fixture-commit/nul.zig", None, "ReservedProviderArchiveName"),
+        ("fixture-commit/MAIN.ZIG", None, "DuplicateProviderArchivePath"),
+        ("fixture-commit/ä.zig", None, "NonAsciiProviderArchivePath"),
+        ("fixture-commit/ctrl\x01.zig", None, "ControlCharProviderArchivePath"),
+        # Regular file main.zig first, then an entry below its case-folded name.
+        ("fixture-commit/MAIN.ZIG/x.zig", None, "CaseFoldedProviderArchiveFileDirConflict"),
+        # The reverse order: an entry below Build.zig/ precedes the file build.zig.
+        ("fixture-commit/Build.zig/x.zig", "before", "CaseFoldedProviderArchiveFileDirConflict"),
+    ):
+        member = tarfile.TarInfo(name)
+        if kind == "before":
+            unsafe_data = archive(before=(member, b""))
+        else:
+            if kind:
+                member.type = kind
+                member.linkname = "../../escape"
+            unsafe_data = archive(extra=(member, b""))
+        unsafe_pin = dict(pin, sha256=hashlib.sha256(unsafe_data).hexdigest())
+        seed(unsafe_pin, unsafe_data)
+        metadata([unsafe_pin])
+        assert reason in accept(code=1).stderr, name
+        assert lock.read_bytes() == old_lock
+        assert not (base / "escape.zig").exists()
+        cleaned()
+    # The hook graph is validated at --accept, before any pin is written: a
+    # provider whose hook references a hook nobody declares is rejected by
+    # the graph error's name, and the working lock is untouched (Codex P2 on
+    # #420 — an accepted lock used to fail only on the next help/build).
+    hooked = manifest.replace('.namespace = "probe",', '.namespace = "probe", .hooks = .{ .{ .id = "sign", .step = .build, '
+                              '.target = "desktop", .when = .after, .build_step = "probe-tool", .executable = "bin/provider-probe", '
+                              '.after_hooks = .{ "fixture/nope" } } },')
+    assert hooked != manifest
+    hooked_data = archive(text=hooked)
+    hooked_pin = dict(pin, sha256=hashlib.sha256(hooked_data).hexdigest())
+    seed(hooked_pin, hooked_data)
+    metadata([hooked_pin])
+    err = accept(code=1).stderr
+    assert "MissingHookReference" in err and "'fixture/sign' references unknown hook 'fixture/nope'" in err, err
+    assert lock.read_bytes() == old_lock and "Pinned" not in err
+    cleaned()
+    # Normal execution does not consult newly edited registry records.
+    updated_data = archive("updated")
+    updated = dict(pin, version="2.0.0", commit="2" * 40, sha256=hashlib.sha256(updated_data).hexdigest())
+    seed(updated, updated_data)
+    metadata([updated])
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["revision"] == "original"
+    config([updated])
+    assert "StaleProviderIntegrityPin" in run("probe", "inspect", code=1).stderr
+    accept()
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["revision"] == "updated"
+    assert json.loads(lock.read_text())["providers"] == [updated]
+    cleaned()
+    env["LABELLE_HOME"] = "../home"
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["revision"] == "updated"
+    cleaned()
+    env["LABELLE_HOME"] = str(home)
+    settings = project / "settings.json"
+    settings.write_text('{"label":"remote-settings"}')
+    project_file = project / "project.labelle"
+    project_file.write_text(project_file.read_text()[:-1] + ', .provider_config = .{ .{ .package = "fixture", .file = "settings.json" } } }')
+    run("probe", "inspect")
+    configured = json.loads(capture.read_text())
+    assert Path(configured["context"]["config_file"]) == settings.resolve()
+    assert configured["setting"] == "remote-settings"
+    cleaned()
+    # Missing and duplicate release records fail at preview, before any accept.
+    metadata([pin])
+    assert "ProviderReleaseNotInRegistry" in resolve(code=1).stderr
+    metadata([updated, updated])
+    assert "DuplicateProviderRelease" in resolve(code=1).stderr
+    assert not preview.exists() and json.loads(lock.read_text())["providers"] == [updated]
+    # The lock rename is the accept's commit point: a preview that cannot be
+    # removed afterwards (read-only .labelle) is a warning, not a failed exit,
+    # so exit status and lock state agree (#418). POSIX permissions only.
+    if os.name != "nt" and os.geteuid() != 0:
+        config([pin])
+        metadata([pin])
+        resolve()
+        labelle_dir = preview.parent
+        labelle_dir.chmod(0o555)
+        try:
+            err = resolve("--accept").stderr
+        finally:
+            labelle_dir.chmod(0o755)
+        assert "could not be removed" in err and "Pinned 1" in err, err
+        assert json.loads(lock.read_text())["providers"] == [pin], "exit 0 but the new lock is not in place"
+        assert preview.exists(), "the removal fault did not fire"
+        cleaned()
+    # Registry schema 2 (#411): release records carry namespace/target claims
+    # that --accept checks against the verified manifest, and the cached
+    # document answers "who provides target <t>" by lookup, with no archive.
+    config([pin])
+    old_lock = lock.read_bytes()
+    other = {"package": "other", "repo": "example/other", "version": "1.0.0", "commit": "3" * 40, "sha256": "0" * 64}
+
+    def schema_two(claims):
+        registry.write_text(json.dumps({"schema_version": 2, "defaults": [],
+                                        "providers": [dict(p, namespace=ns, targets=ts) for p, ns, ts in claims]}))
+
+    schema_two([(pin, "probe", ["probe-target"]), (other, None, ["other-target"])])
+    err = accept(code=1).stderr
+    assert "RegistryDeclarationMismatch" in err and "registry record fixture 1.0.0" in err, err
+    assert lock.read_bytes() == old_lock and "Pinned" not in err
+    schema_two([(pin, "probe", []), (other, None, ["other-target"])])
+    accept()
+    assert json.loads(lock.read_text()) == {"schema_version": 1, "providers": [pin]}
+    cleaned()
+    # `other` was never cached (its hash is not even real), so only the table can name it.
+    err = run("build", "--platform=other-target", code=1).stderr
+    assert "no provider for target 'other-target'" in err and "(registry: other)" in err, err
+    err = run("build", "--platform=unknown-target", code=1).stderr
+    assert "no provider for target 'unknown-target'" in err and "(registry:" not in err, err
+    # The project accepted from a LOCAL providers.json, so the no-provider
+    # lookup asks that file (named in the hint), never the public registry,
+    # even online. A stand-in `curl` that would serve a public document
+    # assigning `other-target` elsewhere logs any request. POSIX only.
+    accepted_record = json.loads((project / ".labelle/providers.registry.json").read_text())
+    assert accepted_record["source"] == str(registry.resolve()), accepted_record
+    if os.name != "nt":
+        public_shim = base / "public-shim"
+        public_shim.mkdir()
+        public_log = base / "public-requests.log"
+        public_doc = base / "public-providers.json"
+        public_doc.write_text(json.dumps({"schema_version": 2, "defaults": [], "providers": [
+            dict(other, package="public-owner", repo="example/public-owner", namespace=None, targets=["other-target"])]}))
+        (public_shim / "curl").write_text(f"""#!{sys.executable}
+import sys
+open({str(public_log)!r}, "a").write(sys.argv[-1] + "\\n")
+sys.stdout.write(open({str(public_doc)!r}).read())
+""")
+        (public_shim / "curl").chmod(0o755)
+        online = {"LABELLE_OFFLINE": "", "PATH": str(public_shim) + os.pathsep + env.get("PATH", "")}
+        saved = dict(env)
+        env.update(online)
+        try:
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "(registry: other)" in err and "public-owner" not in err, err
+            assert f"the registry this project last accepted from, {registry.resolve()}, lists package 'other' 1.0.0" in err, err
+            assert '.{ .name = "other", .repo = "github.com/example/other", .version = "1.0.0" },' in err, err
+            # Both resolve steps name that source, or resolve would read the public registry.
+            assert f"labelle providers resolve {registry.resolve()} --accept" in err, err
+            assert f"2. labelle providers resolve {registry.resolve()} " in err, err
+            # The custom source changes: the fresh read answers, not the recorded copy.
+            schema_two([(pin, "probe", []), (dict(other, version="1.1.0"), None, ["other-target"])])
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "lists package 'other' 1.1.0" in err, err
+            assert not public_log.exists(), public_log.read_text()
+            # Control: without the project's record the public registry IS asked.
+            (project / ".labelle/providers.registry.json").rename(base / "accepted-record.json")
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "(registry: public-owner)" in err and public_log.read_text().count("\n") == 1, err
+            (base / "accepted-record.json").rename(project / ".labelle/providers.registry.json")
+            schema_two([(pin, "probe", []), (other, None, ["other-target"])])
+        finally:
+            env.clear()
+            env.update(saved)
+    # The preview binds the whole registry document (#433), not just the
+    # selected pins: each change below leaves the fixture pin intact, and each
+    # is refused by name with the lock untouched.
+    claims = [(pin, "probe", []), (other, None, ["other-target"])]
+    old_lock = lock.read_bytes()
+
+    def refused(change, expected):
+        schema_two(claims)
+        resolve()
+        change()
+        err = resolve("--accept", code=1).stderr
+        assert "ProviderPreviewMismatch" in err and expected in err, err
+        assert lock.read_bytes() == old_lock and preview.exists() and "Pinned" not in err, err
+
+    # Schema 2 swapped for the same pins as schema 1 (the claim check would be a no-op).
+    refused(lambda: metadata([pin]), "registry schema_version changed since preview: 2 -> 1")
+    # A selected record's claim: the served claim is even true, only the binding refuses.
+    refused(lambda: schema_two([(pin, None, []), (other, None, ["other-target"])]), "provider 'fixture' namespace changed since preview")
+    # An unselected record's claim, which would otherwise reach the target-hint cache.
+    refused(lambda: schema_two([(pin, "probe", []), (other, None, ["moved-target"])]), "outside the selected releases")
+    # The defaults list.
+    refused(lambda: registry.write_text(json.dumps({"schema_version": 2, "defaults": [{"package": "fixture", "version": "1.0.0"}],
+                                                    "providers": [dict(p, namespace=ns, targets=ts) for p, ns, ts in claims]})),
+            "registry defaults changed since preview")
+    err = run("build", "--platform=moved-target", code=1).stderr
+    assert "(registry:" not in err, "an unreviewed document reached the target-hint cache: " + err
+    # Layout-only changes are the same normalised document, and are accepted.
+    schema_two(claims)
+    resolve()
+    registry.write_text(json.dumps(json.loads(registry.read_text()), indent=4))
+    resolve("--accept")
+    cleaned()
+    # A schema-1 document may not carry schema-2 claims.
+    registry.write_text(json.dumps({"schema_version": 1, "providers": [dict(pin, namespace="probe", targets=[])]}))
+    assert "UnknownField" in resolve(code=1).stderr
+    cleaned()
+    # Project repo forms (cli#405): the assembler needs `github.com/<owner>/<name>`,
+    # registry records and locks carry `<owner>/<name>`. Both project forms pin
+    # the same release and write a byte-identical lock; another host never matches.
+    metadata([pin])
+    config([pin])
+    accept()
+    bare_lock = lock.read_bytes()
+    hosted = dict(pin, repo="github.com/" + pin["repo"])
+    config([hosted])
+    accept()
+    assert lock.read_bytes() == bare_lock, "the github.com/ project form changed the lock"
+    assert json.loads(lock.read_text())["providers"] == [pin]
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["revision"] == "original"
+    cleaned()
+    config([dict(pin, repo="gitlab.com/" + pin["repo"])])
+    err = resolve(code=1).stderr
+    assert "NonGitHubProviderRepository" in err and "not on GitHub" in err and "ProviderReleaseNotInRegistry" not in err, err
+    err = run("probe", "inspect", code=1).stderr
+    assert "NonGitHubProviderRepository" in err and "not on GitHub" in err, err
+    assert lock.read_bytes() == bare_lock
+    config([hosted])
+    # `labelle providers fetch` (cli#405): a fresh checkout has the lock but an
+    # empty archive cache; normal commands never download, so they fail closed
+    # and name the command that materialises exactly the lock.
+    fresh = base / "fresh-home"
+    env["LABELLE_HOME"] = str(fresh)
+    fresh_archive = fresh / "provider-archives" / (pin["sha256"] + ".tar.gz")
+    capture.unlink()
+    err = run("probe", "inspect", code=1).stderr
+    assert "ProviderArchiveMissing" in err and "run `labelle providers fetch`" in err, err
+    err = run("providers", "fetch", "--offline", code=1).stderr
+    assert "ProviderArchiveMissing" in err and "provider 'fixture' 1.0.0" in err, err
+    assert not fresh_archive.exists()
+    err = run("providers", "fetch", "extra", code=1).stderr
+    assert "InvalidProviderArguments" in err, err
+    run("providers", "fetch", "--help")
+    # The lock lives next to project.labelle: outside a project, fetch says so.
+    outside = subprocess.run([cli, "providers", "fetch"], cwd=base, env=env, capture_output=True, text=True, timeout=180)
+    assert outside.returncode == 1 and "ProjectRequired" in outside.stderr and "not inside a labelle project" in outside.stderr, outside.stderr
+    checks += 1
+    if os.name != "nt":
+        # A stand-in `curl` first on PATH serves the codeload URL from a local
+        # file, so the CLI's real download path runs without the network.
+        # POSIX only: Windows resolves `curl` through PATHEXT differently.
+        shim_dir = base / "shim"
+        shim_dir.mkdir()
+        served = base / "served.json"
+        requests = base / "requests.log"
+        shim = shim_dir / "curl"
+        shim.write_text(f"""#!{sys.executable}
+import json, sys
+args = sys.argv[1:]
+url = args[-1]
+dest = args[args.index("--output") + 1]
+with open({str(requests)!r}, "a") as log:
+    log.write(url + "\\n")
+table = json.load(open({str(served)!r}))
+if url not in table:
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\\n")
+    sys.exit(22)
+open(dest, "wb").write(open(table[url], "rb").read())
+""")
+        shim.chmod(0o755)
+        env["PATH"] = str(shim_dir) + os.pathsep + os.environ.get("PATH", "")
+        url = "https://codeload.github.com/example/fixture/tar.gz/" + pin["commit"]
+        good = base / "good.tar.gz"
+        good.write_bytes(data)
+        tampered = base / "tampered.tar.gz"
+        tampered.write_bytes(data + b"tampered")
+
+        def serve(path):
+            served.write_text(json.dumps({url: str(path)}))
+
+        def requested():
+            return requests.read_text().split() if requests.exists() else []
+
+        # A mismatch fails closed, names the package and caches nothing.
+        serve(tampered)
+        err = run("providers", "fetch", code=1).stderr
+        assert "ProviderArchiveHashMismatch" in err and "provider 'fixture' 1.0.0" in err and "nothing was cached" in err, err
+        assert requested() == [url]
+        assert not list((fresh / "provider-archives").iterdir()), "a failed fetch left files in the cache"
+        assert lock.read_bytes() == bare_lock
+        # The pinned bytes are cached; the lock and the project are untouched, no package code ran.
+        serve(good)
+        out = run("providers", "fetch").stderr
+        assert "1 fetched, 0 already cached" in out, out
+        assert fresh_archive.read_bytes() == data and requested() == [url, url]
+        assert lock.read_bytes() == bare_lock and not capture.exists() and not preview.exists()
+        # Idempotent: a verified cache is a no-op, with no request.
+        out = run("providers", "fetch").stderr
+        assert "0 fetched, 1 already cached" in out and requested() == [url, url], out
+        run("providers", "fetch", "--offline")
+        run("probe", "inspect")
+        assert json.loads(capture.read_text())["revision"] == "original"
+        cleaned()
+        # A damaged cached archive is replaced by the verified pinned bytes.
+        fresh_archive.write_bytes(data + b"damaged")
+        assert "ProviderArchiveHashMismatch" in run("providers", "fetch", "--offline", code=1).stderr
+        assert "1 fetched" in run("providers", "fetch").stderr
+        assert fresh_archive.read_bytes() == data
+        # `labelle install` in a project with a providers lock fetches too,
+        # after the assembler's own install (a stand-in that only logs).
+        fresh_archive.unlink()
+        assembler_log = base / "assembler.log"
+        fake_assembler = base / "fake-assembler"
+        fake_assembler.write_text(f"""#!{sys.executable}
+import sys
+if sys.argv[1:] == ["--protocol-version"]:
+    print(99)
+else:
+    open({str(assembler_log)!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")
+""")
+        fake_assembler.chmod(0o755)
+        env["LABELLE_ASSEMBLER"] = str(fake_assembler)
+        out = run("install").stderr
+        assert assembler_log.read_text().startswith("install"), assembler_log.read_text()
+        assert "1 fetched" in out and fresh_archive.read_bytes() == data, out
+        del env["LABELLE_ASSEMBLER"]
+    env["LABELLE_HOME"] = str(home)
+    print(f"GitHub provider pins: {checks} real CLI invocations passed")

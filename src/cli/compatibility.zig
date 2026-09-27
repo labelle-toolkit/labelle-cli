@@ -131,10 +131,31 @@ fn compatWarnings(cfg: project_config.ProjectConfig, comptime emit: bool) u8 {
             std.debug.print("labelle: warning: {s} {s} is behind this CLI's tested {s} line ({s})\n", .{ d.name, d.pinned, d.name, d.curated });
             std.debug.print("  a major bump is a breaking change within that package alone — core, engine,\n", .{});
             std.debug.print("  gfx and cli version independently and their majors are not meant to match\n", .{});
-            std.debug.print("  hint: run `labelle upgrade all`\n\n", .{});
+            std.debug.print("  hint: run `labelle upgrade all`\n", .{});
+            if (migrationGuide(d)) |guide| std.debug.print("  {s}\n", .{guide});
+            std.debug.print("\n", .{});
         }
     }
     return warnings;
+}
+
+/// The migration guide for a `cli` pin on a line older than 2.0 when this
+/// CLI is 2.x or newer: `upgrade all` bumps the pins, but moving the Android
+/// and wasm targets to their provider packages is a project edit it cannot
+/// make (cli#405). Null for every other package or line.
+fn migrationGuide(d: DiamondPin) ?[]const u8 {
+    if (!std.mem.eql(u8, d.name, "cli")) return null;
+    if (parseVersion(d.pinned).major >= 2 or parseVersion(d.curated).major < 2) return null;
+    return "upgrading alone is not enough: the 2.0 CLI builds Android and wasm through provider\n" ++
+        "  packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+}
+
+test "compat: a 1.x cli pin under a 2.x CLI points at the migration guide; nothing else does" {
+    const guide = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "2.0.0" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, guide, "docs/migrating-to-2.0.md") != null);
+    try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "2.0.0", .curated = "2.1.0" }) == null);
+    try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "1.60.0", .curated = "1.75.0" }) == null);
+    try std.testing.expect(migrationGuide(.{ .name = "engine", .pinned = "1.67.0", .curated = "2.0.0" }) == null);
 }
 
 /// Decide whether a core-diamond package should emit a compat warning: true
@@ -252,7 +273,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
     // 0.93.1), which warned on every single build.
     // The #357 reproduction pinned core 1.26.0 / engine 2.5.0 / gfx 1.28.1 —
     // same MAJOR line as the curated set of its day, so it must not warn.
-    // Since core 2.0.0 / engine 3.0.0 / gfx 2.0.0 the curated line moved, so
+    // Since core 2.0.0 / engine 3.0.0 / gfx 2.0.0 / CLI 2.0.0 the curated line moved, so
     // the same-major-line guard is expressed on the current line, and the
     // 1.x set is asserted separately below as the case that SHOULD warn.
     const reported = project_config.ProjectConfig{
@@ -260,13 +281,13 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .core_version = "2.0.0",
         .engine_version = "3.0.0",
         .gfx_version = "2.0.0",
-        .labelle_version = "1.67.0",
+        .labelle_version = "2.0.0",
     };
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(reported, false));
 
     // A project still on the whole 1.x line is one MAJOR behind on core,
-    // engine AND gfx. Three warnings is the MAJOR-only compatibility gate
-    // firing exactly once per package — the behaviour that makes a major
+    // engine, gfx AND (since CLI 2.0.0) the CLI. Four warnings is the
+    // MAJOR-only compatibility gate firing exactly once per package — the behaviour that makes a major
     // bump load-bearing rather than cosmetic. Not a regression of #357.
     const one_major_behind = project_config.ProjectConfig{
         .name = "my_game",
@@ -275,7 +296,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .gfx_version = "1.36.0",
         .labelle_version = "1.67.0",
     };
-    try std.testing.expectEqual(@as(u8, 3), compatWarnings(one_major_behind, false));
+    try std.testing.expectEqual(@as(u8, 4), compatWarnings(one_major_behind, false));
 
     // …as does the flagship game's set (core 1.28.0 + engine 2.13.0).
     const flagship = project_config.ProjectConfig{
@@ -283,7 +304,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .core_version = "2.0.0",
         .engine_version = "3.0.0",
         .gfx_version = "2.0.0",
-        .labelle_version = "1.60.1",
+        .labelle_version = "2.0.0",
     };
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(flagship, false));
 }

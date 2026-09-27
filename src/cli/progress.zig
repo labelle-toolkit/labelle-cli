@@ -24,6 +24,11 @@
 //! `std.Progress` IPC (see `zig_progress.zig`); this module is the pure
 //! phase model + fan-out sink and knows nothing about the wire format.
 //!
+//! Terminal records absorb, with one exception: the interactive serve writes `done`
+//! before its interactive loop, and when an `after run` hook fails once the
+//! server stops, a `failed` record follows that `done`
+//! (`Reporter.reviseDoneAsFailed`) so the feed ends with the CLI's outcome.
+//!
 //! Record schema (stable; additive changes only — studio#28 consumes it):
 //!   { "phase":"resolve|generate|compile|link|run|done|failed",
 //!     "step":int?, "total":int?, "percent":float?,
@@ -325,6 +330,43 @@ pub const Reporter = struct {
     pub fn beginPhase(self: *Reporter, phase: Phase, detail: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.beginPhaseLocked(phase, detail);
+    }
+
+    /// Enter `phase`, or, when it is already the live phase, only rename
+    /// the sub-step. Provider hooks share the phase of the core step they
+    /// wrap (`generate`, `compile`, `run`) and the machine rejects a phase
+    /// re-entering itself, so a plain `beginPhase` would silently drop
+    /// whichever of the hook and the core step came second.
+    ///
+    /// `link` is a refinement of `compile` that Zig's progress stream may
+    /// or may not surface (`compileUpdate`), so a `compile` request while
+    /// the reporter sits in `link` is the same build step still running —
+    /// an `after build` hook, typically — and is emitted as a sub-step of
+    /// the live `link` phase. It is never a backward transition: the
+    /// machine would reject it and the advertised `hook <package>/<id>`
+    /// sub-step would be lost to feed consumers.
+    pub fn beginPhaseOrStep(self: *Reporter, phase: Phase, detail: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const same_step = self.machine.current == phase or
+            (phase == .compile and self.machine.current == .link);
+        if (same_step) {
+            // A new sub-step (a hook, or the core step after one) starts
+            // with no counters: a compiler's `step`/`total` from an earlier
+            // `compileUpdate` would otherwise ride along on the hook's
+            // record — and its terminal one — as a stale percentage
+            // (Codex P2 on #420). `beginPhaseLocked` resets them the same way.
+            self.step = null;
+            self.total = null;
+            self.setDetailLocked(detail);
+            self.emitLocked(true, true);
+            return;
+        }
+        self.beginPhaseLocked(phase, detail);
+    }
+
+    fn beginPhaseLocked(self: *Reporter, phase: Phase, detail: []const u8) void {
         self.machine.transition(phase) catch return;
         self.step = null;
         self.total = null;
@@ -380,6 +422,27 @@ pub const Reporter = struct {
     /// Terminal failure record carrying the failing stage's exit code.
     pub fn finishFailed(self: *Reporter, exit_code: u8, detail: []const u8) void {
         self.finishWith(.failed, exit_code, detail);
+    }
+
+    /// Revise a `done` record to `failed`. Terminal states otherwise absorb;
+    /// this is the one sanctioned exception, for the interactive serve: its `done`
+    /// lands BEFORE the interactive loop (the build is ready to be served),
+    /// and its `after run` hooks run only once the server stops. When one of
+    /// those fails, the CLI exits with the hook's code, so the status file
+    /// and the NDJSON stream must not keep reporting success (Codex P2 on
+    /// #420): a `failed` record follows the provisional `done`. A no-op
+    /// unless the live state is `done`.
+    pub fn reviseDoneAsFailed(self: *Reporter, exit_code: u8, detail: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.machine.current != .done) return;
+        self.machine.current = .failed;
+        self.exit_code = exit_code;
+        self.step = null;
+        self.total = null;
+        if (detail.len > 0) self.setDetailLocked(detail);
+        self.emitLocked(true, true);
+        self.clearSpinnerLocked();
     }
 
     /// Wipe the spinner line (no-op when nothing is drawn) so a subsequent
@@ -855,6 +918,157 @@ pub const ReporterPipelineSpec = struct {
             defer allocator.free(phase);
             try std.testing.expectEqualStrings("done", phase);
         }
+    }
+
+    test "beginPhaseOrStep renames the sub-step inside the live phase and still enters a new one" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        rep.beginPhase(.generate, "assembler generate");
+        // A hook wrapping the compile enters the phase like beginPhase would.
+        rep.beginPhaseOrStep(.compile, "hook pkg/pre");
+        try std.testing.expectEqual(Phase.compile, rep.machine.current.?);
+        try std.testing.expectEqualStrings("hook pkg/pre", rep.detail_buf[0..rep.detail_len]);
+        // The core step then re-enters the same phase: beginPhase drops it
+        // (the machine rejects self re-entry) — the step helper keeps it.
+        rep.beginPhase(.compile, "zig build");
+        try std.testing.expectEqualStrings("hook pkg/pre", rep.detail_buf[0..rep.detail_len]);
+        rep.beginPhaseOrStep(.compile, "zig build");
+        try std.testing.expectEqualStrings("zig build", rep.detail_buf[0..rep.detail_len]);
+        try std.testing.expectEqual(Phase.compile, rep.machine.current.?);
+        // Backward moves are still refused, exactly as beginPhase refuses them.
+        rep.beginPhaseOrStep(.generate, "hook pkg/late");
+        try std.testing.expectEqual(Phase.compile, rep.machine.current.?);
+        try std.testing.expectEqualStrings("zig build", rep.detail_buf[0..rep.detail_len]);
+        rep.finishDone(0);
+    }
+
+    test "beginPhaseOrStep(.compile) while in link is a sub-step of link, and is emitted" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        rep.beginPhaseOrStep(.compile, "zig build");
+        // Zig's progress stream detected the link step: compile → link.
+        rep.compileUpdate(null, null, "lld", true);
+        try std.testing.expectEqual(Phase.link, rep.machine.current.?);
+
+        // An `after build` hook reports under the build's phase (`compile`)
+        // while the reporter is already in `link`. Before the fix this was
+        // a rejected backward transition: the phase stayed `link` but the
+        // detail stayed "lld" and no record was written — feed consumers
+        // never saw the advertised sub-step.
+        rep.beginPhaseOrStep(.compile, "hook pkg/post");
+        try std.testing.expectEqual(Phase.link, rep.machine.current.?);
+        try std.testing.expectEqualStrings("hook pkg/post", rep.detail_buf[0..rep.detail_len]);
+        {
+            const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+            defer allocator.free(raw);
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+            defer parsed.deinit();
+            // The record carries the forward phase AND the hook sub-step.
+            try std.testing.expectEqualStrings("link", parsed.value.object.get("phase").?.string);
+            try std.testing.expectEqualStrings("hook pkg/post", parsed.value.object.get("detail").?.string);
+        }
+        // Only the compile/link pair is folded: a genuinely earlier phase is
+        // still refused, so the fold cannot mask a programmer error.
+        rep.beginPhaseOrStep(.generate, "hook pkg/late");
+        try std.testing.expectEqual(Phase.link, rep.machine.current.?);
+        try std.testing.expectEqualStrings("hook pkg/post", rep.detail_buf[0..rep.detail_len]);
+        // And a later phase still moves forward from link.
+        rep.beginPhaseOrStep(.run, "game");
+        try std.testing.expectEqual(Phase.run, rep.machine.current.?);
+        rep.finishDone(0);
+    }
+
+    test "a hook sub-step clears the compiler's step counters" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        rep.beginPhaseOrStep(.compile, "zig build");
+        rep.compileUpdate(7, 10, "game.zig", false);
+        try expect.equal(rep.step.?, @as(u64, 7));
+        // An `after build` hook begins in the same phase: the record it
+        // writes must not carry the compiler's 7/10 (70%).
+        rep.beginPhaseOrStep(.compile, "hook pkg/post");
+        try std.testing.expect(rep.step == null and rep.total == null);
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("hook pkg/post", parsed.value.object.get("detail").?.string);
+        try std.testing.expect(parsed.value.object.get("step").? == .null);
+        try std.testing.expect(parsed.value.object.get("total").? == .null);
+        try std.testing.expect(parsed.value.object.get("percent").? == .null);
+        // The terminal record after the hook carries none either.
+        rep.finishDone(0);
+        try std.testing.expect(rep.step == null and rep.total == null);
+    }
+
+    test "reviseDoneAsFailed turns a provisional done into failed, and only a done" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path_buf);
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "probe_target" });
+        defer allocator.free(target_dir);
+
+        var rep = try Reporter.init(allocator, io, .off, target_dir);
+        defer rep.deinit();
+
+        // A live build is not revised: failing it is finishFailed's job.
+        rep.beginPhase(.compile, "zig build");
+        rep.reviseDoneAsFailed(3, "hook failed");
+        try std.testing.expectEqual(Phase.compile, rep.machine.current.?);
+        // The serve's provisional done, then a failing after-run hook:
+        // finishFailed alone is absorbed (the bug) — the revision is not.
+        rep.finishDone(0);
+        rep.finishFailed(3, "hook failed");
+        try std.testing.expectEqual(Phase.done, rep.machine.current.?);
+        rep.reviseDoneAsFailed(3, "hook failed");
+        try std.testing.expectEqual(Phase.failed, rep.machine.current.?);
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, rep.status_path, allocator, .limited(64 * 1024));
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("failed", parsed.value.object.get("phase").?.string);
+        try expect.equal(parsed.value.object.get("exit_code").?.integer, @as(i64, 3));
+        try std.testing.expectEqualStrings("hook failed", parsed.value.object.get("detail").?.string);
+        // A failed record is never revised again.
+        rep.reviseDoneAsFailed(9, "late");
+        try expect.equal(rep.exit_code.?, @as(u8, 3));
     }
 
     test "failure path: compile error ends failed with the zig exit code" {
