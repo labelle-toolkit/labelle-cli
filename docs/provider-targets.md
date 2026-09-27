@@ -71,10 +71,12 @@ one target, in two halves, before anything is generated, locked or built:
      document against the digest in that same snapshot. When it verifies and
      the source is not the public registry, the recorded document answers —
      nothing is downloaded or re-read — and the hint names that source. The
-     source is printed on a line of its own, to copy as is, and steps 2 and
-     3 say to pass it to `labelle providers resolve`; it is never
-     interpolated into a shell command, since quoting differs per shell
-     (`cmd.exe` expands `%…%` even inside double quotes).
+     source is printed on a line of its own, and steps 2 and 3 say to pass
+     it to `labelle providers resolve`; it is never interpolated into a
+     shell command, since quoting differs per shell (`cmd.exe` expands
+     `%…%` even inside double quotes). The hint tells the user to quote or
+     escape it for their own shell, because a path can contain spaces or
+     special characters.
    - **A record that does not verify** (unreadable, the CLI 2.0.0 layout
      without a digest, a document that does not match its digest, a source
      with control characters) means the project's source is unknown: the

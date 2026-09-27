@@ -123,7 +123,7 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
             try w.print("  {s} lists package '{s}' as the provider of target '{s}'.\n", .{ from, hint.package, target });
             try w.print("  Its newest release that declares the target, {s}, is a candidate: `labelle providers resolve --accept`\n", .{hint.version});
             try w.writeAll("  checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the target).\n");
-            if (hint.registry) |source| try w.print("  That registry's source, to pass as the argument of both resolve steps (copy it as is):\n    {s}\n", .{source});
+            if (hint.registry) |source| try w.print("  That registry's source, to pass as the argument of both resolve steps (quote or escape it for your shell, since it may contain spaces or special characters):\n    {s}\n", .{source});
             try w.writeAll("  To use it:\n");
             try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, hint.version });
             if (hint.registry != null) {
@@ -333,7 +333,7 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
     try std.testing.expect(std.mem.startsWith(u8, custom, head));
     try std.testing.expect(has(custom, "The registry this project last accepted from lists package 'fixture' as the provider"));
     try std.testing.expect(has(custom, "2.0.0, is a candidate: `labelle providers resolve --accept`"));
-    try std.testing.expect(has(custom, try std.fmt.allocPrint(a, "(copy it as is):\n    {s}\n", .{source})));
+    try std.testing.expect(has(custom, try std.fmt.allocPrint(a, "(quote or escape it for your shell, since it may contain spaces or special characters):\n    {s}\n", .{source})));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, custom, source));
     try std.testing.expect(has(custom, "run `labelle providers resolve` with the source above as its argument"));
     try std.testing.expect(!has(custom, "labelle providers resolve --accept   #") and !has(custom, "labelle providers resolve            #"));
