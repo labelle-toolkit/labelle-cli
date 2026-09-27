@@ -72,7 +72,16 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
                 std.debug.print("    namespace {s}, targets {s}\n", .{ jsonText(a, record.namespace), jsonText(a, record.targets) });
             }
         }
-        if (known and !found) return error.ProviderReleaseNotInRegistry;
+        if (known and !found) {
+            // A declaration on another host can never match a GitHub pin:
+            // say so, instead of reading as a missing release.
+            const repo = pin_mod.projectRepo(dep.repo) catch |err| {
+                if (err == error.NonGitHubProviderRepository) pin_mod.reportNonGitHub(dep);
+                return err;
+            };
+            std.debug.print("labelle: no registry release of '{s}' matches the project's .repo = \"{s}\" ({s}) and .version = \"{s}\"\n", .{ dep.name, dep.repo, repo, dep.version });
+            return error.ProviderReleaseNotInRegistry;
+        }
     }
     if (!accept) {
         const shown = try writePreview(a, root, source, doc, selected.items);
@@ -104,7 +113,10 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     // a cycle only moved the failure to the project's next help/build.
     var providers: std.ArrayList(dispatch.Provider) = .empty;
     for (selected.items) |pin| {
-        const dir = try sources.fromPin(pin, !offline);
+        const dir = sources.fromPin(pin, !offline) catch |err| {
+            if (err == error.ProviderArchiveMissing) std.debug.print("labelle: provider '{s}' {s}: archive {s} is not cached, and --offline downloads nothing; accept without --offline to fetch it\n", .{ pin.package, pin.version, pin.sha256 });
+            return err;
+        };
         const meta = try manifest.parse(a, try read(a, try std.fs.path.join(a, &.{ dir, "plugin.labelle" }), 1024 * 1024));
         // A schema-2 registry's ownership claims for this release must be
         // what its verified manifest declares, before anything is pinned.
@@ -235,4 +247,61 @@ test "provider github: accept refuses a schema-2 record whose claims the verifie
     const lock = try parse(a, try read(a, try std.fs.path.join(a, &.{ fx.root, lock_name }), 1024 * 1024), true);
     try std.testing.expectEqual(@as(usize, 1), lock.providers.len);
     try std.testing.expectEqual(@as(u8, 1), lock.schema_version);
+}
+
+test "provider github: the lock is the same for the github.com and the bare project repo, and another host is refused by name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const lock_path = try std.fs.path.join(a, &.{ fx.root, lock_name });
+    // The bare form (the registry's own spelling).
+    try fx.declare(a, "example/fixture");
+    try fx.run(a, false);
+    try fx.run(a, true);
+    const bare = try read(a, lock_path, 1024 * 1024);
+    try std.Io.Dir.cwd().deleteFile(config.globalIo(), lock_path);
+    // The assembler's form: previously `ProviderReleaseNotInRegistry`.
+    try fx.declare(a, "github.com/example/fixture");
+    try fx.run(a, false);
+    try fx.run(a, true);
+    const hosted = try read(a, lock_path, 1024 * 1024);
+    try std.testing.expectEqualStrings(bare, hosted);
+    // The lock keeps the registry's bare owner/name form.
+    try std.testing.expectEqualStrings("example/fixture", (try parse(a, hosted, true)).providers[0].repo);
+    // Normal commands match the lock against the host-qualified declaration too.
+    var sources: Sources = .{ .a = a };
+    defer sources.deinit();
+    const dep: @import("../project_config.zig").PluginDep = .{ .name = "fixture", .repo = "github.com/example/fixture", .version = "1.0.0" };
+    try std.testing.expect((try sources.projectDir(fx.root, dep)) != null);
+    // Another host is its own error, at resolve and against an existing lock,
+    // never a match and never a missing release.
+    try fx.declare(a, "gitlab.com/example/fixture");
+    try std.testing.expectError(error.NonGitHubProviderRepository, fx.run(a, false));
+    var other = dep;
+    other.repo = "gitlab.com/example/fixture";
+    try std.testing.expectError(error.NonGitHubProviderRepository, sources.projectDir(fx.root, other));
+    // A GitHub declaration of another repository is still stale.
+    other.repo = "github.com/example/other";
+    try std.testing.expectError(error.StaleProviderIntegrityPin, sources.projectDir(fx.root, other));
+    try fx.declare(a, "github.com/example/other");
+    try std.testing.expectError(error.ProviderReleaseNotInRegistry, fx.run(a, false));
+    try std.testing.expectEqualStrings(bare, try read(a, lock_path, 1024 * 1024));
+}
+
+test "provider github: a pinned archive missing from the cache fails closed until fetched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    try fx.run(a, false);
+    try fx.run(a, true);
+    // A fresh checkout: the lock is committed, the cache is empty.
+    try std.Io.Dir.cwd().deleteFile(config.globalIo(), try @import("archive.zig").archivePath(a, fx.pin));
+    var sources: Sources = .{ .a = a };
+    defer sources.deinit();
+    const dep: @import("../project_config.zig").PluginDep = .{ .name = "fixture", .repo = "example/fixture", .version = "1.0.0" };
+    try std.testing.expectError(error.ProviderArchiveMissing, sources.projectDir(fx.root, dep));
 }

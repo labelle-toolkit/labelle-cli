@@ -9,6 +9,7 @@ const sources = @import("provider_github/sources.zig");
 const registry_cache = @import("provider_github/registry_cache.zig");
 const preview = @import("provider_github/preview.zig");
 const resolve_mod = @import("provider_github/resolve.zig");
+const fetch_mod = @import("provider_github/fetch.zig");
 const test_fixtures = @import("provider_github/test_fixtures.zig");
 
 pub const lock_name = pin.lock_name;
@@ -34,6 +35,10 @@ pub const writePreview = preview.writePreview;
 pub const loadPreview = preview.loadPreview;
 pub const checkPreview = preview.checkPreview;
 pub const resolve = resolve_mod.resolve;
+pub const fetch = fetch_mod.fetch;
+pub const fetchCommand = fetch_mod.fetchCommand;
+pub const default_downloader = fetch_mod.default_downloader;
+pub const projectRepo = pin.projectRepo;
 pub const testProviderArchive = test_fixtures.testProviderArchive;
 
 /// Fresh archive extractions performed by any `Sources` — the test seam that
@@ -50,5 +55,6 @@ test {
     _ = registry_cache;
     _ = preview;
     _ = resolve_mod;
+    _ = fetch_mod;
     _ = test_fixtures;
 }

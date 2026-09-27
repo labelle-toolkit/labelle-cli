@@ -2,7 +2,7 @@
 
 Short guide for sending an internal tester a game build so they can receive updates automatically. Paired with `labelle android deploy` (ticket #141), this is the v1 of labelle's OTA story — zero custom infrastructure, ships through GitHub Releases.
 
-Since labelle-cli#405 the Android commands come from the `android` provider package ([labelle-android](https://github.com/labelle-toolkit/labelle-android)), not from the CLI itself. The project must add and pin it in `project.labelle` `.plugins`, and every `labelle android …` command runs inside that project. Signing, `package_name` and the `deploy` defaults live in the provider's settings file (`providers/android.json`); see the labelle-android README for the schema.
+Since labelle-cli#405 the Android commands come from the `android` provider package ([labelle-android](https://github.com/labelle-toolkit/labelle-android)), not from the CLI itself. The project must add it to `project.labelle` `.plugins` (`.repo = "github.com/labelle-toolkit/labelle-android"`) and pin it (`labelle providers resolve`, then `labelle providers resolve --accept`, and commit `labelle.providers.lock`), and every `labelle android …` command runs inside that project. On a fresh clone or a new machine, run `labelle providers fetch` (or `labelle install`) once first: it downloads the provider archive the lock pins, which no other command does, and without it every command fails with `ProviderArchiveMissing`. Signing, `package_name` and the `deploy` defaults live in the provider's settings file (`providers/android.json`); see the labelle-android README for the schema.
 
 ## Developer side (one-time per project)
 

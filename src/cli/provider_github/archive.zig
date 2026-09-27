@@ -17,7 +17,10 @@ pub fn archivePath(a: std.mem.Allocator, pin: Pin) ![]const u8 {
     return std.fs.path.join(a, &.{ try cacheRoot(a), "provider-archives", try std.fmt.allocPrint(a, "{s}.tar.gz", .{pin.sha256}) });
 }
 
-fn download(a: std.mem.Allocator, url: []const u8, dest: []const u8, max_size: usize) !void {
+/// The compressed size bound of every provider archive read or download.
+pub const max_archive_size = 128 * 1024 * 1024;
+
+pub fn download(a: std.mem.Allocator, url: []const u8, dest: []const u8, max_size: usize) !void {
     const result = try util.runCmd(a, &.{
         "curl",     "--fail",     "--silent",      "--show-error",   "--location",
         "--proto",  "=https",     "--proto-redir", "=https",         "--connect-timeout",
@@ -36,14 +39,14 @@ pub fn archive(a: std.mem.Allocator, pin: Pin, allow_download: bool) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     const path = try archivePath(a, pin);
-    const bytes = read(a, path, 128 * 1024 * 1024) catch |err| blk: {
+    const bytes = read(a, path, max_archive_size) catch |err| blk: {
         if (err != error.FileNotFound) return err;
         if (!allow_download) return error.ProviderArchiveMissing;
         try cwd.createDirPath(io, std.fs.path.dirname(path).?);
         const tmp = try uniqueName(a, path);
         defer cwd.deleteFile(io, tmp) catch {};
-        try download(a, try pin.archiveUrl(a), tmp, 128 * 1024 * 1024);
-        const downloaded = try read(a, tmp, 128 * 1024 * 1024);
+        try download(a, try pin.archiveUrl(a), tmp, max_archive_size);
+        const downloaded = try read(a, tmp, max_archive_size);
         if (!util.sha256Matches(downloaded, pin.sha256)) return error.ProviderArchiveHashMismatch;
         try std.Io.Dir.renameAbsolute(tmp, path, io);
         break :blk downloaded;

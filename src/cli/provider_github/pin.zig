@@ -29,8 +29,14 @@ pub const Pin = struct {
         if (!lowerHex(self.sha256, 64)) return error.InvalidArchiveHash;
     }
 
+    /// The project declaration names this exact release. The repo is
+    /// compared through `projectRepo`, so the host-qualified form the
+    /// assembler fetches (`github.com/<owner>/<name>`) and the bare registry
+    /// form (`<owner>/<name>`) both name the pin's repository; any other
+    /// host never matches.
     pub fn matches(self: Pin, dep: project.PluginDep) bool {
-        return std.mem.eql(u8, self.package, dep.name) and std.mem.eql(u8, self.repo, dep.repo) and std.mem.eql(u8, self.version, dep.version);
+        const repo = projectRepo(dep.repo) catch return false;
+        return std.mem.eql(u8, self.package, dep.name) and std.mem.eql(u8, self.repo, repo) and std.mem.eql(u8, self.version, dep.version);
     }
 
     pub fn archiveUrl(self: Pin, a: std.mem.Allocator) ![]const u8 {
@@ -38,6 +44,61 @@ pub const Pin = struct {
         return std.fmt.allocPrint(a, "https://codeload.github.com/{s}/tar.gz/{s}", .{ self.repo, self.commit });
     }
 };
+
+/// The single normaliser from a project `.plugins[].repo` to the bare
+/// `<owner>/<name>` form registry records and locks carry (and codeload
+/// URLs use). Every comparison of a pin with a project declaration goes
+/// through it (`Pin.matches`), never through its own string handling.
+///
+/// Accepted spellings are the ones the assembler fetches as the same GitHub
+/// repository (its `normalizeRemote`): an optional `git+`, an optional
+/// `https://`, `http://`, `git://` or `ssh://` scheme, the `github.com` host
+/// (ASCII case-insensitive, as DNS is), a `?ref`/`#sha` suffix, trailing
+/// slashes and a `.git` suffix are all dropped. The bare `<owner>/<name>`
+/// form (no host) is kept for projects that declared it before. Owner and
+/// name are returned byte for byte and compared exactly, as before: a pin
+/// for `Owner/Name` does not match a project declaring `owner/name`.
+///
+/// Provider pins are GitHub archives only (contract §4), so a repo on any
+/// other host is `NonGitHubProviderRepository`, never a match; anything
+/// else that is not `<owner>/<name>` is `InvalidGitHubRepository`.
+pub fn projectRepo(repo: []const u8) error{ NonGitHubProviderRepository, InvalidGitHubRepository }![]const u8 {
+    var r = repo;
+    if (std.ascii.startsWithIgnoreCase(r, "git+")) r = r["git+".len..];
+    inline for (.{ "https://", "http://", "git://", "ssh://" }) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(r, scheme)) {
+            r = r[scheme.len..];
+            break;
+        }
+    }
+    if (std.mem.indexOfAny(u8, r, "?#")) |i| r = r[0..i];
+    while (r.len > 0 and r[r.len - 1] == '/') r = r[0 .. r.len - 1];
+    if (std.mem.endsWith(u8, r, ".git")) r = r[0 .. r.len - ".git".len];
+    const slashes = std.mem.count(u8, r, "/");
+    if (slashes == 1) return checkedRepo(r);
+    if (slashes == 0) return error.InvalidGitHubRepository;
+    const host = r[0..std.mem.indexOfScalar(u8, r, '/').?];
+    if (!std.ascii.eqlIgnoreCase(host, github_host)) return error.NonGitHubProviderRepository;
+    return checkedRepo(r[host.len + 1 ..]);
+}
+
+pub const github_host = "github.com";
+
+fn checkedRepo(repo: []const u8) error{InvalidGitHubRepository}![]const u8 {
+    var parts = std.mem.splitScalar(u8, repo, '/');
+    var count: usize = 0;
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidGitHubRepository;
+        count += 1;
+    }
+    if (count != 2) return error.InvalidGitHubRepository;
+    return repo;
+}
+
+/// The diagnostic for a declared package whose `.repo` names another host.
+pub fn reportNonGitHub(dep: project.PluginDep) void {
+    std.debug.print("labelle: package '{s}' declares .repo = \"{s}\", which is not on GitHub; provider pins are GitHub archives only (codeload.github.com). Declare it as \"github.com/<owner>/<name>\".\n", .{ dep.name, dep.repo });
+}
 
 pub const Document = struct {
     schema_version: u8,
@@ -109,4 +170,46 @@ test "provider github: immutable GitHub identity and strict document" {
     try std.testing.expect(!safeArchivePath("root/C:/evil"));
     try std.testing.expect(!safeArchivePath("root/evil\\escape"));
     try std.testing.expect(safeArchivePath("repo-sha/src/main.zig"));
+}
+
+test "provider github: a project repo matches its pin in the GitHub forms the assembler fetches" {
+    const pin: Pin = .{ .package = "fixture", .repo = "owner/repo", .version = "1.0.0", .commit = "1" ** 40, .sha256 = "a" ** 64 };
+    const Case = struct { repo: []const u8, matches: bool };
+    for ([_]Case{
+        // The assembler's form and the bare registry form.
+        .{ .repo = "github.com/owner/repo", .matches = true },
+        .{ .repo = "owner/repo", .matches = true },
+        // Every other spelling the assembler resolves to the same repository.
+        .{ .repo = "https://github.com/owner/repo", .matches = true },
+        .{ .repo = "https://github.com/owner/repo.git", .matches = true },
+        .{ .repo = "git+https://github.com/owner/repo?ref=main", .matches = true },
+        .{ .repo = "GitHub.COM/owner/repo/", .matches = true },
+        // Owner/name are compared exactly, host or not (unchanged).
+        .{ .repo = "github.com/Owner/repo", .matches = false },
+        .{ .repo = "Owner/Repo", .matches = false },
+        // Another host never matches, even with the same owner/name.
+        .{ .repo = "gitlab.com/owner/repo", .matches = false },
+        .{ .repo = "https://codeberg.org/owner/repo", .matches = false },
+        .{ .repo = "github.com.evil/owner/repo", .matches = false },
+        .{ .repo = "github.com/owner/repo/extra", .matches = false },
+        .{ .repo = "repo", .matches = false },
+        .{ .repo = "", .matches = false },
+    }) |case| {
+        const dep: project.PluginDep = .{ .name = "fixture", .repo = case.repo, .version = "1.0.0" };
+        std.testing.expectEqual(case.matches, pin.matches(dep)) catch |err| {
+            std.debug.print("repo '{s}'\n", .{case.repo});
+            return err;
+        };
+    }
+    // The helper says WHY: another host is its own error, named for the diagnostic.
+    try std.testing.expectEqualStrings("owner/repo", try projectRepo("github.com/owner/repo"));
+    try std.testing.expectEqualStrings("owner/repo", try projectRepo("owner/repo"));
+    try std.testing.expectError(error.NonGitHubProviderRepository, projectRepo("gitlab.com/owner/repo"));
+    try std.testing.expectError(error.NonGitHubProviderRepository, projectRepo("https://codeberg.org/owner/repo"));
+    try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("github.com/owner/repo/extra"));
+    try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("github.com/../repo"));
+    try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("repo"));
+    // Name and version still have to match.
+    try std.testing.expect(!pin.matches(.{ .name = "other", .repo = "github.com/owner/repo", .version = "1.0.0" }));
+    try std.testing.expect(!pin.matches(.{ .name = "fixture", .repo = "github.com/owner/repo", .version = "1.0.1" }));
 }

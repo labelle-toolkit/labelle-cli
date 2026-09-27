@@ -76,11 +76,15 @@ const appendExtraArg = args_mod.appendExtraArg;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 const pipeline = @import("cli/pipeline.zig");
 
-/// Handle `labelle assembler <subcommand>`.
+/// Handle `labelle providers <resolve|fetch>`.
 fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     const usage = "Usage: labelle providers resolve [providers.json] [--accept] [--offline]\n" ++
         "  Without --accept: preview pins and record them in .labelle/providers.preview.json.\n" ++
-        "  --accept: pin only what that preview recorded; a changed registry is rejected.\n";
+        "  --accept: pin only what that preview recorded; a changed registry is rejected.\n" ++
+        "Usage: labelle providers fetch [--offline]\n" ++
+        "  Download the archives labelle.providers.lock pins that are not cached yet, verified\n" ++
+        "  against the lock's sha256 (no registry, no lock change, no package code); a mismatch\n" ++
+        "  caches nothing. --offline downloads nothing and only verifies the cache.\n";
     const sub = args.next() orelse {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -89,7 +93,8 @@ fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterato
         std.debug.print("{s}", .{usage});
         return 0;
     }
-    if (!std.mem.eql(u8, sub, "resolve")) return error.UnknownProviderOperation;
+    const is_fetch = std.mem.eql(u8, sub, "fetch");
+    if (!is_fetch and !std.mem.eql(u8, sub, "resolve")) return error.UnknownProviderOperation;
     var source: ?[]const u8 = null;
     var accept = false;
     var offline = false;
@@ -98,16 +103,20 @@ fn providerCommand(allocator: std.mem.Allocator, args: *std.process.Args.Iterato
             std.debug.print("{s}", .{usage});
             return 0;
         }
-        if (std.mem.eql(u8, arg, "--accept")) {
+        if (std.mem.eql(u8, arg, "--accept") and !is_fetch) {
             accept = true;
         } else if (std.mem.eql(u8, arg, "--offline")) {
             offline = true;
-        } else if (std.mem.startsWith(u8, arg, "-") or source != null) return error.InvalidProviderArguments else source = arg;
+        } else if (std.mem.startsWith(u8, arg, "-") or source != null or is_fetch) return error.InvalidProviderArguments else source = arg;
     }
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const root = try provider_dispatch.projectRoot(a) orelse return error.ProjectRequired;
+    if (is_fetch) {
+        _ = try provider_github.fetchCommand(a, root, offline, true);
+        return 0;
+    }
     try provider_github.resolve(a, root, source orelse provider_github.registry_url, accept, offline, &provider_dispatch.reserved);
     return 0;
 }
@@ -167,7 +176,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
     if (first_arg) |first| {
         if (std.mem.eql(u8, first, "providers")) {
             return providerCommand(allocator, &args) catch |err| {
-                std.debug.print("labelle: provider resolution failed: {s}\n", .{@errorName(err)});
+                std.debug.print("labelle: providers command failed: {s}\n", .{@errorName(err)});
                 return 1;
             };
         }

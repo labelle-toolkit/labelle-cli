@@ -135,6 +135,18 @@ Duplicate JSON keys, unknown fields, duplicate package/version records,
 repository conflicts and unsupported schemas are errors. A project lock
 contains at most one version per package. Releases are stable exact semver.
 
+Registry and lock `repo` values are always the bare `<owner>/<name>` form.
+The project's `.plugins[].repo` is compared with them after one
+normalisation (`projectRepo` in `src/cli/provider_github/pin.zig`), which
+accepts the spellings the assembler fetches as the same GitHub repository:
+`github.com/<owner>/<name>` (the form the assembler needs, and the one to
+declare), `https://github.com/<owner>/<name>` (an optional `git+`, `.git`,
+trailing `/` and `?ref`/`#sha` suffix are dropped), and the bare
+`<owner>/<name>`. The host is compared ASCII case-insensitively; owner and
+name are compared exactly. The lock written for any accepted spelling is
+byte-identical. A repository on any other host never matches a pin and fails
+with `NonGitHubProviderRepository`: only GitHub archives are accepted.
+
 `labelle providers resolve [providers.json]` previews the exact project-declared
 versions, commits and hashes and records them, with a digest, in
 `.labelle/providers.preview.json`. The preview binds the whole registry
@@ -158,8 +170,25 @@ Normal commands use only matching project pins and cached archives; no
 registry lookup, download or pin update is implicit. Verify the archive hash
 on every invocation, extract into a fresh temporary directory, and remove it
 afterward. Never execute the older unverified plugin extraction cache. Missing
-or corrupted archives fail closed. Repair the cached archive and explicitly
-resolve again; a changed GitHub archive is not automatically accepted.
+or corrupted archives fail closed (`ProviderArchiveMissing`,
+`ProviderArchiveHashMismatch`) and name `labelle providers fetch`; a changed
+GitHub archive is not automatically accepted.
+
+`labelle providers fetch [--offline]` is the explicit way to obtain the
+archives a committed lock pins (a fresh clone, a CI runner, an emptied
+cache). It reads `labelle.providers.lock` only, with no registry lookup and
+no preview, and downloads each pinned
+`https://codeload.github.com/<repo>/tar.gz/<commit>` that is not already
+cached and valid into `<LABELLE_HOME>/provider-archives/<sha256>.tar.gz`
+(`LABELLE_HOME` defaults to `~/.labelle`). Every download is verified
+against the lock's sha256 before anything is cached, and the run is all or
+nothing: one mismatch or failed download names the package, fails, and
+caches nothing. A cached archive that verifies is left alone, so a second run
+is a no-op; a damaged one is replaced only by bytes that verify. It never
+writes the lock, extracts nothing and runs no package code. `--offline`
+downloads nothing and only verifies the cache. A bare `labelle install` in a
+project that has a providers lock runs the same fetch after the assembler's
+package install.
 
 Namespace, target and command-contract declarations come from the verified
 `plugin.labelle`. The registry's ownership tables (schema 2, below) are a

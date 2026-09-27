@@ -20,7 +20,7 @@ pub fn printHelp() void {
         \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]  Build the WASM target, serve it locally (default port 8080), open the browser (`--watch` rebuilds + live-reloads on source changes)
         \\  wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]  Build the WASM target and package a deployment-ready dir (default ./release; `--zip` archives it; `--platform` adds host-specific touches; best-effort `wasm-opt -O3`)
         \\  targets              List the targets `--platform` accepts here: `desktop` (core) plus every target a pinned provider package declares (docs/provider-targets.md)
-        \\  install [pkg] [ver]  Fetch packages into cache
+        \\  install [pkg] [ver]  Fetch packages into cache (a bare `install` in a project with labelle.providers.lock also runs `providers fetch`)
         \\  install assembler <ver>  Download and cache an assembler binary
         \\  install <zig|emsdk> <ver>  Provision a managed build toolchain into ~/.labelle
         \\  install python       Provision managed Python for wasm builds (pinned version, ~25 MB)
@@ -34,6 +34,7 @@ pub fn printHelp() void {
         \\  check [dir]          Lint packs for §6 convention violations (Packs RFC)
         \\  plugins [dir]        List attached plugins with version, license, and author
         \\  providers resolve [providers.json] [--accept] [--offline]  Preview or pin GitHub providers for this project
+        \\  providers fetch [--offline]  Download the provider archives labelle.providers.lock pins (verified against the lock; no registry, no lock change); `--offline` only verifies the cache
         \\  doctor [dir] [--fix] [--json]  Check build requirements (SDL2, Zig, emsdk); `--fix` provisions, `--json` emits a capability report
         \\  help                 Show this help
         \\  version              Show CLI version

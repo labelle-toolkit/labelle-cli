@@ -101,8 +101,23 @@ pub const Sources = struct {
         const doc = try parse(self.a, bytes, true);
         for (doc.providers) |pin| {
             if (!std.mem.eql(u8, pin.package, dep.name)) continue;
-            if (!pin.matches(dep)) return error.StaleProviderIntegrityPin;
-            return try self.fromPin(pin, false);
+            if (!pin.matches(dep)) {
+                _ = pin_mod.projectRepo(dep.repo) catch |err| {
+                    if (err == error.NonGitHubProviderRepository) pin_mod.reportNonGitHub(dep);
+                    return err;
+                };
+                return error.StaleProviderIntegrityPin;
+            }
+            // Normal commands never download (contract §4); the explicit,
+            // lock-only way to obtain the pinned archives is `providers fetch`.
+            return self.fromPin(pin, false) catch |err| {
+                switch (err) {
+                    error.ProviderArchiveMissing => std.debug.print("labelle: provider '{s}' {s} is pinned in {s} but its archive is not cached; run `labelle providers fetch` to download the pinned archives\n", .{ pin.package, pin.version, lock_name }),
+                    error.ProviderArchiveHashMismatch => std.debug.print("labelle: the cached archive of provider '{s}' {s} does not match its pinned sha256; run `labelle providers fetch` to replace it with the pinned bytes\n", .{ pin.package, pin.version }),
+                    else => {},
+                }
+                return err;
+            };
         }
         return null;
     }

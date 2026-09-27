@@ -4,6 +4,7 @@ const assembler_proc = @import("assembler_proc.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const python_provision = @import("python_provision.zig");
+const provider_github = @import("provider_github.zig");
 
 /// Fetch and cache packages without modifying any project.
 ///
@@ -86,4 +87,15 @@ pub fn cmdInstall(allocator: std.mem.Allocator, cmd_args: []const []const u8) !v
     }
 
     try assembler_proc.runSubcommand(allocator, ".", "install", argv.items);
+
+    // A project install also materialises the provider archives its
+    // integrity lock pins: normal commands never download them (contract
+    // §4), so without this a fresh checkout has its packages but cannot run
+    // `generate`. Same as `labelle providers fetch`: the lock only, verified,
+    // no registry. A project without `labelle.providers.lock` skips it.
+    if (cmd_args.len == 0) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        _ = try provider_github.fetchCommand(arena.allocator(), ".", false, false);
+    }
 }
