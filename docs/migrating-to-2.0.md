@@ -24,7 +24,7 @@ is the worked example quoted throughout.
 
 ## Checklist
 
-1. [Bump the pins](#1-bump-the-pins): `.labelle_version = "2.0.0"`, `.assembler_version` ≥ 0.116.
+1. [Bump the pins](#1-bump-the-pins): `.labelle_version = "2.0.0"`, `.assembler_version` ≥ 0.116.1.
 2. [Check `.backend`](#2-check-backend): a project that declares none now builds with bgfx.
 3. [Add the providers](#3-add-the-providers-to-plugins) you need to `.plugins`.
 4. [Pin them](#4-pin-them-labelleproviderslock): `labelle providers resolve`, then `--accept`; commit `labelle.providers.lock`.

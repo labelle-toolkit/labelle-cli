@@ -99,7 +99,11 @@ pub fn serveNoBuild(
         .root = project_root,
         .cfg = parsed,
         .target = served.name,
-        .target_dir = wasm_target_dir,
+        // Contract §2 `target_dir`, under the canonical root so it is
+        // absolute whatever `project_dir` was (the building path's
+        // `hook_site` does the same); `wasm_target_dir` keeps the raw
+        // `project_dir`, so `wasm serve ../game --no-build` made it relative.
+        .target_dir = try std.fs.path.join(hook_arena, &.{ project_root, ".labelle", wasm_target }),
         .optimize = no_build_optimize,
         .progress = switch (parsed_args.progress_mode) {
             .human => .human,

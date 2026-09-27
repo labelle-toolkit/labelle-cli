@@ -52,9 +52,12 @@ pub const Pin = struct {
 ///
 /// Accepted spellings are the ones the assembler fetches as the same GitHub
 /// repository (its `normalizeRemote`): an optional `git+`, an optional
-/// `https://`, `http://`, `git://` or `ssh://` scheme, the `github.com` host
-/// (ASCII case-insensitive, as DNS is), a `?ref`/`#sha` suffix, trailing
-/// slashes and a `.git` suffix are all dropped. The bare `<owner>/<name>`
+/// `https://`, `http://`, `git://` or `ssh://` scheme, `user@` userinfo, the
+/// `github.com` host (ASCII case-insensitive, as DNS is), a `?ref`/`#sha`
+/// suffix, trailing slashes and a `.git` suffix are all dropped. The scp form
+/// `git@github.com:<owner>/<name>` is not one of them: the assembler cannot
+/// fetch it (it builds `https://git@github.com:<owner>/…`, an invalid port),
+/// so it is `InvalidGitHubRepository` here too. The bare `<owner>/<name>`
 /// form (no host) is kept for projects that declared it before. Owner and
 /// name are returned byte for byte and compared exactly, as before: a pin
 /// for `Owner/Name` does not match a project declaring `owner/name`.
@@ -77,9 +80,14 @@ pub fn projectRepo(repo: []const u8) error{ NonGitHubProviderRepository, Invalid
     const slashes = std.mem.count(u8, r, "/");
     if (slashes == 1) return checkedRepo(r);
     if (slashes == 0) return error.InvalidGitHubRepository;
-    const host = r[0..std.mem.indexOfScalar(u8, r, '/').?];
+    const authority = r[0..std.mem.indexOfScalar(u8, r, '/').?];
+    // `ssh://git@github.com/<owner>/<name>`: `user@` userinfo is not part of
+    // the host. The assembler keeps it in the URL it downloads
+    // (`https://git@github.com/…/archive/…`), which GitHub serves as the
+    // same repository, so it is dropped before the host comparison.
+    const host = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
     if (!std.ascii.eqlIgnoreCase(host, github_host)) return error.NonGitHubProviderRepository;
-    return checkedRepo(r[host.len + 1 ..]);
+    return checkedRepo(r[authority.len + 1 ..]);
 }
 
 pub const github_host = "github.com";
@@ -89,6 +97,9 @@ fn checkedRepo(repo: []const u8) error{InvalidGitHubRepository}![]const u8 {
     var count: usize = 0;
     while (parts.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidGitHubRepository;
+        // A host or scp remnant (`git@github.com:owner`) is never a GitHub
+        // owner or repository name.
+        if (std.mem.indexOfAny(u8, part, "@:") != null) return error.InvalidGitHubRepository;
         count += 1;
     }
     if (count != 2) return error.InvalidGitHubRepository;
@@ -184,6 +195,16 @@ test "provider github: a project repo matches its pin in the GitHub forms the as
         .{ .repo = "https://github.com/owner/repo.git", .matches = true },
         .{ .repo = "git+https://github.com/owner/repo?ref=main", .matches = true },
         .{ .repo = "GitHub.COM/owner/repo/", .matches = true },
+        // `ssh://` with `user@` userinfo: the host is still github.com,
+        // case-insensitively (#460 review).
+        .{ .repo = "ssh://git@github.com/owner/repo", .matches = true },
+        .{ .repo = "SSH://git@GitHub.com/owner/repo.git", .matches = true },
+        .{ .repo = "git+ssh://git@github.com/owner/repo", .matches = true },
+        .{ .repo = "ssh://git@gitlab.com/owner/repo", .matches = false },
+        .{ .repo = "ssh://github.com@evil.com/owner/repo", .matches = false },
+        // The scp form is not fetched by the assembler, so it never matches.
+        .{ .repo = "git@github.com:owner/repo", .matches = false },
+        .{ .repo = "git@github.com:owner/repo.git", .matches = false },
         // Owner/name are compared exactly, host or not (unchanged).
         .{ .repo = "github.com/Owner/repo", .matches = false },
         .{ .repo = "Owner/Repo", .matches = false },
@@ -209,6 +230,12 @@ test "provider github: a project repo matches its pin in the GitHub forms the as
     try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("github.com/owner/repo/extra"));
     try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("github.com/../repo"));
     try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("repo"));
+    try std.testing.expectEqualStrings("owner/repo", try projectRepo("ssh://git@github.com/owner/repo"));
+    try std.testing.expectEqualStrings("owner/repo", try projectRepo("ssh://Git@GITHUB.com/owner/repo.git"));
+    try std.testing.expectError(error.NonGitHubProviderRepository, projectRepo("ssh://git@gitlab.com/owner/repo"));
+    try std.testing.expectError(error.NonGitHubProviderRepository, projectRepo("ssh://github.com@evil.com/owner/repo"));
+    try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("git@github.com:owner/repo"));
+    try std.testing.expectError(error.InvalidGitHubRepository, projectRepo("git@github.com:owner/repo.git"));
     // Name and version still have to match.
     try std.testing.expect(!pin.matches(.{ .name = "other", .repo = "github.com/owner/repo", .version = "1.0.0" }));
     try std.testing.expect(!pin.matches(.{ .name = "fixture", .repo = "github.com/owner/repo", .version = "1.0.1" }));

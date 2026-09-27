@@ -56,6 +56,7 @@ const migrate = @import("cli/migrate.zig");
 const check = @import("cli/check.zig");
 const plugins = @import("cli/plugins.zig");
 const provider_dispatch = @import("cli/provider_dispatch.zig");
+const provider_contract = @import("cli/provider_contract.zig");
 const provider_github = @import("cli/provider_github.zig");
 const provider_targets = @import("cli/provider_targets.zig");
 const doctor = @import("cli/doctor.zig");
@@ -395,10 +396,21 @@ pub fn main(proc_init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, first, "targets")) {
             parsed_args.command = .targets;
         } else {
-            if (provider_dispatch.dispatch(allocator, first, &args) catch |err| {
-                std.debug.print("labelle: provider command failed: {s}\n", .{@errorName(err)});
-                return 1;
-            }) |code| return code;
+            // Provider dispatch discovers the current project first, so a
+            // config or discovery error there fails the whole invocation.
+            // A token that can never name a provider namespace (`../game`,
+            // `./game`, an absolute path) must not reach it, or `labelle
+            // ../game` from a broken project reports `provider command
+            // failed` instead of running that directory (#460 review). A
+            // namespace-shaped token still dispatches before the directory
+            // shorthand, so `labelle web …` keeps meaning the provider in
+            // a project that also has a `web/` folder.
+            if (mayNameProvider(first)) {
+                if (provider_dispatch.dispatch(allocator, first, &args) catch |err| {
+                    std.debug.print("labelle: provider command failed: {s}\n", .{@errorName(err)});
+                    return 1;
+                }) |code| return code;
+            }
 
             // Preserve the historical shorthand only for an existing
             // directory. An arbitrary token is much more likely to be a
@@ -512,6 +524,22 @@ fn reportUnknownCommand(allocator: std.mem.Allocator, first: []const u8) void {
 
 fn isDirectoryShorthand(path: []const u8) bool {
     return util.dirExists(path);
+}
+
+/// Whether `token` could be a provider namespace at all: namespaces are
+/// contract identifiers (`provider_manifest` rejects anything else), so a
+/// path such as `../game` is decided without discovering the project.
+fn mayNameProvider(token: []const u8) bool {
+    return provider_contract.identifier(token);
+}
+
+test "mayNameProvider: only a namespace-shaped token reaches provider dispatch" {
+    for ([_][]const u8{ "android", "web", "probe", "my-provider", "ns_2" }) |token| {
+        try std.testing.expect(mayNameProvider(token));
+    }
+    for ([_][]const u8{ "../game", "./game", "..", ".", "/abs/game", "game/", "C:\\game", "Game", "" }) |token| {
+        try std.testing.expect(!mayNameProvider(token));
+    }
 }
 
 /// The usage printer for an invocation that can ONLY print usage, or null
