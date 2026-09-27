@@ -72,11 +72,17 @@
 //!
 //! `labelle build --progress=json` promises PURE NDJSON on stdout
 //! (cli#320). A prebuild tool that prints to stdout would corrupt that
-//! stream. In json mode the child's stdout is therefore handed the CLI's
-//! **stderr** file directly (`StdIo.file`) — the user still sees every
-//! line, live, interleaved with the tool's own stderr, and the NDJSON
-//! feed stays machine-parseable. No pumping, no buffering, no reordering.
-//! In human/off mode stdout is inherited unchanged.
+//! stream. In json mode the child's stdout is therefore a pipe the CLI
+//! relays, chunk by chunk as it arrives, to its own **stderr** — the user
+//! still sees every line, live, interleaved with the tool's own
+//! (inherited) stderr, and the NDJSON feed stays machine-parseable. In
+//! human/off mode stdout is inherited unchanged.
+//!
+//! Why a relay and not `StdIo.file = File.stderr()` (cli#448): on Windows
+//! Zig 0.16's spawn RE-OPENS a `.file` handle for the child instead of
+//! duplicating it, so the child gets a new file object with its own
+//! offset at 0. With `2> file` its stdout then overwrote the start of the
+//! file. POSIX dup2()s and was fine; the relay is correct on both.
 //!
 //! Prebuild runs inside the existing `resolve` phase and emits no new
 //! record kind, so the progress schema is untouched (studio#28 consumes
@@ -495,10 +501,12 @@ pub fn runStep(
 ) Error!u8 {
     const io = config.globalIo();
 
-    // In json mode the child's stdout is the CLI's stderr FILE, so its
-    // output streams live without ever touching the NDJSON stdout feed.
+    // In json mode the child's stdout is a pipe relayed to the CLI's
+    // stderr, so its output streams live without ever touching the NDJSON
+    // stdout feed. Not `.file = File.stderr()`: Windows re-opens that
+    // handle with its own offset (cli#448, module doc).
     const child_stdout: std.process.SpawnOptions.StdIo = if (opts.route_stdout_to_stderr)
-        .{ .file = std.Io.File.stderr() }
+        .pipe
     else
         .inherit;
 
@@ -521,6 +529,8 @@ pub fn runStep(
         return error.PrebuildSpawnFailed;
     };
 
+    if (child.stdout) |pipe| relayToStderr(io, &child, pipe);
+
     const term = child.wait(io) catch |err| {
         std.debug.print("labelle: prebuild could not wait on the step ({s})\n", .{@errorName(err)});
         return error.PrebuildSpawnFailed;
@@ -535,6 +545,30 @@ pub fn runStep(
             break :blk error.PrebuildSpawnFailed;
         },
     };
+}
+
+/// Copy `pipe` (the child's stdout) to the CLI's stderr until EOF, each
+/// chunk as it arrives. A streaming write appends at the shared offset, so
+/// a `2> file` redirect stays whole. If stderr is gone the rest is drained
+/// and dropped so the child never blocks on a full pipe; if the pipe read
+/// fails it is closed so the child sees a broken pipe instead of hanging.
+fn relayToStderr(io: std.Io, child: *std.process.Child, pipe: std.Io.File) void {
+    const stderr = std.Io.File.stderr();
+    var buf: [4096]u8 = undefined;
+    var sink_ok = true;
+    while (true) {
+        const n = pipe.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => {
+                pipe.close(io);
+                child.stdout = null;
+                return;
+            },
+        };
+        if (sink_ok) stderr.writeStreamingAll(io, buf[0..n]) catch {
+            sink_ok = false;
+        };
+    }
 }
 
 /// Structural check on EVERY step, before any of them runs. Split out of

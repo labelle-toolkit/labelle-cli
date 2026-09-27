@@ -65,10 +65,6 @@ for n in (1, 2, 3):
 '''
 
 
-def said(step):
-    return [f"PREBUILD_SAY {step} {stream} line {n} of 3" for n in (1, 2, 3) for stream in ("stdout", "stderr")]
-
-
 def zon_str(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -101,14 +97,24 @@ with tempfile.TemporaryDirectory(prefix="labelle-prebuild-stdio-") as temp:
         assert b"\0" not in data, (path.name, "NUL bytes in redirected output", text)
         return text, text.replace("\r\n", "\n").split("\n")
 
-    def in_order(lines, expected, what):
-        """Every expected line is present exactly once, whole, in this order."""
-        at = []
-        for want in expected:
-            hits = [i for i, line in enumerate(lines) if line.strip() == want]
-            assert len(hits) == 1, (what, want, len(hits), "\n".join(lines))
-            at.append(hits[0])
-        assert at == sorted(at), (what, "out of order", expected, "\n".join(lines))
+    def find(lines, want, what, exact=True):
+        """The one line equal to (or containing) `want`; it must be whole and unique."""
+        hits = [i for i, line in enumerate(lines) if (line.strip() == want if exact else want in line)]
+        assert len(hits) == 1, (what, want, len(hits), "\n".join(lines))
+        return hits[0]
+
+    def whole(lines, what):
+        """Every step line and step header is present exactly once, whole.
+        Each stream keeps its own order, step one ends before step two's
+        header, and step two before the CLI moves on to generation. Across
+        a step's stdout and stderr only the per-stream order is asserted:
+        stdout is relayed through the CLI, so it may trail stderr."""
+        headers = [find(lines, f"prebuild [{n}/2]", what, exact=False) for n in (1, 2)]
+        ends = headers[1:] + [find(lines, "FIXTURE_GENERATE", what)]
+        for step, header, end in zip(("one", "two"), headers, ends):
+            for stream in ("stdout", "stderr"):
+                at = [find(lines, f"PREBUILD_SAY {step} {stream} line {n} of 3", what) for n in (1, 2, 3)]
+                assert header < at[0] < at[1] < at[2] < end, (what, step, stream, "out of order", "\n".join(lines))
 
     def run(stdout, stderr):
         result = subprocess.run([cli, "build", "--progress=json"], cwd=project, env=env, stdin=subprocess.DEVNULL,
@@ -123,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-prebuild-stdio-") as temp:
     err_text, err_lines = lines_of(err_log)
     out_text, out_lines = lines_of(out_log)
     assert code == 0, (code, err_text, out_text)
-    in_order(err_lines, said("one") + said("two"), "2> err.log")
+    whole(err_lines, "2> err.log")
     assert "PREBUILD_SAY" not in out_text, ("prebuild output leaked into the NDJSON feed", out_text)
     for line in out_lines:
         if line.strip():
@@ -136,7 +142,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-prebuild-stdio-") as temp:
         code = run(sink, subprocess.STDOUT)
     all_text, all_lines = lines_of(all_log)
     assert code == 0, (code, all_text)
-    in_order(all_lines, said("one") + said("two"), "> all.log 2>&1")
+    whole(all_lines, "> all.log 2>&1")
     checks += 1
 
     print(f"prebuild stdio: {checks} redirected CLI invocations passed")
