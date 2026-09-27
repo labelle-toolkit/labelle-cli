@@ -33,7 +33,9 @@ const registry_cache_dir = registry_cache.registry_cache_dir;
 const registry_cache_file = registry_cache.registry_cache_file;
 const AcceptFixture = @import("test_fixtures.zig").AcceptFixture;
 
-pub const registry_url = "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json";
+const registry_lookup = @import("registry_lookup.zig");
+
+pub const registry_url = registry_lookup.registry_url;
 
 /// Resolve only explicitly declared project versions. Preview is read-only
 /// apart from recording what was shown in `preview_name`; --accept re-fetches
@@ -45,10 +47,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     var metadata: []const u8 = undefined;
     if (std.mem.startsWith(u8, source, "https://raw.githubusercontent.com/")) {
         if (offline) return error.OfflineRegistryNeedsLocalFile;
-        // stdout capture is bounded; curl cannot execute the returned document.
-        const result = try util.runCmd(a, &.{ "curl", "--fail", "--silent", "--show-error", "--proto", "=https", "--connect-timeout", "30", "--max-time", "60", "--max-filesize", "1048576", source });
-        if (result.term != .exited or result.term.exited != 0) return error.ProviderRegistryDownloadFailed;
-        metadata = result.stdout;
+        metadata = try registry_lookup.download(a, source, registry_lookup.Limits.resolve);
     } else {
         if (std.mem.indexOf(u8, source, "://") != null) return error.InvalidProviderRegistrySource;
         metadata = try read(a, source, 1024 * 1024);
@@ -163,6 +162,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     // raw fetch. Best effort: a failed cache write changes nothing about the pins.
     cacheRegistry(a, reviewed) catch |err| {
         std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
+    };
+    // Which source this project accepted from, with the same reviewed
+    // document: the no-provider diagnostic asks that source, not the public
+    // registry, when it is a custom or local one. Best effort, like the cache.
+    registry_lookup.recordAccepted(a, root, source, reviewed) catch |err| {
+        std.debug.print("labelle: warning: could not record the accepted registry source: {s}\n", .{@errorName(err)});
     };
 }
 

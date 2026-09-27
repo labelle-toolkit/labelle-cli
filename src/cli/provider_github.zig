@@ -11,6 +11,7 @@ const preview = @import("provider_github/preview.zig");
 const resolve_mod = @import("provider_github/resolve.zig");
 const fetch_mod = @import("provider_github/fetch.zig");
 const test_fixtures = @import("provider_github/test_fixtures.zig");
+const registry_lookup = @import("provider_github/registry_lookup.zig");
 
 pub const lock_name = pin.lock_name;
 pub const preview_name = preview.preview_name;
@@ -28,6 +29,13 @@ pub const Extractions = sources.Extractions;
 pub const registry_hint_scan_limit = registry_cache.registry_hint_scan_limit;
 pub const cachedRegistryOwner = registry_cache.cachedRegistryOwner;
 pub const cachedRegistryNamespaceOwner = registry_cache.cachedRegistryNamespaceOwner;
+pub const RegistryLookup = registry_lookup.Lookup;
+pub const RegistryOwnerHint = registry_lookup.OwnerHint;
+pub const RegistryMiss = registry_lookup.Miss;
+pub const RegistryMissReason = registry_lookup.Reason;
+pub const registry_accepted_name = registry_lookup.accepted_name;
+pub const registry_offline_env = registry_lookup.offline_env;
+pub const lookupRegistryOwner = registry_lookup.lookupOwnerFromEnv;
 pub const PreviewEntry = preview.PreviewEntry;
 pub const preview_schema = preview.preview_schema;
 pub const Preview = preview.Preview;
@@ -57,4 +65,5 @@ test {
     _ = resolve_mod;
     _ = fetch_mod;
     _ = test_fixtures;
+    _ = registry_lookup;
 }

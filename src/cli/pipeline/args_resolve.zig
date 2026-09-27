@@ -50,10 +50,10 @@ pub fn resolve(
     const provisional = try provider_targets.provisional(requested_target);
     // (1) A project that declares no packages can have no provider, so a
     //     provider target fails before anything is read, written or built.
-    //     The registry hint in the failure line is read from the cached
-    //     registry document only.
+    //     The failure names the owning package when the registry lookup
+    //     (best-effort metadata, `LABELLE_OFFLINE` skips it) finds one.
     if (!provisional.is_core and parsed.plugins.len == 0) {
-        provider_targets.reportNoProvider(hook_arena, requested_target);
+        provider_targets.reportNoProvider(hook_arena, project_root, requested_target);
         return .{ .exit = 1 };
     }
     // (2) `labelle bundle` of the core target: the desktop packager is
@@ -130,13 +130,13 @@ pub const TargetVerdict = union(enum) {
 
 /// The ownership half of target resolution with the pipeline's diagnostic:
 /// `provider_targets.resolve` against the discovered providers, or the
-/// refusal kind after printing its diagnostic (the no-provider line's
-/// registry hint is read from the cached registry document only). The
+/// refusal kind after printing its diagnostic (the no-provider steps name
+/// the owning package when the best-effort registry lookup finds one). The
 /// caller marks its feed with the kind and exits.
-pub fn confirmTarget(a: std.mem.Allocator, providers: []const provider_dispatch.Provider, requested: []const u8) !TargetVerdict {
+pub fn confirmTarget(a: std.mem.Allocator, project_root: []const u8, providers: []const provider_dispatch.Provider, requested: []const u8) !TargetVerdict {
     const resolved = provider_targets.resolve(providers, requested) catch |err| switch (err) {
         error.NoProviderForTarget => {
-            provider_targets.reportNoProvider(a, requested);
+            provider_targets.reportNoProvider(a, project_root, requested);
             return .{ .refused = .no_provider };
         },
         // The owner is a remote package read from the ordinary cache with
@@ -183,7 +183,7 @@ pub fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cf
     };
     if (legacy_wasm and try refuseKnownLegacyWasmReplacement(a, early.providers, requested)) return .refused;
     if (early.unresolved.len != 0) return .deferred;
-    return switch (try confirmTarget(a, early.providers, requested)) {
+    return switch (try confirmTarget(a, project_root, early.providers, requested)) {
         .resolved => .confirmed,
         .refused => .refused,
     };

@@ -171,7 +171,12 @@ and is not rewritten by provider resolution. No package code runs during
 resolution. A failed resolve leaves the previous integrity lock intact.
 
 Normal commands use only matching project pins and cached archives; no
-registry lookup, download or pin update is implicit. Verify the archive hash
+registry lookup, download or pin update is implicit. The one exception is
+metadata for a diagnostic: when a requested target has no provider, the CLI
+may download the registry document (short timeout, skipped under
+`LABELLE_OFFLINE`) to name the owning package in the error. That download is
+never cached, pins nothing and runs no package code
+([provider targets](provider-targets.md#resolution)). Verify the archive hash
 on every invocation, extract into a fresh temporary directory, and remove it
 afterward. Never execute the older unverified plugin extraction cache. Missing
 or corrupted archives fail closed (`ProviderArchiveMissing`,
@@ -252,7 +257,8 @@ which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
   one registry serves every CLI version; dispatch refuses them.
 - **Lookup by target and by namespace** answers "which package provides
   `<t>`" without downloading or extracting anything. The no-provider
-  diagnostic reads it from the cached registry the last `--accept` used
+  diagnostic reads it from a best-effort download of the registry, then from
+  the cached registry the last `--accept` used
   (see [provider targets](provider-targets.md#resolution)). That cache holds
   the normalised document bound to the accepted preview, so its bytes hash to
   the preview's registry digest; a later fetch nobody reviewed never reaches it. Projectless

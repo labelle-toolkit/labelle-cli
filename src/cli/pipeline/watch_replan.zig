@@ -165,7 +165,7 @@ pub const WatchReplan = struct {
         // remote owner, fails this rebuild with the cold pipeline's
         // diagnostic and keeps the previous state — installing empty plans
         // would generate for a target nobody owns (Codex P1 on #421).
-        switch (try confirmTarget(a, providers, ctx.hooks.target)) {
+        switch (try confirmTarget(a, ctx.hooks.root, providers, ctx.hooks.target)) {
             .resolved => {},
             .refused => |kind| return switch (kind) {
                 .no_provider => error.NoProviderForTarget,
@@ -258,7 +258,7 @@ pub const WatchReplan = struct {
             else => return err,
         }
         // Refused: `confirmTarget` prints the cold pipeline's diagnostic.
-        return switch (try confirmTarget(a, view.providers, ctx.hooks.target)) {
+        return switch (try confirmTarget(a, ctx.hooks.root, view.providers, ctx.hooks.target)) {
             .resolved => {},
             .refused => |kind| switch (kind) {
                 .no_provider => error.NoProviderForTarget,
