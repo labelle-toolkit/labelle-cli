@@ -897,6 +897,24 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     generated = run("generate", "--docker", extra_env=contributing)
     assert "--docker doesn't carry" not in generated.stderr and "FIXTURE_GENERATE" in generated.stderr, generated.stderr
     assert by_id(target_dir)["gen-post"]["probe_toolchain"] == "from-tc", log(target_dir)
+    # A target whose owner replaces `build`: the replacement stands in for
+    # the container build and gets the contributions like every hook, so
+    # `build --docker` is not refused and the replacement runs.
+    replaced_dir = project / ".labelle" / "raylib_android"
+    a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="android"),
+                                                 hook("build-owned", "build", "replace", target="android")], targets=["android"]))
+    reset()
+    replaced = run("build", "--platform=android", "--docker", extra_env=contributing)
+    assert "--docker doesn't carry" not in replaced.stderr, replaced.stderr
+    owned_hooks = by_id(replaced_dir / "zig-out")
+    assert owned_hooks["build-owned"]["probe_toolchain"] == "from-tc", owned_hooks
+    assert "building via docker" not in replaced.stderr, replaced.stderr
+    # The mechanism: the same plan without the replacement IS refused.
+    a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="android")], targets=["android"]))
+    reset()
+    refused = run("build", "--platform=android", "--docker", code=1, extra_env=contributing)
+    assert "--docker doesn't carry provider environment contributions" in refused.stderr, refused.stderr
+    a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
     # The legacy `labelle ios` runs its own zig build after generation, with
     # neither the contributions nor the optimize default: refused for either,
     # before any hook or generation.

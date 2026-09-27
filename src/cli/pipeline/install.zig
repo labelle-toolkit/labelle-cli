@@ -273,7 +273,9 @@ pub fn discoverAndPlan(
 ///   is honoured there. Only a command that reaches that container build
 ///   refuses: `labelle generate --docker` stops after generation, and its
 ///   one zig invocation (the host-side fingerprint pass of `tests/`) does
-///   receive the contributions;
+///   receive the contributions; and when the target owner replaces `build`,
+///   its hook stands in for the container build and gets the
+///   contributions like every hook;
 /// - `labelle ios` runs its own `zig build` after generation, with neither
 ///   the contributions nor the effective optimize mode.
 pub const Bypass = enum {
@@ -292,13 +294,14 @@ pub const Bypass = enum {
 
 /// Pure. `contributor` is the plan's first hook that can contribute an
 /// environment (`provider_hooks.planContributor`); `owner_default` the
-/// target owner's `.target_defaults` optimize mode.
-pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool, owner_default: bool) ?Bypass {
+/// target owner's `.target_defaults` optimize mode; `build_replaced`
+/// whether the plan has a `replace` hook on `build`.
+pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool, owner_default: bool, build_replaced: bool) ?Bypass {
     if (command == .ios_cmd) {
         if (contributor) return .ios_env;
         if (owner_default) return .ios_default;
     }
-    if (docker and contributor and reachesContainerBuild(command)) return .docker_env;
+    if (docker and contributor and reachesContainerBuild(command) and !build_replaced) return .docker_env;
     return null;
 }
 
@@ -314,25 +317,33 @@ fn reachesContainerBuild(command: args_mod.Command) bool {
 test "providerBypass: a path that cannot carry a provider's input refuses instead of bypassing it" {
     // Nothing to carry: every path keeps today's behaviour.
     for ([_]args_mod.Command{ .build, .run, .generate, .bundle_cmd, .ios_cmd }) |command| {
-        try std.testing.expect(providerBypass(command, false, false, false) == null);
-        try std.testing.expect(providerBypass(command, true, false, false) == null);
+        try std.testing.expect(providerBypass(command, false, false, false, false) == null);
+        try std.testing.expect(providerBypass(command, true, false, false, false) == null);
     }
     // --docker: contributions are refused; a default is passed through.
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false).?);
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, true).?);
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.bundle_cmd, true, true, false).?);
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.wasm_cmd, true, true, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, true, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.bundle_cmd, true, true, false, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.wasm_cmd, true, true, false, false).?);
     // `labelle generate --docker` never reaches the container build: its
     // fingerprint pass runs on the host with the contributions.
-    try std.testing.expect(providerBypass(.generate, true, true, false) == null);
-    try std.testing.expect(providerBypass(.generate, true, true, true) == null);
-    try std.testing.expect(providerBypass(.build, true, false, true) == null);
+    try std.testing.expect(providerBypass(.generate, true, true, false, false) == null);
+    try std.testing.expect(providerBypass(.generate, true, true, true, false) == null);
+    // A `replace build` hook stands in for the container build and gets the
+    // contributions like every hook: nothing is bypassed.
+    for ([_]args_mod.Command{ .build, .run, .bundle_cmd, .wasm_cmd }) |command| {
+        try std.testing.expectEqual(Bypass.docker_env, providerBypass(command, true, true, false, false).?);
+        try std.testing.expect(providerBypass(command, true, true, false, true) == null);
+    }
+    // `labelle ios` runs its own build whatever the plan replaces.
+    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, false, true).?);
+    try std.testing.expect(providerBypass(.build, true, false, true, false) == null);
     // Without --docker the shared pipeline carries both.
-    try std.testing.expect(providerBypass(.build, false, true, true) == null);
+    try std.testing.expect(providerBypass(.build, false, true, true, false) == null);
     // `labelle ios`: its own build carries neither.
-    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, false).?);
-    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, true).?);
-    try std.testing.expectEqual(Bypass.ios_default, providerBypass(.ios_cmd, false, false, true).?);
+    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, false, false).?);
+    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, true, false).?);
+    try std.testing.expectEqual(Bypass.ios_default, providerBypass(.ios_cmd, false, false, true, false).?);
 }
 
 pub fn legacyRunBranch(platform: ?project_config.Platform) bool {

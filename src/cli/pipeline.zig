@@ -282,6 +282,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         parsed_args.docker,
         provider_hooks.planContributor(hook_plans.generate, hook_plans.build) != null,
         optimize_mod.ownerDefault(providers, target.name) != null,
+        hook_plans.build.replace != null,
     )) |bypass| {
         if (provider_hooks.planContributor(hook_plans.generate, hook_plans.build)) |hook| {
             std.debug.print("labelle: hook '{s}' may contribute an environment for target '{s}'\n", .{ hook.qualified, target.name });
