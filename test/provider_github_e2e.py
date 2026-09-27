@@ -327,7 +327,7 @@ sys.stdout.write(open({str(public_doc)!r}).read())
             assert '.{ .name = "other", .repo = "github.com/example/other", .version = "1.0.0" },' in err, err
             # The source is printed once, alone on its line, and no command
             # carries it: the steps say where it goes.
-            assert f"(copy it as is):\n    {registry.resolve()}\n" in err and err.count(str(registry.resolve())) == 1, err
+            assert f"(quote or escape it for your shell, since it may contain spaces or special characters):\n    {registry.resolve()}\n" in err and err.count(str(registry.resolve())) == 1, err
             assert "run `labelle providers resolve` with the source above as its argument" in err, err
             # The custom source changes: the recorded snapshot still answers
             # (nothing is re-read), until the next accept records a new one.
