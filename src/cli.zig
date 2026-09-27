@@ -580,6 +580,9 @@ test {
     @import("zspec").runAll(@This());
 }
 
+// `labelle init` stamps the running CLI as `--labelle-version`.
+pub const InitCliVersionSpec = init.InitCliVersionSpec;
+
 // Surface the argument-parser spec namespaces (in cli/args_tests.zig).
 const args_tests_mod = @import("cli/args_tests.zig");
 pub const ArgsParseSceneArgSpec = args_tests_mod.ParseSceneArg;
