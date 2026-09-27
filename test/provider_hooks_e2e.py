@@ -158,14 +158,14 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         env.pop(knob, None)
     checks = 0
 
-    def run(*args, code=0, extra_env=None):
+    def run(*args, code=0, extra_env=None, cwd=None):
         global checks
         merged = dict(env, **(extra_env or {}))
         quiet = [] if args[0] == "help" else ["--progress=off"]
         # Everything after `--` is the game's, verbatim: the flag goes before.
         split = args.index("--") if "--" in args else len(args)
         argv = [*args[:split], *quiet, *args[split:]]
-        result = subprocess.run([cli, *argv], cwd=project, env=merged, text=True,
+        result = subprocess.run([cli, *argv], cwd=cwd or project, env=merged, text=True,
                                 capture_output=True, timeout=600)
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
         assert "leaked" not in result.stderr, result.stderr
@@ -458,6 +458,20 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "FIXTURE_INSTALL_DONE" not in text and "FIXTURE_GENERATE" not in text and "build ok" not in text, text
     assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre"), ("after", "a-wasm-run-post")], text
     assert text.index("hook 'fixture-a/a-wasm-run-pre'") < text.index("WASM Export Complete") < text.index("hook 'fixture-a/a-wasm-run-post'"), text
+    # Contract §2 `target_dir` is absolute on the no-build path too, even
+    # when the project is named by a RELATIVE directory: it used to be joined
+    # onto the raw `project_dir`, so `wasm export ../project --no-build`
+    # handed hooks `../project/.labelle/raylib_wasm` (#460 review).
+    for e in log(wasm_target_dir / "zig-out"):
+        assert Path(e["context"]["target_dir"]) == wasm_target_dir.resolve(), e
+    shutil.rmtree(release)
+    (wasm_target_dir / "zig-out" / "hooks.log").unlink()
+    run("wasm", "export", "../project", "--no-build", "--output", "release", cwd=providers["fixture-a"])
+    relative = log(wasm_target_dir / "zig-out")
+    assert order(relative, "run") == [("before", "a-wasm-run-pre"), ("after", "a-wasm-run-post")], relative
+    for e in relative:
+        got = e["context"]["target_dir"]
+        assert os.path.isabs(got) and Path(got) == wasm_target_dir.resolve(), e
     # A failing before hook stops the export: the hook's code is the CLI's
     # and the output directory is never created.
     shutil.rmtree(release)

@@ -125,7 +125,25 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-") as temp:
     for args in (("help",), ()):
         broken = run(*args)
         assert "Usage: labelle" in broken.stderr and "warning" in broken.stderr, (args, broken.stderr)
+    # A path-shaped directory shorthand is decided before provider dispatch
+    # (#460 review): from this broken project, `labelle ../../other` runs that
+    # directory instead of failing discovery with `provider command failed`.
+    # `other` has no project.labelle, so the RUN pipeline is what refuses it.
+    other = base / "other"
+    other.mkdir()
+    shorthand = run("../../other", code=-1)
+    assert "provider command failed" not in shorthand.stderr, shorthand.stderr
+    assert "unknown command" not in shorthand.stderr, shorthand.stderr
+    assert "project.labelle" in shorthand.stderr, shorthand.stderr
+    # A namespace-shaped token still reaches dispatch first, so the broken
+    # project still fails it there even when a same-named directory exists.
+    (nested / "probe").mkdir()
+    assert "provider command failed" in run("probe", "inspect", code=1).stderr
     (project / "project.labelle").write_text(project_text)
+    # With the project fixed, the same-named `probe/` directory does not
+    # shadow the provider namespace.
+    run("probe", "inspect")
+    (nested / "probe").rmdir()
     remote_dep = dep.replace("local:../provider with spaces", "example/fixture")
     remote_dir = home / "packages/plugins/example/fixture/1.0.0"
     remote_dir.mkdir(parents=True)
