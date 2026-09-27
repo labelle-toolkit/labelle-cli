@@ -510,18 +510,23 @@ pub const HostCache = struct {
 
 /// `resolveHost` over an injected provisioner (tests).
 pub fn resolveHostWith(a: std.mem.Allocator, root: []const u8, provision: *const fn (std.mem.Allocator, []const u8) anyerror![]u8) !Host {
-    const io = config.globalIo();
     const required = try toolchain.resolveRequiredVersion(a, root);
     const zig_candidate = try provision(a, root);
-    // Only an override can name a path that does not exist: the managed
-    // path exists once `provision` returned.
-    const zig = real(a, zig_candidate) catch {
-        std.debug.print("labelle: the host compiler override does not exist: {s} (LABELLE_ZIG / --zig)\n", .{zig_candidate});
-        return error.ProviderCompilerMissing;
+    // The same check `labelle doctor` reports for an override. Only an
+    // override can name a path that does not exist: the managed path exists
+    // once `provision` returned.
+    const zig = switch (try toolchain.verifyBinary(a, zig_candidate, required.version)) {
+        .ok => |path| path,
+        .missing => {
+            std.debug.print("labelle: the host compiler override does not exist: {s} (LABELLE_ZIG / --zig)\n", .{zig_candidate});
+            return error.ProviderCompilerMissing;
+        },
+        .not_executable, .failed => return error.ProviderCompilerFailed,
+        .version => |reported| {
+            std.debug.print("labelle: the host compiler {s} is Zig {s}; this project requires {s}\n", .{ zig_candidate, reported, required.version });
+            return error.ProviderCompilerVersionMismatch;
+        },
     };
-    const version = try std.process.run(a, io, .{ .argv = &.{ zig, "version" } });
-    if (version.term != .exited or version.term.exited != 0) return error.ProviderCompilerFailed;
-    if (!std.mem.eql(u8, std.mem.trim(u8, version.stdout, "\r\n "), required.version)) return error.ProviderCompilerVersionMismatch;
 
     // The build child runs with the provider as cwd, so every path handed to
     // it is canonical: a relative LABELLE_HOME (which getCacheRoot accepts)

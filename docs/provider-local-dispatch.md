@@ -60,7 +60,11 @@ Which overrides apply depends on who owns the arguments:
   passthrough is never ambiguous.
 - `labelle doctor` takes `--zig <path>` / `--zig=<path>` as `labelle build`
   does (`LABELLE_ZIG` still wins); the core check reports it and every
-  provider doctor's tool builds with it.
+  provider doctor's tool builds with it. The core check verifies either
+  override with the same check the provider host resolution uses
+  (`zig_toolchain.verifyBinary`: exists, executable, `zig version` equals
+  the project's required version) and reports a FAIL, also in `--json`,
+  when it does not pass.
 - Hooks run inside `labelle build|run|bundle`, whose own `--zig` applies.
 
 `labelle doctor` resolves the host once for all its provider doctors: a

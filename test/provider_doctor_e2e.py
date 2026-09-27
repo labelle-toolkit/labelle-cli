@@ -287,6 +287,16 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert dead.stderr.count("[ FAIL ] labelle alpha doctor: ProviderCompilerMissing") == 1, dead.stderr
     assert dead.stderr.count("[ FAIL ] labelle beta doctor: ProviderCompilerMissing") == 1, dead.stderr
     assert dead.stderr.count("host compiler override does not exist") == 1, dead.stderr
+    # The core check verifies the override too, providers or not, and so
+    # does the studio's --json report.
+    assert "[ FAIL ] Zig toolchain" in dead.stderr, dead.stderr
+    core_dead = subprocess.run([cli, "doctor", "--core-only", "--zig", dead_zig], cwd=project, env=no_env_zig, text=True, capture_output=True, timeout=600)
+    assert core_dead.returncode == 1 and "--zig override '" + dead_zig + "' does not exist" in core_dead.stderr, (core_dead.returncode, core_dead.stderr)
+    json_dead = subprocess.run([cli, "doctor", "--json", f"--zig={dead_zig}"], cwd=project, env=no_env_zig, text=True, capture_output=True, timeout=600)
+    items = {item["id"]: item for item in json.loads(json_dead.stdout)["capabilities"][0]["items"]}
+    assert items["zig"]["ok"] is False and "does not exist" in items["zig"]["hint"], json_dead.stdout
+    # The real compiler passes the same check.
+    assert "--zig override: " + zig in flagged.stderr and "verified" in flagged.stderr, flagged.stderr
     # `labelle <ns> <cmd>` honours LABELLE_ZIG only: everything after the
     # command, `--zig` included, belongs to the provider.
     passthrough = subprocess.run([cli, "alpha", "doctor", "--zig", dead_zig], cwd=project, env=env, text=True, capture_output=True, timeout=600)

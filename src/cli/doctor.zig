@@ -381,15 +381,13 @@ fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
     // Report the managed toolchain the next build would use, without
     // triggering a download. Scoped to `project_dir` so `labelle doctor <dir>`
     // reports the target project's Zig, not the CWD's (cli#279 review).
-    if (zig_toolchain.lookupEnvOverride(arena) catch null) |path| {
-        return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "LABELLE_ZIG override: {s}", .{path}) catch "LABELLE_ZIG override" };
-    }
-    if (zig_toolchain.flagOverride()) |path| {
-        return .{ .name = "Zig toolchain", .ok = true, .detail = std.fmt.allocPrint(arena, "--zig override: {s}", .{path}) catch "--zig override" };
-    }
     const resolved = zig_toolchain.resolveRequiredVersion(arena, project_dir) catch {
         return .{ .name = "Zig toolchain", .ok = false, .hint = "could not resolve the required Zig version" };
     };
+    // An override is used as-is by every build, so it is checked, not
+    // assumed: the same `verifyBinary` the provider host resolution uses.
+    if (zig_toolchain.lookupEnvOverride(arena) catch null) |path| return checkOverride(arena, "LABELLE_ZIG", path, resolved.version);
+    if (zig_toolchain.flagOverride()) |path| return checkOverride(arena, "--zig", path, resolved.version);
     const bin = zig_cache.binaryPath(arena, resolved.version) catch {
         return .{ .name = "Zig toolchain", .ok = false, .hint = "could not compute the managed Zig path" };
     };
@@ -404,6 +402,22 @@ fn checkZig(arena: std.mem.Allocator, project_dir: []const u8) Check {
         .name = "Zig toolchain",
         .ok = true,
         .detail = std.fmt.allocPrint(arena, "managed zig {s} — will download + verify on first build", .{resolved.version}) catch "managed zig (not yet installed)",
+    };
+}
+
+/// The core check of a Zig override (`LABELLE_ZIG` or `--zig`) against the
+/// project's required version.
+fn checkOverride(arena: std.mem.Allocator, source: []const u8, path: []const u8, required: []const u8) Check {
+    const name = "Zig toolchain";
+    const verified = zig_toolchain.verifyBinary(arena, path, required) catch
+        return .{ .name = name, .ok = false, .hint = "could not check the Zig override (out of memory)" };
+    const fmt = std.fmt.allocPrint;
+    return switch (verified) {
+        .ok => .{ .name = name, .ok = true, .detail = fmt(arena, "{s} override: {s} (zig {s}, verified)", .{ source, path, required }) catch "override verified" },
+        .missing => .{ .name = name, .ok = false, .hint = fmt(arena, "{s} override '{s}' does not exist", .{ source, path }) catch "override does not exist" },
+        .not_executable => .{ .name = name, .ok = false, .hint = fmt(arena, "{s} override '{s}' is not an executable file", .{ source, path }) catch "override is not executable" },
+        .failed => .{ .name = name, .ok = false, .hint = fmt(arena, "{s} override '{s}' did not run `zig version`", .{ source, path }) catch "override did not run" },
+        .version => |reported| .{ .name = name, .ok = false, .hint = fmt(arena, "{s} override '{s}' is Zig {s}; this project requires {s}", .{ source, path, reported, required }) catch "override has the wrong version" },
     };
 }
 
@@ -607,6 +621,60 @@ fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "doctor: a Zig override is verified, not assumed: missing, wrong version, right version" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\", .zig_version = \"0.16.0\" }" });
+
+    // Missing, through the real `checkZig` with a `--zig` flag: the override
+    // branch ran (the hint names it) and the check fails.
+    // (A LABELLE_ZIG in the test environment would win over the flag.)
+    const env_override = (zig_toolchain.lookupEnvOverride(a) catch null) != null;
+    const missing = try std.fs.path.join(a, &.{ dir, "no-such-zig" });
+    zig_toolchain.setFlagOverride(missing);
+    defer zig_toolchain.setFlagOverride(null);
+    if (!env_override) {
+        const flagged = checkZig(a, dir);
+        try std.testing.expect(!flagged.ok);
+        try std.testing.expect(std.mem.indexOf(u8, flagged.hint.?, "--zig override") != null);
+        try std.testing.expect(std.mem.indexOf(u8, flagged.hint.?, "does not exist") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, checkOverride(a, "--zig", missing, "0.16.0").hint.?, "does not exist") != null);
+
+    // A directory is not an executable.
+    try std.testing.expect(!checkOverride(a, "--zig", dir, "0.16.0").ok);
+
+    // Scripts that answer `zig version`: POSIX shells only.
+    if (builtin.os.tag == .windows) return;
+    const Fake = struct {
+        fn write(d: std.Io.Dir, name: []const u8, version: []const u8) !void {
+            var buf: [128]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "#!/bin/sh\necho {s}\n", .{version});
+            try d.writeFile(config.globalIo(), .{ .sub_path = name, .data = text, .flags = .{ .permissions = .executable_file } });
+        }
+    };
+    try Fake.write(tmp.dir, "zig-old", "0.15.1");
+    try Fake.write(tmp.dir, "zig-right", "0.16.0");
+    const old = checkOverride(a, "LABELLE_ZIG", try std.fs.path.join(a, &.{ dir, "zig-old" }), "0.16.0");
+    try std.testing.expect(!old.ok);
+    // The version was actually read: the hint quotes what the binary said.
+    try std.testing.expect(std.mem.indexOf(u8, old.hint.?, "is Zig 0.15.1; this project requires 0.16.0") != null);
+    const right = checkOverride(a, "LABELLE_ZIG", try std.fs.path.join(a, &.{ dir, "zig-right" }), "0.16.0");
+    try std.testing.expect(right.ok);
+    try std.testing.expect(std.mem.indexOf(u8, right.detail.?, "zig 0.16.0, verified") != null);
+    // And through `checkZig` with the flag: the same verdict.
+    if (env_override) return;
+    zig_toolchain.setFlagOverride(try std.fs.path.join(a, &.{ dir, "zig-old" }));
+    try std.testing.expect(!checkZig(a, dir).ok);
+    zig_toolchain.setFlagOverride(try std.fs.path.join(a, &.{ dir, "zig-right" }));
+    try std.testing.expect(checkZig(a, dir).ok);
+}
 
 test "doctor: --zig is consumed with its value, in both spellings, and never read as the project dir" {
     const args = [_][]const u8{ "some/dir", "--zig", "/opt/zig/zig", "--zig=/other/zig", "--fix" };

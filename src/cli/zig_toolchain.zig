@@ -139,6 +139,44 @@ pub fn flagOverride() ?[]const u8 {
     return _flag_override;
 }
 
+/// What `verifyBinary` found.
+pub const Verified = union(enum) {
+    /// Runs and reports the required version: its canonical path.
+    ok: []const u8,
+    /// No file at that path.
+    missing,
+    /// A file, but not an executable one.
+    not_executable,
+    /// `zig version` could not be run or did not exit 0.
+    failed,
+    /// Runs, but reports this other version.
+    version: []const u8,
+};
+
+/// Check a Zig binary (an override, or the managed one) against the version
+/// the project requires: it exists, is executable, runs `zig version`, and
+/// reports exactly `required`. The one check both the provider host
+/// resolution and `labelle doctor`'s core Zig check use, so they cannot
+/// disagree about an override.
+pub fn verifyBinary(a: std.mem.Allocator, path: []const u8, required: []const u8) !Verified {
+    const io = config.globalIo();
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, path, a) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .missing,
+    };
+    const stat = std.Io.Dir.cwd().statFile(io, canonical, .{}) catch return .missing;
+    if (stat.kind != .file) return .not_executable;
+    std.Io.Dir.cwd().access(io, canonical, .{ .execute = true }) catch return .not_executable;
+    const run = std.process.run(a, io, .{ .argv = &.{ canonical, "version" } }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .failed,
+    };
+    if (run.term != .exited or run.term.exited != 0) return .failed;
+    const reported = std.mem.trim(u8, run.stdout, "\r\n ");
+    if (!std.mem.eql(u8, reported, required)) return .{ .version = reported };
+    return .{ .ok = canonical };
+}
+
 /// Look up the `LABELLE_ZIG` path override. Heap-owned on success (caller
 /// frees), null when unset. Mirrors `assembler.lookupOverride`.
 pub fn lookupEnvOverride(allocator: std.mem.Allocator) !?[]u8 {
