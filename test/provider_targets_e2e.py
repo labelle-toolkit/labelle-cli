@@ -96,7 +96,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     project.mkdir()
     dep = '.{ .name = "fixture", .repo = "local:../fixture", .version = "1.0.0" }'
     home = base / "home"
-    env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
+    # Hermetic: the no-provider diagnostic's live registry lookup is off
+    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     env.pop("PROVIDER_PROBE_FAIL", None)
     checks = 0
@@ -202,6 +204,72 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     run("generate", "--platform=desktop")
     assert (project / ".labelle" / "raylib_desktop" / "build.zig").exists()
     reset()
+
+    # ── The registry lookup behind the no-provider steps (cli v2.0.0) ─────
+    # A stand-in `curl` first on PATH serves the registry URL from a local
+    # file and logs every request, so the real lookup runs without the
+    # network and the log shows which path ran. POSIX only: Windows resolves
+    # `curl` through PATHEXT differently. Every case fails exactly like the
+    # hermetic runs above (exit 1, nothing touched); only the steps differ.
+    if os.name != "nt":
+        shim_dir = base / "registry-shim"
+        shim_dir.mkdir()
+        served = base / "registry-served.json"
+        requests = base / "registry-requests.log"
+        shim = shim_dir / "curl"
+        shim.write_text(f"""#!{sys.executable}
+import sys
+url = sys.argv[-1]
+with open({str(requests)!r}, "a") as log:
+    log.write(url + "\\n")
+try:
+    data = open({str(served)!r}).read()
+except FileNotFoundError:
+    sys.stderr.write("curl: (6) Could not resolve host\\n")
+    sys.exit(6)
+sys.stdout.write(data)
+""")
+        shim.chmod(0o755)
+        registry_url = "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json"
+
+        def release(version):
+            return {"package": "fixture-owner", "repo": "example/fixture-owner", "version": version,
+                    "commit": "1" * 40, "sha256": "a" * 64, "namespace": None, "targets": ["probe-far"]}
+
+        served.write_text(json.dumps({"schema_version": 2, "defaults": [],
+                                      "providers": [release("0.9.0"), release("0.10.0")]}))
+        online = {"PATH": str(shim_dir) + os.pathsep + env.get("PATH", ""), "LABELLE_OFFLINE": ""}
+
+        def lookup(target, extra, requested):
+            before = requests.read_text().splitlines() if requests.exists() else []
+            refused = run("build", f"--platform={target}", code=1, extra_env=extra)
+            after = requests.read_text().splitlines() if requests.exists() else []
+            assert after[len(before):] == ([registry_url] if requested else []), (target, before, after)
+            assert NO_PROVIDER.format(t=target) in refused.stderr, refused.stderr
+            for step in ("labelle providers resolve ", "labelle providers resolve --accept", "labelle providers fetch",
+                         "docs/migrating-to-2.0.md"):
+                assert step in refused.stderr, (step, refused.stderr)
+            untouched(refused, target)
+            return refused.stderr
+
+        generic = '.{ .name = "<package>", .repo = "github.com/<owner>/<repo>", .version = "<version>" },'
+        # Hit: the owner and its newest release (semver: 0.10.0 > 0.9.0), from registry data.
+        err = lookup("probe-far", online, True)
+        assert "(registry: fixture-owner)" in err and "the provider registry lists package 'fixture-owner' 0.10.0" in err, err
+        assert '.{ .name = "fixture-owner", .repo = "github.com/example/fixture-owner", .version = "0.10.0" },' in err, err
+        assert generic not in err, err
+        # Reached, but nobody declares the target: generic steps.
+        err = lookup("probe-nowhere", online, True)
+        assert "(the provider registry lists no package for this target)" in err and generic in err, err
+        assert "(registry:" not in err, err
+        # Unreachable registry: generic steps, same failure.
+        served.rename(base / "registry-hidden.json")
+        err = lookup("probe-far", online, True)
+        assert "(the provider registry could not be read)" in err and generic in err and "(registry:" not in err, err
+        (base / "registry-hidden.json").rename(served)
+        # Offline: no request at all, even though the registry would answer.
+        err = lookup("probe-far", dict(online, LABELLE_OFFLINE="1"), False)
+        assert "(registry not consulted: LABELLE_OFFLINE is set)" in err and generic in err and "(registry:" not in err, err
 
     # ── A provider that owns the target but replaces nothing on generate ──
     # The pinned assembler cannot generate for a name outside its enum, so

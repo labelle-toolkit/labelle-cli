@@ -27,13 +27,18 @@ pub const registry_cache_file = "providers.json";
 /// size of the registry document.
 pub const registry_hint_scan_limit: usize = 16;
 
-fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
+/// The cached registry document, parsed, or null when none is cached.
+pub fn cachedRegistry(a: std.mem.Allocator) !?registry.Registry {
     const path = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir, registry_cache_file });
     const bytes = read(a, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    const doc = try registry.parse(a, bytes);
+    return try registry.parse(a, bytes);
+}
+
+fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
+    const doc = try cachedRegistry(a) orelse return null;
     // Schema 2 publishes target ownership (#411): the lookup is by name and
     // reads no archive at all. Only a schema-1 document, whose records claim
     // nothing, falls back to the bounded scan of cached archives.
@@ -89,12 +94,7 @@ pub fn cachedRegistryNamespaceOwner(a: std.mem.Allocator, namespace: []const u8)
 }
 
 fn cachedNamespaceOwner(a: std.mem.Allocator, namespace: []const u8) !?[]const u8 {
-    const path = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir, registry_cache_file });
-    const bytes = read(a, path, 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    const doc = try registry.parse(a, bytes);
+    const doc = try cachedRegistry(a) orelse return null;
     if (!doc.claimsOwnership()) return null;
     return doc.namespaceOwner(namespace);
 }

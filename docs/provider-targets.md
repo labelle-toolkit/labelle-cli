@@ -40,18 +40,45 @@ one target, in two halves, before anything is generated, locked or built:
    labelle: target 'wasm' is declared by remote package 'labelle-web', which is unpinned; a target's provider must be pinned. Run labelle providers resolve, review the pins, then repeat with --accept.
    ```
 
-4. A name nobody declares fails:
+4. A name nobody declares fails, with the steps that fix it:
 
    ```
    labelle: no provider for target 'wasm' in this project; add and pin the package that declares target 'wasm'
-     (registry: labelle-web)
+     (registry: web)
+     the provider registry lists package 'web' 0.2.0 as the provider of target 'wasm'. To use it:
+       1. add it to .plugins in project.labelle:
+            .{ .name = "web", .repo = "github.com/labelle-toolkit/labelle-web", .version = "0.2.0" },
+       2. labelle providers resolve            # preview the pin
+       3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;
+                                               # fresh clones and CI run `labelle providers fetch`)
+     Upgrading a project from CLI 1.x? See https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md
    ```
 
-   The second line comes only from the cached registry document, the one
-   the last `labelle providers resolve --accept` was resolved against.
-   That is the normalised document its preview bound and the user reviewed
-   ([pins](provider-github-pins.md)), never a later fetch.
-   Nothing is fetched, and the CLI never invents a name.
+   The package, repository and version are registry data, never names the
+   CLI knows. They come from a best-effort lookup made only on this failure
+   path (`provider_github/registry_lookup.zig`):
+
+   - **Live registry first.** One download of the registry document
+     (`curl`, 3 s connect / 5 s total), parsed and queried by target; the
+     version is the newest release listed for the owner (semver order). This
+     is registry metadata only ([contract §4](provider-contract-v1.md)):
+     nothing is pinned, cached, extracted or run, and the result is a
+     suggestion the user still adds, resolves and accepts. The download is
+     never written to the registry cache, which keeps holding only the
+     document an accepted preview bound.
+   - **Then the cached registry**, the one the last `labelle providers
+     resolve --accept` was resolved against (the normalised document its
+     preview bound and the user reviewed, [pins](provider-github-pins.md)),
+     when the live lookup is skipped, fails, or finds no owner.
+   - **`LABELLE_OFFLINE=1`** (any value but empty or `0`) skips the
+     download; the cache is still read.
+   - **A miss** prints the same steps with a placeholder `.plugins` entry and
+     a note saying why no package was named: `registry not consulted:
+     LABELLE_OFFLINE is set`, `the provider registry could not be read`, or
+     `the provider registry lists no package for this target`.
+
+   The lookup never changes how the command fails: same first line, same
+   exit status, same `failed` progress record, and nothing generated.
 
    - A **schema-2** document publishes target ownership
      ([contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults)),
@@ -192,7 +219,9 @@ gone):
 
 This slice is breaking for every web and mobile project, as the RFC's
 migration order requires — no forwarding shim, no alias, no implicit
-package injection (RFC #406 "Migration", #410):
+package injection (RFC #406 "Migration", #410). The user-facing walkthrough,
+with Flying Platform as the worked example, is
+[Migrating a project to labelle CLI 2.0](migrating-to-2.0.md):
 
 - A project that builds for `wasm`, `android` or `ios` — through `.platform`,
   `--platform=<t>`, or `labelle wasm serve|export`, `labelle ios …` — must add the package that declares that target to
@@ -227,8 +256,11 @@ package injection (RFC #406 "Migration", #410):
 Unit tests (`zig build test-provider-dispatch`, also collected by `zig build
 test`) cover `provider_targets.resolve` (core with no providers, a provider
 target, an undeclared target, an unpinned remote owner, the schema-name
-mapping through a provider only, the diagnostic with and without a registry
-hint), `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
+mapping through a provider only, the diagnostic's steps on a registry hit
+and on each kind of miss), `registry_lookup.lookupOwner` (live hit with the
+newest release by semver, not listed, unreachable, unparseable, offline with
+no fetch, and the cached-registry fallback, each asserting whether the
+fetcher ran), `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
 archive cached; for schema 1, a hint only from a verified cached archive,
 and the bounded scan), `provider_github.cachedRegistryNamespaceOwner`
 (schema 2 only), the `NoRunReplacement` decision table
@@ -257,7 +289,12 @@ assembler runs; `NoBundleReplacement`; a provider replacing
 --platform=probe-target` running the replacement on every host with the
 contract's `output_dir`; the ASTC prepass running for `desktop` and not for
 `probe-target`; a provider owning `wasm` making the assembler receive
-`--platform wasm`; and the `labelle targets` listing. CI runs it on Windows,
+`--platform wasm`; the `labelle targets` listing; and, on POSIX, the
+no-provider registry lookup through a stand-in `curl` that logs each request
+(a hit naming the package and its newest release, a registry that lists no
+owner, an unreachable registry, and `LABELLE_OFFLINE=1` making no request),
+each failing exactly as the hermetic runs do. Every other run sets
+`LABELLE_OFFLINE=1`, so no suite touches the network. CI runs it on Windows,
 macOS and Linux. `test/provider_android_like_e2e.py` drives an
 android-shaped fixture package the same way (no NDK): the no-provider and
 no-namespace diagnostics with and without a cached registry hint, the

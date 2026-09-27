@@ -87,6 +87,18 @@ pub const Registry = struct {
         return pins;
     }
 
+    /// The newest listed release of `package` in semver order (`0.10.0`
+    /// beats `0.9.0`; pins are plain `x.y.z`, `checkPins`), or null when none
+    /// is listed. Used only to suggest a `.plugins` entry, never to pin.
+    pub fn latestRelease(self: Registry, package: []const u8) ?github.Pin {
+        var best: ?github.Pin = null;
+        for (self.pins) |pin| {
+            if (!std.mem.eql(u8, pin.package, package)) continue;
+            if (best == null or releaseNewer(pin.version, best.?.version)) best = pin;
+        }
+        return best;
+    }
+
     /// The schema-2 record for one release, or null (always null for schema 1).
     pub fn find(self: Registry, package: []const u8, version: []const u8) ?Record {
         for (self.records) |record| {
@@ -120,6 +132,13 @@ pub const Registry = struct {
         return error.RegistryDeclarationMismatch;
     }
 };
+
+/// `latestRelease`'s order: is `candidate` newer than `current`?
+fn releaseNewer(candidate: []const u8, current: []const u8) bool {
+    const cand = std.SemanticVersion.parse(candidate) catch return false;
+    const cur = std.SemanticVersion.parse(current) catch return true;
+    return cand.order(cur) == .gt;
+}
 
 /// Both lists are duplicate-free (records by `parse`, manifests by
 /// `manifest.validate`/`validateOwnership`), so equal length plus inclusion
@@ -280,6 +299,18 @@ test "provider registry: defaults resolve to exact releases for consent, never t
     try std.testing.expectError(error.UnknownDefaultRelease, parse(a, "{\"schema_version\":2,\"defaults\":[{\"package\":\"absent\",\"version\":\"1.0.0\"}]," ++ providers));
     try std.testing.expectError(error.DuplicateDefaultPackage, parse(a, "{\"schema_version\":2,\"defaults\":[{\"package\":\"fixture\",\"version\":\"1.0.0\"},{\"package\":\"fixture\",\"version\":\"1.1.0\"}]," ++ providers));
     try std.testing.expectError(error.MissingField, parse(a, "{\"schema_version\":2,\"defaults\":[{\"package\":\"fixture\"}]," ++ providers));
+}
+
+test "provider registry: the suggested release is the newest one in semver order, not document or lexical order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = try parse(a, "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++
+        testRecord("fixture", "0.9.0", "null", "") ++ "," ++ testRecord("fixture", "0.10.0", "null", "") ++ "," ++
+        testRecord("fixture", "0.2.1", "null", "") ++ "," ++ testRecord("other", "9.0.0", "null", "") ++ "]}");
+    try std.testing.expectEqualStrings("0.10.0", doc.latestRelease("fixture").?.version);
+    try std.testing.expectEqualStrings("9.0.0", doc.latestRelease("other").?.version);
+    try std.testing.expect(doc.latestRelease("absent") == null);
 }
 
 test "provider registry: a pinned release must declare exactly what its record claims" {

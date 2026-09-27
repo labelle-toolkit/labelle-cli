@@ -4,6 +4,9 @@ The registry is just `providers.json` committed to the `labelle-registry`
 GitHub repository. No registry service or publishing infrastructure is involved.
 The exact schema lives in [provider contract v1](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock).
 
+Moving a 1.x project onto pinned providers is walked through in
+[Migrating a project to labelle CLI 2.0](migrating-to-2.0.md).
+
 ## Using a declared provider
 
 Declare the provider's exact package/repo/version in the project's `.plugins`

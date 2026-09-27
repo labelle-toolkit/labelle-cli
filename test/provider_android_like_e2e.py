@@ -110,7 +110,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
     project = base / "project"
     project.mkdir()
     home = base / "home"
-    env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
+    # Hermetic: the no-provider diagnostic's live registry lookup is off
+    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for leftover in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_COPY", "PROVIDER_PROBE_PATCH"):
         env.pop(leftover, None)

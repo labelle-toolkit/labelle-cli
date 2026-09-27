@@ -53,7 +53,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     project = base / "project"
     project.mkdir()
     home = base / "home"
-    env = dict(os.environ, LABELLE_HOME=str(home), LABELLE_ZIG=zig)
+    # Hermetic: the no-provider diagnostic's live registry lookup is off
+    # (LABELLE_OFFLINE); only the cached registry can name an owner here.
+    env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig)
     registry = base / "providers.json"
     lock = project / "labelle.providers.lock"
     preview = project / ".labelle/providers.preview.json"

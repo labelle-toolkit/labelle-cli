@@ -67,7 +67,7 @@ pub fn ownerOf(providers: []const dispatch.Provider, target: []const u8) ?*const
 
 /// Pure: the core target, or the target one of `providers` declares.
 /// `NoProviderForTarget` when none does; the caller reports it with
-/// `reportNoProvider` so the registry cache is read only on that path.
+/// `reportNoProvider` so the registry is consulted only on that path.
 /// `UnverifiedTargetOwner` when the owner is a remote package read from the
 /// ordinary cache without an integrity pin (`Provider.verified`): owning a
 /// target means generating, building or bundling for it, so the owner is
@@ -97,20 +97,54 @@ pub fn reportUnverifiedOwner(a: std.mem.Allocator, providers: []const dispatch.P
     std.debug.print("{s}", .{text});
 }
 
-/// The diagnostic for a target no pinned provider declares, plus the
-/// registry line when the cached registry names an owner. The hint is only
-/// ever a name the cache holds (contract §4): never a guess.
-pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, registry_hint: ?[]const u8) ![]const u8 {
-    const head = try std.fmt.allocPrint(a, "labelle: no provider for target '{s}' in this project; add and pin the package that declares target '{s}'\n", .{ target, target });
-    if (registry_hint) |package| return std.fmt.allocPrint(a, "{s}  (registry: {s})\n", .{ head, package });
-    return head;
+/// Where the 1.x → 2.0 migration is explained; every no-provider
+/// diagnostic points at it.
+pub const migration_guide_url = "https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+
+/// The diagnostic for a target no pinned provider declares, with the steps
+/// that fix it. `lookup` is the registry's answer (`lookupRegistryOwner`):
+/// on a hit the steps name the owning package, its repository and newest
+/// release (registry data, never a name the CLI knows); on a miss they are
+/// generic and say why no package was named. Either way the first line, the
+/// exit status and everything else about the failure are the same.
+pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: github.RegistryLookup) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    try w.print("labelle: no provider for target '{s}' in this project; add and pin the package that declares target '{s}'\n", .{ target, target });
+    switch (lookup) {
+        .hit => |hint| {
+            try w.print("  (registry: {s})\n", .{hint.package});
+            const from: []const u8 = switch (hint.source) {
+                .online => "the provider registry",
+                .cache => "the cached provider registry (last `providers resolve --accept`)",
+            };
+            try w.print("  {s} lists package '{s}' {s} as the provider of target '{s}'. To use it:\n", .{ from, hint.package, hint.version, target });
+            try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, hint.version });
+        },
+        .miss => |why| {
+            const reason: []const u8 = switch (why) {
+                .offline => "registry not consulted: " ++ github.registry_offline_env ++ " is set",
+                .unreachable_registry => "the provider registry could not be read",
+                .not_listed => "the provider registry lists no package for this target",
+            };
+            try w.print("  ({s})\n  To add one:\n", .{reason});
+            try w.print("    1. add the package that declares target '{s}' to .plugins in project.labelle\n       (the registry lists each package's targets: {s}):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ target, github.registry_url });
+        },
+    }
+    try w.writeAll("    2. labelle providers resolve            # preview the pin\n");
+    try w.writeAll("    3. labelle providers resolve --accept   # verify it and write labelle.providers.lock (commit it;\n");
+    try w.writeAll("                                            # fresh clones and CI run `labelle providers fetch`)\n");
+    try w.print("  Upgrading a project from CLI 1.x? See {s}\n", .{migration_guide_url});
+    return out.toOwnedSlice();
 }
 
-/// Print the no-provider diagnostic. The registry hint comes from the
-/// cached registry document only — no network, no package code.
+/// Print the no-provider diagnostic. The registry lookup is best-effort
+/// metadata (a short-timeout download, skipped under `LABELLE_OFFLINE`, then
+/// the cached document): nothing is pinned or run, and a failed lookup only
+/// makes the steps generic.
 pub fn reportNoProvider(a: std.mem.Allocator, target: []const u8) void {
-    const hint = github.cachedRegistryOwner(a, target);
-    const text = noProviderDiagnostic(a, target, hint) catch return;
+    const lookup = github.lookupRegistryOwner(a, target);
+    const text = noProviderDiagnostic(a, target, lookup) catch return;
     std.debug.print("{s}", .{text});
 }
 
@@ -252,13 +286,34 @@ test "provider targets: schema platforms map by name only through a provider; ot
     try std.testing.expect((try resolve(&.{owner}, "probe-target")).legacy == null);
 }
 
-test "provider targets: the no-provider diagnostic names a registry owner only when the cache has one" {
+test "provider targets: the no-provider diagnostic names the registry owner on a hit and stays generic on a miss" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const absent = try noProviderDiagnostic(a, "probe-target", null);
-    try std.testing.expectEqualStrings("labelle: no provider for target 'probe-target' in this project; add and pin the package that declares target 'probe-target'\n", absent);
-    const present = try noProviderDiagnostic(a, "probe-target", "fixture");
-    try std.testing.expect(std.mem.startsWith(u8, present, absent));
-    try std.testing.expectEqualStrings("  (registry: fixture)\n", present[absent.len..]);
+    const head = "labelle: no provider for target 'probe-target' in this project; add and pin the package that declares target 'probe-target'\n";
+    const steps = [_][]const u8{ "labelle providers resolve ", "labelle providers resolve --accept", "labelle providers fetch", migration_guide_url };
+    const hit = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.2.0", .source = .online } });
+    try std.testing.expect(std.mem.startsWith(u8, hit, head));
+    try std.testing.expectEqualStrings("  (registry: fixture)\n", hit[head.len..][0.."  (registry: fixture)\n".len]);
+    try std.testing.expect(std.mem.indexOf(u8, hit, "the provider registry lists package 'fixture' 1.2.0 as the provider of target 'probe-target'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hit, ".{ .name = \"fixture\", .repo = \"github.com/owner/fixture\", .version = \"1.2.0\" },") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hit, "<package>") == null);
+    for (steps) |step| try std.testing.expect(std.mem.indexOf(u8, hit, step) != null);
+    const cached = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.0.0", .source = .cache } });
+    try std.testing.expect(std.mem.indexOf(u8, cached, "the cached provider registry") != null);
+    // Every miss: the same head and steps, the placeholder entry, no owner,
+    // and the reason that says which path ran.
+    const reasons = [_]struct { github.RegistryMiss, []const u8 }{
+        .{ .offline, "registry not consulted: LABELLE_OFFLINE is set" },
+        .{ .unreachable_registry, "the provider registry could not be read" },
+        .{ .not_listed, "the provider registry lists no package for this target" },
+    };
+    for (reasons) |case| {
+        const text = try noProviderDiagnostic(a, "probe-target", .{ .miss = case[0] });
+        try std.testing.expect(std.mem.startsWith(u8, text, head));
+        try std.testing.expect(std.mem.indexOf(u8, text, "(registry:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, case[1]) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, ".{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" },") != null);
+        for (steps) |step| try std.testing.expect(std.mem.indexOf(u8, text, step) != null);
+    }
 }

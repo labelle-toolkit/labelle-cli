@@ -131,10 +131,31 @@ fn compatWarnings(cfg: project_config.ProjectConfig, comptime emit: bool) u8 {
             std.debug.print("labelle: warning: {s} {s} is behind this CLI's tested {s} line ({s})\n", .{ d.name, d.pinned, d.name, d.curated });
             std.debug.print("  a major bump is a breaking change within that package alone — core, engine,\n", .{});
             std.debug.print("  gfx and cli version independently and their majors are not meant to match\n", .{});
-            std.debug.print("  hint: run `labelle upgrade all`\n\n", .{});
+            std.debug.print("  hint: run `labelle upgrade all`\n", .{});
+            if (migrationGuide(d)) |guide| std.debug.print("  {s}\n", .{guide});
+            std.debug.print("\n", .{});
         }
     }
     return warnings;
+}
+
+/// The migration guide for a `cli` pin on a line older than 2.0 when this
+/// CLI is 2.x or newer: `upgrade all` bumps the pins, but moving the Android
+/// and wasm targets to their provider packages is a project edit it cannot
+/// make (cli#405). Null for every other package or line.
+fn migrationGuide(d: DiamondPin) ?[]const u8 {
+    if (!std.mem.eql(u8, d.name, "cli")) return null;
+    if (parseVersion(d.pinned).major >= 2 or parseVersion(d.curated).major < 2) return null;
+    return "upgrading alone is not enough: the 2.0 CLI builds Android and wasm through provider\n" ++
+        "  packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+}
+
+test "compat: a 1.x cli pin under a 2.x CLI points at the migration guide; nothing else does" {
+    const guide = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "2.0.0" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, guide, "docs/migrating-to-2.0.md") != null);
+    try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "2.0.0", .curated = "2.1.0" }) == null);
+    try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "1.60.0", .curated = "1.75.0" }) == null);
+    try std.testing.expect(migrationGuide(.{ .name = "engine", .pinned = "1.67.0", .curated = "2.0.0" }) == null);
 }
 
 /// Decide whether a core-diamond package should emit a compat warning: true

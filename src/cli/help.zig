@@ -17,13 +17,10 @@ pub fn printHelp() void {
         \\  pack <input-dir> [options]  Pack PNGs into a sprite atlas
         \\  bundle [dir] [--optimize=<mode>] [--output <dir>] [--build-number <n>] [--platform=<t>] [--progress=<m>]  Generate + build the resolved target, then package it. For `desktop`: wrap the exe in a self-contained macOS `<Title>.app` (Info.plist + AppIcon.icns from `.app_icon`, the project's `assets/` staged into Contents/Resources and a launcher that runs the game from there — cli#364; default output `.labelle/<backend>_desktop/zig-out/bundle/desktop/`; `CFBundleVersion` is `<major+1>.<minor>.<patch>` of `.version` so it always increases with the release — cli#363 — unless `--build-number <n>` (positive integer or `a.b.c`, at most 4/2/2 digits per component) pins it; macOS only — see cli#359). For a provider target (`--platform=<t>`): the provider's `replace` hook on `bundle` packages it into `zig-out/bundle/<t>/`, on any host (docs/provider-targets.md). Pinned provider packages may attach `before`/`after` hooks to the `generate`/`build`/`bundle`/`run` steps (see docs/provider-hooks.md)
         \\  status [dir] [--json]  Print the current/last build progress from .labelle/<target>/.build-progress.json (works from a second shell while a build runs)
-        \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]  Build the WASM target, serve it locally (default port 8080), open the browser (`--watch` rebuilds + live-reloads on source changes)
-        \\  wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]  Build the WASM target and package a deployment-ready dir (default ./release; `--zip` archives it; `--platform` adds host-specific touches; best-effort `wasm-opt -O3`)
         \\  targets              List the targets `--platform` accepts here: `desktop` (core) plus every target a pinned provider package declares (docs/provider-targets.md)
         \\  install [pkg] [ver]  Fetch packages into cache (a bare `install` in a project with labelle.providers.lock also runs `providers fetch`)
         \\  install assembler <ver>  Download and cache an assembler binary
-        \\  install <zig|emsdk> <ver>  Provision a managed build toolchain into ~/.labelle
-        \\  install python       Provision managed Python for wasm builds (pinned version, ~25 MB)
+        \\  install zig <ver>    Provision a managed Zig toolchain into ~/.labelle
         \\  assembler list       List cached assembler versions
         \\  upgrade [dir] [pkg] [ver] [--check] [--json]  Bump versions in project.labelle (pkg: core, engine, gfx, cli, assembler, all); `--check` reports pins vs latest WITHOUT writing (exit 2 = updates available), `--json` emits a machine-readable report (implies --check)
         \\  update [ver] [--no-path] [--check] [--json]  Update the labelle CLI itself; `--check` reports installed vs latest WITHOUT installing (exit 2 = update available), `--json` emits a machine-readable report (implies --check)
@@ -38,6 +35,25 @@ pub fn printHelp() void {
         \\  doctor [dir] [--fix] [--json] [--core-only]  Check build requirements (SDL2, Zig, emsdk), then, inside a project, run each pinned provider's `doctor` command (as `labelle <ns> doctor`, by namespace; exit non-zero if any check fails); `--fix` provisions, `--json` emits a capability report (core only), `--core-only` skips the providers
         \\  help                 Show this help
         \\  version              Show CLI version
+        \\
+        \\Targets (`--platform=<t>`):
+        \\  `desktop` is the only target the CLI itself owns. Since 2.0 every other target
+        \\  (android, wasm, ...) comes from a provider package pinned in the project's
+        \\  `.plugins` + labelle.providers.lock: `labelle targets` lists what this project
+        \\  has, and a target without its provider fails naming the package to add
+        \\  (looked up in the provider registry; `LABELLE_OFFLINE=1` skips the lookup).
+        \\  Upgrading a 1.x project: docs/migrating-to-2.0.md
+        \\  (https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md)
+        \\
+        \\Legacy `wasm` commands (not built in since 2.0: each needs a pinned provider of target `wasm`):
+        \\  wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]  Build the `wasm` target, serve it locally (default port 8080), open the browser (`--watch` rebuilds + live-reloads on source changes)
+        \\  wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]  Build the `wasm` target and package a deployment-ready dir (default ./release; `--zip` archives it; `--platform` adds host-specific touches; best-effort `wasm-opt -O3`)
+        \\  A provider that replaces `run` for `wasm` (the registry's `web` package does) refuses
+        \\  `wasm serve/export`: use its own commands instead (`labelle web serve`, `labelle web
+        \\  export`, listed under "Project package commands" inside the project) or
+        \\  `labelle run --platform=wasm` / `labelle bundle --platform=wasm`.
+        \\  install emsdk <ver>  Provision the emsdk toolchain a `wasm` build compiles with into ~/.labelle
+        \\  install python       Provision managed Python for `wasm` builds (pinned version, ~25 MB)
         \\
         \\Build flags (generate / build / run / astc):
         \\  --allow-older-cli    Build anyway when labelle.lock says the project was locked by a
@@ -61,16 +77,6 @@ pub fn printHelp() void {
         \\  labelle run --screenshot=/tmp/shot.png --after=2s
         \\  labelle run --headless --uncapped --ticks=600
         \\  labelle run --headless --uncapped --profile
-        \\  labelle generate --platform=wasm
-        \\  labelle build --platform=wasm
-        \\  labelle wasm serve
-        \\  labelle wasm serve --port 3000
-        \\  labelle wasm serve --no-build
-        \\  labelle wasm serve --no-open
-        \\  labelle wasm serve --watch
-        \\  labelle wasm export
-        \\  labelle wasm export --output ./release --zip
-        \\  labelle wasm export --platform github-pages
         \\  labelle build --optimize=ReleaseFast
         \\  labelle build --linux-desktop
         \\  labelle build --allow-older-cli
@@ -96,6 +102,17 @@ pub fn printHelp() void {
         \\  labelle migrate unified
         \\  labelle migrate unified --dry-run
         \\  labelle plugins
+        \\  labelle targets
+        \\  labelle providers resolve
+        \\  labelle providers resolve --accept
+        \\  labelle providers fetch
+        \\
+        \\Examples with a provider target (each needs that target's pinned provider):
+        \\  labelle build --platform=wasm
+        \\  labelle run --platform=wasm
+        \\  labelle bundle --platform=wasm
+        \\  labelle build --platform=android
+        \\  labelle run --platform=android
         \\
     , .{project_config.CLI_VERSION});
 }
