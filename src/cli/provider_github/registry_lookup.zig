@@ -180,9 +180,9 @@ pub fn ownerIn(doc: registry.Registry, target: []const u8, named: ?[]const u8, s
 /// `ownerIn` for any document: a schema-1 document's owner comes from the
 /// bounded scan of verified cached archives (`registry_cache.scanOwner`),
 /// the same scan the public path's cache fallback runs.
-fn ownerOfDoc(doc: registry.Registry, target: []const u8, source: Source, from: ?[]const u8) ?OwnerHint {
+fn ownerOfDoc(a: std.mem.Allocator, budget: *registry_cache.ScanBudget, doc: registry.Registry, target: []const u8, source: Source, from: ?[]const u8) ?OwnerHint {
     if (doc.claimsOwnership()) return ownerIn(doc, target, null, source, from);
-    const named = (registry_cache.scanOwner(doc, target) catch return null) orelse return null;
+    const named = (registry_cache.scanOwner(a, doc, target, budget) catch return null) orelse return null;
     return ownerIn(doc, target, named, source, from);
 }
 
@@ -203,30 +203,34 @@ fn fetchLive(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
 ///   the document the project (or, without a record, any project) last
 ///   accepted from it.
 pub fn lookupOwner(a: std.mem.Allocator, root: ?[]const u8, target: []const u8, offline: bool, fetch: Fetcher) Lookup {
+    // One archive-scan allowance for the whole lookup: a schema-1 fresh
+    // read and its fallbacks share it and never read an archive twice.
+    var scan_budget: registry_cache.ScanBudget = .{};
+    const budget = &scan_budget;
     const accepted = if (root) |r| readAccepted(a, r) else null;
     if (accepted) |record| {
-        if (!std.mem.eql(u8, record.source, registry_url)) return lookupCustom(a, record, target, offline, fetch);
+        if (!std.mem.eql(u8, record.source, registry_url)) return lookupCustom(a, budget, record, target, offline, fetch);
     }
     var reached = false;
     if (!offline) live: {
         const bytes = fetch(a, registry_url) catch break :live;
         const doc = registry.parse(a, bytes) catch break :live;
         reached = true;
-        if (ownerOfDoc(doc, target, .online, null)) |hint| return .{ .hit = hint };
+        if (ownerOfDoc(a, budget, doc, target, .online, null)) |hint| return .{ .hit = hint };
         // A schema-2 document that answered is authoritative: a target it
         // no longer lists is not revived from older cached metadata.
         if (doc.claimsOwnership()) return .{ .miss = .{ .reason = .not_listed } };
     }
     if (accepted) |record| {
         if (registry.parse(a, record.document)) |doc| {
-            if (ownerOfDoc(doc, target, .cache, null)) |hint| return .{ .hit = hint };
+            if (ownerOfDoc(a, budget, doc, target, .cache, null)) |hint| return .{ .hit = hint };
         } else |_| {}
-    } else if (cachedOwner(a, target)) |hint| return .{ .hit = hint };
+    } else if (cachedOwner(a, budget, target)) |hint| return .{ .hit = hint };
     if (offline) return .{ .miss = .{ .reason = .offline } };
     return .{ .miss = .{ .reason = if (reached) .not_listed else .unreachable_registry } };
 }
 
-fn lookupCustom(a: std.mem.Allocator, record: Accepted, target: []const u8, offline: bool, fetch: Fetcher) Lookup {
+fn lookupCustom(a: std.mem.Allocator, budget: *registry_cache.ScanBudget, record: Accepted, target: []const u8, offline: bool, fetch: Fetcher) Lookup {
     const from = record.source;
     const fresh: ?[]const u8 = if (isUrl(from))
         (if (offline) null else fetch(a, from) catch null)
@@ -235,12 +239,12 @@ fn lookupCustom(a: std.mem.Allocator, record: Accepted, target: []const u8, offl
     if (fresh) |bytes| {
         if (registry.parse(a, bytes)) |doc| {
             // A schema-2 answer is authoritative, even when it lists nobody.
-            if (ownerOfDoc(doc, target, .accepted_source, from)) |hint| return .{ .hit = hint };
+            if (ownerOfDoc(a, budget, doc, target, .accepted_source, from)) |hint| return .{ .hit = hint };
             if (doc.claimsOwnership()) return .{ .miss = .{ .reason = .not_listed, .registry = from } };
         } else |_| {}
     }
     if (registry.parse(a, record.document)) |doc| {
-        if (ownerOfDoc(doc, target, .accepted_copy, from)) |hint| return .{ .hit = hint };
+        if (ownerOfDoc(a, budget, doc, target, .accepted_copy, from)) |hint| return .{ .hit = hint };
         return .{ .miss = .{ .reason = .not_listed, .registry = from } };
     } else |_| {}
     const reason: Reason = if (offline and isUrl(from)) .offline else .unreachable_registry;
@@ -264,11 +268,11 @@ pub fn offlineRequested(a: std.mem.Allocator) bool {
 /// The global cache's answer, labelled with the source it was accepted
 /// from: a custom source is named (and passed to the resolve steps); an
 /// unrecorded one is marked `unknown_origin`, never presented as public.
-fn cachedOwner(a: std.mem.Allocator, target: []const u8) ?OwnerHint {
+fn cachedOwner(a: std.mem.Allocator, budget: *registry_cache.ScanBudget, target: []const u8) ?OwnerHint {
     const doc = (registry_cache.cachedRegistry(a) catch return null) orelse return null;
     const origin = registry_cache.cachedRegistrySource(a);
     const custom: ?[]const u8 = if (origin) |from| (if (std.mem.eql(u8, from, registry_url)) null else from) else null;
-    var hint = ownerOfDoc(doc, target, .cache, custom) orelse return null;
+    var hint = ownerOfDoc(a, budget, doc, target, .cache, custom) orelse return null;
     hint.unknown_origin = origin == null;
     return hint;
 }
@@ -561,4 +565,37 @@ test "provider registry lookup: an accepted schema-1 source still runs the bound
     try std.testing.expectEqualStrings(accepted.source, hint.registry.?);
     // Neither lookup fetched the public registry.
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
+}
+
+test "provider registry lookup: one archive-scan budget covers the fresh read and its fallbacks, with no archive read twice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 5, registry_cache.registry_hint_scan_limit + 3 }) |decoys| {
+        var fx = try AcceptFixture.init(a);
+        defer fx.deinit();
+        // A schema-1 source listing the accepted fixture release plus
+        // `decoys` cached releases that verify but declare no target.
+        var pins: std.ArrayList(@import("pin.zig").Pin) = .empty;
+        try pins.append(a, fx.pin);
+        for (0..decoys) |i| {
+            const text = try std.fmt.allocPrint(a, ".{{ .name = \"fixture\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"other-{d}\" }} }}", .{i});
+            const data = try AcceptFixture.gzipArchiveWith(a, text);
+            var pin = fx.pin;
+            pin.version = try std.fmt.allocPrint(a, "1.{d}.1", .{i});
+            pin.sha256 = try files.sha256Hex(a, data);
+            try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = try @import("archive.zig").archivePath(a, pin), .data = data });
+            try pins.append(a, pin);
+        }
+        try fx.publishRaw(try std.json.Stringify.valueAlloc(a, @import("pin.zig").Document{ .schema_version = 1, .providers = pins.items }, .{}));
+        try fx.run(a, false);
+        try fx.run(a, true);
+        // The fresh read (schema 1) misses, so the recorded copy — the same
+        // releases — is the fallback. Sharing the budget, the copy reads no
+        // archive the fresh read already read, and the total stays bounded.
+        const before = registry_cache.archive_inspections;
+        try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, "probe-target", true, fetchLiveDoc).miss.reason);
+        const read = registry_cache.archive_inspections - before;
+        try std.testing.expectEqual(@min(decoys + 1, registry_cache.registry_hint_scan_limit), read);
+    }
 }
