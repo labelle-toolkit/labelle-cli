@@ -273,7 +273,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
     // 0.93.1), which warned on every single build.
     // The #357 reproduction pinned core 1.26.0 / engine 2.5.0 / gfx 1.28.1 —
     // same MAJOR line as the curated set of its day, so it must not warn.
-    // Since core 2.0.0 / engine 3.0.0 / gfx 2.0.0 the curated line moved, so
+    // Since core 2.0.0 / engine 3.0.0 / gfx 2.0.0 / CLI 2.0.0 the curated line moved, so
     // the same-major-line guard is expressed on the current line, and the
     // 1.x set is asserted separately below as the case that SHOULD warn.
     const reported = project_config.ProjectConfig{
@@ -281,13 +281,13 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .core_version = "2.0.0",
         .engine_version = "3.0.0",
         .gfx_version = "2.0.0",
-        .labelle_version = "1.67.0",
+        .labelle_version = "2.0.0",
     };
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(reported, false));
 
     // A project still on the whole 1.x line is one MAJOR behind on core,
-    // engine AND gfx. Three warnings is the MAJOR-only compatibility gate
-    // firing exactly once per package — the behaviour that makes a major
+    // engine, gfx AND (since CLI 2.0.0) the CLI. Four warnings is the
+    // MAJOR-only compatibility gate firing exactly once per package — the behaviour that makes a major
     // bump load-bearing rather than cosmetic. Not a regression of #357.
     const one_major_behind = project_config.ProjectConfig{
         .name = "my_game",
@@ -296,7 +296,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .gfx_version = "1.36.0",
         .labelle_version = "1.67.0",
     };
-    try std.testing.expectEqual(@as(u8, 3), compatWarnings(one_major_behind, false));
+    try std.testing.expectEqual(@as(u8, 4), compatWarnings(one_major_behind, false));
 
     // …as does the flagship game's set (core 1.28.0 + engine 2.13.0).
     const flagship = project_config.ProjectConfig{
@@ -304,7 +304,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .core_version = "2.0.0",
         .engine_version = "3.0.0",
         .gfx_version = "2.0.0",
-        .labelle_version = "1.60.1",
+        .labelle_version = "2.0.0",
     };
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(flagship, false));
 }

@@ -94,7 +94,7 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     // The assembler owns the schema and may add fields the CLI does not
     // mirror — without this, a newer project.labelle would fail to parse
     // and break the CLI for no good reason.
-    try @import("provider_settings.zig").validateProject(allocator, source);
+    try @import("provider_settings.zig").validateProject(allocator, source, if (verbose) labelle_path else null);
     return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {

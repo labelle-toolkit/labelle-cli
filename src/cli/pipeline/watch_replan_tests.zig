@@ -818,3 +818,70 @@ test "watch replan release restores the site's stable storage" {
     try std.testing.expectEqualStrings("startup", site.cfg.name);
     try std.testing.expectEqualStrings("/startup", site.providers[0].dir);
 }
+
+// A replan installs the re-read `.prebuild` steps on the rebuild context,
+// not only the hook config: the next rebuild runs the NEW steps, and a
+// removed step stops running (Codex P2 on #460).
+test "watch replan installs the re-read prebuild steps" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pkg/plugin.labelle",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+    });
+    const head = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } }";
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ ", .prebuild = .{ .{ .run = .{ \"gen-old\" } } } }" });
+    const Lock = struct {
+        fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
+    };
+    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    defer a.free(asm_path);
+    var site = testing.testSite(a, project);
+    const startup_steps = [_]prebuild.Step{.{ .run = &.{"gen-startup"} }};
+    var ctx = WasmRebuildCtx{
+        .allocator = a,
+        .asm_bin = .{ .path = asm_path },
+        .project_dir = project,
+        .platform_tag = "wasm",
+        .backend_tag = "bgfx",
+        .output_dir = project,
+        .target_dir = project,
+        .zig_args = &.{},
+        .zig_env = null,
+        .prebuild_steps = &startup_steps,
+        .prebuild_opts = .{ .fatal_on_step_failure = false },
+        .hooks = &site,
+    };
+    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = Lock.none };
+    const startup_cfg = site.cfg;
+    defer replan.deinit(&site, &.{}, startup_cfg);
+
+    try WatchReplan.run(&replan, &ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.prebuild_steps.len);
+    try std.testing.expectEqualStrings("gen-old", ctx.prebuild_steps[0].run[0]);
+
+    // Changed: the next generation's steps replace the previous one's.
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ ", .prebuild = .{ .{ .run = .{ \"gen-new\", \"--flag\" } }, .{ .run = .{ \"gen-extra\" } } } }" });
+    try WatchReplan.run(&replan, &ctx);
+    try std.testing.expectEqual(@as(usize, 2), ctx.prebuild_steps.len);
+    try std.testing.expectEqualStrings("gen-new", ctx.prebuild_steps[0].run[0]);
+    try std.testing.expectEqualStrings("--flag", ctx.prebuild_steps[0].run[1]);
+    try std.testing.expectEqualStrings("gen-extra", ctx.prebuild_steps[1].run[0]);
+
+    // A failed replan keeps the installed steps (and their storage).
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = "not zon" });
+    if (WatchReplan.run(&replan, &ctx)) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.expectEqualStrings("gen-new", ctx.prebuild_steps[0].run[0]);
+
+    // Removed: no step runs any more.
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ " }" });
+    try WatchReplan.run(&replan, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.prebuild_steps.len);
+}
