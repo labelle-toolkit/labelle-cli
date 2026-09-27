@@ -132,7 +132,12 @@ pub const Options = struct {
     /// this false: a failed step there must report and keep the server
     /// alive, exactly like a failed `generate` or `zig build` does.
     fatal_on_step_failure: bool = true,
+    /// Test-only: force the stdout relay (as `RELAY_ENV` does), optionally
+    /// making `Relay.prepare` fail so the fallback route is exercised.
+    relay_test: RelayTest = .off,
 };
+
+pub const RelayTest = enum { off, forced, forced_prepare_fails };
 
 // ── Validation ───────────────────────────────────────────────────────
 
@@ -514,7 +519,8 @@ pub fn runStep(
     // In json mode the child's stdout goes to the CLI's stderr, so its
     // output streams live without ever touching the NDJSON stdout feed
     // (module doc; the routing table is `prebuild_relay.stdoutRoute`).
-    const route = if (opts.route_stdout_to_stderr and envFlag(allocator, RELAY_ENV))
+    const forced = opts.relay_test != .off or envFlag(allocator, RELAY_ENV);
+    var route = if (opts.route_stdout_to_stderr and forced)
         prebuild_relay.StdoutRoute.relay
     else
         prebuild_relay.stdoutRoute(
@@ -522,6 +528,23 @@ pub fn runStep(
             builtin.os.tag,
             std.Io.File.stderr().isTty(io) catch false,
         );
+
+    // The relay's thread starts BEFORE the child, so a failure to start it
+    // can still fall back to handing over the stderr file (the pre-cli#448
+    // route) instead of relaying synchronously, which a background process
+    // holding the pipe could hang (cli#452).
+    var relay: ?*prebuild_relay.Relay = null;
+    if (route == .relay) {
+        relay = if (opts.relay_test == .forced_prepare_fails)
+            null
+        else
+            prebuild_relay.Relay.prepare(std.heap.smp_allocator, io, std.Io.File.stderr()) catch null;
+        if (relay == null) {
+            std.debug.print("labelle: note: prebuild could not start its output relay; passing stderr to the step directly\n", .{});
+            route = .stderr_file;
+        }
+    }
+
     const child_stdout: std.process.SpawnOptions.StdIo = switch (route) {
         .inherit => .inherit,
         .stderr_file => .{ .file = std.Io.File.stderr() },
@@ -535,6 +558,7 @@ pub fn runStep(
         .stdout = child_stdout,
         .stderr = .inherit,
     }) catch |err| {
+        if (relay) |r| r.cancel();
         const owned = renderArgv(allocator, step.run) catch null;
         defer if (owned) |o| allocator.free(o);
         const rendered: []const u8 = owned orelse "<command>";
@@ -547,16 +571,13 @@ pub fn runStep(
         return error.PrebuildSpawnFailed;
     };
 
-    // Relay on its own thread while this one reaps the direct child: a
-    // background process the step leaves holding the pipe must not hang
-    // the build. `wait` would close the pipe, so the relay takes it first.
-    var relay: ?*prebuild_relay.Relay = null;
-    if (child.stdout) |pipe| {
+    // The relay copies on its own thread while this one reaps the direct
+    // child: a background process the step leaves holding the pipe must
+    // not hang the build. `wait` would close the pipe, so the relay takes
+    // it first.
+    if (relay) |r| {
+        r.begin(child.stdout.?);
         child.stdout = null;
-        relay = prebuild_relay.Relay.start(std.heap.smp_allocator, io, pipe, std.Io.File.stderr()) catch blk: {
-            prebuild_relay.Relay.runInline(std.heap.smp_allocator, io, pipe, std.Io.File.stderr());
-            break :blk null;
-        };
     }
     const waited = child.wait(io);
     if (relay) |r| r.finish(prebuild_relay.drain_grace_ns);
@@ -1210,6 +1231,35 @@ pub const RunStepSpec = struct {
                 .run = &.{ "/bin/sh", "-c", "exit 3" },
             }, .{});
             try std.testing.expectEqual(@as(u8, 3), code);
+        }
+    };
+
+    /// cli#452: a step that leaves a background process holding its stdout
+    /// must not hang the build on the relay path, including when the relay
+    /// cannot start. `sleep 3` (not 30): in the fallback it holds the test
+    /// runner's stderr, which the build runner drains to EOF.
+    pub const relay_is_bounded = struct {
+        fn elapsedNs(relay_test: RelayTest) !u64 {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const io = config.globalIo();
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = buf[0..try tmp.dir.realPath(io, &buf)];
+            const began = std.Io.Timestamp.now(io, .awake);
+            const code = try runStep(std.testing.allocator, root, .{
+                .run = &.{ "/bin/sh", "-c", "sleep 3 & printf 'relay-bound-test partial'" },
+            }, .{ .route_stdout_to_stderr = true, .relay_test = relay_test });
+            try std.testing.expectEqual(@as(u8, 0), code);
+            return @intCast(began.untilNow(io, .awake).toNanoseconds());
+        }
+
+        test "the relay stops waiting once the direct child exits" {
+            try std.testing.expect(try elapsedNs(.forced) < 2500 * std.time.ns_per_ms);
+        }
+
+        test "a relay that cannot start falls back without relaying synchronously" {
+            try std.testing.expect(try elapsedNs(.forced_prepare_fails) < 2500 * std.time.ns_per_ms);
         }
     };
 
