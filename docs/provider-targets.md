@@ -196,8 +196,13 @@ package injection (RFC #406 "Migration", #410):
 
 - A project that builds for `wasm`, `android` or `ios` — through `.platform`,
   `--platform=<t>`, or `labelle wasm serve|export`, `labelle ios …` — must add the package that declares that target to
-  `.plugins` and pin it (`labelle providers resolve`, then `--accept`).
-  Until it does, those commands fail with the no-provider error above.
+  `.plugins` (as `.repo = "github.com/<owner>/<name>"`) and pin it
+  (`labelle providers resolve`, then `--accept`). Until it does, those
+  commands fail with the no-provider error above. Commit
+  `labelle.providers.lock`; every other checkout (a teammate, CI) then runs
+  `labelle providers fetch`, or `labelle install`, once to download the
+  pinned archives, since no normal command downloads them
+  ([pins](provider-github-pins.md#fresh-checkouts-and-ci-labelle-providers-fetch)).
 - The target name is unchanged: `--platform=wasm` stays `--platform=wasm`,
   because the web provider declares the target `wasm`. Only the pin is new.
 - The legacy `labelle wasm|ios` command words stay reserved built-ins until

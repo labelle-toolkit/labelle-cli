@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -326,4 +327,125 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     registry.write_text(json.dumps({"schema_version": 1, "providers": [dict(pin, namespace="probe", targets=[])]}))
     assert "UnknownField" in resolve(code=1).stderr
     cleaned()
+    # Project repo forms (cli#405): the assembler needs `github.com/<owner>/<name>`,
+    # registry records and locks carry `<owner>/<name>`. Both project forms pin
+    # the same release and write a byte-identical lock; another host never matches.
+    metadata([pin])
+    config([pin])
+    accept()
+    bare_lock = lock.read_bytes()
+    hosted = dict(pin, repo="github.com/" + pin["repo"])
+    config([hosted])
+    accept()
+    assert lock.read_bytes() == bare_lock, "the github.com/ project form changed the lock"
+    assert json.loads(lock.read_text())["providers"] == [pin]
+    run("probe", "inspect")
+    assert json.loads(capture.read_text())["revision"] == "original"
+    cleaned()
+    config([dict(pin, repo="gitlab.com/" + pin["repo"])])
+    err = resolve(code=1).stderr
+    assert "NonGitHubProviderRepository" in err and "not on GitHub" in err and "ProviderReleaseNotInRegistry" not in err, err
+    err = run("probe", "inspect", code=1).stderr
+    assert "NonGitHubProviderRepository" in err and "not on GitHub" in err, err
+    assert lock.read_bytes() == bare_lock
+    config([hosted])
+    # `labelle providers fetch` (cli#405): a fresh checkout has the lock but an
+    # empty archive cache; normal commands never download, so they fail closed
+    # and name the command that materialises exactly the lock.
+    fresh = base / "fresh-home"
+    env["LABELLE_HOME"] = str(fresh)
+    fresh_archive = fresh / "provider-archives" / (pin["sha256"] + ".tar.gz")
+    capture.unlink()
+    err = run("probe", "inspect", code=1).stderr
+    assert "ProviderArchiveMissing" in err and "run `labelle providers fetch`" in err, err
+    err = run("providers", "fetch", "--offline", code=1).stderr
+    assert "ProviderArchiveMissing" in err and "provider 'fixture' 1.0.0" in err, err
+    assert not fresh_archive.exists()
+    err = run("providers", "fetch", "extra", code=1).stderr
+    assert "InvalidProviderArguments" in err, err
+    run("providers", "fetch", "--help")
+    # The lock lives next to project.labelle: outside a project, fetch says so.
+    outside = subprocess.run([cli, "providers", "fetch"], cwd=base, env=env, capture_output=True, text=True, timeout=180)
+    assert outside.returncode == 1 and "ProjectRequired" in outside.stderr and "not inside a labelle project" in outside.stderr, outside.stderr
+    checks += 1
+    if os.name != "nt":
+        # A stand-in `curl` first on PATH serves the codeload URL from a local
+        # file, so the CLI's real download path runs without the network.
+        # POSIX only: Windows resolves `curl` through PATHEXT differently.
+        shim_dir = base / "shim"
+        shim_dir.mkdir()
+        served = base / "served.json"
+        requests = base / "requests.log"
+        shim = shim_dir / "curl"
+        shim.write_text(f"""#!{sys.executable}
+import json, sys
+args = sys.argv[1:]
+url = args[-1]
+dest = args[args.index("--output") + 1]
+with open({str(requests)!r}, "a") as log:
+    log.write(url + "\\n")
+table = json.load(open({str(served)!r}))
+if url not in table:
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\\n")
+    sys.exit(22)
+open(dest, "wb").write(open(table[url], "rb").read())
+""")
+        shim.chmod(0o755)
+        env["PATH"] = str(shim_dir) + os.pathsep + os.environ.get("PATH", "")
+        url = "https://codeload.github.com/example/fixture/tar.gz/" + pin["commit"]
+        good = base / "good.tar.gz"
+        good.write_bytes(data)
+        tampered = base / "tampered.tar.gz"
+        tampered.write_bytes(data + b"tampered")
+
+        def serve(path):
+            served.write_text(json.dumps({url: str(path)}))
+
+        def requested():
+            return requests.read_text().split() if requests.exists() else []
+
+        # A mismatch fails closed, names the package and caches nothing.
+        serve(tampered)
+        err = run("providers", "fetch", code=1).stderr
+        assert "ProviderArchiveHashMismatch" in err and "provider 'fixture' 1.0.0" in err and "nothing was cached" in err, err
+        assert requested() == [url]
+        assert not list((fresh / "provider-archives").iterdir()), "a failed fetch left files in the cache"
+        assert lock.read_bytes() == bare_lock
+        # The pinned bytes are cached; the lock and the project are untouched, no package code ran.
+        serve(good)
+        out = run("providers", "fetch").stderr
+        assert "1 fetched, 0 already cached" in out, out
+        assert fresh_archive.read_bytes() == data and requested() == [url, url]
+        assert lock.read_bytes() == bare_lock and not capture.exists() and not preview.exists()
+        # Idempotent: a verified cache is a no-op, with no request.
+        out = run("providers", "fetch").stderr
+        assert "0 fetched, 1 already cached" in out and requested() == [url, url], out
+        run("providers", "fetch", "--offline")
+        run("probe", "inspect")
+        assert json.loads(capture.read_text())["revision"] == "original"
+        cleaned()
+        # A damaged cached archive is replaced by the verified pinned bytes.
+        fresh_archive.write_bytes(data + b"damaged")
+        assert "ProviderArchiveHashMismatch" in run("providers", "fetch", "--offline", code=1).stderr
+        assert "1 fetched" in run("providers", "fetch").stderr
+        assert fresh_archive.read_bytes() == data
+        # `labelle install` in a project with a providers lock fetches too,
+        # after the assembler's own install (a stand-in that only logs).
+        fresh_archive.unlink()
+        assembler_log = base / "assembler.log"
+        fake_assembler = base / "fake-assembler"
+        fake_assembler.write_text(f"""#!{sys.executable}
+import sys
+if sys.argv[1:] == ["--protocol-version"]:
+    print(99)
+else:
+    open({str(assembler_log)!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")
+""")
+        fake_assembler.chmod(0o755)
+        env["LABELLE_ASSEMBLER"] = str(fake_assembler)
+        out = run("install").stderr
+        assert assembler_log.read_text().startswith("install"), assembler_log.read_text()
+        assert "1 fetched" in out and fresh_archive.read_bytes() == data, out
+        del env["LABELLE_ASSEMBLER"]
+    env["LABELLE_HOME"] = str(home)
     print(f"GitHub provider pins: {checks} real CLI invocations passed")

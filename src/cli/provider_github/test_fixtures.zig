@@ -79,6 +79,12 @@ pub const AcceptFixture = struct {
         return self;
     }
 
+    /// Rewrite the project's declaration of the fixture with `repo` as its `.repo`.
+    pub fn declare(self: *AcceptFixture, a: std.mem.Allocator, repo: []const u8) !void {
+        const text = try std.fmt.allocPrint(a, ".{{ .name = \"game\", .plugins = .{{ .{{ .name = \"fixture\", .repo = \"{s}\", .version = \"1.0.0\" }} }} }}", .{repo});
+        try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = try std.fs.path.join(a, &.{ self.root, "project.labelle" }), .data = text });
+    }
+
     pub fn deinit(self: *AcceptFixture) void {
         cache.clearCacheRootOverride();
         self.tmp.cleanup();

@@ -7,7 +7,14 @@ The exact schema lives in [provider contract v1](provider-contract-v1.md#4-githu
 ## Using a declared provider
 
 Declare the provider's exact package/repo/version in the project's `.plugins`
-and ordinary `labelle.lock`. Then preview and explicitly accept integrity pins:
+and ordinary `labelle.lock`, with the repo as `github.com/<owner>/<name>` (the
+form the assembler fetches). The registry and the integrity lock spell the
+same repository `<owner>/<name>`; resolve matches the two
+([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock)),
+also accepts `https://github.com/<owner>/<name>` and the bare form, and writes
+the same lock for each. A repo on another host is refused
+(`NonGitHubProviderRepository`). Then preview and explicitly accept
+integrity pins:
 
 ```text
 labelle providers resolve
@@ -72,6 +79,46 @@ temporary extraction. Changes to the older plugin cache have no effect.
 Help for a pinned remote provider also verifies/extracts its manifest, but
 does not resolve a compiler or run a build script.
 
+## Fresh checkouts and CI: `labelle providers fetch`
+
+A clone that has the committed `labelle.providers.lock` but an empty archive
+cache cannot run normal commands: they never download, so even a desktop
+`labelle generate` fails with `ProviderArchiveMissing` and a line naming the
+package and `labelle providers fetch`. That command materialises exactly the
+lock:
+
+```text
+labelle providers fetch            # download what is missing, verify, cache
+labelle providers fetch --offline  # download nothing; verify the cache only
+```
+
+Run it inside the project (the lock always sits next to `project.labelle`,
+which only locates the root and is not parsed; outside a project it fails
+with `ProjectRequired`). It reads the lock only (no registry, no preview),
+downloads each pin's `https://codeload.github.com/<repo>/tar.gz/<commit>`
+that is not already cached and valid, and verifies it against the pinned
+sha256 before caching it at `<LABELLE_HOME>/provider-archives/<sha256>.tar.gz`.
+The cache is per-archive atomic and verified-only: only bytes matching the
+lock are ever cached, each archive by one rename of a verified temporary
+file. Every download is verified before the first rename, so a mismatch or
+failed download names the package and adds nothing to the cache; a failure
+while moving verified archives into place may leave some of them cached,
+which is harmless (they verify) and the next run fetches the rest. The lock
+is never rewritten and no package code runs. An archive that is cached and
+verifies is not downloaded again, so the command is idempotent and safe to
+run on every CI job. A damaged cached archive (wrong hash, or larger than any
+provider archive) is replaced by verified bytes; normal commands report it
+as `ProviderArchiveHashMismatch` and point here.
+
+`labelle install` (no arguments, in a project) runs the same fetch after the
+assembler has installed the project's packages, when the project has a
+providers lock; a project without one is unaffected. So a new clone needs:
+
+```text
+labelle install
+labelle generate
+```
+
 ## Offline and recovery
 
 ```text
@@ -80,10 +127,11 @@ labelle providers resolve /path/to/registry/providers.json --offline --accept
 
 Offline mode requires local metadata and archives already cached at
 `<LABELLE_HOME>/provider-archives/<sha256>.tar.gz`. Otherwise resolve fails
-without replacing the old lock. A hash mismatch is fatal even online; remove
-the damaged archive and explicitly resolve again to fetch the same pinned
-content. If GitHub serves different bytes for that commit, verification still
-fails. Do not simply substitute the newly observed hash into a trusted record.
+without replacing the old lock. A hash mismatch is fatal even online; run
+`labelle providers fetch` to replace the damaged archive with the pinned
+content (for a pin not yet in the lock, remove it and resolve again). If
+GitHub serves different bytes for that commit, verification still fails. Do
+not simply substitute the newly observed hash into a trusted record.
 
 The same rule binds `--accept` to the preview. A registry that is repointed or
 compromised between the two invocations cannot pin code nobody reviewed: the
@@ -137,6 +185,12 @@ registry changed between preview and accept, including a schema-2 to
 schema-1 swap, a changed claim on a selected or unselected record and a
 changed defaults list; an edited preview; accept with no preview), archive/manifest validation, remote command execution, tampering,
 temporary-source cleanup, old-cache isolation, failed-resolution atomicity,
-unsafe entries, stale pins and explicit version updates. Both subprocess suites
+unsafe entries, stale pins and explicit version updates. It also covers the
+project repo forms (`github.com/<owner>/<name>` and the bare form write the
+same lock; another host is `NonGitHubProviderRepository`) and
+`labelle providers fetch` on an empty cache (running outside a project,
+fail-closed hash mismatch that caches nothing, verified fetch, idempotent re-run, `--offline`, the damaged
+archive repair and `labelle install`), with a stand-in `curl` on `PATH`
+serving the codeload URL from a local file on POSIX hosts. Both subprocess suites
 run on all three CI hosts. `zig build test-provider-dispatch` runs the
 in-process twin of the preview binding against a real gzip archive.
