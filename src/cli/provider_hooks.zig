@@ -382,7 +382,8 @@ pub const RunOutcome = union(enum) {
     /// The watchdog killed the game at the `--timeout` deadline.
     timed_out,
     /// The launch returned while the app runs elsewhere (`simctl launch`,
-    /// `adb shell am start`): its exit is never observed.
+    /// or any launcher that hands the app to a device): its exit is never
+    /// observed.
     launched_detached,
 
     pub fn fromExit(code: u8) RunOutcome {

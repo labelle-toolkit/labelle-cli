@@ -79,6 +79,26 @@ pub fn cachedRegistryOwner(a: std.mem.Allocator, target: []const u8) ?[]const u8
     return cachedOwner(a, target) catch null;
 }
 
+/// The package the cached registry document names as declaring the command
+/// `namespace`, or null — the hint for a `labelle <namespace> ...` that no
+/// pinned provider serves. Schema 2 only: a schema-1 record claims nothing,
+/// and an unknown command never pays for an archive scan. Cache only, like
+/// `cachedRegistryOwner`: never used for dispatch.
+pub fn cachedRegistryNamespaceOwner(a: std.mem.Allocator, namespace: []const u8) ?[]const u8 {
+    return cachedNamespaceOwner(a, namespace) catch null;
+}
+
+fn cachedNamespaceOwner(a: std.mem.Allocator, namespace: []const u8) !?[]const u8 {
+    const path = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir, registry_cache_file });
+    const bytes = read(a, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    const doc = try registry.parse(a, bytes);
+    if (!doc.claimsOwnership()) return null;
+    return doc.namespaceOwner(namespace);
+}
+
 /// Keep the document an accept just resolved against, for `cachedRegistryOwner`.
 pub fn cacheRegistry(a: std.mem.Allocator, data: []const u8) !void {
     const dir = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir });
@@ -130,6 +150,23 @@ test "provider github: a schema-2 cached registry names a target owner by lookup
     // with its archive gone the scan has nothing to read, so no hint.
     try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = &.{fx.pin} }, .{}));
     try std.testing.expect(cachedRegistryOwner(a, "probe-target") == null);
+}
+
+test "provider github: a schema-2 cached registry names a namespace owner; schema 1 never does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    try std.testing.expect(cachedRegistryNamespaceOwner(a, "probe") == null);
+    try cacheRegistry(a, try AcceptFixture.schemaTwo(a, fx.pin, "\"probe\"", "\"probe-target\""));
+    try std.testing.expectEqualStrings("fixture", cachedRegistryNamespaceOwner(a, "probe").?);
+    try std.testing.expect(cachedRegistryNamespaceOwner(a, "other") == null);
+    // A target is not a namespace.
+    try std.testing.expect(cachedRegistryNamespaceOwner(a, "probe-target") == null);
+    // The same release as schema 1 claims nothing, and no archive is read.
+    try cacheRegistry(a, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = &.{fx.pin} }, .{}));
+    try std.testing.expect(cachedRegistryNamespaceOwner(a, "probe") == null);
 }
 
 test "provider github: the registry-hint scan reads a bounded number of cached releases" {

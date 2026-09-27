@@ -4,7 +4,6 @@
 const std = @import("std");
 const docker = @import("../docker.zig");
 const runner = @import("../runner.zig");
-const android = @import("../android.zig");
 const sdl_provision = @import("../sdl_provision.zig");
 const bundle = @import("../bundle.zig");
 const linux_desktop = @import("../linux_desktop.zig");
@@ -110,7 +109,7 @@ pub fn run(
         // tree into the command's final artifact. It sits INSIDE the core
         // build so the `after build` hooks below see the finished artifact
         // (a signing, inspecting or publishing hook used to run before the
-        // APK existed, and reported success even when packaging then
+        // artifact existed, and reported success even when packaging then
         // failed — Codex P2 on #420), and so that a `replace build` hook
         // owns it: the replacement produces the artifact its target needs,
         // packaging included.
@@ -126,18 +125,6 @@ pub fn run(
             if (!parsed_args.docker and target.provider == null and linux_desktop.shouldEmit(parsed_args.linux_desktop)) {
                 const entry_path = try linux_desktop.createFromBuild(allocator, project_dir, target_dir, parsed);
                 allocator.free(entry_path);
-            }
-            // `labelle build --platform=android` builds the shared library
-            // above (the generic `zig build` produces `zig-out/lib/libgame.so`)
-            // but, unlike `labelle android build`, used to stop there and leave
-            // a bare `.so`. Package it into a signed APK so the artifact is
-            // installable — backend-agnostic, so it covers sokol and bgfx alike.
-            if (parsed.platform == .android) {
-                const apk_path = try android.packageApk(allocator, project_dir, target_dir, parsed, false, .{}, .{
-                    .strip_native = android.stripForOptimize(effective_optimize),
-                });
-                defer allocator.free(apk_path);
-                std.debug.print("labelle: APK ready: {s}\n", .{apk_path});
             }
         }
     }

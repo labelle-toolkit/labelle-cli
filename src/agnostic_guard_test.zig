@@ -78,6 +78,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `cli/serve/` files that carry its moved platform words: 58 entries.
 /// The `cli/pipeline.zig` split added the eleven `cli/pipeline/` files that
 /// carry its moved platform words (all but `context.zig`): 69 entries.
+/// Android left the CLI for its provider (cli#405): the ten `cli/android*`
+/// entries went with their files, and `cli/add.zig`, `cli/app_icon.zig`,
+/// `cli/check.zig`, `cli/lockfile.zig` and `cli/plugins.zig` came clean
+/// once their comments stopped citing it: 54 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -89,23 +93,10 @@ const allowed_files = [_][]const u8{
     "astc/cmd.zig",
     "astc/convert.zig",
     "cli.zig",
-    "cli/add.zig",
-    "cli/android.zig",
-    "cli/android/apk_slim.zig",
-    "cli/android/build.zig",
-    "cli/android/deploy.zig",
-    "cli/android/doctor.zig",
-    "cli/android/launcher_icon.zig",
-    "cli/android/package.zig",
-    "cli/android/run.zig",
-    "cli/android/studio.zig",
-    "cli/android_sdk.zig",
-    "cli/app_icon.zig",
     "cli/args.zig",
     "cli/args_tests.zig",
     "cli/assembler_proc.zig",
     "cli/bundle.zig",
-    "cli/check.zig",
     "cli/compatibility.zig",
     "cli/config.zig",
     "cli/docker.zig",
@@ -119,7 +110,6 @@ const allowed_files = [_][]const u8{
     "cli/ios.zig",
     "cli/launcher_manifest.zig",
     "cli/linux_desktop.zig",
-    "cli/lockfile.zig",
     "cli/material_toolchain.zig",
     "cli/pack.zig",
     "cli/pipeline.zig",
@@ -136,7 +126,6 @@ const allowed_files = [_][]const u8{
     "cli/pipeline/watch.zig",
     "cli/pipeline/watch_replan.zig",
     "cli/pipeline/watch_replan_tests.zig",
-    "cli/plugins.zig",
     "cli/prebuild.zig",
     "cli/progress.zig",
     "cli/project_config.zig",
@@ -521,12 +510,15 @@ test "host OS names never flag" {
 test "the allowlist matches Windows-style walker paths, one file per entry" {
     try std.testing.expect(allowedIndex("cli/pipeline.zig") != null);
     try std.testing.expect(allowedIndex("cli\\pipeline.zig") != null);
-    try std.testing.expect(allowedIndex("cli\\android\\run.zig") != null);
-    try std.testing.expect(allowedIndex("cli/android.zig") != null);
+    try std.testing.expect(allowedIndex("cli\\serve\\http.zig") != null);
+    try std.testing.expect(allowedIndex("cli/ios.zig") != null);
     // A new file under a legacy directory is NOT exempt.
-    try std.testing.expect(allowedIndex("cli/android/not_yet_written.zig") == null);
-    try std.testing.expect(allowedIndex("cli/android/") == null);
-    try std.testing.expect(allowedIndex("cli/androidx/foo.zig") == null);
+    try std.testing.expect(allowedIndex("cli/serve/not_yet_written.zig") == null);
+    try std.testing.expect(allowedIndex("cli/serve/") == null);
+    try std.testing.expect(allowedIndex("cli/servex/http.zig") == null);
+    // An extracted platform's files left the allowlist with the platform.
+    try std.testing.expect(allowedIndex("cli/android.zig") == null);
+    try std.testing.expect(allowedIndex("cli\\android\\run.zig") == null);
     try std.testing.expect(allowedIndex("cli\\provider_manifest.zig") == null);
     try std.testing.expect(allowedIndex("cli/provider_contract.zig") == null);
 }
@@ -595,15 +587,16 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     try scan.file("cli/provider_settings.zig", "");
     try scan.file("cli/webhook_biosphere.zig", "");
     try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
-    // An allowlisted file under a platform directory stays dirty with clean
-    // contents: the entry is only stale once the file is moved or renamed.
-    try scan.file("cli/android/run.zig", "const x = 1;\n");
+    // An allowlisted file whose path names a platform stays dirty with
+    // clean contents: the entry is only stale once the file is moved or
+    // renamed.
+    try scan.file("cli/emsdk_cache.zig", "const x = 1;\n");
     try scan.file("cli\\ios.zig", "");
     try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
-    try std.testing.expect(!containsString(stale.items, "cli/android/run.zig"));
+    try std.testing.expect(!containsString(stale.items, "cli/emsdk_cache.zig"));
     try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
     try std.testing.expect(containsString(stale.items, "cli/pack.zig"));
 }

@@ -1,7 +1,8 @@
 //! `labelle doctor` — preflight the desktop build/run requirements and report
 //! missing system dependencies with actionable fixes.
 //!
-//! Desktop counterpart of `labelle android doctor`. Almost everything a
+//! The core target's doctor; a provider target has its own (`labelle
+//! <namespace> doctor`, when its package declares one). Almost everything a
 //! labelle game needs is fetched + compiled by Zig automatically (raylib,
 //! sokol, cimgui, glfw, wgpu-native, the labelle packages). The one genuine
 //! manual system dependency is **SDL2** — used by the raylib/sokol backends

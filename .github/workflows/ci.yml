@@ -86,6 +86,9 @@ jobs:
       - name: Provider targets subprocess regression
         run: python test/provider_targets_e2e.py
 
+      - name: Android-shaped provider subprocess regression
+        run: python test/provider_android_like_e2e.py
+
       - name: CLI tests
         run: zig build test
 

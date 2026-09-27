@@ -1,5 +1,5 @@
 //! The run stage: the `run` hook phases around the launch branches (wasm
-//! serve / export with the `--watch` wiring, the iOS and Android deploys,
+//! serve / export with the `--watch` wiring, the iOS deploy,
 //! the host and docker launches) and the `RunOutcome` plumbing, plus the
 //! `wasm serve|export --no-build` path that skips generate and build.
 const std = @import("std");
@@ -11,7 +11,6 @@ const prebuild = @import("../prebuild.zig");
 const serve = @import("../serve.zig");
 const export_mod = @import("../export.zig");
 const ios = @import("../ios.zig");
-const android = @import("../android.zig");
 const util = @import("../util.zig");
 const progress = @import("../progress.zig");
 const args_mod = @import("../args.zig");
@@ -168,7 +167,6 @@ pub fn launch(
     const target_dir = cx.target_dir;
     const target = cx.target;
     const reporter = cx.reporter;
-    const effective_optimize = cx.effective_optimize;
     const hook_arena = cx.hook_arena;
     const hook_site = cx.hook_site;
     const hook_plans = cx.hook_plans;
@@ -322,24 +320,6 @@ pub fn launch(
         // `simctl launch` returns while the app runs on: its exit is never
         // seen here, so this is not the clean exit after hooks wait for.
         return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .launched_detached);
-    } else if (parsed.platform == .android) {
-        // Android: deploy to device/emulator
-        if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to Android");
-        std.debug.print("labelle: deploying to Android...\n", .{});
-        // An app the system starts has no environment we control, so the
-        // env-based run options travel as `am start --es` intent extras
-        // under the same `LABELLE_*` names (cli#397); the Android runtime
-        // turns them back into env vars (labelle-bgfx#139,
-        // labelle-sokol#25). A runtime without that support ignores them.
-        var launch_extras: std.ArrayList(runner.EnvKV) = .empty;
-        defer launch_extras.deinit(allocator);
-        var sec_buf: [32]u8 = undefined;
-        try runner.appendRunOptionEnv(allocator, &launch_extras, runOptionEnv(parsed_args), &sec_buf);
-        try android.deployToDevice(allocator, project_dir, target_dir, parsed, false, .{}, .{
-            .strip_native = android.stripForOptimize(effective_optimize),
-        }, launch_extras.items);
-        // `am start` likewise returns with the app still running.
-        return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .launched_detached);
     } else {
         if (timeout_ns) |t| {
             const secs = t / std.time.ns_per_s;
@@ -396,7 +376,7 @@ pub fn launch(
             var extras: std.ArrayList(runner.EnvKV) = .empty;
             defer extras.deinit(allocator);
             // --scene / --profile / --screenshot(+--after): the list shared
-            // with the Android launch (cli#397).
+            // with a `run`-step hook's `run.env` (`hookRunOptions`, cli#397).
             var sec_buf: [32]u8 = undefined;
             try runner.appendRunOptionEnv(allocator, &extras, runOptionEnv(parsed_args), &sec_buf);
             var ticks_buf: [32]u8 = undefined;
@@ -538,13 +518,14 @@ fn noteRunSharesStdout(reporter: ?*progress.Reporter) void {
 
 /// The `--target` of a `run --docker` whose launch is skipped: a
 /// cross-compiled binary cannot run on this host. Only the host launch
-/// branch launches a binary here — `wasm`, `ios` and `android` deploy their
-/// own way — and a `replace run` hook stands in for the launch entirely, so
-/// neither is skipped. `null` when the launch happens.
+/// branch launches a binary here — `wasm` and `ios` deploy their own way,
+/// and every other provider target has a `replace run` hook (the install
+/// stage refuses it otherwise, `NoRunReplacement`), which stands in for the
+/// launch entirely — so neither is skipped. `null` when the launch happens.
 fn crossTargetLaunchSkipped(in_docker: bool, docker_target: ?[]const u8, platform: project_config.Platform, replaced: bool) ?[]const u8 {
     if (!in_docker or replaced) return null;
     switch (platform) {
-        .wasm, .ios, .android => return null,
+        .wasm, .ios => return null,
         else => return docker_target,
     }
 }
@@ -558,13 +539,19 @@ test "pipeline: a cross-target docker run is skipped before the run hooks" {
     // A replacement launches its own way; the deploy targets never reach
     // the host launch branch.
     try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", .desktop, true) == null);
-    for ([_]project_config.Platform{ .wasm, .ios, .android }) |platform| {
+    for ([_]project_config.Platform{ .wasm, .ios }) |platform| {
         try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", platform, false) == null);
     }
+    // `android` has no launch branch of its own any more: its provider's
+    // `replace run` hook launches it (a cross target is not skipped then),
+    // and without one the install stage refused the run already.
+    try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", .android, true) == null);
+    try std.testing.expectEqualStrings("aarch64-linux", crossTargetLaunchSkipped(true, "aarch64-linux", .android, false).?);
 }
 
 /// The `labelle run` options that reach the game as `LABELLE_*` variables on
-/// every platform (env block on desktop, intent extras on Android — cli#397).
+/// every platform (env block on desktop; a provider's `run` hook gets the same
+/// pairs as `run.env` and decides how they reach its game — cli#397).
 /// The `run` outcome a launched game's termination stands for.
 fn runOutcome(term: runner.Termination) provider_hooks.RunOutcome {
     return switch (term) {

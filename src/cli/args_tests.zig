@@ -11,7 +11,6 @@ const args = @import("args.zig");
 const expect = @import("zspec").expect;
 
 const ParsedArgs = args.ParsedArgs;
-const Backend = project_config.Backend;
 const valid_optimize_modes = args.valid_optimize_modes;
 const parseSceneArg = args.parseSceneArg;
 const sceneArgValue = args.sceneArgValue;
@@ -25,7 +24,6 @@ const parseWasmExportArgs = args.parseWasmExportArgs;
 const parseBundleArgs = args.parseBundleArgs;
 const appendExtraArg = args.appendExtraArg;
 const appendRunForwardedArgs = args.appendRunForwardedArgs;
-const resolveAndroidBackend = args.resolveAndroidBackend;
 
 pub const ParseSceneArg = struct {
     pub const with_equals_value = struct {
@@ -377,32 +375,6 @@ pub const ParsePlatformValueSpec = struct {
             defer iter.deinit();
             const result = parseRunArgs(&iter, "run", true, &parsed) orelse return error.TestFailed;
             try std.testing.expectEqualStrings("probe-target", result.platform.?);
-        }
-    };
-};
-
-pub const ResolveAndroidBackendSpec = struct {
-    pub const android_capable_backends_kept = struct {
-        test "bgfx project keeps bgfx (#252)" {
-            try expect.equal(resolveAndroidBackend(.bgfx), Backend.bgfx);
-        }
-        test "sokol project keeps sokol" {
-            try expect.equal(resolveAndroidBackend(.sokol), Backend.sokol);
-        }
-    };
-
-    pub const non_android_backends_fall_back_to_sokol = struct {
-        test "raylib falls back to sokol" {
-            try expect.equal(resolveAndroidBackend(.raylib), Backend.sokol);
-        }
-        test "sdl falls back to sokol" {
-            try expect.equal(resolveAndroidBackend(.sdl), Backend.sokol);
-        }
-        test "wgpu falls back to sokol" {
-            try expect.equal(resolveAndroidBackend(.wgpu), Backend.sokol);
-        }
-        test "null falls back to sokol" {
-            try expect.equal(resolveAndroidBackend(.null), Backend.sokol);
         }
     };
 };

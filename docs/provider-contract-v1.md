@@ -95,7 +95,7 @@ Introduce one generic project field mapping package identity to a provider-owned
 
 ```zig
 .provider_config = .{
-    .{ .package = "labelle-android", .file = "providers/android.json" },
+    .{ .package = "android", .file = "providers/android.json" },
 },
 ```
 

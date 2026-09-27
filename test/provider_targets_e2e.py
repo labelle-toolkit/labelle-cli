@@ -173,11 +173,18 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
         untouched(refused, "wasm")
     # The legacy subcommands request the same target and fail the same way.
     for args in (("wasm", "serve", "--no-open"), ("wasm", "export"), ("wasm", "serve", "--no-build"),
-                 ("android", "build"), ("ios", "build")):
+                 ("ios", "build")):
         refused = run(*args, code=1)
-        expected = {"wasm": "wasm", "android": "android", "ios": "ios"}[args[0]]
+        expected = {"wasm": "wasm", "ios": "ios"}[args[0]]
         assert NO_PROVIDER.format(t=expected) in refused.stderr, (args, refused.stderr)
         untouched(refused, expected)
+    # `android` is no built-in any more (cli#405): it is a provider namespace
+    # like any other, so with no package declaring it the word is an unknown
+    # command (test/provider_android_like_e2e.py covers the registry hint).
+    refused = run("android", "build", code=1)
+    assert "labelle: unknown command 'android'" in refused.stderr, refused.stderr
+    assert NO_PROVIDER.format(t="android") not in refused.stderr, refused.stderr
+    untouched(refused, "android")
     # The project's own declared platform goes through the resolver too.
     declare(platform="wasm")
     refused = run("generate", code=1)

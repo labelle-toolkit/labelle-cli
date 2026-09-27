@@ -27,7 +27,7 @@ const gateThenInstall = @import("install.zig").gateThenInstall;
 /// `build` / `run` are not assembler subcommands: the subsequent
 /// `zig build` invocation and binary launch stay CLI-side (see below).
 /// The CLI owns docker orchestration, the WASM serve loop, the
-/// iOS/Android deploy paths and `--timeout` — generation is the only
+/// iOS deploy path and `--timeout` — generation is the only
 /// step the assembler binary delegates.
 /// `parsed_args.scene_override` is intentionally NOT forwarded to the
 /// assembler. PR #243 removed the CLI's `cfg.initial_prefab` rewrite for
@@ -101,8 +101,8 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         // (Codex on #421). Its provider owns its asset pipeline; `cmdAstc`
         // itself refuses such a name.
         if (target.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-            // Pass the RESOLVED target: `--platform=wasm`, `labelle ios` (forces
-            // sokol) and the Android backend fallback all differ from what
+            // Pass the RESOLVED target: `--platform=wasm` and `labelle ios`
+            // (forces sokol) differ from what
             // project.labelle declares, and the loadable blocks depend on both.
             astc_cmd.cmdAstc(allocator, &.{
                 project_dir,
@@ -133,7 +133,7 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         // @embedFile path picks up the fresh `.rgba` files. Skipped unless
         // `--bake` is passed: raw RGBA expands heavily-transparent atlases
         // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
-        // APK size sane. Use for projects whose atlases are nearly opaque
+        // packaged sizes sane. Use for projects whose atlases are nearly opaque
         // and PNG decode dominates cold start.
         if (parsed_args.bake) {
             bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {

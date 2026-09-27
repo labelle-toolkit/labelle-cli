@@ -30,7 +30,7 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     compatibility.validateCompatibility(parsed);
 
     // Pre-build hooks (#355). Runs on `generate` / `build` / `run` (and
-    // the ios/android/wasm flows, which all generate) — the first thing
+    // the ios/wasm flows, which all generate) — the first thing
     // that touches the project after its config is validated, and ahead
     // of EVERY generation input reader: the ASTC pre-pass, the `--bake`
     // pre-pass, the assembler's cache populate and `generate`. That
@@ -222,6 +222,16 @@ pub fn discoverAndPlan(
             }
         }
     }
+    // `labelle run` of a provider target is launched by its provider, so it
+    // needs a `replace` hook on `run`: the CLI has no launch of its own for
+    // any provider target except the legacy branches `legacyRunBranch`
+    // still names. Without one the run would fall through to the host
+    // launch and try to execute a binary built for another platform, so
+    // stop HERE, after the install and before generation or any compiler.
+    if (noRunReplacement(command, target.provider != null, hook_plans.run.replace != null, target.legacy)) {
+        std.debug.print("labelle: target '{s}' has no run replacement; package '{s}' must declare a `.when = .replace` hook on `run`\n", .{ target.name, target.providerName() });
+        return error.NoRunReplacement;
+    }
 
     // Plugin→core compatibility, the POST-RESOLVE half (#332).
     //
@@ -243,6 +253,54 @@ pub fn discoverAndPlan(
     // harmless, and `enforceCliNotStale` only reads it on the next run.
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     return .{ .ready = .{ .providers = providers, .target = target, .hook_plans = hook_plans } };
+}
+
+/// The platforms whose provider target the CLI still launches through a
+/// built-in `run` branch of its own (`pipeline/run.zig`). Every other
+/// provider target is launched by its provider's `replace run` hook. The
+/// set only shrinks: a platform leaves it when its launch moves into a
+/// provider (cli#405 removed `android`).
+pub fn legacyRunBranch(platform: ?project_config.Platform) bool {
+    const p = platform orelse return false;
+    return switch (p) {
+        .wasm, .ios => true,
+        .desktop, .android => false,
+    };
+}
+
+/// Whether `labelle run` must be refused before the build
+/// (`error.NoRunReplacement`): a provider target, no `replace run` hook in
+/// the plan, and no legacy launch branch to fall back to. Pure, so the
+/// decision table is unit-tested without a project.
+pub fn noRunReplacement(command: args_mod.Command, has_provider: bool, has_run_replacement: bool, legacy: ?project_config.Platform) bool {
+    return command == .run and has_provider and !has_run_replacement and !legacyRunBranch(legacy);
+}
+
+test "NoRunReplacement: a provider target needs a run replacement unless a legacy branch launches it" {
+    // The refused shape: `run`, a provider target, no replacement, no
+    // legacy branch (a schema name that left the set, or a foreign name).
+    try std.testing.expect(noRunReplacement(.run, true, false, .android));
+    try std.testing.expect(noRunReplacement(.run, true, false, null));
+    // A replacement launches it.
+    try std.testing.expect(!noRunReplacement(.run, true, true, .android));
+    try std.testing.expect(!noRunReplacement(.run, true, true, null));
+    // The legacy branches still launch their own way.
+    try std.testing.expect(!noRunReplacement(.run, true, false, .wasm));
+    try std.testing.expect(!noRunReplacement(.run, true, false, .ios));
+    // The core target is launched by the host branch.
+    try std.testing.expect(!noRunReplacement(.run, false, false, .desktop));
+    // Only `run` launches: build, bundle and generate are never refused here.
+    for ([_]args_mod.Command{ .build, .bundle_cmd, .generate, .wasm_cmd, .ios_cmd }) |command| {
+        try std.testing.expect(!noRunReplacement(command, true, false, .android));
+    }
+}
+
+test "legacyRunBranch: only wasm and ios keep a built-in launch" {
+    try std.testing.expect(legacyRunBranch(.wasm));
+    try std.testing.expect(legacyRunBranch(.ios));
+    try std.testing.expect(!legacyRunBranch(.android));
+    try std.testing.expect(!legacyRunBranch(.desktop));
+    try std.testing.expect(!legacyRunBranch(null));
 }
 
 test "a rejected shader override stops the cold build before any package is installed" {

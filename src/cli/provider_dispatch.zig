@@ -13,12 +13,14 @@ const github = @import("provider_github.zig");
 const hooks = @import("provider_hooks.zig");
 const asm_cache = @import("asm_cache.zig");
 
-// Existing platform commands remain reserved until their extraction lands.
+// Existing platform commands remain reserved until their extraction lands;
+// an extracted one leaves the list and its namespace becomes dispatchable
+// (cli#405).
 pub const reserved = [_][]const u8{
     "generate", "build",   "bundle",    "run",       "init",   "add",   "install", "update",
     "upgrade",  "clean",   "test",      "pack",      "astc",   "audit", "migrate", "check",
-    "plugins",  "doctor",  "assembler", "toolchain", "status", "ios",   "android", "wasm",
-    "help",     "version", "targets",   "providers",
+    "plugins",  "doctor",  "assembler", "toolchain", "status", "ios",   "wasm",    "help",
+    "version",  "targets", "providers",
 };
 pub const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
 
@@ -622,6 +624,17 @@ test "provider dispatch: target_dir and run options reach only a provider whose 
     try cmd_ctx.validate(true);
     const cmd_wire = try std.json.Stringify.valueAlloc(a, cmd_ctx, .{});
     try std.testing.expect(std.mem.indexOf(u8, cmd_wire, "\"target_dir\":null") != null);
+}
+
+test "provider dispatch: an extracted platform's namespace is no longer reserved" {
+    // `android` moved into its provider (cli#405): a package may declare the
+    // namespace. The legacy subcommands still built in stay reserved.
+    for (reserved) |name| try std.testing.expect(!std.mem.eql(u8, name, "android"));
+    for ([_][]const u8{ "ios", "wasm", "run", "build", "bundle" }) |kept| {
+        var found = false;
+        for (reserved) |name| found = found or std.mem.eql(u8, name, kept);
+        try std.testing.expect(found);
+    }
 }
 
 test "provider dispatch: lock mismatch and duplicates fail closed" {
