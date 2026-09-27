@@ -160,7 +160,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     // The accepted document is kept as the hint source of the no-provider
     // diagnostic (a preview stays read-only): `reviewed`, never this run's
     // raw fetch. Best effort: a failed cache write changes nothing about the pins.
-    cacheRegistry(a, reviewed) catch |err| {
+    registry_cache.cacheRegistryFrom(a, reviewed, registry_lookup.canonicalSource(a, source) catch null) catch |err| {
         std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
     };
     // Which source this project accepted from, with the same reviewed

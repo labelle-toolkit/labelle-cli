@@ -10,6 +10,7 @@
 //! Nothing here knows a platform, store or package name: the CLI is agnostic
 //! (`docs/rfc-package-commands.md`).
 const std = @import("std");
+const builtin = @import("builtin");
 const contract = @import("provider_contract.zig");
 const dispatch = @import("provider_dispatch.zig");
 const project = @import("project_config.zig");
@@ -120,7 +121,12 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
             try w.print("  (registry: {s})\n", .{hint.package});
             switch (hint.source) {
                 .online => try w.writeAll("  the provider registry"),
-                .cache => try w.writeAll("  the cached provider registry (last `providers resolve --accept`)"),
+                .cache => if (hint.registry) |from|
+                    try w.print("  the cached copy of the registry last accepted from, {s},", .{from})
+                else if (hint.unknown_origin)
+                    try w.writeAll("  a cached registry of unrecorded origin (the last `providers resolve --accept` on this machine)")
+                else
+                    try w.writeAll("  the cached provider registry (last `providers resolve --accept`)"),
                 .accepted_source => try w.print("  the registry this project last accepted from, {s},", .{hint.registry.?}),
                 .accepted_copy => try w.print("  the recorded copy of the registry this project last accepted from, {s},", .{hint.registry.?}),
             }
@@ -154,10 +160,13 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
             try w.print("    1. add the package that declares target '{s}' to .plugins in project.labelle\n       (the registry lists each package's targets: {s}):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ target, why.registry orelse github.registry_url });
         },
     }
-    const arg: []const u8 = if (custom) |from| try std.fmt.allocPrint(a, " {s}", .{try shellWord(a, from)}) else "";
+    const arg: []const u8 = if (custom) |from| try std.fmt.allocPrint(a, " {s}", .{try shellWord(a, from, builtin.os.tag)}) else "";
     try w.print("    2. labelle providers resolve{s}            # preview the pin\n", .{arg});
     try w.print("    3. labelle providers resolve{s} --accept   # verify it and write labelle.providers.lock (commit it;\n", .{arg});
     try w.writeAll("                                            # fresh clones and CI run `labelle providers fetch`)\n");
+    if (lookup == .hit and lookup.hit.unknown_origin) {
+        try w.writeAll("  If that registry was not the public one, pass its source (a providers.json path or URL) to both resolve steps.\n");
+    }
     if (lookup == .hit) {
         // The registry carries no command-contract metadata, so the suggested
         // release may need a newer CLI than this one.
@@ -167,15 +176,40 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
     return out.toOwnedSlice();
 }
 
-/// `text` as one POSIX shell word: as is when it holds only safe bytes,
-/// else single-quoted.
-fn shellWord(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+/// `text` as one shell word for the shell the user runs `labelle` from on
+/// `os`: as is when it holds only safe bytes; else single-quoted for a POSIX
+/// shell (`'` as `'\''`), or double-quoted on Windows with the quoting rules
+/// the C runtime (and Zig's own argument parser) apply: a `"` is escaped as
+/// `\"`, and the backslashes before a `"` or the closing quote are doubled.
+pub fn shellWord(a: std.mem.Allocator, text: []const u8, os: std.Target.Os.Tag) ![]const u8 {
+    const windows = os == .windows;
+    const extra: []const u8 = if (windows) "/._-:~+@%=,\\" else "/._-:~+@%=,";
     const safe = for (text) |c| {
-        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "/._-:~+@%=,", c) != null)) break false;
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, extra, c) != null)) break false;
     } else text.len > 0;
     if (safe) return text;
-    const escaped = try std.mem.replaceOwned(u8, a, text, "'", "'\\''");
-    return std.fmt.allocPrint(a, "'{s}'", .{escaped});
+    if (!windows) {
+        const escaped = try std.mem.replaceOwned(u8, a, text, "'", "'\\''");
+        return std.fmt.allocPrint(a, "'{s}'", .{escaped});
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '"');
+    var backslashes: usize = 0;
+    for (text) |c| {
+        if (c == '\\') {
+            backslashes += 1;
+            continue;
+        }
+        // Backslashes before a quote are doubled, plus one escaping the quote.
+        const run = if (c == '"') backslashes * 2 + 1 else backslashes;
+        try out.appendNTimes(a, '\\', run);
+        backslashes = 0;
+        try out.append(a, c);
+    }
+    // Trailing backslashes precede the closing quote: doubled.
+    try out.appendNTimes(a, '\\', backslashes * 2);
+    try out.append(a, '"');
+    return out.items;
 }
 
 /// Print the no-provider diagnostic for the project at `root`. The registry
@@ -355,7 +389,16 @@ test "provider targets: the no-provider diagnostic names the registry owner on a
     }
     try std.testing.expect(std.mem.indexOf(u8, hit, "2. labelle providers resolve            #") != null);
     const spaced = try noProviderDiagnostic(a, "probe-target", .{ .miss = .{ .reason = .not_listed, .registry = "/my dir/it's.json" } });
-    try std.testing.expect(std.mem.indexOf(u8, spaced, "labelle providers resolve '/my dir/it'\\''s.json' --accept") != null);
+    const quoted = try std.fmt.allocPrint(a, "labelle providers resolve {s} --accept", .{try shellWord(a, "/my dir/it's.json", builtin.os.tag)});
+    try std.testing.expect(std.mem.indexOf(u8, spaced, quoted) != null);
+    // A cached answer of unrecorded origin is not presented as the public registry.
+    const unknown = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.0.0", .source = .cache, .unknown_origin = true } });
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "a cached registry of unrecorded origin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "the cached provider registry") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "pass its source (a providers.json path or URL) to both resolve steps") != null);
+    const cached_custom = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.0.0", .source = .cache, .registry = "/abs/other.json" } });
+    try std.testing.expect(std.mem.indexOf(u8, cached_custom, "the cached copy of the registry last accepted from, /abs/other.json,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cached_custom, "3. labelle providers resolve /abs/other.json --accept") != null);
     // Only a hit names a release, so only a hit carries the contract note.
     try std.testing.expect(std.mem.indexOf(u8, hit, "If --accept reports UnsupportedContract") != null);
     try std.testing.expect(std.mem.indexOf(u8, custom_miss, "UnsupportedContract") == null);
@@ -379,4 +422,26 @@ test "provider targets: the no-provider diagnostic names the registry owner on a
         try std.testing.expect(std.mem.indexOf(u8, text, ".{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" },") != null);
         for (steps) |step| try std.testing.expect(std.mem.indexOf(u8, text, step) != null);
     }
+}
+
+test "provider targets: a printed registry source is one shell word, POSIX single quotes or Windows double quotes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Safe text is printed as is on both.
+    try std.testing.expectEqualStrings("/abs/providers.json", try shellWord(a, "/abs/providers.json", .linux));
+    try std.testing.expectEqualStrings("https://raw.githubusercontent.com/o/r/main/providers.json", try shellWord(a, "https://raw.githubusercontent.com/o/r/main/providers.json", .windows));
+    try std.testing.expectEqualStrings("C:\\reg\\providers.json", try shellWord(a, "C:\\reg\\providers.json", .windows));
+    // POSIX: single quotes; an embedded ' closes, escapes and reopens.
+    try std.testing.expectEqualStrings("'/my dir/it'\\''s.json'", try shellWord(a, "/my dir/it's.json", .macos));
+    // A backslash is not safe on POSIX (it is a shell escape there).
+    try std.testing.expectEqualStrings("'C:\\reg'", try shellWord(a, "C:\\reg", .linux));
+    // Windows: double quotes, never single ones.
+    try std.testing.expectEqualStrings("\"C:\\My Registry\\providers.json\"", try shellWord(a, "C:\\My Registry\\providers.json", .windows));
+    try std.testing.expectEqualStrings("\"C:\\it's.json\"", try shellWord(a, "C:\\it's.json", .windows));
+    // An embedded quote is \" and the backslashes before it are doubled;
+    // trailing backslashes before the closing quote are doubled too.
+    try std.testing.expectEqualStrings("\"a \\\"b\\\"\"", try shellWord(a, "a \"b\"", .windows));
+    try std.testing.expectEqualStrings("\"x\\\\\\\"y\"", try shellWord(a, "x\\\"y", .windows));
+    try std.testing.expectEqualStrings("\"C:\\my dir\\\\\"", try shellWord(a, "C:\\my dir\\", .windows));
 }

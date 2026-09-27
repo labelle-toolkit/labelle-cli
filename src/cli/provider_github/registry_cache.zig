@@ -37,11 +37,36 @@ pub fn cachedRegistry(a: std.mem.Allocator) !?registry.Registry {
     return try registry.parse(a, bytes);
 }
 
+/// Where the cached document came from: the source the accept that cached
+/// it resolved against, bound to the document's digest so a stale sidecar
+/// never labels a newer document.
+pub const registry_source_file = "source.json";
+
+const CacheSource = struct { source: []const u8, document_sha256: []const u8 };
+
+/// The source the cached document was accepted from (an https URL or an
+/// absolute file path), or null when it is not recorded, or recorded for
+/// other bytes (a cache written before sources were kept, or by hand).
+pub fn cachedRegistrySource(a: std.mem.Allocator) ?[]const u8 {
+    const dir = std.fs.path.join(a, &.{ cacheRoot(a) catch return null, registry_cache_dir }) catch return null;
+    const bytes = read(a, std.fs.path.join(a, &.{ dir, registry_cache_file }) catch return null, 1024 * 1024) catch return null;
+    const side = read(a, std.fs.path.join(a, &.{ dir, registry_source_file }) catch return null, 64 * 1024) catch return null;
+    const record = std.json.parseFromSliceLeaky(CacheSource, a, side, .{ .allocate = .alloc_always }) catch return null;
+    const digest = sha256Hex(a, bytes) catch return null;
+    if (!std.mem.eql(u8, digest, record.document_sha256)) return null;
+    return record.source;
+}
+
 fn cachedOwner(a: std.mem.Allocator, target: []const u8) !?[]const u8 {
     const doc = try cachedRegistry(a) orelse return null;
-    // Schema 2 publishes target ownership (#411): the lookup is by name and
-    // reads no archive at all. Only a schema-1 document, whose records claim
-    // nothing, falls back to the bounded scan of cached archives.
+    return scanOwner(doc, target);
+}
+
+/// The package `doc` names as the owner of `target`. Schema 2 publishes
+/// target ownership (#411): the lookup is by name and reads no archive at
+/// all. Only a schema-1 document, whose records claim nothing, falls back to
+/// the bounded scan of verified cached archives.
+pub fn scanOwner(doc: registry.Registry, target: []const u8) !?[]const u8 {
     if (doc.claimsOwnership()) return doc.targetOwner(target);
     var inspected: usize = 0;
     for (doc.pins) |pin| {
@@ -99,11 +124,24 @@ fn cachedNamespaceOwner(a: std.mem.Allocator, namespace: []const u8) !?[]const u
     return doc.namespaceOwner(namespace);
 }
 
-/// Keep the document an accept just resolved against, for `cachedRegistryOwner`.
+/// Keep the document an accept just resolved against, for `cachedRegistryOwner`,
+/// with no recorded source.
 pub fn cacheRegistry(a: std.mem.Allocator, data: []const u8) !void {
+    return cacheRegistryFrom(a, data, null);
+}
+
+/// Keep the document an accept just resolved against and, when known, the
+/// source it came from (`cachedRegistrySource`). The sidecar carries the
+/// document's digest, so a document cached without a source is never
+/// labelled by an older sidecar.
+pub fn cacheRegistryFrom(a: std.mem.Allocator, data: []const u8, source: ?[]const u8) !void {
     const dir = try std.fs.path.join(a, &.{ try cacheRoot(a), registry_cache_dir });
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
     try writeAtomically(a, try std.fs.path.join(a, &.{ dir, registry_cache_file }), data);
+    if (source) |from| {
+        const side: CacheSource = .{ .source = from, .document_sha256 = try sha256Hex(a, data) };
+        try writeAtomically(a, try std.fs.path.join(a, &.{ dir, registry_source_file }), try std.json.Stringify.valueAlloc(a, side, .{}));
+    }
 }
 
 test "provider github: the cached registry names a target owner only from a verified cached archive" {
