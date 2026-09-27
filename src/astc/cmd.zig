@@ -15,21 +15,21 @@ const util = @import("../cli/util.zig");
 const lockfile = @import("../cli/lockfile.zig");
 const contract = @import("../cli/provider_contract.zig");
 const convert = @import("convert.zig");
+const capabilities = @import("capabilities.zig");
 const astcenc_bin = @import("astcenc_bin.zig");
 
 const usage =
     \\Usage: labelle astc [dir] [--block <4x4|6x6|8x8|...>] [--quality <fastest|fast|medium|thorough>]
     \\
     \\Converts each atlas texture declared in project.labelle to a co-located
-    \\<name>.astc (GPU-native, zero runtime decode). Default block 8x8, quality fast.
+    \\<name>.astc (GPU-native, zero runtime decode). Default block comes from backend metadata; quality fast.
     \\
     \\An individual atlas can pin its own block in project.labelle
     \\(`.astc_block = .@"4x4"` on the resource); an explicit --block here
     \\overrides every such pin.
     \\
     \\  --platform <t>      target name (the resolved target, as the build pipeline
-    \\                      passes it; `desktop` or a legacy schema platform — other
-    \\                      targets have no ASTC table yet); default is
+    \\                      passes it); default is
     \\                      project.labelle's `.platform`.
     \\  --backend <b>       target backend; default is project.labelle's.
     \\  --allow-older-cli   proceed even when labelle.lock was written by a
@@ -71,7 +71,7 @@ fn existingBlockMatches(out: []const u8, block: convert.BlockSize) bool {
 /// Whether the `.astc` sibling at `out` can be kept as-is: newer than its
 /// source AND encoded at `block`. The block check is what keeps a sibling
 /// shared across platforms honest — an 8x8 file an Android build left behind
-/// is NOT current for a bgfx web build that needs 4x4 (labelle-bgfx#134), so
+/// is NOT current for a target that needs 4x4, so
 /// switching platforms re-encodes rather than shipping an unloadable atlas.
 fn siblingIsCurrent(src: []const u8, out: []const u8, block: convert.BlockSize) bool {
     return !convert.needsReencode(Stat, src, out) and existingBlockMatches(out, block);
@@ -112,7 +112,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     var dir: []const u8 = ".";
     var opts = convert.Options{};
     // Whether the user pinned `--block` explicitly. When they didn't, we pick a
-    // backend-safe default below (sokol can only load 4×4); when they did, we
+    // backend-declared default below; when they did, we
     // validate it against the backend instead of silently emitting an
     // unloadable file.
     var block_explicit = false;
@@ -123,9 +123,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // Target overrides: `labelle build --platform=wasm` resolves a platform
     // (and backend) that project.labelle may not declare, and the loadable
     // blocks depend on both — so the pipeline passes what it resolved. The
-    // target is a NAME (RFC #406 phase 3b, `provider_targets.zig`); the
-    // legacy capability table below still keys on the schema enum, so a
-    // target outside it has no table yet (labelle-assembler#378).
+    // target is a NAME, matched against the backend manifest's target keys.
     var platform_override: ?[]const u8 = null;
     var backend_override: ?project_config.Backend = null;
 
@@ -148,7 +146,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             platform_override = cmd_args[i];
         } else if (std.mem.eql(u8, arg, "--backend")) {
             i += 1;
-            if (i >= cmd_args.len) return usageErr("--backend needs a value (e.g. bgfx)");
+            if (i >= cmd_args.len) return usageErr("--backend needs a value");
             backend_override = std.meta.stringToEnum(project_config.Backend, cmd_args[i]) orelse return usageErr("unknown --backend");
         } else if (std.mem.eql(u8, arg, "--allow-older-cli")) {
             allow_older_cli = true;
@@ -174,25 +172,20 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         return error.InvalidArgs;
     };
 
-    // The target backend constrains which block sizes are loadable at runtime.
-    // sokol ships ASTC 4×4 only — an 8×8 atlas parses but fails to upload
-    // (error.LoadFailed), which on FP left the game stuck on the loading scene.
-    // Default to a backend-safe block when the user didn't pin one; reject an
-    // explicit block the backend can't load rather than baking a dud.
     const backend = backend_override orelse cfg.backend;
-    const platform = if (platform_override) |name|
-        std.meta.stringToEnum(project_config.Platform, name) orelse {
-            std.debug.print("labelle astc: target '{s}' has no ASTC capability table yet (labelle-assembler#378)\n", .{name});
-            return error.InvalidArgs;
-        }
-    else
-        cfg.platform;
-    const caps = backendCaps(backend, platform, bgfxWebSamples8x8(cfg.backend_package));
+    const platform = platform_override orelse @tagName(cfg.platform);
+    // An explicit backend switch cannot inherit another package's capabilities.
+    const package = if (backend == cfg.backend) cfg.backend_package else null;
+    const selection = try capabilities.resolve(allocator, dir, package, platform);
+    const caps = selection.caps;
+    std.debug.print("labelle astc: {s} capabilities for {s}, default {s}\n", .{
+        @tagName(selection.source), platform, caps.defaultBlock().arg(),
+    });
     if (block_explicit) {
         if (!caps.supports(opts.block)) {
             std.debug.print(
                 "labelle astc: backend '{s}' on {s} cannot upload ASTC {s} (try {s})\n",
-                .{ @tagName(backend), @tagName(platform), opts.block.arg(), caps.defaultBlock().arg() },
+                .{ @tagName(backend), platform, opts.block.arg(), caps.defaultBlock().arg() },
             );
             return error.InvalidArgs;
         }
@@ -280,42 +273,6 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
 
     std.debug.print("labelle astc: {d} converted, {d} up-to-date, {d} failed\n", .{ tally.converted, tally.cached, tally.failed });
     if (tally.failed > 0) return error.AstcConversionFailed;
-}
-
-/// First labelle-bgfx that samples ASTC 8x8 on WebGL (zbgfx#2 lists the full
-/// LDR set in bgfx's emscripten format table, labelle-bgfx#147).
-const bgfx_web_8x8_min: std.SemanticVersion = .{ .major = 0, .minor = 28, .patch = 1 };
-
-/// Can the project's pinned bgfx sample ASTC 8x8 on the web? Yes for a pin
-/// at or after `bgfx_web_8x8_min`, and for a `local:` checkout (the
-/// developer's own current source). No for an older pin, an unparseable
-/// version, or no `backend_package` at all (the assembler's built-in bgfx
-/// provider pins an old backend). An older bgfx REFUSES 8x8 on the web, and
-/// an assembler before 0.113.0 has no PNG fallback, so emitting 8x8 there
-/// would leave atlases unloaded (Codex review on #404).
-fn bgfxWebSamples8x8(pkg: ?project_config.PluginDep) bool {
-    const p = pkg orelse return false;
-    if (p.isLocal()) return true;
-    const v = std.SemanticVersion.parse(p.version) catch return false;
-    return v.order(bgfx_web_8x8_min) != .lt;
-}
-
-/// Which ASTC blocks `backend` can load on `platform`, see `BackendCaps`.
-/// `bgfx_web_8x8` is `bgfxWebSamples8x8` for the project's pinned bgfx.
-fn backendCaps(backend: project_config.Backend, platform: project_config.Platform, bgfx_web_8x8: bool) convert.BackendCaps {
-    return switch (backend) {
-        .sokol => .sokol_4x4_only,
-        .raylib => .raylib_4x4_8x8,
-        // bgfx uploads any block it can name and validates none of them, so
-        // an unsupported one renders garbage with no error at all, verified
-        // on device with 6x6. See `BackendCaps.bgfx_4x4_8x8`. The web shares
-        // it from bgfx v0.28.1; older bgfx on the web is 4x4-only (#147).
-        .bgfx => if (platform == .wasm and !bgfx_web_8x8) .bgfx_web_4x4_only else .bgfx_4x4_8x8,
-        .wgpu => .full,
-        // sdl/null aren't ASTC upload targets; the gfx seam falls back to PNG
-        // decode if they ever see a compressed blob, so leave block unconstrained.
-        .sdl, .null => .full,
-    };
 }
 
 fn resolveAstcenc(allocator: std.mem.Allocator) ![]const u8 {
@@ -875,7 +832,7 @@ fn atlasPinning(block: ?convert.BlockSize) project_config.ResourceDef {
 
 test "resourceOpts: an atlas without a pin keeps the run-wide block" {
     const base = convert.Options{ .block = .@"8x8" };
-    const opts = resourceOpts(atlasPinning(null), base, false, .full);
+    const opts = resourceOpts(atlasPinning(null), base, false, test_full_caps);
     try std.testing.expectEqual(convert.BlockSize.@"8x8", opts.block);
 }
 
@@ -883,28 +840,28 @@ test "resourceOpts: a pinned block wins over the backend default" {
     // The whole point of the knob: characters at 4x4 while the rest of
     // the project stays on the 8x8 default.
     const base = convert.Options{ .block = .@"8x8" };
-    const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, .full);
+    const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, test_full_caps);
     try std.testing.expectEqual(convert.BlockSize.@"4x4", opts.block);
 }
 
 test "resourceOpts: an explicit --block overrides every pin" {
     const base = convert.Options{ .block = .@"6x6" };
-    const opts = resourceOpts(atlasPinning(.@"4x4"), base, true, .full);
+    const opts = resourceOpts(atlasPinning(.@"4x4"), base, true, test_full_caps);
     try std.testing.expectEqual(convert.BlockSize.@"6x6", opts.block);
 }
 
 test "resourceOpts: a pin the backend cannot upload degrades to the default" {
-    // sokol loads 4x4 only. A pin it can't upload must NOT be baked: the
+    // This declaration allows 4x4 only. A pin it can't upload must NOT be baked: the
     // atlas would parse and then fail to upload, stranding the game on
     // the loading scene. Fall back rather than ship a dud.
     const base = convert.Options{ .block = .@"4x4" };
-    const opts = resourceOpts(atlasPinning(.@"8x8"), base, false, .sokol_4x4_only);
+    const opts = resourceOpts(atlasPinning(.@"8x8"), base, false, test_narrow_caps);
     try std.testing.expectEqual(convert.BlockSize.@"4x4", opts.block);
 }
 
 test "resourceOpts: quality and other options are carried through unchanged" {
     const base = convert.Options{ .block = .@"8x8", .quality = .thorough };
-    const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, .full);
+    const opts = resourceOpts(atlasPinning(.@"4x4"), base, false, test_full_caps);
     try std.testing.expectEqual(convert.Quality.thorough, opts.quality);
 }
 
@@ -1455,12 +1412,8 @@ test "conflictingBlockPin: injected case-sensitive probe keeps case aliases dist
     try std.testing.expect((try conflictingBlockPinProbe(a, &jobs, probe)) == null);
 }
 
-test "BackendCaps: bgfx rejects blocks it cannot actually upload" {
-    // bgfx names every ASTC block in a `TextureFormat` but validates none
-    // against the runtime, so an unsupported one renders garbage with a clean
-    // log — measured on an Adreno 610 with 6x6. Only the two blocks verified
-    // on hardware are accepted.
-    const caps: convert.BackendCaps = .bgfx_4x4_8x8;
+test "resourceOpts rejects undeclared blocks" {
+    const caps: convert.BackendCaps = test_wide_caps;
     try std.testing.expect(caps.supports(.@"4x4"));
     try std.testing.expect(caps.supports(.@"8x8"));
     try std.testing.expect(!caps.supports(.@"6x6"));
@@ -1473,38 +1426,13 @@ test "BackendCaps: bgfx rejects blocks it cannot actually upload" {
     try std.testing.expectEqual(convert.BlockSize.@"8x8", opts.block);
 }
 
-test "backendCaps: with a current bgfx, no backend's blocks depend on the platform (bgfx#147)" {
-    for (std.enums.values(project_config.Platform)) |p| {
-        // bgfx: the two hardware-verified blocks, on the web too now that
-        // zbgfx's WebGL table lists 8x8.
-        try std.testing.expectEqual(convert.BackendCaps.bgfx_4x4_8x8, backendCaps(.bgfx, p, true));
-        try std.testing.expectEqual(convert.BackendCaps.sokol_4x4_only, backendCaps(.sokol, p, true));
-        try std.testing.expectEqual(convert.BackendCaps.raylib_4x4_8x8, backendCaps(.raylib, p, true));
-        try std.testing.expectEqual(convert.BackendCaps.full, backendCaps(.wgpu, p, true));
-        try std.testing.expectEqual(convert.BackendCaps.full, backendCaps(.sdl, p, true));
-        try std.testing.expectEqual(convert.BackendCaps.full, backendCaps(.null, p, true));
-    }
-}
-
-test "resourceOpts: bgfx web honours an 8x8 pin and defaults to 8x8 (bgfx#147)" {
-    const caps = backendCaps(.bgfx, .wasm, true);
-    // Web used to be forced to 4x4, which cost 4x the GPU memory and
-    // download of 8x8 on large soft atlases. It now matches native bgfx.
-    try std.testing.expectEqual(convert.BlockSize.@"8x8", caps.defaultBlock());
+test "resourceOpts honors declared defaults and per-atlas pins" {
+    const caps = test_wide_caps;
     const base = convert.Options{ .block = caps.defaultBlock() };
     try std.testing.expectEqual(convert.BlockSize.@"8x8", resourceOpts(atlasPinning(null), base, false, caps).block);
     try std.testing.expectEqual(convert.BlockSize.@"8x8", resourceOpts(atlasPinning(.@"8x8"), base, false, caps).block);
     try std.testing.expectEqual(convert.BlockSize.@"4x4", resourceOpts(atlasPinning(.@"4x4"), base, false, caps).block);
-    // A block bgfx can't load anywhere is still downgraded, not baked.
     try std.testing.expectEqual(convert.BlockSize.@"8x8", resourceOpts(atlasPinning(.@"6x6"), base, false, caps).block);
-}
-
-test "resourceOpts: non-wasm bgfx still honours an 8x8 pin and defaults to 8x8" {
-    const caps = backendCaps(.bgfx, .android, true);
-    try std.testing.expectEqual(convert.BlockSize.@"8x8", caps.defaultBlock());
-    const base = convert.Options{ .block = caps.defaultBlock() };
-    try std.testing.expectEqual(convert.BlockSize.@"8x8", resourceOpts(atlasPinning(.@"8x8"), base, false, caps).block);
-    try std.testing.expectEqual(convert.BlockSize.@"4x4", resourceOpts(atlasPinning(.@"4x4"), base, false, caps).block);
 }
 
 /// A minimal `.astc` header (magic + block dims + 1x1x1 image) — all
@@ -1539,15 +1467,15 @@ test "an existing sibling at another block is re-encoded, whatever the mtime say
 
     // The mtime says fresh — it is the header BLOCK that decides.
     try std.testing.expect(!convert.needsReencode(Stat, src, out));
-    // Same file: current for a build that resolves 8x8 (the bgfx default)...
-    const bgfx = resourceOpts(atlasPinning(null), .{ .block = backendCaps(.bgfx, .android, true).defaultBlock() }, false, backendCaps(.bgfx, .android, true));
-    try std.testing.expectEqual(convert.BlockSize.@"8x8", bgfx.block);
-    try std.testing.expect(siblingIsCurrent(src, out, bgfx.block));
-    // ...but NOT for one that resolves 4x4 (sokol, or a 4x4 pin), which
+    // Same file: current for a build that resolves 8x8 (the declared default)...
+    const renderer = resourceOpts(atlasPinning(null), .{ .block = test_wide_caps.defaultBlock() }, false, test_wide_caps);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", renderer.block);
+    try std.testing.expect(siblingIsCurrent(src, out, renderer.block));
+    // ...but NOT for one that resolves 4x4 (the conservative default, or a 4x4 pin), which
     // re-encodes instead of shipping a block it can't load.
-    const sokol = resourceOpts(atlasPinning(null), .{ .block = backendCaps(.sokol, .android, true).defaultBlock() }, false, backendCaps(.sokol, .android, true));
-    try std.testing.expectEqual(convert.BlockSize.@"4x4", sokol.block);
-    try std.testing.expect(!siblingIsCurrent(src, out, sokol.block));
+    const narrow = resourceOpts(atlasPinning(null), .{ .block = test_narrow_caps.defaultBlock() }, false, test_narrow_caps);
+    try std.testing.expectEqual(convert.BlockSize.@"4x4", narrow.block);
+    try std.testing.expect(!siblingIsCurrent(src, out, narrow.block));
 }
 
 test "a failed re-encode deletes the stale sibling (PNG fallback, never a wrong block)" {
@@ -1575,7 +1503,7 @@ test "a current sibling survives a failed-encoder run; a stale one does not" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const base = try stageSibling(&tmp, &buf, .@"4x4");
 
-    // Cached path: a 4x4 sibling is current for bgfx web, so convertAtlas
+    // Cached path: a 4x4 sibling is current for this target, so convertAtlas
     // never runs the (broken) encoder and keeps the file.
     var tally = Tally{};
     try convertAtlas(a, "/nonexistent/labelle-test/astcenc", base, "assets/rooms.png", .{ .block = .@"4x4" }, &tally);
@@ -1611,7 +1539,7 @@ test "an undeletable stale sibling is a fatal error, not a silent PNG fallback" 
     try tmp.dir.setFilePermissions(io, "assets", .fromMode(0o555), .{});
     defer tmp.dir.setFilePermissions(io, "assets", .fromMode(0o755), .{}) catch {};
 
-    // bgfx web: the 8x8 sibling is stale, astcenc fails, and the delete is
+    // A target limited to 4x4: the 8x8 sibling is stale, astcenc fails, and the delete is
     // refused → the error the pipeline turns into a fatal exit.
     var tally = Tally{};
     try std.testing.expectError(
@@ -1628,30 +1556,6 @@ test "an undeletable stale sibling is a fatal error, not a silent PNG fallback" 
     try std.testing.expectError(error.StaleAstcSiblingUndeletable, discardIfNotCurrent(a, job));
 }
 
-test "bgfx web stays 4x4-only unless the pinned bgfx samples 8x8 there (Codex on #404)" {
-    // An older pinned bgfx (before 0.28.1) refuses 8x8 on the web.
-    try std.testing.expectEqual(convert.BackendCaps.bgfx_web_4x4_only, backendCaps(.bgfx, .wasm, false));
-    try std.testing.expect(!backendCaps(.bgfx, .wasm, false).supports(.@"8x8"));
-    // ...but only on the web: native bgfx is unaffected by the web flag.
-    try std.testing.expectEqual(convert.BackendCaps.bgfx_4x4_8x8, backendCaps(.bgfx, .android, false));
-    try std.testing.expectEqual(convert.BackendCaps.bgfx_4x4_8x8, backendCaps(.bgfx, .wasm, true));
-}
-
-test "bgfxWebSamples8x8 reads the pinned backend_package" {
-    const dep = struct {
-        fn at(repo: []const u8, version: []const u8) project_config.PluginDep {
-            return .{ .name = "bgfx", .repo = repo, .version = version };
-        }
-    }.at;
-    const gh = "github.com/labelle-toolkit/labelle-bgfx";
-    try std.testing.expect(bgfxWebSamples8x8(dep(gh, "0.28.1")));
-    try std.testing.expect(bgfxWebSamples8x8(dep(gh, "0.29.0")));
-    try std.testing.expect(bgfxWebSamples8x8(dep(gh, "1.0.0")));
-    try std.testing.expect(!bgfxWebSamples8x8(dep(gh, "0.28.0")));
-    try std.testing.expect(!bgfxWebSamples8x8(dep(gh, "0.27.0")));
-    try std.testing.expect(!bgfxWebSamples8x8(dep(gh, "not-a-version")));
-    // No backend_package: the built-in provider pins an old bgfx.
-    try std.testing.expect(!bgfxWebSamples8x8(null));
-    // A local checkout is the developer's own current source.
-    try std.testing.expect(bgfxWebSamples8x8(dep("local:../labelle-bgfx", "0.20.0")));
-}
+const test_narrow_caps: convert.BackendCaps = .{};
+const test_wide_caps: convert.BackendCaps = .{ .blocks = .initMany(&.{ .@"4x4", .@"8x8" }), .default_block = .@"8x8" };
+const test_full_caps: convert.BackendCaps = .{ .blocks = .initFull(), .default_block = .@"8x8" };

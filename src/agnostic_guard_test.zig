@@ -91,7 +91,6 @@ const allowed_files = [_][]const u8{
     "agnostic_guard_test.zig",
     // Legacy platform, store, package and backend sites (RFC #406 "Migration").
     "astc/cmd.zig",
-    "astc/convert.zig",
     "cli.zig",
     "cli/args.zig",
     "cli/args_tests.zig",

@@ -99,6 +99,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_provider_tests.step);
     const provider_step = b.step("test-provider-contract", "Validate provider contract v1");
     provider_step.dependOn(&run_provider_tests.step);
+    const capability_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"texture capabilities"} });
+    b.step("test-texture-caps", "Validate texture capability resolution").dependOn(&b.addRunArtifact(capability_tests).step);
     const material_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"shader tool override"} });
     const dispatch_tests = b.addTest(.{ .root_module = cli_tests.root_module, .filters = &.{"provider "} });
     b.step("test-provider-dispatch", "Validate provider manifest and dispatch rules").dependOn(&b.addRunArtifact(dispatch_tests).step);
