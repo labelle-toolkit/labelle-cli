@@ -1,6 +1,6 @@
 # RFC: One Android packaging implementation
 
-- Status: Proposed
+- Status: Accepted; step 5 (the move into the provider) in progress. The packager lives in labelle-android's `android` provider (labelle-android#13: `package` after `build`, `deploy` replacing `run`, `bundle` replacing `bundle`; commands `doctor`, `run`, `deploy`), and the CLI carries no Android code since labelle-cli#405 PR 3. `labelle android studio`, sokol verification, fat APKs and the emulator ABI are follow-ups; the assembler's `package_apk` step and the backend example scripts retire in #405 PR 4.
 - Tracking: https://github.com/labelle-toolkit/labelle-cli/issues/405
 - Package command architecture: https://github.com/labelle-toolkit/labelle-cli/issues/406
 - Runtime extraction: https://github.com/labelle-toolkit/labelle-bgfx/issues/149

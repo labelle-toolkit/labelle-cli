@@ -263,10 +263,15 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
 
 - No JSON progress relay or validation for hook (or command) stdout yet: the
   child's stdio is inherited exactly as for provider commands.
-- The legacy `labelle ios …` and `labelle android …` subcommand handlers are
-  not hook points for `build`/`run`; they only share the `generate` hooks.
-  They leave with platform extraction (their target already goes through
-  the resolver, so they need the pinned provider like `--platform=<t>`).
+- The legacy `labelle ios …` subcommand handler is not a hook point for
+  `build`/`run`; it only shares the `generate` hooks. It leaves with platform
+  extraction (its target already goes through the resolver, so it needs the
+  pinned provider like `--platform=<t>`). `labelle android …` left with
+  cli#405: it is the `android` provider's namespace, and `--platform=android`
+  runs the ordinary hook points.
+- A provider target other than the legacy `wasm`/`ios` run branches must
+  replace `run` (`NoRunReplacement`, [provider
+  targets](provider-targets.md#labelle-run)).
 - `labelle bundle` for the core `desktop` target is still refused on Linux
   and Windows — before any install or build — because the core packager is
   macOS-only and no hook can replace it (nobody may own `desktop`). A

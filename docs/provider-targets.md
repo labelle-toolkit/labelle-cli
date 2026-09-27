@@ -4,13 +4,15 @@ This documents the target-resolution slice of CLI #406, stacked on the
 [v1 contract](provider-contract-v1.md), [project-local
 dispatch](provider-local-dispatch.md) and [lifecycle
 hooks](provider-hooks.md). `--platform=<t>` now names a target a pinned
-provider declares; the CLI keeps no list of platforms. The platform packages
-themselves (`labelle-web`, `labelle-android`, …) still remain to be extracted.
+provider declares; the CLI keeps no list of platforms. Android is extracted:
+the `android` package (labelle-android) owns target and namespace `android`
+and the CLI carries no Android code (cli#405). The other platform packages
+(`labelle-web`, …) still remain to be extracted.
 
 ## Resolution
 
 Every command that runs the project pipeline (`generate`, `build`, `run`,
-`bundle`, and the legacy `wasm`, `android` and `ios` subcommands) resolves
+`bundle`, and the legacy `wasm` and `ios` subcommands) resolves
 one target, in two halves, before anything is generated, locked or built:
 
 1. The requested name is `--platform=<t>` when given, else the project's
@@ -124,8 +126,9 @@ explicit line:
 
 - A provider target whose name is a schema platform (`wasm`, `android`,
   `ios`) is handed to the assembler as `--platform <name>`, exactly as
-  before. The legacy pipeline branches that key on the enum keep working
-  for it.
+  before. The legacy pipeline branches that key on the enum (`wasm`, `ios`)
+  keep working for it; `android` has none left, so its provider replaces
+  `run` (see [`labelle run`](#labelle-run)).
 - A provider target outside the enum can only be generated for by its
   provider's `replace` hook on `generate`. Without one the command stops
   before the assembler runs:
@@ -145,6 +148,26 @@ What waits for assembler#378: string-resolved platforms in `generate`, the
 removal of the `Capability.{wasm,android,ios}` derivation, and the enum
 leaving both schema mirrors. Nothing in `project.labelle` changes in this
 slice, and `provider_settings.zig` is untouched.
+
+## `labelle run`
+
+The CLI launches only the core `desktop` target on this host, plus the
+legacy run branches it still carries (`wasm` serve, the `ios` simulator).
+Every other provider target is launched by its provider, so it must have a
+`replace` hook on `run`, otherwise:
+
+```
+labelle: target '<t>' has no run replacement; package '<pkg>' must declare a `.when = .replace` hook on `run`
+```
+
+(`NoRunReplacement`). Like `NoBundleReplacement` it is decided with the hook
+plans after discovery — after the install, before generation or any build —
+so a run that cannot launch never builds. Without it the run would fall
+through to the host launch and execute a binary built for another platform.
+The legacy set (`legacyRunBranch` in `pipeline/install.zig`) only shrinks:
+a platform leaves it when its launch moves into a provider (`android` left
+with cli#405). The replacement receives the run options as `run.env`
+(contract 1.2.0, [provider hooks](provider-hooks.md)).
 
 ## `labelle bundle`
 
@@ -171,15 +194,25 @@ migration order requires — no forwarding shim, no alias, no implicit
 package injection (RFC #406 "Migration", #410):
 
 - A project that builds for `wasm`, `android` or `ios` — through `.platform`,
-  `--platform=<t>`, or `labelle wasm serve|export`, `labelle android …`,
-  `labelle ios …` — must add the package that declares that target to
+  `--platform=<t>`, or `labelle wasm serve|export`, `labelle ios …` — must add the package that declares that target to
   `.plugins` and pin it (`labelle providers resolve`, then `--accept`).
   Until it does, those commands fail with the no-provider error above.
 - The target name is unchanged: `--platform=wasm` stays `--platform=wasm`,
   because the web provider declares the target `wasm`. Only the pin is new.
-- The legacy `labelle wasm|android|ios` command words stay reserved built-ins
-  until their extraction lands; they route their target through the same
-  resolver.
+- The legacy `labelle wasm|ios` command words stay reserved built-ins until
+  their extraction lands; they route their target through the same resolver.
+- `labelle android …` is no built-in any more (cli#405): it is the `android`
+  provider's namespace. Without that package pinned, `labelle android` is an
+  unknown command — or, when the cached registry names the package that
+  declares the namespace, `labelle: no provider for namespace 'android' in
+  this project; add and pin the package that declares namespace 'android'`
+  with a `(registry: <package>)` line. `labelle android doctor` therefore
+  runs inside a project that pins the package; the projectless form is gone.
+  The CLI's own packaging on `labelle build --platform=android`, the
+  `.android` block it used to read (still accepted, and ignored, by the
+  CLI's lenient parse; the assembler owns its strictness) and the
+  raylib-to-sokol fallback for Android are removed: the provider's
+  after-build hook packages the APK under `zig-out/apk/`.
 - labelle-studio's web preview builds through `labelle build
   --platform=wasm` and must add and pin `labelle-web`.
 
@@ -191,7 +224,9 @@ target, an undeclared target, an unpinned remote owner, the schema-name
 mapping through a provider only, the diagnostic with and without a registry
 hint), `provider_github.cachedRegistryOwner` (a schema-2 table lookup with no
 archive cached; for schema 1, a hint only from a verified cached archive,
-and the bounded scan), `provider_registry` (schema-2 parsing, ownership
+and the bounded scan), `provider_github.cachedRegistryNamespaceOwner`
+(schema 2 only), the `NoRunReplacement` decision table
+(`pipeline/install.zig`), `provider_registry` (schema-2 parsing, ownership
 conflicts, lookup by target and namespace), `provider_dispatch.discoverAll` (the
 unresolved packages of a partial view), the reserved-device-name rule
 (`provider_contract.targetName`, the manifest's `targets` and hook targets,
@@ -217,6 +252,13 @@ assembler runs; `NoBundleReplacement`; a provider replacing
 contract's `output_dir`; the ASTC prepass running for `desktop` and not for
 `probe-target`; a provider owning `wasm` making the assembler receive
 `--platform wasm`; and the `labelle targets` listing. CI runs it on Windows,
-macOS and Linux. The Docker WASM build in `ci.yml` declares the repo's own
+macOS and Linux. `test/provider_android_like_e2e.py` drives an
+android-shaped fixture package the same way (no NDK): the no-provider and
+no-namespace diagnostics with and without a cached registry hint, the
+assembler receiving `--platform android`, the after-build hook seeing the
+built library and the target dir, the run replacement receiving `run.env`
+with no host launch, `NoRunReplacement` before any build, `labelle android
+run …` reaching the tool verbatim, `bundle --build-number` and a legacy
+`.android` block passing through unchanged. The Docker WASM build in `ci.yml` declares the repo's own
 `test/fixtures/wasm-provider` (a module plugin whose manifest owns `wasm`)
 because the platform packages are not extracted yet.
