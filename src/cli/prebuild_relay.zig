@@ -26,6 +26,7 @@
 //!   A detached relay keeps copying until the pipe really ends, then frees
 //!   itself.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const StdoutRoute = enum {
     /// Human/off mode: the step's stdout is the CLI's stdout.
@@ -51,6 +52,22 @@ pub const drain_grace_ns: u64 = 500 * std.time.ns_per_ms;
 /// A line longer than this is flushed without waiting for its newline.
 pub const max_line: usize = 1 << 20;
 
+/// Ownership protocol for a threaded `Relay` (the heap object `self`):
+///
+/// - `state` starts `running`; `start`'s caller owns `self`.
+/// - The worker, at EOF, does ONE cmpxchg `running -> finished`. On success
+///   it never touches `self` again (the owner frees it). On failure the
+///   state was `detached`, ownership is the worker's, and it frees `self`.
+/// - `finish` (the owner) either sees `finished` and joins + frees, or
+///   detaches the thread through a LOCAL copy of the handle FIRST and only
+///   then publishes `running -> detached`. If that cmpxchg succeeds,
+///   ownership has passed to the worker and `finish` returns without
+///   touching `self`; if it fails, the worker already published
+///   `finished`, so `finish` still owns `self` and frees it (the thread is
+///   already detached, so it is not joined).
+///
+/// So exactly one side frees `self`, and neither side reads it after the
+/// cmpxchg that hands it over.
 const running: u8 = 0;
 const finished: u8 = 1;
 const detached: u8 = 2;
@@ -59,59 +76,87 @@ pub const Relay = struct {
     io: std.Io,
     pipe: std.Io.File,
     sink: std.Io.File,
+    gpa: std.mem.Allocator,
     line: std.ArrayList(u8) = .empty,
     sink_ok: bool = true,
     state: std.atomic.Value(u8) = .init(running),
     thread: std.Thread = undefined,
+    /// Test-only interleaving hooks; always null in the CLI.
+    hooks: ?*TestHooks = null,
 
-    const gpa = std.heap.smp_allocator;
+    pub const TestHooks = struct {
+        /// Runs in `finish` between detaching the thread and publishing
+        /// `detached` (while `finish` still owns `self`).
+        after_detach: ?*const fn (*TestHooks, *Relay) void = null,
+        /// Set by the worker as its very last action, after any free.
+        worker_done: std.atomic.Value(bool) = .init(false),
+        /// The write end the test closes to make the worker hit EOF.
+        write_end: ?std.Io.File = null,
+    };
 
     /// Take ownership of `pipe` and start copying it to `sink` on a new
     /// thread. On error nothing was started and `pipe` is still the
-    /// caller's.
-    pub fn start(io: std.Io, pipe: std.Io.File, sink: std.Io.File) !*Relay {
+    /// caller's. `gpa` must be thread-safe: the worker may free `self`.
+    pub fn start(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: std.Io.File) !*Relay {
+        return startWithHooks(gpa, io, pipe, sink, null);
+    }
+
+    fn startWithHooks(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: std.Io.File, hooks: ?*TestHooks) !*Relay {
         const self = try gpa.create(Relay);
         errdefer gpa.destroy(self);
-        self.* = .{ .io = io, .pipe = pipe, .sink = sink };
+        self.* = .{ .io = io, .pipe = pipe, .sink = sink, .gpa = gpa, .hooks = hooks };
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
     }
 
     /// Call once the direct child has exited. Joins the relay if the pipe
     /// ends within `grace_ns`; otherwise detaches it. `self` is invalid
-    /// afterwards either way.
+    /// afterwards either way (protocol above).
     pub fn finish(self: *Relay, grace_ns: u64) void {
         const step_ns = 10 * std.time.ns_per_ms;
         var waited: u64 = 0;
         while (self.state.load(.acquire) == running and waited < grace_ns) : (waited += step_ns) {
             sleep(self.io, step_ns);
         }
-        if (self.state.cmpxchgStrong(running, detached, .acq_rel, .acquire) == null) {
-            // Still running: a descendant holds the pipe. The thread frees
-            // itself when the pipe finally ends.
-            self.thread.detach();
+        if (self.state.load(.acquire) == running) {
+            // A descendant still holds the pipe. Detach through a local
+            // copy BEFORE handing `self` to the worker.
+            const thread = self.thread;
+            thread.detach();
+            if (self.hooks) |h| if (h.after_detach) |f| f(h, self);
+            if (self.state.cmpxchgStrong(running, detached, .acq_rel, .acquire) == null) {
+                return; // The worker owns `self` now; do not touch it.
+            }
+            // The worker finished in between: `self` is still ours.
+            self.destroy();
             return;
         }
         self.thread.join();
-        self.line.deinit(gpa);
-        gpa.destroy(self);
+        self.destroy();
     }
 
     /// Copy the whole pipe on the calling thread, then release it. The
     /// fallback when no thread could be started.
-    pub fn runInline(io: std.Io, pipe: std.Io.File, sink: std.Io.File) void {
-        var self: Relay = .{ .io = io, .pipe = pipe, .sink = sink };
+    pub fn runInline(gpa: std.mem.Allocator, io: std.Io, pipe: std.Io.File, sink: std.Io.File) void {
+        var self: Relay = .{ .io = io, .pipe = pipe, .sink = sink, .gpa = gpa };
         self.pump();
         self.line.deinit(gpa);
     }
 
+    fn destroy(self: *Relay) void {
+        const gpa = self.gpa;
+        self.line.deinit(gpa);
+        gpa.destroy(self);
+    }
+
     fn threadMain(self: *Relay) void {
+        const hooks = self.hooks; // `self` may be gone by the end.
         self.pump();
         if (self.state.cmpxchgStrong(running, finished, .acq_rel, .acquire) != null) {
-            // `finish` already detached us: nobody will join, so clean up.
-            self.line.deinit(gpa);
-            gpa.destroy(self);
+            // `finish` handed `self` over (`detached`): nobody else frees it.
+            self.destroy();
         }
+        if (hooks) |h| h.worker_done.store(true, .release);
     }
 
     fn pump(self: *Relay) void {
@@ -127,7 +172,7 @@ pub const Relay = struct {
 
     /// Buffer `bytes` and write out every complete line, each in one write.
     fn feed(self: *Relay, bytes: []const u8) void {
-        self.line.appendSlice(gpa, bytes) catch {
+        self.line.appendSlice(self.gpa, bytes) catch {
             // Out of memory: keep the bytes flowing, unaligned.
             self.write(self.line.items);
             self.line.clearRetainingCapacity();
@@ -190,5 +235,68 @@ pub const StdoutRouteSpec = struct {
                 try std.testing.expectEqual(StdoutRoute.stderr_file, stdoutRoute(true, os, tty));
             }
         }
+    }
+};
+
+/// The `finish`/worker ownership handover (protocol above), with each
+/// interleaving forced deterministically. `std.testing.allocator` fails
+/// the test on a leak or a double free, and poisons freed memory, so a
+/// read of `self` after the other side freed it would surface too.
+/// POSIX-only: the fixture needs a raw pipe; the protocol has no OS branch.
+pub const RelayOwnershipSpec = struct {
+    const Fixture = struct {
+        hooks: Relay.TestHooks = .{},
+        relay: *Relay = undefined,
+
+        fn begin(f: *Fixture) !void {
+            if (builtin.os.tag == .windows) return error.SkipZigTest;
+            const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+            const read_end: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+            f.hooks.write_end = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+            f.relay = try Relay.startWithHooks(std.testing.allocator, std.testing.io, read_end, std.Io.File.stderr(), &f.hooks);
+        }
+
+        /// EOF for the worker.
+        fn closeWriteEnd(h: *Relay.TestHooks) void {
+            if (h.write_end) |w| w.close(std.testing.io);
+            h.write_end = null;
+        }
+
+        /// The worker's last action has run; it holds nothing any more.
+        fn awaitWorker(f: *Fixture) void {
+            while (!f.hooks.worker_done.load(.acquire)) sleep(std.testing.io, std.time.ns_per_ms);
+        }
+    };
+
+    test "EOF right after finish published detached: the worker frees, exactly once" {
+        var f: Fixture = .{};
+        try f.begin();
+        f.relay.finish(0); // Pipe still open: detach and hand `self` over.
+        Fixture.closeWriteEnd(&f.hooks); // Now the worker hits EOF and frees.
+        f.awaitWorker();
+    }
+
+    test "EOF between detach and publish: finish keeps ownership and frees" {
+        const Hook = struct {
+            fn afterDetach(h: *Relay.TestHooks, r: *Relay) void {
+                Fixture.closeWriteEnd(h);
+                // Let the worker publish `finished` before `finish` tries
+                // to publish `detached`.
+                while (r.state.load(.acquire) != finished) sleep(std.testing.io, std.time.ns_per_ms);
+            }
+        };
+        var f: Fixture = .{};
+        f.hooks.after_detach = Hook.afterDetach;
+        try f.begin();
+        f.relay.finish(0);
+        f.awaitWorker();
+    }
+
+    test "EOF within the grace period: finish joins and frees" {
+        var f: Fixture = .{};
+        try f.begin();
+        Fixture.closeWriteEnd(&f.hooks);
+        f.relay.finish(10 * std.time.ns_per_s);
+        try std.testing.expect(f.hooks.worker_done.load(.acquire));
     }
 };

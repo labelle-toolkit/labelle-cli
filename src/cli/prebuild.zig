@@ -553,8 +553,8 @@ pub fn runStep(
     var relay: ?*prebuild_relay.Relay = null;
     if (child.stdout) |pipe| {
         child.stdout = null;
-        relay = prebuild_relay.Relay.start(io, pipe, std.Io.File.stderr()) catch blk: {
-            prebuild_relay.Relay.runInline(io, pipe, std.Io.File.stderr());
+        relay = prebuild_relay.Relay.start(std.heap.smp_allocator, io, pipe, std.Io.File.stderr()) catch blk: {
+            prebuild_relay.Relay.runInline(std.heap.smp_allocator, io, pipe, std.Io.File.stderr());
             break :blk null;
         };
     }

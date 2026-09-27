@@ -691,6 +691,7 @@ pub const PrebuildRunStepSpec = prebuild_mod.RunStepSpec;
 pub const PrebuildRunAllSpec = prebuild_mod.RunAllSpec;
 pub const PrebuildParsePrebuildSpec = prebuild_mod.ParsePrebuildSpec;
 pub const PrebuildStdoutRouteSpec = @import("cli/prebuild_relay.zig").StdoutRouteSpec;
+pub const PrebuildRelayOwnershipSpec = @import("cli/prebuild_relay.zig").RelayOwnershipSpec;
 
 // Surface the screenshot output-format specs (cli#356) so
 // `zspec.runAll(@This())` walks into the extension parser, the
