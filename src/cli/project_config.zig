@@ -7,10 +7,10 @@
 //! the CLI itself needs to read.
 //!
 //! Why the CLI needs *any* of the schema: a handful of CLI-retained
-//! commands (`build` / `run` / `upgrade` / the iOS + Android deploy
-//! paths) parse `project.labelle` to drive orchestration the CLI owns —
+//! commands (`build` / `run` / `upgrade` / the legacy iOS deploy path)
+//! parse `project.labelle` to drive orchestration the CLI owns —
 //! target-dir naming (`<backend>_<platform>`), the compatibility-warning
-//! pass, the iOS/Android `Info.plist` / manifest emission, lockfile
+//! pass, the iOS `Info.plist` emission, lockfile
 //! writing, docker target selection. None of that is code generation;
 //! it is the CLI deciding *which assembler subcommand to run and with
 //! what flags*, plus packaging steps the assembler never touches.
@@ -103,19 +103,18 @@ pub const PluginDep = struct {
 
 // ── iOS Configuration ──────────────────────────────────────────────
 
-/// Screen-orientation policy for the mobile platforms.
+/// Screen-orientation policy of a platform config block that names one.
 ///
 /// MIRRORED in labelle-assembler `src/config.zig` — `project.labelle` is
 /// parsed strictly there first, so both copies must learn a new value
 /// together or `generate` rejects the field before the CLI sees it (#341).
 pub const Orientation = enum {
     portrait,
-    /// Android `"landscape"` — ONE landscape direction; a 180° flip does not
-    /// rotate the game. iOS emits BOTH landscape directions; the two
-    /// platforms differ here by design.
+    /// Landscape. Whether a 180° flip rotates the game is the packager's
+    /// choice: a platform may lock ONE landscape direction here and allow
+    /// both only for `.sensor_landscape`, or allow both for either value.
     landscape,
-    /// Landscape only, but EITHER direction — Android `"sensorLandscape"`.
-    /// iOS emits the same array as `.landscape`, which already allowed both.
+    /// Landscape only, but EITHER direction.
     sensor_landscape,
     all,
 };
@@ -127,29 +126,6 @@ pub const IosConfig = struct {
     minimum_ios: []const u8 = "15.0",
     orientation: Orientation = .all,
     device_family: []const u8 = "1,2",
-};
-
-// ── Android Configuration ──────────────────────────────────────────
-
-pub const AndroidConfig = struct {
-    app_name: []const u8 = "",
-    package_name: []const u8 = "", // e.g. "com.labelle.mygame"
-    min_sdk_version: u32 = 28, // Android 9 (Pie) — NativeActivity + GLES3
-    target_sdk_version: u32 = 34, // Android 14
-    orientation: Orientation = .all,
-    /// Launch the game fullscreen with the status bar and title bar hidden.
-    immersive_mode: bool = false,
-    /// Build the APK `android:debuggable` (labelle-assembler#737).
-    ///
-    /// OPT-IN, off by default — a shipping build must never carry it. Its only
-    /// purpose is on-device VERIFICATION: an activity launched normally inherits
-    /// zygote's environment, so the `LABELLE_*` knobs the desktop path already
-    /// honours (`LABELLE_FIXED_DT`, `LABELLE_SCREENSHOT_PATH`) cannot reach the
-    /// process at all. The platform's `wrap.<package>` property CAN hand the
-    /// process a real environment, but only for a debuggable app; `run-as` (to
-    /// read the capture back out of the app's private files dir) likewise needs
-    /// it. Mirrors `labelle-assembler`'s `AndroidConfig.debuggable`.
-    debuggable: bool = false,
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
@@ -427,15 +403,15 @@ pub const ProjectConfig = struct {
     asset_compression: AssetCompression = .{},
     /// App icon — a PNG path relative to the PROJECT ROOT. The assembler
     /// owns this field (`labelle-assembler` `src/config.zig` /
-    /// `src/app_icon.zig`); the CLI mirrors it because packaging is a CLI
-    /// job: `android/launcher_icon.zig` turns it into the APK's
-    /// `res/mipmap-*/ic_launcher.png` (labelle-cli#340).
+    /// `src/app_icon.zig`); the CLI mirrors it because the packaging the
+    /// CLI still owns (`labelle bundle` of the core target) turns it into
+    /// the bundle's icon (labelle-cli#340, #359).
     ///
     /// `null` or `""` both mean "unset" — the assembler then writes its
     /// bundled default to `<target_dir>/default_icon.png` and packaging
     /// picks that up instead. Do NOT read this field directly; go through
-    /// `android/launcher_icon.zig`'s `resolve`, which is the single home
-    /// of that precedence.
+    /// `app_icon.zig`'s `resolve`, which is the single home of that
+    /// precedence.
     app_icon: ?[]const u8 = null,
     // NOTE (cli#363, Codex on #367): a `.build_number` field pinning the
     // `CFBundleVersion` that `labelle bundle` writes is deliberately NOT
@@ -458,9 +434,6 @@ pub const ProjectConfig = struct {
 
     /// iOS configuration — parsed from project.labelle `.ios` section.
     ios: ?IosConfig = null,
-
-    /// Android configuration — parsed from project.labelle `.android` section.
-    android: ?AndroidConfig = null,
 
     /// Pinned assembler version (RFC #122). When set, the CLI resolves the
     /// assembler binary from the cache instead of the paired default.
@@ -530,11 +503,11 @@ test "AssetCompression.formatFor + default png" {
     try @import("std").testing.expectEqual(AssetFormat.png, m.formatFor(.wasm));
 }
 
-test "Orientation: every value parses from ZON on both the .android and .ios blocks" {
+test "Orientation: every value parses from ZON on the .ios block" {
     // Mirrors the assembler's parse test (labelle-assembler src/config.zig):
     // the two copies of this enum must accept the identical value set, or a
     // `project.labelle` that generates fine still fails when the CLI reads it.
-    // Arena, not `std.zon.parse.free`: both structs have `[]const u8` fields
+    // Arena, not `std.zon.parse.free`: the struct has `[]const u8` fields
     // defaulting to a static `""`, which the testing allocator refuses to free.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -547,12 +520,24 @@ test "Orientation: every value parses from ZON on both the .android and .ios blo
         .{ "all", Orientation.all },
     }) |case| {
         const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
-        const android = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, src, null, .{});
-        try std.testing.expectEqual(case[1], android.orientation);
         const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
         try std.testing.expectEqual(case[1], ios.orientation);
     }
 
-    try std.testing.expectEqual(Orientation.all, (AndroidConfig{}).orientation);
     try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
+}
+
+test "a platform block the CLI no longer models still parses (the assembler owns its strictness)" {
+    // `.android` left the CLI (cli#405): its keys belong to the `android`
+    // provider's settings and the assembler's codegen. The CLI's lenient
+    // read (`config.zig`, `ignore_unknown_fields`) must keep accepting a
+    // project that still carries the block.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src: [:0]const u8 =
+        \\.{ .name = "legacy", .android = .{ .package_name = "com.x.y", .orientation = .landscape, .immersive_mode = true } }
+    ;
+    const cfg = try std.zon.parse.fromSliceAlloc(ProjectConfig, arena.allocator(), src, null, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("legacy", cfg.name);
+    try std.testing.expect(!@hasField(ProjectConfig, "android"));
 }

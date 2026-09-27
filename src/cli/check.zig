@@ -57,8 +57,7 @@ const ParseError = error{ TooManyArguments, MissingProjectRootValue, OutOfMemory
 ///     (`--project-root <dir>`) and `=value` (`--project-root=<dir>`)
 ///     forms are recognized and set `dir` instead of being re-forwarded.
 ///     Consuming the value also stops it being mistaken for the positional
-///     dir (the old "misparse `--flag value`" bug — mirrors the
-///     `expect_value` arity handling the android parser uses in cli.zig).
+///     dir (the old "misparse `--flag value`" bug).
 ///   - Every other `-`/`--` token is forwarded untouched so future
 ///     assembler `check` flags need no CLI change. Value-bearing forwarded
 ///     flags should use the `--flag=value` form so the value can't be

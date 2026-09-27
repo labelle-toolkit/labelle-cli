@@ -26,6 +26,7 @@ pub const Sources = sources.Sources;
 pub const Extractions = sources.Extractions;
 pub const registry_hint_scan_limit = registry_cache.registry_hint_scan_limit;
 pub const cachedRegistryOwner = registry_cache.cachedRegistryOwner;
+pub const cachedRegistryNamespaceOwner = registry_cache.cachedRegistryNamespaceOwner;
 pub const PreviewEntry = preview.PreviewEntry;
 pub const preview_schema = preview.preview_schema;
 pub const Preview = preview.Preview;

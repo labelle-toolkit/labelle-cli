@@ -1,6 +1,6 @@
 //! Command-execution pipeline for the labelle CLI (#311). Extracted from
 //! cli.zig `main` so the dispatcher stays small: this owns the
-//! generate -> build -> run flow and the docker / wasm / ios / android
+//! generate -> build -> run flow and the docker / wasm / ios
 //! branches. Behavior is identical to when this lived in `main`.
 //!
 //! Thin root: `run` walks the stages in order and owns every resource they
@@ -31,7 +31,6 @@ const runner = @import("runner.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const material_toolchain = @import("material_toolchain.zig");
 const ios = @import("ios.zig");
-const android = @import("android.zig");
 const progress = @import("progress.zig");
 const args_mod = @import("args.zig");
 const provider_contract = @import("provider_contract.zig");
@@ -57,10 +56,10 @@ pub const CollectPrebuildIgnorePathsSpec = watch.CollectPrebuildIgnorePathsSpec;
 pub const ResolveExportOutputSpec = export_output.ResolveExportOutputSpec;
 
 /// Run the project-scoped pipeline: read project.labelle, then
-/// generate -> build -> run (or the docker / wasm / ios / android
+/// generate -> build -> run (or the docker / wasm / ios
 /// variant selected by `parsed_args`). Dispatch of the standalone
 /// subcommands stays in cli.zig `main`; this is invoked only for the
-/// project commands (generate / build / run / wasm / ios / android).
+/// project commands (generate / build / run / wasm / ios).
 /// Returns the process exit status the command earned: the game's own exit
 /// status for `run` (0 for a genuine `--timeout` expiry), 0 for everything
 /// that completed. `main` returns it as the CLI's exit code, so automation
@@ -169,7 +168,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // runs, "still working" heartbeat lines while the assembler child
     // owns stderr during resolve/generate, cli#321). Enabled for the
     // commands that run the shared build pipeline; `labelle generate` and
-    // the ios/android subcommands (which own their own build flows) stay
+    // the ios subcommand (which owns its own build flow) stay
     // report-free. A
     // reporter that fails to initialize downgrades to the pre-#284
     // behavior instead of blocking the build.
@@ -327,11 +326,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `labelle ios` subcommand — handles its own build/xcode/run
     if (command == .ios_cmd) {
         return ok(ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir));
-    }
-
-    // `labelle android` subcommand — handles its own build/run
-    if (command == .android_cmd) {
-        return ok(android.handleAndroid(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, project_dir, target_dir));
     }
 
     // Warn if --target is used without --docker (it has no effect otherwise)

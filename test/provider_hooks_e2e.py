@@ -638,12 +638,23 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     run_flags = ("--platform=probe-target", "--scene=x", "--screenshot=s", "--after=2s", "--timeout=30s", "--", "a", "b")
     expected_env = [{"name": "LABELLE_SCENE", "value": "x"}, {"name": "LABELLE_SCREENSHOT_PATH", "value": "s"},
                     {"name": "LABELLE_SCREENSHOT_AFTER_SEC", "value": "2.000"}]
-    # The control: with no run replacement the core launch DOES execute the
-    # sentinel, so its absence below is the replacement standing in.
+    # The control: the planted sentinel, run from the launch's cwd (the
+    # target dir), DOES leave the marker, so its absence below is the
+    # replacement standing in.
     a_manifest.write_text(manifest("fixture-a", PROBE, targets=["probe-target"]))
     plant()
-    run("run", *run_flags)
-    assert marker.exists(), "the core launch did not run the planted sentinel; the check below would be vacuous"
+    subprocess.run([str(probe_out / "bin" / ("game" + exe_suffix))], cwd=probe_dir, check=True, timeout=60)
+    assert marker.exists(), "the planted sentinel left no marker; the checks below would be vacuous"
+    marker.unlink()
+    # With no run replacement the CLI has no launch for a provider target: it
+    # refuses before the build (`NoRunReplacement`, cli#405) instead of
+    # falling through to the host launch.
+    plant()
+    refused = run("run", *run_flags, code=1)
+    assert "target 'probe-target' has no run replacement; package 'fixture-a' must declare a `.when = .replace` hook on `run`" in refused.stderr, refused.stderr
+    assert "NoRunReplacement" in refused.stderr, refused.stderr
+    assert not marker.exists(), "the core launch ran for a provider target with no run replacement"
+    assert not log(probe_out) and not log(probe_dir), "a hook ran although the run was refused before the build"
     a_manifest.write_text(manifest("fixture-a", PROBE + [DEPLOY], targets=["probe-target"]))
     plant()
     replaced = run("run", *run_flags)

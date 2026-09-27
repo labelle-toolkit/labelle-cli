@@ -528,8 +528,8 @@ pub const EnvKV = struct { key: []const u8, value: []const u8 };
 
 /// The platform-neutral `labelle run` options that reach the game as
 /// `LABELLE_*` variables: `--scene`, `--profile`, `--screenshot`/`--after`.
-/// ONE list shared by the desktop spawn (env block) and the Android launch
-/// (`am start --es` intent extras, cli#397) so the two can't drift.
+/// ONE list shared by the desktop spawn (env block) and a provider's `run`
+/// hook (`run.env`, contract 1.2.0, cli#397) so the two can't drift.
 /// Desktop-only knobs (`--headless` & co) are appended by the desktop path.
 pub const RunOptionEnv = struct {
     scene: ?[]const u8 = null,

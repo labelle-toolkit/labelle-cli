@@ -11,7 +11,6 @@ const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
 const provider_targets = @import("../provider_targets.zig");
 const ParsedArgs = args_mod.ParsedArgs;
-const resolveAndroidBackend = args_mod.resolveAndroidBackend;
 
 /// What `resolve` settled, or the exit status the command ends with.
 pub const Resolution = union(enum) {
@@ -28,7 +27,7 @@ pub const Resolution = union(enum) {
 /// (docs/provider-targets.md "Resolution")
 /// The target is the core `desktop` or one a pinned provider declares;
 /// nothing else, including the project's own `.platform` and the legacy
-/// `wasm`/`ios`/`android` subcommands (no shim, RFC #406 "Migration").
+/// `wasm`/`ios` subcommands (no shim, RFC #406 "Migration").
 /// Ownership needs the providers, and provider discovery runs only
 /// after the assembler's `install` populated the package cache (below,
 /// next to `gateThenInstall`; Codex P1 on #420) — while the target
@@ -103,26 +102,6 @@ pub fn resolve(
         parsed.backend = .sokol;
     }
 
-    // Resolve the backend for ANY android-targeting invocation —
-    // `labelle android`, `labelle run --platform=android`, or
-    // `labelle build --platform=android` all land here. The backend is
-    // taken from the project's declared backend, honoring an
-    // Android-capable choice (`sokol` or `bgfx`) and falling back to
-    // sokol otherwise (#252). Keying off the resolved platform (rather
-    // than the subcommand) means a `.backend = .raylib` project run with
-    // `--platform=android` gets the same helpful fallback as `labelle
-    // android` instead of failing later on a missing `raylib_android`
-    // target dir.
-    if (parsed.platform == .android) {
-        const android_backend = resolveAndroidBackend(parsed.backend);
-        if (android_backend != parsed.backend) {
-            std.debug.print(
-                "labelle: backend '{s}' can't target Android; defaulting to sokol.\n",
-                .{@tagName(parsed.backend)},
-            );
-        }
-        parsed.backend = android_backend;
-    }
     return .{ .proceed = .{ .project_root = project_root, .provisional = provisional } };
 }
 

@@ -32,7 +32,7 @@ pub fn cmdAdd(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void 
     if (!config.projectExists(".")) {
         config.printNoProjectError(".");
         // Match the project-scoped guard's non-zero outcome without a
-        // Zig error-return trace (same pattern as `android doctor`).
+        // Zig error-return trace.
         std.process.exit(1);
     }
     try assembler_proc.runSubcommand(allocator, ".", "add", cmd_args);

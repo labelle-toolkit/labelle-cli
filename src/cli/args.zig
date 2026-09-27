@@ -14,7 +14,7 @@ const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const bundle = @import("bundle.zig");
 const contract = @import("provider_contract.zig");
 
-pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, android_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
+pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -75,35 +75,13 @@ pub fn parseSceneFlag(
 
 const ParseError = error{TooManyArguments};
 
-const Backend = project_config.Backend;
-
-/// Resolve the backend for an `labelle android` invocation, honoring the
-/// project's declared backend when it can actually target Android.
-///
-/// Android-capable backends are `sokol` and `bgfx` (the bgfx-on-Android
-/// bring-up, cli#300-#303). A project that declares either keeps it. Any
-/// other backend (`raylib`/`sdl`/`wgpu`/`null` — desktop/web only) can't
-/// target Android, so we fall back to `sokol` to preserve the historical
-/// behavior for projects that just say "android" without a real Android
-/// backend (#252).
-///
-/// Pure: the caller logs when the resolved backend differs from the
-/// project's, so unit tests can call this without polluting console output.
-pub fn resolveAndroidBackend(project_backend: Backend) Backend {
-    return switch (project_backend) {
-        .sokol, .bgfx => project_backend,
-        .raylib, .sdl, .wgpu, .null => .sokol,
-    };
-}
-
 pub const ParsedArgs = struct {
     command: Command,
     project_dir: []const u8 = ".",
-    // Sized for the longest realistic android invocation:
-    //   android run --all-abis --release --keystore k --keystore-pass p
-    //               --key-alias a --key-pass kp
-    // That's 11 tokens — 16 gives headroom for future flags without
-    // risking silent truncation (flagged by the PR #171 review).
+    // Sized for the longest realistic built-in subcommand invocation with
+    // headroom; overflow is an error, never silent truncation (PR #171
+    // review). Provider commands forward their argv directly and never
+    // go through this buffer.
     extra_args: [16][]const u8 = undefined,
     extra_count: usize = 0,
     timeout_ns: ?u64 = null,
