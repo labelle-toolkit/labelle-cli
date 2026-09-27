@@ -72,17 +72,16 @@
 //!
 //! `labelle build --progress=json` promises PURE NDJSON on stdout
 //! (cli#320). A prebuild tool that prints to stdout would corrupt that
-//! stream. In json mode the child's stdout is therefore a pipe the CLI
-//! relays, chunk by chunk as it arrives, to its own **stderr** — the user
-//! still sees every line, live, interleaved with the tool's own
-//! (inherited) stderr, and the NDJSON feed stays machine-parseable. In
-//! human/off mode stdout is inherited unchanged.
+//! stream. In json mode the child's stdout is therefore routed to the
+//! CLI's **stderr** — the user still sees every line, live, interleaved
+//! with the tool's own stderr, and the NDJSON feed stays
+//! machine-parseable. In human/off mode stdout is inherited unchanged.
 //!
-//! Why a relay and not `StdIo.file = File.stderr()` (cli#448): on Windows
-//! Zig 0.16's spawn RE-OPENS a `.file` handle for the child instead of
-//! duplicating it, so the child gets a new file object with its own
-//! offset at 0. With `2> file` its stdout then overwrote the start of the
-//! file. POSIX dup2()s and was fine; the relay is correct on both.
+//! The routing is `prebuild_relay.zig` (cli#448): the child is handed the
+//! stderr file directly (`StdIo.file`), except on Windows with a
+//! redirected stderr, where Zig 0.16 re-opens that handle at offset 0 and
+//! the step's stdout is instead piped and relayed line by line.
+//! `RELAY_ENV` forces the relay on any OS so the POSIX e2e can exercise it.
 //!
 //! Prebuild runs inside the existing `resolve` phase and emits no new
 //! record kind, so the progress schema is untouched (studio#28 consumes
@@ -93,6 +92,7 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const progress = @import("progress.zig");
 const project_config = @import("project_config.zig");
+const prebuild_relay = @import("prebuild_relay.zig");
 
 /// One declared step. Re-exported from the CLI's `project.labelle` mirror
 /// so callers need only this module.
@@ -116,6 +116,11 @@ pub const Error = error{
 /// Named like the CLI's other env overrides (`LABELLE_ASSEMBLER`,
 /// `LABELLE_ZIG`, `LABELLE_PROGRESS_DEBUG`).
 pub const SKIP_ENV = "LABELLE_NO_PREBUILD";
+
+/// Test hook: set to anything but empty/`0` to force the json-mode stdout
+/// relay (`prebuild_relay.zig`) on every OS, so the POSIX e2e exercises
+/// the path that otherwise only runs on Windows with a redirected stderr.
+pub const RELAY_ENV = "LABELLE_PREBUILD_FORCE_RELAY";
 
 pub const Options = struct {
     /// `--progress=json`: give the child our stderr as its stdout so the
@@ -481,7 +486,12 @@ pub fn failureDetail(buf: []u8, index: usize, total: usize) []const u8 {
 
 /// True when `LABELLE_NO_PREBUILD` is set to anything but empty or `0`.
 pub fn skipRequested(allocator: std.mem.Allocator) bool {
-    const v = config.globalEnviron().getAlloc(allocator, SKIP_ENV) catch return false;
+    return envFlag(allocator, SKIP_ENV);
+}
+
+/// True when env var `name` is set to anything but empty or `0`.
+fn envFlag(allocator: std.mem.Allocator, name: []const u8) bool {
+    const v = config.globalEnviron().getAlloc(allocator, name) catch return false;
     defer allocator.free(v);
     return v.len > 0 and !std.mem.eql(u8, v, "0");
 }
@@ -501,14 +511,22 @@ pub fn runStep(
 ) Error!u8 {
     const io = config.globalIo();
 
-    // In json mode the child's stdout is a pipe relayed to the CLI's
-    // stderr, so its output streams live without ever touching the NDJSON
-    // stdout feed. Not `.file = File.stderr()`: Windows re-opens that
-    // handle with its own offset (cli#448, module doc).
-    const child_stdout: std.process.SpawnOptions.StdIo = if (opts.route_stdout_to_stderr)
-        .pipe
+    // In json mode the child's stdout goes to the CLI's stderr, so its
+    // output streams live without ever touching the NDJSON stdout feed
+    // (module doc; the routing table is `prebuild_relay.stdoutRoute`).
+    const route = if (opts.route_stdout_to_stderr and envFlag(allocator, RELAY_ENV))
+        prebuild_relay.StdoutRoute.relay
     else
-        .inherit;
+        prebuild_relay.stdoutRoute(
+            opts.route_stdout_to_stderr,
+            builtin.os.tag,
+            std.Io.File.stderr().isTty(io) catch false,
+        );
+    const child_stdout: std.process.SpawnOptions.StdIo = switch (route) {
+        .inherit => .inherit,
+        .stderr_file => .{ .file = std.Io.File.stderr() },
+        .relay => .pipe,
+    };
 
     var child = std.process.spawn(io, .{
         .argv = step.run,
@@ -529,9 +547,21 @@ pub fn runStep(
         return error.PrebuildSpawnFailed;
     };
 
-    if (child.stdout) |pipe| relayToStderr(io, &child, pipe);
+    // Relay on its own thread while this one reaps the direct child: a
+    // background process the step leaves holding the pipe must not hang
+    // the build. `wait` would close the pipe, so the relay takes it first.
+    var relay: ?*prebuild_relay.Relay = null;
+    if (child.stdout) |pipe| {
+        child.stdout = null;
+        relay = prebuild_relay.Relay.start(io, pipe, std.Io.File.stderr()) catch blk: {
+            prebuild_relay.Relay.runInline(io, pipe, std.Io.File.stderr());
+            break :blk null;
+        };
+    }
+    const waited = child.wait(io);
+    if (relay) |r| r.finish(prebuild_relay.drain_grace_ns);
 
-    const term = child.wait(io) catch |err| {
+    const term = waited catch |err| {
         std.debug.print("labelle: prebuild could not wait on the step ({s})\n", .{@errorName(err)});
         return error.PrebuildSpawnFailed;
     };
@@ -545,30 +575,6 @@ pub fn runStep(
             break :blk error.PrebuildSpawnFailed;
         },
     };
-}
-
-/// Copy `pipe` (the child's stdout) to the CLI's stderr until EOF, each
-/// chunk as it arrives. A streaming write appends at the shared offset, so
-/// a `2> file` redirect stays whole. If stderr is gone the rest is drained
-/// and dropped so the child never blocks on a full pipe; if the pipe read
-/// fails it is closed so the child sees a broken pipe instead of hanging.
-fn relayToStderr(io: std.Io, child: *std.process.Child, pipe: std.Io.File) void {
-    const stderr = std.Io.File.stderr();
-    var buf: [4096]u8 = undefined;
-    var sink_ok = true;
-    while (true) {
-        const n = pipe.readStreaming(io, &.{&buf}) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => {
-                pipe.close(io);
-                child.stdout = null;
-                return;
-            },
-        };
-        if (sink_ok) stderr.writeStreamingAll(io, buf[0..n]) catch {
-            sink_ok = false;
-        };
-    }
 }
 
 /// Structural check on EVERY step, before any of them runs. Split out of
