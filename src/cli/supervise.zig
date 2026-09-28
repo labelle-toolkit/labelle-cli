@@ -146,6 +146,12 @@ pub const Group = struct {
         if (self.live() != 0) _ = self.killLive();
     }
 
+    /// Kill the tree registered in `index`, if it still is (error paths).
+    fn killSlot(self: *Group, index: usize) void {
+        const id = self.slots[index].load(.seq_cst);
+        if (id != 0) signalTree(id, .kill);
+    }
+
     fn killLive(self: *Group) usize {
         var n: usize = 0;
         for (&self.slots) |*slot| {
@@ -274,10 +280,39 @@ pub fn spawnIn(group_opt: ?*Group, io: std.Io, options: std.process.SpawnOptions
     return .{ .child = child, .group = group, .slot = slot };
 }
 
+/// How long `run` keeps draining a captured child's pipes after the child
+/// itself has exited (the cli#453 pattern of the prebuild relay).
+pub const drain_grace_ms: u64 = 500;
+
 /// `std.process.run` (captured stdout/stderr), supervised by `current`
 /// when the thread has one.
+///
+/// Supervised, the output is drained while the child is waited for on a
+/// thread of its own: a child that leaves a descendant holding its pipes
+/// never produces EOF, which used to hang the rebuild (cli#474). Once the
+/// direct child has exited, its tree is ended (a descendant in its process
+/// group or job goes with it, closing the pipes) and the drain gets
+/// `drain_grace_ms` more to collect what is buffered — enough for any
+/// descendant that escaped the tree too — then stops.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOptions) !std.process.RunResult {
     if (current == null) return std.process.run(gpa, io, options);
+    return runDrained(gpa, io, options, drain_grace_ms);
+}
+
+/// The child's end, as the waiting thread saw it.
+const Waited = struct {
+    sup: *Supervised,
+    io: std.Io,
+    term: ?(std.process.Child.WaitError!std.process.Child.Term) = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn wait(self: *Waited) void {
+        self.term = self.sup.wait(self.io);
+        self.done.store(true, .release);
+    }
+};
+
+fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOptions, grace_ms: u64) !std.process.RunResult {
     var sup = try spawn(io, .{
         .argv = options.argv,
         .cwd = options.cwd,
@@ -288,18 +323,48 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOptions) 
         .stdout = .pipe,
         .stderr = .pipe,
     });
-    errdefer sup.abort(io);
+    // The pipes are ours from here on: reaping the child (on the waiting
+    // thread) must not close them under the drain.
+    const pipes = [2]std.Io.File{ sup.child.stdout.?, sup.child.stderr.? };
+    sup.child.stdout = null;
+    sup.child.stderr = null;
+    defer for (pipes) |pipe| pipe.close(io);
+
+    var waited: Waited = .{ .sup = &sup, .io = io };
+    const waiter = std.Thread.spawn(.{}, Waited.wait, .{&waited}) catch |err| {
+        sup.abort(io);
+        return err;
+    };
+    var joined = false;
+    defer if (!joined) {
+        // An error ends the child's tree so the waiting thread returns.
+        if (sup.group) |g| g.killSlot(sup.slot);
+        waiter.join();
+    };
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ sup.child.stdout.?, sup.child.stderr.? });
+    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &pipes);
     defer multi_reader.deinit();
-    while (multi_reader.fill(options.reserve_amount, options.timeout)) |_| {} else |err| switch (err) {
-        error.EndOfStream => {},
-        else => |e| return e,
+    const poll_ms: u64 = 50;
+    var exited_at: ?u64 = null;
+    while (true) {
+        if (exited_at == null and waited.done.load(.acquire)) exited_at = monotonicMs();
+        const wait_ms: u64 = if (exited_at) |t| blk: {
+            const left = (t +| grace_ms) -| monotonicMs();
+            if (left == 0) break;
+            break :blk @min(left, poll_ms);
+        } else poll_ms;
+        multi_reader.fill(options.reserve_amount, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(wait_ms)), .clock = .awake } }) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => continue,
+            else => |e| return e,
+        };
     }
     try multi_reader.checkAnyError();
-    const term = try sup.wait(io);
+    waiter.join();
+    joined = true;
+    const term = try waited.term.?;
     const stdout_slice = try multi_reader.toOwnedSlice(0);
     errdefer gpa.free(stdout_slice);
     const stderr_slice = try multi_reader.toOwnedSlice(1);
@@ -585,4 +650,55 @@ test "supervise: a cancel that beats registration ends the child's whole tree" {
         }
     };
     try std.testing.expect(waitUntil(Gone{ .pid = grandchild }, 10_000));
+}
+
+test "supervise: a captured child whose descendant holds its pipes cannot hang the drain (cli#474)" {
+    const io = config.globalIo();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const pid_file = try std.fs.path.join(a, &.{ dir, "grandchild.pid" });
+    defer a.free(pid_file);
+    const Gone = struct {
+        pid: u32,
+        fn check(self: @This()) bool {
+            return processGone(self.pid);
+        }
+    };
+    const Case = struct { mode: []const u8, grace_ms: u64, escapes: bool };
+    const cases = [_]Case{
+        // A descendant in the child's tree ends with it, closing the pipes:
+        // the drain reaches EOF long before a grace this long could expire.
+        .{ .mode = "stay", .grace_ms = 60_000, .escapes = false },
+        // One that left the tree (its own process group) keeps them open:
+        // the grace bounds the drain.
+        .{ .mode = "escape", .grace_ms = 100, .escapes = true },
+    };
+    for (cases) |case| {
+        if (case.escapes and is_windows) continue; // a job cannot be left
+        var group: Group = .{};
+        current = &group;
+        defer current = null;
+        const began = monotonicMs();
+        const res = try runDrained(a, io, .{ .argv = &.{ test_fixtures.child_exe, "leak", case.mode, pid_file, test_fixtures.child_exe } }, case.grace_ms);
+        defer a.free(res.stdout);
+        defer a.free(res.stderr);
+        // The grandchild sleeps 60 s: an unbounded drain would wait for it.
+        try std.testing.expect(monotonicMs() - began < 30_000);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try std.testing.expect(std.mem.indexOf(u8, res.stdout, "child-output") != null);
+        try std.testing.expectEqual(@as(usize, 0), group.live());
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, pid_file, a, .limited(64));
+        defer a.free(bytes);
+        const grandchild = try std.fmt.parseInt(u32, std.mem.trim(u8, bytes, " \r\n"), 10);
+        if (!is_windows and case.escapes) {
+            // The mechanism: it is still running, so the drain ended on the
+            // grace, not on EOF. Clean it up.
+            try std.testing.expect(!processGone(grandchild));
+            if (!is_windows) _ = std.posix.system.kill(@intCast(grandchild), .KILL);
+        }
+        try std.testing.expect(waitUntil(Gone{ .pid = grandchild }, 10_000));
+    }
 }

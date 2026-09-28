@@ -142,7 +142,7 @@ pub fn run(
         return 1;
     };
     defer publisher.deinit(true);
-    publisher.publish() catch |err| {
+    publisher.publish(null) catch |err| {
         std.debug.print("labelle: run --watch: could not publish the initial build ({s})\n", .{@errorName(err)});
         return 1;
     };
@@ -284,8 +284,8 @@ pub fn run(
     return provider_hooks.finishRun(site, after, run_out, .exited_clean);
 }
 
-fn publishNext(ptr: *anyopaque) anyerror!void {
+fn publishNext(ptr: *anyopaque, gate: watch.PublishGate) anyerror!void {
     const publisher: *watch.Publisher = @ptrCast(@alignCast(ptr));
-    try publisher.publish();
+    try publisher.publish(gate);
     std.debug.print("labelle: published generation {d}\n", .{publisher.generation.?});
 }

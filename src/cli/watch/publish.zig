@@ -29,8 +29,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("../config.zig");
+const tree = @import("tree.zig");
 
 const is_windows = builtin.os.tag == .windows;
+
+/// Checks a rebuild runs inside the publication (`Publisher.publish`), so
+/// the publication is part of the rebuild's transaction (cli#474):
+///
+/// - `before_switch` after the copy, before `current` moves: a rebuild
+///   cancelled while the copy ran stops here and publishes nothing;
+/// - `before_advance` after the switch, before the generation file moves —
+///   the commit point: the rebuild's last cancel check and the commit of
+///   its staged `labelle.lock`, so a consumer that sees the new generation
+///   also sees the lock it was built with. A failure here switches
+///   `current` back, exactly as a failed generation write does.
+pub const Gate = struct {
+    ctx: *anyopaque,
+    before_switch: *const fn (*anyopaque) anyerror!void,
+    before_advance: *const fn (*anyopaque) anyerror!void,
+};
 
 pub const Publisher = struct {
     allocator: std.mem.Allocator,
@@ -44,6 +61,11 @@ pub const Publisher = struct {
     generation_file: []const u8,
     /// The last published generation; `null` before the first.
     generation: ?u64 = null,
+    /// The published directory `current` names, and the one before it
+    /// (kept: a request may still read it through a resolved path). Owned
+    /// basenames under `root`; `null` until published.
+    current_name: ?[]const u8 = null,
+    previous_name: ?[]const u8 = null,
     /// Set once the non-atomic Windows fallback had to be used.
     fallback_noted: bool = false,
     /// The generation-file writer. A field only so a test can make it fail
@@ -72,6 +94,10 @@ pub const Publisher = struct {
         self.allocator.free(self.root);
         self.allocator.free(self.output_dir);
         self.allocator.free(self.generation_file);
+        if (self.current_name) |n| self.allocator.free(n);
+        if (self.previous_name) |n| self.allocator.free(n);
+        self.current_name = null;
+        self.previous_name = null;
     }
 
     /// The generation the next `publish` writes.
@@ -79,48 +105,101 @@ pub const Publisher = struct {
         return if (self.generation) |g| g + 1 else 0;
     }
 
-    /// Publish the staged tree as the next generation (0 first). On any
-    /// error nothing observable changed: `current` and `generation` still
-    /// name the previous publication. When the generation file cannot be
-    /// advanced after `current` was switched, `current` is switched BACK
-    /// (or removed, before the first publication), so a consumer never sees
-    /// a switched output under an old generation. Only if that rollback
-    /// fails too does `current` keep the new output under the old
-    /// generation — reported, and `generation` still moves, so the next
-    /// publication never overwrites the directory being served.
-    pub fn publish(self: *Publisher) !void {
+    /// Publish the staged tree as the next generation (0 first), running
+    /// `gate`'s checks at their points (`Gate`). On any error nothing
+    /// observable changed: `current` and `generation` still name the
+    /// previous publication. When the generation cannot be advanced after
+    /// `current` was switched (the gate refused, or the generation write
+    /// failed), `current` is switched BACK (or removed, before the first
+    /// publication), so a consumer never sees a switched output under an
+    /// old generation. Only if that rollback fails too does `current` keep
+    /// the new output under the old generation — reported, and
+    /// `generation` still moves, so the next publication never overwrites
+    /// the directory being served.
+    ///
+    /// Every publication copies into a directory it CREATES (`freshDir`),
+    /// never into one a failed cleanup left behind, so no stale file of an
+    /// earlier attempt can go live with it (cli#474).
+    pub fn publish(self: *Publisher, gate: ?Gate) !void {
         const io = config.globalIo();
         const a = self.allocator;
         const n = self.next();
-        const name = try std.fmt.allocPrint(a, "published-{d}", .{n});
-        defer a.free(name);
+        const name = try self.freshDir(n);
+        var keep_name = false;
+        defer if (!keep_name) a.free(name);
         const dest = try std.fs.path.join(a, &.{ self.root, name });
         defer a.free(dest);
-        std.Io.Dir.cwd().deleteTree(io, dest) catch {};
+        const restore = if (self.current_name) |cur| try std.fs.path.join(a, &.{ self.root, cur }) else null;
+        defer if (restore) |r| a.free(r);
         {
             errdefer std.Io.Dir.cwd().deleteTree(io, dest) catch {};
             try copyTree(a, self.source, dest);
-            try self.switchTo(name, dest);
+            if (gate) |g| try g.before_switch(g.ctx);
+            try self.switchTo(name, dest, restore);
         }
-        // The switch landed: the generation may now say so.
-        self.write_generation(self, n) catch |err| {
-            if (self.switchBack()) {
+        // The switch landed: the generation may now say so, once the gate
+        // (the rebuild's commit point) agrees.
+        const refused: ?anyerror = blk: {
+            if (gate) |g| g.before_advance(g.ctx) catch |err| break :blk err;
+            self.write_generation(self, n) catch |err| break :blk err;
+            break :blk null;
+        };
+        if (refused) |err| {
+            if (self.switchBack(dest)) {
                 std.Io.Dir.cwd().deleteTree(io, dest) catch {};
+                return err;
             } else |back_err| {
                 std.debug.print("labelle: watch: generation {d} is served but its generation file could not be written ({s}), nor the output switched back ({s})\n", .{ n, @errorName(err), @errorName(back_err) });
-                self.generation = n;
-                self.prune(n);
             }
+            self.advance(n, name);
+            keep_name = true;
             return err;
-        };
+        }
+        self.advance(n, name);
+        keep_name = true;
+    }
+
+    /// Record `name` as the published generation `n` and prune.
+    fn advance(self: *Publisher, n: u64, name: []const u8) void {
+        if (self.previous_name) |old| self.allocator.free(old);
+        self.previous_name = self.current_name;
+        self.current_name = name;
         self.generation = n;
-        self.prune(n);
+        self.prune();
+    }
+
+    /// Create a directory for generation `n` that did not exist before:
+    /// `published-<n>`, else `published-<n>-<k>` past any leftover of an
+    /// earlier attempt (one a cleanup could not delete), which `prune`
+    /// removes later. Returns its basename (owned).
+    fn freshDir(self: *Publisher, n: u64) ![]const u8 {
+        const io = config.globalIo();
+        const a = self.allocator;
+        var k: u32 = 0;
+        while (k < 1000) : (k += 1) {
+            const name = if (k == 0)
+                try std.fmt.allocPrint(a, "published-{d}", .{n})
+            else
+                try std.fmt.allocPrint(a, "published-{d}-{d}", .{ n, k });
+            errdefer a.free(name);
+            const path = try std.fs.path.join(a, &.{ self.root, name });
+            defer a.free(path);
+            std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    a.free(name);
+                    continue;
+                },
+                else => return err,
+            };
+            return name;
+        }
+        return error.PublishDirUnavailable;
     }
 
     /// Point `current` back at the last publication, or remove it when
-    /// there is none.
-    fn switchBack(self: *Publisher) !void {
-        const previous = self.generation orelse {
+    /// there is none. `from` is the directory it points at now.
+    fn switchBack(self: *Publisher, from: []const u8) !void {
+        const previous = self.current_name orelse {
             const io = config.globalIo();
             if (is_windows) {
                 const link_w = try std.unicode.wtf8ToWtf16LeAllocZ(self.allocator, self.output_dir);
@@ -129,15 +208,15 @@ pub const Publisher = struct {
             } else try std.Io.Dir.cwd().deleteFile(io, self.output_dir);
             return;
         };
-        const name = try std.fmt.allocPrint(self.allocator, "published-{d}", .{previous});
-        defer self.allocator.free(name);
-        const dest = try std.fs.path.join(self.allocator, &.{ self.root, name });
+        const dest = try std.fs.path.join(self.allocator, &.{ self.root, previous });
         defer self.allocator.free(dest);
-        try self.switchTo(name, dest);
+        try self.switchTo(previous, dest, from);
     }
 
-    fn switchTo(self: *Publisher, name: []const u8, dest: []const u8) !void {
-        if (is_windows) return self.retargetJunction(dest);
+    /// Point `current` at `dest` (basename `name`). `restore` is where it
+    /// points now, for the Windows fallback to put back on failure.
+    fn switchTo(self: *Publisher, name: []const u8, dest: []const u8, restore: ?[]const u8) !void {
+        if (is_windows) return self.retargetJunction(dest, restore);
         const io = config.globalIo();
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp-{s}", .{ self.output_dir, name });
         defer self.allocator.free(tmp);
@@ -147,7 +226,7 @@ pub const Publisher = struct {
         try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), self.output_dir, io);
     }
 
-    fn writeGeneration(self: *Publisher, n: u64) anyerror!void {
+    pub fn writeGeneration(self: *Publisher, n: u64) anyerror!void {
         const io = config.globalIo();
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.generation_file});
         defer self.allocator.free(tmp);
@@ -168,23 +247,24 @@ pub const Publisher = struct {
         }
     }
 
-    /// Delete every published directory older than the previous one.
-    fn prune(self: *Publisher, n: u64) void {
-        if (n < 2) return;
+    /// Delete every published directory but the current and the previous
+    /// one — leftovers of failed attempts included.
+    fn prune(self: *Publisher) void {
         const io = config.globalIo();
         var dir = std.Io.Dir.cwd().openDir(io, self.root, .{ .iterate = true }) catch return;
         defer dir.close(io);
         var it = dir.iterate();
         while (it.next(io) catch return) |entry| {
             if (!std.mem.startsWith(u8, entry.name, "published-")) continue;
-            const k = std.fmt.parseInt(u64, entry.name["published-".len..], 10) catch continue;
+            if (self.current_name) |n| if (std.mem.eql(u8, n, entry.name)) continue;
+            if (self.previous_name) |n| if (std.mem.eql(u8, n, entry.name)) continue;
             // Best effort: a directory a consumer still holds open on
             // Windows is retried after the next publication.
-            if (k + 1 < n) dir.deleteTree(io, entry.name) catch {};
+            dir.deleteTree(io, entry.name) catch {};
         }
     }
 
-    fn retargetJunction(self: *Publisher, dest: []const u8) !void {
+    fn retargetJunction(self: *Publisher, dest: []const u8, restore: ?[]const u8) !void {
         const io = config.globalIo();
         const a = self.allocator;
         const link_w = try std.unicode.wtf8ToWtf16LeAllocZ(a, self.output_dir);
@@ -196,10 +276,77 @@ pub const Publisher = struct {
             // The in-place rewrite was refused: recreate the junction.
             if (!self.fallback_noted) std.debug.print("labelle: note: the output junction could not be switched in place ({s}); recreating it (not atomic)\n", .{@errorName(err)});
             self.fallback_noted = true;
-            if (k32.RemoveDirectoryW(link_w) == 0) return error.JunctionFailed;
-            try std.Io.Dir.cwd().createDir(io, self.output_dir, .default_dir);
-            try setJunction(a, link_w, dest);
+            var real: RealJunction = .{ .a = a, .link_w = link_w, .path = self.output_dir };
+            return recreateJunction(real.ops(), dest, restore);
         };
+    }
+};
+
+/// The three filesystem operations of the non-atomic junction fallback,
+/// behind a seam so its failure handling is tested on every host.
+pub const JunctionOps = struct {
+    ctx: *anyopaque,
+    /// Remove the (empty) junction directory.
+    remove: *const fn (*anyopaque) anyerror!void,
+    /// Create it as an empty directory (`error.PathAlreadyExists` if it is
+    /// there).
+    create: *const fn (*anyopaque) anyerror!void,
+    /// Point it at `target`.
+    set: *const fn (*anyopaque, []const u8) anyerror!void,
+};
+
+/// Recreate the junction pointing at `dest`. When a step after the removal
+/// fails, the junction is put back to `restore` — the output it served —
+/// so a failed switch never leaves `current` missing or pointing nowhere
+/// (cli#474); `restore == null` (nothing published yet) leaves it absent.
+pub fn recreateJunction(ops: JunctionOps, dest: []const u8, restore: ?[]const u8) !void {
+    try ops.remove(ops.ctx);
+    ops.create(ops.ctx) catch |err| {
+        putBack(ops, restore);
+        return err;
+    };
+    ops.set(ops.ctx, dest) catch |err| {
+        putBack(ops, restore);
+        return err;
+    };
+}
+
+fn putBack(ops: JunctionOps, restore: ?[]const u8) void {
+    const target = restore orelse {
+        ops.remove(ops.ctx) catch {};
+        return;
+    };
+    ops.create(ops.ctx) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            std.debug.print("labelle: watch: the output junction could not be restored ({s}); it is missing until the next publication\n", .{@errorName(err)});
+            return;
+        },
+    };
+    ops.set(ops.ctx, target) catch |err| {
+        std.debug.print("labelle: watch: the output junction could not be restored ({s}); it is empty until the next publication\n", .{@errorName(err)});
+    };
+}
+
+const RealJunction = struct {
+    a: std.mem.Allocator,
+    link_w: [:0]const u16,
+    path: []const u8,
+
+    fn ops(self: *RealJunction) JunctionOps {
+        return .{ .ctx = self, .remove = remove, .create = create, .set = set };
+    }
+    fn remove(ctx: *anyopaque) anyerror!void {
+        const self: *RealJunction = @ptrCast(@alignCast(ctx));
+        if (k32.RemoveDirectoryW(self.link_w) == 0) return error.JunctionFailed;
+    }
+    fn create(ctx: *anyopaque) anyerror!void {
+        const self: *RealJunction = @ptrCast(@alignCast(ctx));
+        try std.Io.Dir.cwd().createDir(config.globalIo(), self.path, .default_dir);
+    }
+    fn set(ctx: *anyopaque, target: []const u8) anyerror!void {
+        const self: *RealJunction = @ptrCast(@alignCast(ctx));
+        try setJunction(self.a, self.link_w, target);
     }
 };
 
@@ -211,23 +358,38 @@ pub const Publisher = struct {
 /// whose target lies outside `src` — relative or absolute — is skipped with
 /// a warning; so is a link that cannot be created (Windows without the
 /// privilege).
+///
+/// An entry the directory listing reports as `.unknown` (NFS, FUSE and
+/// other filesystems without `d_type`) is resolved with a `stat` of the
+/// entry itself (`tree.entryKind`), so a directory is still copied as a
+/// directory and a link as a link (cli#474).
 pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
-    return copyTreeWithin(a, src, src, dest);
+    return copyTreeWithin(a, src, src, dest, listedKind);
 }
 
-fn copyTreeWithin(a: std.mem.Allocator, top: []const u8, src: []const u8, dest: []const u8) !void {
+/// What the listing reports; a test substitutes `.unknown` for every
+/// entry to stand in for a filesystem without `d_type`.
+const KindFn = *const fn (std.Io.Dir.Entry) std.Io.File.Kind;
+
+fn listedKind(entry: std.Io.Dir.Entry) std.Io.File.Kind {
+    return entry.kind;
+}
+
+fn copyTreeWithin(a: std.mem.Allocator, top: []const u8, src: []const u8, dest: []const u8, listed: KindFn) !void {
     const io = config.globalIo();
     try std.Io.Dir.cwd().createDirPath(io, dest);
     var dir = try std.Io.Dir.cwd().openDir(io, src, .{ .iterate = true });
     defer dir.close(io);
     var it = dir.iterate();
-    while (try it.next(io)) |entry| {
+    while (try it.next(io)) |raw| {
+        var entry = raw;
+        entry.kind = listed(raw);
         const from = try std.fs.path.join(a, &.{ src, entry.name });
         defer a.free(from);
         const to = try std.fs.path.join(a, &.{ dest, entry.name });
         defer a.free(to);
-        switch (entry.kind) {
-            .directory => try copyTreeWithin(a, top, from, to),
+        switch (try tree.entryKind(io, dir, entry)) {
+            .directory => try copyTreeWithin(a, top, from, to, listed),
             .sym_link => copyLink(a, top, from, to) catch |err| {
                 std.debug.print("labelle: watch: symbolic link '{s}' not published ({s})\n", .{ from, @errorName(err) });
             },
@@ -256,92 +418,13 @@ fn copyLink(a: std.mem.Allocator, top: []const u8, from: []const u8, to: []const
 
 /// True when `path` is `top` or lies beneath it (pure path math; both are
 /// resolved, `top` absolute).
-fn within(top: []const u8, path: []const u8) bool {
+pub fn within(top: []const u8, path: []const u8) bool {
     const t = std.mem.trimEnd(u8, top, "/\\");
     if (path.len < t.len) return false;
     const head = path[0..t.len];
     const same = if (is_windows) std.ascii.eqlIgnoreCase(head, t) else std.mem.eql(u8, head, t);
     if (!same) return false;
     return path.len == t.len or std.fs.path.isSep(path[t.len]);
-}
-
-// ── Session lock ──────────────────────────────────────────────────────
-
-/// One watch session per session root (project and target) at a time: the
-/// session claims `<root>.lock` with its PID BEFORE any build, so a second
-/// `labelle run --watch` for the same target is refused
-/// (`error.WatchSessionActive`) before it touches the target's staging
-/// tree or the published output. A lock whose process is gone (a session
-/// killed outright) is stale and taken over.
-pub const SessionLock = struct {
-    allocator: std.mem.Allocator,
-    path: []const u8,
-
-    pub fn acquire(allocator: std.mem.Allocator, root: []const u8) !SessionLock {
-        const path = try std.fmt.allocPrint(allocator, "{s}.lock", .{root});
-        errdefer allocator.free(path);
-        if (std.fs.path.dirname(root)) |parent| try std.Io.Dir.cwd().createDirPath(config.globalIo(), parent);
-        try claim(allocator, path);
-        return .{ .allocator = allocator, .path = path };
-    }
-
-    pub fn release(self: *SessionLock) void {
-        std.Io.Dir.cwd().deleteFile(config.globalIo(), self.path) catch {};
-        self.allocator.free(self.path);
-    }
-};
-
-/// Claim `lock_path` for this process: create it exclusively with our PID.
-/// An existing lock whose PID still runs refuses; one whose process is gone
-/// is stale and replaced.
-fn claim(a: std.mem.Allocator, lock_path: []const u8) !void {
-    const io = config.globalIo();
-    var attempt: u8 = 0;
-    while (attempt < 3) : (attempt += 1) {
-        if (std.Io.Dir.cwd().createFile(io, lock_path, .{ .exclusive = true })) |file| {
-            defer file.close(io);
-            var buf: [24]u8 = undefined;
-            const text = try std.fmt.bufPrint(&buf, "{d}\n", .{ownPid()});
-            try file.writeStreamingAll(io, text);
-            return;
-        } else |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        }
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock_path, a, .limited(64)) catch continue;
-        defer a.free(bytes);
-        const owner = std.fmt.parseInt(u64, std.mem.trim(u8, bytes, " \r\n"), 10) catch 0;
-        if (owner != 0 and processAlive(owner)) {
-            std.debug.print("labelle: run --watch: another watch session (pid {d}) is already running for this target; stop it first (lock: {s})\n", .{ owner, lock_path });
-            return error.WatchSessionActive;
-        }
-        std.debug.print("labelle: run --watch: taking over a stale watch session lock (pid {d} is gone)\n", .{owner});
-        std.Io.Dir.cwd().deleteFile(io, lock_path) catch {};
-    }
-    return error.WatchSessionActive;
-}
-
-fn ownPid() u64 {
-    if (is_windows) return k32.GetCurrentProcessId();
-    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
-    return @intCast(std.c.getpid());
-}
-
-/// True while process `pid` exists.
-pub fn processAlive(pid: u64) bool {
-    if (is_windows) {
-        const h = k32.OpenProcess(0x1000, 0, @intCast(@min(pid, std.math.maxInt(u32)))) orelse return false;
-        defer _ = k32.CloseHandle(h);
-        var code: u32 = 0;
-        if (k32.GetExitCodeProcess(h, &code) == 0) return true;
-        return code == 259; // STILL_ACTIVE
-    }
-    if (pid > std.math.maxInt(i32)) return false;
-    const rc = std.posix.system.kill(@intCast(pid), @enumFromInt(0));
-    return switch (std.posix.errno(rc)) {
-        .SUCCESS, .PERM => true,
-        else => false,
-    };
 }
 
 // ── Windows junctions ─────────────────────────────────────────────────
@@ -352,9 +435,6 @@ const k32 = struct {
     extern "kernel32" fn DeviceIoControl(h: HANDLE, code: u32, in: ?*const anyopaque, in_len: u32, out: ?*anyopaque, out_len: u32, returned: ?*u32, overlapped: ?*anyopaque) callconv(.winapi) c_int;
     extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) c_int;
     extern "kernel32" fn RemoveDirectoryW(name: [*:0]const u16) callconv(.winapi) c_int;
-    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
-    extern "kernel32" fn OpenProcess(access: u32, inherit: c_int, pid: u32) callconv(.winapi) ?HANDLE;
-    extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *u32) callconv(.winapi) c_int;
     const GENERIC_WRITE: u32 = 0x40000000;
     const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
     const OPEN_EXISTING: u32 = 3;
@@ -429,7 +509,7 @@ test "publish: each generation is a complete copy; the output switches before th
     defer p.deinit(true);
     try std.testing.expectEqual(@as(u64, 0), p.next());
 
-    try p.publish();
+    try p.publish(null);
     {
         const got = try readCurrent(a, &p, "index.txt");
         defer a.free(got);
@@ -449,8 +529,8 @@ test "publish: each generation is a complete copy; the output switches before th
         defer a.free(got);
         try std.testing.expectEqualStrings("one", got);
     }
-    try p.publish();
-    try p.publish();
+    try p.publish(null);
+    try p.publish(null);
     {
         const got = try readCurrent(a, &p, "index.txt");
         defer a.free(got);
@@ -481,10 +561,10 @@ test "publish: a publication that fails leaves the served output and the generat
     defer a.free(root);
     var p = try Publisher.init(a, root, stage);
     defer p.deinit(true);
-    try p.publish();
+    try p.publish(null);
     // The staged tree vanished (a build that wiped its output and died).
     try tmp.dir.deleteTree(io, "stage");
-    try std.testing.expectError(error.FileNotFound, p.publish());
+    try std.testing.expectError(error.FileNotFound, p.publish(null));
     try std.testing.expectEqual(@as(?u64, 0), p.generation);
     const got = try readCurrent(a, &p, "index.txt");
     defer a.free(got);
@@ -521,15 +601,15 @@ test "publish: a generation that cannot be advanced switches the output back" {
     defer p.deinit(true);
     // Before the first publication: `current` is removed again.
     p.write_generation = Fail.write;
-    try std.testing.expectError(error.SharingViolation, p.publish());
+    try std.testing.expectError(error.SharingViolation, p.publish(null));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/current/index.txt", .{}));
     try std.testing.expectEqual(@as(?u64, null), p.generation);
     p.write_generation = Publisher.writeGeneration;
-    try p.publish();
+    try p.publish(null);
     // After it: `current` goes back to generation 0, whose file still says 0.
     try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "one" });
     p.write_generation = Fail.write;
-    try std.testing.expectError(error.SharingViolation, p.publish());
+    try std.testing.expectError(error.SharingViolation, p.publish(null));
     {
         const got = try readCurrent(a, &p, "index.txt");
         defer a.free(got);
@@ -542,7 +622,7 @@ test "publish: a generation that cannot be advanced switches the output back" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/published-1", .{}));
     // The next attempt publishes normally.
     p.write_generation = Publisher.writeGeneration;
-    try p.publish();
+    try p.publish(null);
     const got = try readCurrent(a, &p, "index.txt");
     defer a.free(got);
     try std.testing.expectEqualStrings("one", got);
@@ -609,24 +689,217 @@ test "publish: the containment check is pure path math" {
     try std.testing.expect(!within(top, parent));
 }
 
-test "publish: one session per root; a lock whose process is gone is taken over" {
+test "publish: a leftover directory of the same generation is never merged into (cli#474)" {
     const a = std.testing.allocator;
     const io = config.globalIo();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "stage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "zero" });
     const base = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(base);
-    const root = try std.fs.path.join(a, &.{ base, "watch", "session" });
+    const stage = try std.fs.path.join(a, &.{ base, "stage" });
+    defer a.free(stage);
+    const root = try std.fs.path.join(a, &.{ base, "session" });
     defer a.free(root);
-    var first = try SessionLock.acquire(a, root);
-    // A second session for the same root is refused while the first runs.
-    try std.testing.expectError(error.WatchSessionActive, SessionLock.acquire(a, root));
-    first.release();
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "watch/session.lock", .{}));
-    // A lock left by a process that no longer exists is stale.
-    try std.testing.expect(!processAlive(2147483000));
-    try tmp.dir.writeFile(io, .{ .sub_path = "watch/session.lock", .data = "2147483000\n" });
-    var second = try SessionLock.acquire(a, root);
-    second.release();
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "watch/session.lock", .{}));
+    var p = try Publisher.init(a, root, stage);
+    defer p.deinit(true);
+    try p.publish(null);
+    // What a failed cleanup of an earlier attempt at generation 1 left:
+    // a stale file that must never go live.
+    try tmp.dir.createDirPath(io, "session/published-1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "session/published-1/stale.txt", .data = "stale" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "one" });
+    try p.publish(null);
+    try std.testing.expectEqual(@as(?u64, 1), p.generation);
+    // Published into a directory of its own...
+    try std.testing.expectEqualStrings("published-1-1", p.current_name.?);
+    const got = try readCurrent(a, &p, "index.txt");
+    defer a.free(got);
+    try std.testing.expectEqualStrings("one", got);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/current/stale.txt", .{}));
+    // ...and the leftover is pruned; the previous generation is kept.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/published-1", .{}));
+    try tmp.dir.access(io, "session/published-0/index.txt", .{});
+}
+
+test "publish: the gate runs after the copy and after the switch; a refusal publishes nothing (cli#474)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "stage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "zero" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const stage = try std.fs.path.join(a, &.{ base, "stage" });
+    defer a.free(stage);
+    const root = try std.fs.path.join(a, &.{ base, "session" });
+    defer a.free(root);
+    var p = try Publisher.init(a, root, stage);
+    defer p.deinit(true);
+    try p.publish(null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "one" });
+
+    const Probe = struct {
+        p: *Publisher,
+        refuse_switch: bool = false,
+        refuse_advance: bool = false,
+        /// What `current` served, and the generation file said, at each check.
+        at_switch: [8]u8 = undefined,
+        at_switch_len: usize = 0,
+        at_advance: [8]u8 = undefined,
+        at_advance_len: usize = 0,
+        generation_at_advance: [8]u8 = undefined,
+        generation_at_advance_len: usize = 0,
+        fn served(self: *@This(), out: *[8]u8, len: *usize) void {
+            const bytes = readCurrent(std.testing.allocator, self.p, "index.txt") catch return;
+            defer std.testing.allocator.free(bytes);
+            @memcpy(out[0..bytes.len], bytes);
+            len.* = bytes.len;
+        }
+        fn beforeSwitch(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.served(&self.at_switch, &self.at_switch_len);
+            if (self.refuse_switch) return error.Canceled;
+        }
+        fn beforeAdvance(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.served(&self.at_advance, &self.at_advance_len);
+            const g = readGeneration(std.testing.allocator, self.p) catch return;
+            defer std.testing.allocator.free(g);
+            @memcpy(self.generation_at_advance[0..g.len], g);
+            self.generation_at_advance_len = g.len;
+            if (self.refuse_advance) return error.LockCommitFailed;
+        }
+        fn gate(self: *@This()) Gate {
+            return .{ .ctx = self, .before_switch = beforeSwitch, .before_advance = beforeAdvance };
+        }
+    };
+    // Refused before the switch (a cancel during the copy): the old output
+    // is still served, and no directory is left.
+    var probe: Probe = .{ .p = &p, .refuse_switch = true };
+    try std.testing.expectError(error.Canceled, p.publish(probe.gate()));
+    try std.testing.expectEqualStrings("zero", probe.at_switch[0..probe.at_switch_len]);
+    try std.testing.expectEqual(@as(usize, 0), probe.at_advance_len);
+    try std.testing.expectEqual(@as(?u64, 0), p.generation);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/published-1", .{}));
+    // Refused at the commit point: the check ran with the NEW output
+    // switched in and the OLD generation still current; the output is
+    // switched back.
+    probe = .{ .p = &p, .refuse_advance = true };
+    try std.testing.expectError(error.LockCommitFailed, p.publish(probe.gate()));
+    try std.testing.expectEqualStrings("zero", probe.at_switch[0..probe.at_switch_len]);
+    try std.testing.expectEqualStrings("one", probe.at_advance[0..probe.at_advance_len]);
+    try std.testing.expectEqualStrings("0\n", probe.generation_at_advance[0..probe.generation_at_advance_len]);
+    try std.testing.expectEqual(@as(?u64, 0), p.generation);
+    {
+        const got = try readCurrent(a, &p, "index.txt");
+        defer a.free(got);
+        try std.testing.expectEqualStrings("zero", got);
+        const g = try readGeneration(a, &p);
+        defer a.free(g);
+        try std.testing.expectEqualStrings("0\n", g);
+    }
+    // Agreed: published.
+    probe = .{ .p = &p };
+    try p.publish(probe.gate());
+    try std.testing.expectEqual(@as(?u64, 1), p.generation);
+    const got = try readCurrent(a, &p, "index.txt");
+    defer a.free(got);
+    try std.testing.expectEqualStrings("one", got);
+}
+
+/// The junction fallback's filesystem, in memory: whether the junction
+/// directory exists and where it points, with scripted failures.
+const FakeJunction = struct {
+    exists: bool = true,
+    target: ?[]const u8 = null,
+    fail_create: u32 = 0,
+    fail_set_to: ?[]const u8 = null,
+
+    fn ops(self: *FakeJunction) JunctionOps {
+        return .{ .ctx = self, .remove = remove, .create = create, .set = set };
+    }
+    fn remove(ctx: *anyopaque) anyerror!void {
+        const self: *FakeJunction = @ptrCast(@alignCast(ctx));
+        if (!self.exists) return error.FileNotFound;
+        self.exists = false;
+        self.target = null;
+    }
+    fn create(ctx: *anyopaque) anyerror!void {
+        const self: *FakeJunction = @ptrCast(@alignCast(ctx));
+        if (self.exists) return error.PathAlreadyExists;
+        if (self.fail_create != 0) {
+            self.fail_create -= 1;
+            return error.AccessDenied;
+        }
+        self.exists = true;
+    }
+    fn set(ctx: *anyopaque, target: []const u8) anyerror!void {
+        const self: *FakeJunction = @ptrCast(@alignCast(ctx));
+        if (!self.exists) return error.FileNotFound;
+        if (self.fail_set_to) |bad| if (std.mem.eql(u8, bad, target)) return error.JunctionFailed;
+        self.target = target;
+    }
+};
+
+test "publish: a junction recreate that fails puts the previous junction back (cli#474)" {
+    // The recreate itself.
+    var ok: FakeJunction = .{ .target = "old" };
+    try recreateJunction(ok.ops(), "new", "old");
+    try std.testing.expectEqualStrings("new", ok.target.?);
+    // Pointing the recreated junction at the new output fails: it serves
+    // the previous output again, not nothing.
+    var bad_set: FakeJunction = .{ .target = "old", .fail_set_to = "new" };
+    try std.testing.expectError(error.JunctionFailed, recreateJunction(bad_set.ops(), "new", "old"));
+    try std.testing.expect(bad_set.exists);
+    try std.testing.expectEqualStrings("old", bad_set.target.?);
+    // Recreating the directory fails once: the restore recreates it.
+    var bad_create: FakeJunction = .{ .target = "old", .fail_create = 1 };
+    try std.testing.expectError(error.AccessDenied, recreateJunction(bad_create.ops(), "new", "old"));
+    try std.testing.expect(bad_create.exists);
+    try std.testing.expectEqualStrings("old", bad_create.target.?);
+    // Before the first publication there is nothing to restore: no
+    // junction is left behind.
+    var first: FakeJunction = .{ .fail_set_to = "new" };
+    try std.testing.expectError(error.JunctionFailed, recreateJunction(first.ops(), "new", null));
+    try std.testing.expect(!first.exists);
+}
+
+fn alwaysUnknown(_: std.Io.Dir.Entry) std.Io.File.Kind {
+    return .unknown;
+}
+
+test "publish: entries a filesystem lists as .unknown are resolved with a stat (cli#474)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "stage/sub/deeper");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "top" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/sub/deeper/leaf.txt", .data = "leaf" });
+    const links = !is_windows; // links need a privilege there
+    if (links) try tmp.dir.symLink(io, "index.txt", "stage/alias.txt", .{});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const stage = try std.fs.path.join(a, &.{ base, "stage" });
+    defer a.free(stage);
+    const out = try std.fs.path.join(a, &.{ base, "out" });
+    defer a.free(out);
+    // Every entry listed as `.unknown`, as NFS or FUSE may: directories are
+    // still recursed into (copying one "as a file" failed publication),
+    // files copied, links kept as links.
+    try copyTreeWithin(a, stage, stage, out, alwaysUnknown);
+    const leaf = try tmp.dir.readFileAlloc(io, "out/sub/deeper/leaf.txt", a, .limited(16));
+    defer a.free(leaf);
+    try std.testing.expectEqualStrings("leaf", leaf);
+    const top = try tmp.dir.readFileAlloc(io, "out/index.txt", a, .limited(16));
+    defer a.free(top);
+    try std.testing.expectEqualStrings("top", top);
+    if (links) {
+        var buf: [64]u8 = undefined;
+        const n = try tmp.dir.readLink(io, "out/alias.txt", &buf);
+        try std.testing.expectEqualStrings("index.txt", buf[0..n]);
+    }
 }

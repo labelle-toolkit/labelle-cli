@@ -25,6 +25,7 @@ const provider_env = @import("../provider_env.zig");
 const testing = @import("testing.zig");
 const generate = @import("generate.zig");
 const install = @import("install.zig");
+const plugins = @import("../plugins.zig");
 
 /// Rebuild context for a watch session. Bundles the generate+build inputs
 /// the initial pipeline computed so the watcher thread can re-run them on
@@ -137,6 +138,7 @@ pub const RebuildCtx = struct {
         ZigSpawnFailed,
         BuildFailed,
         PublishFailed,
+        LockCommitFailed,
     };
 
     /// The per-rebuild replan seam, around the prebuild steps:
@@ -150,10 +152,15 @@ pub const RebuildCtx = struct {
     ///   the full rediscovery + replan + ownership validation, so provider
     ///   metadata a prebuild step generates reaches THIS rebuild's plans
     ///   (Codex P2 on #427). It stages what it replans on the context.
+    /// - `commit_lock` moves the rebuild's staged `labelle.lock` over the
+    ///   project's at the rebuild's commit point (the last step that may
+    ///   still fail): before the publication advances its generation, so a
+    ///   consumer never sees new output with the old lock, and while a
+    ///   failure still rolls the rebuild back (cli#474).
     /// - `commit` / `rollback` end the transaction (cli#469): `commit` once
     ///   the whole rebuild succeeded, `rollback` on any failure, restoring
     ///   whatever the replan changed outside the context (its generation,
-    ///   the lock on disk).
+    ///   the lock on disk — a lock `commit_lock` already moved included).
     ///
     /// Either may fail with `error.SessionChanged` when the edit affects the
     /// running replacement; it has printed the restart diagnostic.
@@ -161,13 +168,18 @@ pub const RebuildCtx = struct {
         ctx: *anyopaque,
         precheck: ?*const fn (*anyopaque, *RebuildCtx) anyerror!void = null,
         run: *const fn (*anyopaque, *RebuildCtx) anyerror!void,
+        commit_lock: ?*const fn (*anyopaque) anyerror!void = null,
         commit: ?*const fn (*anyopaque) void = null,
         rollback: ?*const fn (*anyopaque) void = null,
     };
 
+    /// The publication (`watch.Publisher.publish`). It runs the gate's
+    /// checks at their points (`watch.PublishGate`): the rebuild's cancel
+    /// check before the output switch, and its commit point — the last
+    /// cancel check and the lock commit — before the generation advances.
     pub const Publish = struct {
         ctx: *anyopaque,
-        run: *const fn (*anyopaque) anyerror!void,
+        run: *const fn (*anyopaque, watch.PublishGate) anyerror!void,
     };
 
     /// Everything a rebuild may change on the context, as it was before.
@@ -216,6 +228,30 @@ pub const RebuildCtx = struct {
 
     fn checkCanceled(self: *const RebuildCtx) Stage!void {
         if (self.canceled()) return error.Canceled;
+    }
+
+    /// The rebuild's commit point: nothing after it may fail. A cancel
+    /// that arrived during the stages (a publication copy included) is
+    /// honoured here, and the staged lock is committed — a failure to
+    /// move it fails the rebuild, which rolls back (cli#474).
+    fn commitPoint(self: *RebuildCtx) Stage!void {
+        try self.checkCanceled();
+        const replan = self.replan orelse return;
+        const commit_lock = replan.commit_lock orelse return;
+        commit_lock(replan.ctx) catch |err| {
+            std.debug.print("labelle: rebuild could not commit labelle.lock ({s}); nothing is published\n", .{@errorName(err)});
+            return error.LockCommitFailed;
+        };
+    }
+
+    fn gateBeforeSwitch(ptr: *anyopaque) anyerror!void {
+        const self: *RebuildCtx = @ptrCast(@alignCast(ptr));
+        try self.checkCanceled();
+    }
+
+    fn gateBeforeAdvance(ptr: *anyopaque) anyerror!void {
+        const self: *RebuildCtx = @ptrCast(@alignCast(ptr));
+        try self.commitPoint();
     }
 
     /// One hook phase of a watched rebuild. A failing hook (nonzero exit, or
@@ -270,7 +306,7 @@ pub const RebuildCtx = struct {
         var old_env = saved.env;
         old_env.deinit();
         if (self.replan) |replan| if (replan.commit) |commit| commit(replan.ctx);
-        // The commit moved any staged lock over `labelle.lock`.
+        // The commit point moved any staged lock over `labelle.lock`.
         self.hooks.lock_path = saved.lock_path;
         self.refreshIgnore();
     }
@@ -379,9 +415,15 @@ pub const RebuildCtx = struct {
         if (self.launch_env) |launched| if (!self.hooks.env.sameAs(launched)) {
             return @import("session_key.zig").SessionKey.report("the provider environment");
         };
-        if (self.publish) |p| p.run(p.ctx) catch |err| {
-            std.debug.print("labelle: rebuild could not publish its output ({s}); the last good output stays published\n", .{@errorName(err)});
-            return error.PublishFailed;
+        const p = self.publish orelse return self.commitPoint();
+        p.run(p.ctx, .{ .ctx = self, .before_switch = gateBeforeSwitch, .before_advance = gateBeforeAdvance }) catch |err| switch (err) {
+            // The gate's own verdicts, reported where they were drawn.
+            error.Canceled => return error.Canceled,
+            error.LockCommitFailed => return error.LockCommitFailed,
+            else => {
+                std.debug.print("labelle: rebuild could not publish its output ({s}); the last good output stays published\n", .{@errorName(err)});
+                return error.PublishFailed;
+            },
         };
     }
 
@@ -417,20 +459,31 @@ pub const RebuildCtx = struct {
         }
     }
 
-    /// Recompute the ignore set from the committed prebuild steps, swapping
-    /// it (and moving `epoch`) only when it changed.
+    /// Recompute the ignore set from the committed prebuild steps, and the
+    /// extra watched roots from the committed local providers (cli#474),
+    /// swapping them (and moving `epoch`) only when either changed.
     pub fn refreshIgnore(self: *RebuildCtx) void {
-        var next = watchIgnorePaths(self.allocator, self.project_dir, self.prebuild_steps, self.hooks_enabled);
-        if (sameFiles(self.ignore.files, next.items)) {
-            freePaths(self.allocator, &next);
+        const a = self.allocator;
+        var next = watchIgnorePaths(a, self.project_dir, self.prebuild_steps, self.hooks_enabled);
+        var roots = localProviderRoots(a, self.project_dir, self.hooks.cfg.plugins);
+        if (sameFiles(self.ignore.files, next.items) and sameFiles(self.ignore.roots, roots.items)) {
+            freePaths(a, &next);
+            freePaths(a, &roots);
             return;
         }
-        self.freeIgnore();
-        const owned = next.toOwnedSlice(self.allocator) catch {
-            freePaths(self.allocator, &next);
+        const owned = next.toOwnedSlice(a) catch {
+            freePaths(a, &next);
+            freePaths(a, &roots);
             return;
         };
-        self.ignore = .{ .files = owned, .epoch = self.ignore.epoch + 1 };
+        const owned_roots = roots.toOwnedSlice(a) catch {
+            for (owned) |f| a.free(f);
+            a.free(owned);
+            freePaths(a, &roots);
+            return;
+        };
+        self.freeIgnore();
+        self.ignore = .{ .files = owned, .roots = owned_roots, .epoch = self.ignore.epoch + 1 };
     }
 
     /// Seed the ignore set from the startup steps (epoch unchanged).
@@ -444,6 +497,9 @@ pub const RebuildCtx = struct {
         for (self.ignore.files) |f| self.allocator.free(f);
         if (self.ignore.files.len != 0) self.allocator.free(self.ignore.files);
         self.ignore.files = &.{};
+        for (self.ignore.roots) |r| self.allocator.free(r);
+        if (self.ignore.roots.len != 0) self.allocator.free(self.ignore.roots);
+        self.ignore.roots = &.{};
     }
 
     pub fn deinit(self: *RebuildCtx) void {
@@ -471,6 +527,42 @@ pub fn watchIgnorePaths(allocator: std.mem.Allocator, project_dir: []const u8, s
     var out = collectPrebuildIgnorePaths(allocator, project_dir, steps, hooks_enabled);
     const lock = watch.watchIgnorePath(allocator, project_dir, "labelle.lock") catch return out;
     out.append(allocator, lock) catch allocator.free(lock);
+    return out;
+}
+
+/// The source trees of the project's LOCAL providers (a `local:` or `@`
+/// package with a `plugin.labelle`) that lie outside `project_dir`, as
+/// canonical paths: the watch session watches them too, so an edit to a
+/// provider's hooks or tools rebuilds (cli#474). A provider inside the
+/// project is already walked with it; one whose directory contains the
+/// project is not added (it would walk the project twice). Best effort: a
+/// package that cannot be resolved is not watched. Caller owns the list.
+pub fn localProviderRoots(allocator: std.mem.Allocator, project_dir: []const u8, deps: []const project_config.PluginDep) std.ArrayList([]const u8) {
+    const io = config.globalIo();
+    var out: std.ArrayList([]const u8) = .empty;
+    const project_real = std.Io.Dir.cwd().realPathFileAlloc(io, project_dir, allocator) catch return out;
+    defer allocator.free(project_real);
+    for (deps) |dep| {
+        if (!dep.isLocal()) continue;
+        const declared = plugins.resolvePluginDir(allocator, project_dir, dep) catch continue;
+        defer allocator.free(declared);
+        const dir_z = std.Io.Dir.cwd().realPathFileAlloc(io, declared, allocator) catch continue;
+        defer allocator.free(dir_z);
+        const dir = allocator.dupe(u8, dir_z) catch continue;
+        const keep = blk: {
+            const manifest = std.fs.path.join(allocator, &.{ dir, "plugin.labelle" }) catch break :blk false;
+            defer allocator.free(manifest);
+            std.Io.Dir.cwd().access(io, manifest, .{}) catch break :blk false;
+            if (watch.publish.within(project_real, dir) or watch.publish.within(dir, project_real)) break :blk false;
+            for (out.items) |seen| if (std.mem.eql(u8, seen, dir)) break :blk false;
+            break :blk true;
+        };
+        if (!keep) {
+            allocator.free(dir);
+            continue;
+        }
+        out.append(allocator, dir) catch allocator.free(dir);
+    }
     return out;
 }
 
