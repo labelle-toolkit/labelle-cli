@@ -111,10 +111,17 @@ pub fn problem(allocator: std.mem.Allocator, os: std.Target.Os.Tag, repo: []cons
 }
 
 /// Print `problem` for the host (stderr). A no-op when the pair is usable.
+/// Callers rely on this line having been printed (they report the package
+/// as unusable without repeating why), so the message is built in an
+/// unbounded arena — a long declaration does not outgrow a fixed buffer —
+/// and even an allocation failure prints a plain line naming the values.
 pub fn report(repo: []const u8, version: []const u8) void {
-    var buf: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const msg = (problem(fba.allocator(), builtin.os.tag, repo, version) catch return) orelse return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const msg = problem(arena.allocator(), builtin.os.tag, repo, version) catch {
+        std.debug.print("labelle: package repo '{s}' / version '{s}' cannot be used as a cache path on this OS\n", .{ repo, version });
+        return;
+    } orelse return;
     std.debug.print("labelle: {s}\n", .{msg});
 }
 
@@ -191,4 +198,10 @@ test "plugin_path_key: problem names the field and byte, and suggests the canoni
     try testing.expect(std.mem.indexOf(u8, (try problem(a, .linux, "x\x00y", "1.0.0")).?, "control byte 0x00") != null);
     try testing.expect((try problem(a, .linux, "git+https://github.com/x/y", "1.0.0")) == null);
     try testing.expect((try problem(a, .windows, "github.com/x/y", "1.0.0")) == null);
+
+    // A declaration longer than any small fixed buffer still gets its full
+    // line; `report` builds it in an unbounded arena (PR #505 review).
+    const long_repo = "git+https://github.com/labelle-toolkit/" ++ "x" ** 1200;
+    const long = (try problem(a, .windows, long_repo, "1.0.0")).?;
+    try testing.expect(std.mem.indexOf(u8, long, "Spell it 'github.com/labelle-toolkit/" ++ "x" ** 1200 ++ "'") != null);
 }
