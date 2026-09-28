@@ -72,7 +72,9 @@ const Claimed = struct { file: std.Io.File, took_over: ?u64 };
 fn claim(lock_path: []const u8) !Claimed {
     const io = config.globalIo();
     const file = try openRegular(lock_path);
-    errdefer file.close(io);
+    // The one cleanup of this handle on every error path below (closing
+    // twice could close a descriptor another thread was just handed).
+    errdefer closeClaimed(file);
     const locked = file.tryLock(io, .exclusive) catch |err| switch (err) {
         else => return err,
     };
@@ -85,7 +87,6 @@ fn claim(lock_path: []const u8) !Claimed {
         }
         return error.WatchSessionActive;
     }
-    errdefer file.close(io);
     // The lock is ours: a previous owner, if the file still names one,
     // ended without releasing it (a clean release empties the file).
     var prev: [24]u8 = undefined;
@@ -94,11 +95,26 @@ fn claim(lock_path: []const u8) !Claimed {
     if (took_over) |owner| {
         std.debug.print("labelle: run --watch: taking over a stale watch session lock (pid {d} is gone)\n", .{owner});
     }
+    try rewritePid(file);
+    return .{ .file = file, .took_over = took_over };
+}
+
+fn rewritePid(file: std.Io.File) !void {
+    if (builtin.is_test and test_fail_rewrite) return error.NoSpaceLeft;
+    const io = config.globalIo();
     try file.setLength(io, 0);
     var buf: [32]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "#{d}\n", .{ownPid()});
     try file.writePositionalAll(io, text, 0);
-    return .{ .file = file, .took_over = took_over };
+}
+
+/// Test seams: make the PID rewrite fail, and count claim's cleanups.
+var test_fail_rewrite = false;
+var test_closes: usize = 0;
+
+fn closeClaimed(file: std.Io.File) void {
+    if (builtin.is_test) test_closes += 1;
+    file.close(config.globalIo());
 }
 
 /// Open (or create) `lock_path` for reading and writing, never through a
@@ -245,4 +261,24 @@ test "session lock: a symbolic link or directory at the lock path is refused, an
     try tmp.dir.deleteFile(io, "session.lock");
     try tmp.dir.createDirPath(io, "session.lock");
     try std.testing.expectError(error.WatchLockNotRegular, SessionLock.acquire(a, root));
+}
+
+test "session lock: a failed PID rewrite closes the claimed handle exactly once (cli#476)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const root = try std.fs.path.join(a, &.{ base, "session" });
+    defer a.free(root);
+    test_fail_rewrite = true;
+    const before = test_closes;
+    try std.testing.expectError(error.NoSpaceLeft, SessionLock.acquire(a, root));
+    test_fail_rewrite = false;
+    // One cleanup ran, not two...
+    try std.testing.expectEqual(before + 1, test_closes);
+    // ...and it released the lock: the next session claims it.
+    var next = try SessionLock.acquire(a, root);
+    next.release();
 }

@@ -563,3 +563,79 @@ test "rebuild commit: a prebuild output inside an external local provider is ign
     try tmp.dir.deleteFile(io, "pkg/gen.zig");
     try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEditIgnoring(project, roots.items, ignore.items[0..1], gen));
 }
+
+test "rebuild commit: a project reached through a link watches the providers beside its real path (cli#476)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // links need a privilege there
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/project");
+    try tmp.dir.createDirPath(io, "real/pkg");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pkg/plugin.labelle", .data = ".{}" });
+    // The project, as the user reaches it: `elsewhere/link`. Lexically,
+    // `local:../pkg` from there is `elsewhere/pkg`, which does not exist;
+    // discovery resolves it from the real path, `real/pkg`.
+    try tmp.dir.symLink(io, "../real/project", "elsewhere/link", .{ .is_directory = true });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const link = try std.fs.path.join(a, &.{ base, "elsewhere", "link" });
+    defer a.free(link);
+    const pkg = try tmp.dir.realPathFileAlloc(io, "real/pkg", a);
+    defer a.free(pkg);
+    const deps = [_]project_config.PluginDep{.{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" }};
+    var roots = rebuild.localProviderRoots(a, link, &deps);
+    defer freeRoots(a, &roots);
+    try std.testing.expectEqual(@as(usize, 1), roots.items.len);
+    try std.testing.expectEqualStrings(pkg, roots.items[0]);
+}
+
+test "rebuild commit: a newly declared provider whose manifest fails the replan is still watched (cli#476)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    ctx.initIgnore();
+    try std.testing.expectEqual(@as(usize, 1), ctx.ignore.roots.len);
+    const epoch = ctx.ignore.epoch;
+
+    // The edit declares a second external provider whose manifest is
+    // broken: the replan fails and nothing of it is committed...
+    try fx.tmp.dir.createDirPath(io, "ext");
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "ext/plugin.labelle", .data = ".{ this is not zon" });
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" }, .{ .name = \"ext\", .repo = \"local:../ext\", .version = \"1.0.0\" } } }" });
+    Publish.reset();
+    if (ctx.rebuildStaged()) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), Publish.count);
+    try std.testing.expectEqual(@as(usize, 1), site.cfg.plugins.len);
+    // ...but its tree joins the watch set.
+    const ext = try fx.tmp.dir.realPathFileAlloc(io, "ext", a);
+    defer a.free(ext);
+    try std.testing.expectEqual(@as(usize, 2), ctx.ignore.roots.len);
+    try std.testing.expect(ctx.ignore.epoch != epoch);
+    var watched = false;
+    for (ctx.ignore.roots) |r| watched = watched or std.mem.eql(u8, r, ext);
+    try std.testing.expect(watched);
+    // Fixing the manifest is a watched change: it fires a rebuild. With
+    // only the committed roots, the same fix fired nothing.
+    const manifest = try std.fs.path.join(a, &.{ ext, "plugin.labelle" });
+    defer a.free(manifest);
+    try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEditIgnoring(fx.project, ctx.ignore.roots, ctx.ignore.files, manifest));
+    var committed = rebuild.localProviderRoots(a, fx.project, fx.cfg.plugins);
+    defer freeRoots(a, &committed);
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "ext/plugin.labelle", .data = ".{ still not zon" });
+    try std.testing.expectEqual(@as(u32, 0), try rebuildsAfterEditIgnoring(fx.project, committed.items, ctx.ignore.files, manifest));
+}

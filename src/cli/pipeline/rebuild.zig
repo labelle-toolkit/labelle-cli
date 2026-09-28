@@ -301,6 +301,7 @@ pub const RebuildCtx = struct {
             self.hooks.env.deinit();
             self.restore(saved);
             if (self.replan) |replan| if (replan.rollback) |rollback| rollback(replan.ctx);
+            self.watchDeclaredRoots();
             return err;
         };
         var old_env = saved.env;
@@ -463,9 +464,14 @@ pub const RebuildCtx = struct {
     /// extra watched roots from the committed local providers (cli#474),
     /// swapping them (and moving `epoch`) only when either changed.
     pub fn refreshIgnore(self: *RebuildCtx) void {
+        self.refreshIgnoreFor(self.hooks.cfg.plugins);
+    }
+
+    /// `refreshIgnore`, with the extra roots drawn from `deps`.
+    fn refreshIgnoreFor(self: *RebuildCtx, deps: []const project_config.PluginDep) void {
         const a = self.allocator;
         var next = watchIgnorePaths(a, self.project_dir, self.prebuild_steps, self.hooks_enabled);
-        var roots = localProviderRoots(a, self.project_dir, self.hooks.cfg.plugins);
+        var roots = localProviderRoots(a, self.project_dir, deps);
         if (sameFiles(self.ignore.files, next.items) and sameFiles(self.ignore.roots, roots.items)) {
             freePaths(a, &next);
             freePaths(a, &roots);
@@ -484,6 +490,20 @@ pub const RebuildCtx = struct {
         };
         self.freeIgnore();
         self.ignore = .{ .files = owned, .roots = owned_roots, .epoch = self.ignore.epoch + 1 };
+    }
+
+    /// After a FAILED rebuild: watch, besides the committed local providers,
+    /// the ones `project.labelle` declares now (watch-only; nothing else of
+    /// the failed replan survives). A newly added external provider whose
+    /// manifest broke the replan is then watched, so fixing it rebuilds
+    /// (cli#476). Best effort: an unreadable project keeps the set.
+    fn watchDeclaredRoots(self: *RebuildCtx) void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const declared = config.readProjectConfig(sa, self.project_dir) catch return;
+        const both = std.mem.concat(sa, project_config.PluginDep, &.{ self.hooks.cfg.plugins, declared.plugins }) catch return;
+        self.refreshIgnoreFor(both);
     }
 
     /// Seed the ignore set from the startup steps (epoch unchanged).
@@ -553,7 +573,11 @@ pub fn localProviderRoots(allocator: std.mem.Allocator, project_dir: []const u8,
     defer for (candidates.items) |c| allocator.free(c);
     for (deps) |dep| {
         if (!dep.isLocal()) continue;
-        const declared = plugins.resolvePluginDir(allocator, project_dir, dep) catch continue;
+        // Against the project's REAL path, as provider discovery resolves
+        // it (`provider_dispatch` passes the canonical project root): a
+        // project reached through a link must watch the provider the build
+        // uses, not the link's lexical neighbour (cli#476).
+        const declared = plugins.resolvePluginDir(allocator, project_real, dep) catch continue;
         defer allocator.free(declared);
         const dir_z = std.Io.Dir.cwd().realPathFileAlloc(io, declared, allocator) catch continue;
         defer allocator.free(dir_z);
