@@ -676,9 +676,12 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     // reaches every provider hook and command, the way it reaches the
     // `.prebuild` steps (`pipeline/install.wirePrebuildPython`), so a
     // machine whose only Python is the managed one runs a provider tool
-    // that spawns `python3`. A no-op when none is provisioned, or when its
-    // directory is already on PATH; before the environment snapshot below.
-    python_provision.autoWireEnv(a);
+    // that spawns `python3`. Only an interpreter that actually runs
+    // (`managedPythonOk`): a partial or broken install left on disk must not
+    // shadow a working system Python. A no-op when none is provisioned, or
+    // when its directory is already on PATH; before the environment
+    // snapshot below.
+    if (python_provision.managedPythonOk(a)) python_provision.autoWireEnv(a);
     var env = try runner.buildZigEnv(a, &.{});
     defer env.deinit();
     // Keep relative LABELLE_HOME stable when child cwd changes to the package.

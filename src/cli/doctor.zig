@@ -121,7 +121,14 @@ fn writeJsonReport(w: *std.Io.Writer, a: std.mem.Allocator, zig_check: Check, py
             .items = &items,
         },
     };
-    try provider_doctor_json.write(w, try provider_doctor_json.aggregate(a, &caps, providers));
+    const merged = try provider_doctor_json.aggregate(a, &caps, providers);
+    // The stderr summary is derived from the merged document, so the two
+    // cannot disagree (RFC cli#466 D7).
+    var err_buf: [1024]u8 = undefined;
+    var err_w = std.Io.File.stderr().writerStreaming(config.globalIo(), &err_buf);
+    try provider_doctor_json.printSummary(&err_w.interface, merged);
+    try err_w.interface.flush();
+    try provider_doctor_json.write(w, merged.capabilities);
 }
 
 pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {

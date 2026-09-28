@@ -335,23 +335,28 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
 
     # A valid report and an invalid one: the valid capability is kept as the
     # provider wrote it; the invalid one is a failed capability under the
-    # provider's namespace, carrying the error. `--json` reached both.
+    # synthetic id `provider:<package>`, carrying the error. `--json` reached
+    # both.
     caps, ids, mixed = report(capability("alpha-cap") + "\n", "{not json")
-    assert ids == [core_id, "alpha-cap", "beta"], (ids, mixed.stdout, mixed.stderr)
+    assert ids == [core_id, "alpha-cap", "provider:beta-pkg"], (ids, mixed.stdout, mixed.stderr)
     assert caps["alpha-cap"]["ok"] is True and caps["alpha-cap"]["items"][0]["detail"] == "probe", caps
-    beta = caps["beta"]
+    beta = caps["provider:beta-pkg"]
     assert beta["ok"] is False and beta["required"] is True, beta
     assert "not one capability object" in beta["items"][0]["detail"] and "beta-pkg" in beta["items"][0]["name"], beta
     assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (runs[0] + 1, runs[1] + 1)
     for package in ("alpha-pkg", "beta-pkg"):
         assert json.loads((outputs / package / "capture.json").read_text())["args"] == ["--json"], package
-    # The human report still goes to stderr.
-    assert "labelle alpha doctor" in mixed.stderr and "Provider doctors: 2 checked" in mixed.stderr, mixed.stderr
-    # ...and agrees with the document: beta exited 0, but its report is
-    # invalid, so the summary counts it as failed.
-    assert "[ FAIL ] labelle beta doctor printed an invalid --json report" in mixed.stderr, mixed.stderr
-    assert "Provider doctors: 2 checked, 1 failed (beta)" in mixed.stderr, mixed.stderr
-    assert "[  OK  ] labelle alpha doctor" in mixed.stderr, mixed.stderr
+    # The stderr summary is derived from the document: beta exited 0, but
+    # its report is invalid, so it counts as failed.
+    assert "labelle alpha doctor" in mixed.stderr, mixed.stderr
+    assert "[  OK  ] alpha-cap ('alpha-pkg')" in mixed.stderr, mixed.stderr
+    assert "[ FAIL ] provider:beta-pkg ('beta-pkg')" in mixed.stderr, mixed.stderr
+    assert "Provider capabilities: 2 reported, 1 failed (provider:beta-pkg)" in mixed.stderr, mixed.stderr
+    assert "Provider doctors: 2 checked" not in mixed.stderr, mixed.stderr
+    # A valid report saying `"ok": false` fails the summary too, exit 0 or not.
+    caps, ids, unhappy = report(capability("alpha-cap", ok=False), capability("beta-cap"))
+    assert caps["alpha-cap"]["ok"] is False, caps
+    assert "Provider capabilities: 2 reported, 1 failed (alpha-cap)" in unhappy.stderr, unhappy.stderr
 
     # A provider tool whose BUILD prints on stdout: in `--json` mode that
     # text goes to stderr, and stdout stays the one document. The control
@@ -367,22 +372,34 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     # A provider that fails after a report claiming ok, beside one that
     # prints nothing: both are failed capabilities, and the document stands.
     caps, ids, _ = report(capability("alpha-cap"), None, extra_env={"PROVIDER_PROBE_FAIL_PACKAGE": "alpha-pkg"})
-    assert ids == [core_id, "alpha-cap", "beta"], ids
+    assert ids == [core_id, "alpha-cap", "provider:beta-pkg"], ids
     assert caps["alpha-cap"]["ok"] is False, caps
     assert caps["alpha-cap"]["items"][-1]["detail"] == "exited 7 although its report says ok", caps
-    assert caps["beta"]["ok"] is False and "printed nothing" in caps["beta"]["items"][0]["detail"], caps
+    assert caps["provider:beta-pkg"]["ok"] is False and "printed nothing" in caps["provider:beta-pkg"]["items"][0]["detail"], caps
 
     # Two providers reporting one id: a single failed entry naming both.
-    caps, ids, _ = report(capability("shared-cap"), capability("shared-cap"))
+    caps, ids, dup_run = report(capability("shared-cap"), capability("shared-cap"))
     assert ids == [core_id, "shared-cap"], ids
     dup = caps["shared-cap"]
     assert dup["ok"] is False, dup
     assert "'alpha-pkg' and 'beta-pkg'" in dup["items"][0]["detail"], dup
+    # ...and the summary, computed after the merge, fails it too.
+    assert "Provider capabilities: 1 reported, 1 failed (shared-cap)" in dup_run.stderr, dup_run.stderr
 
     # A provider reporting the core's id owns it: the core's entry gives way.
     caps, ids, _ = report(capability(core_id), capability("beta-cap"))
     assert ids == [core_id, "beta-cap"], ids
     assert caps[core_id]["items"][0]["detail"] == "probe", caps[core_id]
+    # A declared package named like the core's capability id that never ran
+    # (remote, unpinned, not installed: a WARN) cannot displace the core's
+    # entry: its synthetic id is namespaced.
+    write_project([f'.{{ .name = "{core_id}", .repo = "example/{core_id}", .version = "1.0.0" }}'])
+    caps, ids, shadow = report(capability("alpha-cap"), capability("beta-cap"))
+    assert ids == [core_id, "alpha-cap", "beta-cap", f"provider:{core_id}"], ids
+    assert caps[core_id]["items"] and caps[core_id]["items"][0]["id"] != "provider-doctor", caps[core_id]
+    assert caps[f"provider:{core_id}"]["required"] is False, caps
+    assert f"1 warning(s) (provider:{core_id})" in shadow.stderr, shadow.stderr
+    write_project()
     # Outside a project the document is the core's alone.
     lone_json = run("--json", cwd=outside)
     assert [c["id"] for c in json.loads(lone_json.stdout)["capabilities"]] == [core_id], lone_json.stdout

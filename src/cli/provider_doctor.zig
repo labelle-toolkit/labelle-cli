@@ -24,7 +24,6 @@ const project = @import("project_config.zig");
 const manifest = @import("provider_manifest.zig");
 const dispatch = @import("provider_dispatch.zig");
 const github = @import("provider_github.zig");
-const provider_doctor_json = @import("provider_doctor_json.zig");
 
 /// The command a provider declares to take part.
 pub const command_name = "doctor";
@@ -149,12 +148,9 @@ pub const Outcome = struct {
     /// What the tool printed on stdout, when the run captured it
     /// (`labelle doctor --json`: `provider_doctor_json.zig` reads it).
     stdout: ?[]const u8 = null,
-    /// Why the captured stdout is not a valid capability object (`--json`),
-    /// when it is not: a doctor that exits 0 with an invalid report failed.
-    invalid_report: ?[]const u8 = null,
 
     pub fn ok(self: Outcome) bool {
-        return (self.code == 0 and self.invalid_report == null) or self.warning;
+        return self.code == 0 or self.warning;
     }
 };
 
@@ -210,21 +206,18 @@ pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
                 var stdout: ?[]const u8 = null;
                 const code = runner.run(step, &stdout) catch |err|
                     break :blk .{ .label = step.label, .package = step.package, .code = null, .err = err };
-                // A captured report (`--json`) is judged as the document
-                // will judge it, so the summary and the document agree.
-                const invalid: ?[]const u8 = if (stdout) |bytes| switch (try provider_doctor_json.validate(a, bytes)) {
-                    .capability => null,
-                    .invalid => |why| why,
-                } else null;
-                break :blk .{ .label = step.label, .package = step.package, .code = code, .stdout = stdout, .invalid_report = invalid };
+                break :blk .{ .label = step.label, .package = step.package, .code = code, .stdout = stdout };
             },
         };
         switch (step.action) {
             .unavailable, .unverified => {},
-            .run => if (outcome.code) |code| {
-                if (code == 0 and outcome.invalid_report != null) {
-                    std.debug.print("  [ FAIL ] labelle {s} {s} printed an invalid --json report: {s}\n", .{ step.label, command_name, outcome.invalid_report.? });
-                } else if (code == 0) {
+            // A captured report (`--json`) is judged only once, in the
+            // merged document, and the stderr summary is derived from that
+            // (`provider_doctor_json.printSummary`): no verdict here.
+            .run => if (outcome.stdout != null) {
+                std.debug.print("  (report captured; its verdict is in the capability summary)\n", .{});
+            } else if (outcome.code) |code| {
+                if (code == 0) {
                     std.debug.print("  [  OK  ] labelle {s} {s}\n", .{ step.label, command_name });
                 } else {
                     std.debug.print("  [ FAIL ] labelle {s} {s} exited {d}\n", .{ step.label, command_name, code });
@@ -328,7 +321,9 @@ pub fn printOutsideProject(start: []const u8) void {
 /// The provider part of `labelle doctor` for the project at `root` (the
 /// canonical project root the core checks used too). `json`: each provider
 /// doctor runs with `--json` and its stdout is captured on its outcome
-/// (`DispatchRunner.json`); the human report still goes to stderr.
+/// (`DispatchRunner.json`), and the closing summary is left to the caller,
+/// which derives it from the merged document
+/// (`provider_doctor_json.printSummary`); the headers still go to stderr.
 pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, json: bool) !Report {
     // The report outlives this call; its strings live in `allocator`'s arena
     // owned by the caller.
@@ -368,7 +363,7 @@ pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, json: bool) !R
         .json = json,
     });
     if (mapping) |outcome| report.outcomes = try std.mem.concat(a, Outcome, &.{ &.{outcome}, report.outcomes });
-    printSummary(report);
+    if (!json) printSummary(report);
     return report;
 }
 
@@ -742,26 +737,18 @@ test "provider doctor: one host resolution per doctor, failure included, and eve
     for (report.outcomes) |outcome| try testing.expectEqual(@as(?anyerror, error.ProbeOffline), outcome.err);
 }
 
-test "provider doctor: in --json mode an exit-0 doctor with an invalid report counts as failed" {
+test "provider doctor: a captured report is kept on its outcome for the merged document" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const providers = [_]dispatch.Provider{
         fake("a-pkg", "alpha", &.{cmd("doctor", "bin/a")}),
         fake("b-pkg", "beta", &.{cmd("doctor", "bin/b")}),
-        fake("c-pkg", "gamma", &.{cmd("doctor", "bin/c")}),
     };
     const p = try plan(a, &providers, &.{}, &.{}, &.{}, &.{});
     var calls: std.ArrayList([]const u8) = .empty;
-    const report = try execute(a, p, Recorder{ .a = a, .calls = &calls, .stdouts = &.{
-        .{ "alpha", "{\"id\":\"cap\",\"required\":true,\"ok\":true,\"items\":[]}" },
-        .{ "beta", "{not json" },
-    } });
-    // alpha: a valid report; beta: exit 0 with an invalid one; gamma: not
-    // captured (the human mode), judged by its exit code alone.
-    try testing.expect(report.outcomes[0].ok());
-    try testing.expect(!report.outcomes[1].ok());
-    try testing.expect(report.outcomes[1].invalid_report != null);
-    try testing.expect(report.outcomes[2].ok() and report.outcomes[2].invalid_report == null);
-    try testing.expectEqual(@as(usize, 1), report.failed());
+    const report = try execute(a, p, Recorder{ .a = a, .calls = &calls, .stdouts = &.{.{ "alpha", "{not json" }} });
+    try testing.expectEqualStrings("{not json", report.outcomes[0].stdout.?);
+    // Not captured: the human mode, judged by the exit code.
+    try testing.expect(report.outcomes[1].stdout == null and report.outcomes[1].ok());
 }

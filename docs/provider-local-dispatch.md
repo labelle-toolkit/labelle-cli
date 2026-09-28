@@ -162,17 +162,20 @@ declare no `doctor` command.
   prints one document, `{"capabilities":[...]}`. A provider prints one
   capability object, `{"id","required","ok","items":[{"id","name","ok",
   "fixable","size_mb","action","detail","hint"}]}` (unknown keys ignored). The
-  core's own capabilities come first, minus any whose id a provider reports
-  (the provider owns it), then one entry per provider id. Two providers
-  reporting one id become a single failed entry naming both. A doctor that
-  cannot run, fails without a valid object, or prints something else becomes a
-  failed capability under the provider's namespace carrying the error; a valid
-  object from a doctor that exited non-zero is kept with `ok: false`. The exit
-  status stays 0: the verdict is in the document. `--core-only` still skips
-  the providers.
+  core's own capabilities come first, minus any whose id a VALID provider
+  report claims (the provider owns it), then one entry per provider id. Two
+  providers reporting one id become a single failed entry naming both. A
+  doctor that cannot run, fails without a valid object, or prints something
+  else becomes a failed capability with the synthetic id `provider:<package>`
+  carrying the error (it never replaces a core capability); a valid object
+  from a doctor that exited non-zero is kept with `ok: false`. The stderr
+  summary (`Provider capabilities: N reported, M failed`) is derived from the
+  merged document, so the two agree. The exit status stays 0: the verdict is
+  in the document. `--core-only` still skips the providers.
 - Every provider command and hook runs with the managed interpreter
-  (`labelle install python`) on PATH when one is provisioned (RFC cli#466 D2),
-  as the `.prebuild` steps do.
+  (`labelle install python`) on PATH when one is provisioned and runs
+  (RFC cli#466 D2), as the `.prebuild` steps do; a broken install is not
+  wired, so it cannot shadow a system Python.
 
 Nothing in the core names a provider: who takes part comes from the manifests.
 

@@ -1024,19 +1024,58 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     hook_seen, command_seen, text = which_seen()
     assert hook_seen["which"] is None and command_seen["which"] is None, (hook_seen, command_seen)
     assert "using provisioned Python" not in text, text
+    # The wiring only takes an interpreter that RUNS (`--version`), so the
+    # stand-in must be a working one: a wrapper script on POSIX; on Windows
+    # the interpreter with the DLLs beside it.
     managed_bin = home / "python" if os.name == "nt" else home / "python" / "bin"
-    managed_bin.mkdir(parents=True)
     interpreter = managed_bin / ("python.exe" if os.name == "nt" else "python3")
-    if os.name == "nt":
-        shutil.copy(sys.executable, interpreter)
-    else:
-        interpreter.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-        interpreter.chmod(0o755)
+
+    def install_managed(working):
+        shutil.rmtree(home / "python", ignore_errors=True)
+        managed_bin.mkdir(parents=True)
+        if not working:
+            # On disk, but it does not run.
+            if os.name == "nt":
+                interpreter.write_bytes(b"not an interpreter\n")
+            else:
+                interpreter.write_text("#!/bin/sh\nexit 1\n")
+                interpreter.chmod(0o755)
+            return
+        if os.name == "nt":
+            base_dir = Path(sys.executable).parent
+            shutil.copy(sys.executable, interpreter)
+            for dll in base_dir.glob("*.dll"):
+                shutil.copy(dll, managed_bin / dll.name)
+        else:
+            interpreter.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+            interpreter.chmod(0o755)
+        probe = subprocess.run([str(interpreter), "--version"], capture_output=True, text=True)
+        assert probe.returncode == 0, (probe.returncode, probe.stdout, probe.stderr)
+
+    install_managed(True)
     hook_seen, command_seen, text = which_seen()
     for seen in (hook_seen, command_seen):
         assert same_dir(seen["path_head"], managed_bin), seen
         assert seen["which"] and same_dir(os.path.dirname(seen["which"]), managed_bin), seen
     assert "using provisioned Python" in text, text
+    # A BROKEN managed install (on disk, but `--version` fails) must not
+    # shadow a working system Python: PATH carries one, and both the hook
+    # and the command still resolve it.
+    install_managed(False)
+    system_bin = base / "system-python-bin"
+    if os.name == "nt":
+        system_bin = Path(sys.executable).parent
+    else:
+        system_bin.mkdir(exist_ok=True)
+        system_python = system_bin / "python3"
+        system_python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        system_python.chmod(0o755)
+    which_env = dict(which_env, PATH=str(system_bin) + os.pathsep + scrubbed)
+    hook_seen, command_seen, text = which_seen()
+    for seen in (hook_seen, command_seen):
+        assert not same_dir(seen["path_head"], managed_bin), seen
+        assert seen["which"] and same_dir(os.path.dirname(seen["which"]), system_bin), seen
+    assert "using provisioned Python" not in text, text
     shutil.rmtree(home / "python")
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     declare(dep_b, dep_a)
