@@ -105,7 +105,7 @@ pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cf
             });
             // Only when set, so every lock written before assembler#771
             // stays byte-identical.
-            if (plugin.subdir.len > 0) try w.print(", .subdir = \"{s}\"", .{plugin.subdir});
+            if (plugin.subdir.len > 0) try w.print(", .subdir = \"{f}\"", .{std.zig.fmtString(plugin.subdir)});
             try w.writeAll(" },\n");
         }
         try w.writeAll("    },\n");

@@ -54,6 +54,10 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     }
     const doc = try registry.parse(a, metadata);
     const cfg = try config.readProjectConfigQuiet(a, root);
+    // The lock pins COMMITTED declarations: an `install plugin` override
+    // (assembler#772) is this machine's temporary state, so a provider under
+    // one is pinned by its retained repo/version, exactly as after --unlink.
+    @import("../plugin_slot.zig").clearOverrides(cfg);
     var selected: std.ArrayList(Pin) = .empty;
     for (cfg.plugins, 0..) |dep, i| {
         for (cfg.plugins[0..i]) |prev| if (std.mem.eql(u8, dep.name, prev.name)) return error.DuplicateProjectPlugin;
@@ -64,6 +68,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
             if (!std.mem.eql(u8, pin.package, dep.name)) continue;
             known = true;
             if (!pin.matches(dep)) continue;
+            // Same refusal as `Sources.projectDir`, before any preview or
+            // download: pin verification reads the archive ROOT.
+            if (dep.subdir.len > 0) {
+                std.debug.print("labelle: provider '{s}' declares `.subdir = \"{s}\"`; integrity-pinned providers do not support `.subdir` yet\n", .{ dep.name, dep.subdir });
+                return error.ProviderSubdirUnsupported;
+            }
             try selected.append(a, pin);
             found = true;
             std.debug.print("  {s} {s}: {s}@{s}\n    sha256 {s}\n    {s}\n", .{ pin.package, pin.version, pin.repo, pin.commit, pin.sha256, try pin.archiveUrl(a) });

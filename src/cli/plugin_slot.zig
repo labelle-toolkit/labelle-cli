@@ -39,6 +39,12 @@ pub fn resolveRemotePlugin(allocator: std.mem.Allocator, dep: project_config.Plu
     return std.fs.path.join(allocator, &.{ packages_dir, "plugins", dep.repo, dep.version, sub });
 }
 
+/// Undo `applyOverrides`: every dep back to its committed declaration.
+/// For the commands whose output is committed (`providers resolve`).
+pub fn clearOverrides(cfg: project_config.ProjectConfig) void {
+    for (@constCast(cfg.plugins)) |*dep| dep.cli_override_source = null;
+}
+
 /// Mark every remote `.plugins` entry that has an active explicit override
 /// as local to its checkout. `cfg.plugins` is the parser's own allocation,
 /// so the entries are updated in place; the source string is allocated with
@@ -209,6 +215,9 @@ test "plugin slot: an EXPLICIT override wins, a discovered one or a dead source 
     const plugin_dir = try @import("plugins.zig").resolvePluginDir(a, root, deps[0]);
     defer a.free(plugin_dir);
     try testing.expectEqualStrings(checkout, plugin_dir);
+    // Committed-output commands see the declaration again.
+    clearOverrides(.{ .name = "g", .plugins = &deps });
+    try testing.expect(!deps[0].isLocal());
 
     // A discovered slot is the assembler's monorepo business, not ours.
     const discovered = try std.fmt.allocPrint(a, "source = {s}\nmode = discovered\n", .{checkout});
