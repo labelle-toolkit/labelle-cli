@@ -608,6 +608,13 @@ test {
     @import("zspec").runAll(@This());
 }
 
+// Generic watch-session modules (RFC cli#466 A2): referenced so their
+// tests run.
+test {
+    _ = @import("cli/supervise.zig");
+    _ = @import("cli/watch.zig");
+}
+
 // `labelle init` stamps the running CLI as `--labelle-version`.
 pub const InitCliVersionSpec = init.InitCliVersionSpec;
 

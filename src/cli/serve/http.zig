@@ -2,7 +2,7 @@
 //! hardening, root-shell lookup, MIME types, and the live-reload endpoint
 //! and client injection used under `--watch`.
 const std = @import("std");
-const WatchState = @import("watch.zig").WatchState;
+const WatchState = @import("../watch/loop.zig").WatchState;
 const testBindFreePort = @import("testing.zig").testBindFreePort;
 
 /// Extension → Content-Type. WASM and JS are the load-bearing ones:

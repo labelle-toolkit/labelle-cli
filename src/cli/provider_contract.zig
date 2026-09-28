@@ -23,6 +23,9 @@ pub const run_context_since = "1.2.0";
 /// The first wire version that carries `cache_dir` and `env_file`.
 pub const toolchain_context_since = "1.3.0";
 
+/// The first wire version whose `run` context carries `watch`.
+pub const watch_context_since = "1.3.0";
+
 fn atLeast(wire_version: []const u8, since: []const u8) bool {
     const wire = std.SemanticVersion.parse(wire_version) catch return false;
     const floor = std.SemanticVersion.parse(since) catch unreachable;
@@ -44,6 +47,12 @@ pub fn carriesRunContext(wire_version: []const u8) bool {
 /// `env_file` keys (on every context).
 pub fn carriesToolchainContext(wire_version: []const u8) bool {
     return atLeast(wire_version, toolchain_context_since);
+}
+
+/// True when the wire `contract_version`'s `run` context carries the
+/// `watch` key (null outside a watch session).
+pub fn carriesWatchContext(wire_version: []const u8) bool {
+    return atLeast(wire_version, watch_context_since);
 }
 
 /// The hook slots whose context names an `env_file` (wire `1.3.0`+): the
@@ -94,9 +103,28 @@ pub const RunEnv = struct {
     value: []const u8,
 };
 
+/// A watch session (`labelle run --watch`, wire `1.3.0`+), handed to the
+/// run replacement only. Both paths are absolute. `output_dir` names the
+/// last successfully built output, switched atomically to each new
+/// publication; `generation_file` holds that publication's number (ASCII
+/// decimal and a newline, 0 first), advanced only AFTER `output_dir` was
+/// switched. A consumer polls the generation and re-resolves `output_dir`
+/// once it changes.
+pub const WatchContext = struct {
+    generation_file: []const u8,
+    output_dir: []const u8,
+
+    pub fn validate(self: WatchContext) !void {
+        try absolute(self.generation_file);
+        try absolute(self.output_dir);
+    }
+};
+
 /// The `labelle run` options a `run`-step hook receives (wire `1.2.0`+).
 /// Every key is required; `timeout_ms` is null when `--timeout` was not
-/// given.
+/// given. `watch` (wire `1.3.0`+) is required there too: null outside a
+/// watch session and on every hook but the replacement; absent below
+/// `1.3.0`.
 pub const RunContext = struct {
     /// The run options as `LABELLE_*` variables, in the order the core
     /// launch sets them. Empty when none was given.
@@ -105,6 +133,8 @@ pub const RunContext = struct {
     args: []const []const u8,
     /// `--timeout`, in milliseconds.
     timeout_ms: ?u64,
+    /// The watch session, on the run replacement of `labelle run --watch`.
+    watch: ?WatchContext = null,
 
     /// Whether the user passed any run option at all.
     pub fn given(self: RunContext) bool {
@@ -122,6 +152,24 @@ pub const RunContext = struct {
         for (self.args) |arg| {
             if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidRunArgument;
         }
+        if (self.watch) |w| try w.validate();
+    }
+
+    /// The object on `wire`: `watch` written (null or not) from `1.3.0`,
+    /// never below.
+    fn write(self: RunContext, jws: anytype, wire: []const u8) !void {
+        try jws.beginObject();
+        try jws.objectField("env");
+        try jws.write(self.env);
+        try jws.objectField("args");
+        try jws.write(self.args);
+        try jws.objectField("timeout_ms");
+        try jws.write(self.timeout_ms);
+        if (carriesWatchContext(wire)) {
+            try jws.objectField("watch");
+            try jws.write(self.watch);
+        }
+        try jws.endObject();
     }
 };
 
@@ -234,6 +282,12 @@ pub const Context = struct {
         if (self.run) |run| {
             if (!run_hook) return error.InvalidInvocation;
             try run.validate();
+            if (run.watch != null) {
+                // A `1.2.0` strict decoder rejects the key.
+                if (!carriesWatchContext(self.contract_version)) return error.UnsupportedContract;
+                // Only the replacement is the session's long-lived launch.
+                if (self.invocation.phase != .replace) return error.WatchNotAllowed;
+            }
         } else if (run_hook) return error.MissingRunContext;
         if (!carriesToolchainContext(self.contract_version)) return;
         try absolute(self.cache_dir orelse return error.MissingCacheDir);
@@ -264,7 +318,9 @@ pub const Context = struct {
                 true;
             if (write) {
                 try jws.objectField(field.name);
-                try jws.write(value);
+                if (comptime std.mem.eql(u8, field.name, "run")) {
+                    try value.?.write(jws, self.contract_version);
+                } else try jws.write(value);
             }
         }
         try jws.endObject();
@@ -306,6 +362,12 @@ fn keyPresence(allocator: std.mem.Allocator, bytes: []const u8, wire: []const u8
     for ([_][]const u8{ "build_number", "run" }) |key| {
         if (object.get(key)) |value| if (value == .null) return error.NullOptionalKey;
     }
+    // `run.watch`: required (possibly null) from `1.3.0`, absent below.
+    if (object.get("run")) |run| if (run == .object) {
+        if (carriesWatchContext(wire)) {
+            if (!run.object.contains("watch")) return error.MissingField;
+        } else if (run.object.contains("watch")) return error.UnknownField;
+    };
 }
 
 /// A named install-only build step produces this exact host executable.
@@ -435,7 +497,11 @@ pub fn windowsVolumeQualified(path: []const u8) bool {
     return rest.next() != null;
 }
 
-const fixture = if (@import("builtin").os.tag == .windows)
+test {
+    _ = @import("provider_contract_watch_test.zig");
+}
+
+pub const fixture = if (@import("builtin").os.tag == .windows)
     @embedFile("provider_contract/projectless-windows.json")
 else
     @embedFile("provider_contract/projectless.json");
@@ -657,7 +723,7 @@ test "a 1.0.0 context never carries build_number; every wire otherwise validates
 }
 
 /// A project hook context on `wire` for `step`, from the projectless fixture.
-fn hookContext(base: Context, wire: []const u8, step: Step) Context {
+pub fn hookContext(base: Context, wire: []const u8, step: Step) Context {
     var value = base;
     value.contract_version = wire;
     value.project_dir = value.package_dir;

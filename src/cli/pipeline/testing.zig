@@ -12,10 +12,26 @@ pub fn testSite(a: std.mem.Allocator, project: []const u8) provider_hooks.Site {
         .providers = &.{},
         .root = project,
         .cfg = .{ .name = "game" },
-        .target = "wasm",
+        .target = "probe-target",
         .target_dir = project,
         .optimize = .ReleaseSafe,
         .progress = .off,
         .reporter = null,
     };
+}
+
+/// An executable that ignores its arguments and exits 0, written into
+/// `dir`: an assembler and a compiler under which a whole rebuild
+/// succeeds. POSIX only (a shell script); caller frees the path.
+pub fn okTool(a: std.mem.Allocator, dir: std.Io.Dir) ![:0]u8 {
+    return exitTool(a, dir, "ok-tool", 0);
+}
+
+/// `okTool` exiting `code` instead: a compile that fails.
+pub fn exitTool(a: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, code: u8) ![:0]u8 {
+    const io = @import("../config.zig").globalIo();
+    var buf: [64]u8 = undefined;
+    const script = try std.fmt.bufPrint(&buf, "#!/bin/sh\nexit {d}\n", .{code});
+    try dir.writeFile(io, .{ .sub_path = name, .data = script, .flags = .{ .permissions = .executable_file } });
+    return dir.realPathFileAlloc(io, name, a);
 }

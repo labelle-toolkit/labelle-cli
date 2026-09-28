@@ -167,6 +167,7 @@ pub fn discoverAndPlan(
     project_dir: []const u8,
     project_root: []const u8,
     command: args_mod.Command,
+    watch: bool,
     parsed: project_config.ProjectConfig,
     requested_target: []const u8,
     reporter: ?*progress.Reporter,
@@ -236,6 +237,14 @@ pub fn discoverAndPlan(
         std.debug.print("labelle: target '{s}' has no run replacement; package '{s}' must declare a `.when = .replace` hook on `run`\n", .{ target.name, target.providerName() });
         return error.NoRunReplacement;
     }
+
+    // `labelle run --watch` (RFC cli#466 §3.4) needs a watch-capable run
+    // replacement speaking wire 1.3.0+: refused HERE, before the lock,
+    // generation or any compiler (`watch_session.refusal`).
+    if (watch) if (@import("watch_session.zig").refusal(target.name, hook_plans.run)) |why| {
+        if (reporter) |r| r.finishFailed(1, why.detail());
+        return .{ .exit = 1 };
+    };
 
     // Plugin→core compatibility, the POST-RESOLVE half (#332).
     //

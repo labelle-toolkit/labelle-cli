@@ -338,7 +338,11 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     const output = try dispatch.canonicalDir(a, output_dir);
     const target_dir = try dispatch.canonicalDir(a, site.target_dir);
     const no_run_options: contract.RunContext = .{ .env = &.{}, .args = &.{}, .timeout_ms = null };
-    const run_options: ?contract.RunContext = if (step == .run) site.run_options orelse no_run_options else null;
+    var run_options: ?contract.RunContext = if (step == .run) site.run_options orelse no_run_options else null;
+    // A watch session (`run.watch`) is the replacement's alone.
+    if (run_options) |*options| if (phase != .replace) {
+        options.watch = null;
+    };
     for (list, locks) |planned, lock| {
         const provider = planned.provider.*;
         const settings = try dispatch.resolveSettings(a, site.root, site.cfg, site.providers, provider.meta.name);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const supervise = @import("supervise.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
 const emsdk_toolchain = @import("emsdk_toolchain.zig");
@@ -148,7 +149,7 @@ fn reportSpawnFailure(err: anyerror, argv: []const []const u8, cwd: []const u8) 
 
 /// Run a zig command capturing stdout/stderr.
 pub fn runZig(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !std.process.RunResult {
-    return std.process.run(allocator, config.globalIo(), .{
+    return supervise.run(allocator, config.globalIo(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
     }) catch |err| {
@@ -165,7 +166,7 @@ pub fn runZigWithEnv(
     argv: []const []const u8,
     environ_map: ?*const std.process.Environ.Map,
 ) !std.process.RunResult {
-    return std.process.run(allocator, config.globalIo(), .{
+    return supervise.run(allocator, config.globalIo(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .environ_map = environ_map,
@@ -221,6 +222,23 @@ pub fn runInheritTerm(
     environ_map: ?*const std.process.Environ.Map,
 ) !Termination {
     const io = config.globalIo();
+    // A supervised thread (a watch session, `supervise.zig`) runs the child
+    // in its own cancellable process tree; the `--timeout` watchdog below is
+    // never armed there (a session's children have no timeout).
+    if (supervise.current != null and timeout_ns == null) {
+        var sup = supervise.spawn(io, .{
+            .argv = argv,
+            .cwd = .{ .path = cwd },
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .environ_map = environ_map,
+        }) catch |err| {
+            if (err != error.Canceled) reportSpawnFailure(err, argv, cwd);
+            return err;
+        };
+        return .{ .exited = exitStatus(try sup.wait(io)) };
+    }
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },

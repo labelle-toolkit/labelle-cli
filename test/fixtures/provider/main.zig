@@ -1,6 +1,16 @@
 const std = @import("std");
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
+    // `provider-probe linger`: a grandchild the watch suites start from a
+    // hook or a replacement, to prove it does not outlive `labelle run`.
+    {
+        var probe_args = try std.process.Args.Iterator.initAllocator(init.minimal.args, a);
+        _ = probe_args.skip();
+        if (probe_args.next()) |first| if (std.mem.eql(u8, first, "linger")) {
+            init.io.sleep(std.Io.Duration.fromSeconds(120), .awake) catch {};
+            return 0;
+        };
+    }
     const context = try init.minimal.environ.getAlloc(a, "LABELLE_CONTEXT");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, context, a, .limited(1024 * 1024));
     const ctx = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
@@ -83,6 +93,34 @@ pub fn main(init: std.process.Init) !u8 {
         .sub_path = log_path,
         .data = try std.mem.concat(a, u8, &.{ previous, line, "\n" }),
     });
+    // `PROVIDER_PROBE_SLOW=<hook id>|<marker>` makes that hook — once the
+    // file `<marker>.arm` exists — start a lingering grandchild, write
+    // `<own pid> <grandchild pid>` to <marker> and then sleep, so a suite
+    // can stop the session while it runs and check that neither process
+    // survives it.
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_SLOW")) |spec| {
+        const bar = std.mem.indexOfScalar(u8, spec, '|') orelse return error.BadProbeSlowSpec;
+        const armed = if (std.Io.Dir.cwd().access(init.io, try std.fmt.allocPrint(a, "{s}.arm", .{spec[bar + 1 ..]}), .{})) |_| true else |_| false;
+        if (armed and invocation == .object and std.mem.eql(u8, invocation.object.get("id").?.string, spec[0..bar])) {
+            try linger(init, a, spec[bar + 1 ..]);
+            init.io.sleep(std.Io.Duration.fromSeconds(120), .awake) catch {};
+            return 0;
+        }
+    } else |_| {}
+    // The watch-capable run replacement (contract §2 `run.watch`, wire
+    // 1.3.0+): a stand-in for a dev server. It never serves HTTP: it polls
+    // the generation file and, on every new generation, appends
+    // `gen=<n> data=<bin/data.txt as published>` to `watch.log` in its
+    // step output directory — reading the PUBLISHED output directory, the
+    // way a server would serve it. It exits with the code written to
+    // `PROVIDER_PROBE_WATCH_STOP` (a file path) once that file exists, and
+    // with 3 after two minutes. `PROVIDER_PROBE_WATCH_CHILD=<marker>`
+    // makes it start a lingering grandchild first (see `linger`).
+    if (invocation == .object and ctx.value.object.get("run") != null) {
+        const run_ctx = ctx.value.object.get("run").?;
+        const watch_ctx = if (run_ctx == .object) run_ctx.object.get("watch") else null;
+        if (watch_ctx) |w| if (w == .object) return watchServer(init, a, output, w.object);
+    }
     // `PROVIDER_PROBE_PATCH=<hook id>` makes that hook post-process the step
     // output the way a signing/stripping hook would: it overwrites
     // `<output_dir>/bin/data.txt`, a file the fixture game's build INSTALLS
@@ -162,4 +200,51 @@ pub fn main(init: std.process.Init) !u8 {
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "fail")) return 7;
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "crash")) @panic("provider fixture crash");
     return 0;
+}
+
+/// Start `provider-probe linger` and write `<own pid> <its pid>\n` to
+/// `marker` (written last, whole: a reader sees both or nothing).
+fn linger(init: std.process.Init, a: std.mem.Allocator, marker: []const u8) !void {
+    const self_exe = try std.process.executablePathAlloc(init.io, a);
+    const child = try std.process.spawn(init.io, .{ .argv = &.{ self_exe, "linger" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const is_windows = @import("builtin").os.tag == .windows;
+    const own: u64 = if (is_windows) GetCurrentProcessId() else if (@import("builtin").os.tag == .linux) @intCast(std.os.linux.getpid()) else @intCast(std.c.getpid());
+    const theirs: u64 = if (is_windows) GetProcessId(child.id.?) else @intCast(child.id.?);
+    const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{marker});
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = tmp, .data = try std.fmt.allocPrint(a, "{d} {d}\n", .{ own, theirs }) });
+    try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), marker, init.io);
+}
+
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn GetProcessId(process: std.os.windows.HANDLE) callconv(.winapi) u32;
+
+fn watchServer(init: std.process.Init, a: std.mem.Allocator, output: []const u8, watch: std.json.ObjectMap) !u8 {
+    const io = init.io;
+    const generation_file = watch.get("generation_file").?.string;
+    const output_dir = watch.get("output_dir").?.string;
+    const log_path = try std.fs.path.join(a, &.{ output, "watch.log" });
+    const stop_path: ?[]const u8 = init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_WATCH_STOP") catch null;
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_WATCH_CHILD")) |marker| try linger(init, a, marker) else |_| {}
+    var seen: ?[]const u8 = null;
+    var ticks: u32 = 0;
+    while (ticks < 2400) : (ticks += 1) {
+        if (std.Io.Dir.cwd().readFileAlloc(io, generation_file, a, .limited(64))) |raw| {
+            const gen = std.mem.trim(u8, raw, " \r\n");
+            if (seen == null or !std.mem.eql(u8, seen.?, gen)) {
+                seen = gen;
+                const data_path = try std.fs.path.join(a, &.{ output_dir, "bin", "data.txt" });
+                const data = std.Io.Dir.cwd().readFileAlloc(io, data_path, a, .limited(1024)) catch "missing";
+                const previous = std.Io.Dir.cwd().readFileAlloc(io, log_path, a, .limited(1 << 20)) catch "";
+                const line = try std.fmt.allocPrint(a, "{s}gen={s} data={s}\n", .{ previous, gen, std.mem.trim(u8, data, " \r\n") });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log_path, .data = line });
+            }
+        } else |_| {}
+        if (stop_path) |path| {
+            if (std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16))) |code| {
+                return std.fmt.parseInt(u8, std.mem.trim(u8, code, " \r\n"), 10) catch 0;
+            } else |_| {}
+        }
+        io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    }
+    return 3;
 }

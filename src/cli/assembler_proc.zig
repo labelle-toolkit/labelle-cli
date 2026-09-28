@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const supervise = @import("supervise.zig");
 const assembler = @import("assembler.zig");
 const progress = @import("progress.zig");
 
@@ -65,6 +66,11 @@ fn minProtocolFor(subcommand: []const u8) u32 {
 pub const Assembler = struct {
     /// Absolute path to the `labelle-assembler` executable. Heap-owned.
     path: []u8,
+    /// A failing subcommand ends the CLI with the assembler's exit code
+    /// (`progress.fatalExit`). A watched rebuild clears it: a failed
+    /// regeneration must fail that rebuild and keep the session alive, and
+    /// the session's cleanup must still run.
+    fatal_on_failure: bool = true,
 
     /// Free the owned path.
     pub fn deinit(self: Assembler, allocator: std.mem.Allocator) void {
@@ -79,7 +85,7 @@ pub const Assembler = struct {
         subcommand: []const u8,
         args: []const []const u8,
     ) !void {
-        return spawnAndWait(allocator, self.path, subcommand, args);
+        return spawnAndWait(allocator, self.path, subcommand, args, self.fatal_on_failure);
     }
 };
 
@@ -326,6 +332,7 @@ fn spawnAndWait(
     exe_path: []const u8,
     subcommand: []const u8,
     args: []const []const u8,
+    fatal_on_failure: bool,
 ) !void {
     const io = config.globalIo();
 
@@ -335,7 +342,7 @@ fn spawnAndWait(
     try argv.append(allocator, subcommand);
     try argv.appendSlice(allocator, args);
 
-    var child = std.process.spawn(io, .{
+    var child = supervise.spawn(io, .{
         .argv = argv.items,
         .stdin = .inherit,
         .stdout = .inherit,
@@ -348,6 +355,10 @@ fn spawnAndWait(
     const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) {
+            if (!fatal_on_failure) {
+                std.debug.print("labelle: assembler {s} failed (exit {d})\n", .{ subcommand, code });
+                return error.AssemblerFailed;
+            }
             // The assembler already printed a diagnostic on its inherited
             // stderr. Exit with its *exact* code so the CLI is a faithful
             // proxy for the delegated subcommand — returning a plain

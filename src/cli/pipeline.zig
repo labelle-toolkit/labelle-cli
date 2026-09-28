@@ -19,9 +19,14 @@
 //!   pipeline/context.zig             `Context` + `HookPlans` the stages share
 //!   pipeline/optimize.zig            the effective optimize mode (flag, the
 //!                                    target owner's default, core fallback)
-//!   pipeline/watch.zig               `WasmRebuildCtx`, the watch ignore set
-//!   pipeline/watch_replan.zig        `WatchReplan` and its generations
-//!   pipeline/watch_replan_tests.zig  the replan's tests
+//!   pipeline/rebuild.zig             `RebuildCtx`, the watch ignore set
+//!   pipeline/rebuild_tests.zig       the rebuild's tests
+//!   pipeline/rebuild_replan.zig      `Replanner` and its generations
+//!   pipeline/rebuild_replan_tests.zig the replan's tests
+//!   pipeline/session_key.zig         what a running watch replacement
+//!                                    depends on (the restart rules)
+//!   pipeline/watch_session.zig       `labelle run --watch`: refusals,
+//!                                    publication, supervision
 //!   pipeline/screenshot.zig          the post-run `--screenshot` report
 //!   pipeline/export_output.zig       the `wasm export --output` resolver
 //!   pipeline/testing.zig             helpers shared by the tests above
@@ -46,16 +51,18 @@ const generate = @import("pipeline/generate.zig");
 const build = @import("pipeline/build.zig");
 const run_stage = @import("pipeline/run.zig");
 const context = @import("pipeline/context.zig");
-const watch = @import("pipeline/watch.zig");
-const watch_replan = @import("pipeline/watch_replan.zig");
-const watch_replan_tests = @import("pipeline/watch_replan_tests.zig");
+const rebuild = @import("pipeline/rebuild.zig");
+const rebuild_replan = @import("pipeline/rebuild_replan.zig");
+const rebuild_replan_tests = @import("pipeline/rebuild_replan_tests.zig");
+const session_key = @import("pipeline/session_key.zig");
+const watch_session = @import("pipeline/watch_session.zig");
 const optimize_mod = @import("pipeline/optimize.zig");
 const screenshot = @import("pipeline/screenshot.zig");
 const export_output = @import("pipeline/export_output.zig");
 const testing = @import("pipeline/testing.zig");
 
 pub const ScreenshotProbeSpec = screenshot.ScreenshotProbeSpec;
-pub const CollectPrebuildIgnorePathsSpec = watch.CollectPrebuildIgnorePathsSpec;
+pub const CollectPrebuildIgnorePathsSpec = rebuild.CollectPrebuildIgnorePathsSpec;
 pub const ResolveExportOutputSpec = export_output.ResolveExportOutputSpec;
 
 /// Run the project-scoped pipeline: read project.labelle, then
@@ -78,6 +85,13 @@ pub const ResolveExportOutputSpec = export_output.ResolveExportOutputSpec;
 fn ok(result: anytype) !u8 {
     if (comptime @typeInfo(@TypeOf(result)) == .error_union) try result;
     return 0;
+}
+
+/// The core's legacy optimize fallback for a target platform: ReleaseSafe
+/// for a wasm build (Debug exceeds browser local variable limits), which a
+/// provider's declared default replaces.
+fn fallbackOptimize(platform: @import("project_config.zig").Platform) ?[]const u8 {
+    return if (platform == .wasm) "ReleaseSafe" else null;
 }
 
 pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
@@ -239,7 +253,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // docs/provider-targets.md)
     var provider_sources: provider_github.Sources = .{ .a = hook_arena };
     defer provider_sources.deinit();
-    const planned = switch (try install.discoverAndPlan(allocator, hook_arena, project_dir, project_root, command, parsed, requested_target, reporter, &provider_sources)) {
+    const planned = switch (try install.discoverAndPlan(allocator, hook_arena, project_dir, project_root, command, parsed_args.run_watch, parsed, requested_target, reporter, &provider_sources)) {
         .ready => |ready| ready,
         .exit => |code| return code,
     };
@@ -271,7 +285,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const effective_optimize = optimize_mod.effective(
         parsed_args.optimize_override,
         optimize_mod.ownerDefault(providers, target.name),
-        if (parsed.platform == .wasm) "ReleaseSafe" else null,
+        fallbackOptimize(parsed.platform),
     ).mode;
 
     // A path that cannot carry a provider's environment contribution or its
@@ -348,6 +362,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .hook_plans = hook_plans,
         .hook_site = &hook_site,
         .effective_optimize = effective_optimize,
+        .fallback_optimize = fallbackOptimize(parsed.platform),
     };
 
     // Provider hooks on `generate` around the core generation
@@ -431,9 +446,12 @@ test {
     _ = build;
     _ = run_stage;
     _ = context;
-    _ = watch;
-    _ = watch_replan;
-    _ = watch_replan_tests;
+    _ = rebuild;
+    _ = rebuild_replan;
+    _ = rebuild_replan_tests;
+    _ = @import("pipeline/rebuild_transaction_tests.zig");
+    _ = session_key;
+    _ = watch_session;
     _ = optimize_mod;
     _ = screenshot;
     _ = export_output;

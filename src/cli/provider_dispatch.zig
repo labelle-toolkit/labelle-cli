@@ -600,7 +600,11 @@ pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRu
         break :blk null;
     } else null;
     const run_context = contract.carriesRunContext(wire);
-    const run_options = if (run.run_options) |options| blk: {
+    const run_options = if (run.run_options) |given_options| blk: {
+        var options = given_options;
+        // `run.watch` is a `1.3.0` key: an older wire never carries it
+        // (`labelle run --watch` refuses such a replacement before any build).
+        if (!contract.carriesWatchContext(wire)) options.watch = null;
         if (run_context) break :blk options;
         if (options.given()) std.debug.print("labelle: note: run options not passed to '{s}/{s}' (provider contract {s} < {s})\n", .{
             provider.meta.name, run.invocation.id, wire, contract.run_context_since,

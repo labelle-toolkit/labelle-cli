@@ -36,4 +36,7 @@ pub const Context = struct {
     hook_plans: HookPlans,
     hook_site: *provider_hooks.Site,
     effective_optimize: ?[]const u8,
+    /// The core's optimize fallback for the target, which a watched
+    /// rebuild's replan recomputes the effective mode from.
+    fallback_optimize: ?[]const u8 = null,
 };

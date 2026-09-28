@@ -85,6 +85,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// RFC cli#466 PR A1 (contract 1.3.0) scrubbed the legacy serve wording from
 /// `cli/material_toolchain.zig`, `cli/prebuild.zig` and
 /// `cli/provider_hooks.zig`: 50 entries.
+/// RFC cli#466 PR A2 moved the generic watcher out of `cli/serve/` into
+/// `cli/watch/` and renamed the rebuild supervision (`cli/pipeline/watch*`
+/// to `cli/pipeline/rebuild*`) with neutral names and fixtures; with
+/// `cli/pipeline/testing.zig` scrubbed too, six entries went: 44 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -123,10 +127,6 @@ const allowed_files = [_][]const u8{
     "cli/pipeline/install.zig",
     "cli/pipeline/run.zig",
     "cli/pipeline/screenshot.zig",
-    "cli/pipeline/testing.zig",
-    "cli/pipeline/watch.zig",
-    "cli/pipeline/watch_replan.zig",
-    "cli/pipeline/watch_replan_tests.zig",
     "cli/progress.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
@@ -139,8 +139,6 @@ const allowed_files = [_][]const u8{
     // mentions the served build and its output dir.
     "cli/serve/http.zig",
     "cli/serve/server.zig",
-    "cli/serve/tree.zig",
-    "cli/serve/watch.zig",
     "cli/status.zig",
     "cli/stb_image.h",
     "cli/stb_image_impl.c",

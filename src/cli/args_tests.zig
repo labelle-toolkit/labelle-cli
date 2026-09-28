@@ -391,6 +391,36 @@ fn testIter(line: []const u8) std.process.Args.IteratorGeneral(.{}) {
 }
 
 pub const ParseRunArgsPassthroughSpec = struct {
+    pub const watch_flag = struct {
+        test "`run --watch` sets the watch session, off by default" {
+            var iter = testIter("--watch --platform=probe-target");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            const result = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expect(pa.run_watch);
+            try std.testing.expectEqualStrings("probe-target", result.platform.?);
+            var plain_iter = testIter("");
+            defer plain_iter.deinit();
+            var plain = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&plain_iter, "run", true, &plain) orelse return error.TestFailed;
+            try std.testing.expect(!plain.run_watch);
+        }
+        test "`--watch` after `--` is a game argument, not the flag" {
+            var iter = testIter("-- --watch");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            try std.testing.expect(!pa.run_watch);
+            try std.testing.expectEqualStrings("--watch", pa.extra_args[0]);
+        }
+        test "`--watch --docker` is refused" {
+            var iter = testIter("--watch --docker");
+            defer iter.deinit();
+            var pa = ParsedArgs{ .command = .run };
+            try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+        }
+    };
+
     pub const no_separator = struct {
         test "empty extras when no `--` token" {
             var iter = testIter("");
