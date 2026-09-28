@@ -13,10 +13,19 @@
 //! document names an owner, and only one document is read, the same one for
 //! a target and for a namespace (#465):
 //!
-//! - the project last accepted from a custom source: the copy of that
-//!   source's document recorded with it, read and verified as one snapshot;
+//! - the project's pins came from a custom source (`labelle.providers.lock`
+//!   schema 2 names it, #456; a schema-1 lock names none, and then the
+//!   accepted-source record alone says so): the copy of that source's
+//!   document recorded with it in `.labelle/`, read and verified as one
+//!   snapshot. When `.labelle/` holds no verified copy of THAT source's
+//!   document, the hint is generic — it still never asks the public
+//!   registry for a project whose pins came from elsewhere;
 //! - otherwise: one short-timeout download of the public registry, skipped
 //!   under `LABELLE_OFFLINE`.
+//!
+//! The candidate is the newest release that declares the name; in a
+//! schema-3 document, the newest whose recorded `command_contract` this CLI
+//! supports (#456). It stays a candidate: `--accept` verifies it.
 //!
 //! Anything else — schema 1, offline, a failed or oversize download, a
 //! record that does not verify — is a miss, and the diagnostic prints the
@@ -28,6 +37,7 @@ const builtin = @import("builtin");
 const config = @import("../config.zig");
 const registry = @import("../provider_registry.zig");
 const files = @import("files.zig");
+const pin = @import("pin.zig");
 
 pub const registry_url = "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json";
 
@@ -75,7 +85,8 @@ fn capture(a: std.mem.Allocator, argv: []const []const u8, limit: usize) ![]cons
 /// Project-local record of the registry source the project's last
 /// `providers resolve --accept` used, and the normalised document it bound,
 /// in one file (one snapshot). Written after the lock commits; best effort.
-/// It lives in `.labelle/`, so deleting that directory forgets it (#456).
+/// It lives in `.labelle/`, so deleting that directory forgets the document;
+/// the source itself is kept in `labelle.providers.lock` (#456).
 pub const accepted_name = ".labelle/providers.registry.json";
 
 /// The record's layout. Version 2 binds the source to its document by the
@@ -99,6 +110,34 @@ fn isUrl(source: []const u8) bool {
 /// A registry source as it is recorded: a URL as given, a local path made absolute.
 pub fn canonicalSource(a: std.mem.Allocator, source: []const u8) ![]const u8 {
     return if (isUrl(source)) source else try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), source, a);
+}
+
+/// A canonical source (`canonicalSource`) in the form the lock records: a
+/// URL as given; a local file as its path relative to `root` with `/`
+/// separators (absolute only when no relative path exists, e.g. another
+/// Windows drive).
+pub fn projectSource(a: std.mem.Allocator, root: []const u8, canonical: []const u8) ![]const u8 {
+    if (isUrl(canonical)) return canonical;
+    const relative = try std.fs.path.relative(a, root, null, root, canonical);
+    if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, relative, '\\', '/');
+    return relative;
+}
+
+/// Where `labelle.providers.lock` says its pins came from.
+pub const LockSource = union(enum) {
+    /// No lock, a lock that does not parse, or a schema-1 lock (no source).
+    unknown,
+    public,
+    /// The lock's `registry`, in the project form (`projectSource`).
+    custom: []const u8,
+};
+
+pub fn readLockSource(a: std.mem.Allocator, root: []const u8) LockSource {
+    const path = std.fs.path.join(a, &.{ root, pin.lock_name }) catch return .unknown;
+    const bytes = files.read(a, path, max_document_bytes) catch return .unknown;
+    const lock = pin.parseLock(a, bytes) catch return .unknown;
+    const source = lock.registry orelse return .unknown;
+    return if (std.mem.eql(u8, source, registry_url)) .public else .{ .custom = source };
 }
 
 /// Record the source an accept used (a local path made absolute) with the
@@ -152,6 +191,9 @@ pub const OwnerHint = struct {
     version: []const u8,
     /// The project's verified custom source; null for the public registry.
     registry: ?[]const u8 = null,
+    /// The document records each release's `command_contract` (schema 3),
+    /// and `version` is the newest declaring release this CLI supports.
+    contract_checked: bool = false,
 };
 
 pub const Reason = enum {
@@ -166,13 +208,21 @@ pub const Reason = enum {
     /// The project's accepted-source record does not verify, so its source
     /// is unknown (and the public registry is not asked in its place).
     unverified_source,
+    /// The lock's pins came from a custom source and `.labelle/` holds no
+    /// verified copy of that source's document (#456): the hint stays
+    /// generic, and the public registry is not asked in its place.
+    not_recorded,
+    /// A schema-3 document lists releases that declare the name, but none
+    /// whose `command_contract` this CLI supports.
+    no_supported_release,
 };
 
 /// Why no owner is named; the diagnostic says which, so the path that ran
 /// is visible. The steps stay generic either way.
 pub const Miss = struct {
     reason: Reason,
-    /// The document read was the project's custom source's.
+    /// The project's pins came from a custom source (the document read, if
+    /// any, was that source's).
     custom: bool = false,
 };
 
@@ -189,8 +239,11 @@ pub fn ownerIn(doc: registry.Registry, declaration: registry.Declaration, from: 
     const custom = from != null;
     if (!doc.claimsOwnership()) return .{ .miss = .{ .reason = .no_owner_table, .custom = custom } };
     const package = doc.owner(declaration) orelse return .{ .miss = .{ .reason = .not_listed, .custom = custom } };
-    const record = doc.latestDeclaring(package, declaration) orelse return .{ .miss = .{ .reason = .not_listed, .custom = custom } };
-    return .{ .hit = .{ .package = package, .repo = record.repo, .version = record.version, .registry = from } };
+    const record = doc.latestSupported(package, declaration) orelse {
+        const declared = doc.latestDeclaring(package, declaration) != null;
+        return .{ .miss = .{ .reason = if (declared) .no_supported_release else .not_listed, .custom = custom } };
+    };
+    return .{ .hit = .{ .package = package, .repo = record.repo, .version = record.version, .registry = from, .contract_checked = doc.carriesContracts() } };
 }
 
 /// The download the lookup uses: the real one, or a test's stand-in.
@@ -202,21 +255,39 @@ fn fetchLive(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
 
 /// The best-effort lookup behind the no-provider diagnostics. Never an error.
 ///
-/// - A verified record of a custom source: that source's recorded document
-///   answers. Nothing is downloaded.
-/// - A record that does not verify: a miss. The project may use a custom
-///   source, so the public registry is not asked in its place.
-/// - No record, or a record of the public registry: one download of the
-///   public registry, unless offline.
+/// - The lock names a custom source: the verified record of THAT source
+///   answers from its document; anything else is a generic miss. Nothing is
+///   downloaded, and the public registry is never asked.
+/// - The lock names the public registry: one download of it, unless offline.
+/// - The lock names no source (none, schema 1, unreadable): the record
+///   decides, as before lock schema 2. A verified record of a custom source
+///   answers; one that does not verify is a miss (the project may use a
+///   custom source, so the public registry is not asked in its place); no
+///   record, or one of the public registry, is one public download.
 pub fn lookupOwner(a: std.mem.Allocator, root: ?[]const u8, declaration: registry.Declaration, offline: bool, fetch: Fetcher) Lookup {
-    if (root) |r| switch (readAccepted(a, r)) {
-        .none => {},
-        .unverified => return .{ .miss = .{ .reason = .unverified_source } },
-        .verified => |record| if (!std.mem.eql(u8, record.source, registry_url)) {
-            const doc = registry.parse(a, record.document) catch return .{ .miss = .{ .reason = .unverified_source } };
-            return ownerIn(doc, declaration, record.source);
-        },
-    };
+    if (root) |r| {
+        const recorded = readAccepted(a, r);
+        switch (readLockSource(a, r)) {
+            .public => {},
+            .custom => |source| {
+                const not_recorded: Lookup = .{ .miss = .{ .reason = .not_recorded, .custom = true } };
+                if (recorded != .verified) return not_recorded;
+                const record = recorded.verified;
+                const same = std.mem.eql(u8, source, projectSource(a, r, record.source) catch return not_recorded);
+                if (!same) return not_recorded;
+                const doc = registry.parse(a, record.document) catch return not_recorded;
+                return ownerIn(doc, declaration, record.source);
+            },
+            .unknown => switch (recorded) {
+                .none => {},
+                .unverified => return .{ .miss = .{ .reason = .unverified_source } },
+                .verified => |record| if (!std.mem.eql(u8, record.source, registry_url)) {
+                    const doc = registry.parse(a, record.document) catch return .{ .miss = .{ .reason = .unverified_source } };
+                    return ownerIn(doc, declaration, record.source);
+                },
+            },
+        }
+    }
     if (offline) return .{ .miss = .{ .reason = .offline } };
     const bytes = fetch(a, registry_url) catch return .{ .miss = .{ .reason = .unreachable_registry } };
     if (bytes.len > max_document_bytes) return .{ .miss = .{ .reason = .unreachable_registry } };
@@ -389,9 +460,11 @@ test "provider registry lookup: a verified custom source answers from its record
     try std.testing.expectEqual(Reason.not_listed, miss.reason);
     try std.testing.expect(miss.custom);
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
-    // A recorded custom URL, online: its recorded document answers and
-    // names the source; nothing is downloaded, not even from that URL.
+    // A recorded custom URL (the lock names it too), online: its recorded
+    // document answers and names the source; nothing is downloaded, not
+    // even from that URL.
     const fork = "https://example.test/fork registry/%20b%/providers.json";
+    try writeLock(a, fx.root, fork);
     try recordAccepted(a, fx.root, fork, custom_doc);
     const hint = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit;
     try std.testing.expectEqualStrings("custom-owner", hint.package);
@@ -406,6 +479,7 @@ test "provider registry lookup: a verified custom source answers from its record
     try std.testing.expect(one.custom);
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
     // A record of the public registry is the public path: one download.
+    try writeLock(a, fx.root, registry_url);
     try recordAccepted(a, fx.root, registry_url, custom_doc);
     try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
     try std.testing.expectEqual(@as(usize, 1), fetch_calls);
@@ -510,4 +584,115 @@ test "provider registry lookup: a namespace is answered by the same one document
 test "provider registry lookup: the resolve and hint limits stay distinct and the url is the resolve default" {
     try std.testing.expect(!std.mem.eql(u8, Limits.resolve.max_time, Limits.hint.max_time));
     try std.testing.expect(std.mem.startsWith(u8, registry_url, "https://raw.githubusercontent.com/"));
+}
+
+fn writeLock(a: std.mem.Allocator, root: []const u8, source: ?[]const u8) !void {
+    const path = try std.fs.path.join(a, &.{ root, pin.lock_name });
+    const bytes = if (source) |value|
+        try std.json.Stringify.valueAlloc(a, pin.Lock{ .schema_version = pin.lock_schema, .registry = value, .providers = &.{} }, .{})
+    else
+        "{\"schema_version\":1,\"providers\":[]}";
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = path, .data = bytes });
+}
+
+test "provider registry lookup: the lock's recorded source decides which document may answer, whatever .labelle/ holds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    const fork = "https://example.test/fork/providers.json";
+    const record_path = try std.fs.path.join(a, &.{ fx.root, accepted_name });
+    const cwd = std.Io.Dir.cwd();
+    const io = config.globalIo();
+    fetch_calls = 0;
+    // The lock names the fork and .labelle/ holds its verified document: it answers.
+    try writeLock(a, fx.root, fork);
+    try recordAccepted(a, fx.root, fork, custom_doc);
+    try std.testing.expectEqualStrings(fork, readLockSource(a, fx.root).custom);
+    try std.testing.expectEqualStrings("custom-owner", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
+    // `.labelle/` deleted: the lock still says the pins came from the fork,
+    // so the hint is generic and the public registry (which would answer)
+    // is not asked (#456).
+    try cwd.deleteFile(io, record_path);
+    const gone = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss;
+    try std.testing.expectEqual(Reason.not_recorded, gone.reason);
+    try std.testing.expect(gone.custom);
+    // A verified record of ANOTHER source (or of the public registry) does not answer for the fork.
+    try recordAccepted(a, fx.root, "https://example.test/other/providers.json", custom_doc);
+    try std.testing.expectEqual(Reason.not_recorded, lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss.reason);
+    try recordAccepted(a, fx.root, registry_url, live_doc);
+    try std.testing.expectEqual(Reason.not_recorded, lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss.reason);
+    // A record that does not verify: the same generic miss.
+    try cwd.writeFile(io, .{ .sub_path = record_path, .data = "{ truncated" });
+    try std.testing.expectEqual(Reason.not_recorded, lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss.reason);
+    try std.testing.expectEqual(@as(usize, 0), fetch_calls);
+    // The lock names the public registry: a stale custom record is ignored
+    // and the public registry answers.
+    try writeLock(a, fx.root, registry_url);
+    try recordAccepted(a, fx.root, fork, custom_doc);
+    try std.testing.expect(readLockSource(a, fx.root) == .public);
+    try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
+    try std.testing.expectEqual(@as(usize, 1), fetch_calls);
+    // A schema-1 lock names no source: the record decides, as before.
+    try writeLock(a, fx.root, null);
+    try std.testing.expect(readLockSource(a, fx.root) == .unknown);
+    try std.testing.expectEqualStrings("custom-owner", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
+    try cwd.deleteFile(io, record_path);
+    try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
+    try std.testing.expectEqual(@as(usize, 2), fetch_calls);
+}
+
+test "provider registry lookup: a local source is compared in the lock's project-relative form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    // The fixture's providers.json sits next to the project directory.
+    try fx.publishSchemaTwo(a, "\"probe\"", "");
+    const canonical = try canonicalSource(a, fx.registry);
+    try std.testing.expectEqualStrings("../providers.json", try projectSource(a, fx.root, canonical));
+    try std.testing.expectEqualStrings(fork_url, try projectSource(a, fx.root, fork_url));
+    // An accept writes lock schema 2 with that form, and the record verifies against it.
+    try fx.run(a, false);
+    try fx.run(a, true);
+    try std.testing.expectEqualStrings("../providers.json", readLockSource(a, fx.root).custom);
+    fetch_calls = 0;
+    const miss = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss;
+    // Mechanism: answered from the recorded document (it lists no target), not `not_recorded`.
+    try std.testing.expectEqual(Reason.not_listed, miss.reason);
+    try std.testing.expect(miss.custom);
+    try std.testing.expectEqual(@as(usize, 0), fetch_calls);
+}
+
+const fork_url = "https://example.test/fork/providers.json";
+
+const contract_doc = "{\"schema_version\":3,\"defaults\":[],\"providers\":[" ++
+    contractRecord("fixture", "1.0.0", ">=1.0.0 <2.0.0") ++ "," ++ contractRecord("fixture", "1.4.0", ">=1.0.0 <2.0.0") ++ "," ++
+    contractRecord("fixture", "2.0.0", ">=90.0.0 <91.0.0") ++ "," ++ contractRecord("future", "1.0.0", ">=90.0.0 <91.0.0") ++ "]}";
+
+fn contractRecord(comptime package: []const u8, comptime version: []const u8, comptime range: []const u8) []const u8 {
+    const target = if (std.mem.eql(u8, package, "future")) "future-target" else "probe-target";
+    return "{\"package\":\"" ++ package ++ "\",\"repo\":\"owner/" ++ package ++ "\",\"version\":\"" ++ version ++
+        "\",\"commit\":\"" ++ commit_a ++ "\",\"sha256\":\"" ++ hash_a ++ "\",\"namespace\":null,\"targets\":[\"" ++ target ++ "\"],\"command_contract\":\"" ++ range ++ "\"}";
+}
+
+fn fetchContractDoc(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
+    note(url);
+    return a.dupe(u8, contract_doc);
+}
+
+test "provider registry lookup: a schema-3 document suggests the newest release whose contract this CLI supports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const hint = lookupOwner(a, null, .{ .target = "probe-target" }, false, fetchContractDoc).hit;
+    // 2.0.0 is newer but requires a contract this CLI does not speak.
+    try std.testing.expectEqualStrings("1.4.0", hint.version);
+    try std.testing.expect(hint.contract_checked);
+    // Every declaring release requires an unsupported contract.
+    try std.testing.expectEqual(Reason.no_supported_release, lookupOwner(a, null, .{ .target = "future-target" }, false, fetchContractDoc).miss.reason);
+    // Schema 2 carries no contract: the newest declaring release, unchecked.
+    try std.testing.expect(!lookupOwner(a, null, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.contract_checked);
 }

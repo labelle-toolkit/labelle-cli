@@ -63,11 +63,22 @@ one target, in two halves, before anything is generated, locked or built:
    deliberately simple (#459): it reads **one** document, and only a
    **schema-2** document names an owner.
 
-   - **A custom source this project accepted from.** Every `providers
-     resolve --accept` records its registry source (an https URL, or the
-     absolute path of a local `providers.json`), the normalised document it
-     bound and that document's SHA-256 in `.labelle/providers.registry.json`,
-     one file written atomically. The lookup reads it once and checks the
+   - **Which registry the pins came from.** Every `providers resolve
+     --accept` writes that source into `labelle.providers.lock` (lock schema
+     2, #456; committed, so it survives deleting `.labelle/` and reaches
+     fresh clones) and records the source (an https URL, or the absolute path
+     of a local `providers.json`), the normalised document it bound and that
+     document's SHA-256 in `.labelle/providers.registry.json`, one file
+     written atomically.
+   - **A custom source this project accepted from.** When the lock names a
+     custom source, only the verified record of that same source answers.
+     If `.labelle/` holds no such record (deleted, never written, another
+     source's, or one that does not verify), the steps are generic: no
+     package or source is named, the reason line says the lock came from a
+     registry other than the public one, the last line says to pass that
+     registry's path or URL to both resolve steps, and the public registry is
+     **not** asked. A schema-1 lock (CLI 2.x) names no source; then
+     the record alone decides, as described next. The lookup reads it once and checks the
      document against the digest in that same snapshot. When it verifies and
      the source is not the public registry, the recorded document answers —
      nothing is downloaded or re-read — and the hint names that source. The
@@ -77,7 +88,7 @@ one target, in two halves, before anything is generated, locked or built:
      `%…%` even inside double quotes). The hint tells the user to quote or
      escape it for their own shell, because a path can contain spaces or
      special characters.
-   - **A record that does not verify** (unreadable, the CLI 2.0.0 layout
+   - **With a schema-1 lock, a record that does not verify** (unreadable, the CLI 2.0.0 layout
      without a digest, a document that does not match its digest, a source
      with control characters) means the project's source is unknown: the
      steps are generic, and the public registry is **not** asked in its place.
@@ -88,10 +99,13 @@ one target, in two halves, before anything is generated, locked or built:
      extracted or run. The download is never written anywhere.
    - **The release suggested** is the owner's newest release whose own
      record declares the target (the ownership table is the union of a
-     package's releases, so the newest release may have dropped it). It is a
-     **candidate**: the registry carries no command-contract metadata, so
-     `labelle providers resolve --accept` is what checks that this CLI
-     supports it. Contract-aware selection is tracked in #456.
+     package's releases, so the newest release may have dropped it). In a
+     schema-3 document, which records each release's `command_contract`, it
+     is the newest such release whose range this CLI supports (#456); when
+     none is, the steps are generic and say so. It is always a
+     **candidate**: `labelle providers resolve --accept` is what verifies
+     it. A schema-2 document records no contract, so there the hint adds
+     that `--accept` checks whether this CLI supports the release.
    - Every download, the hint's and `providers resolve`'s, is capped at
      1 MiB by the CLI itself (the captured output), not only by curl's
      `--max-filesize`, which curl before 8.4.0 ignores for a response of
@@ -116,10 +130,10 @@ one target, in two halves, before anything is generated, locked or built:
    first line, same exit status, same `failed` progress record, and nothing
    generated.
 
-   Known limitation (#456): the accepted-source record lives in `.labelle/`,
-   which is generated output and safe to delete. Deleting it forgets the
-   custom source: the next hint asks the public registry, until the next
-   `providers resolve <source> --accept` records it again.
+   Deleting `.labelle/` (generated output) forgets the recorded document but
+   not the source: the lock still names it, so the hint turns generic
+   instead of asking the public registry, until the next `providers resolve
+   <source> --accept` records the document again (#456).
 
 The two halves are the **name** and the **ownership**. The name is settled
 from the string alone, first thing: `desktop` is core, any other name is
@@ -346,7 +360,12 @@ not listed, schema 1, unreachable, unparseable, oversize, offline with no
 fetch, a verified custom record answered from its document with no fetch, and
 records that do not verify answered generically with no public fetch, each
 asserting which URLs the fetcher was asked for, and the same for a
-namespace), `Registry.latestDeclaring` (by target and by namespace), the
+namespace; the lock's recorded source deciding which document may answer,
+with `.labelle/` deleted, another source's record or a public lock; a
+local source compared in its project-relative form; a schema-3 candidate
+skipping a newer release whose contract this CLI does not speak),
+`Registry.latestDeclaring` and `latestSupported` (by target and by
+namespace), lock schema 2 parsing, the
 namespace diagnostic, the `NoRunReplacement` decision table
 (`pipeline/install.zig`), `provider_registry` (schema-2 parsing, ownership
 conflicts, lookup by target and namespace), `provider_dispatch.discoverAll` (the

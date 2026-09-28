@@ -124,8 +124,12 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, declaration: registry.Declarat
             const from: []const u8 = if (hint.registry != null) "The registry this project last accepted from" else "The provider registry";
             try w.print("  (registry: {s})\n", .{hint.package});
             try w.print("  {s} lists package '{s}' as the provider of {s} '{s}'.\n", .{ from, hint.package, kind, name });
-            try w.print("  Its newest release that declares the {s}, {s}, is a candidate: `labelle providers resolve --accept`\n", .{ kind, hint.version });
-            try w.print("  checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the {s}).\n", .{kind});
+            if (hint.contract_checked) {
+                try w.print("  Its newest release that declares the {s} and whose recorded command_contract this CLI supports,\n  {s}, is a candidate: `labelle providers resolve --accept` verifies it.\n", .{ kind, hint.version });
+            } else {
+                try w.print("  Its newest release that declares the {s}, {s}, is a candidate: `labelle providers resolve --accept`\n", .{ kind, hint.version });
+                try w.print("  checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the {s}).\n", .{kind});
+            }
             if (hint.registry) |source| try w.print("  That registry's source, to pass as the argument of both resolve steps (quote or escape it for your shell, since it may contain spaces or special characters):\n    {s}\n", .{source});
             try w.writeAll("  To use it:\n");
             try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, hint.version });
@@ -143,11 +147,16 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, declaration: registry.Declarat
                 .no_owner_table => try w.print("  ({s} does not publish {s} owners: registry schema 1)\n", .{ subject, kind }),
                 .not_listed => try w.print("  ({s} lists no package for this {s})\n", .{ subject, kind }),
                 .unverified_source => try w.writeAll("  (the registry this project last accepted from is unknown: " ++ github.registry_accepted_name ++ " does not verify)\n"),
+                .not_recorded => try w.writeAll("  (" ++ github.lock_name ++ " came from a registry other than the public one, and " ++ github.registry_accepted_name ++ "\n   holds no verified copy of its document)\n"),
+                .no_supported_release => try w.print("  ({s} lists releases for this {s}, but none whose command_contract this CLI supports;\n   a newer labelle CLI may)\n", .{ subject, kind }),
             }
             try w.writeAll("  To add one:\n");
             try w.print("    1. add the package that declares {s} '{s}' to .plugins in project.labelle\n       (a provider registry lists each package's {s}s):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ kind, name, kind });
             try writeResolveSteps(w);
-            try w.writeAll("  Both resolve steps read the public provider registry; to use another one, pass its\n  providers.json path or URL as the argument of both.\n");
+            // Never the public registry as the source of a project whose pins came from elsewhere.
+            if (why.custom) {
+                try w.writeAll("  This project's pins came from another registry: pass its providers.json path or URL as the\n  argument of both resolve steps.\n");
+            } else try w.writeAll("  Both resolve steps read the public provider registry; to use another one, pass its\n  providers.json path or URL as the argument of both.\n");
         },
     }
     try w.print("  Upgrading a project from CLI 1.x? See {s}\n", .{migration_guide_url});
@@ -375,9 +384,8 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
         .{ .{ .reason = .unreachable_registry }, "  (the provider registry could not be read)\n" },
         .{ .{ .reason = .no_owner_table }, "  (the provider registry does not publish target owners: registry schema 1)\n" },
         .{ .{ .reason = .not_listed }, "  (the provider registry lists no package for this target)\n" },
-        .{ .{ .reason = .not_listed, .custom = true }, "  (the registry this project last accepted from lists no package for this target)\n" },
-        .{ .{ .reason = .no_owner_table, .custom = true }, "  (the registry this project last accepted from does not publish target owners: registry schema 1)\n" },
         .{ .{ .reason = .unverified_source }, "  (the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)\n" },
+        .{ .{ .reason = .no_supported_release }, "  (the provider registry lists releases for this target, but none whose command_contract this CLI supports;\n   a newer labelle CLI may)\n" },
     };
     for (reasons) |case| {
         const text = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .miss = case[0] });
@@ -388,6 +396,28 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
         try std.testing.expect(!has(text, "(registry:") and !has(text, "candidate") and !has(text, "https://raw."));
     }
     try std.testing.expect(has(generic, ".{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" },"));
+    // A project whose pins came from a custom source: the same generic
+    // steps, but the public registry is never presented as its source.
+    const custom_reasons = [_]struct { github.RegistryMiss, []const u8 }{
+        .{ .{ .reason = .not_listed, .custom = true }, "  (the registry this project last accepted from lists no package for this target)\n" },
+        .{ .{ .reason = .no_owner_table, .custom = true }, "  (the registry this project last accepted from does not publish target owners: registry schema 1)\n" },
+        .{ .{ .reason = .not_recorded, .custom = true }, "  (labelle.providers.lock came from a registry other than the public one, and .labelle/providers.registry.json\n   holds no verified copy of its document)\n" },
+    };
+    const public_line = "  Both resolve steps read the public provider registry";
+    const custom_line = "  This project's pins came from another registry: pass its providers.json path or URL as the\n  argument of both resolve steps.\n";
+    const generic_steps = generic[reason_end..std.mem.indexOf(u8, generic, public_line).?];
+    for (custom_reasons) |case| {
+        const text = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .miss = case[0] });
+        const steps = std.mem.indexOf(u8, text, "  To add one:\n").?;
+        try std.testing.expectEqualStrings(case[1], text[head.len..steps]);
+        try std.testing.expect(std.mem.startsWith(u8, text[steps..], generic_steps));
+        try std.testing.expect(has(text, custom_line) and !has(text, public_line) and !has(text, "(registry:"));
+    }
+    try std.testing.expect(has(generic, public_line) and !has(generic, custom_line));
+    // A schema-3 hit says the contract was checked, and still says candidate.
+    const checked = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.4.0", .contract_checked = true } });
+    try std.testing.expect(has(checked, "declares the target and whose recorded command_contract this CLI supports,\n  1.4.0, is a candidate: `labelle providers resolve --accept` verifies it.\n"));
+    try std.testing.expect(!has(checked, "UnsupportedContract") and !has(checked, "compatible"));
     try std.testing.expect(has(generic, "    3. labelle providers resolve --accept   #"));
     try std.testing.expect(has(generic, "labelle providers fetch") and has(generic, migration_guide_url));
 }
