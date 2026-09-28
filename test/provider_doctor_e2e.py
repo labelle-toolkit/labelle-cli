@@ -337,7 +337,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     # provider wrote it; the invalid one is a failed capability under the
     # provider's namespace, carrying the error. `--json` reached both.
     caps, ids, mixed = report(capability("alpha-cap") + "\n", "{not json")
-    assert ids == [core_id, "alpha-cap", "beta"], ids
+    assert ids == [core_id, "alpha-cap", "beta"], (ids, mixed.stdout, mixed.stderr)
     assert caps["alpha-cap"]["ok"] is True and caps["alpha-cap"]["items"][0]["detail"] == "probe", caps
     beta = caps["beta"]
     assert beta["ok"] is False and beta["required"] is True, beta

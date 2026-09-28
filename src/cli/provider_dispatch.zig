@@ -716,18 +716,29 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     return runner.runZigInheritWithEnv(a, run.cwd, argv.items, null, &env);
 }
 
-/// Run `argv` with stdin and stderr inherited and its stdout sent to the
+/// Run `argv` with stdin and stderr inherited and its stdout relayed to the
 /// CLI's stderr. Returns the exit status (128 + signal for a signal death).
+/// The stdout is piped and copied rather than handed the CLI's stderr
+/// handle, which a Windows child cannot be given as its stdout.
 fn runStdoutToStderr(cwd: []const u8, argv: []const []const u8, env: *const std.process.Environ.Map) !u8 {
     const io = config.globalIo();
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
         .stdin = .inherit,
-        .stdout = .{ .file = std.Io.File.stderr() },
+        .stdout = .pipe,
         .stderr = .inherit,
         .environ_map = env,
     });
+    var buffer: [4096]u8 = undefined;
+    var reader = child.stdout.?.readerStreaming(io, &buffer);
+    var err_buffer: [4096]u8 = undefined;
+    var relay = std.Io.File.stderr().writerStreaming(io, &err_buffer);
+    _ = reader.interface.streamRemaining(&relay.interface) catch |err| {
+        child.kill(io);
+        return err;
+    };
+    relay.interface.flush() catch {};
     return exitStatus(try child.wait(io));
 }
 
