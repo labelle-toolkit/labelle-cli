@@ -205,9 +205,16 @@ pub const Publisher = struct {
 
 /// Copy the tree at `src` into `dest` (created). A symbolic link is copied
 /// AS a link (its target text verbatim), never followed, so a link back to
-/// an ancestor cannot make the copy recurse; where a link cannot be created
-/// (Windows without the privilege) it is skipped with a warning.
+/// an ancestor cannot make the copy recurse. A RELATIVE link whose target
+/// lies outside `src` would resolve somewhere else from the published copy,
+/// and rewriting it absolute would leak host paths into the published
+/// output, so it is skipped with a warning; so is a link that cannot be
+/// created (Windows without the privilege).
 pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
+    return copyTreeWithin(a, src, src, dest);
+}
+
+fn copyTreeWithin(a: std.mem.Allocator, top: []const u8, src: []const u8, dest: []const u8) !void {
     const io = config.globalIo();
     try std.Io.Dir.cwd().createDirPath(io, dest);
     var dir = try std.Io.Dir.cwd().openDir(io, src, .{ .iterate = true });
@@ -219,8 +226,8 @@ pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
         const to = try std.fs.path.join(a, &.{ dest, entry.name });
         defer a.free(to);
         switch (entry.kind) {
-            .directory => try copyTree(a, from, to),
-            .sym_link => copyLink(a, from, to) catch |err| {
+            .directory => try copyTreeWithin(a, top, from, to),
+            .sym_link => copyLink(a, top, from, to) catch |err| {
                 std.debug.print("labelle: watch: symbolic link '{s}' not published ({s})\n", .{ from, @errorName(err) });
             },
             else => try std.Io.Dir.cwd().copyFile(from, std.Io.Dir.cwd(), to, io, .{}),
@@ -228,13 +235,29 @@ pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
     }
 }
 
-fn copyLink(a: std.mem.Allocator, from: []const u8, to: []const u8) !void {
+fn copyLink(a: std.mem.Allocator, top: []const u8, from: []const u8, to: []const u8) !void {
     const io = config.globalIo();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try std.Io.Dir.cwd().readLink(io, from, &buf);
+    const target = buf[0..n];
+    if (!std.fs.path.isAbsolute(target)) {
+        const resolved = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(from) orelse ".", target });
+        defer a.free(resolved);
+        if (!within(top, resolved)) return error.LinkLeavesTheStagedTree;
+    }
     const is_dir = if (std.Io.Dir.cwd().statFile(io, from, .{})) |st| st.kind == .directory else |_| false;
-    _ = a;
-    try std.Io.Dir.cwd().symLink(io, buf[0..n], to, .{ .is_directory = is_dir });
+    try std.Io.Dir.cwd().symLink(io, target, to, .{ .is_directory = is_dir });
+}
+
+/// True when `path` is `top` or lies beneath it (pure path math; both are
+/// resolved, `top` absolute).
+fn within(top: []const u8, path: []const u8) bool {
+    const t = std.mem.trimEnd(u8, top, "/\\");
+    if (path.len < t.len) return false;
+    const head = path[0..t.len];
+    const same = if (is_windows) std.ascii.eqlIgnoreCase(head, t) else std.mem.eql(u8, head, t);
+    if (!same) return false;
+    return path.len == t.len or std.fs.path.isSep(path[t.len]);
 }
 
 // ── Session lock ──────────────────────────────────────────────────────
@@ -520,15 +543,22 @@ test "publish: a generation that cannot be advanced switches the output back" {
     try std.testing.expectEqualStrings("one", got);
 }
 
-test "publish: a directory link back to an ancestor is copied as a link, not followed" {
+test "publish: links inside the staged tree are copied as links; relative ones leaving it are skipped" {
     if (is_windows) return error.SkipZigTest; // links need a privilege there
     const a = std.testing.allocator;
     const io = config.globalIo();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "stage/sub");
+    try tmp.dir.createDirPath(io, "outside");
     try tmp.dir.writeFile(io, .{ .sub_path = "stage/sub/file.txt", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/secret.txt", .data = "host" });
+    // Inside: a cycle back to an ancestor, and a sibling file.
     try tmp.dir.symLink(io, "..", "stage/sub/loop", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "file.txt", "stage/sub/alias.txt", .{});
+    // Outside: relative targets that leave the staged tree.
+    try tmp.dir.symLink(io, "../../outside/secret.txt", "stage/sub/escape.txt", .{});
+    try tmp.dir.symLink(io, "../outside", "stage/escape-dir", .{ .is_directory = true });
     const base = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(base);
     const stage = try std.fs.path.join(a, &.{ base, "stage" });
@@ -539,7 +569,23 @@ test "publish: a directory link back to an ancestor is copied as a link, not fol
     var buf: [64]u8 = undefined;
     const n = try tmp.dir.readLink(io, "out/sub/loop", &buf);
     try std.testing.expectEqualStrings("..", buf[0..n]);
+    const m = try tmp.dir.readLink(io, "out/sub/alias.txt", &buf);
+    try std.testing.expectEqualStrings("file.txt", buf[0..m]);
     try tmp.dir.access(io, "out/sub/file.txt", .{});
+    // Skipped: no link, and no rewritten absolute path either.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/sub/escape.txt", .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/escape-dir", .{ .follow_symlinks = false }));
+}
+
+test "publish: the containment check is pure path math" {
+    const top = if (is_windows) "C:\\stage" else "/stage";
+    const inside = if (is_windows) "C:\\stage\\sub" else "/stage/sub";
+    const sibling = if (is_windows) "C:\\stage2" else "/stage2";
+    const parent = if (is_windows) "C:\\" else "/";
+    try std.testing.expect(within(top, top));
+    try std.testing.expect(within(top, inside));
+    try std.testing.expect(!within(top, sibling));
+    try std.testing.expect(!within(top, parent));
 }
 
 test "publish: one session per root; a lock whose process is gone is taken over" {

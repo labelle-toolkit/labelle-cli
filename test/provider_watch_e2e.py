@@ -21,6 +21,7 @@ macOS and Linux.
 """
 import argparse
 import ctypes
+import json
 import os
 from pathlib import Path
 import shutil
@@ -147,9 +148,18 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     hooks_log = target_dir / "zig-out" / "hooks.log"
     checks = 0
 
+    # A `.prebuild` step that only leaves a marker OUTSIDE the project (so it
+    # never triggers a watched rebuild). The suite runs with
+    # LABELLE_NO_PREBUILD=1; the concurrency check below re-enables it to
+    # prove a refused second session runs no prebuild step.
+    prebuild_marker = base / "prebuild-ran"
+    mark_script = base / "mark.py"
+    mark_script.write_text(f"from pathlib import Path\nPath({str(prebuild_marker)!r}).write_text('1')\n")
+    prebuild = f', .prebuild = .{{ .{{ .run = .{{ {json.dumps(sys.executable)}, {json.dumps(str(mark_script))} }} }} }}'
+
     def declare(plugins=True, pkg_version="1.0.0"):
         deps = f', .plugins = .{{ .{{ .name = "probe", .repo = "local:../probe", .version = "{pkg_version}" }} }}' if plugins else ""
-        (project / "project.labelle").write_text(f'.{{ .name = "game", .zig_version = "{version}"{deps} }}')
+        (project / "project.labelle").write_text(f'.{{ .name = "game", .zig_version = "{version}"{deps}{prebuild} }}')
 
     def reset(data="one"):
         shutil.rmtree(project / ".labelle", ignore_errors=True)
@@ -249,12 +259,23 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     try:
         s.wait_gen("gen=0 data=one")
         assert generation() == "0" and published_data() == "one"
-        # A second session for the same target is refused before any build.
-        second = subprocess.run([cli, "run", f"--platform={TARGET}", "--watch", "--progress=off"], cwd=project, env=env,
+        # A second session for the same target is refused before ANY side
+        # effect: with prebuild enabled, its prebuild step never runs, and
+        # neither the install nor generation does; the first session's
+        # status file and lock are untouched.
+        prebuild_marker.unlink(missing_ok=True)
+        status_file = target_dir / ".build-progress.json"
+        status_before = status_file.read_bytes() if status_file.exists() else None
+        lock_before = (project / "labelle.lock").read_bytes()
+        prebuild_env = {k: v for k, v in env.items() if k != "LABELLE_NO_PREBUILD"}
+        second = subprocess.run([cli, "run", f"--platform={TARGET}", "--watch", "--progress=off"], cwd=project, env=prebuild_env,
                                 text=True, capture_output=True, timeout=600)
         assert second.returncode == 1, (second.returncode, second.stderr)
         assert "another watch session (pid" in second.stderr, second.stderr
-        assert "FIXTURE_GENERATE" not in second.stderr, second.stderr
+        assert not prebuild_marker.exists(), "the refused session ran its prebuild step"
+        assert "FIXTURE_INSTALL_DONE" not in second.stderr and "FIXTURE_GENERATE" not in second.stderr, second.stderr
+        assert (status_file.read_bytes() if status_file.exists() else None) == status_before, "the refused session rewrote the status file"
+        assert (project / "labelle.lock").read_bytes() == lock_before, "the refused session rewrote labelle.lock"
         assert generation() == "0" and published_data() == "one"
         # The replacement received the session and nothing else did: the
         # after-build hook ran before the replacement started.
@@ -287,6 +308,14 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         # A clean status-0 exit runs `after run`; the session is cleaned up.
         assert hook_ids().count("done") == before + 1, hook_ids()
         assert not session_dir.exists(), "the published generations were left behind"
+        checks += 1
+        # The control for the refusal above: with no session running, the
+        # same prebuild-enabled environment does run the step.
+        prebuild_marker.unlink(missing_ok=True)
+        control = subprocess.run([cli, "generate", f"--platform={TARGET}"], cwd=project, env=prebuild_env, text=True,
+                                 capture_output=True, timeout=600)
+        assert control.returncode == 0, (control.returncode, control.stderr)
+        assert prebuild_marker.exists(), "the prebuild step never runs: the refusal check above would be vacuous"
         checks += 1
     except BaseException:
         print('---- labelle output ----\n' + s.output(), file=sys.stderr)

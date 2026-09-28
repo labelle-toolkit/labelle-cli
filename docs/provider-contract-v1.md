@@ -134,7 +134,7 @@ A `before generate`, `after generate` or `before build` hook receives `env_file`
 - ``labelle: run --watch: package '<p>' does not declare `.watch = true` on its run replacement '<p>/<id>' for target '<t>'``;
 - `labelle: run --watch: package '<p>' speaks provider contract 1.2.0; its run replacement '<p>/<id>' needs >= 1.3.0 to receive run.watch`.
 
-`--watch` cannot be combined with `--docker` (a usage error: exit status 2). One session runs per project and target: a second `labelle run --watch` for them is refused before any build while the first one's process lives (`.labelle/.watch/<backend>_<target>.lock` holds its PID; a lock whose process is gone is stale and taken over).
+`--watch` cannot be combined with `--docker` (a usage error: exit status 2). One session runs per project and target: a second `labelle run --watch` for them is refused, before it starts its progress feed or runs any prebuild step, install, lock write or build, while the first one's process lives (`.labelle/.watch/<backend>_<target>.lock` holds its PID; a lock whose process is gone is stale and taken over).
 
 **Publication.** The core builds into the ordinary staging tree (the `build` step's `output_dir`, `<target_dir>/zig-out`). Only once a rebuild has fully succeeded — every generate and build phase, the compile and every `after build` hook — does it publish:
 
@@ -142,7 +142,7 @@ A `before generate`, `after generate` or `before build` hook receives `env_file`
 2. `run.watch.output_dir` (`<session>/current`) is switched to it atomically. On POSIX it is a relative symbolic link, replaced by renaming a new link over it. On Windows it is a directory junction (no privilege needed) whose reparse data is rewritten in place with `FSCTL_SET_REPARSE_POINT`, one filesystem operation; should the in-place rewrite be refused, the junction is recreated, which is not atomic and is reported once;
 3. only then is `run.watch.generation_file` advanced: an ASCII decimal number and a newline, written to a temporary file and renamed over the old one. Should that write fail after the switch, `output_dir` is switched back to the previous publication (or removed, before the first one), so the generation file and the served output never disagree; only if the switch back fails too is the mismatch reported.
 
-The copy preserves symbolic links as links (never following them, so a link back to an ancestor cannot recurse); where a link cannot be created (Windows without the privilege) it is skipped with a warning.
+The copy preserves symbolic links as links (never following them, so a link back to an ancestor cannot recurse). A relative link whose target lies outside the staged tree would resolve elsewhere from the published copy, so it is skipped with a warning rather than rewritten to an absolute host path; so is a link that cannot be created (Windows without the privilege).
 
 The cold build is published as generation `0` before the replacement starts. A failed rebuild publishes nothing: `output_dir` and the generation keep naming the last successful output. The previous published directory is kept (a request may still be reading it); older ones are deleted after each publication, and the whole session directory when the session ends. A provider polls `generation_file`, re-resolves `output_dir` once it changes (never caching its resolved target), serves only from `output_dir` and reloads its clients; it never reads the staging tree.
 

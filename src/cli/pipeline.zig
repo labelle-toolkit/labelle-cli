@@ -178,6 +178,21 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", target_name });
     defer allocator.free(target_dir);
 
+    // `labelle run --watch`: claim the session FIRST, before the progress
+    // reporter, the prebuild steps, the install or the `labelle.lock` write
+    // touch anything a running session owns, so a second session for the
+    // same target is refused having changed nothing (`watch.SessionLock`).
+    var session_lock: ?@import("watch.zig").SessionLock = if (parsed_args.run_watch)
+        @import("watch.zig").SessionLock.acquire(allocator, try std.fs.path.join(hook_arena, &.{ project_root, ".labelle", ".watch", target_name })) catch |err| {
+            // `WatchSessionActive` printed its own diagnostic (the owner's
+            // PID); anything else is reported for what it is.
+            if (err != error.WatchSessionActive) std.debug.print("labelle: run --watch: could not claim the watch session lock ({s})\n", .{@errorName(err)});
+            return 1;
+        }
+    else
+        null;
+    defer if (session_lock) |*lock| lock.release();
+
     // One event source, three access modes: NDJSON on stdout
     // (`--progress=json`), the atomically-rewritten status file (all
     // modes; read by `labelle status` + studio), and a live indicator on
@@ -260,19 +275,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const providers = planned.providers;
     const target = planned.target;
     const hook_plans = planned.hook_plans;
-
-    // `labelle run --watch`: claim the session before anything is built, so
-    // a second session for the same target is refused before it touches the
-    // first one's staging tree or published output (`watch.SessionLock`).
-    var session_lock: ?@import("watch.zig").SessionLock = if (parsed_args.run_watch)
-        @import("watch.zig").SessionLock.acquire(allocator, try std.fs.path.join(hook_arena, &.{ project_root, ".labelle", ".watch", target_name })) catch |err| {
-            if (err != error.WatchSessionActive) std.debug.print("labelle: run --watch: could not claim the session ({s})\n", .{@errorName(err)});
-            if (reporter) |r| r.finishFailed(1, "another watch session is running");
-            return 1;
-        }
-    else
-        null;
-    defer if (session_lock) |*lock| lock.release();
 
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
