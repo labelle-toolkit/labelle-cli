@@ -46,6 +46,10 @@ pub const Group = struct {
     /// group, so `-pid` is the group). Windows: its job object handle.
     /// Zero is a free slot.
     slots: [max_children]std.atomic.Value(usize) = [_]std.atomic.Value(usize){.init(0)} ** max_children,
+    /// Bumped each time a slot is taken: a `Handle` names one registration,
+    /// so a kill aimed at a child already reaped never reaches the child
+    /// registered in its slot since (cli#478). Guarded by `mutex`.
+    generations: [max_children]u64 = [_]u64{0} ** max_children,
     cancelled: std.atomic.Value(bool) = .init(false),
     /// A stop forwarded to the group (`forward`), latched: `Stop` + 1, or
     /// 0. A child registered AFTER the stop arrived — while the session was
@@ -69,14 +73,18 @@ pub const Group = struct {
         }
     }
 
-    fn register(self: *Group, io: std.Io, id: usize) error{ Canceled, TooManyChildren }!usize {
+    /// One registration: a slot and the generation it held then.
+    pub const Handle = struct { index: usize, generation: u64 };
+
+    fn register(self: *Group, io: std.Io, id: usize) error{ Canceled, TooManyChildren }!Handle {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.cancelled.load(.seq_cst)) return error.Canceled;
         for (&self.slots, 0..) |*slot, i| {
             if (slot.load(.seq_cst) == 0) {
+                self.generations[i] +%= 1;
                 slot.store(id, .seq_cst);
-                return i;
+                return .{ .index = i, .generation = self.generations[i] };
             }
         }
         return error.TooManyChildren;
@@ -146,10 +154,21 @@ pub const Group = struct {
         if (self.live() != 0) _ = self.killLive();
     }
 
-    /// Kill the tree registered in `index`, if it still is (error paths).
-    fn killSlot(self: *Group, index: usize) void {
-        const id = self.slots[index].load(.seq_cst);
-        if (id != 0) signalTree(id, .kill);
+    /// Kill the tree `handle` registered, if it still is registered: a
+    /// slot freed since, or taken by another child, is left alone (cli#478).
+    /// Under `mutex`, so the slot cannot be freed and re-taken between the
+    /// check and the signal. `mark`, when given, is set before the signal
+    /// (so whoever sees the child die sees it too). Returns whether it
+    /// signalled.
+    fn killSlot(self: *Group, io: std.Io, handle: Handle, mark: ?*std.atomic.Value(bool)) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.generations[handle.index] != handle.generation) return false;
+        const id = self.slots[handle.index].load(.seq_cst);
+        if (id == 0) return false;
+        if (mark) |m| m.store(true, .release);
+        signalTree(id, .kill);
+        return true;
     }
 
     fn killLive(self: *Group) usize {
@@ -212,11 +231,11 @@ fn endTree(id: usize) void {
 pub const Supervised = struct {
     child: std.process.Child,
     group: ?*Group,
-    slot: usize = 0,
+    slot: Group.Handle = .{ .index = 0, .generation = 0 },
 
     pub fn wait(self: *Supervised, io: std.Io) !std.process.Child.Term {
         const term = self.child.wait(io);
-        if (self.group) |g| g.unregister(io, self.slot);
+        if (self.group) |g| g.unregister(io, self.slot.index);
         self.group = null;
         return term;
     }
@@ -224,7 +243,7 @@ pub const Supervised = struct {
     /// Kill and reap (error paths).
     pub fn abort(self: *Supervised, io: std.Io) void {
         if (self.child.id != null) self.child.kill(io);
-        if (self.group) |g| g.unregister(io, self.slot);
+        if (self.group) |g| g.unregister(io, self.slot.index);
         self.group = null;
     }
 };
@@ -233,6 +252,12 @@ pub const Supervised = struct {
 /// test can make cancellation win that race deterministically. Never set
 /// in production.
 pub var test_after_spawn: ?*const fn (*Group) void = null;
+
+/// Test seam: runs on a captured child's waiting thread after the child
+/// was reaped (its slot released) and before the drain learns it ended,
+/// so a test can register another child in that gap. Never set in
+/// production.
+var test_after_reap: ?*const fn (*Waited) void = null;
 
 /// `std.process.spawn`, supervised by `current` when the thread has one.
 /// A cancelled group refuses the spawn (`error.Canceled`).
@@ -307,10 +332,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOptions) 
 const Waited = struct {
     sup: *Supervised,
     io: std.Io,
-    /// The child's group and slot, read once (the waiting thread clears
-    /// `sup.group` when it reaps).
+    /// The child's group and registration, read once (the waiting thread
+    /// clears `sup.group` when it reaps). A kill through them reaches this
+    /// child only: once it is reaped its slot may hold another (cli#478).
     group: ?*Group,
-    slot: usize,
+    slot: Group.Handle,
     term: ?(std.process.Child.WaitError!std.process.Child.Term) = null,
     done: std.atomic.Value(bool) = .init(false),
     /// Set when the caller's timeout ended the child.
@@ -320,6 +346,9 @@ const Waited = struct {
 
     fn wait(self: *Waited) void {
         self.term = self.sup.wait(self.io);
+        // The child is reaped and its slot free, but `done` is not set yet:
+        // a kill from here on must not reach whoever registers in the slot.
+        if (test_after_reap) |hook| hook(self);
         self.done.store(true, .release);
     }
 
@@ -337,10 +366,12 @@ const Waited = struct {
         }
     }
 
+    /// The deadline passed: kill the child if it is still registered. One
+    /// already reaped did not time out, and its slot is not touched.
     fn expire(self: *Waited) void {
         if (self.done.load(.acquire)) return;
-        self.timed_out.store(true, .release);
-        if (self.group) |g| g.killSlot(self.slot);
+        const g = self.group orelse return;
+        _ = g.killSlot(self.io, self.slot, &self.timed_out);
     }
 };
 
@@ -372,7 +403,7 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
         // An error ends the child's tree so the waiting thread returns.
         // The group and slot saved before the waiter started: it clears
         // `sup.group` itself when it reaps.
-        if (waited.group) |g| g.killSlot(waited.slot);
+        if (waited.group) |g| _ = g.killSlot(io, waited.slot, null);
         waiter.join();
     };
 
@@ -778,4 +809,68 @@ test "supervise: the caller's timeout still ends a supervised captured child (cl
     defer a.free(res.stdout);
     defer a.free(res.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, res.term);
+}
+
+test "supervise: a kill aimed at a reaped child spares the child registered in its slot since (cli#478)" {
+    const io = config.globalIo();
+    var group: Group = .{};
+    // The first child's registration, then its reap.
+    var first = try spawnIn(&group, io, .{ .argv = &.{ test_fixtures.child_exe, "exit:0" }, .stdout = .ignore, .stderr = .inherit });
+    const stale = first.slot;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try first.wait(io));
+    // A second child takes the same slot: a new generation.
+    var second = try spawnIn(&group, io, .{ .argv = &.{ test_fixtures.child_exe, "sleep-exit:1500:9" }, .stdout = .ignore, .stderr = .inherit });
+    try std.testing.expectEqual(stale.index, second.slot.index);
+    try std.testing.expect(stale.generation != second.slot.generation);
+    // The stale kill is refused; the second child runs to its own exit.
+    try std.testing.expect(!group.killSlot(io, stale, null));
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 9 }, try second.wait(io));
+    try std.testing.expectEqual(@as(usize, 0), group.live());
+}
+
+test "supervise: the drain's timeout and error kills never reach a child registered after the reap (cli#478)" {
+    const io = config.globalIo();
+    const a = std.testing.allocator;
+    const Gap = struct {
+        var next: ?Supervised = null;
+        var spawn_err: ?anyerror = null;
+        var killed_by_watchdog = false;
+        var killed_by_cleanup = false;
+        // In the gap between the reap and `done`: another child registers
+        // (in the slot just freed), then the watchdog's expiry and the
+        // error cleanup's kill both fire, as a late thread would.
+        fn hook(w: *Waited) void {
+            const g = w.group.?;
+            next = spawnIn(g, w.io, .{ .argv = &.{ test_fixtures.child_exe, "sleep-exit:1500:9" }, .stdout = .ignore, .stderr = .inherit }) catch |err| {
+                spawn_err = err;
+                return;
+            };
+            w.expire();
+            killed_by_watchdog = w.timed_out.load(.acquire);
+            killed_by_cleanup = g.killSlot(w.io, w.slot, null);
+        }
+    };
+    test_after_reap = Gap.hook;
+    defer test_after_reap = null;
+    var group: Group = .{};
+    current = &group;
+    defer current = null;
+    const res = try runDrained(a, io, .{
+        .argv = &.{ test_fixtures.child_exe, "exit:0" },
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(60_000), .clock = .awake } },
+    }, drain_grace_ms);
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+    // The drained child ended on its own: no timeout reported.
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    try std.testing.expect(Gap.spawn_err == null);
+    var next = Gap.next.?;
+    // The mechanism: the new child reused the reaped child's slot, and
+    // both kills saw the stale registration and did nothing.
+    try std.testing.expectEqual(@as(usize, 0), next.slot.index);
+    try std.testing.expect(!Gap.killed_by_watchdog);
+    try std.testing.expect(!Gap.killed_by_cleanup);
+    // It runs to its own exit, not a kill.
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 9 }, try next.wait(io));
+    try std.testing.expectEqual(@as(usize, 0), group.live());
 }

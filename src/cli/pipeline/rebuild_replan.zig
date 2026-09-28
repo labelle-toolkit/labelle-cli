@@ -55,10 +55,20 @@ pub const Replanner = struct {
     /// Moves the staged lock over `labelle.lock` (`commitLock`). A field
     /// only so a test can make it fail; production never overrides it.
     rename_lock: *const fn ([]const u8, []const u8) anyerror!void = renameLock,
+    /// Test seam: runs in `rollback` right before the lock is compared and
+    /// restored, with the lock's path, so a test can play another command
+    /// writing `labelle.lock` concurrently. Never set in production.
+    before_restore_lock: ?*const fn ([]const u8) void = null,
     /// The project's `labelle.lock` as it was before `commitLock` replaced
     /// it in this rebuild, so `rollback` can put it back: `.absent` when
     /// there was none. `null`: nothing committed in this rebuild.
     lock_before: ?LockBefore = null,
+    /// SHA-256 of the lock `commitLock` put in place in this rebuild:
+    /// `rollback` restores `lock_before` only while `labelle.lock` still
+    /// holds exactly this, so a lock another command wrote since (a watch
+    /// session for another target, `labelle install`) is never overwritten
+    /// by an older one (cli#478). Set with `lock_before`.
+    lock_written: ?[32]u8 = null,
     /// SHA-256 of the `project.labelle` bytes the package cache and the lock
     /// were last brought in line with. `null` until `baseline` or the first
     /// replan. A replan that reads the same bytes skips the install and the
@@ -264,6 +274,13 @@ pub const Replanner = struct {
         };
         const lock = try std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" });
         defer a.free(lock);
+        // What this rebuild is about to put in place, for the rollback's
+        // compare-and-restore.
+        const written = blk: {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io, staged, a, .limited(16 * 1024 * 1024));
+            defer a.free(bytes);
+            break :blk digestBytes(bytes);
+        };
         const before: LockBefore = if (std.Io.Dir.cwd().readFileAlloc(io, lock, a, .limited(16 * 1024 * 1024))) |bytes|
             .{ .bytes = bytes }
         else |err| switch (err) {
@@ -276,6 +293,7 @@ pub const Replanner = struct {
         };
         self.forgetLockBefore();
         self.lock_before = before;
+        self.lock_written = written;
     }
 
     pub fn renameLock(from: []const u8, to: []const u8) anyerror!void {
@@ -285,11 +303,15 @@ pub const Replanner = struct {
     fn forgetLockBefore(self: *Replanner) void {
         if (self.lock_before) |before| if (before == .bytes) self.backing.free(before.bytes);
         self.lock_before = null;
+        self.lock_written = null;
     }
 
     /// Put back the `labelle.lock` a rolled-back rebuild's `commitLock`
     /// replaced: written aside and renamed over it, so a reader never
-    /// sees a partial lock.
+    /// sees a partial lock. Compare-and-restore (cli#478): only while the
+    /// file still holds what this rebuild wrote. Another command that
+    /// rewrote (or removed) it meanwhile wins: its lock is newer than the
+    /// one this rebuild replaced, so it is left in place, with a warning.
     fn restoreLock(self: *Replanner) void {
         const before = self.lock_before orelse return;
         defer self.forgetLockBefore();
@@ -297,6 +319,16 @@ pub const Replanner = struct {
         const a = self.backing;
         const lock = std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" }) catch return;
         defer a.free(lock);
+        if (self.before_restore_lock) |hook| hook(lock);
+        const still_ours = if (self.lock_written) |written| blk: {
+            const now = std.Io.Dir.cwd().readFileAlloc(io, lock, a, .limited(16 * 1024 * 1024)) catch break :blk false;
+            defer a.free(now);
+            break :blk std.mem.eql(u8, &digestBytes(now), &written);
+        } else true;
+        if (!still_ours) {
+            std.debug.print("labelle: labelle.lock changed since this rebuild wrote it; keeping the newer lock instead of rolling it back\n", .{});
+            return;
+        }
         switch (before) {
             .absent => std.Io.Dir.cwd().deleteFile(io, lock) catch |err| switch (err) {
                 error.FileNotFound => {},
