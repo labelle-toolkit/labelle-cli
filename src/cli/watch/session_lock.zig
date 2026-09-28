@@ -109,7 +109,18 @@ fn openRegular(lock_path: []const u8) !std.Io.File {
     const io = config.globalIo();
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
-        const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false }) catch |err| switch (err) {
+        // Windows: Zig 0.16 opens a no-follow handle (the reparse point
+        // itself) without synchronous I/O, so its reads panic; the entry is
+        // checked with a no-follow stat instead, then opened normally.
+        // POSIX: O_NOFOLLOW, then the handle's own stat.
+        if (is_windows) {
+            const st = std.Io.Dir.cwd().statFile(io, lock_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (st) |entry| if (entry.kind != .file) return notRegular(lock_path);
+        }
+        const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write, .follow_symlinks = is_windows, .allow_directory = false }) catch |err| switch (err) {
             error.FileNotFound => {
                 return std.Io.Dir.cwd().createFile(io, lock_path, .{ .read = true, .truncate = false, .exclusive = true }) catch |create_err| switch (create_err) {
                     error.PathAlreadyExists => continue,
@@ -135,7 +146,7 @@ fn notRegular(lock_path: []const u8) error{WatchLockNotRegular} {
 /// The PID a lock file records, read without taking the lock.
 fn readOwner(lock_path: []const u8, buf: []u8) ?u64 {
     const io = config.globalIo();
-    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .follow_symlinks = false, .allow_directory = false }) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .follow_symlinks = is_windows, .allow_directory = false }) catch return null;
     defer file.close(io);
     const n = file.readPositionalAll(io, buf, pid_offset) catch return null;
     return parseOwner(buf[0..n]);
