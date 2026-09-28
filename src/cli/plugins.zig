@@ -148,7 +148,7 @@ pub fn resolvePluginDir(
 ) ![]const u8 {
     if (dep.isLocal())
         return std.fs.path.resolve(allocator, &.{ project_dir, dep.localPath() });
-    return asm_cache.resolveRemotePluginDir(allocator, dep.repo, dep.version);
+    return @import("plugin_slot.zig").resolveRemotePlugin(allocator, dep);
 }
 
 /// A single row of the `labelle plugins` table. Pure data so the renderer
@@ -268,6 +268,7 @@ const expect = @import("zspec").expect;
 
 test {
     @import("zspec").runAll(@This());
+    _ = @import("plugin_slot.zig");
 }
 
 fn writeManifest(dir: std.Io.Dir, body: []const u8) !void {

@@ -85,6 +85,10 @@ pub const PluginDep = struct {
     name: []const u8,
     repo: []const u8 = "",
     version: []const u8 = "",
+    /// Directory inside the fetched `.repo` archive that holds the plugin
+    /// (assembler#771), e.g. `"plugins/debug"` for the assembler's debug
+    /// overlay. Empty = the repo root. See `plugin_slot.zig`.
+    subdir: []const u8 = "",
     /// Game states this plugin runs in. Empty = all states (plugin default).
     states: []const []const u8 = &.{},
 
