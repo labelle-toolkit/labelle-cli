@@ -325,12 +325,16 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
         assert len(ids) == len(set(ids)), ids
         return {c["id"]: c for c in doc["capabilities"]}, ids, result
 
-    # `--core-only`: the core's own capability alone, and no provider runs.
+    # `--core-only`: the core's own capabilities alone (the managed Zig and
+    # the optional managed Python; no target's toolchain, which is its
+    # provider's to report), and no provider runs.
     runs = (len(invocations("alpha-pkg")), len(invocations("beta-pkg")))
     caps, ids, core_only = report(capability("alpha-cap"), capability("beta-cap"), "--core-only")
-    assert len(ids) == 1 and caps[ids[0]]["items"], ids
+    assert ids == ["zig", "python"] and all(caps[i]["items"] for i in ids), ids
+    assert caps["zig"]["required"] is True and caps["python"]["required"] is False, caps
     assert "labelle alpha doctor" not in core_only.stderr, core_only.stderr
     assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == runs, "--core-only ran a provider"
+    core_ids = ids
     core_id = ids[0]
 
     # A valid report and an invalid one: the valid capability is kept as the
@@ -338,7 +342,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     # synthetic id `provider:<package>`, carrying the error. `--json` reached
     # both.
     caps, ids, mixed = report(capability("alpha-cap") + "\n", "{not json")
-    assert ids == [core_id, "alpha-cap", "provider:beta-pkg"], (ids, mixed.stdout, mixed.stderr)
+    assert ids == core_ids + ["alpha-cap", "provider:beta-pkg"], (ids, mixed.stdout, mixed.stderr)
     assert caps["alpha-cap"]["ok"] is True and caps["alpha-cap"]["items"][0]["detail"] == "probe", caps
     beta = caps["provider:beta-pkg"]
     assert beta["ok"] is False and beta["required"] is True, beta
@@ -366,20 +370,20 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     control = subprocess.run([cli, "alpha", "doctor"], cwd=project, env=dict(env, **noise), text=True, capture_output=True, timeout=600)
     assert control.returncode == 0 and "PROBE-BUILD-STDOUT-NOISE" in control.stdout, (control.returncode, control.stdout, control.stderr)
     caps, ids, noisy = report(capability("alpha-cap"), capability("beta-cap"), extra_env=noise)
-    assert ids == [core_id, "alpha-cap", "beta-cap"], ids
+    assert ids == core_ids + ["alpha-cap", "beta-cap"], ids
     assert "PROBE-BUILD-STDOUT-NOISE" not in noisy.stdout and "PROBE-BUILD-STDOUT-NOISE" in noisy.stderr, (noisy.stdout, noisy.stderr)
 
     # A provider that fails after a report claiming ok, beside one that
     # prints nothing: both are failed capabilities, and the document stands.
     caps, ids, _ = report(capability("alpha-cap"), None, extra_env={"PROVIDER_PROBE_FAIL_PACKAGE": "alpha-pkg"})
-    assert ids == [core_id, "alpha-cap", "provider:beta-pkg"], ids
+    assert ids == core_ids + ["alpha-cap", "provider:beta-pkg"], ids
     assert caps["alpha-cap"]["ok"] is False, caps
     assert caps["alpha-cap"]["items"][-1]["detail"] == "exited 7 although its report says ok", caps
     assert caps["provider:beta-pkg"]["ok"] is False and "printed nothing" in caps["provider:beta-pkg"]["items"][0]["detail"], caps
 
     # Two providers reporting one id: a single failed entry naming both.
     caps, ids, dup_run = report(capability("shared-cap"), capability("shared-cap"))
-    assert ids == [core_id, "shared-cap"], ids
+    assert ids == core_ids + ["shared-cap"], ids
     dup = caps["shared-cap"]
     assert dup["ok"] is False, dup
     assert "'alpha-pkg' and 'beta-pkg'" in dup["items"][0]["detail"], dup
@@ -388,20 +392,20 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
 
     # A provider reporting the core's id owns it: the core's entry gives way.
     caps, ids, _ = report(capability(core_id), capability("beta-cap"))
-    assert ids == [core_id, "beta-cap"], ids
+    assert ids == core_ids + ["beta-cap"], ids
     assert caps[core_id]["items"][0]["detail"] == "probe", caps[core_id]
     # A declared package named like the core's capability id that never ran
     # (remote, unpinned, not installed: a WARN) cannot displace the core's
     # entry: its synthetic id is namespaced.
     write_project([f'.{{ .name = "{core_id}", .repo = "example/{core_id}", .version = "1.0.0" }}'])
     caps, ids, shadow = report(capability("alpha-cap"), capability("beta-cap"))
-    assert ids == [core_id, "alpha-cap", "beta-cap", f"provider:{core_id}"], ids
+    assert ids == core_ids + ["alpha-cap", "beta-cap", f"provider:{core_id}"], ids
     assert caps[core_id]["items"] and caps[core_id]["items"][0]["id"] != "provider-doctor", caps[core_id]
     assert caps[f"provider:{core_id}"]["required"] is False, caps
     assert f"1 warning(s) (provider:{core_id})" in shadow.stderr, shadow.stderr
     write_project()
     # Outside a project the document is the core's alone.
     lone_json = run("--json", cwd=outside)
-    assert [c["id"] for c in json.loads(lone_json.stdout)["capabilities"]] == [core_id], lone_json.stdout
+    assert [c["id"] for c in json.loads(lone_json.stdout)["capabilities"]] == core_ids, lone_json.stdout
 
     print(f"provider doctor e2e: {checks} invocations OK")

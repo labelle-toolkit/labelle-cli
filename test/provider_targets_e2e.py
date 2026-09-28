@@ -173,20 +173,30 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
         assert NO_PROVIDER.format(t="wasm") in refused.stderr, refused.stderr
         assert "(registry:" not in refused.stderr, "a registry owner was invented"
         untouched(refused, "wasm")
-    # The legacy subcommands request the same target and fail the same way.
-    for args in (("wasm", "serve", "--no-open"), ("wasm", "export"), ("wasm", "serve", "--no-build"),
-                 ("ios", "build")):
+    # The legacy subcommand requests the same target and fails the same way.
+    refused = run("ios", "build", code=1)
+    assert NO_PROVIDER.format(t="ios") in refused.stderr, refused.stderr
+    untouched(refused, "ios")
+    # `android` (cli#405) and the legacy `wasm serve|export` (RFC cli#466 PR
+    # B) are no built-ins any more: each is a provider namespace like any
+    # other, so with no package declaring it the word is an unknown command
+    # and nothing is generated (test/provider_android_like_e2e.py covers the
+    # registry hint).
+    for args in (("android", "build"), ("wasm", "serve", "--no-open"), ("wasm", "export"),
+                 ("wasm", "serve", "--no-build")):
         refused = run(*args, code=1)
-        expected = {"wasm": "wasm", "ios": "ios"}[args[0]]
-        assert NO_PROVIDER.format(t=expected) in refused.stderr, (args, refused.stderr)
-        untouched(refused, expected)
-    # `android` is no built-in any more (cli#405): it is a provider namespace
-    # like any other, so with no package declaring it the word is an unknown
-    # command (test/provider_android_like_e2e.py covers the registry hint).
-    refused = run("android", "build", code=1)
-    assert "labelle: unknown command 'android'" in refused.stderr, refused.stderr
-    assert NO_PROVIDER.format(t="android") not in refused.stderr, refused.stderr
-    untouched(refused, "android")
+        assert f"labelle: unknown command '{args[0]}'" in refused.stderr, (args, refused.stderr)
+        assert NO_PROVIDER.format(t=args[0]) not in refused.stderr, (args, refused.stderr)
+        untouched(refused, args[0])
+    # `--docker` builds the core target only (RFC cli#466 D5): a provider
+    # target is refused before resolution, so before the no-provider verdict
+    # and before anything is installed or generated.
+    for args in (("build", "--docker", "--platform=wasm"), ("run", "--docker", "--platform=probe-target"),
+                 ("generate", "--docker", "--platform=probe-target")):
+        refused = run(*args, code=1)
+        assert "--docker builds the `desktop` target only" in refused.stderr, (args, refused.stderr)
+        assert NO_PROVIDER.format(t=args[2].split("=")[1]) not in refused.stderr, (args, refused.stderr)
+        untouched(refused, args[2].split("=")[1])
     # The project's own declared platform goes through the resolver too.
     declare(platform="wasm")
     refused = run("generate", code=1)
@@ -398,12 +408,6 @@ sys.stdout.write(data)
     shutil.rmtree(home, ignore_errors=True)
     declare(dep)
 
-    # `wasm serve --no-build` installs nothing, so it confirms the target
-    # against the providers discoverable as-is: refused the same way.
-    reset()
-    refused = run("wasm", "serve", "--no-build", code=1)
-    assert NO_PROVIDER.format(t="wasm") in refused.stderr, refused.stderr
-    untouched(refused, "wasm")
     # A provider target without a bundle replacement cannot be bundled.
     provider_manifest.write_text(manifest("fixture", ["probe-target"],
                                           [hook("gen", "generate", "replace", "probe-target"), hook("build", "build", "replace", "probe-target")]))

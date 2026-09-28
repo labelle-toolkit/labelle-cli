@@ -1,15 +1,17 @@
-//! Standalone Python provisioning for the wasm toolchain.
+//! Standalone Python provisioning (`labelle install python`).
 //!
-//! bgfx→wasm builds need Python: emsdk's activation can't populate the
-//! emscripten sysroot without it, and `emcc` itself is a Python script (its
-//! shebang is `env python3`). A typical Windows box has no Python (only the
-//! Store stub); macOS usually ships `python3`, but a bare one may not.
+//! The core runs no Python itself, but what it spawns may: a `.prebuild`
+//! step (`.run = .{ "python3", ... }` is the documented example), and a
+//! provider's commands and hooks, such as a toolchain a provider provisions
+//! whose tools are Python scripts (RFC cli#466 D2). A typical Windows box
+//! has no Python (only the Store stub); macOS usually ships `python3`, but a
+//! bare one may not.
 //!
 //! We ship ONE full `python-build-standalone` distro into `~/.labelle/python/`
-//! and put it on the build env's PATH — it drives BOTH emsdk activation and
-//! emcc. (The python.org *embeddable* distro is smaller but its `._pth`
-//! sys.path isolation breaks emcc's `from tools import …`; verified during the
-//! WI-0 spike — see RFC-windows-install.md.)
+//! and `autoWireEnv` puts it on this process's PATH, so every child the CLI
+//! spawns afterwards resolves `python3`. A full distro, not the python.org
+//! *embeddable* one: that one's `._pth` sys.path isolation breaks tools that
+//! import their own packages (see RFC-windows-install.md).
 //!
 //! Windows + macOS supported; the macOS path is written but not yet run on a
 //! real Mac. Mirrors `zig_provision.zig`.
@@ -92,8 +94,8 @@ pub fn findPythonExe(a: std.mem.Allocator) ?[]const u8 {
 }
 
 /// True if the managed interpreter exists AND runs (`--version` exit 0).
-/// The validated form of `findPythonExe` for verdict paths (doctor, the wasm
-/// preflight): a partial extract that left the binary behind reports NOT ok
+/// The validated form of `findPythonExe` for verdict paths (doctor, the
+/// provider-tool wiring): a partial extract that left the binary behind reports NOT ok
 /// here, steering the user to `labelle install python`, whose provisioner
 /// detects the broken install and reprovisions.
 pub fn managedPythonOk(gpa: std.mem.Allocator) bool {
@@ -104,12 +106,11 @@ pub fn managedPythonOk(gpa: std.mem.Allocator) bool {
     return runOk(a, &.{ exe, "--version" });
 }
 
-/// True if a system Python usable by the wasm toolchain runs (exit 0).
-/// On non-Windows this probes ONLY `python3` — the exact command the emsdk
-/// launcher script and emcc's `env python3` shebang resolve — so the
-/// preflight/doctor verdict reflects the interpreter activation will
-/// actually use (a `python`-only box would pass a laxer probe and then die
-/// inside emsdk). On Windows `emsdk.bat` resolves `python` itself, so both
+/// True if a system Python runs (exit 0). On non-Windows this probes ONLY
+/// `python3` — the command a `.run = .{ "python3", ... }` step and an
+/// `env python3` shebang resolve — so the doctor verdict reflects the
+/// interpreter a spawned tool will actually find (a `python`-only box would
+/// pass a laxer probe). On Windows tools commonly resolve `python`, so both
 /// spellings are accepted there. Running `--version` also distinguishes a
 /// real interpreter from the Windows Store execution-alias stub, which
 /// prints "Python was not found" and exits non-zero.
@@ -123,15 +124,6 @@ pub fn systemPythonOk(gpa: std.mem.Allocator) bool {
     return runOk(a, &.{ "python3", "--version" });
 }
 
-/// True if a Python usable for the wasm build (emsdk activation + emcc) is
-/// available — the managed one under `~/.labelle/python`, or a working system
-/// `python`/`python3` on PATH. Lets the wasm build fail fast with an
-/// actionable message instead of dying deep in emsdk activation.
-pub fn isAvailable(gpa: std.mem.Allocator) bool {
-    if (managedPythonOk(gpa)) return true;
-    return systemPythonOk(gpa);
-}
-
 /// Ensure a standalone Python exists, downloading it if the platform is
 /// supported.
 pub fn provisionPython(gpa: std.mem.Allocator) Result {
@@ -139,7 +131,7 @@ pub fn provisionPython(gpa: std.mem.Allocator) Result {
         std.debug.print(
             \\
             \\  Managed Python auto-provisioning isn't available for this platform yet.
-            \\  Install Python 3 yourself (emsdk + emcc need it) and ensure
+            \\  Install Python 3 yourself and ensure
             \\  `python3` is on PATH.
             \\
         , .{});
@@ -231,9 +223,9 @@ fn extractArchive(a: std.mem.Allocator, archive: []const u8, py_dir: []const u8)
     return runOk(a, &.{ "tar", "-xzf", archive, "-C", py_dir, "--strip-components=1" });
 }
 
-/// Prepend the provisioned Python's dir to THIS process's PATH so the `zig
-/// build` children (emsdk activation + emcc's `env python3` shebang) resolve
-/// `python3`. No-op when Python isn't provisioned or it's already on PATH.
+/// Prepend the provisioned Python's dir to THIS process's PATH so every
+/// child spawned afterwards (a `.prebuild` step, a provider command or hook,
+/// and the `zig build` children those set up) resolves `python3`. No-op when Python isn't provisioned or it's already on PATH.
 /// (macOS with a system `python3` doesn't need this — it only matters when we
 /// provisioned our own.)
 pub fn autoWireEnv(gpa: std.mem.Allocator) void {
@@ -264,14 +256,15 @@ pub fn autoWireEnv(gpa: std.mem.Allocator) void {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Windows only. Zig's `std.http` package fetch and emsdk activation validate
-/// TLS against the Windows certificate store, which is unpopulated on a fresh
-/// machine — so a clean-box wasm build dies with `CertificateBundleLoadFailure`
-/// (and emsdk's node download with `CERTIFICATE_VERIFY_FAILED`) before any
-/// compilation. Point `SSL_CERT_FILE` — which zig's `Certificate.Bundle.rescan`
-/// and emsdk's Python both honor — at the CA bundle already shipped inside the
-/// provisioned Python (pip's vendored certifi), so every child `zig`/`emsdk`
-/// process (including the nested assembler build) has a trust store. Respects a
+/// Windows only. Zig's `std.http` package fetch and Python's own downloads
+/// validate TLS against the Windows certificate store, which is unpopulated
+/// on a fresh machine — so a clean-box build dies with
+/// `CertificateBundleLoadFailure` (and a Python tool's download with
+/// `CERTIFICATE_VERIFY_FAILED`) before any compilation. Point
+/// `SSL_CERT_FILE` — which zig's `Certificate.Bundle.rescan` and Python both
+/// honor — at the CA bundle already shipped inside the provisioned Python
+/// (pip's vendored certifi), so every child `zig`/Python process (including
+/// the nested assembler build) has a trust store. Respects a
 /// user-set `SSL_CERT_FILE`; no-op if the bundle isn't found.
 fn wireCertBundle(a: std.mem.Allocator, python_root: []const u8) void {
     const env = config.globalEnviron();

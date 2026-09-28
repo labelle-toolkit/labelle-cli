@@ -9,7 +9,6 @@ const bundle = @import("../bundle.zig");
 const args_mod = @import("../args.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
-const provider_hooks = @import("../provider_hooks.zig");
 const provider_targets = @import("../provider_targets.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 
@@ -28,7 +27,7 @@ pub const Resolution = union(enum) {
 /// (docs/provider-targets.md "Resolution")
 /// The target is the core `desktop` or one a pinned provider declares;
 /// nothing else, including the project's own `.platform` and the legacy
-/// `wasm`/`ios` subcommands (no shim, RFC #406 "Migration").
+/// `ios` subcommand (no shim, RFC #406 "Migration").
 /// Ownership needs the providers, and provider discovery runs only
 /// after the assembler's `install` populated the package cache (below,
 /// next to `gateThenInstall`; Codex P1 on #420) — while the target
@@ -84,7 +83,7 @@ pub fn resolve(
     //     so the pinned archives it reads are not held again beside the
     //     authoritative discovery's copies (Codex P2 on #421).
     if (!provisional.is_core) {
-        switch (earlyTargetCheck(allocator, project_root, parsed.*, requested_target, command == .wasm_cmd) catch return .{ .exit = 1 }) {
+        switch (earlyTargetCheck(allocator, project_root, parsed.*, requested_target) catch return .{ .exit = 1 }) {
             .confirmed, .deferred => {},
             .refused => return .{ .exit = 1 },
         }
@@ -104,6 +103,34 @@ pub fn resolve(
     }
 
     return .{ .proceed = .{ .project_root = project_root, .provisional = provisional } };
+}
+
+/// Whether `--docker` must be refused for `requested` (RFC cli#466 D5),
+/// after printing why. The container build is the core target's only: a
+/// provider target's hooks, their environment contributions (contract §2
+/// `env_file`) and the toolchain they provision all live on this host, and
+/// the container sees none of them. Decided from the target NAME alone, so
+/// the refusal lands before the prebuild steps, the install or any
+/// generation, and before the no-provider diagnostic. A malformed name is
+/// left to `resolve`, which reports it.
+pub fn dockerRefused(docker: bool, requested: []const u8) bool {
+    if (!docker) return false;
+    const target = provider_targets.provisional(requested) catch return false;
+    if (target.is_core) return false;
+    std.debug.print(
+        "labelle: --docker builds the `{s}` target only; target '{s}' comes from a provider, whose hooks and toolchain run on this host\n" ++
+            "  build it without --docker (docs/migrating-to-3.0.md)\n",
+        .{ provider_targets.core_target, requested },
+    );
+    return true;
+}
+
+test "dockerRefused: --docker is refused for every provider target, never for the core one" {
+    try std.testing.expect(!dockerRefused(false, "probe-target"));
+    try std.testing.expect(!dockerRefused(true, provider_targets.core_target));
+    try std.testing.expect(dockerRefused(true, "probe-target"));
+    // A malformed name is not decided here: `resolve` reports it.
+    try std.testing.expect(!dockerRefused(true, "Not A Target"));
 }
 
 /// Why `confirmTarget` refused the requested target. The kind survives to
@@ -168,10 +195,9 @@ pub const EarlyVerdict = enum {
 /// tar) — lives on a scratch arena carved from `backing` and freed before
 /// this returns: only the verdict leaves. On the pipeline's long-lived arena
 /// that storage was never reclaimed, so the authoritative discovery after
-/// the install held every pinned provider twice, and a `wasm serve
-/// --no-build` server kept both for its lifetime (Codex P2 on #421).
+/// the install held every pinned provider twice (Codex P2 on #421).
 /// `error.ProviderDiscoveryFailed` after printing the reason.
-pub fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: project_config.ProjectConfig, requested: []const u8, legacy_wasm: bool) !EarlyVerdict {
+pub fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cfg: project_config.ProjectConfig, requested: []const u8) !EarlyVerdict {
     var scratch = std.heap.ArenaAllocator.init(backing);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -181,7 +207,6 @@ pub fn earlyTargetCheck(backing: std.mem.Allocator, project_root: []const u8, cf
         std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
         return error.ProviderDiscoveryFailed;
     };
-    if (legacy_wasm and try refuseKnownLegacyWasmReplacement(a, early.providers, requested)) return .refused;
     if (early.unresolved.len != 0) return .deferred;
     return switch (try confirmTarget(a, project_root, early.providers, requested)) {
         .resolved => .confirmed,
@@ -214,7 +239,7 @@ test "pipeline: the early target check frees its discovery before returning" {
     };
     for (cases) |case| {
         var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        const verdict = try earlyTargetCheck(counting.allocator(), project, cfg, case.target, false);
+        const verdict = try earlyTargetCheck(counting.allocator(), project, cfg, case.target);
         try std.testing.expectEqual(case.verdict, verdict);
         try std.testing.expect(counting.allocations > 0);
         try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
@@ -229,29 +254,4 @@ test "pipeline: each target refusal kind writes its own progress detail" {
     try std.testing.expectEqualStrings("unpinned provider for target", TargetRefusal.unpinned_owner.detail());
     try std.testing.expect(std.mem.indexOf(u8, TargetRefusal.unpinned_owner.detail(), "unpinned") != null);
     try std.testing.expect(std.mem.indexOf(u8, TargetRefusal.no_provider.detail(), "unpinned") == null);
-}
-
-/// Inspect readable declarations without requiring unresolved providers' hook
-/// edges to be plannable. A known replacement is enough to refuse the verb.
-pub fn refuseKnownLegacyWasmReplacement(a: std.mem.Allocator, providers: []const provider_dispatch.Provider, target: []const u8) !bool {
-    for (providers) |*provider| for (provider.meta.hooks) |hook| {
-        if (hook.step == .run and hook.when == .replace and std.mem.eql(u8, hook.target, target)) {
-            const qualified = try std.fmt.allocPrint(a, "{s}/{s}", .{ provider.meta.name, hook.id });
-            defer a.free(qualified);
-            return refuseLegacyWasmReplacement(.{ .replace = .{ .provider = provider, .hook = hook, .qualified = qualified } });
-        }
-    };
-    return false;
-}
-
-/// Legacy wasm verbs share the run phase but have their own arguments and
-/// export semantics. A replacement cannot receive those through hook context.
-pub fn refuseLegacyWasmReplacement(plan: provider_hooks.Plan) bool {
-    const replacement = plan.replace orelse return false;
-    std.debug.print(
-        "labelle: legacy `wasm serve/export` cannot invoke run replacement '{s}'\n" ++
-            "  use the provider commands listed by `labelle help`, or `labelle run/bundle --platform=wasm`.\n",
-        .{replacement.qualified},
-    );
-    return true;
 }

@@ -19,12 +19,12 @@ const python_provision = @import("python_provision.zig");
 
 // Existing platform commands remain reserved until their extraction lands;
 // an extracted one leaves the list and its namespace becomes dispatchable
-// (cli#405).
+// (cli#405, and RFC cli#466 PR B for the legacy browser commands).
 pub const reserved = [_][]const u8{
-    "generate", "build",   "bundle",    "run",       "init",   "add",   "install", "update",
-    "upgrade",  "clean",   "test",      "pack",      "astc",   "audit", "migrate", "check",
-    "plugins",  "doctor",  "assembler", "toolchain", "status", "ios",   "wasm",    "help",
-    "version",  "targets", "providers",
+    "generate", "build",     "bundle",    "run",       "init",   "add",   "install", "update",
+    "upgrade",  "clean",     "test",      "pack",      "astc",   "audit", "migrate", "check",
+    "plugins",  "doctor",    "assembler", "toolchain", "status", "ios",   "help",    "version",
+    "targets",  "providers",
 };
 pub const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
 
@@ -1014,10 +1014,13 @@ test "provider dispatch: cache_dir and env_file reach only a provider whose rang
 }
 
 test "provider dispatch: an extracted platform's namespace is no longer reserved" {
-    // `android` moved into its provider (cli#405): a package may declare the
-    // namespace. The legacy subcommands still built in stay reserved.
-    for (reserved) |name| try std.testing.expect(!std.mem.eql(u8, name, "android"));
-    for ([_][]const u8{ "ios", "wasm", "run", "build", "bundle" }) |kept| {
+    // `android` moved into its provider (cli#405), and the legacy browser
+    // subcommands left the core (RFC cli#466 PR B): a package may declare
+    // either namespace. The legacy subcommand still built in stays reserved.
+    for ([_][]const u8{ "android", "wasm" }) |extracted| {
+        for (reserved) |name| try std.testing.expect(!std.mem.eql(u8, name, extracted));
+    }
+    for ([_][]const u8{ "ios", "run", "build", "bundle" }) |kept| {
         var found = false;
         for (reserved) |name| found = found or std.mem.eql(u8, name, kept);
         try std.testing.expect(found);

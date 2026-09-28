@@ -59,7 +59,7 @@ pub fn run(
             // its progress pipe) lives inside the container.
             if (reporter) |r| r.beginPhaseOrStep(.compile, "docker build");
             std.debug.print("labelle: building via docker...\n", .{});
-            const docker_exit = try docker.runBuild(allocator, target_dir, parsed.platform, parsed_args.docker_target, effective_optimize);
+            const docker_exit = try docker.runBuild(allocator, target_dir, parsed_args.docker_target, effective_optimize);
             if (reporter) |r| r.clearSpinner();
             if (docker_exit != 0) {
                 if (reporter) |r| r.finishFailed(docker_exit, "docker build failed");

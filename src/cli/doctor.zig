@@ -25,8 +25,6 @@ const project_config = @import("project_config.zig");
 const sdl_provision = @import("sdl_provision.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
-const emsdk_toolchain = @import("emsdk_toolchain.zig");
-const emsdk_cache = @import("emsdk_cache.zig");
 const python_provision = @import("python_provision.zig");
 const provider_doctor = @import("provider_doctor.zig");
 const provider_dispatch = @import("provider_dispatch.zig");
@@ -54,72 +52,57 @@ const Check = struct {
 // Inside a project the pinned providers' doctors contribute capabilities of
 // their own (RFC cli#466 D7, `provider_doctor_json.zig`): the core runs them
 // with `--json`, captures their stdout and prints ONE document. A provider
-// capability replaces a core one with the same id.
+// capability replaces a core one with the same id. The core reports only
+// what it owns: the managed Zig (`zig`) and the managed Python (`python`,
+// optional: `.prebuild` steps and provider tools use it). A target's
+// toolchain capability is its provider's to report.
 
 const JsonItem = provider_doctor_json.Item;
 const JsonCapability = provider_doctor_json.Capability;
 
-/// Serialize the core's toolchain capability (zig + python + emsdk/emcc),
-/// with the providers' (when `providers` is set), as the studio's capability
-/// JSON on stdout. The python item is FIXABLE when
-/// managed provisioning supports this platform: `action` carries the exact
-/// command (`labelle install python`) the studio's install flow runs
-/// (cli#291); zig/emsdk stay non-fixable status rows (the studio treats
-/// `ok || !fixable` as satisfied).
-fn emitJsonReport(a: std.mem.Allocator, zig_check: Check, python_check: Check, emsdk_check: Check, providers: ?provider_doctor.Report) !void {
+/// Serialize the core's capabilities (`zig`, `python`), with the providers'
+/// (when `providers` is set), as the studio's capability JSON on stdout. The
+/// python item is FIXABLE when managed provisioning supports this platform:
+/// `action` carries the exact command (`labelle install python`) the
+/// studio's install flow runs (cli#291); zig stays a non-fixable status row
+/// (the studio treats `ok || !fixable` as satisfied).
+fn emitJsonReport(a: std.mem.Allocator, zig_check: Check, python_check: Check, providers: ?provider_doctor.Report) !void {
     var out_buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(config.globalIo(), &out_buf);
-    try writeJsonReport(&w.interface, a, zig_check, python_check, emsdk_check, providers);
+    try writeJsonReport(&w.interface, a, zig_check, python_check, providers);
     try w.interface.flush();
 }
 
 /// Serialize the capability report to `w` (split out for testing). Emits a
 /// single compact JSON line + trailing newline.
-fn writeJsonReport(w: *std.Io.Writer, a: std.mem.Allocator, zig_check: Check, python_check: Check, emsdk_check: Check, providers: ?provider_doctor.Report) !void {
-    // The python item used to proxy the emsdk check (no independent probe
-    // existed); it now carries a REAL interpreter check and, on platforms
-    // with managed provisioning, is fixable via `labelle install python`
-    // (cli#291). ~25 MB = the python-build-standalone install_only archive.
+fn writeJsonReport(w: *std.Io.Writer, a: std.mem.Allocator, zig_check: Check, python_check: Check, providers: ?provider_doctor.Report) !void {
+    // ~25 MB = the python-build-standalone install_only archive.
     const python_fixable = python_provision.managedProvisioningSupported();
-    const items = [_]JsonItem{
-        .{
-            .id = "zig",
-            .name = "Zig toolchain",
-            .ok = zig_check.ok,
-            .fixable = false,
-            .size_mb = 0,
-            .action = null,
-            .detail = zig_check.detail,
-            .hint = zig_check.hint,
-        },
-        .{
-            .id = "python",
-            .name = "Python (wasm: emsdk + emcc)",
-            .ok = python_check.ok,
-            .fixable = python_fixable,
-            .size_mb = if (python_fixable) 25 else 0,
-            .action = if (python_fixable) "labelle install python" else null,
-            .detail = python_check.detail,
-            .hint = python_check.hint,
-        },
-        .{
-            .id = "emsdk",
-            .name = "emsdk toolchain (wasm)",
-            .ok = emsdk_check.ok,
-            .fixable = false,
-            .size_mb = 0,
-            .action = null,
-            .detail = emsdk_check.detail,
-            .hint = emsdk_check.hint,
-        },
-    };
+    const zig_items = [_]JsonItem{.{
+        .id = "zig",
+        .name = "Zig toolchain",
+        .ok = zig_check.ok,
+        .fixable = false,
+        .size_mb = 0,
+        .action = null,
+        .detail = zig_check.detail,
+        .hint = zig_check.hint,
+    }};
+    const python_items = [_]JsonItem{.{
+        .id = "python",
+        .name = python_check_name,
+        .ok = python_check.ok,
+        .fixable = python_fixable,
+        .size_mb = if (python_fixable) 25 else 0,
+        .action = if (python_fixable) "labelle install python" else null,
+        .detail = python_check.detail,
+        .hint = python_check.hint,
+    }};
     const caps = [_]JsonCapability{
-        .{
-            .id = "wasm",
-            .required = true,
-            .ok = zig_check.ok and python_check.ok and emsdk_check.ok,
-            .items = &items,
-        },
+        .{ .id = "zig", .required = true, .ok = zig_check.ok, .items = &zig_items },
+        // Optional: only `.prebuild` steps and provider tools that spawn
+        // Python need it, and a provider that does reports its own need.
+        .{ .id = "python", .required = false, .ok = python_check.ok, .items = &python_items },
     };
     const merged = try provider_doctor_json.aggregate(a, &caps, providers);
     // The stderr summary is derived from the merged document, so the two
@@ -168,7 +151,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     }
 
     // One project root for both halves: the core checks (config, backend,
-    // Zig/emsdk versions) and the provider doctors read the same project.
+    // the Zig version) and the provider doctors read the same project.
     const scope = resolveScope(arena, project_dir);
 
     // Best-effort read of project.labelle to scope what's actually required.
@@ -196,13 +179,12 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     const zig_check = checkZig(arena, scope.dir);
     const python_check = checkPython(arena);
-    const emsdk_check = checkEmsdk(arena, scope.dir);
 
     // `--json`: emit the studio's capability report from the toolchain
     // checks and the provider doctors, and stop — no human report, no SDL
     // provisioning. The python
-    // item is fixable via `labelle install python` (cli#291); zig/emsdk stay
-    // non-fixable status rows (the gate treats non-fixable as satisfied, so
+    // item is fixable via `labelle install python` (cli#291); zig stays a
+    // non-fixable status row (the gate treats non-fixable as satisfied, so
     // it renders their status without offering an install button).
     //
     // Inside a project, and unless `--core-only`, every provider doctor runs
@@ -215,7 +197,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
             try provider_doctor.runForRoot(arena, root, true)
         else
             null;
-        try emitJsonReport(arena, zig_check, python_check, emsdk_check, providers);
+        try emitJsonReport(arena, zig_check, python_check, providers);
         return;
     }
 
@@ -223,7 +205,6 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     try checks.append(arena, zig_check);
     try checks.append(arena, python_check);
-    try checks.append(arena, emsdk_check);
 
     if (needs_sdl) {
         var lib = checkSdl2Lib(arena);
@@ -424,56 +405,32 @@ fn checkOverride(arena: std.mem.Allocator, source: []const u8, path: []const u8,
     };
 }
 
-/// Python for the wasm toolchain: the managed interpreter under
-/// `~/.labelle/python`, or the system one the emsdk launcher actually
-/// resolves (`python3` on non-Windows; `python`/`python3` on Windows —
-/// python_provision.systemPythonOk mirrors activation exactly). Reported
-/// independently of the emsdk check since cli#291 (it used to proxy emsdk).
+/// The name of the Python check, in the human report and the JSON item.
+const python_check_name = "Python (.prebuild steps, provider tools)";
+
+/// Python: the managed interpreter under `~/.labelle/python`, or a system
+/// `python3` (`python`/`python3` on Windows) on PATH. Optional (a WARN,
+/// never a FAIL): the core itself runs no Python; `.prebuild` steps and
+/// provider commands and hooks that spawn it do, and get the managed one on
+/// PATH (RFC cli#466 D2).
 fn checkPython(arena: std.mem.Allocator) Check {
     // `managedPythonOk` RUNS the interpreter (--version), so a half-extracted
     // install reports not-ok instead of faking readiness (PR #291 review).
     if (python_provision.managedPythonOk(arena)) {
         const exe = python_provision.findPythonExe(arena) orelse unreachable;
-        return .{ .name = "Python (wasm)", .ok = true, .detail = std.fmt.allocPrint(arena, "managed: {s}", .{exe}) catch "managed" };
+        return .{ .name = python_check_name, .ok = true, .required = false, .detail = std.fmt.allocPrint(arena, "managed: {s}", .{exe}) catch "managed" };
     }
     if (python_provision.systemPythonOk(arena)) {
-        return .{ .name = "Python (wasm)", .ok = true, .detail = "system python3 on PATH" };
+        return .{ .name = python_check_name, .ok = true, .required = false, .detail = "system python3 on PATH" };
     }
     return .{
-        .name = "Python (wasm)",
+        .name = python_check_name,
         .ok = false,
+        .required = false,
         .hint = if (python_provision.managedProvisioningSupported())
             "run `labelle install python` (managed, ~25 MB) or install Python 3 yourself"
         else
             "install Python 3 and ensure `python3` is on PATH",
-    };
-}
-
-fn checkEmsdk(arena: std.mem.Allocator, project_dir: []const u8) Check {
-    // Post-cli#283 the CLI owns emsdk/emcc for wasm builds: it resolves +
-    // fetches + verifies + ACTIVATES a managed emsdk on demand, so "emcc on
-    // PATH" is no longer required. Report the managed toolchain the next wasm
-    // build would use, without triggering a fetch/activate.
-    if (emsdk_toolchain.lookupEnvOverride(arena) catch null) |path| {
-        return .{ .name = "emsdk toolchain (wasm)", .ok = true, .detail = std.fmt.allocPrint(arena, "LABELLE_EMSDK override: {s}", .{path}) catch "LABELLE_EMSDK override" };
-    }
-    const resolved = emsdk_toolchain.resolveRequiredVersion(arena, project_dir) catch {
-        return .{ .name = "emsdk toolchain (wasm)", .ok = false, .hint = "could not resolve the required emsdk version" };
-    };
-    const emcc = emsdk_cache.emccPath(arena, resolved.version) catch {
-        return .{ .name = "emsdk toolchain (wasm)", .ok = false, .hint = "could not compute the managed emcc path" };
-    };
-    const activated = blk: {
-        std.Io.Dir.cwd().access(config.globalIo(), emcc, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (activated) {
-        return .{ .name = "emsdk toolchain (wasm)", .ok = true, .detail = std.fmt.allocPrint(arena, "managed emsdk {s} ({s})", .{ resolved.version, resolved.source.label() }) catch "managed emsdk" };
-    }
-    return .{
-        .name = "emsdk toolchain (wasm)",
-        .ok = true,
-        .detail = std.fmt.allocPrint(arena, "managed emsdk {s} — will fetch + activate on first wasm build", .{resolved.version}) catch "managed emsdk (not yet activated)",
     };
 }
 
@@ -753,17 +710,15 @@ test "doctor: a project.labelle without .backend is checked as the default backe
 /// labelle-studio's ToolchainGate (src/services/doctor.ts zod schema). Pin
 /// its shape so a drift breaks CI here, not the studio at runtime.
 pub const JsonReportSpec = struct {
-    test "doctor --json emits a wasm capability with zig+python+emsdk items" {
+    test "doctor --json emits the core's zig and python capabilities, python optional" {
         const testing = std.testing;
         var buf: [3072]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        // zig ok, python NOT ok, emsdk ok → capability ok must be the AND (false).
         const zig_check = Check{ .name = "Zig toolchain", .ok = true, .detail = "managed zig 0.16.0" };
-        const python_check = Check{ .name = "Python (wasm)", .ok = false, .hint = "run `labelle install python`" };
-        const emsdk_check = Check{ .name = "emsdk", .ok = true, .detail = "activated" };
+        const python_check = Check{ .name = python_check_name, .ok = false, .required = false, .hint = "run `labelle install python`" };
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        try writeJsonReport(&w, arena.allocator(), zig_check, python_check, emsdk_check, null);
+        try writeJsonReport(&w, arena.allocator(), zig_check, python_check, null);
         const line = w.buffered();
 
         // Exactly one line (the studio extractor is line-based).
@@ -772,27 +727,27 @@ pub const JsonReportSpec = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
         defer parsed.deinit();
         const caps = parsed.value.object.get("capabilities").?.array;
-        try testing.expectEqual(@as(usize, 1), caps.items.len);
+        // The core names no target's capability: that is its provider's.
+        try testing.expectEqual(@as(usize, 2), caps.items.len);
 
-        const wasm = caps.items[0].object;
-        try testing.expectEqualStrings("wasm", wasm.get("id").?.string);
-        try testing.expectEqual(true, wasm.get("required").?.bool);
-        try testing.expectEqual(false, wasm.get("ok").?.bool); // AND of item states
-
-        const items = wasm.get("items").?.array;
-        try testing.expectEqual(@as(usize, 3), items.items.len);
-
-        const zig_item = items.items[0].object;
+        const zig = caps.items[0].object;
+        try testing.expectEqualStrings("zig", zig.get("id").?.string);
+        try testing.expectEqual(true, zig.get("required").?.bool);
+        try testing.expectEqual(true, zig.get("ok").?.bool);
+        const zig_item = zig.get("items").?.array.items[0].object;
         try testing.expectEqualStrings("zig", zig_item.get("id").?.string);
-        try testing.expectEqual(true, zig_item.get("ok").?.bool);
         try testing.expectEqual(false, zig_item.get("fixable").?.bool);
         try testing.expectEqualStrings("managed zig 0.16.0", zig_item.get("detail").?.string);
         try testing.expectEqual(std.json.Value.null, std.meta.activeTag(zig_item.get("hint").?));
 
-        // The python item carries its OWN check now (it used to proxy emsdk)
-        // and is fixable on managed-provisioning platforms with the exact
-        // install command as its action (cli#291).
-        const py_item = items.items[1].object;
+        // Python is optional: a missing one fails its own capability, which
+        // is not required, and is fixable on managed-provisioning platforms
+        // with the exact install command as its action (cli#291).
+        const python = caps.items[1].object;
+        try testing.expectEqualStrings("python", python.get("id").?.string);
+        try testing.expectEqual(false, python.get("required").?.bool);
+        try testing.expectEqual(false, python.get("ok").?.bool);
+        const py_item = python.get("items").?.array.items[0].object;
         try testing.expectEqualStrings("python", py_item.get("id").?.string);
         try testing.expectEqual(false, py_item.get("ok").?.bool);
         const py_fixable = python_provision.managedProvisioningSupported();
@@ -802,10 +757,11 @@ pub const JsonReportSpec = struct {
             try testing.expectEqual(@as(i64, 25), py_item.get("size_mb").?.integer);
         }
         try testing.expectEqualStrings("run `labelle install python`", py_item.get("hint").?.string);
+    }
 
-        const emsdk_item = items.items[2].object;
-        try testing.expectEqualStrings("emsdk", emsdk_item.get("id").?.string);
-        try testing.expectEqual(true, emsdk_item.get("ok").?.bool);
-        try testing.expectEqual(false, emsdk_item.get("fixable").?.bool);
+    test "doctor: a missing Python is a warning, never a failure" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expect(!checkPython(arena.allocator()).required);
     }
 };
