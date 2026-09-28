@@ -100,9 +100,13 @@ pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cf
     if (cfg.plugins.len > 0) {
         try w.writeAll("    .plugins = .{\n");
         for (cfg.plugins) |plugin| {
-            try w.print("        .{{ .name = \"{s}\", .repo = \"{s}\", .version = \"{s}\" }},\n", .{
+            try w.print("        .{{ .name = \"{s}\", .repo = \"{s}\", .version = \"{s}\"", .{
                 plugin.name, plugin.repo, plugin.version,
             });
+            // Only when set, so every lock written before assembler#771
+            // stays byte-identical.
+            if (plugin.subdir.len > 0) try w.print(", .subdir = \"{f}\"", .{std.zig.fmtString(plugin.subdir)});
+            try w.writeAll(" },\n");
         }
         try w.writeAll("    },\n");
     }
@@ -200,7 +204,7 @@ fn resolveGuiPluginDir(
         // Remote plugin — resolve from the package cache the same way
         // `cache.resolvePlugin` does. `labelle install` ran before the
         // lock file is written, so the plugin is already cached here.
-        return asm_cache.resolveRemotePluginDir(allocator, dep.repo, dep.version) catch null;
+        return @import("plugin_slot.zig").resolveRemotePlugin(allocator, dep) catch null;
     }
     return null;
 }
@@ -778,4 +782,26 @@ test "writeLockFile: never writes through a symbolic link at the lock path (cli#
     const victim = try tmp.dir.readFileAlloc(io, "victim.txt", alloc, .limited(64));
     defer alloc.free(victim);
     try std.testing.expectEqualStrings("precious", victim);
+}
+
+test "writeLockFile: a .subdir pin is recorded, a plain pin stays byte-identical (assembler#771)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stampedLockDir(alloc, &tmp, "0.0.1");
+    defer alloc.free(dir);
+
+    const plugins = [_]project_config.PluginDep{
+        .{ .name = "debug", .repo = "github.com/labelle-toolkit/labelle-assembler", .version = "0.118.0", .subdir = "plugins/debug" },
+        .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "0.5.0" },
+    };
+    try writeLockFile(alloc, dir, .{ .name = "t", .plugins = &plugins });
+    const after = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after,
+        \\.{ .name = "debug", .repo = "github.com/labelle-toolkit/labelle-assembler", .version = "0.118.0", .subdir = "plugins/debug" },
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, after,
+        \\.{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "0.5.0" },
+    ) != null);
 }
