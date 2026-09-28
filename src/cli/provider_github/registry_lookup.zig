@@ -666,6 +666,17 @@ test "provider registry lookup: a local source is compared in the lock's project
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
 }
 
+test "provider registry lookup: a local source on another Windows drive is kept absolute" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `std.fs.path.relative` returns the target itself when no relative path
+    // exists (it has no DifferentDisk error): the lock keeps it absolute.
+    try std.testing.expectEqualStrings("D:/registry/providers.json", try projectSource(a, "C:\\work\\game", "D:\\registry\\providers.json"));
+    try std.testing.expectEqualStrings("../registry/providers.json", try projectSource(a, "C:\\work\\game", "C:\\work\\registry\\providers.json"));
+}
+
 const fork_url = "https://example.test/fork/providers.json";
 
 const contract_doc = "{\"schema_version\":3,\"defaults\":[],\"providers\":[" ++
