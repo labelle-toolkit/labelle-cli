@@ -16,6 +16,7 @@ const astc_cmd = @import("../../astc/cmd.zig");
 const provider_contract = @import("../provider_contract.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_hooks = @import("../provider_hooks.zig");
+const provider_env = @import("../provider_env.zig");
 const Context = @import("context.zig").Context;
 const gateThenInstall = @import("install.zig").gateThenInstall;
 
@@ -136,7 +137,18 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         // early-return so the generate-then-build path is covered too. Best-effort +
         // idempotent; on failure the build still surfaces the clear #492 guidance.
         // The PINNED version keeps activation deterministic.
-        if (!parsed_args.docker and parsed.platform == .wasm) {
+        //
+        // Unless a provider hook of this build already contributed the
+        // toolchain root through its `env_file` (contract §2, wire 1.3.0+):
+        // that provider owns the toolchain the build then consumes, and
+        // activating the fetched package too would install a second copy
+        // (~1 GB) nothing uses. Projects without such a provider keep this
+        // path unchanged.
+        const provider_toolchain = !parsed_args.docker and parsed.platform == .wasm and hook_site.env.sets(toolchain_root_var);
+        if (provider_toolchain) {
+            std.debug.print("labelle: {s} comes from a provider hook; skipping the core Python preflight and fetched-toolchain activation\n", .{toolchain_root_var});
+        }
+        if (coreActivatesToolchain(parsed_args.docker, parsed.platform == .wasm, &hook_site.env)) {
             // Python preflight (cli#291): emsdk activation and emcc itself (an
             // `env python3` script) both need a working interpreter. Fail fast
             // with the exact fix instead of dying deep inside emsdk activation
@@ -161,6 +173,41 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         if (code != 0) return code;
     }
     return null;
+}
+
+/// The variable the fetched-toolchain activation exists to supply: the
+/// generated build's link step reads it, and so do the backends. A provider
+/// hook that contributes it owns the toolchain.
+pub const toolchain_root_var = "EMSDK";
+
+/// Whether the core runs its Python preflight and activates the fetched
+/// toolchain package after generation: a host (not docker) wasm build whose
+/// provider hooks did not contribute `toolchain_root_var` (`contributed` is
+/// the build's accumulated `env_file` environment at that point: the
+/// `before generate` hooks').
+pub fn coreActivatesToolchain(docker: bool, wasm: bool, contributed: *const provider_env.Accumulator) bool {
+    return !docker and wasm and !contributed.sets(toolchain_root_var);
+}
+
+test "pipeline: a provider-contributed toolchain root skips the core toolchain activation" {
+    const a = std.testing.allocator;
+    var diag: provider_env.Diagnostic = .{};
+    var none: provider_env.Accumulator = .{};
+    defer none.deinit();
+    // No provider contribution: today's behaviour, host builds only.
+    try std.testing.expect(coreActivatesToolchain(false, true, &none));
+    try std.testing.expect(!coreActivatesToolchain(true, true, &none));
+    try std.testing.expect(!coreActivatesToolchain(false, false, &none));
+    // An unrelated contribution changes nothing.
+    var other: provider_env.Accumulator = .{};
+    defer other.deinit();
+    try other.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "PROBE_TOOLCHAIN", .value = "x" }}, .path_prepend = &.{if (provider_env.native_windows) "C:\\tc\\bin" else "/tc/bin"} }, &diag);
+    try std.testing.expect(coreActivatesToolchain(false, true, &other));
+    // The provider supplies the root: the core stands down.
+    var supplied: provider_env.Accumulator = .{};
+    defer supplied.deinit();
+    try supplied.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = toolchain_root_var, .value = if (provider_env.native_windows) "C:\\sdk" else "/sdk" }} }, &diag);
+    try std.testing.expect(!coreActivatesToolchain(false, true, &supplied));
 }
 
 /// How the core generation's pre-passes run (`corePrepasses`).

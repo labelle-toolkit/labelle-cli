@@ -963,6 +963,84 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     declare(dep_b, dep_a)
 
+    # ── wasm generate: a provider-supplied EMSDK skips the core activation ─
+    # A `before generate` hook that contributes EMSDK through its env_file
+    # (contract 1.3.0) owns the toolchain: the core's Python preflight and its
+    # activation of the fetched toolchain package stand down, so the package
+    # is not installed a second time. PATH is scrubbed of Python and no
+    # managed interpreter exists, so the preflight, whenever it runs, stops
+    # the command with its fix line: its absence proves the skip. Without
+    # the contribution the core path is unchanged.
+    no_python_bin = base / "no-python-bin"
+    no_python_bin.mkdir()
+    scrubbed = str(no_python_bin)
+    if os.name == "nt":
+        scrubbed += os.pathsep + os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    no_python = {"PATH": scrubbed}
+    assert not (home / "python").exists(), "a managed interpreter already exists"
+    a_manifest.write_text(manifest("fixture-a", [hook("sdk", "generate", "before", target="wasm")], targets=["wasm"]))
+    declare(dep_a)
+    sdk_root = base / "provider-sdk"
+    sdk_root.mkdir()
+    sdk_contribution = base / "sdk-env.json"
+    sdk_contribution.write_text(json.dumps({"set": [{"name": "EMSDK", "value": str(sdk_root)}]}))
+    wasm_dir = project / ".labelle" / "raylib_wasm"
+    reset()
+    control = run("generate", "--platform=wasm", code=1, extra_env=no_python)
+    assert "wasm builds need Python 3" in control.stderr, control.stderr
+    assert "comes from a provider hook" not in control.stderr, control.stderr
+    assert "sdk" in by_id(wasm_dir), log(wasm_dir)
+    reset()
+    supplied = run("generate", "--platform=wasm", extra_env=dict(no_python, PROVIDER_PROBE_ENV=f"sdk|{sdk_contribution}"))
+    assert "labelle: EMSDK comes from a provider hook; skipping" in supplied.stderr, supplied.stderr
+    assert "wasm builds need Python 3" not in supplied.stderr, supplied.stderr
+    assert "FIXTURE_GENERATE" in supplied.stderr, supplied.stderr
+    # An unrelated contribution does not stand the core down.
+    reset()
+    unrelated = run("generate", "--platform=wasm", code=1, extra_env=dict(no_python, PROVIDER_PROBE_ENV=f"sdk|{contribution}"))
+    assert "wasm builds need Python 3" in unrelated.stderr, unrelated.stderr
+
+    # ── managed Python reaches every provider hook and command (D2) ───────
+    # `labelle install python`'s interpreter joins PATH for the `.prebuild`
+    # steps; it must reach every provider hook and `labelle <ns> <cmd>` too,
+    # so a machine whose only Python is the managed one runs a provider that
+    # spawns `python3`. PATH is scrubbed of Python; the probe reports where
+    # its own PATH finds the interpreter.
+    python_name = "python" if os.name == "nt" else "python3"
+    a_manifest.write_text(
+        '.{ .name = "fixture-a", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0", .namespace = "fixa",\n'
+        f'    .commands = .{{ .{{ .name = "probe", {TOOL}, .help = "probe" }} }},\n'
+        f'    .hooks = .{{ {hook("py-gen", "generate", "before")} }} }}')
+    command_out = project / ".labelle" / "providers" / "fixture-a"
+    which_env = dict(no_python, PROVIDER_PROBE_WHICH=python_name)
+
+    def which_seen():
+        reset()
+        generated = run("generate", extra_env=which_env)
+        commanded = run("fixa", "probe", extra_env=which_env)
+        return by_id(target_dir)["py-gen"], by_id(command_out)["probe"], generated.stderr + commanded.stderr
+
+    # The control: nothing managed, so neither finds an interpreter.
+    hook_seen, command_seen, text = which_seen()
+    assert hook_seen["which"] is None and command_seen["which"] is None, (hook_seen, command_seen)
+    assert "using provisioned Python" not in text, text
+    managed_bin = home / "python" if os.name == "nt" else home / "python" / "bin"
+    managed_bin.mkdir(parents=True)
+    interpreter = managed_bin / ("python.exe" if os.name == "nt" else "python3")
+    if os.name == "nt":
+        shutil.copy(sys.executable, interpreter)
+    else:
+        interpreter.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        interpreter.chmod(0o755)
+    hook_seen, command_seen, text = which_seen()
+    for seen in (hook_seen, command_seen):
+        assert same_dir(seen["path_head"], managed_bin), seen
+        assert seen["which"] and same_dir(os.path.dirname(seen["which"]), managed_bin), seen
+    assert "using provisioned Python" in text, text
+    shutil.rmtree(home / "python")
+    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+    declare(dep_b, dep_a)
+
     # ── bundle ────────────────────────────────────────────────────────────
     reset()
     if platform.system() == "Darwin":

@@ -145,6 +145,9 @@ pub const Outcome = struct {
     err: ?anyerror = null,
     /// A WARN: reported, never a failure (an uninstalled package).
     warning: bool = false,
+    /// What the tool printed on stdout, when the run captured it
+    /// (`labelle doctor --json`: `provider_doctor_json.zig` reads it).
+    stdout: ?[]const u8 = null,
 
     pub fn ok(self: Outcome) bool {
         return self.code == 0 or self.warning;
@@ -168,9 +171,11 @@ pub const Report = struct {
     }
 };
 
-/// Run every step with `runner.run(step) anyerror!u8`, one after another,
-/// whatever the previous ones returned. Prints a header per provider and
-/// its result line to stderr.
+/// Run every step with `runner.run(step, &stdout) anyerror!u8`, one after
+/// another, whatever the previous ones returned. A runner that captures the
+/// tool's stdout stores it in `stdout` (kept on the outcome); one that passes
+/// it through leaves it null. Prints a header per provider and its result
+/// line to stderr.
 pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
     var outcomes: std.ArrayList(Outcome) = .empty;
     for (p.steps) |step| {
@@ -197,10 +202,13 @@ pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
                     break :blk .{ .label = step.label, .package = step.package, .code = null, .err = error.RemoteProviderIntegrityRequired };
                 },
             },
-            .run => if (runner.run(step)) |code|
-                .{ .label = step.label, .package = step.package, .code = code }
-            else |err|
-                .{ .label = step.label, .package = step.package, .code = null, .err = err },
+            .run => blk: {
+                var stdout: ?[]const u8 = null;
+                break :blk if (runner.run(step, &stdout)) |code|
+                    .{ .label = step.label, .package = step.package, .code = code, .stdout = stdout }
+                else |err|
+                    .{ .label = step.label, .package = step.package, .code = null, .err = err };
+            },
         };
         switch (step.action) {
             .unavailable, .unverified => {},
@@ -282,13 +290,22 @@ const DispatchRunner = struct {
     /// offline) provisioning is attempted once and every provider after it
     /// gets the same error as its own failed line.
     hosts: *dispatch.HostCache,
+    /// `labelle doctor --json` (RFC cli#466 D7): every provider doctor gets
+    /// `--json`, and its stdout is captured for the core's one document
+    /// instead of reaching the CLI's stdout.
+    json: bool = false,
 
-    pub fn run(self: DispatchRunner, step: Step) anyerror!u8 {
+    pub fn run(self: DispatchRunner, step: Step, stdout: *?[]const u8) anyerror!u8 {
         const action = step.action.run;
+        var captured: []const u8 = "";
         // `.selected`: only this provider's settings file is opened, so a
         // bad file of another provider fails that provider alone.
-        return dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, &.{}, .selected, self.hosts);
+        const code = try dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, if (self.json) &json_args else &.{}, .selected, self.hosts, if (self.json) &captured else null);
+        if (self.json) stdout.* = captured;
+        return code;
     }
+
+    const json_args = [_][]const u8{"--json"};
 };
 
 /// The line `labelle doctor` prints instead of the provider part outside a
@@ -298,8 +315,10 @@ pub fn printOutsideProject(start: []const u8) void {
 }
 
 /// The provider part of `labelle doctor` for the project at `root` (the
-/// canonical project root the core checks used too).
-pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8) !Report {
+/// canonical project root the core checks used too). `json`: each provider
+/// doctor runs with `--json` and its stdout is captured on its outcome
+/// (`DispatchRunner.json`); the human report still goes to stderr.
+pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, json: bool) !Report {
     // The report outlives this call; its strings live in `allocator`'s arena
     // owned by the caller.
     const a = allocator;
@@ -335,6 +354,7 @@ pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8) !Report {
         .cfg = discovered.cfg,
         .providers = survey.providers,
         .hosts = &hosts,
+        .json = json,
     });
     if (mapping) |outcome| report.outcomes = try std.mem.concat(a, Outcome, &.{ &.{outcome}, report.outcomes });
     printSummary(report);
@@ -415,7 +435,7 @@ const Recorder = struct {
     exit_codes: []const struct { []const u8, u8 } = &.{},
     errors: []const []const u8 = &.{},
 
-    pub fn run(self: Recorder, step: Step) anyerror!u8 {
+    pub fn run(self: Recorder, step: Step, _: *?[]const u8) anyerror!u8 {
         const command = step.action.run.command;
         try self.calls.append(self.a, try std.fmt.allocPrint(self.a, "{s}:{s}", .{ step.label, command.executable }));
         for (self.errors) |label| if (std.mem.eql(u8, label, step.label)) return error.ProviderCompilerMissing;

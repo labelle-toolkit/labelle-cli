@@ -145,11 +145,6 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert "Provider doctors" not in core.stderr and "labelle alpha doctor" not in core.stderr, core.stderr
     assert len(invocations("alpha-pkg")) == 4 and len(invocations("beta-pkg")) == 4
 
-    # `--json` stays the studio's single-line capability report.
-    report = run("--json")
-    assert report.stdout.count("\n") == 1 and json.loads(report.stdout)["capabilities"], report.stdout
-    assert "Provider doctors" not in report.stderr, report.stderr
-
     # Outside a project: the core checks and one line about providers.
     outside = base / "outside"
     outside.mkdir()
@@ -302,5 +297,78 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     passthrough = subprocess.run([cli, "alpha", "doctor", "--zig", dead_zig], cwd=project, env=env, text=True, capture_output=True, timeout=600)
     assert passthrough.returncode == 0, (passthrough.returncode, passthrough.stderr)
     assert json.loads((outputs / "alpha-pkg" / "capture.json").read_text())["args"] == ["--zig", dead_zig]
+
+    # ── `--json` aggregates the provider doctors (RFC cli#466 D7) ────────
+    # Each provider doctor runs with `--json`; its stdout is captured, never
+    # passed through, and validated as one capability object. The core
+    # prints ONE document on stdout: its own capabilities, then the
+    # providers'. The probe prints `reports/<package>.out` verbatim.
+    reports = base / "reports"
+    reports.mkdir()
+
+    def capability(cap_id, ok=True):
+        return json.dumps({"id": cap_id, "required": True, "ok": ok, "unknown_key": 1, "items": [
+            {"id": "tool", "name": "Tool", "ok": ok, "fixable": False, "size_mb": 0, "action": None, "detail": "probe", "hint": None}]})
+
+    def report(alpha, beta, *flags, extra_env=None):
+        for package, text in (("alpha-pkg", alpha), ("beta-pkg", beta)):
+            out = reports / f"{package}.out"
+            out.unlink(missing_ok=True)
+            if text is not None:
+                out.write_text(text)
+        result = run("--json", *flags, extra_env=dict({"PROVIDER_PROBE_STDOUT": str(reports)}, **(extra_env or {})))
+        # Exit 0 whatever the verdict, and exactly one line on stdout.
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert result.stdout.count("\n") == 1, result.stdout
+        doc = json.loads(result.stdout)
+        ids = [c["id"] for c in doc["capabilities"]]
+        assert len(ids) == len(set(ids)), ids
+        return {c["id"]: c for c in doc["capabilities"]}, ids, result
+
+    # `--core-only`: the core's own capability alone, and no provider runs.
+    runs = (len(invocations("alpha-pkg")), len(invocations("beta-pkg")))
+    caps, ids, core_only = report(capability("alpha-cap"), capability("beta-cap"), "--core-only")
+    assert len(ids) == 1 and caps[ids[0]]["items"], ids
+    assert "labelle alpha doctor" not in core_only.stderr, core_only.stderr
+    assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == runs, "--core-only ran a provider"
+    core_id = ids[0]
+
+    # A valid report and an invalid one: the valid capability is kept as the
+    # provider wrote it; the invalid one is a failed capability under the
+    # provider's namespace, carrying the error. `--json` reached both.
+    caps, ids, mixed = report(capability("alpha-cap") + "\n", "{not json")
+    assert ids == [core_id, "alpha-cap", "beta"], ids
+    assert caps["alpha-cap"]["ok"] is True and caps["alpha-cap"]["items"][0]["detail"] == "probe", caps
+    beta = caps["beta"]
+    assert beta["ok"] is False and beta["required"] is True, beta
+    assert "not one capability object" in beta["items"][0]["detail"] and "beta-pkg" in beta["items"][0]["name"], beta
+    assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (runs[0] + 1, runs[1] + 1)
+    for package in ("alpha-pkg", "beta-pkg"):
+        assert json.loads((outputs / package / "capture.json").read_text())["args"] == ["--json"], package
+    # The human report still goes to stderr.
+    assert "labelle alpha doctor" in mixed.stderr and "Provider doctors: 2 checked" in mixed.stderr, mixed.stderr
+
+    # A provider that fails after a report claiming ok, beside one that
+    # prints nothing: both are failed capabilities, and the document stands.
+    caps, ids, _ = report(capability("alpha-cap"), None, extra_env={"PROVIDER_PROBE_FAIL_PACKAGE": "alpha-pkg"})
+    assert ids == [core_id, "alpha-cap", "beta"], ids
+    assert caps["alpha-cap"]["ok"] is False, caps
+    assert caps["alpha-cap"]["items"][-1]["detail"] == "exited 7 although its report says ok", caps
+    assert caps["beta"]["ok"] is False and "printed nothing" in caps["beta"]["items"][0]["detail"], caps
+
+    # Two providers reporting one id: a single failed entry naming both.
+    caps, ids, _ = report(capability("shared-cap"), capability("shared-cap"))
+    assert ids == [core_id, "shared-cap"], ids
+    dup = caps["shared-cap"]
+    assert dup["ok"] is False, dup
+    assert "'alpha-pkg' and 'beta-pkg'" in dup["items"][0]["detail"], dup
+
+    # A provider reporting the core's id owns it: the core's entry gives way.
+    caps, ids, _ = report(capability(core_id), capability("beta-cap"))
+    assert ids == [core_id, "beta-cap"], ids
+    assert caps[core_id]["items"][0]["detail"] == "probe", caps[core_id]
+    # Outside a project the document is the core's alone.
+    lone_json = run("--json", cwd=outside)
+    assert [c["id"] for c in json.loads(lone_json.stdout)["capabilities"]] == [core_id], lone_json.stdout
 
     print(f"provider doctor e2e: {checks} invocations OK")
