@@ -1,13 +1,16 @@
-# End-to-end suite, run on demand only (Actions → "E2E (manual)" → Run workflow).
+# End-to-end suite: runs after every merge to main, and on demand
+# (Actions → "E2E (main + manual)" → Run workflow). PRs run only CI (ci.yml).
 #
 # These were part of CI until 2026-09-28, when the owner moved every e2e out
 # of the per-PR run to bring CI down to ~10 minutes. Run this before a
 # release, or when a change touches provider dispatch, hooks, watch, docker,
 # the versions pipeline or the progress feed. The scripts live in test/ and
 # also run locally (`zig build` first — they use zig-out/bin/labelle).
-name: E2E (manual)
+name: E2E (main + manual)
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:

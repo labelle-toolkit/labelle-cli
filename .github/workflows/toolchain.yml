@@ -11,8 +11,17 @@
 # provision and validate from zero: see the provider package's CI.
 name: Toolchain provisioning
 
-# Manual only since 2026-09-28 (e2e suites were moved out of per-PR CI).
+# Since 2026-09-28 this no longer runs on PRs: it runs after a merge to main
+# that touches the toolchain files, and on demand.
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/cli/python_provision.zig'
+      - 'src/cli/zig_toolchain.zig'
+      - 'src/cli/doctor.zig'
+      - 'src/cli/install.zig'
+      - '.github/workflows/toolchain.yml'
   workflow_dispatch:
 
 # Least-privilege token: these jobs only read the repo (zizmor, PR #291 review).
