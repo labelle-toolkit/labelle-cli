@@ -201,8 +201,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
             for (ignore.items) |f| allocator.free(f);
             ignore.deinit(allocator);
         }
+        // The local providers' trees outside the project too (cli#474):
+        // the same roots the watcher starts with (`RebuildCtx.initIgnore`).
+        var roots = rebuild.localProviderRoots(allocator, project_dir, parsed.plugins);
+        defer {
+            for (roots.items) |r| allocator.free(r);
+            roots.deinit(allocator);
+        }
         var sig: @import("watch.zig").TreeSignature = .{};
-        @import("watch.zig").computeSignature(config.globalIo(), allocator, project_dir, ignore.items, &sig);
+        @import("watch.zig").computeSignatureRoots(config.globalIo(), allocator, project_dir, roots.items, ignore.items, &sig);
         break :blk sig;
     } else null;
 
@@ -479,6 +486,7 @@ test {
     _ = rebuild_replan;
     _ = rebuild_replan_tests;
     _ = @import("pipeline/rebuild_transaction_tests.zig");
+    _ = @import("pipeline/rebuild_commit_tests.zig");
     _ = session_key;
     _ = watch_session;
     _ = optimize_mod;

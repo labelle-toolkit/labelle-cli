@@ -25,11 +25,11 @@ const Replanner = @import("rebuild_replan.zig").Replanner;
 const SessionKey = @import("session_key.zig").SessionKey;
 const testing = @import("testing.zig");
 
-const target = "probe-target";
+pub const target = "probe-target";
 
 /// A project with one local provider `pkg` owning the target, written in
 /// the temporary directory, plus the cold pipeline's startup state.
-const Fixture = struct {
+pub const Fixture = struct {
     a: std.mem.Allocator,
     tmp: std.testing.TmpDir,
     project: [:0]u8,
@@ -46,7 +46,7 @@ const Fixture = struct {
     generate_plan: provider_hooks.Plan = .{},
     build_plan: provider_hooks.Plan = .{},
 
-    const Spec = struct {
+    pub const Spec = struct {
         version: []const u8 = "1.0.0",
         /// Extra `.hooks` records of the manifest.
         hooks: []const u8 = "",
@@ -57,7 +57,7 @@ const Fixture = struct {
         contract: []const u8 = ">=1.0.0 <2.0.0",
     };
 
-    fn init(fx: *Fixture, a: std.mem.Allocator) !void {
+    pub fn init(fx: *Fixture, a: std.mem.Allocator) !void {
         const io = config.globalIo();
         fx.a = a;
         fx.tmp = std.testing.tmpDir(.{});
@@ -72,7 +72,7 @@ const Fixture = struct {
         fx.sources = .{ .a = fx.arena.allocator() };
     }
 
-    fn deinit(fx: *Fixture) void {
+    pub fn deinit(fx: *Fixture) void {
         fx.sources.deinit();
         fx.arena.deinit();
         fx.a.free(fx.project);
@@ -81,7 +81,7 @@ const Fixture = struct {
         fx.tmp.cleanup();
     }
 
-    fn write(fx: *Fixture, spec: Spec) !void {
+    pub fn write(fx: *Fixture, spec: Spec) !void {
         const io = config.globalIo();
         var buf: [4096]u8 = undefined;
         const manifest = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \"{s}\", .targets = .{{ \"{s}\" }}, .target_defaults = .{{ {s} }}, .hooks = .{{ .{{ .id = \"serve\", .step = .run, .target = \"{s}\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\", .watch = true }}, {s} }} }}", .{ spec.contract, target, spec.defaults, target, spec.hooks });
@@ -92,7 +92,7 @@ const Fixture = struct {
     }
 
     /// The cold pipeline: read, lock, discover, plan.
-    fn startup(fx: *Fixture) !void {
+    pub fn startup(fx: *Fixture) !void {
         const sa = fx.arena.allocator();
         fx.cfg = try config.readProjectConfig(sa, fx.project);
         try lockfile.writeLockFile(sa, fx.project, fx.cfg);
@@ -102,7 +102,7 @@ const Fixture = struct {
         fx.build_plan = try provider_hooks.plan(sa, fx.providers, .build, target);
     }
 
-    fn site(fx: *Fixture) provider_hooks.Site {
+    pub fn site(fx: *Fixture) provider_hooks.Site {
         var s = testing.testSite(fx.a, fx.project);
         s.target = target;
         s.providers = fx.providers;
@@ -111,23 +111,23 @@ const Fixture = struct {
         return s;
     }
 
-    fn lockBytes(fx: *Fixture) ![]u8 {
+    pub fn lockBytes(fx: *Fixture) ![]u8 {
         return fx.tmp.dir.readFileAlloc(config.globalIo(), "project/labelle.lock", fx.a, .limited(1 << 20));
     }
 };
 
 /// Records hook invocations in order; `fail_id` exits 7.
-const Hooks = struct {
+pub const Hooks = struct {
     // Copied: the ids live on a generation a rollback releases.
     var bufs: [16][32]u8 = undefined;
     var log: [16][]const u8 = undefined;
     var count: usize = 0;
     var fail_id: []const u8 = "";
-    fn reset() void {
+    pub fn reset() void {
         count = 0;
         fail_id = "";
     }
-    fn run(_: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+    pub fn run(_: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
         for (list) |planned| {
             const id = planned.hook.id;
             @memcpy(bufs[count][0..id.len], id);
@@ -143,29 +143,32 @@ const Hooks = struct {
     }
 };
 
-/// Records publications, and which hooks had run by then.
-const Publish = struct {
-    var count: usize = 0;
+/// Records publications, and which hooks had run by then. Runs the gate
+/// as `watch.Publisher` does: before the switch, then the commit point.
+pub const Publish = struct {
+    pub var count: usize = 0;
     var hooks_at_publish: usize = 0;
-    var fail = false;
-    fn reset() void {
+    pub var fail = false;
+    pub fn reset() void {
         count = 0;
         fail = false;
     }
-    fn run(_: *anyopaque) anyerror!void {
+    pub fn run(_: *anyopaque, gate: @import("../watch.zig").PublishGate) anyerror!void {
         if (fail) return error.DiskFull;
+        try gate.before_switch(gate.ctx);
+        try gate.before_advance(gate.ctx);
         count += 1;
         hooks_at_publish = Hooks.count;
     }
 };
 
 /// Records the prebuild steps each rebuild ran.
-const Steps = struct {
+pub const Steps = struct {
     // Copied: the steps live on a generation a rollback releases.
     var buf: [32]u8 = undefined;
     var last: []const u8 = "";
-    var runs: usize = 0;
-    fn run(_: std.mem.Allocator, _: []const u8, steps: []const prebuild.Step, _: prebuild.Options) prebuild.Error!void {
+    pub var runs: usize = 0;
+    pub fn run(_: std.mem.Allocator, _: []const u8, steps: []const prebuild.Step, _: prebuild.Options) prebuild.Error!void {
         runs += 1;
         const name = if (steps.len == 0) "" else steps[0].run[0];
         @memcpy(buf[0..name.len], name);
@@ -173,7 +176,7 @@ const Steps = struct {
     }
 };
 
-fn rebuildCtx(fx: *Fixture, site: *provider_hooks.Site, replan: *Replanner, dummy: *u8) RebuildCtx {
+pub fn rebuildCtx(fx: *Fixture, site: *provider_hooks.Site, replan: *Replanner, dummy: *u8) RebuildCtx {
     return .{
         .allocator = fx.a,
         .asm_bin = .{ .path = fx.ok },

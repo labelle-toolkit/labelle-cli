@@ -601,7 +601,9 @@ test "a rebuild that contributes a different environment than the launch one pub
             };
             return 0;
         }
-        fn publish(_: *anyopaque) anyerror!void {
+        fn publish(_: *anyopaque, gate: @import("../watch.zig").PublishGate) anyerror!void {
+            try gate.before_switch(gate.ctx);
+            try gate.before_advance(gate.ctx);
             published += 1;
         }
         var provider: provider_dispatch.Provider = .{

@@ -12,6 +12,7 @@ const provider_hooks = @import("../provider_hooks.zig");
 const provider_github = @import("../provider_github.zig");
 const provider_manifest = @import("../provider_manifest.zig");
 const zig_toolchain = @import("../zig_toolchain.zig");
+const tree = @import("../watch/tree.zig");
 
 pub const SessionKey = struct {
     /// The replacement's package (`provider.meta.name`).
@@ -23,6 +24,13 @@ pub const SessionKey = struct {
     /// other bytes for the same package, repository and version changes
     /// it); for a local provider its repository spec (`pinOf`).
     pin: []const u8,
+    /// SHA-256 of the sources of the LOCAL providers the replacement runs
+    /// from — its own and its `before run` hooks' owners — which built its
+    /// tools at startup; `null` when none is local (a remote one is pinned
+    /// by `pin`). An edit to them is a change: the replacement keeps the
+    /// binary it started with (cli#474). `localSourceDigest` says what is
+    /// hashed.
+    source: ?[32]u8 = null,
     /// The wire version negotiated from the provider's `command_contract`.
     wire: []const u8,
     /// The replacement hook (`<package>/<id>`), with its tool.
@@ -93,10 +101,20 @@ pub const SessionKey = struct {
         } else null;
         const wire: []const u8 = if (provider.meta.command_contract) |range| provider_manifest.negotiate(range) catch "none" else "none";
         const zig = try zig_toolchain.resolveRequiredVersion(a, root);
+        var local_dirs: std.ArrayList([]const u8) = .empty;
+        if (provider.dep.isLocal()) try local_dirs.append(a, provider.dir);
+        for (run_plan.before) |planned| {
+            const owner = planned.provider.*;
+            if (!owner.dep.isLocal()) continue;
+            for (local_dirs.items) |seen| {
+                if (std.mem.eql(u8, seen, owner.dir)) break;
+            } else try local_dirs.append(a, owner.dir);
+        }
         return .{
             .package = provider.meta.name,
             .version = provider.dep.version,
             .pin = try pinOf(a, root, provider.dep),
+            .source = if (local_dirs.items.len == 0) null else try localSourceDigest(a, local_dirs.items, root),
             .wire = wire,
             .hook = replacement.qualified,
             .build_step = replacement.hook.build_step,
@@ -145,6 +163,7 @@ pub const SessionKey = struct {
         if (!eql(self.package, n.package)) return "the provider package";
         if (!eql(self.version, n.version)) return "the provider version";
         if (!eql(self.pin, n.pin)) return "the provider pin";
+        if (!std.meta.eql(self.source, n.source)) return "the provider source";
         if (!eql(self.wire, n.wire)) return "the provider contract version";
         if (!eql(self.hook, n.hook) or !eql(self.build_step, n.build_step) or !eql(self.executable, n.executable)) return "the run replacement";
         if (self.watch != n.watch) return "the watch capability";
@@ -175,6 +194,119 @@ pub const SessionKey = struct {
         return error.SessionChanged;
     }
 };
+
+/// SHA-256 over the files of the local provider trees `dirs`, in order:
+/// per file, its path relative to its tree, its size and its bytes, files
+/// sorted by that path. Walked with the watcher's skip rules (dot
+/// directories, build output, nested checkouts), so what is hashed is what
+/// the watch session watches; each tree's `plugin.labelle` is left out —
+/// what the manifest declares is compared field by field above, and a
+/// manifest edit the replacement does not depend on (a new `build` hook)
+/// must stay an ordinary rebuild. Symbolic links are not followed. The
+/// project directory `project` is never entered: a provider that contains
+/// the project (`local:../..`) is hashed without it, or every script edit
+/// would read as a provider change. A file or directory that disappears
+/// during the walk (an editor saving through a temporary file it renames
+/// away) is absent, not an error: the digest is best effort like the
+/// watcher's walk, and the next edit is seen anyway.
+pub fn localSourceDigest(a: std.mem.Allocator, dirs: []const []const u8, project: []const u8) ![32]u8 {
+    var chunk: [64 * 1024]u8 = undefined;
+    return localSourceDigestWith(a, dirs, project, null, &chunk);
+}
+
+/// Test seam: runs between collecting a tree's files and reading them.
+const Between = *const fn ([]const u8, []const []const u8) void;
+
+/// Files are streamed through `chunk`, so any size hashes in constant
+/// memory; a test passes a tiny one.
+fn localSourceDigestWith(a: std.mem.Allocator, dirs: []const []const u8, project: []const u8, between: ?Between, chunk: []u8) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (dirs) |dir| {
+        var files: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (files.items) |f| a.free(f);
+            files.deinit(a);
+        }
+        try collectSources(a, dir, "", project, &files);
+        std.mem.sort([]const u8, files.items, {}, struct {
+            fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lessThan);
+        if (between) |hook| hook(dir, files.items);
+        hash.update(dir);
+        hash.update(&.{0});
+        for (files.items) |rel| {
+            const path = try std.fs.path.join(a, &.{ dir, rel });
+            defer a.free(path);
+            const io = config.globalIo();
+            const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer file.close(io);
+            hash.update(rel);
+            hash.update(&.{0});
+            // The bytes, then their length: framed, whatever the size.
+            var total: u64 = 0;
+            while (true) {
+                const n = try file.readPositionalAll(io, chunk, total);
+                hash.update(chunk[0..n]);
+                total += n;
+                if (n < chunk.len) break;
+            }
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, total, .little);
+            hash.update(&size);
+        }
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn collectSources(a: std.mem.Allocator, top: []const u8, rel: []const u8, project: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const io = config.globalIo();
+    const abs = if (rel.len == 0) try a.dupe(u8, top) else try std.fs.path.join(a, &.{ top, rel });
+    defer a.free(abs);
+    // Below the tree's top, a directory is never entered through a link
+    // (one swapped in mid-walk included).
+    var dir = std.Io.Dir.cwd().openDir(io, abs, .{ .iterate = true, .follow_symlinks = rel.len == 0 }) catch |err| switch (err) {
+        // A subdirectory renamed away (or replaced) mid-walk; the tree
+        // itself must exist.
+        error.FileNotFound, error.SymLinkLoop, error.NotDir => if (rel.len != 0) return else return err,
+        else => return err,
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const sub = if (rel.len == 0) try a.dupe(u8, entry.name) else try std.fs.path.join(a, &.{ rel, entry.name });
+        var owned = true;
+        defer if (owned) a.free(sub);
+        const kind = tree.entryKind(io, dir, entry) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        switch (kind) {
+            .directory => {
+                if (tree.skipWatchDir(entry.name)) continue;
+                const sub_abs = try std.fs.path.join(a, &.{ top, sub });
+                defer a.free(sub_abs);
+                if (std.mem.eql(u8, sub_abs, project)) continue;
+                if (tree.isNestedCheckout(io, a, sub_abs)) continue;
+                try collectSources(a, top, sub, project, out);
+            },
+            .file => {
+                if (rel.len == 0 and std.mem.eql(u8, entry.name, "plugin.labelle")) continue;
+                // One spelling on every host, so the order is the same.
+                std.mem.replaceScalar(u8, sub, '\\', '/');
+                try out.append(a, sub);
+                owned = false;
+            },
+            else => {},
+        }
+    }
+}
 
 fn eql(x: []const u8, y: []const u8) bool {
     return std.mem.eql(u8, x, y);
@@ -241,6 +373,11 @@ test "session key: every field the replacement depends on is reported, the first
         .{ .what = "the provider pin", .edit = struct {
             fn f(k: *SessionKey) void {
                 k.pin = "github:o/r#sha256-x";
+            }
+        }.f },
+        .{ .what = "the provider source", .edit = struct {
+            fn f(k: *SessionKey) void {
+                k.source = [_]u8{2} ** 32;
             }
         }.f },
         .{ .what = "the provider contract version", .edit = struct {
@@ -357,4 +494,115 @@ test "session key: a remote provider's pin is the accepted lock entry, so a re-p
     try std.testing.expect(!std.mem.eql(u8, first, second));
     // A local provider is not in the lock: its declaration.
     try std.testing.expectEqualStrings("local:../local", try SessionKey.pinOf(aa, root, local));
+}
+
+test "session key: a local provider's source digest covers its files, not its manifest or build output (cli#474)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pkg/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = ".{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/tool.zig", .data = "v1" });
+    const dir = try tmp.dir.realPathFileAlloc(io, "pkg", a);
+    defer a.free(dir);
+    const dirs = [_][]const u8{dir};
+    const first = try localSourceDigest(a, &dirs, "");
+    // Build output, caches and the manifest are not the source.
+    try tmp.dir.createDirPath(io, "pkg/zig-out/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/zig-out/bin/tool", .data = "binary" });
+    try tmp.dir.createDirPath(io, "pkg/.zig-cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/.zig-cache/obj", .data = "obj" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = ".{ .name = \"pkg\" }" });
+    try std.testing.expectEqualSlices(u8, &first, &(try localSourceDigest(a, &dirs, "")));
+    // A same-size edit to a source file is a change (content, not mtime).
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/tool.zig", .data = "v2" });
+    const edited = try localSourceDigest(a, &dirs, "");
+    try std.testing.expect(!std.mem.eql(u8, &first, &edited));
+    // So is a new file; reverting everything restores the digest.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/tool.zig", .data = "v1" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/extra.zig", .data = "" });
+    try std.testing.expect(!std.mem.eql(u8, &first, &(try localSourceDigest(a, &dirs, ""))));
+    try tmp.dir.deleteFile(io, "pkg/src/extra.zig");
+    try std.testing.expectEqualSlices(u8, &first, &(try localSourceDigest(a, &dirs, "")));
+}
+
+test "session key: a source file renamed away during the digest walk is absent, not an error (cli#474)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pkg/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/keep.zig", .data = "keep" });
+    const dir = try tmp.dir.realPathFileAlloc(io, "pkg", a);
+    defer a.free(dir);
+    const dirs = [_][]const u8{dir};
+    const without = try localSourceDigest(a, &dirs, "");
+    // An editor's temporary file: listed by the walk, gone when read.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/keep.zig~", .data = "tmp" });
+    const Vanish = struct {
+        var seen = false;
+        fn between(top: []const u8, files: []const []const u8) void {
+            for (files) |rel| if (std.mem.eql(u8, rel, "src/keep.zig~")) {
+                const path = std.fs.path.join(std.testing.allocator, &.{ top, rel }) catch return;
+                defer std.testing.allocator.free(path);
+                std.Io.Dir.cwd().deleteFile(config.globalIo(), path) catch return;
+                seen = true;
+            };
+        }
+    };
+    var chunk: [4096]u8 = undefined;
+    const got = try localSourceDigestWith(a, &dirs, "", Vanish.between, &chunk);
+    // The seam really removed a listed file, and the digest is the tree's
+    // without it.
+    try std.testing.expect(Vanish.seen);
+    try std.testing.expectEqualSlices(u8, &without, &got);
+}
+
+test "session key: a provider containing the project is hashed without the project (cli#474)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mono/game");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/tool.zig", .data = "tool" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/game/main.zig", .data = "v1" });
+    const mono = try tmp.dir.realPathFileAlloc(io, "mono", a);
+    defer a.free(mono);
+    const project = try tmp.dir.realPathFileAlloc(io, "mono/game", a);
+    defer a.free(project);
+    const dirs = [_][]const u8{mono};
+    const first = try localSourceDigest(a, &dirs, project);
+    // A project edit is not a provider-source change...
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/game/main.zig", .data = "v2" });
+    try std.testing.expectEqualSlices(u8, &first, &(try localSourceDigest(a, &dirs, project)));
+    // ...an edit to the provider around it is.
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/tool.zig", .data = "tool2" });
+    try std.testing.expect(!std.mem.eql(u8, &first, &(try localSourceDigest(a, &dirs, project))));
+}
+
+test "session key: provider files are hashed in chunks, whatever their size (cli#476)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pkg");
+    // A file many chunks long, and one exactly a chunk long.
+    const big = try a.alloc(u8, 10_000);
+    defer a.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i % 251);
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/big.bin", .data = big });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/even.bin", .data = big[0..64] });
+    const dir = try tmp.dir.realPathFileAlloc(io, "pkg", a);
+    defer a.free(dir);
+    const dirs = [_][]const u8{dir};
+    var tiny: [64]u8 = undefined;
+    var huge: [32 * 1024]u8 = undefined;
+    const streamed = try localSourceDigestWith(a, &dirs, "", null, &tiny);
+    const whole = try localSourceDigestWith(a, &dirs, "", null, &huge);
+    try std.testing.expectEqualSlices(u8, &whole, &streamed);
+    // A change past the first chunks is still seen.
+    big[9_999] +%= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/big.bin", .data = big });
+    try std.testing.expect(!std.mem.eql(u8, &streamed, &(try localSourceDigestWith(a, &dirs, "", null, &tiny))));
 }

@@ -154,7 +154,7 @@ pub fn isSubset(sub: []const u64, super: []const u64) bool {
 /// True when a directory name should be skipped during the walk: any
 /// dot-prefixed dir (`.labelle`, `.git`, `.zig-cache`, `.cache`) plus the
 /// non-hidden build dirs in `watch_skip_dirs`.
-fn skipWatchDir(name: []const u8) bool {
+pub fn skipWatchDir(name: []const u8) bool {
     if (name.len > 0 and name[0] == '.') return true;
     for (watch_skip_dirs) |d| {
         if (std.mem.eql(u8, name, d)) return true;
@@ -178,6 +178,31 @@ pub fn watchIgnorePath(
     return std.fs.path.join(allocator, &.{ watch_dir, norm });
 }
 
+/// `path` as the extra-root walk spells it (cli#476): canonical — its
+/// realpath when it exists, else its parent's realpath plus its name —
+/// so a declared output inside a local provider outside the project
+/// (`../pkg/gen.zig`) matches the provider's canonical walk. `null` when it
+/// cannot be resolved or is already spelled that way. Caller owns it.
+pub fn canonicalIgnorePath(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const resolved = blk: {
+        if (std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator)) |real| {
+            defer allocator.free(real);
+            break :blk allocator.dupe(u8, real) catch return null;
+        } else |_| {}
+        const lexical = std.fs.path.resolve(allocator, &.{path}) catch return null;
+        defer allocator.free(lexical);
+        const parent = std.fs.path.dirname(lexical) orelse return null;
+        const real_parent = std.Io.Dir.cwd().realPathFileAlloc(io, parent, allocator) catch return null;
+        defer allocator.free(real_parent);
+        break :blk std.fs.path.join(allocator, &.{ real_parent, std.fs.path.basename(lexical) }) catch return null;
+    };
+    if (std.mem.eql(u8, resolved, path)) {
+        allocator.free(resolved);
+        return null;
+    }
+    return resolved;
+}
+
 /// True when `dir_path` is the root of its own git checkout: a linked
 /// worktree, a submodule, or a nested clone.
 ///
@@ -189,11 +214,21 @@ pub fn watchIgnorePath(
 /// a plain name (`worktrees/`, `vendor/`, `branches/`) would otherwise
 /// fold thousands of unrelated files into the signature and make edits
 /// on another branch trigger rebuilds here.
-fn isNestedCheckout(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+pub fn isNestedCheckout(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
     const marker = std.fs.path.join(allocator, &.{ dir_path, ".git" }) catch return false;
     defer allocator.free(marker);
     std.Io.Dir.cwd().access(io, marker, .{}) catch return false;
     return true;
+}
+
+/// `entry`'s kind, as `dir`'s listing reported it — unless the listing
+/// could not tell (`.unknown`: NFS, FUSE and other filesystems without
+/// `d_type`), in which case the entry itself is `stat`ed, NOT followed, so
+/// a symbolic link stays a link (cli#474).
+pub fn entryKind(io: std.Io, dir: std.Io.Dir, entry: std.Io.Dir.Entry) !std.Io.File.Kind {
+    if (entry.kind != .unknown) return entry.kind;
+    const st = try dir.statFile(io, entry.name, .{ .follow_symlinks = false });
+    return st.kind;
 }
 
 /// True when a walked file path is one of the rebuild's own declared
@@ -217,23 +252,75 @@ pub fn computeSignature(
     ignore_files: []const []const u8,
     sig: *TreeSignature,
 ) void {
+    computeSignatureRoots(io, allocator, dir_path, &.{}, ignore_files, sig);
+}
+
+/// `computeSignature` over `dir_path` AND every tree in `extra_roots` (the
+/// sources of local providers outside the project, cli#474), walked with
+/// the same skip rules into one signature. An extra root that contains the
+/// project (a `local:../..` provider) is walked WITHOUT the project, which
+/// `dir_path`'s own walk covers, so no file is folded twice (the XOR
+/// digest would cancel it out). The roots themselves never nest
+/// (`localProviderRoots` collapses them).
+pub fn computeSignatureRoots(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    extra_roots: []const []const u8,
+    ignore_files: []const []const u8,
+    sig: *TreeSignature,
+) void {
     var snap: TreeSnapshot = .{ .sig = sig.* };
-    walkTree(io, allocator, dir_path, ignore_files, &snap, false);
+    walkRoots(io, allocator, dir_path, extra_roots, ignore_files, &snap, false);
     sig.* = snap.sig;
 }
 
-/// The watched tree's `TreeSnapshot`: `computeSignature`'s walk, also
+/// The watched trees' `TreeSnapshot`: `computeSignatureRoots`'s walk, also
 /// recording every file's `PathState` (sorted). `allocator` owns `paths`.
 pub fn snapshotTree(
     io: std.Io,
     allocator: std.mem.Allocator,
     dir_path: []const u8,
+    extra_roots: []const []const u8,
     ignore_files: []const []const u8,
 ) TreeSnapshot {
     var snap: TreeSnapshot = .{};
-    walkTree(io, allocator, dir_path, ignore_files, &snap, true);
+    walkRoots(io, allocator, dir_path, extra_roots, ignore_files, &snap, true);
     snap.sort();
     return snap;
+}
+
+fn walkRoots(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    extra_roots: []const []const u8,
+    ignore_files: []const []const u8,
+    snap: *TreeSnapshot,
+    per_path: bool,
+) void {
+    walkTree(io, allocator, dir_path, ignore_files, "", snap, per_path);
+    if (extra_roots.len == 0) return;
+    // The extra roots are canonical paths: compare the project's too.
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.cwd().realPathFile(io, dir_path, &buf) catch 0;
+    const project = buf[0..n];
+    for (extra_roots) |root| walkTree(io, allocator, root, ignore_files, project, snap, per_path);
+}
+
+/// True when the walk from `outer` reaches the directory `inner` beneath
+/// it: no directory on the way (`inner` included) is one the walk skips
+/// (`skipWatchDir`) or a nested checkout. Both canonical.
+pub fn reaches(io: std.Io, allocator: std.mem.Allocator, outer: []const u8, inner: []const u8) bool {
+    const t = std.mem.trimEnd(u8, outer, "/\\");
+    if (inner.len <= t.len + 1) return inner.len == t.len;
+    var it = std.mem.tokenizeAny(u8, inner[t.len + 1 ..], "/\\");
+    while (it.next()) |name| {
+        if (skipWatchDir(name)) return false;
+        const prefix = inner[0 .. t.len + 1 + it.index];
+        if (isNestedCheckout(io, allocator, prefix)) return false;
+    }
+    return true;
 }
 
 fn walkTree(
@@ -241,21 +328,47 @@ fn walkTree(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     ignore_files: []const []const u8,
+    /// A directory not entered (the project, inside a provider around it);
+    /// "" for none.
+    exclude: []const u8,
     snap: *TreeSnapshot,
     per_path: bool,
 ) void {
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    walkDir(io, allocator, dir_path, ignore_files, exclude, snap, per_path, true);
+}
+
+/// Test seam: runs just before the walk opens a subdirectory it listed as
+/// a directory, so a test can swap it for a link in that window.
+pub var test_before_descend: ?*const fn ([]const u8) void = null;
+
+fn walkDir(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    ignore_files: []const []const u8,
+    exclude: []const u8,
+    snap: *TreeSnapshot,
+    per_path: bool,
+    /// Only a root is opened through a link (the project may be reached
+    /// through one); a subdirectory never is, so one swapped for a link
+    /// after it was listed cannot pull an outside tree into the walk.
+    top: bool,
+) void {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true, .follow_symlinks = top }) catch return;
     defer dir.close(io);
 
     var it = dir.iterate();
     while (it.next(io) catch return) |entry| {
-        if (entry.kind == .directory) {
+        const kind = entryKind(io, dir, entry) catch continue;
+        if (kind == .directory) {
             if (skipWatchDir(entry.name)) continue;
             const sub = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(sub);
+            if (exclude.len != 0 and std.mem.eql(u8, sub, exclude)) continue;
             if (isNestedCheckout(io, allocator, sub)) continue;
-            walkTree(io, allocator, sub, ignore_files, snap, per_path);
-        } else if (entry.kind == .file) {
+            if (test_before_descend) |hook| hook(sub);
+            walkDir(io, allocator, sub, ignore_files, exclude, snap, per_path, false);
+        } else if (kind == .file) {
             const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(fpath);
             if (skipWatchFile(fpath, ignore_files)) continue;
@@ -537,4 +650,54 @@ test "isNestedCheckout: keys on the .git marker's existence, not its kind" {
         defer alloc.free(p);
         try std.testing.expectEqual(case.want, isNestedCheckout(io, alloc, p));
     }
+}
+
+test "entryKind: a kind the listing reports as .unknown is resolved without following links (cli#474)" {
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "file.txt", .data = "x" });
+    const links = builtin.os.tag != .windows; // links need a privilege there
+    if (links) try tmp.dir.symLink(io, "sub", "link", .{ .is_directory = true });
+    // Reported kinds pass through untouched.
+    try std.testing.expectEqual(std.Io.File.Kind.file, try entryKind(io, tmp.dir, .{ .name = "sub", .kind = .file, .inode = 0 }));
+    // `.unknown` (NFS, FUSE): a stat of the entry itself.
+    try std.testing.expectEqual(std.Io.File.Kind.directory, try entryKind(io, tmp.dir, .{ .name = "sub", .kind = .unknown, .inode = 0 }));
+    try std.testing.expectEqual(std.Io.File.Kind.file, try entryKind(io, tmp.dir, .{ .name = "file.txt", .kind = .unknown, .inode = 0 }));
+    if (links) try std.testing.expectEqual(std.Io.File.Kind.sym_link, try entryKind(io, tmp.dir, .{ .name = "link", .kind = .unknown, .inode = 0 }));
+}
+
+test "computeSignature: a directory swapped for a link mid-walk is not followed (cli#476)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // links need a privilege there
+    const io = config.globalIo();
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project/sub");
+    try tmp.dir.createDirPath(io, "outside");
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/game.zig", .data = "g" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/a.txt", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/b.txt", .data = "b" });
+    const project = try tmp.dir.realPathFileAlloc(io, "project", alloc);
+    defer alloc.free(project);
+    const Swap = struct {
+        var dir: std.Io.Dir = undefined;
+        var swapped = false;
+        fn hook(path: []const u8) void {
+            if (!std.mem.endsWith(u8, path, "sub")) return;
+            // Listed as a directory; replaced by a link before it is opened.
+            dir.deleteTree(config.globalIo(), "project/sub") catch return;
+            dir.symLink(config.globalIo(), "../outside", "project/sub", .{ .is_directory = true }) catch return;
+            swapped = true;
+        }
+    };
+    Swap.dir = tmp.dir;
+    test_before_descend = Swap.hook;
+    defer test_before_descend = null;
+    var sig = TreeSignature{};
+    computeSignature(io, alloc, project, &.{}, &sig);
+    try std.testing.expect(Swap.swapped);
+    // Only the project's own file: the outside tree was not walked.
+    try std.testing.expectEqual(@as(u64, 1), sig.file_count);
 }

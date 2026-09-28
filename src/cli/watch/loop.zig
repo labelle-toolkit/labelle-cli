@@ -7,6 +7,7 @@ const std = @import("std");
 const tree = @import("tree.zig");
 const TreeSignature = tree.TreeSignature;
 const computeSignature = tree.computeSignature;
+const computeSignatureRoots = tree.computeSignatureRoots;
 const snapshotTree = tree.snapshotTree;
 const changedPaths = tree.changedPaths;
 const WatchBaseline = @import("baseline.zig").WatchBaseline;
@@ -22,6 +23,10 @@ pub const RebuildFn = *const fn (ctx: *anyopaque) bool;
 /// whenever `files` changes.
 pub const IgnoreSet = struct {
     files: []const []const u8 = &.{},
+    /// Trees watched besides `watch_dir`: the sources of the committed
+    /// local providers outside the project (cli#474), which follow a replan
+    /// the same way the declared outputs do.
+    roots: []const []const u8 = &.{},
     epoch: u64 = 0,
 };
 
@@ -71,9 +76,13 @@ pub const WatchConfig = struct {
     /// instead: their write costs a bounded number of follow-up rebuilds
     /// (one when it rewrites the same paths), never a loop.
     ignore_files: []const []const u8 = &.{},
-    /// When set, the ignore set is read from here on every poll instead of
-    /// `ignore_files`, so a rebuild that swaps the prebuild steps swaps
-    /// their declared outputs out of the signature at the same moment.
+    /// Trees watched besides `watch_dir`, with the same skip rules (a
+    /// local provider's sources outside the project, cli#474).
+    extra_roots: []const []const u8 = &.{},
+    /// When set, the ignore set — and the extra roots — are read from here
+    /// on every poll instead of `ignore_files` / `extra_roots`, so a
+    /// rebuild that swaps the prebuild steps swaps their declared outputs
+    /// out of the signature at the same moment.
     ignore: ?*const IgnoreSet = null,
     /// The tree as the build the session starts from read it: a watch
     /// session takes it BEFORE its cold build, so an edit saved while that
@@ -86,6 +95,14 @@ pub const WatchConfig = struct {
 
     fn ignored(self: WatchConfig) []const []const u8 {
         return if (self.ignore) |set| set.files else self.ignore_files;
+    }
+
+    fn roots(self: WatchConfig) []const []const u8 {
+        return if (self.ignore) |set| set.roots else self.extra_roots;
+    }
+
+    fn signature(self: WatchConfig, io: std.Io, a: std.mem.Allocator, sig: *TreeSignature) void {
+        computeSignatureRoots(io, a, self.watch_dir, self.roots(), self.ignored(), sig);
     }
 
     fn epoch(self: WatchConfig) u64 {
@@ -132,7 +149,7 @@ pub fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
     // signature seen on the previous poll — used to detect a burst still in
     // flight.
     var initial = TreeSignature{};
-    computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignored(), &initial);
+    cfg.signature(io, scan_arena.allocator(), &initial);
     _ = scan_arena.reset(.retain_capacity);
     var baseline: WatchBaseline = .{ .applied = cfg.baseline orelse initial, .allocator = std.heap.page_allocator };
     defer baseline.deinit();
@@ -151,7 +168,7 @@ pub fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
         if (state.stop.load(.acquire)) return;
 
         var sig = TreeSignature{};
-        computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignored(), &sig);
+        cfg.signature(io, scan_arena.allocator(), &sig);
         _ = scan_arena.reset(.retain_capacity);
 
         if (!sig.eql(last)) {
@@ -169,18 +186,18 @@ pub fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
         // (`WatchBaseline`).
         const ra = rebuild_arena.allocator();
         const epoch = cfg.epoch();
-        const start = snapshotTree(io, ra, cfg.watch_dir, cfg.ignored());
+        const start = snapshotTree(io, ra, cfg.watch_dir, cfg.roots(), cfg.ignored());
         const ok = cfg.rebuild_fn(cfg.rebuild_ctx);
         if (cfg.epoch() != epoch) {
             // The declared outputs changed under this rebuild: judge the
             // tree afresh under the new set and confirm with one more build.
             baseline.deinit();
             var now = TreeSignature{};
-            computeSignature(io, ra, cfg.watch_dir, cfg.ignored(), &now);
+            cfg.signature(io, ra, &now);
             baseline = .{ .applied = unbuilt_sentinel, .allocator = std.heap.page_allocator };
             last = now;
         } else {
-            const post = snapshotTree(io, ra, cfg.watch_dir, cfg.ignored());
+            const post = snapshotTree(io, ra, cfg.watch_dir, cfg.roots(), cfg.ignored());
             const delta: ?[]const u64 = if (start.complete and post.complete)
                 changedPaths(ra, start.paths.items, post.paths.items) catch null
             else
@@ -343,4 +360,44 @@ test "watchLoop: an edit saved before the loop started (during the cold build) f
     var quiet_state: WatchState = .{};
     watchLoop(std.testing.io, .{ .watch_dir = dir_path, .rebuild_fn = Script.rebuild, .rebuild_ctx = &quiet, .clock = .{ .ctx = &quiet, .wait = Script.wait } }, &quiet_state);
     try std.testing.expectEqual(@as(u32, 0), quiet.rebuilds);
+}
+
+test "watchLoop: an edit in an extra root (a local provider outside the project) fires a rebuild; its build output does not (cli#474)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(base);
+    const project = try std.fs.path.join(alloc, &.{ base, "project" });
+    defer alloc.free(project);
+    const provider = try std.fs.path.join(alloc, &.{ base, "provider" });
+    defer alloc.free(provider);
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "provider/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/game.zig", .data = "g" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "provider/src/tool.zig", .data = "t" });
+    var project_dir = try tmp.dir.openDir(io, "project", .{});
+    defer project_dir.close(io);
+    var provider_dir = try tmp.dir.openDir(io, "provider", .{});
+    defer provider_dir.close(io);
+    const roots = [_][]const u8{provider};
+
+    // The provider's source is edited at tick 2: one rebuild.
+    var script: Script = .{ .dir = provider_dir, .max_ticks = 10, .edits = &.{.{ .tick = 2, .name = "src/tool.zig" }} };
+    var state: WatchState = .{};
+    watchLoop(io, .{ .watch_dir = project, .extra_roots = &roots, .rebuild_fn = Script.rebuild, .rebuild_ctx = &script, .clock = .{ .ctx = &script, .wait = Script.wait } }, &state);
+    try std.testing.expectEqual(@as(u32, 1), script.rebuilds);
+    // The provider's own build output is skipped like the project's.
+    try provider_dir.createDirPath(io, "zig-out");
+    try provider_dir.createDirPath(io, ".zig-cache");
+    var output: Script = .{ .dir = provider_dir, .max_ticks = 10, .edits = &.{ .{ .tick = 2, .name = "zig-out/tool" }, .{ .tick = 3, .name = ".zig-cache/obj" } } };
+    var output_state: WatchState = .{};
+    watchLoop(io, .{ .watch_dir = project, .extra_roots = &roots, .rebuild_fn = Script.rebuild, .rebuild_ctx = &output, .clock = .{ .ctx = &output, .wait = Script.wait } }, &output_state);
+    try std.testing.expectEqual(@as(u32, 0), output.rebuilds);
+    // The mechanism: without the extra root the same edit fires nothing.
+    var unwatched: Script = .{ .dir = provider_dir, .max_ticks = 10, .edits = &.{.{ .tick = 2, .name = "src/other.zig" }} };
+    var unwatched_state: WatchState = .{};
+    watchLoop(io, .{ .watch_dir = project, .rebuild_fn = Script.rebuild, .rebuild_ctx = &unwatched, .clock = .{ .ctx = &unwatched, .wait = Script.wait } }, &unwatched_state);
+    try std.testing.expectEqual(@as(u32, 0), unwatched.rebuilds);
 }

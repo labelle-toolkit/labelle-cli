@@ -10,6 +10,13 @@
 //!   tree <pidfile> <exe> start `<exe> sleep:60000` (a grandchild), write its
 //!                       pid and a newline to <pidfile>, then sleep 60 s:
 //!                       a process tree for the supervision tests
+//!   leak <stay|escape> <pidfile> <exe>
+//!                       start `<exe> sleep:60000` INHERITING this process's
+//!                       stdout/stderr (so it holds a captured child's
+//!                       pipes open), write its pid and a newline to
+//!                       <pidfile>, print `child-output` and exit 0 at once.
+//!                       `escape` starts it in a process group of its own
+//!                       (POSIX), out of reach of the parent's tree kill
 const std = @import("std");
 
 pub fn main(init: std.process.Init) !u8 {
@@ -32,6 +39,21 @@ pub fn main(init: std.process.Init) !u8 {
         var buf: [32]u8 = undefined;
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = pid_file, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{pid}) });
         sleepMs(60_000);
+        return 0;
+    }
+    if (std.mem.eql(u8, spec, "leak")) {
+        const mode = args.next() orelse return 64;
+        const pid_file = args.next() orelse return 64;
+        const exe = args.next() orelse return 64;
+        var options: std.process.SpawnOptions = .{ .argv = &.{ exe, "sleep:60000" }, .stdin = .ignore, .stdout = .inherit, .stderr = .inherit };
+        if (@import("builtin").os.tag != .windows) {
+            if (std.mem.eql(u8, mode, "escape")) options.pgid = 0;
+        }
+        const grandchild = try std.process.spawn(init.io, options);
+        const pid: u64 = if (@import("builtin").os.tag == .windows) GetProcessId(grandchild.id.?) else @intCast(grandchild.id.?);
+        var buf: [32]u8 = undefined;
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = pid_file, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{pid}) });
+        try std.Io.File.stdout().writeStreamingAll(init.io, "child-output\n");
         return 0;
     }
     if (std.mem.startsWith(u8, spec, "sleep-exit:")) {
