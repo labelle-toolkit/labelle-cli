@@ -639,3 +639,142 @@ test "rebuild commit: a newly declared provider whose manifest fails the replan 
     try fx.tmp.dir.writeFile(io, .{ .sub_path = "ext/plugin.labelle", .data = ".{ still not zon" });
     try std.testing.expectEqual(@as(u32, 0), try rebuildsAfterEditIgnoring(fx.project, committed.items, ctx.ignore.files, manifest));
 }
+
+test "rebuild commit: a rollback leaves a labelle.lock another command rewrote meanwhile (cli#478)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    var published: Published = undefined;
+    try published.init(&fx);
+    defer published.deinit(a);
+    ctx.publish = published.seam();
+    const Fail = struct {
+        fn write(_: *watch.Publisher, _: u64) anyerror!void {
+            return error.SharingViolation;
+        }
+    };
+    // Another command (a watch session for another target, an install)
+    // writes its own lock between this rebuild's commit and its rollback.
+    const Writer = struct {
+        const newer = "// written by another command\n";
+        var wrote = false;
+        var saw_ours = false;
+        fn write(lock: []const u8) void {
+            const io = config.globalIo();
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock, std.testing.allocator, .limited(1 << 20)) catch return;
+            defer std.testing.allocator.free(bytes);
+            saw_ours = contains(bytes, "\"7.7.7\"");
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lock, .data = newer }) catch return;
+            wrote = true;
+        }
+    };
+    published.publisher.write_generation = Fail.write;
+    replan.before_restore_lock = Writer.write;
+    try fx.write(.{ .version = "7.7.7" });
+    try std.testing.expectError(error.PublishFailed, ctx.rebuildStaged());
+    // The mechanism: the rollback ran against this rebuild's committed lock,
+    // found the concurrent write instead, and kept it.
+    try std.testing.expect(Writer.saw_ours and Writer.wrote);
+    {
+        const now = try fx.lockBytes();
+        defer a.free(now);
+        try std.testing.expectEqualStrings(Writer.newer, now);
+    }
+    // Control: with nobody writing in between, the same rollback restores.
+    const Quiet = struct {
+        fn write(_: []const u8) void {}
+    };
+    replan.before_restore_lock = Quiet.write;
+    try fx.write(.{ .version = "8.8.8" });
+    try std.testing.expectError(error.PublishFailed, ctx.rebuildStaged());
+    const now = try fx.lockBytes();
+    defer a.free(now);
+    try std.testing.expectEqualStrings(Writer.newer, now);
+}
+
+test "rebuild commit: a local provider whose manifest is deleted stays watched, so recreating it rebuilds (cli#478)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    ctx.initIgnore();
+    const pkg = try fx.tmp.dir.realPathFileAlloc(io, "pkg", a);
+    defer a.free(pkg);
+    try std.testing.expectEqual(@as(usize, 1), ctx.ignore.roots.len);
+    try std.testing.expectEqualStrings(pkg, ctx.ignore.roots[0]);
+    const manifest_bytes = try fx.tmp.dir.readFileAlloc(io, "pkg/plugin.labelle", a, .limited(1 << 20));
+    defer a.free(manifest_bytes);
+
+    // Delete: the rebuild that follows (whatever its verdict) keeps the
+    // declared provider's folder in the watch set.
+    try fx.tmp.dir.deleteFile(io, "pkg/plugin.labelle");
+    _ = ctx.rebuildStaged() catch {};
+    try std.testing.expectEqual(@as(usize, 1), ctx.ignore.roots.len);
+    try std.testing.expectEqualStrings(pkg, ctx.ignore.roots[0]);
+    // The mechanism: without the current watch set to keep it, the folder
+    // drops out (no manifest, so not a provider)...
+    var fresh = rebuild.localProviderRoots(a, fx.project, fx.cfg.plugins);
+    defer freeRoots(a, &fresh);
+    try std.testing.expectEqual(@as(usize, 0), fresh.items.len);
+
+    // ...so recreating the manifest fires nothing there, while the kept
+    // root rebuilds on it.
+    const Recreate = struct {
+        path: []const u8,
+        data: []const u8,
+        ticks: u32 = 0,
+        rebuilds: u32 = 0,
+        fn wait(c: *anyopaque, _: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            self.ticks += 1;
+            if (self.ticks == 2) std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = self.path, .data = self.data }) catch unreachable;
+            return self.ticks <= 10;
+        }
+        fn rebuild_(c: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            self.rebuilds += 1;
+            return true;
+        }
+        fn count(project: []const u8, roots: []const []const u8, ignore: []const []const u8, path: []const u8, data: []const u8) u32 {
+            var script: @This() = .{ .path = path, .data = data };
+            var state: watch.WatchState = .{};
+            watch.watchLoop(config.globalIo(), .{ .watch_dir = project, .extra_roots = roots, .ignore_files = ignore, .rebuild_fn = rebuild_, .rebuild_ctx = &script, .clock = .{ .ctx = &script, .wait = wait } }, &state);
+            return script.rebuilds;
+        }
+    };
+    const manifest = try std.fs.path.join(a, &.{ pkg, "plugin.labelle" });
+    defer a.free(manifest);
+    try std.testing.expectEqual(@as(u32, 0), Recreate.count(fx.project, fresh.items, ctx.ignore.files, manifest, manifest_bytes));
+    try fx.tmp.dir.deleteFile(io, "pkg/plugin.labelle");
+    try std.testing.expectEqual(@as(u32, 1), Recreate.count(fx.project, ctx.ignore.roots, ctx.ignore.files, manifest, manifest_bytes));
+    // The recreated manifest rebuilds cleanly, and the provider is watched
+    // as a provider again.
+    Publish.reset();
+    try ctx.rebuildStaged();
+    try std.testing.expectEqual(@as(usize, 1), ctx.ignore.roots.len);
+    try std.testing.expectEqualStrings(pkg, ctx.ignore.roots[0]);
+}

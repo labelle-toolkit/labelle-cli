@@ -471,7 +471,9 @@ pub const RebuildCtx = struct {
     fn refreshIgnoreFor(self: *RebuildCtx, deps: []const project_config.PluginDep) void {
         const a = self.allocator;
         var next = watchIgnorePaths(a, self.project_dir, self.prebuild_steps, self.hooks_enabled);
-        var roots = localProviderRoots(a, self.project_dir, deps);
+        // A root watched now stays watched while its manifest is missing:
+        // recreating it must rebuild (cli#478).
+        var roots = localProviderRootsKeeping(a, self.project_dir, deps, self.ignore.roots);
         if (sameFiles(self.ignore.files, next.items) and sameFiles(self.ignore.roots, roots.items)) {
             freePaths(a, &next);
             freePaths(a, &roots);
@@ -564,6 +566,15 @@ pub fn watchIgnorePaths(allocator: std.mem.Allocator, project_dir: []const u8, s
 /// (`computeSignatureRoots`). Best effort: a package that cannot be
 /// resolved is not watched. Caller owns the list.
 pub fn localProviderRoots(allocator: std.mem.Allocator, project_dir: []const u8, deps: []const project_config.PluginDep) std.ArrayList([]const u8) {
+    return localProviderRootsKeeping(allocator, project_dir, deps, &.{});
+}
+
+/// `localProviderRoots`, also keeping a declared local package whose
+/// canonical folder is in `watched` (the session's current extra roots)
+/// while its `plugin.labelle` is missing: a provider whose manifest was
+/// deleted stays watched, so recreating the manifest rebuilds (cli#478).
+/// A local package that never had a manifest is still not watched.
+pub fn localProviderRootsKeeping(allocator: std.mem.Allocator, project_dir: []const u8, deps: []const project_config.PluginDep, watched: []const []const u8) std.ArrayList([]const u8) {
     const io = config.globalIo();
     var out: std.ArrayList([]const u8) = .empty;
     const project_real = std.Io.Dir.cwd().realPathFileAlloc(io, project_dir, allocator) catch return out;
@@ -583,7 +594,12 @@ pub fn localProviderRoots(allocator: std.mem.Allocator, project_dir: []const u8,
         defer allocator.free(dir_z);
         const manifest = std.fs.path.join(allocator, &.{ dir_z, "plugin.labelle" }) catch continue;
         defer allocator.free(manifest);
-        std.Io.Dir.cwd().access(io, manifest, .{}) catch continue;
+        std.Io.Dir.cwd().access(io, manifest, .{}) catch {
+            const kept = for (watched) |w| {
+                if (std.mem.eql(u8, w, dir_z)) break true;
+            } else false;
+            if (!kept) continue;
+        };
         const dir = allocator.dupe(u8, dir_z) catch continue;
         candidates.append(allocator, dir) catch allocator.free(dir);
     }
