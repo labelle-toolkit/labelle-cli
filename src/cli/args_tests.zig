@@ -430,6 +430,13 @@ pub const ParseRunArgsPassthroughSpec = struct {
                 const r = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
                 try std.testing.expectEqualStrings("x86_64-windows", r.docker_target.?);
             }
+            {
+                // Without --docker, --target is a warned no-op, not a refusal.
+                var iter = testIter("--target=aarch64-macos");
+                defer iter.deinit();
+                var pa = ParsedArgs{ .command = .run };
+                _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            }
         }
     };
 

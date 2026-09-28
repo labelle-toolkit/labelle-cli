@@ -5,6 +5,7 @@
 //! these lived in cli.zig. Unit tests live in the sibling
 //! args_tests.zig, surfaced to the runner via re-exports in cli.zig.
 const std = @import("std");
+const builtin = @import("builtin");
 const project_config = @import("project_config.zig");
 const util = @import("util.zig");
 const config = @import("config.zig");
@@ -386,24 +387,40 @@ pub fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []co
     return null;
 }
 
-/// `--docker --target=<arch>-macos[-abi]` is refused (cli#471 X3, D6): the
-/// container build cannot link macOS without Apple's frameworks, and the core
-/// no longer fetches a third-party copy of them. Linux and Windows cross
-/// builds stay.
-fn dockerTargetRefused(target: []const u8) bool {
-    var parts = std.mem.splitScalar(u8, target, '-');
+/// A `--docker` build for macOS is refused (cli#471 X3, D6): the container
+/// build cannot link macOS without Apple's frameworks, and the core no longer
+/// fetches a third-party copy of them. Linux and Windows cross builds stay.
+/// The effective target is the explicit `--target`, else the host's own
+/// (`docker.runBuild` falls back to it), so a bare `--docker` on a Mac is
+/// refused too. Without `--docker`, `--target` is a no-op the pipeline warns
+/// about, so nothing is refused here.
+fn dockerBuildRefused(docker_build: bool, target: ?[]const u8, host_os: std.Target.Os.Tag) bool {
+    if (!docker_build) return false;
+    const t = target orelse return host_os == .macos;
+    var parts = std.mem.splitScalar(u8, t, '-');
     _ = parts.next() orelse return false; // arch
     const os = parts.next() orelse return false;
     return std.mem.eql(u8, os, "macos");
 }
 
-test "dockerTargetRefused: macOS targets only" {
-    try std.testing.expect(dockerTargetRefused("aarch64-macos"));
-    try std.testing.expect(dockerTargetRefused("x86_64-macos-none"));
-    try std.testing.expect(!dockerTargetRefused("x86_64-windows"));
-    try std.testing.expect(!dockerTargetRefused("x86_64-linux-gnu"));
-    try std.testing.expect(!dockerTargetRefused("aarch64"));
-    try std.testing.expect(!dockerTargetRefused("x86_64-linux-macosish"));
+fn refuseDockerBuild(cmd_name: []const u8, docker_build: bool, target: ?[]const u8) bool {
+    if (!dockerBuildRefused(docker_build, target, builtin.os.tag)) return false;
+    std.debug.print("labelle {s}: --docker does not cross-compile for macOS (target {s}); pick a Linux or Windows --target, or build natively on a Mac\n", .{ cmd_name, target orelse "defaults to this Mac" });
+    return true;
+}
+
+test "dockerBuildRefused: the effective docker target, macOS only" {
+    try std.testing.expect(dockerBuildRefused(true, "aarch64-macos", .linux));
+    try std.testing.expect(dockerBuildRefused(true, "x86_64-macos-none", .linux));
+    try std.testing.expect(!dockerBuildRefused(true, "x86_64-windows", .macos));
+    try std.testing.expect(!dockerBuildRefused(true, "x86_64-linux-gnu", .macos));
+    try std.testing.expect(!dockerBuildRefused(true, "x86_64-linux-macosish", .linux));
+    // No --target: the host's own target.
+    try std.testing.expect(dockerBuildRefused(true, null, .macos));
+    try std.testing.expect(!dockerBuildRefused(true, null, .linux));
+    // Without --docker nothing is refused.
+    try std.testing.expect(!dockerBuildRefused(false, "aarch64-macos", .linux));
+    try std.testing.expect(!dockerBuildRefused(false, null, .macos));
 }
 
 /// Parse [dir], --scene, --platform, --optimize, --progress, --docker, --target
@@ -461,10 +478,6 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
                 std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
                 return null;
             }
-            if (dockerTargetRefused(val)) {
-                std.debug.print("labelle {s}: --docker does not cross-compile for macOS (--target={s}); build on a Mac, or pick a Linux or Windows target\n", .{ cmd_name, val });
-                return null;
-            }
             docker_target = val;
             continue;
         }
@@ -483,6 +496,7 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
             dir_set = true;
         }
     }
+    if (refuseDockerBuild(cmd_name, docker_build, docker_target)) return null;
     return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode, .linux_desktop = linux_desktop, .allow_older_cli = allow_older_cli };
 }
 
@@ -590,10 +604,6 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
                 std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
                 return null;
             }
-            if (dockerTargetRefused(val)) {
-                std.debug.print("labelle {s}: --docker does not cross-compile for macOS (--target={s}); build on a Mac, or pick a Linux or Windows target\n", .{ cmd_name, val });
-                return null;
-            }
             docker_target = val;
             continue;
         }
@@ -694,6 +704,7 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
     const resolved = resolveRunTimeout(timeout_ns, timeout_given, parsed_args.headless, headlessDefaultTimeoutNs());
     timeout_ns = resolved.timeout_ns;
     parsed_args.timeout_defaulted = resolved.defaulted;
+    if (refuseDockerBuild(cmd_name, docker_build, docker_target)) return null;
     return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .screenshot_path = screenshot_path, .screenshot_after_ns = screenshot_after_ns };
 }
 
