@@ -287,7 +287,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     assert lock.read_bytes() == old_lock and "Pinned" not in err
     schema_two([(pin, "probe", []), (other, None, ["other-target"])])
     accept()
-    assert json.loads(lock.read_text()) == {"schema_version": 1, "providers": [pin]}
+    # Lock schema 2 records the source, relative to the project (#456).
+    assert json.loads(lock.read_text()) == {"schema_version": 2, "registry": "../providers.json", "providers": [pin]}
     cleaned()
     # `other` was never cached (its hash is not even real), so only the table can name it.
     err = run("build", "--platform=other-target", code=1).stderr
@@ -303,6 +304,15 @@ with tempfile.TemporaryDirectory(prefix="labelle-github-") as temp:
     accepted_record = json.loads(record_path.read_text())
     assert accepted_record["source"] == str(registry.resolve()), accepted_record
     assert accepted_record["schema_version"] == 2 and len(accepted_record["document_sha256"]) == 64, accepted_record
+    # `.labelle/` is generated and safe to delete. The lock still says the
+    # pins came from the local registry, so the hint turns generic but never
+    # presents the public registry as this project's source (#456).
+    record_path.unlink()
+    err = run("build", "--platform=other-target", code=1).stderr
+    assert "(labelle.providers.lock came from a registry other than the public one, and .labelle/providers.registry.json" in err, err
+    assert "This project's pins came from another registry: pass its providers.json path or URL" in err, err
+    assert "Both resolve steps read the public provider registry" not in err and "(registry:" not in err, err
+    record_path.write_text(json.dumps(accepted_record))
     if os.name != "nt":
         public_shim = base / "public-shim"
         public_shim.mkdir()
@@ -343,15 +353,34 @@ sys.stdout.write(open({str(public_doc)!r}).read())
             record_path.write_text(json.dumps(tampered))
             err = run("build", "--platform=other-target", code=1).stderr
             assert "no provider for target 'other-target'" in err, err
-            assert "(the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)" in err, err
+            # The lock names the local source, so a tampered record is the
+            # same generic miss as a missing one (#456).
+            assert "(labelle.providers.lock came from a registry other than the public one" in err, err
+            assert "This project's pins came from another registry" in err, err
             assert "(registry:" not in err and "9.9.9" not in err and "public-owner" not in err, err
             assert '.{ .name = "<package>", .repo = "github.com/<owner>/<repo>", .version = "<version>" },' in err, err
             assert not public_log.exists(), public_log.read_text()
-            # Control: without the project's record the public registry IS asked.
+            # Online, with the record gone: still generic, and the public
+            # registry is not asked for a project whose pins came from elsewhere.
+            record_path.unlink()
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "came from a registry other than the public one" in err and "public-owner" not in err, err
+            assert not public_log.exists(), public_log.read_text()
+            # Control: a schema-1 lock (CLI 2.x) names no source, and
+            # with no record the public registry IS asked.
+            accepted_lock = lock.read_text()
+            lock.write_text(json.dumps({"schema_version": 1, "providers": [pin]}))
+            # With a schema-1 lock a tampered record still means "unknown
+            # source": generic, and the public registry is not asked.
+            record_path.write_text(json.dumps(tampered))
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "(the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)" in err, err
+            assert not public_log.exists(), public_log.read_text()
             record_path.unlink()
             err = run("build", "--platform=other-target", code=1).stderr
             assert "(registry: public-owner)" in err and "The provider registry lists package 'public-owner'" in err, err
             assert public_log.read_text().count("\n") == 1, err
+            lock.write_text(accepted_lock)
             record_path.write_text(good_record)
         finally:
             env.clear()

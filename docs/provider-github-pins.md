@@ -61,9 +61,15 @@ atomically replace `labelle.providers.lock`. When the registry is schema 2
 ([contract §4](provider-contract-v1.md#registry-schema-2-ownership-tables-and-defaults)),
 each release's `namespace`/`targets` claims must equal its verified
 manifest's declarations. Otherwise `RegistryDeclarationMismatch` names the
-release, and nothing is written. The lock itself stays schema 1. The registry kept for target diagnostics is
-the normalised document the accepted preview bound (its bytes hash to the
-preview's registry digest), never an unreviewed fetch. A successful accept removes the
+release, and nothing is written; in a schema-3 registry so must each
+release's `command_contract`. The lock is written as lock schema 2
+([contract §4](provider-contract-v1.md#4-github-manifest-and-project-integrity-lock)):
+the pins plus `registry`, the source this accept read (a local file relative
+to the project root), so the no-provider hints know which registry the pins
+came from even after `.labelle/` is deleted. The registry document kept for
+those hints (`.labelle/providers.registry.json`) is the normalised document
+the accepted preview bound (its bytes hash to the preview's registry digest),
+never an unreviewed fetch. A successful accept removes the
 preview file, so each accept is preceded by its own review. The lock rename is
 the commit point: if the preview cannot be removed afterwards (for example a
 read-only `.labelle`), the accept still exits 0 with the new lock in place and

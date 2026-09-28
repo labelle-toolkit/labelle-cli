@@ -75,6 +75,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
             std.debug.print("  {s} {s}: {s}@{s}\n    sha256 {s}\n    {s}\n", .{ pin.package, pin.version, pin.repo, pin.commit, pin.sha256, try pin.archiveUrl(a) });
             if (doc.find(pin.package, pin.version)) |record| {
                 std.debug.print("    namespace {s}, targets {s}\n", .{ jsonText(a, record.namespace), jsonText(a, record.targets) });
+                if (record.command_contract) |range| std.debug.print("    command_contract {s}\n", .{jsonText(a, range)});
             }
         }
         if (known and !found) {
@@ -99,6 +100,11 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     // confirm it (the whole normalised document, not just the selected
     // pins), and the pins prepared below are the previewed ones.
     try checkPreview(a, preview.?, source, doc, selected.items);
+    // The source the new lock will record (#456), in the project form (a
+    // local file relative to the project root). Checked before any archive
+    // work, so an accept never commits a lock that no later read accepts.
+    const lock_source = try registry_lookup.projectSource(a, root, try registry_lookup.canonicalSource(a, source));
+    try pin_mod.checkRegistrySource(lock_source);
     // What the target-hint cache will hold after the commit: the normalised
     // form of the document just bound to the preview, so its bytes hash to
     // the reviewed `registry_digest`. `checkPreview` already refused any
@@ -153,7 +159,8 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     try contract.validateOwnership(ownership.items, reserved);
     try hooks.validateAll(a, providers.items, &.{});
     const dest = try std.fs.path.join(a, &.{ root, lock_name });
-    const pins = try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = selected.items }, .{ .whitespace = .indent_2 });
+    const lock: pin_mod.Lock = .{ .schema_version = pin_mod.lock_schema, .registry = lock_source, .providers = selected.items };
+    const pins = try std.json.Stringify.valueAlloc(a, lock, .{ .whitespace = .indent_2 });
     {
         // Under the project lock every lock write of the project takes
         // (cli#481), held for the write only.
@@ -261,9 +268,11 @@ test "provider github: accept refuses a schema-2 record whose claims the verifie
     try fx.publishSchemaTwo(a, "\"probe\"", "");
     try fx.run(a, false);
     try fx.run(a, true);
-    const lock = try parse(a, try read(a, try std.fs.path.join(a, &.{ fx.root, lock_name }), 1024 * 1024), true);
-    try std.testing.expectEqual(@as(usize, 1), lock.providers.len);
-    try std.testing.expectEqual(@as(u8, 1), lock.schema_version);
+    const lock = try pin_mod.parseLock(a, try read(a, try std.fs.path.join(a, &.{ fx.root, lock_name }), 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 1), lock.document.providers.len);
+    // Lock schema 2 records the source, relative to the project (#456).
+    try std.testing.expectEqual(pin_mod.lock_schema, lock.document.schema_version);
+    try std.testing.expectEqualStrings("../providers.json", lock.registry.?);
 }
 
 test "provider github: the lock is the same for the github.com and the bare project repo, and another host is refused by name" {

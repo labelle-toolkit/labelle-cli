@@ -122,10 +122,61 @@ fn lowerHex(text: []const u8, length: usize) bool {
     return true;
 }
 
-/// The project integrity lock (and a schema-1 registry) share this small
-/// schema; locks allow one pin/package. Registry documents are read through
-/// `provider_registry.parse`, which also accepts schema 2.
+/// The lock schema `providers resolve --accept` writes. Schema 1 (CLI 2.x)
+/// stays readable; it records no registry source.
+pub const lock_schema: u8 = 2;
+
+/// Lock schema 2: the pins plus `registry`, the source the accept that
+/// wrote them read (#456) — the public registry URL, a custom https URL, or
+/// a local `providers.json` as a path relative to the project root with `/`
+/// separators, so a committed lock names no machine's directories. It lives
+/// outside `.labelle/`, so deleting generated output does not forget it.
+pub const Lock = struct {
+    schema_version: u8,
+    registry: []const u8,
+    providers: []const Pin,
+};
+
+pub const ParsedLock = struct {
+    document: Document,
+    /// Null for a schema-1 lock.
+    registry: ?[]const u8,
+};
+
+/// A lock's `registry` is one printable line: non-empty, no control bytes.
+/// `--accept` checks it before writing, so it never commits a lock this
+/// parser would refuse.
+pub fn checkRegistrySource(source: []const u8) !void {
+    if (source.len == 0) return error.InvalidProviderRegistrySource;
+    for (source) |c| if (c < 0x20 or c == 0x7f) return error.InvalidProviderRegistrySource;
+}
+
+/// Strict, like every lock read: schema 1 may not carry `registry`, schema 2
+/// must, as one printable line.
+pub fn parseLock(a: std.mem.Allocator, bytes: []const u8) !ParsedLock {
+    const Head = struct { schema_version: u8 };
+    const head = try std.json.parseFromSliceLeaky(Head, a, bytes, .{ .ignore_unknown_fields = true });
+    switch (head.schema_version) {
+        1 => {
+            const doc = try std.json.parseFromSliceLeaky(Document, a, bytes, .{ .allocate = .alloc_always });
+            try checkPins(doc.providers, true);
+            return .{ .document = doc, .registry = null };
+        },
+        lock_schema => {
+            const lock = try std.json.parseFromSliceLeaky(Lock, a, bytes, .{ .allocate = .alloc_always });
+            try checkRegistrySource(lock.registry);
+            try checkPins(lock.providers, true);
+            return .{ .document = .{ .schema_version = lock.schema_version, .providers = lock.providers }, .registry = lock.registry };
+        },
+        else => return error.UnsupportedProviderSchema,
+    }
+}
+
+/// The project integrity lock (either lock schema, `parseLock`) or a
+/// schema-1 registry; locks allow one pin/package. Registry documents are
+/// read through `provider_registry.parse`, which also accepts schemas 2 and 3.
 pub fn parse(a: std.mem.Allocator, bytes: []const u8, is_lock: bool) !Document {
+    if (is_lock) return (try parseLock(a, bytes)).document;
     const parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .allocate = .alloc_always });
     // The caller owns an arena; successful parsed strings live through invocation.
     const doc = parsed.value;
@@ -164,7 +215,7 @@ test "provider github: immutable GitHub identity and strict document" {
     const bytes = try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = &.{ pin, pin } }, .{});
     try std.testing.expectError(error.DuplicateProviderRelease, parse(a, bytes, false));
     try std.testing.expectError(error.UnknownField, parse(a, "{\"schema_version\":1,\"providers\":[],\"ignored\":true}", false));
-    try std.testing.expectError(error.UnsupportedProviderSchema, parse(a, "{\"schema_version\":2,\"providers\":[]}", true));
+    try std.testing.expectError(error.UnsupportedProviderSchema, parse(a, "{\"schema_version\":3,\"registry\":\"x\",\"providers\":[]}", true));
     try std.testing.expectError(error.DuplicateField, parse(a, "{\"schema_version\":1,\"schema_version\":1,\"providers\":[]}", true));
     bad = pin;
     bad.sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -239,4 +290,28 @@ test "provider github: a project repo matches its pin in the GitHub forms the as
     // Name and version still have to match.
     try std.testing.expect(!pin.matches(.{ .name = "other", .repo = "github.com/owner/repo", .version = "1.0.0" }));
     try std.testing.expect(!pin.matches(.{ .name = "fixture", .repo = "github.com/owner/repo", .version = "1.0.1" }));
+}
+
+test "provider github: lock schema 2 records the registry source; schema 1 stays readable; both are strict" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pin = "{\"package\":\"fixture\",\"repo\":\"owner/fixture\",\"version\":\"1.0.0\",\"commit\":\"" ++ "1" ** 40 ++ "\",\"sha256\":\"" ++ "a" ** 64 ++ "\"}";
+    const one = try parseLock(a, "{\"schema_version\":1,\"providers\":[" ++ pin ++ "]}");
+    try std.testing.expect(one.registry == null);
+    try std.testing.expectEqual(@as(usize, 1), one.document.providers.len);
+    const two = try parseLock(a, "{\"schema_version\":2,\"registry\":\"../my registry/providers.json\",\"providers\":[" ++ pin ++ "]}");
+    try std.testing.expectEqualStrings("../my registry/providers.json", two.registry.?);
+    try std.testing.expectEqualStrings("fixture", (try parse(a, "{\"schema_version\":2,\"registry\":\"x\",\"providers\":[" ++ pin ++ "]}", true)).providers[0].package);
+    try std.testing.expectError(error.UnknownField, parseLock(a, "{\"schema_version\":1,\"registry\":\"x\",\"providers\":[]}"));
+    try std.testing.expectError(error.MissingField, parseLock(a, "{\"schema_version\":2,\"providers\":[]}"));
+    try std.testing.expectError(error.InvalidProviderRegistrySource, parseLock(a, "{\"schema_version\":2,\"registry\":\"\",\"providers\":[]}"));
+    try std.testing.expectError(error.InvalidProviderRegistrySource, parseLock(a, "{\"schema_version\":2,\"registry\":\"a\\u001bb\",\"providers\":[]}"));
+    try std.testing.expectError(error.UnsupportedProviderSchema, parseLock(a, "{\"schema_version\":3,\"registry\":\"x\",\"providers\":[]}"));
+    // The same rule `--accept` applies before it writes (a POSIX path may hold a newline).
+    try std.testing.expectError(error.InvalidProviderRegistrySource, checkRegistrySource("../reg\nistry/providers.json"));
+    try checkRegistrySource("../my registry/providers.json");
+    try std.testing.expectError(error.DuplicateProviderRelease, parseLock(a, "{\"schema_version\":2,\"registry\":\"x\",\"providers\":[" ++ pin ++ "," ++ pin ++ "]}"));
+    // A registry document is still schema 1 only through this parser.
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"schema_version\":2,\"registry\":\"x\",\"providers\":[]}", false));
 }
