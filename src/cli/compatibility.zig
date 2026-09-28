@@ -290,14 +290,28 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
     // Since core 2.0.0 / engine 3.0.0 / gfx 2.0.0 / CLI 2.0.0 the curated line moved, so
     // the same-major-line guard is expressed on the current line, and the
     // 1.x set is asserted separately below as the case that SHOULD warn.
+    // The CLI pin is this CLI's own version, so the case keeps meaning "on
+    // the current line" across CLI major bumps (3.0.0 broke a hard-coded 2.0.0).
     const reported = project_config.ProjectConfig{
         .name = "my_game",
         .core_version = "2.0.0",
         .engine_version = "3.0.0",
         .gfx_version = "2.0.0",
-        .labelle_version = "2.0.0",
+        .labelle_version = project_config.CLI_VERSION,
     };
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(reported, false));
+
+    // A CLI pin exactly one major behind this CLI is the only drift: one warning.
+    if (parseVersion(project_config.CLI_VERSION).major >= 3) {
+        const cli_behind = project_config.ProjectConfig{
+            .name = "my_game",
+            .core_version = "2.0.0",
+            .engine_version = "3.0.0",
+            .gfx_version = "2.0.0",
+            .labelle_version = "2.1.1",
+        };
+        try std.testing.expectEqual(@as(u8, 1), compatWarnings(cli_behind, false));
+    }
 
     // A project still on the whole 1.x line is one MAJOR behind on core,
     // engine, gfx AND (since CLI 2.0.0) the CLI. Four warnings is the
@@ -318,7 +332,7 @@ test "the pin set `labelle init` scaffolds passes the CLI's own check (#357)" {
         .core_version = "2.0.0",
         .engine_version = "3.0.0",
         .gfx_version = "2.0.0",
-        .labelle_version = "2.0.0",
+        .labelle_version = project_config.CLI_VERSION,
     };
     try std.testing.expectEqual(@as(u8, 0), compatWarnings(flagship, false));
 }
