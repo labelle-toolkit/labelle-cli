@@ -57,18 +57,15 @@ pub fn launch(
         return 0;
     }
     const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, target.name, null);
-    // cli#485: say once, before anything launches, that the headless
-    // default budget is in force — it reaches every branch below (a
-    // replacement as its `timeout_ms`), like an explicit `--timeout`.
-    if (headlessDefaultNotice(parsed_args)) |t| {
-        var dur_buf: [48]u8 = undefined;
-        std.debug.print("labelle: headless run: stopping after {s} (use --timeout to change, --timeout=0 for none)\n", .{formatDuration(&dur_buf, t)});
-    }
+    // cli#485: the headless default is announced by the branches that
+    // honour it — the host launch's watchdog and a replacement (as its
+    // `timeout_ms`) — and never by a detached launch, which no budget stops.
     {
         const code = try provider_hooks.runPhase(hook_site, hook_plans.run.before, .run, .before, run_out);
         if (code != 0) return code;
     }
     if (hook_plans.run.replace) |replacement| {
+        announceHeadlessDefault(parsed_args);
         // `labelle run --watch` (RFC cli#466 §3.4): the replacement serves
         // while core rebuilds and publishes (`watch_session.zig`). The
         // install stage already refused a replacement that cannot watch.
@@ -82,10 +79,12 @@ pub fn launch(
         if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to iOS Simulator");
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
         try ios.deployToSimulator(allocator, target_dir, parsed);
+        if (parsed_args.timeout_defaulted) std.debug.print("labelle: note: the headless default timeout does not apply to a detached launch; stop the app yourself\n", .{});
         // `simctl launch` returns while the app runs on: its exit is never
         // seen here, so this is not the clean exit after hooks wait for.
         return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .launched_detached);
     } else {
+        announceHeadlessDefault(parsed_args);
         if (timeout_ns) |t| {
             var dur_buf: [48]u8 = undefined;
             std.debug.print("labelle: running (timeout: {s})...\n\n", .{formatDuration(&dur_buf, t)});
@@ -268,6 +267,13 @@ pub fn launch(
 fn headlessDefaultNotice(parsed_args: *const ParsedArgs) ?u64 {
     if (!parsed_args.timeout_defaulted) return null;
     return parsed_args.timeout_ns;
+}
+
+/// cli#485: the one notice line for a run the headless default bounds.
+fn announceHeadlessDefault(parsed_args: *const ParsedArgs) void {
+    const t = headlessDefaultNotice(parsed_args) orelse return;
+    var dur_buf: [48]u8 = undefined;
+    std.debug.print("labelle: headless run: stopping after {s} (use --timeout to change, --timeout=0 for none)\n", .{formatDuration(&dur_buf, t)});
 }
 
 /// cli#485: when the watchdog that ended the game was the headless
