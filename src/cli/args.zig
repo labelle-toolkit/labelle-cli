@@ -46,29 +46,12 @@ pub fn parseSceneFlag(
     scene_override: *?[]const u8,
     cmd_name: []const u8,
 ) SceneResult {
-    switch (parseSceneArg(arg)) {
-        .parsed => {
-            scene_override.* = sceneArgValue(arg);
+    switch (parseValueFlag(arg, args, "scene", "--scene main_menu", cmd_name) orelse return .err) {
+        .value => |val| {
+            scene_override.* = val;
             return .parsed;
         },
-        .needs_next => {
-            if (args.next()) |val| {
-                if (val.len == 0) {
-                    std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene main_menu)\n", .{cmd_name});
-                    return .err;
-                }
-                scene_override.* = val;
-                return .parsed;
-            } else {
-                std.debug.print("labelle {s}: --scene requires a value (e.g. --scene main_menu)\n", .{cmd_name});
-                return .err;
-            }
-        },
-        .err => {
-            std.debug.print("labelle {s}: --scene requires a non-empty value (e.g. --scene=main_menu)\n", .{cmd_name});
-            return .err;
-        },
-        .not_scene => return .not_scene,
+        .skip => return .not_scene,
     }
 }
 
@@ -169,38 +152,59 @@ pub const BundleArgs = struct {
     platform: ?[]const u8 = null,
 };
 
-/// Result of `parseBundleValueFlag`: `.skip` = not this flag.
-const ValueFlag = union(enum) { skip, value: []const u8 };
+/// Result of `parseValueFlag`: `.skip` = not this flag.
+pub const ValueFlag = union(enum) { skip, value: []const u8 };
 
-/// One `--<name> <value>` / `--<name>=<value>` flag of `labelle bundle`.
+/// The one parser for every value-taking `--<name> <value>` /
+/// `--<name>=<value>` flag (`run`, `build`, `generate`, `bundle`).
 /// `.skip` when `arg` is not this flag, `.value` on a match, `null` on a
-/// usage error (already printed). A following flag is NOT the value:
-/// `--output --progress=json` would otherwise create a directory
-/// literally named `--progress=json` and silently drop the progress flag
-/// (CodeRabbit on #362). A value that really starts with `--` can still
-/// be given in the `=` form (`--output=--weird`).
-fn parseBundleValueFlag(
+/// usage error (already printed).
+///
+/// In the space form the next token is the value only when it does not
+/// itself look like a flag: `run --screenshot --timeout=60` used to write
+/// the capture to a file named `--timeout=60` and silently drop the
+/// timeout (cli#396), and `bundle --output --progress=json` the same way
+/// (CodeRabbit on #362). A bare `--` is refused too, so a missing value
+/// cannot swallow the passthrough separator. A value that really starts
+/// with `--` can still be given in the `=` form (`--screenshot=--odd.png`).
+pub fn parseValueFlag(
     arg: []const u8,
     args: anytype,
     comptime name: []const u8,
     comptime example: []const u8,
+    cmd_name: []const u8,
 ) ?ValueFlag {
     const bare = "--" ++ name;
     const eq_form = bare ++ "=";
-    if (!std.mem.startsWith(u8, arg, eq_form) and !std.mem.eql(u8, arg, bare)) return .skip;
-    const separate_value = std.mem.eql(u8, arg, bare);
-    const val = if (separate_value)
-        (args.next() orelse {
-            std.debug.print("labelle bundle: {s} requires a value (e.g. {s})\n", .{ bare, example });
+    if (std.mem.startsWith(u8, arg, eq_form)) {
+        const val = arg[eq_form.len..];
+        if (val.len == 0) {
+            std.debug.print("labelle {s}: {s} requires a value (e.g. {s})\n", .{ cmd_name, bare, example });
             return null;
-        })
-    else
-        arg[eq_form.len..];
-    if (val.len == 0 or (separate_value and std.mem.startsWith(u8, val, "--"))) {
-        std.debug.print("labelle bundle: {s} requires a value (e.g. {s})\n", .{ bare, example });
-        return null;
+        }
+        return .{ .value = val };
     }
-    return .{ .value = val };
+    if (!std.mem.eql(u8, arg, bare)) return .skip;
+    const next = args.next();
+    switch (classifySeparateValue(next)) {
+        .value => return .{ .value = next.? },
+        .missing => std.debug.print("labelle {s}: {s} requires a value (e.g. {s})\n", .{ cmd_name, bare, example }),
+        .empty => std.debug.print("labelle {s}: {s} requires a non-empty value (e.g. {s})\n", .{ cmd_name, bare, example }),
+        .flag => std.debug.print("labelle {s}: {s} requires a value, but the next argument '{s}' is a flag (e.g. {s}; a value that starts with `--` needs the `{s}<value>` form)\n", .{ cmd_name, bare, next.?, example, eq_form }),
+    }
+    return null;
+}
+
+/// What the token after a bare `--<name>` is to `parseValueFlag`: the
+/// flag's value, or why it is not. `.flag` = it starts with `--`, so it
+/// is the next flag or the `--` passthrough separator (cli#396).
+pub const SeparateValue = enum { value, missing, empty, flag };
+
+pub fn classifySeparateValue(next: ?[]const u8) SeparateValue {
+    const val = next orelse return .missing;
+    if (val.len == 0) return .empty;
+    if (std.mem.startsWith(u8, val, "--")) return .flag;
+    return .value;
 }
 
 /// Parse the flags of `labelle bundle [dir] [--optimize=<mode>]
@@ -225,10 +229,10 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
         if (parseProgressFlag(arg, &result.progress_mode, "bundle")) |consumed| {
             if (consumed) continue;
         } else return null;
-        if (parseToolchainFlag(arg, args)) |consumed| {
+        if (parseToolchainFlag(arg, args, "bundle")) |consumed| {
             if (consumed) continue;
         } else return null;
-        switch (parseBundleValueFlag(arg, args, "platform", "--platform=<target>") orelse return null) {
+        switch (parseValueFlag(arg, args, "platform", "--platform=<target>", "bundle") orelse return null) {
             .value => |v| {
                 result.platform = parseTargetValue(v) orelse {
                     printInvalidTarget("bundle", v);
@@ -238,14 +242,14 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
             },
             .skip => {},
         }
-        switch (parseBundleValueFlag(arg, args, "output", "--output ./dist") orelse return null) {
+        switch (parseValueFlag(arg, args, "output", "--output ./dist", "bundle") orelse return null) {
             .value => |v| {
                 result.output = v;
                 continue;
             },
             .skip => {},
         }
-        switch (parseBundleValueFlag(arg, args, "build-number", "--build-number 42") orelse return null) {
+        switch (parseValueFlag(arg, args, "build-number", "--build-number 42", "bundle") orelse return null) {
             .value => |v| {
                 // Validated HERE, before the (minutes-long) build, not when
                 // the plist is rendered after it (cli#363). Same words as
@@ -316,29 +320,14 @@ fn parsePlatformFlag(arg: []const u8, platform: *?[]const u8, cmd_name: []const 
 /// wins (checked first in `resolveZig`). Returns true when consumed, false
 /// when `arg` is not `--zig`, and null on a missing value. The stored slice
 /// borrows argv, which lives for the whole `main()` call.
-fn parseZigFlag(arg: []const u8, args: anytype) ?bool {
-    if (std.mem.startsWith(u8, arg, "--zig=")) {
-        const val = arg["--zig=".len..];
-        if (val.len == 0) {
-            std.debug.print("labelle: --zig requires a path (e.g. --zig=/opt/zig/zig)\n", .{});
-            return null;
-        }
-        zig_toolchain.setFlagOverride(val);
-        return true;
+fn parseZigFlag(arg: []const u8, args: anytype, cmd_name: []const u8) ?bool {
+    switch (parseValueFlag(arg, args, "zig", "--zig /opt/zig/zig", cmd_name) orelse return null) {
+        .value => |val| {
+            zig_toolchain.setFlagOverride(val);
+            return true;
+        },
+        .skip => return false,
     }
-    if (std.mem.eql(u8, arg, "--zig")) {
-        const val = args.next() orelse {
-            std.debug.print("labelle: --zig requires a path (e.g. --zig /opt/zig/zig)\n", .{});
-            return null;
-        };
-        if (val.len == 0) {
-            std.debug.print("labelle: --zig requires a non-empty path (e.g. --zig /opt/zig/zig)\n", .{});
-            return null;
-        }
-        zig_toolchain.setFlagOverride(val);
-        return true;
-    }
-    return false;
 }
 
 /// `--allow-older-cli` (#353): the escape hatch of the stale-CLI lock gate
@@ -351,8 +340,8 @@ pub fn parseAllowOlderCliFlag(arg: []const u8) bool {
 
 /// Try the managed-toolchain path override (`--zig`) for one arg. true =
 /// consumed, false = not the flag, null = the flag with a bad value.
-fn parseToolchainFlag(arg: []const u8, args: anytype) ?bool {
-    return parseZigFlag(arg, args);
+fn parseToolchainFlag(arg: []const u8, args: anytype, cmd_name: []const u8) ?bool {
+    return parseZigFlag(arg, args, cmd_name);
 }
 
 /// Try to parse `--progress=<mode>` (cli#284). Returns true if consumed,
@@ -455,7 +444,7 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
             docker_target = val;
             continue;
         }
-        if (parseToolchainFlag(arg, args)) |consumed| {
+        if (parseToolchainFlag(arg, args, cmd_name)) |consumed| {
             if (consumed) continue;
         } else return null;
         if (std.mem.startsWith(u8, arg, "--")) {
@@ -584,68 +573,51 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
             parsed_args.run_watch = true;
             continue;
         }
-        if (std.mem.startsWith(u8, arg, "--timeout=")) {
-            const val = arg["--timeout=".len..];
-            timeout_given = true;
-            timeout_ns = parseTimeoutValue(val) orelse {
-                std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
-                std.debug.print("  expected format: --timeout=30s, --timeout=2m (--timeout=0 or --timeout=none: no timeout)\n", .{});
-                return null;
-            };
-        } else if (std.mem.eql(u8, arg, "--timeout")) {
-            if (args.next()) |val| {
+        switch (parseValueFlag(arg, args, "timeout", "--timeout 30s", cmd_name) orelse return null) {
+            .value => |val| {
                 timeout_given = true;
                 timeout_ns = parseTimeoutValue(val) orelse {
-                    std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
-                    std.debug.print("  expected format: --timeout 30s, --timeout 2m (--timeout 0 or --timeout none: no timeout)\n", .{});
+                    std.debug.print("labelle {s}: invalid --timeout value '{s}'\n", .{ cmd_name, val });
+                    std.debug.print("  expected format: --timeout=30s, --timeout 2m (--timeout=0 or --timeout=none: no timeout)\n", .{});
                     return null;
                 };
-            } else {
-                std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
-                return null;
-            }
-        } else if (std.mem.startsWith(u8, arg, "--screenshot=")) {
-            const val = arg["--screenshot=".len..];
-            if (val.len == 0) {
-                std.debug.print("labelle {s}: --screenshot requires a path (e.g. --screenshot=/tmp/shot.png)\n", .{cmd_name});
-                return null;
-            }
-            screenshot_path = val;
-            continue;
-        } else if (std.mem.eql(u8, arg, "--screenshot")) {
-            if (args.next()) |val| {
-                if (val.len == 0) {
-                    std.debug.print("labelle {s}: --screenshot requires a path (e.g. --screenshot /tmp/shot.png)\n", .{cmd_name});
-                    return null;
-                }
+                continue;
+            },
+            .skip => {},
+        }
+        switch (parseValueFlag(arg, args, "screenshot", "--screenshot /tmp/shot.png", cmd_name) orelse return null) {
+            .value => |val| {
                 screenshot_path = val;
-            } else {
-                std.debug.print("labelle {s}: --screenshot requires a path (e.g. --screenshot /tmp/shot.png)\n", .{cmd_name});
-                return null;
-            }
-            continue;
-        } else if (std.mem.startsWith(u8, arg, "--after=")) {
-            screenshot_after_ns = util.parseDuration(arg["--after=".len..]);
-            if (screenshot_after_ns == null) {
-                std.debug.print("labelle {s}: invalid --after value '{s}'\n", .{ cmd_name, arg["--after=".len..] });
-                std.debug.print("  expected format: --after=2s, --after=500ms\n", .{});
-                return null;
-            }
-            continue;
-        } else if (std.mem.eql(u8, arg, "--after")) {
-            if (args.next()) |val| {
-                screenshot_after_ns = util.parseDuration(val);
-                if (screenshot_after_ns == null) {
+                continue;
+            },
+            .skip => {},
+        }
+        switch (parseValueFlag(arg, args, "after", "--after 2s", cmd_name) orelse return null) {
+            .value => |val| {
+                screenshot_after_ns = util.parseDuration(val) orelse {
                     std.debug.print("labelle {s}: invalid --after value '{s}'\n", .{ cmd_name, val });
-                    std.debug.print("  expected format: --after 2s, --after 500ms\n", .{});
+                    std.debug.print("  expected format: --after=2s, --after 500ms\n", .{});
+                    return null;
+                };
+                continue;
+            },
+            .skip => {},
+        }
+        switch (parseValueFlag(arg, args, "ticks", "--ticks=600", cmd_name) orelse return null) {
+            .value => |val| {
+                const n = std.fmt.parseInt(u64, val, 10) catch 0;
+                if (n == 0) {
+                    std.debug.print("labelle {s}: invalid --ticks value '{s}'\n", .{ cmd_name, val });
+                    std.debug.print("  expected a positive integer, e.g. --ticks=600\n", .{});
                     return null;
                 }
-            } else {
-                std.debug.print("labelle {s}: --after requires a value (e.g. --after 2s)\n", .{cmd_name});
-                return null;
-            }
-            continue;
-        } else if (parseAllowOlderCliFlag(arg)) {
+                parsed_args.headless = true; // --ticks implies --headless
+                parsed_args.headless_ticks = n;
+                continue;
+            },
+            .skip => {},
+        }
+        if (parseAllowOlderCliFlag(arg)) {
             parsed_args.allow_older_cli = true;
             continue;
         } else if (std.mem.eql(u8, arg, "--headless")) {
@@ -660,34 +632,7 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
             parsed_args.headless = true;
             parsed_args.headless_uncapped = true;
             continue;
-        } else if (std.mem.startsWith(u8, arg, "--ticks=")) {
-            const val = arg["--ticks=".len..];
-            const n = std.fmt.parseInt(u64, val, 10) catch null;
-            if (n == null or n.? == 0) {
-                std.debug.print("labelle {s}: invalid --ticks value '{s}'\n", .{ cmd_name, val });
-                std.debug.print("  expected a positive integer, e.g. --ticks=600\n", .{});
-                return null;
-            }
-            parsed_args.headless = true; // --ticks implies --headless
-            parsed_args.headless_ticks = n.?;
-            continue;
-        } else if (std.mem.eql(u8, arg, "--ticks")) {
-            // Space-separated form, same as `--timeout 30s`.
-            if (args.next()) |val| {
-                const n = std.fmt.parseInt(u64, val, 10) catch null;
-                if (n == null or n.? == 0) {
-                    std.debug.print("labelle {s}: invalid --ticks value '{s}'\n", .{ cmd_name, val });
-                    std.debug.print("  expected a positive integer, e.g. --ticks 600\n", .{});
-                    return null;
-                }
-                parsed_args.headless = true; // --ticks implies --headless
-                parsed_args.headless_ticks = n.?;
-            } else {
-                std.debug.print("labelle {s}: --ticks requires a value (e.g. --ticks=600)\n", .{cmd_name});
-                return null;
-            }
-            continue;
-        } else if (parseToolchainFlag(arg, args)) |consumed| {
+        } else if (parseToolchainFlag(arg, args, cmd_name)) |consumed| {
             if (consumed) continue;
             // parseToolchainFlag returned false → fall through to unknown-flag/dir.
             if (std.mem.startsWith(u8, arg, "--")) {
