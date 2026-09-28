@@ -7,14 +7,17 @@
 //!
 //!   * a `.subdir` pin (assembler#771) — a plugin that lives in a directory
 //!     of a monorepo. The archive is cached whole; the plugin root is
-//!     `<archive>/<subdir>`.
+//!     `<archive>/<subdir>` (`resolveRemotePlugin`).
 //!   * an `install plugin <name> local:<path>` override (assembler#772) —
 //!     an EXPLICIT local slot at `<packages>/local/plugins/<key>` with a
 //!     provenance marker at `<packages>/local.origins/plugins/<key>`. The
-//!     assembler builds from it instead of the pinned release, so the CLI
-//!     must read the plugin's manifests (and watch its sources) there too;
-//!     otherwise a fresh clone with an override installed fails provider
-//!     discovery on a release that was never fetched.
+//!     assembler builds from it instead of the pinned release. Rather than
+//!     teach every CLI consumer about it, `applyOverrides` runs once when
+//!     project.labelle is read and turns the dep into a LOCAL one
+//!     (`PluginDep.cli_override_source`): provider discovery, watch roots,
+//!     atlases and manifests then all treat it like a `local:` pin — which
+//!     is what it is for this build — while `repo`/`version` keep the
+//!     committed pin for `labelle.lock`.
 //!
 //! Only `.explicit` markers are honoured here. A `.discovered` slot is the
 //! assembler's monorepo auto-discovery, which activates only for an
@@ -25,16 +28,29 @@ const config = @import("config.zig");
 const project_config = @import("project_config.zig");
 const asm_cache = @import("asm_cache.zig");
 
-/// The on-disk plugin directory for a REMOTE dep: the source an explicit
-/// override names when one is active, else `<archive>/<subdir>`. Caller
-/// owns the returned slice.
+/// The cached plugin directory for a REMOTE dep: `<archive>/<subdir>`.
+/// Overrides are not consulted here — `applyOverrides` has already made an
+/// overridden dep local. Caller owns the returned slice.
 pub fn resolveRemotePlugin(allocator: std.mem.Allocator, dep: project_config.PluginDep) ![]const u8 {
-    if (try explicitOverrideSource(allocator, dep)) |source| return source;
     const packages_dir = try asm_cache.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
     const sub = std.mem.trimEnd(u8, dep.subdir, "/\\");
     if (sub.len == 0) return std.fs.path.join(allocator, &.{ packages_dir, "plugins", dep.repo, dep.version });
     return std.fs.path.join(allocator, &.{ packages_dir, "plugins", dep.repo, dep.version, sub });
+}
+
+/// Mark every remote `.plugins` entry that has an active explicit override
+/// as local to its checkout. `cfg.plugins` is the parser's own allocation,
+/// so the entries are updated in place; the source string is allocated with
+/// `allocator` like every other parsed field. A value AUTHORED in
+/// project.labelle is discarded first: only the assembler's marker counts.
+pub fn applyOverrides(allocator: std.mem.Allocator, cfg: project_config.ProjectConfig) !void {
+    const plugins = @constCast(cfg.plugins);
+    for (plugins) |*dep| {
+        dep.cli_override_source = null;
+        if (dep.isLocal()) continue;
+        dep.cli_override_source = try explicitOverrideSource(allocator, dep.*);
+    }
 }
 
 /// `<readable name>-<16 hex digits>` — mirrors the assembler's
@@ -173,9 +189,26 @@ test "plugin slot: an EXPLICIT override wins, a discovered one or a dead source 
     const explicit = try std.fmt.allocPrint(a, "# labelle local cache slot\nsource = {s}\nrevision = unknown\npinned = 0.1.0\nmode = explicit\n", .{checkout});
     defer a.free(explicit);
     try tmp.dir.writeFile(io, .{ .sub_path = marker_rel, .data = explicit });
-    const dir = try resolveRemotePlugin(a, debug_dep);
-    defer a.free(dir);
-    try testing.expectEqualStrings(checkout, dir);
+    // Folded in at load time: the dep becomes LOCAL to its checkout for
+    // every consumer, while the committed pin (what the lock records) stays.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var deps = [_]project_config.PluginDep{
+        debug_dep,
+        .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "0.5.0" },
+        .{ .name = "mine", .repo = "@libs/mine", .cli_override_source = "authored" },
+    };
+    try applyOverrides(arena.allocator(), .{ .name = "g", .plugins = &deps });
+    try testing.expect(deps[0].isLocal());
+    try testing.expectEqualStrings(checkout, deps[0].localPath());
+    try testing.expectEqualStrings(debug_dep.repo, deps[0].repo);
+    try testing.expect(!deps[1].isLocal());
+    // An authored value is never trusted: only the assembler's marker counts.
+    try testing.expect(deps[2].cli_override_source == null);
+    try testing.expectEqualStrings("libs/mine", deps[2].localPath());
+    const plugin_dir = try @import("plugins.zig").resolvePluginDir(a, root, deps[0]);
+    defer a.free(plugin_dir);
+    try testing.expectEqualStrings(checkout, plugin_dir);
 
     // A discovered slot is the assembler's monorepo business, not ours.
     const discovered = try std.fmt.allocPrint(a, "source = {s}\nmode = discovered\n", .{checkout});

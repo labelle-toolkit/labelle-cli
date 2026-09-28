@@ -288,6 +288,11 @@ test "provider github: the lock is the same for the github.com and the bare proj
     defer sources.deinit();
     const dep: @import("../project_config.zig").PluginDep = .{ .name = "fixture", .repo = "github.com/example/fixture", .version = "1.0.0" };
     try std.testing.expect((try sources.projectDir(fx.root, dep)) != null);
+    // A `.subdir` declaration of the pinned provider is refused, not read
+    // from the archive root (assembler#771).
+    var sub = dep;
+    sub.subdir = "plugins/fixture";
+    try std.testing.expectError(error.ProviderSubdirUnsupported, sources.projectDir(fx.root, sub));
     // Another host is its own error, at resolve and against an existing lock,
     // never a match and never a missing release.
     try fx.declare(a, "gitlab.com/example/fixture");
