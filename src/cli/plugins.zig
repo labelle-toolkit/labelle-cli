@@ -139,8 +139,9 @@ pub fn readPluginMeta(allocator: std.mem.Allocator, plugin_dir: []const u8) erro
 ///
 /// Resolution is pure path construction — it never inspects the filesystem —
 /// so there is no "not found" case to fold into a `null`; failures
-/// (`OutOfMemory`, `NoHomeDirectory` from cache-root resolution) are real and
-/// propagate to the caller.
+/// (`OutOfMemory`, `NoHomeDirectory` from cache-root resolution, and
+/// `UnusableCachePath` for a remote repo/version the host cannot name, #496)
+/// are real and propagate to the caller.
 pub fn resolvePluginDir(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
@@ -242,8 +243,13 @@ pub fn cmdPlugins(allocator: std.mem.Allocator, args: []const []const u8) !void 
         var license: []const u8 = NONE;
         var author: []const u8 = NONE;
 
-        const plugin_dir = try resolvePluginDir(a, project_dir, dep);
-        if (try readPluginMeta(a, plugin_dir)) |meta| {
+        // A repo/version the host cannot name (#496) is still listed; the
+        // resolver has printed why its manifest cannot be read.
+        const plugin_dir: ?[]const u8 = resolvePluginDir(a, project_dir, dep) catch |err| switch (err) {
+            error.UnusableCachePath => null,
+            else => return err,
+        };
+        if (if (plugin_dir) |dir| try readPluginMeta(a, dir) else null) |meta| {
             if (meta.license) |l| license = l;
             if (meta.author) |au| author = au;
         }
