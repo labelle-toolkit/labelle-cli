@@ -353,7 +353,10 @@ sys.stdout.write(open({str(public_doc)!r}).read())
             record_path.write_text(json.dumps(tampered))
             err = run("build", "--platform=other-target", code=1).stderr
             assert "no provider for target 'other-target'" in err, err
-            assert "(the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)" in err, err
+            # The lock names the local source, so a tampered record is the
+            # same generic miss as a missing one (#456).
+            assert "(labelle.providers.lock came from a registry other than the public one" in err, err
+            assert "This project's pins came from another registry" in err, err
             assert "(registry:" not in err and "9.9.9" not in err and "public-owner" not in err, err
             assert '.{ .name = "<package>", .repo = "github.com/<owner>/<repo>", .version = "<version>" },' in err, err
             assert not public_log.exists(), public_log.read_text()
@@ -367,6 +370,13 @@ sys.stdout.write(open({str(public_doc)!r}).read())
             # with no record the public registry IS asked.
             accepted_lock = lock.read_text()
             lock.write_text(json.dumps({"schema_version": 1, "providers": [pin]}))
+            # With a schema-1 lock a tampered record still means "unknown
+            # source": generic, and the public registry is not asked.
+            record_path.write_text(json.dumps(tampered))
+            err = run("build", "--platform=other-target", code=1).stderr
+            assert "(the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)" in err, err
+            assert not public_log.exists(), public_log.read_text()
+            record_path.unlink()
             err = run("build", "--platform=other-target", code=1).stderr
             assert "(registry: public-owner)" in err and "The provider registry lists package 'public-owner'" in err, err
             assert public_log.read_text().count("\n") == 1, err
