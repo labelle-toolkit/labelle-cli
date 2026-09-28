@@ -219,6 +219,10 @@ replacement launch needs:
   only way the budget reaches a replacement, and the replacement enforces
   it. A provider on contract `1.0.0`/`1.1.0` never receives it, so its run
   is not time-limited; the CLI prints a warning saying so.
+- `outcome_file` (wire `1.5.0`, the `replace run` hook only; null on the
+  other `run` hooks, absent below `1.5.0`) is where a replacement that
+  enforced `timeout_ms` itself writes `timeout` before exiting 0. See the
+  outcome table under [Failure](#failure).
 
 The CLI maps none of this to a platform. The provider decides how the pairs
 reach its game, for example as launch extras on a device.
@@ -312,14 +316,18 @@ to skip); the CLI's exit status is unchanged by the skip:
 | --- | --- | --- |
 | `exited_clean` | the game exited 0 | 0, or a failing after hook's code |
 | `exited_error` | the game exited nonzero or was killed by a signal | the game's (128 + signal) |
-| `timed_out` | the `--timeout` watchdog stopped the game | 0 (a genuine expiry is not a failure, cli#390) |
+| `timed_out` | the `--timeout` watchdog stopped the game, or a `replace run` hook wrote `timeout` to its `run.outcome_file` (wire `1.5.0`, cli#473) | 0 (a genuine expiry is not a failure, cli#390) |
 | `launched_detached` | `simctl launch` / `adb shell am start` returned while the app runs on | 0 |
 
 A zero status alone was never a clean exit — the watchdog reports 0 after
 killing the game, and the mobile deploy paths return as soon as the launch is
 issued — so a publishing or cleanup hook used to run after a forced timeout
 or immediately after a device launch. A `replace run` hook that exits 0 is a
-clean end of the step.
+clean end of the step unless it reported `timeout` through its
+`run.outcome_file`; any other content there fails the run (exit 1) before
+the `after run` hooks. A provider capped below wire `1.5.0` can't report, so
+its status-0 exit is always clean (contract §2, "Run outcome";
+`test/provider_run_outcome_e2e.py`).
 
 Hooks report under the progress phase of the step they wrap (`generate`,
 `compile` for `build`, `run` for `bundle` and `run`) as sub-steps named

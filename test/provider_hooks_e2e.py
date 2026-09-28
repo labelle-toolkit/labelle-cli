@@ -287,9 +287,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         assert Path(e["package_dir"]).name in ("fixture-a", "fixture-b"), e
         # Contract 1.2.0: every hook names the generated target dir; only
         # `run`-step hooks carry the run options. 1.3.0 adds the cache dir
-        # everywhere and an env_file on `before build`; 1.4.0 (the negotiated
-        # wire) the command's last step.
-        assert e["context"]["contract_version"] == "1.4.0", e
+        # everywhere and an env_file on `before build`; 1.4.0 the command's
+        # last step (1.5.0, run.outcome_file, is the negotiated wire).
+        assert e["context"]["contract_version"] == "1.5.0", e
         assert e["context"]["final_step"] == "build", e
         assert (e["context"]["env_file"] is not None) == (e["invocation"]["phase"] == "before"), e
         assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
@@ -441,10 +441,10 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert text.index("hook 'fixture-b/b-run-pre'") < text.index("labelle: running...") < text.index("hook 'fixture-a/a-run-post'"), text
     assert "after-run hooks skipped" not in text, text
     # A run with no options: every run-step hook still carries `run`, empty
-    # (on wire 1.3.0 with `watch: null` outside a watch session).
+    # (`watch` null outside a watch session, `outcome_file` off a replacement).
     for e in entries:
         if e["invocation"]["step"] == "run":
-            assert e["context"]["run"] == {"env": [], "args": [], "timeout_ms": None, "watch": None}, e
+            assert e["context"]["run"] == {"env": [], "args": [], "timeout_ms": None, "watch": None, "outcome_file": None}, e
             assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
 
     # ── run: the --timeout kill is not a clean exit ───────────────────────
@@ -731,7 +731,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     replaced = run("run", *run_flags)
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     ctx = probe_context(probe_out, "deploy")
-    assert ctx["contract_version"] == "1.4.0" and ctx["final_step"] == "run", ctx
+    assert ctx["contract_version"] == "1.5.0" and ctx["final_step"] == "run", ctx
+    # Its outcome file (wire 1.5.0) is covered by test/provider_run_outcome_e2e.py.
+    assert Path(ctx["run"].pop("outcome_file")).name == "outcome", ctx
     assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000, "watch": None}, ctx
     assert Path(ctx["target_dir"]) == probe_dir.resolve() and Path(ctx["output_dir"]) == probe_out.resolve(), ctx
     assert "run options not passed" not in replaced.stderr, replaced.stderr

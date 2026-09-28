@@ -249,7 +249,7 @@ pub fn run(
     session_site.run_options = options;
     supervise.current = &session_group;
     defer supervise.current = null;
-    const replaced = provider_hooks.runPhase(&session_site, &.{replacement}, .run, .replace, run_out);
+    const replaced = provider_hooks.runReplacement(&session_site, replacement, run_out);
     // A stop latched for the replacement ends with it: the `after run`
     // hooks of a clean exit are not signalled on spawn.
     session_group.clearPending();
@@ -270,9 +270,10 @@ pub fn run(
     if (site.host == null) site.host = session_site.host orelse rebuild_site.host;
     defer replanner.deinit(site, cx.providers, cx.parsed);
 
-    const code = replaced catch |err| return err;
+    const outcome = replaced catch |err| return err;
     const after = replanner.shutdownRunAfter(cx.hook_plans.run.after);
-    if (code != 0) {
+    if (outcome == .exited_error) {
+        const code = outcome.exited_error;
         if (after.len != 0) std.debug.print("labelle: after-run hooks skipped: the run replacement exited with status {d}\n", .{code});
         // A non-zero or signal exit is the run's terminal outcome: the
         // status file leaves the live `run` phase (`failed`, the code the
@@ -280,7 +281,8 @@ pub fn run(
         if (site.reporter) |r| r.failIfActive(code, "the run replacement exited with an error");
         return code;
     }
-    return provider_hooks.finishRun(site, after, run_out, .exited_clean);
+    // A reported `timeout` (`run.outcome_file`, wire 1.5.0+) skips them too.
+    return provider_hooks.finishRun(site, after, run_out, outcome);
 }
 
 fn publishNext(ptr: *anyopaque, gate: watch.PublishGate) anyerror!void {

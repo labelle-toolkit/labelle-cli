@@ -363,6 +363,25 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     finally:
         s.kill()
 
+    # ── A replacement that reports `timeout` skips `after run` too ──────
+    # A server that enforces `--timeout` itself exits 0 at its deadline; it
+    # says so through `run.outcome_file` (wire 1.5.0, cli#473), so the CLI
+    # applies the watchdog's rule: exit 0, the `after run` hooks skipped.
+    s = Session()
+    try:
+        s.wait_gen("gen=0 data=one")
+        status = s.finish("timeout")
+        assert status == 0, (status, s.output())
+        assert "labelle: after-run hooks skipped: the game was stopped by --timeout" in s.output(), s.output()
+        assert "done" not in hook_ids(), hook_ids()
+        assert not session_dir.exists()
+        checks += 1
+    except BaseException:
+        print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+        raise
+    finally:
+        s.kill()
+
     # ── Cancellation of an in-flight rebuild, no orphan ─────────────────
     for hook_id in ("toolchain", "stage"):
         marker = base / f"slow-{hook_id}"

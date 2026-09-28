@@ -19,6 +19,11 @@ const project = @import("project_config.zig");
 const progress = @import("progress.zig");
 const provider_env = @import("provider_env.zig");
 const config = @import("config.zig");
+const run_outcome = @import("provider_run_outcome.zig");
+
+/// Run a `run` replacement and say how it ended, its `run.outcome_file`
+/// report included (`provider_run_outcome.zig`, wire `1.5.0`+).
+pub const runReplacement = run_outcome.runReplacement;
 
 pub const Planned = struct { provider: *const dispatch.Provider, hook: manifest.Hook, qualified: []const u8 };
 
@@ -332,6 +337,13 @@ pub const Site = struct {
 /// Everything the phase allocates lives in a scratch arena freed on return;
 /// only the resolved host outlives it, on the site's long-lived arena.
 pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: contract.Phase, output_dir: []const u8) !u8 {
+    return runPhaseReporting(site, list, step, phase, output_dir, null);
+}
+
+/// `runPhase`, where a `run` replacement whose provider negotiates wire
+/// `1.5.0`+ also gets `run.outcome_file`: what it wrote there before
+/// exiting 0 lands in `reported` (`provider_run_outcome.runReplacement`).
+pub fn runPhaseReporting(site: *Site, list: []const Planned, step: contract.Step, phase: contract.Phase, output_dir: []const u8, reported: ?*RunOutcome) !u8 {
     if (list.len == 0) return 0;
     var scratch = std.heap.ArenaAllocator.init(site.backing);
     defer scratch.deinit();
@@ -363,11 +375,22 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
         // A fresh, private directory per invocation for the hook's
         // `env_file`; the file itself does not exist until the hook writes
         // it. Removed whatever happens.
-        const env_dir: ?[]const u8 = if (contract.envFileSlot(invocation)) try envDir(a, site.host.?) else null;
+        const env_dir: ?[]const u8 = if (contract.envFileSlot(invocation)) try privateDir(a, site.host.?, "provider-env") else null;
         defer if (env_dir) |dir| std.Io.Dir.cwd().deleteTree(config.globalIo(), dir) catch |err| {
             std.debug.print("labelle: could not remove hook environment directory '{s}': {s}\n", .{ dir, @errorName(err) });
         };
         const env_file: ?[]const u8 = if (env_dir) |dir| try std.fs.path.join(a, &.{ dir, "env.json" }) else null;
+        // Likewise for the run replacement's `outcome_file` (wire `1.5.0`+).
+        const outcome_dir: ?[]const u8 = if (reported != null and step == .run and phase == .replace and run_outcome.carried(provider))
+            try privateDir(a, site.host.?, "provider-run")
+        else
+            null;
+        defer if (outcome_dir) |dir| std.Io.Dir.cwd().deleteTree(config.globalIo(), dir) catch |err| {
+            std.debug.print("labelle: could not remove run outcome directory '{s}': {s}\n", .{ dir, @errorName(err) });
+        };
+        const outcome_file: ?[]const u8 = if (outcome_dir) |dir| try std.fs.path.join(a, &.{ dir, run_outcome.file_name }) else null;
+        var hook_run_options = run_options;
+        if (hook_run_options) |*options| options.outcome_file = outcome_file;
         if (site.reporter) |r| r.beginPhaseOrStep(progressPhase(step), try std.fmt.allocPrint(a, "hook {s}", .{planned.qualified}));
         std.debug.print("labelle: running {s} hook '{s}' for {s} ({s})\n", .{ @tagName(phase), planned.qualified, @tagName(step), site.target });
         const code = try site.run_tool(a, site.host.?, site.root, provider, .{ .build_step = planned.hook.build_step, .executable = planned.hook.executable }, .{
@@ -383,7 +406,7 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
             .cwd = site.root,
             .build_number = if (step == .bundle) site.build_number else null,
             .target_dir = target_dir,
-            .run_options = run_options,
+            .run_options = hook_run_options,
             .env_file = env_file,
             .final_step = site.final_step,
             .env = &site.env,
@@ -397,6 +420,7 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
             return code;
         }
         if (env_file) |path| try absorbEnvFile(site, a, planned.qualified, path);
+        if (outcome_file) |path| reported.?.* = try run_outcome.absorb(site, a, planned.qualified, path);
     }
     return 0;
 }
@@ -409,9 +433,10 @@ fn rejectEnvFile(site: *Site, qualified: []const u8, reason: []const u8) error{I
     return error.InvalidHookEnvFile;
 }
 
-/// `<LABELLE_HOME>/provider-env/<random>/`, created empty.
-fn envDir(a: std.mem.Allocator, host: dispatch.Host) ![]const u8 {
-    const parent = try dispatch.canonicalDir(a, try std.fs.path.join(a, &.{ host.cache_root, "provider-env" }));
+/// `<LABELLE_HOME>/<kind>/<random>/`, created empty: one invocation's
+/// private directory for a file it hands back (`env_file`, `outcome_file`).
+fn privateDir(a: std.mem.Allocator, host: dispatch.Host, kind: []const u8) ![]const u8 {
+    const parent = try dispatch.canonicalDir(a, try std.fs.path.join(a, &.{ host.cache_root, kind }));
     var random: [16]u8 = undefined;
     config.globalIo().random(&random);
     const dir = try std.fs.path.join(a, &.{ parent, &std.fmt.bytesToHex(random, .lower) });
@@ -479,7 +504,8 @@ pub fn finishServe(site: *Site, after: []const Planned, output_dir: []const u8) 
 
 /// How the core `run` step ended. A status of 0 alone does not mean the
 /// game ran to a clean end: the `--timeout` watchdog reports 0 after
-/// killing the game (cli#390), and a simulator or device launch returns
+/// killing the game (cli#390), a run replacement that enforced it reports
+/// `timeout` (cli#473), and a simulator or device launch returns
 /// while the app is still running. Only `exited_clean` is the success of
 /// contract §6 that lets a publishing or cleanup `after run` hook run
 /// (Codex P2 on #420); the CLI's exit status is `status()` either way.
@@ -489,7 +515,8 @@ pub const RunOutcome = union(enum) {
     /// The game process exited with this nonzero status (or was killed by a
     /// signal, 128 + signal).
     exited_error: u8,
-    /// The watchdog killed the game at the `--timeout` deadline.
+    /// The game was stopped at the `--timeout` deadline: by the CLI's
+    /// watchdog, or by a run replacement that reported it.
     timed_out,
     /// The launch returned while the app runs elsewhere (`simctl launch`,
     /// or any launcher that hands the app to a device): its exit is never
@@ -541,6 +568,7 @@ pub fn finishRun(site: *Site, after: []const Planned, output_dir: []const u8, ou
 test {
     _ = @import("provider_hooks_env_test.zig");
     _ = @import("provider_hooks_run_test.zig");
+    _ = @import("provider_run_outcome.zig");
 }
 
 const Fixture = struct {
