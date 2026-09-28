@@ -635,6 +635,13 @@ pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRu
         if (options.given()) std.debug.print("labelle: note: run options not passed to '{s}/{s}' (provider contract {s} < {s})\n", .{
             provider.meta.name, run.invocation.id, wire, contract.run_context_since,
         });
+        // The run's timeout (an explicit `--timeout`, or the headless
+        // default, cli#485) travels ONLY as `timeout_ms`: the CLI does not
+        // time a replacement itself. An older wire cannot carry it, so the
+        // run is NOT time-limited — say so plainly, not just "not passed".
+        if (options.timeout_ms != null and run.invocation.phase == .replace) std.debug.print("labelle: warning: '{s}/{s}' cannot receive the run's timeout (provider contract {s} < {s}); this run is not time-limited — stop it yourself, or upgrade the provider\n", .{
+            provider.meta.name, run.invocation.id, wire, contract.run_context_since,
+        });
         break :blk null;
     } else null;
     return .{

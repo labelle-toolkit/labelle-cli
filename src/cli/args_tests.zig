@@ -995,3 +995,67 @@ pub const AllowOlderCliFlagSpec = struct {
         try std.testing.expectEqualStrings("--allow-older-cli", pa.extra_args[0]);
     }
 };
+
+/// cli#485: `labelle run --headless` gets a default run-time budget,
+/// carried in the same `timeout_ns` an explicit `--timeout` sets. Under
+/// `zig build test` the CLI's environ is empty, so the test-only override
+/// is never set here and the default is `headless_default_timeout_ns`.
+pub const HeadlessDefaultTimeoutSpec = struct {
+    fn parse(line: []const u8, pa: *ParsedArgs) !?u64 {
+        var iter = testIter(line);
+        defer iter.deinit();
+        const result = parseRunArgs(&iter, "run", true, pa) orelse return error.TestFailed;
+        return result.timeout_ns;
+    }
+
+    test "a headless run with no --timeout gets the default, marked as the default" {
+        for ([_][]const u8{ "--headless", "--uncapped", "--ticks=600" }) |line| {
+            var pa = ParsedArgs{ .command = .run };
+            try expect.equal(try parse(line, &pa), @as(?u64, args.headless_default_timeout_ns));
+            try std.testing.expect(pa.timeout_defaulted);
+        }
+        try expect.equal(args.headless_default_timeout_ns, 5 * std.time.ns_per_min);
+    }
+
+    test "an explicit --timeout wins, in either position and form" {
+        for ([_][]const u8{ "--headless --timeout=30m", "--timeout=30m --headless", "--headless --timeout 30m" }) |line| {
+            var pa = ParsedArgs{ .command = .run };
+            try expect.equal(try parse(line, &pa), @as(?u64, 30 * std.time.ns_per_min));
+            try std.testing.expect(!pa.timeout_defaulted);
+        }
+    }
+
+    test "--timeout=0 and --timeout=none opt out: no watchdog at all" {
+        for ([_][]const u8{ "--headless --timeout=0", "--headless --timeout=none", "--headless --timeout 0s", "--timeout=0" }) |line| {
+            var pa = ParsedArgs{ .command = .run };
+            try expect.equal(try parse(line, &pa), @as(?u64, null));
+            try std.testing.expect(!pa.timeout_defaulted);
+        }
+    }
+
+    test "a non-headless run is unchanged: no timeout unless one is given" {
+        var pa = ParsedArgs{ .command = .run };
+        try expect.equal(try parse("--scene=main", &pa), @as(?u64, null));
+        try std.testing.expect(!pa.timeout_defaulted);
+        var pb = ParsedArgs{ .command = .run };
+        try expect.equal(try parse("--timeout=30s", &pb), @as(?u64, 30 * std.time.ns_per_s));
+        try std.testing.expect(!pb.timeout_defaulted);
+    }
+
+    test "an invalid --timeout value is still refused" {
+        var iter = testIter("--headless --timeout=soon");
+        defer iter.deinit();
+        var pa = ParsedArgs{ .command = .run };
+        try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+    }
+
+    test "resolveRunTimeout: the default is the only thing a headless, flagless run gets" {
+        const d: u64 = 2 * std.time.ns_per_s;
+        const defaulted = args.resolveRunTimeout(null, false, true, d);
+        try expect.equal(defaulted.timeout_ns, @as(?u64, d));
+        try std.testing.expect(defaulted.defaulted);
+        try expect.equal(args.resolveRunTimeout(7, true, true, d).timeout_ns, @as(?u64, 7));
+        try expect.equal(args.resolveRunTimeout(null, true, true, d).timeout_ns, @as(?u64, null));
+        try expect.equal(args.resolveRunTimeout(null, false, false, d).timeout_ns, @as(?u64, null));
+    }
+};

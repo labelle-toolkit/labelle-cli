@@ -58,11 +58,15 @@ pub fn launch(
         return 0;
     }
     const run_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .run, target.name, null);
+    // cli#485: the headless default is announced by the branches that
+    // honour it — the host launch's watchdog and a replacement (as its
+    // `timeout_ms`) — and never by a detached launch, which no budget stops.
     {
         const code = try provider_hooks.runPhase(hook_site, hook_plans.run.before, .run, .before, run_out);
         if (code != 0) return code;
     }
     if (hook_plans.run.replace) |replacement| {
+        announceHeadlessDefault(parsed_args);
         // `labelle run --watch` (RFC cli#466 §3.4): the replacement serves
         // while core rebuilds and publishes (`watch_session.zig`). The
         // install stage already refused a replacement that cannot watch.
@@ -78,21 +82,15 @@ pub fn launch(
         if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to iOS Simulator");
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
         try ios.deployToSimulator(allocator, target_dir, parsed);
+        if (parsed_args.timeout_defaulted) std.debug.print("labelle: note: the headless default timeout does not apply to a detached launch; stop the app yourself\n", .{});
         // `simctl launch` returns while the app runs on: its exit is never
         // seen here, so this is not the clean exit after hooks wait for.
         return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .launched_detached);
     } else {
+        announceHeadlessDefault(parsed_args);
         if (timeout_ns) |t| {
-            const secs = t / std.time.ns_per_s;
-            const mins = secs / 60;
-            const rem = secs % 60;
-            if (mins > 0 and rem > 0) {
-                std.debug.print("labelle: running (timeout: {d}m{d}s)...\n\n", .{ mins, rem });
-            } else if (mins > 0) {
-                std.debug.print("labelle: running (timeout: {d}m)...\n\n", .{mins});
-            } else {
-                std.debug.print("labelle: running (timeout: {d}s)...\n\n", .{secs});
-            }
+            var dur_buf: [48]u8 = undefined;
+            std.debug.print("labelle: running (timeout: {s})...\n\n", .{formatDuration(&dur_buf, t)});
         } else {
             std.debug.print("labelle: running...\n\n", .{});
         }
@@ -191,6 +189,7 @@ pub fn launch(
             if (run_outcome == .exited_error) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_outcome.status()});
             }
+            noteDefaultTimeoutFired(parsed_args, run_outcome);
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record, and it is
@@ -253,6 +252,7 @@ pub fn launch(
             if (run_outcome == .exited_error) {
                 std.debug.print("\nlabelle: process exited with code {d}\n", .{run_outcome.status()});
             }
+            noteDefaultTimeoutFired(parsed_args, run_outcome);
             if (screenshot_probe) |p| p.report(allocator);
             // The game ran: the pipeline is `done` even on a nonzero game
             // exit — the code is carried in the terminal record, and it is
@@ -262,6 +262,64 @@ pub fn launch(
             return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, run_outcome);
         }
     }
+}
+
+/// The headless default budget when it is in force for this run (the
+/// notice line prints it), null when the user gave `--timeout` or the run
+/// is not headless.
+fn headlessDefaultNotice(parsed_args: *const ParsedArgs) ?u64 {
+    if (!parsed_args.timeout_defaulted) return null;
+    return parsed_args.timeout_ns;
+}
+
+/// cli#485: the one notice line for a run the headless default bounds.
+fn announceHeadlessDefault(parsed_args: *const ParsedArgs) void {
+    const t = headlessDefaultNotice(parsed_args) orelse return;
+    var dur_buf: [48]u8 = undefined;
+    std.debug.print("labelle: headless run: stopping after {s} (use --timeout to change, --timeout=0 for none)\n", .{formatDuration(&dur_buf, t)});
+}
+
+/// cli#485: when the watchdog that ended the game was the headless
+/// DEFAULT, say so — the user never typed a `--timeout`, so "timed out"
+/// alone would not explain why their run stopped.
+fn noteDefaultTimeoutFired(parsed_args: *const ParsedArgs, outcome: provider_hooks.RunOutcome) void {
+    if (outcome != .timed_out) return;
+    const t = headlessDefaultNotice(parsed_args) orelse return;
+    var dur_buf: [48]u8 = undefined;
+    std.debug.print("labelle: stopped by the headless default timeout ({s}); pass --timeout=<dur> to run longer\n", .{formatDuration(&dur_buf, t)});
+}
+
+/// `ns` as `1m30s` / `5m` / `30s` / `250ms` for the run's notices.
+fn formatDuration(buf: []u8, ns: u64) []const u8 {
+    const secs = ns / std.time.ns_per_s;
+    const mins = secs / 60;
+    const rem = secs % 60;
+    return (if (secs == 0)
+        std.fmt.bufPrint(buf, "{d}ms", .{ns / std.time.ns_per_ms})
+    else if (mins > 0 and rem > 0)
+        std.fmt.bufPrint(buf, "{d}m{d}s", .{ mins, rem })
+    else if (mins > 0)
+        std.fmt.bufPrint(buf, "{d}m", .{mins})
+    else
+        std.fmt.bufPrint(buf, "{d}s", .{secs})) catch "?";
+}
+
+test "pipeline: run durations format as the notices print them" {
+    var buf: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("5m", formatDuration(&buf, 5 * std.time.ns_per_min));
+    try std.testing.expectEqualStrings("1m30s", formatDuration(&buf, 90 * std.time.ns_per_s));
+    try std.testing.expectEqualStrings("30s", formatDuration(&buf, 30 * std.time.ns_per_s));
+    try std.testing.expectEqualStrings("250ms", formatDuration(&buf, 250 * std.time.ns_per_ms));
+}
+
+test "pipeline: the headless default notice shows only for a defaulted budget (cli#485)" {
+    var parsed_args: ParsedArgs = .{ .command = .run };
+    try std.testing.expect(headlessDefaultNotice(&parsed_args) == null);
+    parsed_args.headless = true;
+    parsed_args.timeout_ns = 30 * std.time.ns_per_s; // an explicit --timeout
+    try std.testing.expect(headlessDefaultNotice(&parsed_args) == null);
+    parsed_args.timeout_defaulted = true;
+    try std.testing.expectEqual(@as(?u64, 30 * std.time.ns_per_s), headlessDefaultNotice(&parsed_args));
 }
 
 /// cli#320: in `--progress=json` mode a desktop `run` spawns the game
@@ -385,4 +443,17 @@ test "pipeline: a run hook's options are the core launch's LABELLE_* list, the -
     try std.testing.expectEqual(@as(usize, 2), options.args.len);
     try std.testing.expectEqualStrings("b", options.args[1]);
     try std.testing.expectEqual(@as(?u64, 30_000), options.timeout_ms);
+}
+
+test "pipeline: a replacement receives the headless default as its timeout_ms (cli#485)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var iter = try std.process.Args.IteratorGeneral(.{}).init(a, "--headless");
+    var parsed_args: ParsedArgs = .{ .command = .run };
+    const result = args_mod.parseRunArgs(&iter, "run", true, &parsed_args) orelse return error.TestFailed;
+    parsed_args.timeout_ns = result.timeout_ns;
+    try std.testing.expect(parsed_args.timeout_defaulted);
+    const options = try hookRunOptions(a, &parsed_args);
+    try std.testing.expectEqual(@as(?u64, args_mod.headless_default_timeout_ns / std.time.ns_per_ms), options.timeout_ms);
 }

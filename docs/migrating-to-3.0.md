@@ -172,6 +172,17 @@ labelle-studio's toolchain gate, must read it from a project that pins `web`
   unknown-namespace hint now reads the same one document as the no-provider
   target hint: the project's verified accepted source, else the public
   registry (cli#465). An existing cache file is ignored; delete it if you like.
+- `labelle providers resolve --accept` writes `labelle.providers.lock` as
+  **lock schema 2**, which adds `registry`: the registry source the pins came
+  from (a local `providers.json` relative to the project root). The
+  no-provider hints use it so a project pinned from a custom registry is never
+  pointed at the public one, even after `.labelle/` is deleted (cli#456).
+  Schema-1 locks keep working; the next accept rewrites them. **CLI 2.x cannot read a
+  schema-2 lock**, so everyone who shares the lock (CI
+  too) needs this CLI once someone re-accepts.
+- Registry schema 3 (each release's `command_contract`) is readable, and the
+  hints then suggest a release this CLI supports (cli#456). The public
+  registry stays at schema 2 until the CLIs reading it support schema 3.
 
 ## Troubleshooting
 

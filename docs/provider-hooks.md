@@ -212,7 +212,13 @@ replacement launch needs:
   option the user didn't pass adds nothing. The desktop-only headless knobs
   aren't run options and never appear here.
 - `args` are the tokens after `--`, verbatim.
-- `timeout_ms` is `--timeout` in milliseconds, or null.
+- `timeout_ms` is `--timeout` in milliseconds, or null. A `--headless` run
+  given no `--timeout` carries its default budget here (5 minutes, cli#485),
+  exactly as if the user had typed it; `--timeout=0` (or `none`) is null.
+  The CLI does not time a `replace run` hook itself: `timeout_ms` is the
+  only way the budget reaches a replacement, and the replacement enforces
+  it. A provider on contract `1.0.0`/`1.1.0` never receives it, so its run
+  is not time-limited; the CLI prints a warning saying so.
 - `outcome_file` (wire `1.5.0`, the `replace run` hook only; null on the
   other `run` hooks, absent below `1.5.0`) is where a replacement that
   enforced `timeout_ms` itself writes `timeout` before exiting 0. See the

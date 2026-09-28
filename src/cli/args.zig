@@ -7,6 +7,7 @@
 const std = @import("std");
 const project_config = @import("project_config.zig");
 const util = @import("util.zig");
+const config = @import("config.zig");
 const progress = @import("progress.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const bundle = @import("bundle.zig");
@@ -83,6 +84,9 @@ pub const ParsedArgs = struct {
     extra_args: [16][]const u8 = undefined,
     extra_count: usize = 0,
     timeout_ns: ?u64 = null,
+    /// `timeout_ns` is the headless default (cli#485), not a `--timeout`
+    /// the user gave: the launch announces it, and says so when it fires.
+    timeout_defaulted: bool = false,
     scene_override: ?[]const u8 = null,
     /// The requested target name (`--platform=<t>`, or the legacy platform
     /// subcommands' fixed value), resolved by the pipeline against the core
@@ -469,6 +473,51 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
     return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode, .linux_desktop = linux_desktop, .allow_older_cli = allow_older_cli };
 }
 
+/// cli#485: the run-time budget of a `labelle run --headless` given no
+/// `--timeout`. Headless runs have nobody watching them, so they must not
+/// run forever; `--timeout=<dur>` extends it and `--timeout=0` (or `none`)
+/// turns it off.
+pub const headless_default_timeout_ns: u64 = 5 * std.time.ns_per_min;
+
+/// Test-only: a duration (`parseDuration` syntax) that replaces
+/// `headless_default_timeout_ns`, so an end-to-end test can watch the
+/// default fire in seconds instead of minutes. Not documented as a user
+/// knob — the supported way to change the budget is `--timeout`.
+pub const headless_default_timeout_env = "LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT";
+
+/// The headless default budget: `headless_default_timeout_env` when it is
+/// set to a positive duration, `headless_default_timeout_ns` otherwise.
+pub fn headlessDefaultTimeoutNs() u64 {
+    // `getAlloc` copies the whole environment into a map first, so it needs
+    // a real allocator, not a small fixed buffer.
+    const gpa = std.heap.page_allocator;
+    const raw = config.globalEnviron().getAlloc(gpa, headless_default_timeout_env) catch
+        return headless_default_timeout_ns;
+    defer gpa.free(raw);
+    const ns = util.parseDuration(raw) orelse return headless_default_timeout_ns;
+    return if (ns == 0) headless_default_timeout_ns else ns;
+}
+
+/// A `--timeout` value: a `parseDuration` duration, or `none`. Returns
+/// `@as(?u64, null)` wrapped for "no timeout" (`none`, or any zero
+/// duration — a zero deadline would kill the game before its first frame,
+/// so it means "off" instead), null for a value that does not parse.
+pub fn parseTimeoutValue(val: []const u8) ??u64 {
+    if (std.mem.eql(u8, val, "none")) return @as(?u64, null);
+    const ns = util.parseDuration(val) orelse return null;
+    return if (ns == 0) @as(?u64, null) else ns;
+}
+
+pub const RunTimeout = struct { timeout_ns: ?u64, defaulted: bool };
+
+/// The run's effective watchdog budget: an explicit `--timeout` (including
+/// its `0`/`none` opt-out) always wins; otherwise a headless run gets
+/// `default_ns` and every other run keeps running until it exits.
+pub fn resolveRunTimeout(explicit_ns: ?u64, timeout_given: bool, headless: bool, default_ns: u64) RunTimeout {
+    if (timeout_given or !headless) return .{ .timeout_ns = explicit_ns, .defaulted = false };
+    return .{ .timeout_ns = default_ns, .defaulted = true };
+}
+
 /// Parse [dir], --scene, --timeout, --platform, --optimize, --docker, and --target flags for run command (explicit or implicit).
 ///
 /// A bare `--` token switches the parser into "passthrough" mode: every
@@ -480,6 +529,7 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
     var dir_set = !allow_dir;
     var scene: ?[]const u8 = null;
     var timeout_ns: ?u64 = null;
+    var timeout_given = false;
     var platform: ?[]const u8 = null;
     var optimize: ?[]const u8 = null;
     var docker_build = false;
@@ -535,20 +585,21 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
-            timeout_ns = util.parseDuration(arg["--timeout=".len..]);
-            if (timeout_ns == null) {
-                std.debug.print("labelle: invalid --timeout value '{s}'\n", .{arg["--timeout=".len..]});
-                std.debug.print("  expected format: --timeout=30s, --timeout=2m\n", .{});
+            const val = arg["--timeout=".len..];
+            timeout_given = true;
+            timeout_ns = parseTimeoutValue(val) orelse {
+                std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
+                std.debug.print("  expected format: --timeout=30s, --timeout=2m (--timeout=0 or --timeout=none: no timeout)\n", .{});
                 return null;
-            }
+            };
         } else if (std.mem.eql(u8, arg, "--timeout")) {
             if (args.next()) |val| {
-                timeout_ns = util.parseDuration(val);
-                if (timeout_ns == null) {
+                timeout_given = true;
+                timeout_ns = parseTimeoutValue(val) orelse {
                     std.debug.print("labelle: invalid --timeout value '{s}'\n", .{val});
-                    std.debug.print("  expected format: --timeout 30s, --timeout 2m\n", .{});
+                    std.debug.print("  expected format: --timeout 30s, --timeout 2m (--timeout 0 or --timeout none: no timeout)\n", .{});
                     return null;
-                }
+                };
             } else {
                 std.debug.print("labelle: --timeout requires a value (e.g. --timeout 30s)\n", .{});
                 return null;
@@ -663,6 +714,13 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
         std.debug.print("labelle {s}: --watch cannot be combined with --docker\n", .{cmd_name});
         return null;
     }
+    // cli#485: a headless run with no `--timeout` gets the default budget,
+    // through the same `timeout_ns` an explicit `--timeout` sets — so the
+    // watchdog, the exit status and the run hooks' `timeout_ms` are exactly
+    // the explicit flag's.
+    const resolved = resolveRunTimeout(timeout_ns, timeout_given, parsed_args.headless, headlessDefaultTimeoutNs());
+    timeout_ns = resolved.timeout_ns;
+    parsed_args.timeout_defaulted = resolved.defaulted;
     return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .screenshot_path = screenshot_path, .screenshot_after_ns = screenshot_after_ns };
 }
 

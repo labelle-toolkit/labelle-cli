@@ -77,7 +77,7 @@ The `run` object holds the `labelle run` options for a hook that wraps or replac
 | --- | --- |
 | `env` | Array of `{ "name", "value" }`. These are the platform-neutral `LABELLE_*` variables the core launch sets for `--scene`, `--profile`, `--screenshot` and `--after` (`LABELLE_SCENE`, `LABELLE_PROFILE`, `LABELLE_SCREENSHOT_PATH`, `LABELLE_SCREENSHOT_AFTER_SEC`), in that order. An option the user didn't pass adds nothing. Names match `[A-Za-z_][A-Za-z0-9_]*` and are unique; values contain no NUL |
 | `args` | The tokens after `--`, verbatim, as an array of strings |
-| `timeout_ms` | `--timeout` in milliseconds, or null |
+| `timeout_ms` | `--timeout` in milliseconds, or null. A `--headless` run given no `--timeout` carries the 5-minute headless default here (cli#485); `--timeout=0`/`none` is null |
 | `watch` | **Wire `1.3.0`+, required there; absent below.** Null outside a watch session and on every `run` hook but the replacement. On the replacement of `labelle run --watch`: `{ "generation_file": "<abs>", "output_dir": "<abs>" }` (see [Watch sessions](#watch-sessions)). Unknown keys inside it are errors |
 | `outcome_file` | **Wire `1.5.0`+, required there; absent below.** On the run replacement, an absolute path it may write how the run ended to; null on every other `run` hook. See [Run outcome](#run-outcome) |
 
@@ -247,6 +247,28 @@ Duplicate JSON keys, unknown fields, duplicate package/version records,
 repository conflicts and unsupported schemas are errors. A project lock
 contains at most one version per package. Releases are stable exact semver.
 
+The lock `providers resolve --accept` writes is **lock schema 2**: the same
+shape plus a required `registry` key, the registry source that accept read
+(#456):
+
+```json
+{
+  "schema_version": 2,
+  "registry": "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json",
+  "providers": [ ... ]
+}
+```
+
+`registry` is the source as given for a URL, and for a local `providers.json`
+its path relative to the project root with `/` separators (absolute only when
+no relative path exists, such as another Windows drive), so a committed lock
+names no machine's home directory. It is one printable line. A schema-1 lock
+(written by CLI 2.x) stays readable and records no source; a
+schema-1 lock must not carry `registry`, and a schema-2 one must. Only the
+no-provider hints read it ([provider targets](provider-targets.md#resolution));
+pins, fetch and verification ignore it. CLI 2.x cannot read a
+schema-2 lock (`UnsupportedProviderSchema`).
+
 Registry and lock `repo` values are always the bare `<owner>/<name>` form.
 The project's `.plugins[].repo` is compared with them after one
 normalisation (`projectRepo` in `src/cli/provider_github/pin.zig`), which
@@ -330,8 +352,8 @@ changes provider pins.
 
 ### Registry schema 2: ownership tables and defaults
 
-The lock stays at schema 1. The registry document may use `schema_version: 2`,
-which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
+The registry document may use `schema_version: 2` (or 3, below), which the
+CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
 
 ```json
 {
@@ -354,8 +376,8 @@ which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
 - **Every key is required.** `namespace` is explicitly `null` for a release
   that declares none, `targets` is `[]`, and `defaults` is `[]` when there are
   none. A schema-1 document must not carry any of these keys. Unknown keys,
-  duplicate keys and schemas other than 1 and 2 are errors. All schema-1 pin
-  rules still apply.
+  duplicate keys and schemas other than 1, 2 and 3 are errors. All schema-1
+  pin rules still apply.
 - **Each release record repeats the declarations of that release's
   `plugin.labelle`.** Names follow the manifest rules: identifiers, no
   duplicates, no Windows reserved device name as a target, and never
@@ -386,6 +408,25 @@ which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
   records (`Registry.defaultPins`), which are what the §5 consent prompt shows:
   package, version, repository, commit, hash. It is never a bare name, a range
   or "latest".
+
+### Registry schema 3: each release's command contract
+
+Schema 3 is schema 2 plus one required key per release record,
+`command_contract`: the range that release's `plugin.labelle` declares, for
+example `">=1.0.0 <2.0.0"` (#456). A schema-2 record must not carry it.
+
+- It must parse as a range (`InvalidCommandContract` otherwise). Whether the
+  running CLI speaks it is not checked at parse time: one registry serves
+  every CLI version.
+- `--accept` checks it like the other claims: the verified manifest's
+  `command_contract` must be the same text, or `RegistryDeclarationMismatch`.
+- The no-provider hints use it to suggest the newest release that declares
+  the target or namespace **and** whose recorded range admits a provider
+  contract version this CLI speaks (`Registry.latestSupported`), still as a
+  candidate that `--accept` verifies. A schema-2 document records no range, so
+  there the candidate is the newest declaring release, by version alone.
+- CLI 2.x rejects schema 3 (`UnsupportedProviderSchema`), so the
+  public registry can move to it only once the CLIs that read it support it.
 
 ## 5. Default-package consent
 
