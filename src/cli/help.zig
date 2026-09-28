@@ -44,6 +44,7 @@ pub fn printHelp() void {
         \\  has, and a target without its provider fails naming the package to add
         \\  (looked up in the provider registry; `LABELLE_OFFLINE=1` skips the lookup).
         \\  `--docker` builds the `desktop` target only; a provider target refuses it.
+        \\  `--target` cross-compiles for Linux or Windows; a macOS target is refused.
         \\  Upgrading a 1.x project: docs/migrating-to-2.0.md
         \\  (https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md)
         \\  Upgrading from 2.x: docs/migrating-to-3.0.md

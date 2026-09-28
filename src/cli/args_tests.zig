@@ -416,6 +416,21 @@ pub const ParseRunArgsPassthroughSpec = struct {
             var pa = ParsedArgs{ .command = .run };
             try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
         }
+        test "`--docker --target=<arch>-macos` is refused; Windows stays (cli#471 X3)" {
+            {
+                var iter = testIter("--docker --target=aarch64-macos");
+                defer iter.deinit();
+                var pa = ParsedArgs{ .command = .run };
+                try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+            }
+            {
+                var iter = testIter("--docker --target=x86_64-windows");
+                defer iter.deinit();
+                var pa = ParsedArgs{ .command = .run };
+                const r = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+                try std.testing.expectEqualStrings("x86_64-windows", r.docker_target.?);
+            }
+        }
     };
 
     pub const no_separator = struct {

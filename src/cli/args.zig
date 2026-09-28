@@ -386,6 +386,26 @@ pub fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []co
     return null;
 }
 
+/// `--docker --target=<arch>-macos[-abi]` is refused (cli#471 X3, D6): the
+/// container build cannot link macOS without Apple's frameworks, and the core
+/// no longer fetches a third-party copy of them. Linux and Windows cross
+/// builds stay.
+fn dockerTargetRefused(target: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, target, '-');
+    _ = parts.next() orelse return false; // arch
+    const os = parts.next() orelse return false;
+    return std.mem.eql(u8, os, "macos");
+}
+
+test "dockerTargetRefused: macOS targets only" {
+    try std.testing.expect(dockerTargetRefused("aarch64-macos"));
+    try std.testing.expect(dockerTargetRefused("x86_64-macos-none"));
+    try std.testing.expect(!dockerTargetRefused("x86_64-windows"));
+    try std.testing.expect(!dockerTargetRefused("x86_64-linux-gnu"));
+    try std.testing.expect(!dockerTargetRefused("aarch64"));
+    try std.testing.expect(!dockerTargetRefused("x86_64-linux-macosish"));
+}
+
 /// Parse [dir], --scene, --platform, --optimize, --progress, --docker, --target
 /// and (build only) --linux-desktop flags for generate/build commands.
 /// `args` is `anytype` so tests can drive it with an in-memory iterator.
@@ -439,6 +459,10 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
             const val = arg["--target=".len..];
             if (val.len == 0) {
                 std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
+                return null;
+            }
+            if (dockerTargetRefused(val)) {
+                std.debug.print("labelle {s}: --docker does not cross-compile for macOS (--target={s}); build on a Mac, or pick a Linux or Windows target\n", .{ cmd_name, val });
                 return null;
             }
             docker_target = val;
@@ -564,6 +588,10 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
             const val = arg["--target=".len..];
             if (val.len == 0) {
                 std.debug.print("labelle {s}: --target requires a value (e.g. --target=x86_64-windows)\n", .{cmd_name});
+                return null;
+            }
+            if (dockerTargetRefused(val)) {
+                std.debug.print("labelle {s}: --docker does not cross-compile for macOS (--target={s}); build on a Mac, or pick a Linux or Windows target\n", .{ cmd_name, val });
                 return null;
             }
             docker_target = val;

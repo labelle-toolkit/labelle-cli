@@ -104,7 +104,9 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `cli/runner.zig` came clean: 18 entries. RFC cli#471 X2 moved the
 /// vendored stb single-headers to `vendor/stb/` (third-party code lives
 /// outside `src/`), taking `cli/stb_image.h`'s upstream comment with it:
-/// 17 entries.
+/// 17 entries. RFC cli#471 X3 refused `--docker` for macOS targets and
+/// deleted the fetch of a third-party copy of Apple's frameworks, so
+/// `cli/docker.zig` came clean: 16 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -116,7 +118,6 @@ const allowed_files = [_][]const u8{
     "cli.zig",
     "cli/args.zig",
     "cli/config.zig",
-    "cli/docker.zig",
     "cli/doctor.zig",
     "cli/ios.zig",
     "cli/pipeline.zig",
@@ -560,7 +561,7 @@ test "a finding is reported per line and a clean allowlisted file goes stale" {
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/pipeline.zig"));
     try std.testing.expect(containsString(stale.items, "cli/upgrade.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/docker.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/doctor.zig"));
     // The sentinel is only set by the CLI root itself.
     try std.testing.expect(!scan.saw_cli_root);
     try scan.file(cli_root, "// android\n");
