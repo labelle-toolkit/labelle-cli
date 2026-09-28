@@ -29,6 +29,7 @@ pub const IgnoreSet = loop.IgnoreSet;
 pub const watchLoop = loop.watchLoop;
 pub const watchIgnorePath = tree.watchIgnorePath;
 pub const Publisher = publish.Publisher;
+pub const SessionLock = publish.SessionLock;
 
 // Reference every module so its tests run.
 test {

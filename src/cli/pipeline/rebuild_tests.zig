@@ -506,3 +506,71 @@ test "watched rebuild keeps the last good hook environment unless the whole rebu
     try ctx.rebuildStaged();
     try std.testing.expect(site.env.isEmpty());
 }
+
+// A watch session hands the rebuilds a DEEP copy of the startup environment
+// (`watch_session.run`): a committed rebuild frees the environment it
+// replaces, and the replacement's own site — which may still be starting
+// with the startup environment — must never see that storage freed or
+// changed.
+test "a rebuild's environment changes never reach the session's copy" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    const Spy = struct {
+        fn run(site: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+            for (list) |entry| if (std.mem.eql(u8, entry.hook.id, "tc")) {
+                var diag: provider_env.Diagnostic = .{};
+                try site.env.add(site.backing, site.backing, entry.qualified, .{ .set = &.{.{ .name = "PROBE_TOOLCHAIN", .value = "rebuilt" }} }, &diag);
+            };
+            return 0;
+        }
+        var provider: provider_dispatch.Provider = .{
+            .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+            .dir = "/pkg",
+            .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+            .verified = true,
+        };
+        fn planned(id: []const u8, step: provider_contract.Step, when: provider_contract.Phase) provider_hooks.Planned {
+            return .{ .provider = &provider, .hook = .{ .id = id, .step = step, .target = "probe-target", .when = when, .build_step = "tool", .executable = "bin/tool" }, .qualified = id };
+        }
+    };
+    // The session's site, with the environment the startup hooks contributed.
+    var session = testing.testSite(a, project);
+    defer session.env.deinit();
+    var diag: provider_env.Diagnostic = .{};
+    try session.env.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "PROBE_TOOLCHAIN", .value = "startup" }} }, &diag);
+    const startup_value = session.env.vars.items[0].value;
+    // The rebuilds' copy.
+    var rebuilds = session;
+    rebuilds.env = try session.env.clone(a);
+    defer rebuilds.env.deinit();
+    var ctx = RebuildCtx{
+        .allocator = a,
+        .asm_bin = .{ .path = "" },
+        .project_dir = project,
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
+        .output_dir = project,
+        .target_dir = project,
+        .zig_args = &.{},
+        .zig_env = null,
+        .prebuild_steps = &.{},
+        .prebuild_opts = .{ .fatal_on_step_failure = false },
+        .hooks = &rebuilds,
+        .run_hook_phase = Spy.run,
+        .generate_plan = .{ .before = &.{Spy.planned("tc", .generate, .before)}, .replace = Spy.planned("gen", .generate, .replace) },
+        .build_plan = .{ .replace = Spy.planned("build", .build, .replace) },
+    };
+    // Two committed rebuilds: each frees the environment it replaces.
+    try ctx.rebuildStaged();
+    try ctx.rebuildStaged();
+    try std.testing.expectEqualStrings("rebuilt", rebuilds.env.vars.items[0].value);
+    // The session's copy is untouched: same storage, same value.
+    try std.testing.expectEqual(@as(usize, 1), session.env.vars.items.len);
+    try std.testing.expectEqual(startup_value.ptr, session.env.vars.items[0].value.ptr);
+    try std.testing.expectEqualStrings("startup", session.env.vars.items[0].value);
+}

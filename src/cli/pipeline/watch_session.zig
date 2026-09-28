@@ -178,6 +178,12 @@ pub fn run(
     var rebuild_arena = std.heap.ArenaAllocator.init(allocator);
     defer rebuild_arena.deinit();
     rebuild_site.a = rebuild_arena.allocator();
+    // Its environment is a deep copy: a rebuild frees the environment it
+    // replaces, and the startup one stays the session's (the replacement
+    // may still be starting with it) until the watcher is joined.
+    rebuild_site.env = try site.env.clone(allocator);
+    var rebuild_env_owned = true;
+    defer if (rebuild_env_owned) rebuild_site.env.deinit();
     const installer = AssemblerInstaller{ .bin = cx.asm_bin };
     var replanner = Replanner{
         .backing = allocator,
@@ -238,6 +244,9 @@ pub fn run(
     supervise.current = &session_group;
     defer supervise.current = null;
     const replaced = provider_hooks.runPhase(&session_site, &.{replacement}, .run, .replace, run_out);
+    // A stop latched for the replacement ends with it: the `after run`
+    // hooks of a clean exit are not signalled on spawn.
+    session_group.clearPending();
 
     // The replacement ended (or never started): stop watching, cancel and
     // reap the in-flight rebuild, join — before anything else runs.
@@ -249,7 +258,9 @@ pub fn run(
     site.providers = rebuild_site.providers;
     site.cfg = rebuild_site.cfg;
     site.optimize = rebuild_site.optimize;
+    site.env.deinit();
     site.env = rebuild_site.env;
+    rebuild_env_owned = false;
     if (site.host == null) site.host = session_site.host orelse rebuild_site.host;
     defer replanner.deinit(site, cx.providers, cx.parsed);
 

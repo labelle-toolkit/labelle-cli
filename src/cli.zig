@@ -161,6 +161,11 @@ fn handleToolchainCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
 /// Returns the process exit status. `run` earns the game's own status (a
 /// crash can no longer exit 0 — cli#390); every other command returns 0 on
 /// completion and an error (exit 1) or an explicit code on failure.
+/// The exit status of a command line its parser rejected (it printed the
+/// diagnostic): never 0, so a shell or CI step cannot read a refused
+/// command — `run --watch --docker`, an unknown flag — as a success.
+const usage_error: u8 = 2;
+
 pub fn main(proc_init: std.process.Init) !u8 {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -192,9 +197,8 @@ pub fn main(proc_init: std.process.Init) !u8 {
             // A usage error must exit NON-ZERO so a CI step cannot read a
             // REJECTED command as a successful build — the same rule PR #362
             // applied to `bundle`. The parser has already printed the
-            // diagnostic; this only sets the status. (The `run`/`wasm`/…
-            // parsers still `return` with exit 0 on a usage error —
-            // pre-existing, and a separate cleanup.)
+            // diagnostic; this only sets the status. (The `run` and `wasm`
+            // parsers exit `usage_error`.)
             const result = parseDirAndScene(&args, first) orelse return error.InvalidArguments;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
@@ -217,9 +221,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
             parsed_args.command = .bundle_cmd;
             // A usage error must exit NON-ZERO so automation can't mistake
             // `labelle bundle --bogus` for a built bundle (Codex on #362).
-            // The parser has already printed the diagnostic. (The older
-            // parsers above still `return` with exit 0 — pre-existing, left
-            // alone here; candidate for a separate cleanup.)
+            // The parser has already printed the diagnostic.
             const result = parseBundleArgs(&args) orelse return error.InvalidArguments;
             parsed_args.project_dir = result.dir;
             parsed_args.optimize_override = result.optimize;
@@ -229,7 +231,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
             parsed_args.platform_override = result.platform;
         } else if (std.mem.eql(u8, first, "run")) {
             parsed_args.command = .run;
-            const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return 0;
+            const result = parseRunArgs(&args, "run", true, &parsed_args) orelse return usage_error;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;
@@ -350,7 +352,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
             const sub = args.next();
             if (sub != null and std.mem.eql(u8, sub.?, "serve")) {
                 parsed_args.command = .wasm_cmd;
-                const result = parseWasmServeArgs(&args) orelse return 0;
+                const result = parseWasmServeArgs(&args) orelse return usage_error;
                 parsed_args.project_dir = result.dir;
                 parsed_args.serve_port = result.port;
                 parsed_args.serve_no_build = result.no_build;
@@ -364,7 +366,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
             } else if (sub != null and std.mem.eql(u8, sub.?, "export")) {
                 parsed_args.command = .wasm_cmd;
                 parsed_args.wasm_export = true;
-                const result = parseWasmExportArgs(&args) orelse return 0;
+                const result = parseWasmExportArgs(&args) orelse return usage_error;
                 parsed_args.project_dir = result.dir;
                 parsed_args.export_output = result.output;
                 parsed_args.export_zip = result.zip;
@@ -419,7 +421,7 @@ pub fn main(proc_init: std.process.Init) !u8 {
                 reportUnknownCommand(allocator, first);
                 std.process.exit(1);
             }
-            const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return 0;
+            const result = parseRunArgs(&args, "run", false, &parsed_args) orelse return usage_error;
             parsed_args.project_dir = first;
             parsed_args.scene_override = result.scene;
             parsed_args.timeout_ns = result.timeout_ns;

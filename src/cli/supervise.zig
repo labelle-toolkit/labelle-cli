@@ -47,6 +47,11 @@ pub const Group = struct {
     /// Zero is a free slot.
     slots: [max_children]std.atomic.Value(usize) = [_]std.atomic.Value(usize){.init(0)} ** max_children,
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// A stop forwarded to the group (`forward`), latched: `Stop` + 1, or
+    /// 0. A child registered AFTER the stop arrived — while the session was
+    /// still setting up, or between two spawns — is signalled the moment it
+    /// registers, so a Ctrl+C is never lost for want of a child to reach.
+    pending: std.atomic.Value(u8) = .init(0),
     /// Serialises registration against `cancel`, so a child registered
     /// concurrently with a cancel is either seen by it or refused.
     mutex: std.Io.Mutex = .init,
@@ -110,8 +115,15 @@ pub const Group = struct {
         return n;
     }
 
-    /// Signal-handler safe: forward `sig` to every registered tree.
+    /// Forget a latched stop (the session's own child ended with it).
+    pub fn clearPending(self: *Group) void {
+        self.pending.store(0, .seq_cst);
+    }
+
+    /// Signal-handler safe: latch `sig`, then forward it to every
+    /// registered tree.
     fn forward(self: *Group, sig: Stop) usize {
+        self.pending.store(@as(u8, @intFromEnum(sig)) + 1, .seq_cst);
         var n: usize = 0;
         for (&self.slots) |*slot| {
             const id = slot.load(.seq_cst);
@@ -131,7 +143,19 @@ pub const Group = struct {
         self.cancel(io);
         const deadline = monotonicMs() +| grace_ms;
         while (self.live() != 0 and monotonicMs() < deadline) sleepMs(10);
-        if (self.live() != 0) _ = self.forward(.kill);
+        if (self.live() != 0) _ = self.killLive();
+    }
+
+    fn killLive(self: *Group) usize {
+        var n: usize = 0;
+        for (&self.slots) |*slot| {
+            const id = slot.load(.seq_cst);
+            if (id != 0) {
+                signalTree(id, .kill);
+                n += 1;
+            }
+        }
+        return n;
     }
 };
 
@@ -199,6 +223,11 @@ pub const Supervised = struct {
     }
 };
 
+/// Test seam: runs between a supervised spawn and its registration, so a
+/// test can make cancellation win that race deterministically. Never set
+/// in production.
+pub var test_after_spawn: ?*const fn (*Group) void = null;
+
 /// `std.process.spawn`, supervised by `current` when the thread has one.
 /// A cancelled group refuses the spawn (`error.Canceled`).
 pub fn spawn(io: std.Io, options: std.process.SpawnOptions) !Supervised {
@@ -223,13 +252,20 @@ pub fn spawnIn(group_opt: ?*Group, io: std.Io, options: std.process.SpawnOptions
         };
         break :blk @intFromPtr(job);
     } else @intCast(child.id.?);
+    if (test_after_spawn) |hook| hook(group);
     const slot = group.register(io, id) catch |err| {
-        if (is_windows) _ = win.CloseHandle(@ptrFromInt(id));
+        // Refused (cancelled meanwhile): end the whole tree the child may
+        // already have started — its process group, or its job — not only
+        // the child, then reap it.
+        endTree(id);
         if (is_windows) _ = win.ResumeThread(child.thread_handle);
         child.kill(io);
         return err;
     };
     if (is_windows) _ = win.ResumeThread(child.thread_handle);
+    // A stop that arrived before this child could be reached.
+    const latched = group.pending.load(.seq_cst);
+    if (latched != 0) signalTree(id, @enumFromInt(latched - 1));
     return .{ .child = child, .group = group, .slot = slot };
 }
 
@@ -455,4 +491,77 @@ test "supervise: forwardAll reaches the trees of attached groups only" {
     group.attach();
     defer group.detach();
     try std.testing.expectEqual(@as(usize, 0), forwardAll(.interrupt));
+}
+
+test "supervise: a stop latched before any child exists reaches the next child at once" {
+    const io = config.globalIo();
+    var group: Group = .{};
+    group.attach();
+    defer group.detach();
+    // The stop arrives while nothing is registered (session setup).
+    try std.testing.expectEqual(@as(usize, 0), forwardAll(.terminate));
+    // The next child is signalled the moment it registers: it never runs
+    // its 60 s. No clock is involved; a lost stop would hang the test.
+    var term: ?std.process.Child.Term = null;
+    var err: ?anyerror = null;
+    runIn(&group, &.{ test_fixtures.child_exe, "sleep:60000" }, &term, &err);
+    try std.testing.expect(err == null);
+    switch (term.?) {
+        .exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
+    // Cleared, a later child runs normally.
+    group.clearPending();
+    runIn(&group, &.{ test_fixtures.child_exe, "exit:0" }, &term, &err);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term.?);
+    _ = io;
+}
+
+test "supervise: a cancel that beats registration ends the child's whole tree" {
+    // Windows starts the child suspended until it is registered, so no
+    // descendant can exist before registration there.
+    if (is_windows) return error.SkipZigTest;
+    const io = config.globalIo();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const pid_file = try std.fs.path.join(a, &.{ dir, "grandchild.pid" });
+    defer a.free(pid_file);
+    const Race = struct {
+        var path: []const u8 = "";
+        // Wait for the grandchild to exist, then cancel: registration loses.
+        fn cancelFirst(group: *Group) void {
+            const deadline = monotonicMs() + 30_000;
+            while (monotonicMs() < deadline) {
+                const bytes = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, std.testing.allocator, .limited(64)) catch {
+                    std.Thread.yield() catch {};
+                    continue;
+                };
+                defer std.testing.allocator.free(bytes);
+                if (std.mem.endsWith(u8, bytes, "\n")) break;
+            }
+            group.cancel(config.globalIo());
+        }
+    };
+    Race.path = pid_file;
+    test_after_spawn = Race.cancelFirst;
+    defer test_after_spawn = null;
+    var group: Group = .{};
+    var term: ?std.process.Child.Term = null;
+    var err: ?anyerror = null;
+    runIn(&group, &.{ test_fixtures.child_exe, "tree", pid_file, test_fixtures.child_exe }, &term, &err);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), err);
+    try std.testing.expectEqual(@as(usize, 0), group.live());
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, pid_file, a, .limited(64));
+    defer a.free(bytes);
+    const grandchild = try std.fmt.parseInt(u32, std.mem.trim(u8, bytes, " \r\n"), 10);
+    const Gone = struct {
+        pid: u32,
+        fn check(self: @This()) bool {
+            return processGone(self.pid);
+        }
+    };
+    try std.testing.expect(waitUntil(Gone{ .pid = grandchild }, 10_000));
 }

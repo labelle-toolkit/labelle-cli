@@ -54,6 +54,7 @@ const Fixture = struct {
         defaults: []const u8 = "",
         /// Extra `project.labelle` fields.
         project_extra: []const u8 = "",
+        contract: []const u8 = ">=1.0.0 <2.0.0",
     };
 
     fn init(fx: *Fixture, a: std.mem.Allocator) !void {
@@ -83,7 +84,7 @@ const Fixture = struct {
     fn write(fx: *Fixture, spec: Spec) !void {
         const io = config.globalIo();
         var buf: [4096]u8 = undefined;
-        const manifest = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"{s}\" }}, .target_defaults = .{{ {s} }}, .hooks = .{{ .{{ .id = \"serve\", .step = .run, .target = \"{s}\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\", .watch = true }}, {s} }} }}", .{ target, spec.defaults, target, spec.hooks });
+        const manifest = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \"{s}\", .targets = .{{ \"{s}\" }}, .target_defaults = .{{ {s} }}, .hooks = .{{ .{{ .id = \"serve\", .step = .run, .target = \"{s}\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\", .watch = true }}, {s} }} }}", .{ spec.contract, target, spec.defaults, target, spec.hooks });
         try fx.tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = manifest });
         var pbuf: [2048]u8 = undefined;
         const proj = try std.fmt.bufPrint(&pbuf, ".{{ .name = \"game\", .plugins = .{{ .{{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"{s}\" }} }}{s} }}", .{ spec.version, spec.project_extra });
@@ -383,6 +384,12 @@ test "rebuild transaction: a change the running replacement depends on publishes
         .{ .spec = .{ .project_extra = ", .backend = .null" }, .prebuild_runs = 0 },
         // The replacement losing its watch capability.
         .{ .spec = .{ .hooks = "" }, .prebuild_runs = 1 },
+        // The provider's negotiated wire falling below run.watch.
+        .{ .spec = .{ .contract = ">=1.0.0 <1.3.0" }, .prebuild_runs = 1 },
+        // A `before run` hook added: it ran once, before the replacement.
+        .{ .spec = .{ .hooks = ".{ .id = \"prepare\", .step = .run, .target = \"probe-target\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }" }, .prebuild_runs = 1 },
+        // The Zig version the project requires.
+        .{ .spec = .{ .project_extra = ", .zig_version = \"0.99.0\"" }, .prebuild_runs = 1 },
     };
     for (cases, 0..) |case, i| {
         try fx.write(case.spec);

@@ -46,9 +46,12 @@ pub const Publisher = struct {
     generation: ?u64 = null,
     /// Set once the non-atomic Windows fallback had to be used.
     fallback_noted: bool = false,
+    /// The generation-file writer. A field only so a test can make it fail
+    /// after the switch; production never overrides it.
+    write_generation: *const fn (*Publisher, u64) anyerror!void = writeGeneration,
 
     /// Start a session at `root`: whatever an earlier session left there is
-    /// removed first.
+    /// removed first. The caller holds the root's `SessionLock`.
     pub fn init(allocator: std.mem.Allocator, root: []const u8, source: []const u8) !Publisher {
         const io = config.globalIo();
         std.Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -78,7 +81,13 @@ pub const Publisher = struct {
 
     /// Publish the staged tree as the next generation (0 first). On any
     /// error nothing observable changed: `current` and `generation` still
-    /// name the previous publication.
+    /// name the previous publication. When the generation file cannot be
+    /// advanced after `current` was switched, `current` is switched BACK
+    /// (or removed, before the first publication), so a consumer never sees
+    /// a switched output under an old generation. Only if that rollback
+    /// fails too does `current` keep the new output under the old
+    /// generation — reported, and `generation` still moves, so the next
+    /// publication never overwrites the directory being served.
     pub fn publish(self: *Publisher) !void {
         const io = config.globalIo();
         const a = self.allocator;
@@ -94,9 +103,37 @@ pub const Publisher = struct {
             try self.switchTo(name, dest);
         }
         // The switch landed: the generation may now say so.
-        try self.writeGeneration(n);
+        self.write_generation(self, n) catch |err| {
+            if (self.switchBack()) {
+                std.Io.Dir.cwd().deleteTree(io, dest) catch {};
+            } else |back_err| {
+                std.debug.print("labelle: watch: generation {d} is served but its generation file could not be written ({s}), nor the output switched back ({s})\n", .{ n, @errorName(err), @errorName(back_err) });
+                self.generation = n;
+                self.prune(n);
+            }
+            return err;
+        };
         self.generation = n;
         self.prune(n);
+    }
+
+    /// Point `current` back at the last publication, or remove it when
+    /// there is none.
+    fn switchBack(self: *Publisher) !void {
+        const previous = self.generation orelse {
+            const io = config.globalIo();
+            if (is_windows) {
+                const link_w = try std.unicode.wtf8ToWtf16LeAllocZ(self.allocator, self.output_dir);
+                defer self.allocator.free(link_w);
+                if (k32.RemoveDirectoryW(link_w) == 0) return error.JunctionFailed;
+            } else try std.Io.Dir.cwd().deleteFile(io, self.output_dir);
+            return;
+        };
+        const name = try std.fmt.allocPrint(self.allocator, "published-{d}", .{previous});
+        defer self.allocator.free(name);
+        const dest = try std.fs.path.join(self.allocator, &.{ self.root, name });
+        defer self.allocator.free(dest);
+        try self.switchTo(name, dest);
     }
 
     fn switchTo(self: *Publisher, name: []const u8, dest: []const u8) !void {
@@ -110,7 +147,7 @@ pub const Publisher = struct {
         try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), self.output_dir, io);
     }
 
-    fn writeGeneration(self: *Publisher, n: u64) !void {
+    fn writeGeneration(self: *Publisher, n: u64) anyerror!void {
         const io = config.globalIo();
         const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.generation_file});
         defer self.allocator.free(tmp);
@@ -166,8 +203,10 @@ pub const Publisher = struct {
     }
 };
 
-/// Copy the tree at `src` into `dest` (created). Symbolic links are
-/// followed: the published tree is self-contained.
+/// Copy the tree at `src` into `dest` (created). A symbolic link is copied
+/// AS a link (its target text verbatim), never followed, so a link back to
+/// an ancestor cannot make the copy recurse; where a link cannot be created
+/// (Windows without the privilege) it is skipped with a warning.
 pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
     const io = config.globalIo();
     try std.Io.Dir.cwd().createDirPath(io, dest);
@@ -181,12 +220,100 @@ pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
         defer a.free(to);
         switch (entry.kind) {
             .directory => try copyTree(a, from, to),
-            else => std.Io.Dir.cwd().copyFile(from, std.Io.Dir.cwd(), to, io, .{}) catch |err| switch (err) {
-                error.IsDir => try copyTree(a, from, to),
-                else => return err,
+            .sym_link => copyLink(a, from, to) catch |err| {
+                std.debug.print("labelle: watch: symbolic link '{s}' not published ({s})\n", .{ from, @errorName(err) });
             },
+            else => try std.Io.Dir.cwd().copyFile(from, std.Io.Dir.cwd(), to, io, .{}),
         }
     }
+}
+
+fn copyLink(a: std.mem.Allocator, from: []const u8, to: []const u8) !void {
+    const io = config.globalIo();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try std.Io.Dir.cwd().readLink(io, from, &buf);
+    const is_dir = if (std.Io.Dir.cwd().statFile(io, from, .{})) |st| st.kind == .directory else |_| false;
+    _ = a;
+    try std.Io.Dir.cwd().symLink(io, buf[0..n], to, .{ .is_directory = is_dir });
+}
+
+// ── Session lock ──────────────────────────────────────────────────────
+
+/// One watch session per session root (project and target) at a time: the
+/// session claims `<root>.lock` with its PID BEFORE any build, so a second
+/// `labelle run --watch` for the same target is refused
+/// (`error.WatchSessionActive`) before it touches the target's staging
+/// tree or the published output. A lock whose process is gone (a session
+/// killed outright) is stale and taken over.
+pub const SessionLock = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+
+    pub fn acquire(allocator: std.mem.Allocator, root: []const u8) !SessionLock {
+        const path = try std.fmt.allocPrint(allocator, "{s}.lock", .{root});
+        errdefer allocator.free(path);
+        if (std.fs.path.dirname(root)) |parent| try std.Io.Dir.cwd().createDirPath(config.globalIo(), parent);
+        try claim(allocator, path);
+        return .{ .allocator = allocator, .path = path };
+    }
+
+    pub fn release(self: *SessionLock) void {
+        std.Io.Dir.cwd().deleteFile(config.globalIo(), self.path) catch {};
+        self.allocator.free(self.path);
+    }
+};
+
+/// Claim `lock_path` for this process: create it exclusively with our PID.
+/// An existing lock whose PID still runs refuses; one whose process is gone
+/// is stale and replaced.
+fn claim(a: std.mem.Allocator, lock_path: []const u8) !void {
+    const io = config.globalIo();
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        if (std.Io.Dir.cwd().createFile(io, lock_path, .{ .exclusive = true })) |file| {
+            defer file.close(io);
+            var buf: [24]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "{d}\n", .{ownPid()});
+            try file.writeStreamingAll(io, text);
+            return;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        }
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock_path, a, .limited(64)) catch continue;
+        defer a.free(bytes);
+        const owner = std.fmt.parseInt(u64, std.mem.trim(u8, bytes, " \r\n"), 10) catch 0;
+        if (owner != 0 and processAlive(owner)) {
+            std.debug.print("labelle: run --watch: another watch session (pid {d}) is already running for this target; stop it first (lock: {s})\n", .{ owner, lock_path });
+            return error.WatchSessionActive;
+        }
+        std.debug.print("labelle: run --watch: taking over a stale watch session lock (pid {d} is gone)\n", .{owner});
+        std.Io.Dir.cwd().deleteFile(io, lock_path) catch {};
+    }
+    return error.WatchSessionActive;
+}
+
+fn ownPid() u64 {
+    if (is_windows) return k32.GetCurrentProcessId();
+    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
+    return @intCast(std.c.getpid());
+}
+
+/// True while process `pid` exists.
+pub fn processAlive(pid: u64) bool {
+    if (is_windows) {
+        const h = k32.OpenProcess(0x1000, 0, @intCast(@min(pid, std.math.maxInt(u32)))) orelse return false;
+        defer _ = k32.CloseHandle(h);
+        var code: u32 = 0;
+        if (k32.GetExitCodeProcess(h, &code) == 0) return true;
+        return code == 259; // STILL_ACTIVE
+    }
+    if (pid > std.math.maxInt(i32)) return false;
+    const rc = std.posix.system.kill(@intCast(pid), @enumFromInt(0));
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS, .PERM => true,
+        else => false,
+    };
 }
 
 // ── Windows junctions ─────────────────────────────────────────────────
@@ -197,6 +324,9 @@ const k32 = struct {
     extern "kernel32" fn DeviceIoControl(h: HANDLE, code: u32, in: ?*const anyopaque, in_len: u32, out: ?*anyopaque, out_len: u32, returned: ?*u32, overlapped: ?*anyopaque) callconv(.winapi) c_int;
     extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) c_int;
     extern "kernel32" fn RemoveDirectoryW(name: [*:0]const u16) callconv(.winapi) c_int;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn OpenProcess(access: u32, inherit: c_int, pid: u32) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *u32) callconv(.winapi) c_int;
     const GENERIC_WRITE: u32 = 0x40000000;
     const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
     const OPEN_EXISTING: u32 = 3;
@@ -339,4 +469,97 @@ test "publish: a publication that fails leaves the served output and the generat
     p.deinit(true);
     p = try Publisher.init(a, root, stage);
     try std.testing.expectEqual(@as(?u64, null), p.generation);
+}
+
+test "publish: a generation that cannot be advanced switches the output back" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "stage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "zero" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const stage = try std.fs.path.join(a, &.{ base, "stage" });
+    defer a.free(stage);
+    const root = try std.fs.path.join(a, &.{ base, "session" });
+    defer a.free(root);
+    const Fail = struct {
+        fn write(_: *Publisher, _: u64) anyerror!void {
+            return error.SharingViolation;
+        }
+    };
+    var p = try Publisher.init(a, root, stage);
+    defer p.deinit(true);
+    // Before the first publication: `current` is removed again.
+    p.write_generation = Fail.write;
+    try std.testing.expectError(error.SharingViolation, p.publish());
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/current/index.txt", .{}));
+    try std.testing.expectEqual(@as(?u64, null), p.generation);
+    p.write_generation = Publisher.writeGeneration;
+    try p.publish();
+    // After it: `current` goes back to generation 0, whose file still says 0.
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "one" });
+    p.write_generation = Fail.write;
+    try std.testing.expectError(error.SharingViolation, p.publish());
+    {
+        const got = try readCurrent(a, &p, "index.txt");
+        defer a.free(got);
+        try std.testing.expectEqualStrings("zero", got);
+        const g = try readGeneration(a, &p);
+        defer a.free(g);
+        try std.testing.expectEqualStrings("0\n", g);
+    }
+    try std.testing.expectEqual(@as(?u64, 0), p.generation);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "session/published-1", .{}));
+    // The next attempt publishes normally.
+    p.write_generation = Publisher.writeGeneration;
+    try p.publish();
+    const got = try readCurrent(a, &p, "index.txt");
+    defer a.free(got);
+    try std.testing.expectEqualStrings("one", got);
+}
+
+test "publish: a directory link back to an ancestor is copied as a link, not followed" {
+    if (is_windows) return error.SkipZigTest; // links need a privilege there
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "stage/sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stage/sub/file.txt", .data = "x" });
+    try tmp.dir.symLink(io, "..", "stage/sub/loop", .{ .is_directory = true });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const stage = try std.fs.path.join(a, &.{ base, "stage" });
+    defer a.free(stage);
+    const out = try std.fs.path.join(a, &.{ base, "out" });
+    defer a.free(out);
+    try copyTree(a, stage, out);
+    var buf: [64]u8 = undefined;
+    const n = try tmp.dir.readLink(io, "out/sub/loop", &buf);
+    try std.testing.expectEqualStrings("..", buf[0..n]);
+    try tmp.dir.access(io, "out/sub/file.txt", .{});
+}
+
+test "publish: one session per root; a lock whose process is gone is taken over" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const root = try std.fs.path.join(a, &.{ base, "watch", "session" });
+    defer a.free(root);
+    var first = try SessionLock.acquire(a, root);
+    // A second session for the same root is refused while the first runs.
+    try std.testing.expectError(error.WatchSessionActive, SessionLock.acquire(a, root));
+    first.release();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "watch/session.lock", .{}));
+    // A lock left by a process that no longer exists is stale.
+    try std.testing.expect(!processAlive(2147483000));
+    try tmp.dir.writeFile(io, .{ .sub_path = "watch/session.lock", .data = "2147483000\n" });
+    var second = try SessionLock.acquire(a, root);
+    second.release();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "watch/session.lock", .{}));
 }

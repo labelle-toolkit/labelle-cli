@@ -261,6 +261,19 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const target = planned.target;
     const hook_plans = planned.hook_plans;
 
+    // `labelle run --watch`: claim the session before anything is built, so
+    // a second session for the same target is refused before it touches the
+    // first one's staging tree or published output (`watch.SessionLock`).
+    var session_lock: ?@import("watch.zig").SessionLock = if (parsed_args.run_watch)
+        @import("watch.zig").SessionLock.acquire(allocator, try std.fs.path.join(hook_arena, &.{ project_root, ".labelle", ".watch", target_name })) catch |err| {
+            if (err != error.WatchSessionActive) std.debug.print("labelle: run --watch: could not claim the session ({s})\n", .{@errorName(err)});
+            if (reporter) |r| r.finishFailed(1, "another watch session is running");
+            return 1;
+        }
+    else
+        null;
+    defer if (session_lock) |*lock| lock.release();
+
     // Generate into .labelle/
     const output_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
     defer allocator.free(output_dir);

@@ -385,8 +385,9 @@ context carries `run.watch` (`generation_file`, `output_dir`); every other
 `run` hook gets `run.watch: null`. A rebuild publishes only after its
 `after build` hooks succeeded; a failed rebuild publishes nothing; a change
 the running replacement depends on (its provider, version or pin, the hook,
-the capability, the backend, the target, the output location, the effective
-optimize mode, its settings) stops the rebuild with a restart diagnostic.
+the negotiated wire, the capability, the `before run` hooks, the backend, the
+target, the output location, the effective optimize mode, its settings, the
+Zig version) stops the rebuild with a restart diagnostic.
 When the replacement exits the CLI cancels any in-flight hook or compile and
 reaps it, then runs the committed generation's `after run` hooks, only after
 a clean status-0 exit. A target without such a replacement — `desktop`

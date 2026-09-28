@@ -179,6 +179,13 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     assert "run --watch: target 'desktop' has no run replacement to watch through" in result.stderr, result.stderr
     assert "FIXTURE_GENERATE" not in result.stderr, result.stderr
     checks += 1
+    # `--watch --docker` is a usage error: non-zero, and nothing runs.
+    result = subprocess.run([cli, "run", f"--platform={TARGET}", "--watch", "--docker"], cwd=project, env=env, text=True,
+                            capture_output=True, timeout=600)
+    assert result.returncode == 2, (result.returncode, result.stderr)
+    assert "--watch cannot be combined with --docker" in result.stderr, result.stderr
+    assert "FIXTURE_INSTALL_DONE" not in result.stderr, result.stderr
+    checks += 1
     declare()
     refused("package 'probe' does not declare `.watch = true` on its run replacement 'probe/serve'", watch=False)
     refused("package 'probe' speaks provider contract 1.2.0; its run replacement 'probe/serve' needs >= 1.3.0",
@@ -241,6 +248,13 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     s = Session()
     try:
         s.wait_gen("gen=0 data=one")
+        assert generation() == "0" and published_data() == "one"
+        # A second session for the same target is refused before any build.
+        second = subprocess.run([cli, "run", f"--platform={TARGET}", "--watch", "--progress=off"], cwd=project, env=env,
+                                text=True, capture_output=True, timeout=600)
+        assert second.returncode == 1, (second.returncode, second.stderr)
+        assert "another watch session (pid" in second.stderr, second.stderr
+        assert "FIXTURE_GENERATE" not in second.stderr, second.stderr
         assert generation() == "0" and published_data() == "one"
         # The replacement received the session and nothing else did: the
         # after-build hook ran before the replacement started.
