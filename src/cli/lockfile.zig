@@ -2,6 +2,7 @@ const std = @import("std");
 const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 const asm_cache = @import("asm_cache.zig");
+const project_lock = @import("project_lock.zig");
 
 /// Write labelle.lock into the project root.
 ///
@@ -37,6 +38,14 @@ pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cf
 
     const lock_path = try std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" });
     defer allocator.free(lock_path);
+
+    // A write of the project's own `labelle.lock` holds the project lock
+    // (cli#481) from the high-water read below to the write, so no other
+    // labelle command's read-compare-write interleaves with it. A staged
+    // write (`out_path`) is not a write of the project's lock: its commit
+    // takes the lock instead (`Replanner.commitLock`).
+    const held: ?project_lock.Held = if (out_path == null) try project_lock.acquire(allocator, project_dir) else null;
+    defer if (held) |h| h.release();
 
     // High-water `.cli_version` — see the doc comment above. `previous`
     // owns the bytes `keep_version` points into, so it stays alive until
@@ -711,6 +720,31 @@ test "writeLockFile: an older or absent stamp becomes this CLI's version" {
     defer alloc.free(fresh_dir);
     try writeLockFile(alloc, fresh_dir, .{ .name = "t" });
     const written = try fresh.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(written).?);
+}
+
+test "writeLockFile: holds the project lock around the write (cli#481)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", alloc);
+    defer alloc.free(dir);
+    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "labelle.lock", .data = "// another command's lock\n" });
+    // Another command is inside its critical section: this write waits for
+    // it, and past the (shortened) budget gives up without touching the lock.
+    const other = try project_lock.acquire(alloc, dir);
+    const saved = project_lock.wait_budget_ms;
+    project_lock.wait_budget_ms = 30;
+    defer project_lock.wait_budget_ms = saved;
+    try std.testing.expectError(error.ProjectLockBusy, writeLockFile(alloc, dir, .{ .name = "t" }));
+    const kept = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("// another command's lock\n", kept);
+    // Released: the write goes through.
+    other.release();
+    try writeLockFile(alloc, dir, .{ .name = "t" });
+    const written = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
     defer alloc.free(written);
     try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(written).?);
 }

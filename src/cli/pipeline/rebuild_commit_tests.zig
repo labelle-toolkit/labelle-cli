@@ -19,6 +19,7 @@ const supervise = @import("../supervise.zig");
 const watch = @import("../watch.zig");
 const rebuild = @import("rebuild.zig");
 const Replanner = @import("rebuild_replan.zig").Replanner;
+const project_lock = @import("../project_lock.zig");
 const SessionKey = @import("session_key.zig").SessionKey;
 const tx = @import("rebuild_transaction_tests.zig");
 const Fixture = tx.Fixture;
@@ -702,6 +703,81 @@ test "rebuild commit: a rollback leaves a labelle.lock another command rewrote m
     const now = try fx.lockBytes();
     defer a.free(now);
     try std.testing.expectEqualStrings(Writer.newer, now);
+}
+
+test "rebuild commit: a write racing the rollback's compare-and-restore waits for it and is never overwritten (cli#481)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    var published: Published = undefined;
+    try published.init(&fx);
+    defer published.deinit(a);
+    ctx.publish = published.seam();
+    const Fail = struct {
+        fn write(_: *watch.Publisher, _: u64) anyerror!void {
+            return error.SharingViolation;
+        }
+    };
+    // Another command writes `labelle.lock` exactly in the window between
+    // the rollback's compare (the lock is still this rebuild's) and its
+    // restore, through the project lock as every writer does. Before
+    // cli#481 that write landed and the restore overwrote it.
+    const Racer = struct {
+        const newer = "// written by another command\n";
+        var thread: ?std.Thread = null;
+        var saw_restored = false;
+        var wrote = false;
+        var project: []const u8 = "";
+        fn write() void {
+            const held = project_lock.acquire(std.testing.allocator, project) catch return;
+            defer held.release();
+            const io = config.globalIo();
+            // Its own path: the rollback's is freed once it returns.
+            const lock = std.fs.path.join(std.testing.allocator, &.{ project, "labelle.lock" }) catch return;
+            defer std.testing.allocator.free(lock);
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock, std.testing.allocator, .limited(1 << 20)) catch return;
+            defer std.testing.allocator.free(bytes);
+            // It only got the lock after the restore finished.
+            saw_restored = !contains(bytes, "\"7.7.7\"");
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lock, .data = newer }) catch return;
+            wrote = true;
+        }
+        fn window(_: []const u8) void {
+            const before = project_lock.test_busy_polls.load(.monotonic);
+            thread = std.Thread.spawn(.{}, write, .{}) catch return;
+            // Hold the window open until the racer is blocked on the lock.
+            var spins: usize = 0;
+            while (project_lock.test_busy_polls.load(.monotonic) == before and spins < 1000) : (spins += 1) {
+                config.globalIo().sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+            }
+        }
+    };
+    Racer.project = fx.project;
+    published.publisher.write_generation = Fail.write;
+    replan.restore_window = Racer.window;
+    const polls = project_lock.test_busy_polls.load(.monotonic);
+    try fx.write(.{ .version = "7.7.7" });
+    try std.testing.expectError(error.PublishFailed, ctx.rebuildStaged());
+    (Racer.thread orelse return error.TestUnexpectedResult).join();
+    // The mechanism: the racer found the lock held and waited, and only
+    // wrote after the restore; its newer lock is what stays.
+    try std.testing.expect(project_lock.test_busy_polls.load(.monotonic) > polls);
+    try std.testing.expect(Racer.saw_restored and Racer.wrote);
+    const now = try fx.lockBytes();
+    defer a.free(now);
+    try std.testing.expectEqualStrings(Racer.newer, now);
 }
 
 test "rebuild commit: a local provider whose manifest is deleted stays watched, so recreating it rebuilds (cli#478)" {

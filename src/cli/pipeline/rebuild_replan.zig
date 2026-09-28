@@ -4,6 +4,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const lockfile = @import("../lockfile.zig");
+const project_lock = @import("../project_lock.zig");
 const project_config = @import("../project_config.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
@@ -59,6 +60,10 @@ pub const Replanner = struct {
     /// restored, with the lock's path, so a test can play another command
     /// writing `labelle.lock` concurrently. Never set in production.
     before_restore_lock: ?*const fn ([]const u8) void = null,
+    /// Test seam: runs in `rollback` while the project lock is held, after
+    /// the compare and before the restore (the window cli#481 closes), with
+    /// the lock's path. Never set in production.
+    restore_window: ?*const fn ([]const u8) void = null,
     /// The project's `labelle.lock` as it was before `commitLock` replaced
     /// it in this rebuild, so `rollback` can put it back: `.absent` when
     /// there was none. `null`: nothing committed in this rebuild.
@@ -274,6 +279,10 @@ pub const Replanner = struct {
         };
         const lock = try std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" });
         defer a.free(lock);
+        // The read of the lock it replaces and the rename are one step to
+        // every other labelle command (cli#481).
+        const held = try project_lock.acquire(a, self.project_dir);
+        defer held.release();
         // What this rebuild is about to put in place, for the rollback's
         // compare-and-restore.
         const written = blk: {
@@ -312,6 +321,9 @@ pub const Replanner = struct {
     /// file still holds what this rebuild wrote. Another command that
     /// rewrote (or removed) it meanwhile wins: its lock is newer than the
     /// one this rebuild replaced, so it is left in place, with a warning.
+    /// The compare and the restore run under the project lock (cli#481),
+    /// which every writer of `labelle.lock` takes, so no write can land
+    /// between them and be overwritten.
     fn restoreLock(self: *Replanner) void {
         const before = self.lock_before orelse return;
         defer self.forgetLockBefore();
@@ -320,6 +332,11 @@ pub const Replanner = struct {
         const lock = std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" }) catch return;
         defer a.free(lock);
         if (self.before_restore_lock) |hook| hook(lock);
+        const held = project_lock.acquire(a, self.project_dir) catch |err| {
+            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer held.release();
         const still_ours = if (self.lock_written) |written| blk: {
             const now = std.Io.Dir.cwd().readFileAlloc(io, lock, a, .limited(16 * 1024 * 1024)) catch break :blk false;
             defer a.free(now);
@@ -329,6 +346,7 @@ pub const Replanner = struct {
             std.debug.print("labelle: labelle.lock changed since this rebuild wrote it; keeping the newer lock instead of rolling it back\n", .{});
             return;
         }
+        if (self.restore_window) |hook| hook(lock);
         switch (before) {
             .absent => std.Io.Dir.cwd().deleteFile(io, lock) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -373,8 +391,18 @@ pub const Replanner = struct {
             std.Io.Dir.cwd().deleteFile(io, staged) catch {};
             return;
         }
+        // Nothing staged (the common rebuild): no lock to take.
+        std.Io.Dir.cwd().access(io, staged, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {},
+        };
         const lock = std.fs.path.join(self.backing, &.{ self.project_dir, "labelle.lock" }) catch return;
         defer self.backing.free(lock);
+        const held = project_lock.acquire(self.backing, self.project_dir) catch |err| {
+            std.debug.print("labelle: could not commit labelle.lock ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer held.release();
         std.Io.Dir.cwd().rename(staged, std.Io.Dir.cwd(), lock, io) catch |err| switch (err) {
             error.FileNotFound => {}, // nothing staged: the lock did not change
             else => std.debug.print("labelle: could not commit labelle.lock ({s})\n", .{@errorName(err)}),
