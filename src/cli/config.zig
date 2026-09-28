@@ -95,12 +95,17 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     // mirror — without this, a newer project.labelle would fail to parse
     // and break the CLI for no good reason.
     try @import("provider_settings.zig").validateProject(allocator, source, if (verbose) labelle_path else null);
-    return std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
+    const cfg = std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
         return error.ParseError;
     };
+    // `labelle install plugin <name> local:<path>` overrides (assembler#772)
+    // live outside the project; fold them in once, here, so every consumer
+    // sees the plugin where the assembler builds it from.
+    try @import("plugin_slot.zig").applyOverrides(allocator, cfg);
+    return cfg;
 }
 
 const expect = @import("zspec").expect;

@@ -27,10 +27,6 @@ const writePreview = preview_mod.writePreview;
 const checkPreview = preview_mod.checkPreview;
 const jsonText = preview_mod.jsonText;
 const removePreview = preview_mod.removePreview;
-const registry_cache = @import("registry_cache.zig");
-const cacheRegistry = registry_cache.cacheRegistry;
-const registry_cache_dir = registry_cache.registry_cache_dir;
-const registry_cache_file = registry_cache.registry_cache_file;
 const AcceptFixture = @import("test_fixtures.zig").AcceptFixture;
 
 const registry_lookup = @import("registry_lookup.zig");
@@ -54,6 +50,10 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     }
     const doc = try registry.parse(a, metadata);
     const cfg = try config.readProjectConfigQuiet(a, root);
+    // The lock pins COMMITTED declarations: an `install plugin` override
+    // (assembler#772) is this machine's temporary state, so a provider under
+    // one is pinned by its retained repo/version, exactly as after --unlink.
+    @import("../plugin_slot.zig").clearOverrides(cfg);
     var selected: std.ArrayList(Pin) = .empty;
     for (cfg.plugins, 0..) |dep, i| {
         for (cfg.plugins[0..i]) |prev| if (std.mem.eql(u8, dep.name, prev.name)) return error.DuplicateProjectPlugin;
@@ -64,6 +64,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
             if (!std.mem.eql(u8, pin.package, dep.name)) continue;
             known = true;
             if (!pin.matches(dep)) continue;
+            // Same refusal as `Sources.projectDir`, before any preview or
+            // download: pin verification reads the archive ROOT.
+            if (dep.subdir.len > 0) {
+                std.debug.print("labelle: provider '{s}' declares `.subdir = \"{s}\"`; integrity-pinned providers do not support `.subdir` yet\n", .{ dep.name, dep.subdir });
+                return error.ProviderSubdirUnsupported;
+            }
             try selected.append(a, pin);
             found = true;
             std.debug.print("  {s} {s}: {s}@{s}\n    sha256 {s}\n    {s}\n", .{ pin.package, pin.version, pin.repo, pin.commit, pin.sha256, try pin.archiveUrl(a) });
@@ -164,16 +170,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     removePreview(a, root) catch |err| {
         std.debug.print("labelle: warning: the new pins are committed, but the consumed preview {s} could not be removed ({s}); delete it by hand before the next review\n", .{ preview_name, @errorName(err) });
     };
-    // The accepted document is kept as the hint source of the unknown-
-    // namespace diagnostic (a preview stays read-only): `reviewed`, never this
-    // run's raw fetch. Best effort: a failed cache write changes nothing about the pins.
-    registry_cache.cacheRegistry(a, reviewed) catch |err| {
-        std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
-    };
-    // Which source this project accepted from, with the same reviewed
-    // document, as one snapshot: the no-provider diagnostic answers from that
-    // document, not the public registry, when the source is a custom or
-    // local one. Best effort, like the cache.
+    // Which source this project accepted from, with the reviewed document
+    // (never this run's raw fetch), as one snapshot: the no-provider
+    // diagnostics (target and namespace) answer from that document, not the
+    // public registry, when the source is a custom or local one. It is kept
+    // in the project, never in a global cache another project could have
+    // written (#465). Best effort: a failed write changes nothing about the pins.
     registry_lookup.recordAccepted(a, root, source, reviewed) catch |err| {
         std.debug.print("labelle: warning: could not record the accepted registry source: {s}\n", .{@errorName(err)});
     };
@@ -221,8 +223,9 @@ test "provider github: accept is bound to the whole registry document, not only 
     try std.testing.expectError(error.ProviderPreviewMismatch, fx.run(a, true));
     try std.testing.expect(!try fx.exists(a, lock_name));
     // (5) The same document with other whitespace is the same normalised
-    // document: accepted. The target-hint cache then holds exactly the
-    // reviewed document (its bytes hash to the preview's registry digest).
+    // document: accepted. The project's accepted-source record then holds
+    // exactly the reviewed document (its bytes hash to the preview's
+    // registry digest), and nothing is written to a global registry cache.
     try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", ""));
     try fx.run(a, false);
     const reviewed = try loadPreview(a, fx.root);
@@ -231,9 +234,10 @@ test "provider github: accept is bound to the whole registry document, not only 
     try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", "\n  "));
     try fx.run(a, true);
     try std.testing.expect(try fx.exists(a, lock_name));
-    const cached = try read(a, try std.fs.path.join(a, &.{ fx.home, registry_cache_dir, registry_cache_file }), 1024 * 1024);
-    try std.testing.expectEqualStrings(reviewed.registry_digest, try sha256Hex(a, cached));
-    try std.testing.expectEqualStrings("other", (try registry_cache.cachedRegistry(a)).?.targetOwner("other-target").?);
+    const accepted = registry_lookup.readAccepted(a, fx.root).verified;
+    try std.testing.expectEqualStrings(reviewed.registry_digest, accepted.document_sha256);
+    try std.testing.expectEqualStrings("other", (try registry.parse(a, accepted.document)).targetOwner("other-target").?);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(config.globalIo(), try std.fs.path.join(a, &.{ fx.home, "registry" }), .{}));
 }
 
 test "provider github: accept refuses a schema-2 record whose claims the verified manifest contradicts" {
@@ -288,6 +292,11 @@ test "provider github: the lock is the same for the github.com and the bare proj
     defer sources.deinit();
     const dep: @import("../project_config.zig").PluginDep = .{ .name = "fixture", .repo = "github.com/example/fixture", .version = "1.0.0" };
     try std.testing.expect((try sources.projectDir(fx.root, dep)) != null);
+    // A `.subdir` declaration of the pinned provider is refused, not read
+    // from the archive root (assembler#771).
+    var sub = dep;
+    sub.subdir = "plugins/fixture";
+    try std.testing.expectError(error.ProviderSubdirUnsupported, sources.projectDir(fx.root, sub));
     // Another host is its own error, at resolve and against an existing lock,
     // never a match and never a missing release.
     try fx.declare(a, "gitlab.com/example/fixture");

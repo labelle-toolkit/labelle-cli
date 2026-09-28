@@ -363,6 +363,8 @@ test "rebuild transaction: a change the running replacement depends on publishes
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
+    // The startup mode with no `--optimize` and no owner default.
+    site.optimize = .Debug;
     const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
     var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
     defer replan.deinit(&site, fx.providers, fx.cfg);
@@ -370,7 +372,6 @@ test "rebuild transaction: a change the running replacement depends on publishes
     var dummy: u8 = 0;
     var ctx = rebuildCtx(&fx, &site, &replan, &dummy);
     defer ctx.deinit();
-    ctx.fallback_optimize = "ReleaseSafe";
     const lock_v1 = try fx.lockBytes();
     defer a.free(lock_v1);
 
@@ -666,6 +667,8 @@ test "rebuild transaction: a before-run hook's OWNING provider changing is a ses
     try std.testing.expectEqualStrings("aux/prepare", fx.run_plan.before[0].qualified);
     var site = fx.site();
     defer site.env.deinit();
+    // The startup mode with no `--optimize` and no owner default.
+    site.optimize = .Debug;
     const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
     var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
     defer replan.deinit(&site, fx.providers, fx.cfg);
@@ -673,7 +676,6 @@ test "rebuild transaction: a before-run hook's OWNING provider changing is a ses
     var dummy: u8 = 0;
     var ctx = rebuildCtx(&fx, &site, &replan, &dummy);
     defer ctx.deinit();
-    ctx.fallback_optimize = "ReleaseSafe";
     Publish.reset();
     try ctx.rebuildStaged();
     try std.testing.expectEqual(@as(usize, 1), Publish.count);

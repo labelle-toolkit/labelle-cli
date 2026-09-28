@@ -454,19 +454,16 @@ fn printHelpWithProviders(allocator: std.mem.Allocator) u8 {
 }
 
 /// A first token that is no built-in command, no pinned provider's
-/// namespace and no directory. When the cached registry names a package that
-/// declares it as a namespace (schema 2, cache only), say so: the command
-/// exists once that package is added and pinned — the namespace twin of the
-/// no-provider target diagnostic (`provider_targets.reportNoProvider`).
+/// namespace and no directory: `provider_targets.reportUnknownCommand` names
+/// the package that declares it as a namespace when the project's own
+/// registry document (its verified custom source, else the public registry)
+/// says so, and is the plain unknown-command error otherwise (#465).
 fn reportUnknownCommand(allocator: std.mem.Allocator, first: []const u8) void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    if (provider_github.cachedRegistryNamespaceOwner(arena.allocator(), first)) |package| {
-        std.debug.print("labelle: no provider for namespace '{s}' in this project; add and pin the package that declares namespace '{s}'\n  (registry: {s})\n", .{ first, first, package });
-        return;
-    }
-    std.debug.print("labelle: unknown command '{s}'\n", .{first});
-    std.debug.print("Run 'labelle help' to see available commands.\n", .{});
+    const a = arena.allocator();
+    const root = provider_dispatch.projectRoot(a) catch null;
+    provider_targets.reportUnknownCommand(a, root, first);
 }
 
 fn isDirectoryShorthand(path: []const u8) bool {

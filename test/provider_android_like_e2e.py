@@ -14,6 +14,7 @@ Hermetic: no network, no game dependencies; every workspace is temporary.
 Runs on Windows, macOS and Linux.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -85,8 +86,20 @@ DEPLOY = f'.{{ .id = "deploy", .step = .run, .target = "android", .when = .repla
 BUNDLE = f'.{{ .id = "bundle", .step = .bundle, .target = "android", .when = .replace, {TOOL} }}'
 
 
-def manifest(hooks):
-    return ('.{ .name = "android", .manifest_version = 2, .command_contract = ">=1.2.0 <2.0.0",\n'
+def phase_hook(id, step, when):
+    return f'.{{ .id = "{id}", .step = .{step}, .target = "android", .when = .{when}, {TOOL} }}'
+
+
+# A hook in every other slot a command can reach, so section 5b can assert
+# the whole order of `labelle bundle` (cli#443), `build` and `run`.
+LIFECYCLE = [phase_hook("pre-gen", "generate", "before"), phase_hook("post-gen", "generate", "after"),
+             phase_hook("pre-build", "build", "before"), PACKAGE, phase_hook("pre-bundle", "bundle", "before"),
+             BUNDLE, phase_hook("post-bundle", "bundle", "after"), phase_hook("pre-run", "run", "before"), DEPLOY,
+             phase_hook("post-run", "run", "after")]
+
+
+def manifest(hooks, contract=">=1.2.0 <2.0.0"):
+    return (f'.{{ .name = "android", .manifest_version = 2, .command_contract = "{contract}",\n'
             '    .namespace = "android", .targets = .{ "android" },\n'
             f'    .commands = .{{ .{{ .name = "run", {TOOL}, .help = "Install and launch the built APK" }} }},\n'
             f'    .hooks = .{{ {", ".join(hooks)} }} }}')
@@ -110,8 +123,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
     project = base / "project"
     project.mkdir()
     home = base / "home"
-    # Hermetic: the no-provider diagnostic's registry download is off
-    # (LABELLE_OFFLINE); only the unknown-namespace hint reads the cached registry.
+    # Hermetic: the no-provider diagnostics' registry download is off
+    # (LABELLE_OFFLINE); only the project's own accepted-source record answers.
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for leftover in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_COPY", "PROVIDER_PROBE_PATCH"):
@@ -158,34 +171,51 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
         assert not target_dir.exists() or not (target_dir / "build.zig").exists(), "the assembler generated"
         assert not marker.exists(), "the host launch ran"
 
-    # A cached schema-2 registry whose `android` release declares the
-    # namespace and the target. It names the namespace's owner; the target
-    # hint never reads it (another project's accept may have written it), so
-    # offline the target steps stay generic (#459).
+    # A schema-2 registry document whose `android` release declares the
+    # namespace and the target.
     registry_doc = {"schema_version": 2, "defaults": [], "providers": [{
         "package": "android", "repo": "labelle-toolkit/labelle-android", "version": "0.2.0",
         "commit": "1" * 40, "sha256": "0" * 64, "namespace": "android", "targets": ["android"]}]}
+    fork = "https://example.test/fork/providers.json"
 
     # ── 1. Without the pin: every entry point fails, nothing is generated ──
+    # Three states: nothing recorded; the document only in the global
+    # registry cache (where an older CLI kept another project's accepted
+    # document, #465), which never answers; and the project's own verified
+    # accepted-source record, which answers both the target and the
+    # namespace hint (offline: it is read from the project, not downloaded).
     declare()
     reset()
-    for with_registry in (False, True):
-        if with_registry:
+    for state in ("none", "global-cache", "project-record"):
+        if state == "global-cache":
             (home / "registry").mkdir(parents=True, exist_ok=True)
             (home / "registry" / "providers.json").write_text(json.dumps(registry_doc))
+        if state == "project-record":
+            document = json.dumps(registry_doc, separators=(",", ":"))
+            (project / ".labelle").mkdir(parents=True, exist_ok=True)
+            (project / ".labelle" / "providers.registry.json").write_text(json.dumps({
+                "schema_version": 2, "source": fork,
+                "document_sha256": hashlib.sha256(document.encode()).hexdigest(), "document": document}))
+        named = state == "project-record"
         hint = "(registry: android)"
         for args in (("run", "--platform=android"), ("build", "--platform=android"), ("bundle", "--platform=android")):
             refused = run(*args, code=1)
             assert NO_PROVIDER in refused.stderr, (args, refused.stderr)
-            assert hint not in refused.stderr, (args, with_registry, refused.stderr)
-            assert "(registry not consulted: LABELLE_OFFLINE is set)" in refused.stderr, (args, refused.stderr)
+            assert (hint in refused.stderr) == named, (args, state, refused.stderr)
+            if named:
+                assert "\n    " + fork + "\n" in refused.stderr, (args, refused.stderr)
+            else:
+                assert "(registry not consulted: LABELLE_OFFLINE is set)" in refused.stderr, (args, refused.stderr)
             nothing_generated(refused)
         refused = run("android", "run", code=1)
-        if with_registry:
+        if named:
             assert NO_NAMESPACE in refused.stderr and hint in refused.stderr, refused.stderr
+            assert "Its newest release that declares the namespace, 0.2.0, is a candidate" in refused.stderr, refused.stderr
+            assert "\n    " + fork + "\n" in refused.stderr and "compatible" not in refused.stderr, refused.stderr
         else:
-            assert "labelle: unknown command 'android'" in refused.stderr and hint not in refused.stderr, refused.stderr
+            assert "labelle: unknown command 'android'" in refused.stderr and hint not in refused.stderr, (state, refused.stderr)
         nothing_generated(refused)
+    shutil.rmtree(home / "registry")
 
     # ── 2. With the pin: generate, the after-build hook, the run replacement ─
     declare(dep)
@@ -255,6 +285,55 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
     packed = hook_context(bundle_dir, "bundle")
     assert packed["context"]["build_number"] == "7", packed
     assert Path(packed["output_dir"]) == bundle_dir.resolve(), packed
+
+    # ── 5b. bundle with a bundle replacement: which hooks, in what order ──
+    # cli#443: `labelle bundle` runs generate, then build, then bundle, with
+    # every hook of each (contract §6), the `after build` package hook
+    # included: a hook of another package in that slot (a signer, a symbol
+    # upload) must not be bypassed silently. The replacement stands in for
+    # the core packager only, and no `run` hook runs. Every hook is told the
+    # command's last step (`final_step`, wire 1.4.0): that is how the
+    # package hook knows the bundle replacement makes the distributable, and
+    # can skip packaging the install APK a second time.
+    def ordered(*step_dirs):
+        entries = sorted((e for d in step_dirs for e in log(d)), key=lambda e: e["nanoseconds"])
+        return entries, [(e["invocation"]["step"], e["invocation"]["phase"], e["invocation"]["id"]) for e in entries]
+
+    provider_manifest.write_text(manifest(LIFECYCLE))
+    reset()
+    run("bundle", "--platform=android", "--build-number=9")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert ran == [("generate", "before", "pre-gen"), ("generate", "after", "post-gen"),
+                   ("build", "before", "pre-build"), ("build", "after", "package"),
+                   ("bundle", "before", "pre-bundle"), ("bundle", "replace", "bundle"),
+                   ("bundle", "after", "post-bundle")], ran
+    for e in entries:
+        assert e["context"]["contract_version"] == "1.4.0", e
+        assert e["context"]["final_step"] == "bundle", e
+    # The package hook saw the finished build.
+    assert "lib" in hook_context(zig_out, "package")["output_entries"]
+    # The same hooks under `build` and `run` see those commands' last step;
+    # neither runs a bundle hook, and `build` runs no run hook.
+    reset()
+    run("build", "--platform=android")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert [r[2] for r in ran] == ["pre-gen", "post-gen", "pre-build", "package"], ran
+    assert {e["context"]["final_step"] for e in entries} == {"build"}, entries
+    reset()
+    run("run", "--platform=android")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert [r[2] for r in ran] == ["pre-gen", "post-gen", "pre-build", "package", "pre-run", "deploy", "post-run"], ran
+    assert {e["context"]["final_step"] for e in entries} == {"run"}, entries
+    # A provider capped below 1.4.0 runs the same hooks on the exact 1.3.0
+    # wire, without the key its strict decoder would reject.
+    provider_manifest.write_text(manifest(LIFECYCLE, contract=">=1.2.0 <1.4.0"))
+    reset()
+    run("bundle", "--platform=android")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert [r[2] for r in ran] == ["pre-gen", "post-gen", "pre-build", "package", "pre-bundle", "bundle", "post-bundle"], ran
+    for e in entries:
+        assert e["context"]["contract_version"] == "1.3.0" and "final_step" not in e["context"], e
+    provider_manifest.write_text(manifest([PACKAGE, DEPLOY, BUNDLE]))
 
     # ── 6. A legacy `.android` block goes through the CLI unchanged ───────
     # Its keys belong to the provider's settings and the assembler's codegen;

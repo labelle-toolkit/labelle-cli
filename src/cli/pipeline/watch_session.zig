@@ -204,7 +204,6 @@ pub fn run(
         .zig_args = zig_args,
         .zig_env = zig_env,
         .optimize_flag = cx.parsed_args.optimize_override,
-        .fallback_optimize = cx.fallback_optimize,
         .prebuild_steps = cx.parsed.prebuild,
         .prebuild_opts = .{
             .route_stdout_to_stderr = cx.parsed_args.progress_mode == .json,

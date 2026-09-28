@@ -304,7 +304,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const effective_optimize = optimize_mod.effective(
         parsed_args.optimize_override,
         optimize_mod.ownerDefault(providers, target.name),
-        null,
     ).mode;
 
     // A path that cannot carry a provider's environment contribution or its
@@ -359,6 +358,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         // The `run` hooks' contract §2 `run` (wire 1.2.0+): the options the
         // core launch would set, for a replacement standing in for it.
         .run_options = if (command == .run) try run_stage.hookRunOptions(hook_arena, &parsed_args) else null,
+        // Every hook's contract §2 `final_step` (wire 1.4.0+): how far this
+        // command goes, so an `after build` hook under `labelle bundle` knows
+        // the bundle step packages the distributable (cli#443).
+        .final_step = finalStep(command),
     };
     // The hooks' environment contributions (contract §2) live until the
     // command ends: the run and bundle hooks after the build still see them.
@@ -451,6 +454,26 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // Run: the `run` hook phases around the launch branches
     // (`run_stage.launch`).
     return run_stage.launch(&cx, generate_out, build_out, zig_args.items, zig_env_ptr);
+}
+
+/// The last lifecycle step `command` runs its hooks for (contract §2
+/// `final_step`). The legacy `labelle ios` subcommand only shares the
+/// `generate` hooks, so its hooks see `generate`.
+fn finalStep(command: args_mod.Command) provider_contract.Step {
+    return switch (command) {
+        .build => .build,
+        .run => .run,
+        .bundle_cmd => .bundle,
+        else => .generate,
+    };
+}
+
+test "finalStep: each project command's last hook step" {
+    try std.testing.expectEqual(provider_contract.Step.generate, finalStep(.generate));
+    try std.testing.expectEqual(provider_contract.Step.generate, finalStep(.ios_cmd));
+    try std.testing.expectEqual(provider_contract.Step.build, finalStep(.build));
+    try std.testing.expectEqual(provider_contract.Step.run, finalStep(.run));
+    try std.testing.expectEqual(provider_contract.Step.bundle, finalStep(.bundle_cmd));
 }
 
 // Reference every module so its tests run: a file reached only lazily
