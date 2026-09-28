@@ -89,7 +89,11 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `cli/linux_desktop.zig`, `cli/pack.zig`, `cli/progress.zig`,
 /// `cli/status.zig`, `cli/screenshot_format.zig`,
 /// `cli/pipeline/screenshot.zig`, `cli/update_check.zig` and
-/// `cli/stb_image_impl.c`: 40 entries.
+/// `cli/stb_image_impl.c`: 40 entries. RFC cli#466 PR A2 moved the generic
+/// watcher out of `cli/serve/` into `cli/watch/` and renamed the rebuild
+/// supervision (`cli/pipeline/watch*` to `cli/pipeline/rebuild*`) with
+/// neutral names and fixtures; with `cli/pipeline/testing.zig` scrubbed too,
+/// six more entries went: 34 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -123,10 +127,6 @@ const allowed_files = [_][]const u8{
     "cli/pipeline/generate.zig",
     "cli/pipeline/install.zig",
     "cli/pipeline/run.zig",
-    "cli/pipeline/testing.zig",
-    "cli/pipeline/watch.zig",
-    "cli/pipeline/watch_replan.zig",
-    "cli/pipeline/watch_replan_tests.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
     "cli/python_provision.zig",
@@ -137,8 +137,6 @@ const allowed_files = [_][]const u8{
     // mentions the served build and its output dir.
     "cli/serve/http.zig",
     "cli/serve/server.zig",
-    "cli/serve/tree.zig",
-    "cli/serve/watch.zig",
     "cli/stb_image.h",
     "cli/upgrade.zig",
 };

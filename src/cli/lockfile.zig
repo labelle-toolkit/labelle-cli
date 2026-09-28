@@ -16,6 +16,14 @@ const asm_cache = @import("asm_cache.zig");
 /// project back to an older CLI, edit (or delete) the lock's
 /// `.cli_version` line.
 pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig) !void {
+    return writeLockFileTo(allocator, project_dir, cfg, null);
+}
+
+/// `writeLockFile`, writing the bytes to `out_path` instead of the project's
+/// `labelle.lock` (a watched rebuild stages its lock there until it
+/// commits). The high-water `.cli_version` is still read from the project's
+/// own lock.
+pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig, out_path: ?[]const u8) !void {
     var aw = std.Io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
@@ -92,7 +100,7 @@ pub fn writeLockFile(allocator: std.mem.Allocator, project_dir: []const u8, cfg:
     try w.writeAll("}\n");
 
     try std.Io.Dir.cwd().writeFile(config.globalIo(), .{
-        .sub_path = lock_path,
+        .sub_path = out_path orelse lock_path,
         .data = aw.written(),
     });
 }

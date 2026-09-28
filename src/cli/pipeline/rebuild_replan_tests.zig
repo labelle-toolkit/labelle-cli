@@ -1,6 +1,8 @@
-//! Tests of `WatchReplan` (`watch_replan.zig`) against real projects and
+//! Tests of `Replanner` (`rebuild_replan.zig`) against real projects and
 //! provider manifests, and of the two-stage (pre-check -> prebuild ->
-//! replan) watched rebuild it drives.
+//! replan) watched rebuild it drives. The rebuild-driven tests use a tool
+//! that always succeeds (`testing.okTool`) for the assembler and the
+//! compiler, so a whole rebuild commits (cli#469).
 const std = @import("std");
 const config = @import("../config.zig");
 const lockfile = @import("../lockfile.zig");
@@ -11,9 +13,30 @@ const provider_contract = @import("../provider_contract.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
 const provider_hooks = @import("../provider_hooks.zig");
-const WasmRebuildCtx = @import("watch.zig").WasmRebuildCtx;
-const WatchReplan = @import("watch_replan.zig").WatchReplan;
+const RebuildCtx = @import("rebuild.zig").RebuildCtx;
+const Replanner = @import("rebuild_replan.zig").Replanner;
 const testing = @import("testing.zig");
+
+/// `Replanner.run` then `commit`: a replan the tests drive directly,
+/// without a whole rebuild around it.
+fn runCommitted(replan: *Replanner, ctx: *RebuildCtx) !void {
+    try Replanner.run(replan, ctx);
+    Replanner.commit(replan);
+}
+
+/// A forbidding session mode, as the legacy serve supplies one.
+const Refuse = struct {
+    fn plan(p: provider_hooks.Plan) bool {
+        return p.replace != null;
+    }
+    fn known(_: std.mem.Allocator, providers: []const provider_dispatch.Provider, target: []const u8) anyerror!bool {
+        for (providers) |provider| for (provider.meta.hooks) |hook| {
+            if (hook.step == .run and hook.when == .replace and std.mem.eql(u8, hook.target, target)) return true;
+        };
+        return false;
+    }
+    const forbid: Replanner.Forbid = .{ .plan = plan, .known = known };
+};
 
 // Against a real project: edits to the manifest between rebuilds change
 // the installed plans; a broken manifest fails the replan and keeps the
@@ -41,37 +64,38 @@ test "watch replan re-reads the project and provider manifests on every call" {
             try dir.writeFile(config.globalIo(), .{ .sub_path = sub_path, .data = text });
         }
         fn write(dir: std.Io.Dir, hooks: []const u8) !void {
-            try writeAt(dir, "pkg/plugin.labelle", "\"wasm\"", hooks);
+            try writeAt(dir, "pkg/plugin.labelle", "\"probe-target\"", hooks);
         }
     };
-    const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
-    const build_hook = ".{ .id = \"post\", .step = .build, .target = \"wasm\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"probe-target\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    const build_hook = ".{ .id = \"post\", .step = .build, .target = \"probe-target\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
     try Manifest.write(tmp.dir, gen_hook);
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{ .backing = a, .project_dir = project };
+    defer ctx.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = project };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
     // First replan: the manifest's generate hook is planned; the site
     // now knows the provider and the re-read config.
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 1), ctx.generate_plan.before.len);
     try std.testing.expectEqualStrings("pkg/gen", ctx.generate_plan.before[0].qualified);
     try std.testing.expect(ctx.build_plan.isEmpty());
@@ -79,22 +103,24 @@ test "watch replan re-reads the project and provider manifests on every call" {
     try std.testing.expectEqual(@as(usize, 1), site.cfg.plugins.len);
     // The manifest changes between rebuilds: the next replan sees it.
     try Manifest.write(tmp.dir, build_hook);
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expect(ctx.generate_plan.isEmpty());
     try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
     // A broken manifest fails the replan; the last good plans stay
     // installed and remain readable (their generation was kept).
     try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = "not a manifest" });
-    try std.testing.expectError(error.InvalidManifest, WatchReplan.run(&replan, &ctx));
+    try std.testing.expectError(error.InvalidManifest, Replanner.run(&replan, &ctx));
     try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
     try Manifest.write(tmp.dir, build_hook);
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     const good = replan.current.?;
-    // A manifest edit cannot silently add a server replacement to a
-    // running legacy watch session. Both checks keep the old plans.
-    try Manifest.write(tmp.dir, ".{ .id = \"server\", .step = .run, .target = \"wasm\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\" }");
-    try std.testing.expectError(error.LegacyWasmReplacement, WatchReplan.precheck(&replan, &ctx));
-    try std.testing.expectError(error.LegacyWasmReplacement, WatchReplan.run(&replan, &ctx));
+    // A manifest edit cannot silently add a run replacement to a session
+    // that forbids one (the legacy serve). Both checks keep the old plans.
+    try Manifest.write(tmp.dir, ".{ .id = \"server\", .step = .run, .target = \"probe-target\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\" }");
+    replan.forbid_run_replacement = Refuse.forbid;
+    try std.testing.expectError(error.RunReplacementForbidden, Replanner.precheck(&replan, &ctx));
+    try std.testing.expectError(error.RunReplacementForbidden, Replanner.run(&replan, &ctx));
+    replan.forbid_run_replacement = null;
     try std.testing.expectEqual(good, replan.current.?);
     try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
     try Manifest.write(tmp.dir, build_hook);
@@ -105,7 +131,7 @@ test "watch replan re-reads the project and provider manifests on every call" {
     // config — never empty plans that would generate for an unowned
     // target.
     const Kept = struct {
-        fn check(r: *const WatchReplan, c: *const WasmRebuildCtx, s: *const provider_hooks.Site, expected: *const WatchReplan.Generation) !void {
+        fn check(r: *const Replanner, c: *const RebuildCtx, s: *const provider_hooks.Site, expected: *const Replanner.Generation) !void {
             try std.testing.expectEqual(expected, r.current.?);
             try std.testing.expectEqualStrings("pkg/post", c.build_plan.after[0].qualified);
             try std.testing.expectEqual(@as(usize, 1), s.providers.len);
@@ -114,12 +140,12 @@ test "watch replan re-reads the project and provider manifests on every call" {
     };
     // (a) The package stops declaring the target.
     try Manifest.writeAt(tmp.dir, "pkg/plugin.labelle", "", "");
-    try std.testing.expectError(error.NoProviderForTarget, WatchReplan.run(&replan, &ctx));
+    try std.testing.expectError(error.NoProviderForTarget, Replanner.run(&replan, &ctx));
     try Kept.check(&replan, &ctx, &site, good);
     try Manifest.write(tmp.dir, build_hook);
     // (b) The project drops the plugin altogether.
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
-    try std.testing.expectError(error.NoProviderForTarget, WatchReplan.run(&replan, &ctx));
+    try std.testing.expectError(error.NoProviderForTarget, Replanner.run(&replan, &ctx));
     try Kept.check(&replan, &ctx, &site, good);
     // (c) The owner becomes a remote package read from the ordinary
     //     cache with no integrity pin: present, but unverified.
@@ -132,22 +158,22 @@ test "watch replan re-reads the project and provider manifests on every call" {
     try tmp.dir.createDirPath(io, cached);
     const cached_manifest = try std.fs.path.join(a, &.{ cached, "plugin.labelle" });
     defer a.free(cached_manifest);
-    try Manifest.writeAt(tmp.dir, cached_manifest, "\"wasm\"", build_hook);
+    try Manifest.writeAt(tmp.dir, cached_manifest, "\"probe-target\"", build_hook);
     try tmp.dir.writeFile(io, .{
         .sub_path = "project/project.labelle",
         .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }",
     });
-    try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.run(&replan, &ctx));
+    try std.testing.expectError(error.UnverifiedTargetOwner, Replanner.run(&replan, &ctx));
     try Kept.check(&replan, &ctx, &site, good);
     try std.testing.expectEqualStrings("local:../pkg", site.cfg.plugins[0].repo);
 }
 
 /// Shared fixture for the two-stage (pre-check → prebuild → replan)
 /// tests below: a project declaring a local package `pkg` that owns
-/// `wasm`, a rebuild context wired to the production pre-check and
+/// `probe-target`, a rebuild context wired to the production pre-check and
 /// replan, and spies for the prebuild runner and the hook phases.
 const TwoStage = struct {
-    const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"wasm\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    const gen_hook = ".{ .id = \"gen\", .step = .generate, .target = \"probe-target\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }";
     const local_project = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }";
 
     fn manifest(buf: []u8, targets: []const u8, hooks: []const u8) ![]const u8 {
@@ -198,38 +224,39 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
     const project = try tmp.dir.realPathFileAlloc(io, "project", a);
     defer a.free(project);
     var buf: [1024]u8 = undefined;
-    const owning = try TwoStage.manifest(&buf, "\"wasm\"", TwoStage.gen_hook);
+    const owning = try TwoStage.manifest(&buf, "\"probe-target\"", TwoStage.gen_hook);
     try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = owning });
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
         .run_prebuild = TwoStage.Spy.runPrebuild,
         .run_hook_phase = TwoStage.Spy.runHook,
-        .replan = .{ .ctx = &replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+        .replan = replan.seam(),
     };
+    defer ctx.deinit();
 
     // Owned: the pre-check passes, the prebuild runs, the replan plans
     // the hook (generation then fails on the missing assembler).
     TwoStage.Spy.reset();
-    try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+    try ctx.rebuildStaged();
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.hook_count);
     const good = replan.current.?;
@@ -237,7 +264,7 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
     // (a) The project drops the package: no local package is left to
     // regenerate, so no prebuild can bring an owner back.
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = ".{ .name = \"game\" }" });
-    try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
+    try std.testing.expectError(error.NoProviderForTarget, Replanner.precheck(&replan, &ctx));
     TwoStage.Spy.reset();
     try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
     try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
@@ -259,14 +286,14 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
     try tmp.dir.writeFile(io, .{ .sub_path = cached_manifest, .data = unowned });
     const remote_project = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"example/pkg\", .version = \"1.0.0\" } } }";
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = remote_project });
-    try std.testing.expectError(error.NoProviderForTarget, WatchReplan.precheck(&replan, &ctx));
+    try std.testing.expectError(error.NoProviderForTarget, Replanner.precheck(&replan, &ctx));
     TwoStage.Spy.reset();
     try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
     try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
     try std.testing.expectEqual(good, replan.current.?);
     // (c) The owner becomes a remote package with no integrity pin.
     try tmp.dir.writeFile(io, .{ .sub_path = cached_manifest, .data = owning });
-    try std.testing.expectError(error.UnverifiedTargetOwner, WatchReplan.precheck(&replan, &ctx));
+    try std.testing.expectError(error.UnverifiedTargetOwner, Replanner.precheck(&replan, &ctx));
     TwoStage.Spy.reset();
     try std.testing.expectError(error.TargetPrecheckFailed, ctx.rebuildStaged());
     try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.prebuilds);
@@ -279,14 +306,14 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
     // nothing changed the manifest.
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
     try tmp.dir.deleteFile(io, "pkg/plugin.labelle");
-    try WatchReplan.precheck(&replan, &ctx);
+    try Replanner.precheck(&replan, &ctx);
     TwoStage.Spy.reset();
     try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
     try std.testing.expectEqual(@as(usize, 0), TwoStage.Spy.hook_count);
     try std.testing.expectEqual(good, replan.current.?);
     try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = unowned });
-    try WatchReplan.precheck(&replan, &ctx);
+    try Replanner.precheck(&replan, &ctx);
     TwoStage.Spy.reset();
     try std.testing.expectError(error.ReplanFailed, ctx.rebuildStaged());
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
@@ -315,36 +342,37 @@ test "watched rebuild lets a prebuild refresh an existing provider manifest" {
     const stale = try TwoStage.manifest(&stale_buf, "", TwoStage.gen_hook);
     try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = stale });
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
         .run_prebuild = TwoStage.Spy.runPrebuild,
         .run_hook_phase = TwoStage.Spy.runHook,
-        .replan = .{ .ctx = &replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+        .replan = replan.seam(),
     };
+    defer ctx.deinit();
 
     // The existing manifest does not declare the target, yet the
     // pre-check defers: a local package's metadata is not final
     // before its prebuild runs.
-    try WatchReplan.precheck(&replan, &ctx);
+    try Replanner.precheck(&replan, &ctx);
     var buf: [1024]u8 = undefined;
-    const regenerated = try TwoStage.manifest(&buf, "\"wasm\"", TwoStage.gen_hook);
+    const regenerated = try TwoStage.manifest(&buf, "\"probe-target\"", TwoStage.gen_hook);
     const manifest_path = try std.fs.path.join(a, &.{ pkg, "plugin.labelle" });
     defer a.free(manifest_path);
     TwoStage.Spy.reset();
@@ -353,7 +381,7 @@ test "watched rebuild lets a prebuild refresh an existing provider manifest" {
     // The rebuild gets past the replan (generation then fails on the
     // missing assembler): the regenerated manifest owns the target and
     // its hook ran in this very rebuild.
-    try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+    try ctx.rebuildStaged();
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
     try std.testing.expect(replan.current != null);
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.hook_count);
@@ -378,40 +406,41 @@ test "watched rebuild replans after a prebuild step generates provider metadata"
     defer a.free(pkg);
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = TwoStage.local_project });
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
         .run_prebuild = TwoStage.Spy.runPrebuild,
         .run_hook_phase = TwoStage.Spy.runHook,
-        .replan = .{ .ctx = &replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+        .replan = replan.seam(),
     };
+    defer ctx.deinit();
 
     // The manifest does not exist when the rebuild starts; the prebuild
     // step generates it, owning the target and declaring a hook.
     var buf: [1024]u8 = undefined;
-    const generated = try TwoStage.manifest(&buf, "\"wasm\"", TwoStage.gen_hook);
+    const generated = try TwoStage.manifest(&buf, "\"probe-target\"", TwoStage.gen_hook);
     const manifest_path = try std.fs.path.join(a, &.{ pkg, "plugin.labelle" });
     defer a.free(manifest_path);
     TwoStage.Spy.reset();
     TwoStage.Spy.generate_path = manifest_path;
     TwoStage.Spy.generate_text = generated;
-    try std.testing.expectError(error.GenerateFailed, ctx.rebuildStaged());
+    try ctx.rebuildStaged();
     try std.testing.expectEqual(@as(usize, 1), TwoStage.Spy.prebuilds);
     // The replan saw the generated manifest: its hook is planned and ran
     // in this very rebuild.
@@ -457,7 +486,7 @@ test "watch replan extracts a pinned provider once per changed pin" {
         /// `variant`) and pin it in the project's provider lock.
         fn publish(dir: std.Io.Dir, variant: []const u8, commit: u8) !void {
             const ta = std.testing.allocator;
-            const data = try provider_github.testProviderArchive(ta, ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }", variant);
+            const data = try provider_github.testProviderArchive(ta, ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }", variant);
             defer ta.free(data);
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
@@ -485,24 +514,25 @@ test "watch replan extracts a pinned provider once per changed pin" {
     const startup_providers = try provider_dispatch.discover(sa, project, startup_cfg_read, &startup_sources, .populated);
     try std.testing.expectEqual(@as(usize, 1), startup_providers.len);
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    defer ctx.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
     replan.seed(&startup_sources);
@@ -512,8 +542,8 @@ test "watch replan extracts a pinned provider once per changed pin" {
     // unpacked, and the providers point at the cold pipeline's copy.
     const before = provider_github.extraction_count;
     for (0..2) |_| {
-        try WatchReplan.precheck(&replan, &ctx);
-        try WatchReplan.run(&replan, &ctx);
+        try Replanner.precheck(&replan, &ctx);
+        try runCommitted(&replan, &ctx);
         try std.testing.expectEqualStrings(startup_providers[0].dir, site.providers[0].dir);
     }
     try std.testing.expectEqual(before, provider_github.extraction_count);
@@ -521,17 +551,17 @@ test "watch replan extracts a pinned provider once per changed pin" {
     // The pin changes: the pre-check still unpacks nothing (the new pin
     // is unread, so it defers), the replan unpacks it exactly once...
     try Pins.publish(tmp.dir, "// v2\n", '2');
-    try WatchReplan.precheck(&replan, &ctx);
+    try Replanner.precheck(&replan, &ctx);
     try std.testing.expectEqual(before, provider_github.extraction_count);
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(before + 1, provider_github.extraction_count);
     const v2_dir = try a.dupe(u8, site.providers[0].dir);
     defer a.free(v2_dir);
     try std.testing.expect(!std.mem.eql(u8, startup_providers[0].dir, v2_dir));
     // ...and the two rebuilds after it reuse that extraction.
     for (0..2) |_| {
-        try WatchReplan.precheck(&replan, &ctx);
-        try WatchReplan.run(&replan, &ctx);
+        try Replanner.precheck(&replan, &ctx);
+        try runCommitted(&replan, &ctx);
         try std.testing.expectEqualStrings(v2_dir, site.providers[0].dir);
     }
     try std.testing.expectEqual(before + 1, provider_github.extraction_count);
@@ -540,8 +570,8 @@ test "watch replan extracts a pinned provider once per changed pin" {
     // unpacked; v2's, owned by the session and read by no installed
     // generation any more, is removed.
     try Pins.publish(tmp.dir, "// v1\n", '1');
-    try WatchReplan.precheck(&replan, &ctx);
-    try WatchReplan.run(&replan, &ctx);
+    try Replanner.precheck(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(before + 1, provider_github.extraction_count);
     try std.testing.expectEqualStrings(startup_providers[0].dir, site.providers[0].dir);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, v2_dir, .{}));
@@ -568,7 +598,7 @@ test "watch replan installs and relocks when project.labelle changes" {
     defer asm_cache.clearCacheRootOverride();
     try tmp.dir.writeFile(io, .{
         .sub_path = "pkg/plugin.labelle",
-        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }",
     });
     const local = ".{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" }";
     const remote = ".{ .name = \"extra\", .repo = \"example/extra\", .version = \"1.0.0\" }";
@@ -595,24 +625,25 @@ test "watch replan installs and relocks when project.labelle changes" {
     Spy.cache_dir = try std.fs.path.join(a, &.{ home, "packages", "plugins", "example", "extra", "1.0.0" });
     defer a.free(Spy.cache_dir);
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{
+    defer ctx.deinit();
+    var replan = Replanner{
         .backing = a,
         .project_dir = project,
         .installer = .{ .ctx = &Spy.count, .run = Spy.install },
@@ -622,7 +653,7 @@ test "watch replan installs and relocks when project.labelle changes" {
     defer replan.deinit(&site, &.{}, startup_cfg);
     // The cold pipeline installed and locked this project: the baseline.
     replan.baseline();
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 0), Spy.count);
 
     // The project gains a remote package the startup install never saw.
@@ -630,10 +661,10 @@ test "watch replan installs and relocks when project.labelle changes" {
     // A failing install fails the replan (previous state kept) and is
     // retried on the next rebuild, with no lock written in between.
     Spy.fail_install = true;
-    try std.testing.expectError(error.InstallFailed, WatchReplan.run(&replan, &ctx));
+    try std.testing.expectError(error.InstallFailed, Replanner.run(&replan, &ctx));
     try std.testing.expectEqual(@as(usize, 1), site.cfg.plugins.len);
     Spy.fail_install = false;
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     // Installed first (discovery then found the package), locked for the
     // new project last.
     try std.testing.expectEqual(@as(usize, 3), Spy.count);
@@ -642,15 +673,15 @@ test "watch replan installs and relocks when project.labelle changes" {
     try std.testing.expectEqualStrings("lock-2", Spy.events[2]);
     try std.testing.expectEqual(@as(usize, 2), site.cfg.plugins.len);
     // Unchanged again: nothing re-runs.
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 3), Spy.count);
 
     // Without the install the same edit is the reported failure: the
     // cache never learns about the package.
-    var bare = WatchReplan{ .backing = a, .project_dir = project, .write_lock = Spy.lock };
+    var bare = Replanner{ .backing = a, .project_dir = project, .write_lock = Spy.lock };
     defer bare.deinit(&site, &.{}, startup_cfg);
     try std.Io.Dir.cwd().deleteTree(io, Spy.cache_dir);
-    try std.testing.expectError(error.ProviderPackageMissing, WatchReplan.run(&bare, &ctx));
+    try std.testing.expectError(error.ProviderPackageMissing, Replanner.run(&bare, &ctx));
 }
 
 // The serve's shutdown runs the CURRENT generation's `after run` hooks:
@@ -672,7 +703,7 @@ test "watched serve shutdown runs the replanned after-run hooks" {
     const Files = struct {
         fn write(dir: std.Io.Dir, version: []const u8, hook_id: []const u8) !void {
             var buf: [1024]u8 = undefined;
-            const manifest = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"wasm\" }}, .hooks = .{{ .{{ .id = \"{s}\", .step = .run, .target = \"wasm\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }} }} }}", .{hook_id});
+            const manifest = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"probe-target\" }}, .hooks = .{{ .{{ .id = \"{s}\", .step = .run, .target = \"probe-target\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }} }} }}", .{hook_id});
             try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = manifest });
             var pbuf: [512]u8 = undefined;
             const proj = try std.fmt.bufPrint(&pbuf, ".{{ .name = \"game\", .plugins = .{{ .{{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"{s}\" }} }} }}", .{version});
@@ -702,31 +733,32 @@ test "watched serve shutdown runs the replanned after-run hooks" {
     var startup_sources: provider_github.Sources = .{ .a = sa };
     defer startup_sources.deinit();
     const startup_providers = try provider_dispatch.discover(sa, project, startup_cfg, &startup_sources, .populated);
-    const startup_run = try provider_hooks.plan(sa, startup_providers, .run, "wasm");
+    const startup_run = try provider_hooks.plan(sa, startup_providers, .run, "probe-target");
     try std.testing.expectEqualStrings("pkg/publish-v1", startup_run.after[0].qualified);
 
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
     site.providers = startup_providers;
     site.cfg = startup_cfg;
     site.host = .{ .zig = "/z", .cache_root = project, .global_cache = project, .packages = project };
     site.run_tool = Spy.tool;
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = lockfile.writeLockFile };
+    defer ctx.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = lockfile.writeLockFile };
     defer replan.deinit(&site, startup_providers, startup_cfg);
     replan.baseline();
     // No rebuild has replanned yet: the startup plan is the shutdown's.
@@ -735,7 +767,7 @@ test "watched serve shutdown runs the replanned after-run hooks" {
     // A watched edit bumps the provider to v2 and swaps its after-run
     // hook; the rebuild's replan installs it and relocks.
     try Files.write(tmp.dir, "2.0.0", "publish-v2");
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
 
     // The startup plan is stale against the rewritten lock...
     try std.testing.expectError(error.StaleProviderPin, provider_hooks.finishServe(&site, startup_run.after, project));
@@ -751,9 +783,9 @@ test "watched serve shutdown runs the replanned after-run hooks" {
     // A later edit that removes every after-run hook: shutdown runs none.
     try tmp.dir.writeFile(io, .{
         .sub_path = "pkg/plugin.labelle",
-        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }",
     });
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 0), replan.shutdownRunAfter(startup_run.after).len);
 }
 
@@ -772,7 +804,7 @@ test "watch replan release restores the site's stable storage" {
     defer a.free(project);
     try tmp.dir.writeFile(io, .{
         .sub_path = "pkg/plugin.labelle",
-        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "project/project.labelle",
@@ -788,27 +820,28 @@ test "watch replan release restores the site's stable storage" {
         .verified = true,
     }};
     const stable_cfg: project_config.ProjectConfig = .{ .name = "startup" };
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
     site.providers = &stable_providers;
     site.cfg = stable_cfg;
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = Lock.none };
-    try WatchReplan.run(&replan, &ctx);
+    defer ctx.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none };
+    try runCommitted(&replan, &ctx);
     // The site now reads the replan's generation, not the startup storage.
     try std.testing.expect(site.providers.ptr != &stable_providers);
     try std.testing.expectEqualStrings("game", site.cfg.name);
@@ -834,42 +867,43 @@ test "watch replan installs the re-read prebuild steps" {
     defer a.free(project);
     try tmp.dir.writeFile(io, .{
         .sub_path = "pkg/plugin.labelle",
-        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"wasm\" } }",
+        .data = ".{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{ \"probe-target\" } }",
     });
     const head = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } }";
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ ", .prebuild = .{ .{ .run = .{ \"gen-old\" } } } }" });
     const Lock = struct {
         fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
     };
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
     const startup_steps = [_]prebuild.Step{.{ .run = &.{"gen-startup"} }};
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        .zig_args = &.{},
+        .zig_args = &.{asm_path},
         .zig_env = null,
         .prebuild_steps = &startup_steps,
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{ .backing = a, .project_dir = project, .write_lock = Lock.none };
+    defer ctx.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 1), ctx.prebuild_steps.len);
     try std.testing.expectEqualStrings("gen-old", ctx.prebuild_steps[0].run[0]);
 
     // Changed: the next generation's steps replace the previous one's.
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ ", .prebuild = .{ .{ .run = .{ \"gen-new\", \"--flag\" } }, .{ .run = .{ \"gen-extra\" } } } }" });
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 2), ctx.prebuild_steps.len);
     try std.testing.expectEqualStrings("gen-new", ctx.prebuild_steps[0].run[0]);
     try std.testing.expectEqualStrings("--flag", ctx.prebuild_steps[0].run[1]);
@@ -877,12 +911,12 @@ test "watch replan installs the re-read prebuild steps" {
 
     // A failed replan keeps the installed steps (and their storage).
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = "not zon" });
-    if (WatchReplan.run(&replan, &ctx)) |_| return error.TestUnexpectedResult else |_| {}
+    if (Replanner.run(&replan, &ctx)) |_| return error.TestUnexpectedResult else |_| {}
     try std.testing.expectEqualStrings("gen-new", ctx.prebuild_steps[0].run[0]);
 
     // Removed: no step runs any more.
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ " }" });
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(@as(usize, 0), ctx.prebuild_steps.len);
 }
 
@@ -907,7 +941,7 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
     const Manifest = struct {
         fn write(dir: std.Io.Dir, defaults: []const u8) !void {
             var buf: [512]u8 = undefined;
-            const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"wasm\" }}, .target_defaults = .{{ {s} }} }}", .{defaults});
+            const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"pkg\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .targets = .{{ \"probe-target\" }}, .target_defaults = .{{ {s} }} }}", .{defaults});
             try dir.writeFile(config.globalIo(), .{ .sub_path = "pkg/plugin.labelle", .data = text });
         }
         fn flags(args: []const []const u8) usize {
@@ -916,15 +950,15 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
             return n;
         }
     };
-    const asm_path = try a.dupe(u8, "/nonexistent/labelle-assembler-probe");
+    const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var ctx = WasmRebuildCtx{
+    var ctx = RebuildCtx{
         .allocator = a,
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
-        .platform_tag = "wasm",
-        .backend_tag = "bgfx",
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         // The startup plan: the core fallback, before any replan.
@@ -935,27 +969,28 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
-    var replan = WatchReplan{ .backing = a, .project_dir = project };
+    defer ctx.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = project };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
     // The owner declares a default: it replaces the core fallback.
-    try Manifest.write(tmp.dir, ".{ .target = \"wasm\", .optimize = .ReleaseSmall }");
-    try WatchReplan.run(&replan, &ctx);
+    try Manifest.write(tmp.dir, ".{ .target = \"probe-target\", .optimize = .ReleaseSmall }");
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(provider_contract.Optimize.ReleaseSmall, site.optimize);
     try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", ctx.zig_args[ctx.zig_args.len - 1]);
     try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
     try std.testing.expectEqualStrings("build", ctx.zig_args[1]);
     // The default is edited away: back to the core fallback.
     try Manifest.write(tmp.dir, "");
-    try WatchReplan.run(&replan, &ctx);
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(provider_contract.Optimize.ReleaseSafe, site.optimize);
     try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", ctx.zig_args[ctx.zig_args.len - 1]);
     try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
     // An explicit flag wins over a declared default.
     ctx.optimize_flag = "Debug";
-    try Manifest.write(tmp.dir, ".{ .target = \"wasm\", .optimize = .ReleaseFast }");
-    try WatchReplan.run(&replan, &ctx);
+    try Manifest.write(tmp.dir, ".{ .target = \"probe-target\", .optimize = .ReleaseFast }");
+    try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(provider_contract.Optimize.Debug, site.optimize);
     try std.testing.expectEqualStrings("-Doptimize=Debug", ctx.zig_args[ctx.zig_args.len - 1]);
     try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
@@ -965,10 +1000,10 @@ test "watch replan: withOptimize replaces or drops the flag, keeping every other
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const replaced = try WatchReplan.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug", "-Dother=1" }, "ReleaseFast");
+    const replaced = try Replanner.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug", "-Dother=1" }, "ReleaseFast");
     try std.testing.expectEqual(@as(usize, 4), replaced.len);
     try std.testing.expectEqualStrings("-Dother=1", replaced[2]);
     try std.testing.expectEqualStrings("-Doptimize=ReleaseFast", replaced[3]);
-    const dropped = try WatchReplan.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug" }, null);
+    const dropped = try Replanner.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug" }, null);
     try std.testing.expectEqual(@as(usize, 2), dropped.len);
 }

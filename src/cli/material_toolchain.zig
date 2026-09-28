@@ -191,7 +191,7 @@ pub fn validateOverride(path: []const u8) !void {
 
 /// Read `LABELLE_SHADERC` and gate on it. Called by BOTH the cold pipeline
 /// (`pipeline.run`, before `assembler generate`) and every watched rebuild
-/// (`pipeline/watch.zig`), so a `materials/` directory that appears only
+/// (`pipeline/rebuild.zig`), so a `materials/` directory that appears only
 /// after a `--watch` session started is gated exactly like a cold
 /// build — the first rebuild that would consume the override is the one
 /// that validates it.

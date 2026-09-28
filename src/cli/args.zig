@@ -106,6 +106,10 @@ pub const ParsedArgs = struct {
     serve_no_open: bool = false,
     // `wasm serve --watch` (cli#208): rebuild + live-reload on source change.
     serve_watch: bool = false,
+    /// `labelle run --watch` (RFC cli#466 A2): after the initial build,
+    /// keep the target's watch-capable run replacement running and rebuild
+    /// + publish on every source change.
+    run_watch: bool = false,
     // `wasm export` options. `wasm_export` selects the export action of
     // the shared `wasm_cmd`; the rest configure packaging. `serve_no_build`
     // (above) is reused as the shared "skip build, package existing output"
@@ -718,6 +722,10 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
             docker_target = val;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--watch")) {
+            parsed_args.run_watch = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--timeout=")) {
             timeout_ns = util.parseDuration(arg["--timeout=".len..]);
             if (timeout_ns == null) {
@@ -840,6 +848,12 @@ pub fn parseRunArgs(args: anytype, cmd_name: []const u8, allow_dir: bool, parsed
     // a warning preserves forward-compat if future flags reuse `--after`.
     if (screenshot_after_ns != null and screenshot_path == null) {
         std.debug.print("labelle {s}: warning: --after has no effect without --screenshot\n", .{cmd_name});
+    }
+    // A container build never reaches a watch session: the rebuilds run on
+    // this host, next to the replacement.
+    if (parsed_args.run_watch and docker_build) {
+        std.debug.print("labelle {s}: --watch cannot be combined with --docker\n", .{cmd_name});
+        return null;
     }
     return .{ .dir = dir, .scene = scene, .timeout_ns = timeout_ns, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .screenshot_path = screenshot_path, .screenshot_after_ns = screenshot_after_ns };
 }

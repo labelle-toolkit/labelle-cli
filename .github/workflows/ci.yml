@@ -98,6 +98,9 @@ jobs:
       - name: Provider doctor aggregation subprocess regression
         run: python test/provider_doctor_e2e.py
 
+      - name: Provider watch session subprocess regression (run --watch)
+        run: python test/provider_watch_e2e.py
+
       - name: CLI tests
         run: zig build test
 

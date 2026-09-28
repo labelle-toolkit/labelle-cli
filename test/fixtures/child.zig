@@ -7,6 +7,9 @@
 //!   abort               abnormal termination (SIGABRT on POSIX)
 //!   sleep:<ms>          stay alive for ms, then exit 0
 //!   sleep-exit:<ms>:<n> stay alive for ms, then exit n
+//!   tree <pidfile> <exe> start `<exe> sleep:60000` (a grandchild), write its
+//!                       pid and a newline to <pidfile>, then sleep 60 s:
+//!                       a process tree for the supervision tests
 const std = @import("std");
 
 pub fn main(init: std.process.Init) !u8 {
@@ -19,6 +22,16 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.startsWith(u8, spec, "exit:")) return try std.fmt.parseInt(u8, spec["exit:".len..], 10);
     if (std.mem.startsWith(u8, spec, "sleep:")) {
         sleepMs(try std.fmt.parseInt(u64, spec["sleep:".len..], 10));
+        return 0;
+    }
+    if (std.mem.eql(u8, spec, "tree")) {
+        const pid_file = args.next() orelse return 64;
+        const exe = args.next() orelse return 64;
+        const grandchild = try std.process.spawn(init.io, .{ .argv = &.{ exe, "sleep:60000" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        const pid: u64 = if (@import("builtin").os.tag == .windows) GetProcessId(grandchild.id.?) else @intCast(grandchild.id.?);
+        var buf: [32]u8 = undefined;
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = pid_file, .data = try std.fmt.bufPrint(&buf, "{d}\n", .{pid}) });
+        sleepMs(60_000);
         return 0;
     }
     if (std.mem.startsWith(u8, spec, "sleep-exit:")) {
@@ -48,3 +61,5 @@ fn sleepMs(ms: u64) void {
     var rem: std.c.timespec = undefined;
     while (std.c.nanosleep(&req, &rem) != 0) req = rem;
 }
+
+extern "kernel32" fn GetProcessId(process: std.os.windows.HANDLE) callconv(.winapi) u32;

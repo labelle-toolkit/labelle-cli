@@ -23,10 +23,10 @@ const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
 const resolveExportOutput = @import("export_output.zig").resolveExportOutput;
 const ScreenshotProbe = @import("screenshot.zig").ScreenshotProbe;
-const watch = @import("watch.zig");
-const WasmRebuildCtx = watch.WasmRebuildCtx;
-const collectPrebuildIgnorePaths = watch.collectPrebuildIgnorePaths;
-const WatchReplan = @import("watch_replan.zig").WatchReplan;
+const RebuildCtx = @import("rebuild.zig").RebuildCtx;
+const Replanner = @import("rebuild_replan.zig").Replanner;
+const watch_session = @import("watch_session.zig");
+const refuseKnownLegacyWasmReplacement = @import("args_resolve.zig").refuseKnownLegacyWasmReplacement;
 const optimize_mod = @import("optimize.zig");
 const Context = @import("context.zig").Context;
 const ParsedArgs = args_mod.ParsedArgs;
@@ -192,6 +192,10 @@ pub fn launch(
         if (code != 0) return code;
     }
     if (hook_plans.run.replace) |replacement| {
+        // `labelle run --watch` (RFC cli#466 §3.4): the replacement serves
+        // while core rebuilds and publishes (`watch_session.zig`). The
+        // install stage already refused a replacement that cannot watch.
+        if (parsed_args.run_watch) return watch_session.run(cx, replacement, run_out, generate_out, build_out, zig_args, zig_env_ptr);
         const code = try provider_hooks.runPhase(hook_site, &.{replacement}, .run, .replace, run_out);
         if (code != 0) return code;
         return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .exited_clean);
@@ -237,31 +241,30 @@ pub fn launch(
             // i.e. after the hooks, and restores the startup storage on the
             // site as it releases the generation.
             const watch_installer = AssemblerInstaller{ .bin = cx.asm_bin };
-            var watch_replan = WatchReplan{
+            var watch_replan = Replanner{
                 .backing = allocator,
                 .project_dir = project_dir,
-                .installer = WatchReplan.assemblerInstaller(&watch_installer),
+                .installer = Replanner.assemblerInstaller(&watch_installer),
+                // A running legacy serve cannot switch server
+                // implementations: a replan that adds a run replacement
+                // is refused.
+                .forbid_run_replacement = .{ .plan = refuseLegacyWasmReplacement, .known = refuseKnownLegacyWasmReplacement },
             };
             defer watch_replan.deinit(hook_site, cx.providers, parsed);
             if (parsed_args.serve_watch) {
-                // `--watch` (cli#208): hand the serve loop a rebuild callback
-                // that re-runs the same generate→fingerprint→zig-build steps
-                // this pipeline just did. The context borrows locals that stay
+                // `--watch` (cli#208): hand the serve loop the generic
+                // rebuild callback (`RebuildCtx`, the same one `labelle run
+                // --watch` drives). The context borrows locals that stay
                 // alive because `serveAndOpen` blocks until Ctrl+C.
                 //
-                // The hook plans are NOT borrowed for the session: every
-                // rebuild re-reads the project and replans through
-                // `watch_replan`, so an edited manifest or `provider_config`
-                // reaches the next rebuild; the plans computed above are only
-                // the initial state. The project the cold pipeline just
-                // installed and locked is the replan's baseline: an edit to
-                // `project.labelle` re-runs the install and rewrites the lock.
+                // Every rebuild re-reads the project and replans through
+                // `watch_replan`, transactionally (cli#469); the plans
+                // computed above are only the initial state. The project
+                // the cold pipeline just installed and locked is the
+                // replan's baseline.
                 watch_replan.baseline();
-                // The pinned providers the cold pipeline just extracted are
-                // lent to the session (their `Sources` outlives the replan):
-                // a rebuild re-extracts only a pin that changed (cli#429).
                 watch_replan.seed(cx.provider_sources);
-                var rebuild_ctx = WasmRebuildCtx{
+                var rebuild_ctx = RebuildCtx{
                     .allocator = allocator,
                     .asm_bin = cx.asm_bin,
                     .project_dir = project_dir,
@@ -271,46 +274,34 @@ pub fn launch(
                     .target_dir = target_dir,
                     .zig_args = zig_args,
                     .zig_env = zig_env_ptr,
-                    // What the replan recomputes the optimize mode from.
                     .optimize_flag = parsed_args.optimize_override,
                     .fallback_optimize = "ReleaseSafe",
                     .prebuild_steps = parsed.prebuild,
                     .prebuild_opts = .{
                         .route_stdout_to_stderr = parsed_args.progress_mode == .json,
-                        // Keep the serve loop alive on a failing step.
                         .fatal_on_step_failure = false,
                     },
-                    // The same hook site, plans and output directories the
-                    // cold pipeline just used; the feed is already terminal
-                    // here, so the hooks' sub-step records are no-ops.
                     .hooks = hook_site,
                     .generate_plan = hook_plans.generate,
                     .build_plan = hook_plans.build,
                     .generate_out = generate_out,
                     .build_out = build_out,
-                    .replan = .{ .ctx = &watch_replan, .precheck = WatchReplan.precheck, .run = WatchReplan.run },
+                    .replan = watch_replan.seam(),
+                    // The declared outputs of the prebuild steps are kept
+                    // out of the watch signature, swapped together with the
+                    // steps (cli#463) — but only while the steps actually
+                    // run (`collectPrebuildIgnorePaths`).
+                    .hooks_enabled = !prebuild.skipRequested(allocator),
+                    .prepass = .{ .legacy_target = target.legacy != null, .bake = parsed_args.bake, .fatal = false },
                 };
-                // The hooks' declared `.outputs` are excluded from the watch
-                // signature so the rebuild callback can't trip its own
-                // watcher — but ONLY while the hooks actually run, so the
-                // kill switch doesn't hide out-of-band regeneration from the
-                // watcher. See `collectPrebuildIgnorePaths`.
-                var ignore_files = collectPrebuildIgnorePaths(
-                    allocator,
-                    project_dir,
-                    parsed.prebuild,
-                    !prebuild.skipRequested(allocator),
-                );
-                defer {
-                    for (ignore_files.items) |f| allocator.free(f);
-                    ignore_files.deinit(allocator);
-                }
+                rebuild_ctx.initIgnore();
+                defer rebuild_ctx.deinit();
 
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
                     .watch_dir = project_dir,
-                    .rebuild_fn = WasmRebuildCtx.rebuild,
+                    .rebuild_fn = RebuildCtx.rebuild,
                     .rebuild_ctx = &rebuild_ctx,
-                    .ignore_files = ignore_files.items,
+                    .ignore = &rebuild_ctx.ignore,
                 });
             } else {
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);

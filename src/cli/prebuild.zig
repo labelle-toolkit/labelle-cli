@@ -88,6 +88,7 @@
 //! it; additive-only).
 
 const std = @import("std");
+const supervise = @import("supervise.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const progress = @import("progress.zig");
@@ -551,7 +552,9 @@ pub fn runStep(
         .relay => .pipe,
     };
 
-    var child = std.process.spawn(io, .{
+    // Supervised inside a watch session (`supervise.zig`): the step then
+    // runs in its own cancellable process tree.
+    var sup = supervise.spawn(io, .{
         .argv = step.run,
         .cwd = .{ .path = project_dir },
         .stdin = .inherit,
@@ -576,10 +579,10 @@ pub fn runStep(
     // not hang the build. `wait` would close the pipe, so the relay takes
     // it first.
     if (relay) |r| {
-        r.begin(child.stdout.?);
-        child.stdout = null;
+        r.begin(sup.child.stdout.?);
+        sup.child.stdout = null;
     }
-    const waited = child.wait(io);
+    const waited = sup.wait(io);
     if (relay) |r| r.finish(prebuild_relay.drain_grace_ns);
 
     const term = waited catch |err| {

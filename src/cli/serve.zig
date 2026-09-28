@@ -10,37 +10,32 @@
 //! Thin root: the implementation lives in `serve/`, one responsibility
 //! per file, and this file re-exports the public API.
 //!
-//!   serve/server.zig    `serveAndOpen`, the accept loop, browser launch
+//!   serve/server.zig    `serveAndOpen`, the accept loop, the stop waker,
+//!                       browser launch
 //!   serve/http.zig      one request: routing, MIME, live-reload endpoint
-//!   serve/cancel.zig    Ctrl+C / SIGTERM / console handler and the waker
-//!   serve/watch.zig     `--watch` config, shared state, the watcher thread
-//!   serve/baseline.zig  `WatchBaseline`: follow-up / cap / ceiling policy
-//!   serve/tree.zig      tree signatures, snapshots and the walk
 //!   serve/testing.zig   helpers shared by the tests above
+//!
+//! The `--watch` loop, the stop handler and the tree signatures are the
+//! generic ones in `watch/` (`watch.zig`).
 
+const watch = @import("watch.zig");
 /// The stop flag and its handler; `cancel.cancel_requested` is the flag.
-pub const cancel = @import("serve/cancel.zig");
+pub const cancel = watch.cancel;
 const server = @import("serve/server.zig");
 const http = @import("serve/http.zig");
-const watch = @import("serve/watch.zig");
-const baseline = @import("serve/baseline.zig");
-const tree = @import("serve/tree.zig");
 const testing = @import("serve/testing.zig");
 
 pub const installCancelHandler = cancel.installCancelHandler;
 pub const serveAndOpen = server.serveAndOpen;
 pub const RebuildFn = watch.RebuildFn;
 pub const WatchConfig = watch.WatchConfig;
-pub const watchIgnorePath = tree.watchIgnorePath;
+pub const watchIgnorePath = watch.watchIgnorePath;
 
 // Reference every module so its tests run: a file reached only lazily
 // (or not at all from here) would silently drop out of `zig build test`.
 test {
-    _ = cancel;
     _ = server;
     _ = http;
     _ = watch;
-    _ = baseline;
-    _ = tree;
     _ = testing;
 }

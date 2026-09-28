@@ -334,7 +334,12 @@ pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectCo
 /// this exact provider, and a remote provider to carry an integrity pin.
 /// Returns the lock's real path for the wire context.
 pub fn requirePinned(a: std.mem.Allocator, root: []const u8, provider: Provider) ![]const u8 {
-    const lock_path = try std.fs.path.join(a, &.{ root, "labelle.lock" });
+    return requirePinnedAt(a, try std.fs.path.join(a, &.{ root, "labelle.lock" }), provider);
+}
+
+/// `requirePinned` against the lock at `lock_path` (a watched rebuild's
+/// staged lock). Returns its canonical path.
+pub fn requirePinnedAt(a: std.mem.Allocator, lock_path: []const u8, provider: Provider) ![]const u8 {
     const lock_bytes = read(a, lock_path) catch |err| {
         std.debug.print("labelle: provider execution requires the project's labelle.lock: {s}\n", .{@errorName(err)});
         return error.MissingProjectLock;
@@ -600,7 +605,11 @@ pub fn wireContext(provider: Provider, host: Host, root: []const u8, run: ToolRu
         break :blk null;
     } else null;
     const run_context = contract.carriesRunContext(wire);
-    const run_options = if (run.run_options) |options| blk: {
+    const run_options = if (run.run_options) |given_options| blk: {
+        var options = given_options;
+        // `run.watch` is a `1.3.0` key: an older wire never carries it
+        // (`labelle run --watch` refuses such a replacement before any build).
+        if (!contract.carriesWatchContext(wire)) options.watch = null;
         if (run_context) break :blk options;
         if (options.given()) std.debug.print("labelle: note: run options not passed to '{s}/{s}' (provider contract {s} < {s})\n", .{
             provider.meta.name, run.invocation.id, wire, contract.run_context_since,

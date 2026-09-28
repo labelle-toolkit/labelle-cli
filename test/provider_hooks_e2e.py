@@ -433,10 +433,11 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     text = result.stderr
     assert text.index("hook 'fixture-b/b-run-pre'") < text.index("labelle: running...") < text.index("hook 'fixture-a/a-run-post'"), text
     assert "after-run hooks skipped" not in text, text
-    # A run with no options: every run-step hook still carries `run`, empty.
+    # A run with no options: every run-step hook still carries `run`, empty
+    # (on wire 1.3.0 with `watch: null` outside a watch session).
     for e in entries:
         if e["invocation"]["step"] == "run":
-            assert e["context"]["run"] == {"env": [], "args": [], "timeout_ms": None}, e
+            assert e["context"]["run"] == {"env": [], "args": [], "timeout_ms": None, "watch": None}, e
             assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
 
     # ── run: the --timeout kill is not a clean exit ───────────────────────
@@ -739,7 +740,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     ctx = probe_context(probe_out, "deploy")
     assert ctx["contract_version"] == "1.3.0", ctx
-    assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000}, ctx
+    assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000, "watch": None}, ctx
     assert Path(ctx["target_dir"]) == probe_dir.resolve() and Path(ctx["output_dir"]) == probe_out.resolve(), ctx
     assert "run options not passed" not in replaced.stderr, replaced.stderr
     # The same command's generate and build replacements: the target dir,

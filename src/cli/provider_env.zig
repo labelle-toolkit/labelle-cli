@@ -131,6 +131,36 @@ pub const Accumulator = struct {
         self.reset();
     }
 
+    /// Whether two accumulators make the same environment: the same
+    /// variables with the same values, and the same PATH entries, in order
+    /// (names folded on Windows). Which hook contributed is not compared.
+    pub fn sameAs(self: *const Accumulator, other: *const Accumulator) bool {
+        if (self.vars.items.len != other.vars.items.len or self.path.items.len != other.path.items.len) return false;
+        for (self.vars.items, other.vars.items) |x, y| {
+            if (!eqlName(x.name, y.name, self.windows) or !std.mem.eql(u8, x.value, y.value)) return false;
+        }
+        for (self.path.items, other.path.items) |x, y| {
+            if (!eqlPath(x, y, self.windows)) return false;
+        }
+        return true;
+    }
+
+    /// A deep copy on its own arena (from `backing`): a second owner — a
+    /// watch session's rebuild thread — may reset or free either copy
+    /// without touching the other's storage.
+    pub fn clone(self: *const Accumulator, backing: std.mem.Allocator) !Accumulator {
+        var copy: Accumulator = .{ .windows = self.windows };
+        if (self.isEmpty()) return copy;
+        copy.arena = std.heap.ArenaAllocator.init(backing);
+        errdefer copy.deinit();
+        const a = copy.arena.?.allocator();
+        for (self.vars.items) |entry| {
+            try copy.vars.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try a.dupe(u8, entry.value), .hook = try a.dupe(u8, entry.hook) });
+        }
+        for (self.path.items) |dir| try copy.path.append(a, try a.dupe(u8, dir));
+        return copy;
+    }
+
     /// Merge `hook`'s file after every earlier hook's. A name another hook
     /// already set to a different value is a conflict naming both hooks
     /// (`diag`, allocated with `diag_a`); the same value is accepted. PATH
@@ -406,4 +436,46 @@ test "provider env: a missing file is no contribution" {
     const bytes = (try readFile(std.testing.allocator, path, max_file_bytes)).?;
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("{}", bytes);
+}
+
+test "provider env: a clone owns its storage; freeing or replacing either leaves the other intact" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var original: Accumulator = .{};
+    try original.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "PROBE_TOOLCHAIN", .value = "one" }}, .path_prepend = &.{"/abs/bin"} }, &diag);
+    var copy = try original.clone(a);
+    // The rebuild's side frees its copy and builds a new one: the session's
+    // original still reads its values.
+    copy.deinit();
+    copy = try original.clone(a);
+    try copy.add(a, a, "pkg/other", .{ .set = &.{.{ .name = "EXTRA", .value = "x" }} }, &diag);
+    try std.testing.expectEqual(@as(usize, 1), original.vars.items.len);
+    try std.testing.expectEqualStrings("one", original.vars.items[0].value);
+    try std.testing.expectEqualStrings("/abs/bin", original.path.items[0]);
+    try std.testing.expect(original.vars.items[0].value.ptr != copy.vars.items[0].value.ptr);
+    original.deinit();
+    try std.testing.expectEqualStrings("one", copy.vars.items[0].value);
+    copy.deinit();
+    // An empty accumulator clones without an arena.
+    const empty = try (Accumulator{}).clone(a);
+    try std.testing.expect(empty.arena == null);
+}
+
+test "provider env: sameAs compares the resulting environment, not who contributed it" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var x: Accumulator = .{};
+    defer x.deinit();
+    var y: Accumulator = .{};
+    defer y.deinit();
+    try std.testing.expect(x.sameAs(&y));
+    try x.add(a, a, "pkg/a", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/one" }} }, &diag);
+    try y.add(a, a, "pkg/b", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/one" }} }, &diag);
+    try std.testing.expect(x.sameAs(&y));
+    var z: Accumulator = .{};
+    defer z.deinit();
+    try z.add(a, a, "pkg/a", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/two" }} }, &diag);
+    try std.testing.expect(!x.sameAs(&z));
+    try y.add(a, a, "pkg/b", .{ .path_prepend = &.{"/abs/bin"} }, &diag);
+    try std.testing.expect(!x.sameAs(&y));
 }

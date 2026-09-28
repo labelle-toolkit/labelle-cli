@@ -384,8 +384,8 @@ test "computeSignature: skips .labelle build-output dir (no self-trigger)" {
     computeSignature(io, alloc, dir_path, &.{}, &before);
 
     // Simulate a rebuild writing into .labelle/ — the signature must not move.
-    try tmp.dir.createDirPath(io, ".labelle/raylib_wasm");
-    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/raylib_wasm/out.wasm", .data = "artifact" });
+    try tmp.dir.createDirPath(io, ".labelle/probe_probe-target");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/probe_probe-target/out.bin", .data = "artifact" });
     var after = TreeSignature{};
     computeSignature(io, alloc, dir_path, &.{}, &after);
     try std.testing.expect(before.eql(after));

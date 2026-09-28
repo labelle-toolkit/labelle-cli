@@ -22,6 +22,11 @@ pub const Hook = struct {
     build_step: []const u8,
     executable: []const u8,
     after_hooks: []const []const u8 = &.{},
+    /// The replacement stays alive through a watch session and consumes
+    /// `run.watch` (contract §2, wire `1.3.0`+): `labelle run --watch`
+    /// refuses any replacement without it. Only a `run` `replace` hook may
+    /// declare it.
+    watch: bool = false,
 };
 /// A default the target's owner declares for it (contract §1
 /// `.target_defaults`). Applied only when the user gave no explicit flag.
@@ -100,6 +105,9 @@ pub const Manifest = struct {
             // Contract §6: a replacement belongs only to the target owner.
             // Core owns `desktop`, so no package can ever replace it.
             if (hook.when == .replace and !self.ownsTarget(hook.target)) return error.ReplaceRequiresOwnedTarget;
+            // Watch support is a property of the long-lived launch that
+            // stands in for `run`; on any other hook it could never apply.
+            if (hook.watch and (hook.step != .run or hook.when != .replace)) return error.WatchRequiresRunReplace;
             for (hook.after_hooks) |ref| {
                 const parts = splitHookRef(ref) orelse return error.InvalidHookReference;
                 if (std.mem.eql(u8, parts.package, self.name) and std.mem.eql(u8, parts.id, hook.id))
@@ -362,4 +370,31 @@ test "provider manifest: target defaults belong to the target's owner, once per 
     // Strict records: an unknown field or mode is a parse error.
     try std.testing.expectError(error.ParseZon, parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"probe-target\", .optimize = .ReleaseSafe, .typo = 1 }" })));
     try std.testing.expectError(error.ParseZon, parse(a, try std.fmt.allocPrint(a, base, .{ "\"probe-target\"", ".{ .target = \"probe-target\", .optimize = .Fastest }" })));
+}
+
+test "provider manifest: .watch is declared only on a run replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const hook = ".{ .id = \"serve\", .step = .{step}, .target = \"probe-target\", .when = .{when}, .build_step = \"tool\", .executable = \"bin/tool\"{watch} }";
+    const Fill = struct {
+        fn f(al: std.mem.Allocator, template: []const u8, step: []const u8, when: []const u8, watch: []const u8) ![]const u8 {
+            const one = try std.mem.replaceOwned(u8, al, template, "{step}", step);
+            const two = try std.mem.replaceOwned(u8, al, one, "{when}", when);
+            return std.mem.replaceOwned(u8, al, two, "{watch}", watch);
+        }
+    };
+    // Absent: false; declared on a run replacement: true.
+    const plain = try parse(a, try hookManifest(a, "\"probe-target\"", try Fill.f(a, hook, "run", "replace", "")));
+    try std.testing.expect(!plain.hooks[0].watch);
+    const watching = try parse(a, try hookManifest(a, "\"probe-target\"", try Fill.f(a, hook, "run", "replace", ", .watch = true")));
+    try std.testing.expect(watching.hooks[0].watch);
+    // `false` is allowed anywhere; `true` on anything else is refused.
+    _ = try parse(a, try hookManifest(a, "\"probe-target\"", try Fill.f(a, hook, "build", "after", ", .watch = false")));
+    for ([_][2][]const u8{ .{ "run", "before" }, .{ "run", "after" }, .{ "build", "replace" }, .{ "generate", "before" }, .{ "bundle", "replace" } }) |slot| {
+        const bad = try Fill.f(a, hook, slot[0], slot[1], ", .watch = true");
+        try std.testing.expectError(error.WatchRequiresRunReplace, parse(a, try hookManifest(a, "\"probe-target\"", bad)));
+    }
+    // Strict: a non-bool is a parse error.
+    try std.testing.expectError(error.ParseZon, parse(a, try hookManifest(a, "\"probe-target\"", try Fill.f(a, hook, "run", "replace", ", .watch = 1"))));
 }

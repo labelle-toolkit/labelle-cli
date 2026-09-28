@@ -79,72 +79,11 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
             break :core_generate;
         }
 
-        // ASTC build-time conversion (#340): when this platform ships ASTC atlases
-        // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
-        // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
-        // before the assembler's `generate` (it only needs project.labelle + the
-        // PNGs + astcenc). Non-fatal — on any failure the assembler finds no
-        // sibling and falls back to the source PNG, so the build still succeeds.
-        //
-        // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
-        // compile to one `.astc` with disagreeing block pins; falling back would
-        // hand BOTH of them whatever `.astc` is on disk — including a STALE one
-        // from an earlier build, which is worse than no atlas because it looks
-        // like it worked. So a config error stops the build, while a conversion
-        // failure still degrades to PNG.
-        //
-        // Only for a target the asset_compression schema knows (`target.legacy`:
-        // `desktop` or a schema-named provider target). A provider target
-        // outside the enum has `parsed.platform` derived as `.desktop` for the
-        // legacy sites, but it is NOT the desktop target: running the desktop
-        // prepass for it would use the wrong compression setting (Codex on
-        // #421). Its provider owns its asset pipeline; standalone `cmdAstc`
-        // can read capabilities for any declared target name.
-        if (target.legacy != null and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-            // Pass the RESOLVED target: `--platform=wasm` and `labelle ios`
-            // (forces sokol) differ from what
-            // project.labelle declares, and the loadable blocks depend on both.
-            astc_cmd.cmdAstc(allocator, &.{
-                project_dir,
-                "--platform",
-                @tagName(parsed.platform),
-                "--backend",
-                @tagName(parsed.backend),
-            }) catch |err| switch (err) {
-                error.InvalidTextureCapabilities => progress.fatalExit(
-                    1,
-                    "cannot resolve backend texture capabilities — see the error above",
-                ),
-                error.ConflictingAstcBlocks => progress.fatalExit(
-                    1,
-                    "conflicting .astc_block pins compile to one .astc — see the error above",
-                ),
-                // A stale `.astc` (wrong block for this target) that could not be
-                // deleted would be swapped in by the assembler — the PNG fallback
-                // below would be a lie. Stop instead (labelle-bgfx#134).
-                error.StaleAstcSiblingUndeletable => progress.fatalExit(
-                    1,
-                    "a stale .astc sibling could not be deleted — see the error above",
-                ),
-                else => std.debug.print(
-                    "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
-                    .{@errorName(err)},
-                ),
-            };
-        }
-
-        // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
-        // @embedFile path picks up the fresh `.rgba` files. Skipped unless
-        // `--bake` is passed: raw RGBA expands heavily-transparent atlases
-        // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
-        // packaged sizes sane. Use for projects whose atlases are nearly opaque
-        // and PNG decode dominates cold start.
-        if (parsed_args.bake) {
-            bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
-                std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
-                return err;
-            };
-        }
+        try corePrepasses(allocator, project_dir, parsed, .{
+            .legacy_target = target.legacy != null,
+            .bake = parsed_args.bake,
+            .fatal = true,
+        });
 
         // The assembler receives the resolved target NAME; the #378 gate above
         // guarantees it is one the pinned assembler can take.
@@ -222,6 +161,92 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         if (code != 0) return code;
     }
     return null;
+}
+
+/// How the core generation's pre-passes run (`corePrepasses`).
+pub const Prepass = struct {
+    /// The target is one the `asset_compression` schema knows.
+    legacy_target: bool,
+    /// `--bake`.
+    bake: bool,
+    /// A misconfiguration ends the command (the cold pipeline) rather than
+    /// failing with an error (a watched rebuild, which must keep the
+    /// session alive).
+    fatal: bool,
+};
+
+/// The generation-input pre-passes the core generation runs before the
+/// assembler: the ASTC conversion and the `--bake` pre-bake. The cold
+/// pipeline and every watched rebuild run this same function, so an edited
+/// source PNG reaches a rebuild's `.astc`/`.rgba` siblings exactly as it
+/// reaches a cold build's.
+pub fn corePrepasses(allocator: std.mem.Allocator, project_dir: []const u8, parsed: @import("../project_config.zig").ProjectConfig, opts: Prepass) anyerror!void {
+    // ASTC build-time conversion (#340): when this platform ships ASTC atlases
+    // (`asset_compression`), run `labelle astc` first so the `<name>.astc`
+    // siblings exist for the assembler's catalog `.png → .astc` swap. Runs
+    // before the assembler's `generate` (it only needs project.labelle + the
+    // PNGs + astcenc). Non-fatal — on any failure the assembler finds no
+    // sibling and falls back to the source PNG, so the build still succeeds.
+    //
+    // EXCEPT a misconfiguration. `ConflictingAstcBlocks` means two atlases
+    // compile to one `.astc` with disagreeing block pins; falling back would
+    // hand BOTH of them whatever `.astc` is on disk — including a STALE one
+    // from an earlier build, which is worse than no atlas because it looks
+    // like it worked. So a config error stops the build, while a conversion
+    // failure still degrades to PNG.
+    //
+    // Only for a target the asset_compression schema knows (`target.legacy`:
+    // `desktop` or a schema-named provider target). A provider target
+    // outside the enum has `parsed.platform` derived as `.desktop` for the
+    // legacy sites, but it is NOT the desktop target: running the desktop
+    // prepass for it would use the wrong compression setting (Codex on
+    // #421). Its provider owns its asset pipeline; standalone `cmdAstc`
+    // can read capabilities for any declared target name.
+    if (opts.legacy_target and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
+        // Pass the RESOLVED target: `--platform=wasm` and `labelle ios`
+        // (forces sokol) differ from what
+        // project.labelle declares, and the loadable blocks depend on both.
+        astc_cmd.cmdAstc(allocator, &.{
+            project_dir,
+            "--platform",
+            @tagName(parsed.platform),
+            "--backend",
+            @tagName(parsed.backend),
+        }) catch |err| switch (err) {
+            error.InvalidTextureCapabilities => {
+                if (!opts.fatal) return err;
+                progress.fatalExit(1, "cannot resolve backend texture capabilities — see the error above");
+            },
+            error.ConflictingAstcBlocks => {
+                if (!opts.fatal) return err;
+                progress.fatalExit(1, "conflicting .astc_block pins compile to one .astc — see the error above");
+            },
+            // A stale `.astc` (wrong block for this target) that could not be
+            // deleted would be swapped in by the assembler — the PNG fallback
+            // below would be a lie. Stop instead (labelle-bgfx#134).
+            error.StaleAstcSiblingUndeletable => {
+                if (!opts.fatal) return err;
+                progress.fatalExit(1, "a stale .astc sibling could not be deleted — see the error above");
+            },
+            else => std.debug.print(
+                "labelle: ASTC conversion failed ({s}); falling back to PNG atlases\n",
+                .{@errorName(err)},
+            ),
+        };
+    }
+
+    // Opt-in PNG → LRGBA pre-bake. Runs before the assembler so its
+    // @embedFile path picks up the fresh `.rgba` files. Skipped unless
+    // `--bake` is passed: raw RGBA expands heavily-transparent atlases
+    // by 100×+ (a 200 KB PNG can become 64 MB), so default-off keeps
+    // packaged sizes sane. Use for projects whose atlases are nearly opaque
+    // and PNG decode dominates cold start.
+    if (opts.bake) {
+        bake_mod.run(allocator, project_dir, parsed.resources) catch |err| {
+            std.debug.print("labelle: bake failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+    }
 }
 
 /// The cold pipeline's `before generate` phase, then the shader-compiler

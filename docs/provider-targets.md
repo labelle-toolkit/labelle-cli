@@ -223,6 +223,13 @@ a platform leaves it when its launch moves into a provider (`android` left
 with cli#405). The replacement receives the run options as `run.env`
 (contract 1.2.0, [provider hooks](provider-hooks.md)).
 
+`labelle run --watch` (CLI 2.1.0+) needs the target's run replacement to
+declare `.watch = true` and its provider to speak wire `1.3.0` or newer; it
+is refused, before any build, for a target without one — the core `desktop`
+target and every native target included — naming the package and what is
+missing. See the contract's
+[watch sessions](provider-contract-v1.md#watch-sessions).
+
 ## Optimize defaults
 
 The owner of a target may declare the optimize mode its builds default to,
@@ -243,7 +250,9 @@ owner's default, else the core's own fallback for the target (the legacy
 ReleaseSafe for a `wasm` build, until that policy moves into its provider),
 else none. The core `zig build` gets it as `-Doptimize=<mode>`, every hook
 receives it as the wire `optimize`, and a watched rebuild's replan
-recomputes it from the providers it rediscovers. The core `desktop` target
+recomputes it from the providers it rediscovers (in a `labelle run --watch`
+session a change of the effective mode stops the rebuild with a restart
+diagnostic: the running replacement was started with the old one). The core `desktop` target
 has no owner, so no provider can change its default. See the contract's
 [target defaults](provider-contract-v1.md#target-defaults).
 

@@ -339,18 +339,23 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   core steps exactly as the cold pipeline did (the feed is already terminal,
   so the hooks' sub-step records are not emitted there); a failing hook stops
   that rebuild and keeps the server alive, like a failing core step. Every
-  rebuild first — before its prebuild steps — re-reads `project.labelle`,
-  re-runs the package install and rewrites `labelle.lock` when that file
-  changed, rediscovers the providers (with the cache `.populated`, as the
-  cold pipeline did), re-checks that the served target still has a pinned
-  owner and replans both phases,
+  rebuild first — before its prebuild steps — re-reads `project.labelle` and
+  stages the `.prebuild` steps it declares (so an edited step runs in that
+  very rebuild, and the watch ignore set is swapped with it, cli#463); after
+  the steps it re-runs the package install and rewrites `labelle.lock` when
+  that file changed, rediscovers the providers (with the cache `.populated`,
+  as the cold pipeline did), re-checks that the served target still has a
+  pinned owner and replans both phases,
   so a watched edit to the project, to a provider manifest or to a
   `provider_config` file reaches the next rebuild — the plans computed at
-  startup are only the initial state, never reused for a rebuild. A replan
-  that fails (a manifest saved mid-edit, say) stops that rebuild before any
-  hook or core step and leaves the last good plans installed. Each hook
-  phase allocates on a scratch arena freed when the phase returns, and each
-  replan lives on its own arena released once the next one is installed —
+  startup are only the initial state, never reused for a rebuild. A rebuild
+  is a transaction (cli#469): what its replan changes — providers, config,
+  prebuild steps, plans, optimize mode, lock and environment — is committed
+  only when the whole rebuild succeeds; a replan that fails (a manifest saved
+  mid-edit, say), a failing hook or a failing compile restores all of it,
+  and the shutdown `after run` hooks are the committed generation's. Each
+  hook phase allocates on a scratch arena freed when the phase returns, and
+  each replan lives on its own arena released once the next one commits —
   only the resolved host compiler outlives them — so a long watch session
   with hooks does not grow on every saved edit. The replan's storage is
   kept until the shutdown `after run` hooks have run. A hook that writes
@@ -368,6 +373,26 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   runs there, so discovery is the metadata-only kind that `labelle help`
   uses: a declared remote package absent from every cache is not listed
   rather than reported as a failed install.
+
+## Watch sessions (`labelle run --watch`)
+
+A `replace run` hook may declare `.watch = true` (CLI 2.1.0+; only on a `run`
+replacement). With it, and a provider that negotiates wire `1.3.0` or newer,
+`labelle run --watch` keeps the replacement running after the cold build
+while the CLI watches the project and rebuilds on every change, through the
+same generate and build hook phases as the cold pipeline. The replacement's
+context carries `run.watch` (`generation_file`, `output_dir`); every other
+`run` hook gets `run.watch: null`. A rebuild publishes only after its
+`after build` hooks succeeded; a failed rebuild publishes nothing; a change
+the running replacement depends on (its provider, version or pin, the hook,
+the negotiated wire, the capability, the `before run` hooks, the backend, the
+target, the output location, the effective optimize mode, its settings, the
+Zig version) stops the rebuild with a restart diagnostic.
+When the replacement exits the CLI cancels any in-flight hook or compile and
+reaps it, then runs the committed generation's `after run` hooks, only after
+a clean status-0 exit. A target without such a replacement — `desktop`
+included — is refused before any build. The full rules are in the contract:
+[watch sessions](provider-contract-v1.md#watch-sessions).
 
 ## Verification
 
@@ -446,7 +471,9 @@ provider declares a run replacement, both legacy verbs are refused before
 generation or hooks (also with `--no-build`). Known declarations are checked
 before project prebuild commands; post-install discovery checks again for newly
 available providers. Watched manifest edits are checked before prebuild and
-before replacing the active plans, keeping the last good plans on refusal. This prevents export from starting
+before replacing the active plans, keeping the last good plans on refusal
+(legacy `wasm serve --watch` shares the generic rebuild engine of
+`labelle run --watch`, minus its run replacement). This prevents export from starting
 a server and prevents serve flags from being silently discarded. Use the
 provider's namespaced commands shown by `labelle help`, or the generic
 `labelle run/bundle --platform=wasm` pipeline. Existing before/after hooks around
