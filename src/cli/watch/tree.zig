@@ -232,8 +232,11 @@ pub fn computeSignature(
 
 /// `computeSignature` over `dir_path` AND every tree in `extra_roots` (the
 /// sources of local providers outside the project, cli#474), walked with
-/// the same skip rules into one signature. Paths are absolute or rooted at
-/// their own tree, so two roots never fold the same path.
+/// the same skip rules into one signature. An extra root that contains the
+/// project (a `local:../..` provider) is walked WITHOUT the project, which
+/// `dir_path`'s own walk covers, so no file is folded twice (the XOR
+/// digest would cancel it out). The roots themselves never nest
+/// (`localProviderRoots` collapses them).
 pub fn computeSignatureRoots(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -243,8 +246,7 @@ pub fn computeSignatureRoots(
     sig: *TreeSignature,
 ) void {
     var snap: TreeSnapshot = .{ .sig = sig.* };
-    walkTree(io, allocator, dir_path, ignore_files, &snap, false);
-    for (extra_roots) |root| walkTree(io, allocator, root, ignore_files, &snap, false);
+    walkRoots(io, allocator, dir_path, extra_roots, ignore_files, &snap, false);
     sig.* = snap.sig;
 }
 
@@ -258,10 +260,42 @@ pub fn snapshotTree(
     ignore_files: []const []const u8,
 ) TreeSnapshot {
     var snap: TreeSnapshot = .{};
-    walkTree(io, allocator, dir_path, ignore_files, &snap, true);
-    for (extra_roots) |root| walkTree(io, allocator, root, ignore_files, &snap, true);
+    walkRoots(io, allocator, dir_path, extra_roots, ignore_files, &snap, true);
     snap.sort();
     return snap;
+}
+
+fn walkRoots(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    extra_roots: []const []const u8,
+    ignore_files: []const []const u8,
+    snap: *TreeSnapshot,
+    per_path: bool,
+) void {
+    walkTree(io, allocator, dir_path, ignore_files, "", snap, per_path);
+    if (extra_roots.len == 0) return;
+    // The extra roots are canonical paths: compare the project's too.
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.cwd().realPathFile(io, dir_path, &buf) catch 0;
+    const project = buf[0..n];
+    for (extra_roots) |root| walkTree(io, allocator, root, ignore_files, project, snap, per_path);
+}
+
+/// True when the walk from `outer` reaches the directory `inner` beneath
+/// it: no directory on the way (`inner` included) is one the walk skips
+/// (`skipWatchDir`) or a nested checkout. Both canonical.
+pub fn reaches(io: std.Io, allocator: std.mem.Allocator, outer: []const u8, inner: []const u8) bool {
+    const t = std.mem.trimEnd(u8, outer, "/\\");
+    if (inner.len <= t.len + 1) return inner.len == t.len;
+    var it = std.mem.tokenizeAny(u8, inner[t.len + 1 ..], "/\\");
+    while (it.next()) |name| {
+        if (skipWatchDir(name)) return false;
+        const prefix = inner[0 .. t.len + 1 + it.index];
+        if (isNestedCheckout(io, allocator, prefix)) return false;
+    }
+    return true;
 }
 
 fn walkTree(
@@ -269,6 +303,9 @@ fn walkTree(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     ignore_files: []const []const u8,
+    /// A directory not entered (the project, inside a provider around it);
+    /// "" for none.
+    exclude: []const u8,
     snap: *TreeSnapshot,
     per_path: bool,
 ) void {
@@ -282,8 +319,9 @@ fn walkTree(
             if (skipWatchDir(entry.name)) continue;
             const sub = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(sub);
+            if (exclude.len != 0 and std.mem.eql(u8, sub, exclude)) continue;
             if (isNestedCheckout(io, allocator, sub)) continue;
-            walkTree(io, allocator, sub, ignore_files, snap, per_path);
+            walkTree(io, allocator, sub, ignore_files, exclude, snap, per_path);
         } else if (kind == .file) {
             const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
             defer allocator.free(fpath);

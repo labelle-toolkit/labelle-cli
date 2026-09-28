@@ -369,3 +369,157 @@ test "rebuild commit: the local providers outside the project are watched with i
     watch.computeSignatureRoots(io, a, fx.project, ctx.ignore.roots, ctx.ignore.files, &after);
     try std.testing.expect(!before.eql(after));
 }
+
+/// A scripted watch loop over `project` + `roots`: `edit` is written at
+/// tick 2; returns how many rebuilds fired in 10 ticks.
+fn rebuildsAfterEdit(project: []const u8, roots: []const []const u8, edit: []const u8) !u32 {
+    const Script = struct {
+        path: []const u8,
+        ticks: u32 = 0,
+        rebuilds: u32 = 0,
+        fn wait(ctx: *anyopaque, _: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ticks += 1;
+            if (self.ticks == 2) std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = self.path, .data = "edited in place" }) catch unreachable;
+            return self.ticks <= 10;
+        }
+        fn rebuild(ctx: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rebuilds += 1;
+            return true;
+        }
+    };
+    var script: Script = .{ .path = edit };
+    var state: watch.WatchState = .{};
+    watch.watchLoop(config.globalIo(), .{ .watch_dir = project, .extra_roots = roots, .rebuild_fn = Script.rebuild, .rebuild_ctx = &script, .clock = .{ .ctx = &script, .wait = Script.wait } }, &state);
+    return script.rebuilds;
+}
+
+fn freeRoots(a: std.mem.Allocator, roots: *std.ArrayList([]const u8)) void {
+    for (roots.items) |r| a.free(r);
+    roots.deinit(a);
+}
+
+test "rebuild commit: nested local providers are walked once, so an inner edit rebuilds (cli#474)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "outer/inner/src");
+    try tmp.dir.createDirPath(io, "outer/checkout");
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/game.zig", .data = "g" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outer/plugin.labelle", .data = ".{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outer/inner/plugin.labelle", .data = ".{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outer/inner/src/tool.zig", .data = "v1" });
+    // A provider that is its own checkout: the outer walk skips it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "outer/checkout/plugin.labelle", .data = ".{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outer/checkout/.git", .data = "gitdir: /elsewhere\n" });
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    const outer = try tmp.dir.realPathFileAlloc(io, "outer", a);
+    defer a.free(outer);
+    const checkout = try tmp.dir.realPathFileAlloc(io, "outer/checkout", a);
+    defer a.free(checkout);
+    const deps = [_]project_config.PluginDep{
+        .{ .name = "inner", .repo = "local:../outer/inner", .version = "1.0.0" },
+        .{ .name = "outer", .repo = "local:../outer", .version = "1.0.0" },
+        .{ .name = "checkout", .repo = "local:../outer/checkout", .version = "1.0.0" },
+    };
+    var roots = rebuild.localProviderRoots(a, project, &deps);
+    defer freeRoots(a, &roots);
+    // The inner provider is covered by the outer root; the checkout is not.
+    try std.testing.expectEqual(@as(usize, 2), roots.items.len);
+    try std.testing.expectEqualStrings(outer, roots.items[0]);
+    try std.testing.expectEqualStrings(checkout, roots.items[1]);
+    // An edit in the inner provider fires one rebuild. Walked twice (once
+    // per root), its XOR contributions cancelled out and nothing fired.
+    const edit = try std.fs.path.join(a, &.{ outer, "inner", "src", "tool.zig" });
+    defer a.free(edit);
+    try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEdit(project, roots.items, edit));
+    const inner = try tmp.dir.realPathFileAlloc(io, "outer/inner", a);
+    defer a.free(inner);
+    const doubled = [_][]const u8{ outer, inner };
+    try std.testing.expectEqual(@as(u32, 0), try rebuildsAfterEdit(project, &doubled, edit));
+}
+
+test "rebuild commit: a local provider containing the project is watched without the project (cli#474)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A monorepo whose root is a provider; the game lives inside it.
+    try tmp.dir.createDirPath(io, "mono/tools");
+    try tmp.dir.createDirPath(io, "mono/games/game/.labelle");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/plugin.labelle", .data = ".{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/tools/tool.zig", .data = "v1" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono/games/game/game.zig", .data = "g" });
+    const mono = try tmp.dir.realPathFileAlloc(io, "mono", a);
+    defer a.free(mono);
+    const project = try tmp.dir.realPathFileAlloc(io, "mono/games/game", a);
+    defer a.free(project);
+    const deps = [_]project_config.PluginDep{.{ .name = "mono", .repo = "local:../..", .version = "1.0.0" }};
+    var roots = rebuild.localProviderRoots(a, project, &deps);
+    defer freeRoots(a, &roots);
+    // Kept, not dropped.
+    try std.testing.expectEqual(@as(usize, 1), roots.items.len);
+    try std.testing.expectEqualStrings(mono, roots.items[0]);
+    // An edit to the provider around the project rebuilds...
+    const tool = try std.fs.path.join(a, &.{ mono, "tools", "tool.zig" });
+    defer a.free(tool);
+    try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEdit(project, roots.items, tool));
+    // ...a project edit still does (the project is walked once, by its own
+    // walk: folded twice, it would cancel out)...
+    const game = try std.fs.path.join(a, &.{ project, "game.zig" });
+    defer a.free(game);
+    try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEdit(project, roots.items, game));
+    // ...and the build output under the project's `.labelle/` does not.
+    const out = try std.fs.path.join(a, &.{ project, ".labelle", "out.bin" });
+    defer a.free(out);
+    try std.testing.expectEqual(@as(u32, 0), try rebuildsAfterEdit(project, roots.items, out));
+}
+
+test "rebuild commit: a rollback restores an absent labelle.lock as absent (cli#474)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    // The project had no lock before this rebuild.
+    try fx.tmp.dir.deleteFile(io, "project/labelle.lock");
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    var published: Published = undefined;
+    try published.init(&fx);
+    defer published.deinit(a);
+    ctx.publish = published.seam();
+    const Spy = struct {
+        var project: []const u8 = "";
+        var lock_existed = false;
+        fn write(_: *watch.Publisher, _: u64) anyerror!void {
+            const lock = try std.fs.path.join(std.testing.allocator, &.{ project, "labelle.lock" });
+            defer std.testing.allocator.free(lock);
+            lock_existed = if (std.Io.Dir.cwd().access(config.globalIo(), lock, .{})) |_| true else |_| false;
+            return error.SharingViolation;
+        }
+    };
+    Spy.project = fx.project;
+    published.publisher.write_generation = Spy.write;
+    try fx.write(.{ .version = "7.7.7" });
+    try std.testing.expectError(error.PublishFailed, ctx.rebuildStaged());
+    // The lock was committed at the commit point, then rolled back to none.
+    try std.testing.expect(Spy.lock_existed);
+    try std.testing.expectError(error.FileNotFound, fx.tmp.dir.access(io, "project/labelle.lock", .{}));
+    try published.expectServes(a, "zero", 0);
+}

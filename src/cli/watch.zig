@@ -20,7 +20,7 @@ pub const loop = @import("watch/loop.zig");
 pub const publish = @import("watch/publish.zig");
 pub const session_lock = @import("watch/session_lock.zig");
 const baseline = @import("watch/baseline.zig");
-const tree = @import("watch/tree.zig");
+pub const tree = @import("watch/tree.zig");
 const testing = @import("watch/testing.zig");
 
 pub const installCancelHandler = cancel.installCancelHandler;

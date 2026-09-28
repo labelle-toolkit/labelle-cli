@@ -531,37 +531,55 @@ pub fn watchIgnorePaths(allocator: std.mem.Allocator, project_dir: []const u8, s
 }
 
 /// The source trees of the project's LOCAL providers (a `local:` or `@`
-/// package with a `plugin.labelle`) that lie outside `project_dir`, as
-/// canonical paths: the watch session watches them too, so an edit to a
-/// provider's hooks or tools rebuilds (cli#474). A provider inside the
-/// project is already walked with it; one whose directory contains the
-/// project is not added (it would walk the project twice). Best effort: a
-/// package that cannot be resolved is not watched. Caller owns the list.
+/// package with a `plugin.labelle`) that the project's own walk does not
+/// cover, as canonical paths: the watch session watches them too, so an
+/// edit to a provider's hooks or tools rebuilds (cli#474).
+///
+/// Collapsed so each file is walked exactly once — the watch signature
+/// XOR-folds every file, and a file folded twice cancels out, hiding its
+/// edits: a provider the project's walk reaches (inside the project, not
+/// under a skipped directory or a nested checkout) is dropped, and so is a
+/// provider another kept root's walk reaches. A provider that CONTAINS the
+/// project (`local:../..`) is kept; its walk skips the project
+/// (`computeSignatureRoots`). Best effort: a package that cannot be
+/// resolved is not watched. Caller owns the list.
 pub fn localProviderRoots(allocator: std.mem.Allocator, project_dir: []const u8, deps: []const project_config.PluginDep) std.ArrayList([]const u8) {
     const io = config.globalIo();
     var out: std.ArrayList([]const u8) = .empty;
     const project_real = std.Io.Dir.cwd().realPathFileAlloc(io, project_dir, allocator) catch return out;
     defer allocator.free(project_real);
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer candidates.deinit(allocator);
+    defer for (candidates.items) |c| allocator.free(c);
     for (deps) |dep| {
         if (!dep.isLocal()) continue;
         const declared = plugins.resolvePluginDir(allocator, project_dir, dep) catch continue;
         defer allocator.free(declared);
         const dir_z = std.Io.Dir.cwd().realPathFileAlloc(io, declared, allocator) catch continue;
         defer allocator.free(dir_z);
+        const manifest = std.fs.path.join(allocator, &.{ dir_z, "plugin.labelle" }) catch continue;
+        defer allocator.free(manifest);
+        std.Io.Dir.cwd().access(io, manifest, .{}) catch continue;
         const dir = allocator.dupe(u8, dir_z) catch continue;
-        const keep = blk: {
-            const manifest = std.fs.path.join(allocator, &.{ dir, "plugin.labelle" }) catch break :blk false;
-            defer allocator.free(manifest);
-            std.Io.Dir.cwd().access(io, manifest, .{}) catch break :blk false;
-            if (watch.publish.within(project_real, dir) or watch.publish.within(dir, project_real)) break :blk false;
-            for (out.items) |seen| if (std.mem.eql(u8, seen, dir)) break :blk false;
-            break :blk true;
-        };
-        if (!keep) {
-            allocator.free(dir);
-            continue;
+        candidates.append(allocator, dir) catch allocator.free(dir);
+    }
+    // Outermost first, so a nested provider meets the root that covers it.
+    std.mem.sort([]const u8, candidates.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return x.len < y.len;
         }
-        out.append(allocator, dir) catch allocator.free(dir);
+    }.lessThan);
+    for (candidates.items) |dir| {
+        const covered = blk: {
+            if (watch.publish.within(project_real, dir) and watch.tree.reaches(io, allocator, project_real, dir)) break :blk true;
+            for (out.items) |kept| {
+                if (watch.publish.within(kept, dir) and watch.tree.reaches(io, allocator, kept, dir)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (covered) continue;
+        const owned = allocator.dupe(u8, dir) catch continue;
+        out.append(allocator, owned) catch allocator.free(owned);
     }
     return out;
 }

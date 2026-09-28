@@ -293,7 +293,11 @@ pub const drain_grace_ms: u64 = 500;
 /// direct child has exited, its tree is ended (a descendant in its process
 /// group or job goes with it, closing the pipes) and the drain gets
 /// `drain_grace_ms` more to collect what is buffered — enough for any
-/// descendant that escaped the tree too — then stops.
+/// descendant that escaped the tree too — then stops. The caller's
+/// `options.timeout` still holds: a child still running when it expires is
+/// killed (with its tree) and `error.Timeout` returned, as `std.process.run`
+/// does; after the child exited, the drain ends at whichever of the grace
+/// and the timeout comes first.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOptions) !std.process.RunResult {
     if (current == null) return std.process.run(gpa, io, options);
     return runDrained(gpa, io, options, drain_grace_ms);
@@ -347,12 +351,25 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
     multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &pipes);
     defer multi_reader.deinit();
     const poll_ms: u64 = 50;
+    // The caller's timeout, as an absolute deadline on our clock.
+    const deadline: ?u64 = if (options.timeout.toDurationFromNow(io)) |d|
+        monotonicMs() +| @as(u64, @intCast(@max(d.raw.toMilliseconds(), 0)))
+    else
+        null;
     var exited_at: ?u64 = null;
     while (true) {
         if (exited_at == null and waited.done.load(.acquire)) exited_at = monotonicMs();
-        const wait_ms: u64 = if (exited_at) |t| blk: {
-            const left = (t +| grace_ms) -| monotonicMs();
-            if (left == 0) break;
+        const now = monotonicMs();
+        var end: ?u64 = deadline;
+        if (exited_at) |t| end = if (end) |e| @min(e, t +| grace_ms) else t +| grace_ms;
+        const wait_ms: u64 = if (end) |e| blk: {
+            const left = e -| now;
+            if (left == 0) {
+                // Past the end: a child still running timed out (the
+                // deferred cleanup kills its tree); an exited one is done.
+                if (exited_at == null) return error.Timeout;
+                break;
+            }
             break :blk @min(left, poll_ms);
         } else poll_ms;
         multi_reader.fill(options.reserve_amount, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(wait_ms)), .clock = .awake } }) catch |err| switch (err) {
@@ -701,4 +718,28 @@ test "supervise: a captured child whose descendant holds its pipes cannot hang t
         }
         try std.testing.expect(waitUntil(Gone{ .pid = grandchild }, 10_000));
     }
+}
+
+test "supervise: the caller's timeout still ends a supervised captured child (cli#474)" {
+    const io = config.globalIo();
+    const a = std.testing.allocator;
+    var group: Group = .{};
+    current = &group;
+    defer current = null;
+    const began = monotonicMs();
+    // A 60 s child under a 100 ms timeout: error.Timeout, the child reaped.
+    try std.testing.expectError(error.Timeout, runDrained(a, io, .{
+        .argv = &.{ test_fixtures.child_exe, "sleep:60000" },
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } },
+    }, drain_grace_ms));
+    try std.testing.expect(monotonicMs() - began < 30_000);
+    try std.testing.expectEqual(@as(usize, 0), group.live());
+    // A child that ends well inside its timeout is unaffected.
+    const res = try runDrained(a, io, .{
+        .argv = &.{ test_fixtures.child_exe, "exit:3" },
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(60_000), .clock = .awake } },
+    }, drain_grace_ms);
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, res.term);
 }

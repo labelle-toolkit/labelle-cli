@@ -33,18 +33,27 @@ pub const SessionLock = struct {
     path: []const u8,
     /// Holds the OS lock until `release`.
     file: std.Io.File,
+    /// The PID a stale lock recorded when this session took it over (a
+    /// session that ended without releasing); `null` for a fresh or
+    /// cleanly released lock.
+    took_over: ?u64 = null,
 
     pub fn acquire(allocator: std.mem.Allocator, root: []const u8) !SessionLock {
         const path = try std.fmt.allocPrint(allocator, "{s}.lock", .{root});
         errdefer allocator.free(path);
         if (std.fs.path.dirname(root)) |parent| try std.Io.Dir.cwd().createDirPath(config.globalIo(), parent);
-        const file = try claim(path);
-        return .{ .allocator = allocator, .path = path, .file = file };
+        const claimed = try claim(path);
+        return .{ .allocator = allocator, .path = path, .file = claimed.file, .took_over = claimed.took_over };
     }
 
-    /// Drop the OS lock (the file stays; see the module comment).
+    /// Drop the OS lock (the file stays; see the module comment). The PID
+    /// is cleared first, while the lock is still ours: an empty lock was
+    /// released cleanly, so the next session takes it without calling it
+    /// stale. The OS lock stays the authority either way.
     pub fn release(self: *SessionLock) void {
-        self.file.close(config.globalIo());
+        const io = config.globalIo();
+        self.file.setLength(io, 0) catch {};
+        self.file.close(io);
         self.allocator.free(self.path);
     }
 };
@@ -53,7 +62,9 @@ pub const SessionLock = struct {
 /// is ours) with a non-blocking exclusive OS lock. Refused: another live
 /// session holds it. Granted: whatever the file recorded belongs to a
 /// session that is gone, and it is rewritten with our PID.
-fn claim(lock_path: []const u8) !std.Io.File {
+const Claimed = struct { file: std.Io.File, took_over: ?u64 };
+
+fn claim(lock_path: []const u8) !Claimed {
     const io = config.globalIo();
     const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
@@ -73,17 +84,19 @@ fn claim(lock_path: []const u8) !std.Io.File {
         else => return err,
     };
     errdefer file.close(io);
-    // The lock is ours: a previous owner, if the file names one, is gone.
+    // The lock is ours: a previous owner, if the file still names one,
+    // ended without releasing it (a clean release empties the file).
     var prev: [24]u8 = undefined;
     const n = file.readPositionalAll(io, &prev, pid_offset) catch 0;
-    if (parseOwner(prev[0..n])) |owner| {
+    const took_over = parseOwner(prev[0..n]);
+    if (took_over) |owner| {
         std.debug.print("labelle: run --watch: taking over a stale watch session lock (pid {d} is gone)\n", .{owner});
     }
     try file.setLength(io, 0);
     var buf: [32]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "#{d}\n", .{ownPid()});
     try file.writePositionalAll(io, text, 0);
-    return file;
+    return .{ .file = file, .took_over = took_over };
 }
 
 /// The PID a lock file records, read without taking the lock.
@@ -125,9 +138,12 @@ test "session lock: one session per root; the lock is released with the session"
     // The refusal can name the owner: the file records our PID.
     var buf: [24]u8 = undefined;
     try std.testing.expectEqual(ownPid(), readOwner(first.path, &buf).?);
+    try std.testing.expect(first.took_over == null);
     first.release();
-    // Released: the next session claims it at once.
+    // Released cleanly: the next session claims it at once, and does not
+    // take it for a stale lock.
     var second = try SessionLock.acquire(a, root);
+    try std.testing.expect(second.took_over == null);
     second.release();
 }
 
@@ -154,6 +170,7 @@ test "session lock: a stale lock is taken over by exactly one contender (cli#474
     contender.close(io);
     var owner = try SessionLock.acquire(a, root);
     defer owner.release();
+    try std.testing.expectEqual(@as(?u64, 2147483000), owner.took_over);
     var buf: [24]u8 = undefined;
     try std.testing.expectEqual(ownPid(), readOwner(owner.path, &buf).?);
 }
