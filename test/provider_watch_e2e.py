@@ -199,7 +199,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
 
         def output(self):
             # The child writes the file directly; nothing is buffered here.
-            return self.err_path.read_text(errors="replace")
+            return self.err_path.read_bytes().decode("utf-8", errors="replace")
 
         def log(self):
             return watch_log.read_text().splitlines() if watch_log.exists() else []
@@ -220,6 +220,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
             return status
 
         def kill(self):
+            if sys.exc_info()[0] is not None:
+                print("---- labelle output ----\n" + self.output(), file=sys.stderr)
             if self.proc.poll() is None:
                 self.proc.kill()
                 self.proc.wait()
@@ -253,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         # A broken build publishes nothing: the old output stays served.
         (project / "broken.flag").write_text("1")
         (project / "assets" / "data.txt").write_text("three")
-        wait_for("the failed rebuild", lambda: "rebuild failed — see errors above" in s.output())
+        wait_for("the failed rebuild", lambda: "labelle: rebuild failed" in s.output())
         assert generation() == "1" and published_data() == "two", (generation(), published_data())
         assert s.log()[-1] == "gen=1 data=two", s.log()
         # The fix publishes.
