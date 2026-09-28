@@ -3,6 +3,7 @@ const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 const asm_cache = @import("asm_cache.zig");
 const project_lock = @import("project_lock.zig");
+const lock_state = @import("lock_state.zig");
 
 /// Write labelle.lock into the project root.
 ///
@@ -112,6 +113,9 @@ pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cf
         .sub_path = out_path orelse lock_path,
         .data = aw.written(),
     });
+    // A full write supersedes every lock a watched rollback could lead
+    // back to (cli#481).
+    if (held != null) lock_state.clearAll(allocator, project_dir);
 }
 
 /// A GUI plugin name destined for the lock file, plus whether the buffer

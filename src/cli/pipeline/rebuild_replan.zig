@@ -6,6 +6,7 @@ const config = @import("../config.zig");
 const lockfile = @import("../lockfile.zig");
 const project_lock = @import("../project_lock.zig");
 const lock_open = @import("../lock_open.zig");
+const lock_state = @import("../lock_state.zig");
 const project_config = @import("../project_config.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
@@ -153,6 +154,11 @@ pub const Replanner = struct {
     /// the first replan does not repeat that work for unchanged bytes.
     pub fn baseline(self: *Replanner) void {
         self.synced = digestProject(self.backing, self.project_dir) catch null;
+        // The session starts: remove the staged locks sessions killed
+        // outright left behind (cli#481). Best effort.
+        const held = project_lock.acquire(self.backing, self.project_dir) catch return;
+        defer held.release();
+        lock_state.sweepStaged(self.backing, self.project_dir);
     }
 
     /// Lend the cold pipeline's pinned extractions (`startup`, which
@@ -255,7 +261,10 @@ pub const Replanner = struct {
         self.settleLock(true);
         // A restore an earlier rollback could not do yet stays owed: a
         // rebuild that committed no lock of its own does not cancel it.
-        if (self.restore_pending) self.retryRestore(.try_once) else self.forgetLockBefore();
+        if (self.restore_pending) self.retryRestore(.try_once) else {
+            self.forgetAncestry();
+            self.forgetLockBefore();
+        }
         self.pruneExtractions();
     }
 
@@ -339,6 +348,20 @@ pub const Replanner = struct {
         try std.Io.Dir.cwd().rename(from, std.Io.Dir.cwd(), to, config.globalIo());
     }
 
+    /// This rebuild succeeded: the lock it replaced is superseded by a
+    /// published one, so a record leading back from it (another session's
+    /// failed rebuild, `lock_state`) is dropped.
+    fn forgetAncestry(self: *Replanner) void {
+        const before = self.lock_before orelse return;
+        const bytes = switch (before) {
+            .absent => return,
+            .bytes => |b| b,
+        };
+        const held = project_lock.acquire(self.backing, self.project_dir) catch return;
+        defer held.release();
+        lock_state.forget(self.backing, self.project_dir, digestBytes(bytes));
+    }
+
     fn forgetLockBefore(self: *Replanner) void {
         if (self.lock_before) |before| if (before == .bytes) self.backing.free(before.bytes);
         self.lock_before = null;
@@ -394,11 +417,21 @@ pub const Replanner = struct {
     /// meanwhile wins, with a warning. Written aside and renamed over it,
     /// so a reader never sees a partial lock. Settles the owed restore
     /// either way.
+    ///
+    /// Across overlapping watch sessions (cli#481, `lock_state`): a lock
+    /// kept in place records the one this rebuild replaced, and the lock
+    /// restored is followed back past every lock a failed rebuild
+    /// committed, so the rollbacks end on the last published lock or the
+    /// original.
     fn restoreHeld(self: *Replanner, lock: []const u8) void {
         const before = self.lock_before orelse return;
         defer self.forgetLockBefore();
         const io = config.globalIo();
         const a = self.backing;
+        const before_bytes: lock_state.Lock = switch (before) {
+            .absent => null,
+            .bytes => |bytes| bytes,
+        };
         const still_ours = if (self.lock_written) |written| blk: {
             const now = std.Io.Dir.cwd().readFileAlloc(io, lock, a, .limited(16 * 1024 * 1024)) catch break :blk false;
             defer a.free(now);
@@ -406,28 +439,35 @@ pub const Replanner = struct {
         } else true;
         if (!still_ours) {
             std.debug.print("labelle: labelle.lock changed since this rebuild wrote it; keeping the newer lock instead of rolling it back\n", .{});
+            if (self.lock_written) |written| lock_state.record(a, self.project_dir, written, before_bytes) catch |err| {
+                std.debug.print("labelle: could not record the lock to roll back to ({s})\n", .{@errorName(err)});
+            };
             return;
         }
         if (self.restore_window) |hook| hook(lock);
-        switch (before) {
-            .absent => std.Io.Dir.cwd().deleteFile(io, lock) catch |err| switch (err) {
+        const target = lock_state.resolve(a, self.project_dir, before_bytes) catch |err| {
+            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer if (target) |bytes| a.free(bytes);
+        const bytes = target orelse {
+            std.Io.Dir.cwd().deleteFile(io, lock) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)}),
-            },
-            .bytes => |bytes| {
-                // Beside the staged lock, under `.labelle/` (not watched).
-                const tmp = std.fs.path.join(a, &.{ self.project_dir, ".labelle", "labelle.lock.rollback" }) catch return;
-                defer a.free(tmp);
-                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = bytes }) catch |err| {
-                    std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
-                    return;
-                };
-                std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), lock, io) catch |err| {
-                    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-                    std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
-                };
-            },
-        }
+            };
+            return;
+        };
+        // Beside the staged locks, under `.labelle/` (not watched).
+        const tmp = std.fs.path.join(a, &.{ self.project_dir, ".labelle", "labelle.lock.rollback" }) catch return;
+        defer a.free(tmp);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = bytes }) catch |err| {
+            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
+            return;
+        };
+        std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), lock, io) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
+        };
     }
 
     /// Process-wide sequence of staged-lock names, so two replanners of one

@@ -29,7 +29,7 @@ const target = tx.target;
 
 /// A real publisher over `<tmp>/stage`, publishing into `<tmp>/session`,
 /// with generation 0 ("zero") already published.
-const Published = struct {
+pub const Published = struct {
     publisher: watch.Publisher,
     stage: []const u8,
     root: []const u8,
@@ -39,7 +39,7 @@ const Published = struct {
     cancel_at: enum { never, copy, switch_ } = .never,
     gate: watch.PublishGate = undefined,
 
-    fn init(self: *Published, fx: *Fixture) !void {
+    pub fn init(self: *Published, fx: *Fixture) !void {
         const a = fx.a;
         const io = config.globalIo();
         try fx.tmp.dir.createDirPath(io, "stage");
@@ -53,13 +53,13 @@ const Published = struct {
         try fx.tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "one" });
     }
 
-    fn deinit(self: *Published, a: std.mem.Allocator) void {
+    pub fn deinit(self: *Published, a: std.mem.Allocator) void {
         self.publisher.deinit(true);
         a.free(self.stage);
         a.free(self.root);
     }
 
-    fn seam(self: *Published) @import("rebuild.zig").RebuildCtx.Publish {
+    pub fn seam(self: *Published) @import("rebuild.zig").RebuildCtx.Publish {
         return .{ .ctx = self, .run = run };
     }
 
@@ -99,7 +99,7 @@ const Published = struct {
     }
 };
 
-fn contains(haystack: []const u8, needle: []const u8) bool {
+pub fn contains(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
@@ -703,227 +703,6 @@ test "rebuild commit: a rollback leaves a labelle.lock another command rewrote m
     const now = try fx.lockBytes();
     defer a.free(now);
     try std.testing.expectEqualStrings(Writer.newer, now);
-}
-
-test "rebuild commit: a write racing the rollback's compare-and-restore waits for it and is never overwritten (cli#481)" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    var fx: Fixture = undefined;
-    try fx.init(a);
-    defer fx.deinit();
-    try fx.write(.{});
-    try fx.startup();
-    var site = fx.site();
-    defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
-    defer replan.deinit(&site, fx.providers, fx.cfg);
-    replan.baseline();
-    var dummy: u8 = 0;
-    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
-    defer ctx.deinit();
-    var published: Published = undefined;
-    try published.init(&fx);
-    defer published.deinit(a);
-    ctx.publish = published.seam();
-    const Fail = struct {
-        fn write(_: *watch.Publisher, _: u64) anyerror!void {
-            return error.SharingViolation;
-        }
-    };
-    // Another command writes `labelle.lock` exactly in the window between
-    // the rollback's compare (the lock is still this rebuild's) and its
-    // restore, through the project lock as every writer does. Before
-    // cli#481 that write landed and the restore overwrote it.
-    const Racer = struct {
-        const newer = "// written by another command\n";
-        var thread: ?std.Thread = null;
-        var saw_restored = false;
-        var wrote = false;
-        var project: []const u8 = "";
-        fn write() void {
-            const held = project_lock.acquire(std.testing.allocator, project) catch return;
-            defer held.release();
-            const io = config.globalIo();
-            // Its own path: the rollback's is freed once it returns.
-            const lock = std.fs.path.join(std.testing.allocator, &.{ project, "labelle.lock" }) catch return;
-            defer std.testing.allocator.free(lock);
-            const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock, std.testing.allocator, .limited(1 << 20)) catch return;
-            defer std.testing.allocator.free(bytes);
-            // It only got the lock after the restore finished.
-            saw_restored = !contains(bytes, "\"7.7.7\"");
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lock, .data = newer }) catch return;
-            wrote = true;
-        }
-        fn window(_: []const u8) void {
-            const before = project_lock.test_busy_polls.load(.monotonic);
-            thread = std.Thread.spawn(.{}, write, .{}) catch return;
-            // Hold the window open until the racer is blocked on the lock.
-            var spins: usize = 0;
-            while (project_lock.test_busy_polls.load(.monotonic) == before and spins < 1000) : (spins += 1) {
-                config.globalIo().sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-            }
-        }
-    };
-    Racer.project = fx.project;
-    published.publisher.write_generation = Fail.write;
-    replan.restore_window = Racer.window;
-    const polls = project_lock.test_busy_polls.load(.monotonic);
-    try fx.write(.{ .version = "7.7.7" });
-    try std.testing.expectError(error.PublishFailed, ctx.rebuildStaged());
-    (Racer.thread orelse return error.TestUnexpectedResult).join();
-    // The mechanism: the racer found the lock held and waited, and only
-    // wrote after the restore; its newer lock is what stays.
-    try std.testing.expect(project_lock.test_busy_polls.load(.monotonic) > polls);
-    try std.testing.expect(Racer.saw_restored and Racer.wrote);
-    const now = try fx.lockBytes();
-    defer a.free(now);
-    try std.testing.expectEqualStrings(Racer.newer, now);
-}
-
-test "rebuild commit: two watch sessions stage their locks privately, and each commits its own (cli#481)" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const io = config.globalIo();
-    var fx: Fixture = undefined;
-    try fx.init(a);
-    defer fx.deinit();
-    try fx.write(.{});
-    try fx.startup();
-    var site = fx.site();
-    defer site.env.deinit();
-    // Two sessions of one project (two targets), each with its replanner.
-    var one = Replanner{ .backing = a, .project_dir = fx.project };
-    defer one.deinit(&site, fx.providers, fx.cfg);
-    var two = Replanner{ .backing = a, .project_dir = fx.project };
-    defer two.deinit(&site, fx.providers, fx.cfg);
-    const p1 = try one.stagedPath();
-    const p2 = try two.stagedPath();
-    try std.testing.expect(!std.mem.eql(u8, p1, p2));
-    var cfg1 = fx.cfg;
-    cfg1.engine_version = "1.1.1";
-    var cfg2 = fx.cfg;
-    cfg2.engine_version = "2.2.2";
-    // Both stage at once; one session rolling back drops only its own.
-    try Replanner.stageLock(a, fx.project, cfg1, p1);
-    try Replanner.stageLock(a, fx.project, cfg2, p2);
-    Replanner.rollback(&one);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, p1, .{}));
-    try std.Io.Dir.cwd().access(io, p2, .{});
-    // Staged again: each commit installs its own session's lock.
-    try Replanner.stageLock(a, fx.project, cfg1, p1);
-    try Replanner.commitLock(&one);
-    {
-        const now = try fx.lockBytes();
-        defer a.free(now);
-        try std.testing.expect(contains(now, "\"1.1.1\"") and !contains(now, "\"2.2.2\""));
-    }
-    try std.Io.Dir.cwd().access(io, p2, .{});
-    try Replanner.commitLock(&two);
-    const now = try fx.lockBytes();
-    defer a.free(now);
-    try std.testing.expect(contains(now, "\"2.2.2\"") and !contains(now, "\"1.1.1\""));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, p2, .{}));
-}
-
-test "rebuild commit: the commit keeps a newer CLI's stamp written after the lock was staged (cli#481)" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const io = config.globalIo();
-    var fx: Fixture = undefined;
-    try fx.init(a);
-    defer fx.deinit();
-    try fx.write(.{});
-    try fx.startup();
-    var site = fx.site();
-    defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
-    defer replan.deinit(&site, fx.providers, fx.cfg);
-    var cfg = fx.cfg;
-    cfg.engine_version = "3.3.3";
-    // Rendered with this CLI's stamp...
-    try Replanner.stageLock(a, fx.project, cfg, try replan.stagedPath());
-    // ...then a newer CLI writes the project's lock before the commit.
-    const newer = ".{\n    .cli_version = \"999.0.0\",\n}\n";
-    try fx.tmp.dir.writeFile(io, .{ .sub_path = "project/labelle.lock", .data = newer });
-    try Replanner.commitLock(&replan);
-    {
-        const now = try fx.lockBytes();
-        defer a.free(now);
-        // The staged content, with the high-water stamp.
-        try std.testing.expectEqualStrings("999.0.0", lockfile.lockCliVersion(now).?);
-        try std.testing.expect(contains(now, "\"3.3.3\""));
-    }
-    // What the rollback compares against is the committed (raised) bytes:
-    // the rollback recognises its own write and restores the newer CLI's lock.
-    Replanner.rollback(&replan);
-    const now = try fx.lockBytes();
-    defer a.free(now);
-    try std.testing.expectEqualStrings(newer, now);
-}
-
-test "rebuild commit: a rollback the project lock holds up is kept and done on a later watch tick (cli#481)" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    var fx: Fixture = undefined;
-    try fx.init(a);
-    defer fx.deinit();
-    try fx.write(.{});
-    try fx.startup();
-    var site = fx.site();
-    defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
-    defer replan.deinit(&site, fx.providers, fx.cfg);
-    replan.baseline();
-    var dummy: u8 = 0;
-    var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
-    defer ctx.deinit();
-    var published: Published = undefined;
-    try published.init(&fx);
-    defer published.deinit(a);
-    ctx.publish = published.seam();
-    const lock_v1 = try fx.lockBytes();
-    defer a.free(lock_v1);
-    const Fail = struct {
-        fn write(_: *watch.Publisher, _: u64) anyerror!void {
-            return error.SharingViolation;
-        }
-    };
-    // Another command takes the project lock after this rebuild committed
-    // its lock and keeps it past the (shortened) wait of the rollback.
-    const Holder = struct {
-        var held: ?project_lock.Held = null;
-        var project: []const u8 = "";
-        fn take(_: []const u8) void {
-            held = project_lock.acquire(std.testing.allocator, project) catch null;
-        }
-    };
-    Holder.project = fx.project;
-    const saved = project_lock.wait_budget_ms;
-    project_lock.wait_budget_ms = 30;
-    defer project_lock.wait_budget_ms = saved;
-    published.publisher.write_generation = Fail.write;
-    replan.before_restore_lock = Holder.take;
-    try fx.write(.{ .version = "7.7.7" });
-    try std.testing.expectError(error.PublishFailed, ctx.rebuildStaged());
-    try std.testing.expect(Holder.held != null);
-    // Not rolled back yet, and not given up: the saved lock is kept.
-    try std.testing.expect(replan.restore_pending and replan.lock_before != null);
-    {
-        const now = try fx.lockBytes();
-        defer a.free(now);
-        try std.testing.expect(contains(now, "\"7.7.7\""));
-    }
-    // A tick while the lock is still held does not wait and changes nothing.
-    rebuild.RebuildCtx.tick(&ctx);
-    try std.testing.expect(replan.restore_pending);
-    // The holder finishes: the next tick does the rollback.
-    Holder.held.?.release();
-    Holder.held = null;
-    rebuild.RebuildCtx.tick(&ctx);
-    try std.testing.expect(!replan.restore_pending and replan.lock_before == null);
-    const now = try fx.lockBytes();
-    defer a.free(now);
-    try std.testing.expectEqualSlices(u8, lock_v1, now);
 }
 
 test "rebuild commit: a local provider whose manifest is deleted stays watched, so recreating it rebuilds (cli#478)" {

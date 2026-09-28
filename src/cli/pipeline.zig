@@ -487,6 +487,7 @@ test {
     _ = rebuild_replan_tests;
     _ = @import("pipeline/rebuild_transaction_tests.zig");
     _ = @import("pipeline/rebuild_commit_tests.zig");
+    _ = @import("pipeline/rebuild_lock_tests.zig");
     _ = session_key;
     _ = watch_session;
     _ = optimize_mod;
