@@ -50,3 +50,13 @@ pub fn openRegular(lock_path: []const u8) !std.Io.File {
     }
     return error.LockNotRegular;
 }
+
+/// This process's id: named in a lock's refusal, and part of a watch
+/// session's private staged-lock name (cli#481).
+pub fn ownPid() u64 {
+    if (is_windows) return GetCurrentProcessId();
+    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
+    return @intCast(std.c.getpid());
+}
+
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;

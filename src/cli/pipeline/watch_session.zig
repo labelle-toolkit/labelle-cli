@@ -233,6 +233,7 @@ pub fn run(
     const watcher = std.Thread.spawn(.{}, watch.watchLoop, .{ io, watch.WatchConfig{
         .watch_dir = cx.project_dir,
         .rebuild_fn = RebuildCtx.rebuild,
+        .tick_fn = RebuildCtx.tick,
         .rebuild_ctx = &ctx,
         .ignore = &ctx.ignore,
         .baseline = cx.watch_baseline,

@@ -491,6 +491,21 @@ pub fn lockCliVersion(lock_bytes: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `staged` lock bytes with their top-level `.cli_version` raised to the
+/// one `current` (the project's `labelle.lock` as it is NOW) records when
+/// that one is newer: `writeLockFile`'s high-water rule, applied again when
+/// a watched rebuild commits a lock it rendered earlier (cli#481), so a
+/// newer CLI's stamp written meanwhile is never lowered. Caller owns the
+/// returned copy.
+pub fn withHighWater(a: std.mem.Allocator, staged: []const u8, current: ?[]const u8) ![]u8 {
+    const now = current orelse return a.dupe(u8, staged);
+    const newer = lockCliVersion(now) orelse return a.dupe(u8, staged);
+    const ours = lockCliVersion(staged) orelse return a.dupe(u8, staged);
+    if (!isLockNewer(newer, ours)) return a.dupe(u8, staged);
+    const at = @intFromPtr(ours.ptr) - @intFromPtr(staged.ptr);
+    return std.mem.concat(a, u8, &.{ staged[0..at], newer, staged[at + ours.len ..] });
+}
+
 /// The guard against a stale binary silently mis-building a modern
 /// project (#353): a labelle.lock written by a NEWER CLI means this
 /// binary may not understand everything the project relies on — the
@@ -747,4 +762,19 @@ test "writeLockFile: holds the project lock around the write (cli#481)" {
     const written = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
     defer alloc.free(written);
     try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(written).?);
+}
+
+test "withHighWater: a newer stamp in the current lock is carried into the staged bytes (cli#481)" {
+    const a = std.testing.allocator;
+    const staged = ".{\n    .cli_version = \"1.0.0\",\n    .resolved = .{ .engine = .{ .version = \"2.0.0\" } },\n}\n";
+    // Newer: raised, nothing else changes.
+    const raised = try withHighWater(a, staged, ".{\n    .cli_version = \"9.9.9\",\n}\n");
+    defer a.free(raised);
+    try std.testing.expectEqualStrings(".{\n    .cli_version = \"9.9.9\",\n    .resolved = .{ .engine = .{ .version = \"2.0.0\" } },\n}\n", raised);
+    // Older, absent or unstamped: the staged bytes as they are.
+    for ([_]?[]const u8{ ".{\n    .cli_version = \"0.1.0\",\n}\n", null, ".{}\n" }) |current| {
+        const kept = try withHighWater(a, staged, current);
+        defer a.free(kept);
+        try std.testing.expectEqualStrings(staged, kept);
+    }
 }

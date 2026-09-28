@@ -63,14 +63,7 @@ pub fn acquire(a: std.mem.Allocator, project_dir: []const u8) !Held {
     const io = config.globalIo();
     const path = try std.fs.path.join(a, &.{ project_dir, rel_path });
     defer a.free(path);
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
-    const file = lock_open.openRegular(path) catch |err| switch (err) {
-        error.LockNotRegular => {
-            std.debug.print("labelle: the project lock '{s}' is not a regular file (a symbolic link or a directory); remove it and run again\n", .{path});
-            return error.ProjectLockNotRegular;
-        },
-        else => return err,
-    };
+    const file = try open(path);
     errdefer file.close(io);
     var waited: u64 = 0;
     var noticed = false;
@@ -88,6 +81,33 @@ pub fn acquire(a: std.mem.Allocator, project_dir: []const u8) !Held {
         waited += poll_ms;
     }
     return .{ .file = file };
+}
+
+/// `acquire` without waiting: `null` while another command holds the lock.
+/// For a retry that must not stall its caller (a watch tick).
+pub fn tryAcquire(a: std.mem.Allocator, project_dir: []const u8) !?Held {
+    const io = config.globalIo();
+    const path = try std.fs.path.join(a, &.{ project_dir, rel_path });
+    defer a.free(path);
+    const file = try open(path);
+    errdefer file.close(io);
+    if (!try file.tryLock(io, .exclusive)) {
+        _ = test_busy_polls.fetchAdd(1, .monotonic);
+        file.close(io);
+        return null;
+    }
+    return .{ .file = file };
+}
+
+fn open(path: []const u8) !std.Io.File {
+    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
+    return lock_open.openRegular(path) catch |err| switch (err) {
+        error.LockNotRegular => {
+            std.debug.print("labelle: the project lock '{s}' is not a regular file (a symbolic link or a directory); remove it and run again\n", .{path});
+            return error.ProjectLockNotRegular;
+        },
+        else => return err,
+    };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -161,10 +181,14 @@ test "project lock: a lock held past the budget fails with ProjectLockBusy (cli#
     wait_budget_ms = 50;
     defer wait_budget_ms = saved;
     try std.testing.expectError(error.ProjectLockBusy, acquire(a, t.dir));
+    // Nor does a try, which returns at once.
+    try std.testing.expect(try tryAcquire(a, t.dir) == null);
     held.release();
     // Released: the next command takes it at once.
     const next = try acquire(a, t.dir);
     next.release();
+    const tried = (try tryAcquire(a, t.dir)) orelse return error.TestUnexpectedResult;
+    tried.release();
 }
 
 test "project lock: a symbolic link at the lock path is refused and never written through (cli#481)" {

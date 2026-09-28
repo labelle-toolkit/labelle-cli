@@ -300,6 +300,7 @@ pub fn launch(
                 try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
                     .watch_dir = project_dir,
                     .rebuild_fn = RebuildCtx.rebuild,
+                    .tick_fn = RebuildCtx.tick,
                     .rebuild_ctx = &rebuild_ctx,
                     .ignore = &rebuild_ctx.ignore,
                 });
