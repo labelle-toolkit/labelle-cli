@@ -220,8 +220,6 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
             return status
 
         def kill(self):
-            if sys.exc_info()[0] is not None:
-                print("---- labelle output ----\n" + self.output(), file=sys.stderr)
             if self.proc.poll() is None:
                 self.proc.kill()
                 self.proc.wait()
@@ -276,6 +274,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         assert hook_ids().count("done") == before + 1, hook_ids()
         assert not session_dir.exists(), "the published generations were left behind"
         checks += 1
+    except BaseException:
+        print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+        raise
     finally:
         s.kill()
 
@@ -289,6 +290,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         assert "done" not in hook_ids(), hook_ids()
         assert not session_dir.exists()
         checks += 1
+    except BaseException:
+        print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+        raise
     finally:
         s.kill()
 
@@ -315,6 +319,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
             for pid in pids + [server_child[1]]:
                 wait_for(f"process {pid} to end", lambda: not alive(pid), timeout=30)
             checks += 1
+        except BaseException:
+            print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+            raise
         finally:
             Path(f"{marker}.arm").unlink(missing_ok=True)
             s.kill()
@@ -336,6 +343,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
             for pid in server_child:
                 wait_for(f"process {pid} to end", lambda: not alive(pid), timeout=30)
             checks += 1
+        except BaseException:
+            print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+            raise
         finally:
             s.kill()
 
