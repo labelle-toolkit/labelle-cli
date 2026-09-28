@@ -30,7 +30,7 @@
 //!
 //! A `.app` launched by LaunchServices (Finder, Dock, `open`) starts with
 //! cwd `/`. The generated game still resolves some runtime files RELATIVE
-//! TO CWD: labelle-bgfx streams video from `assets/<name>` (it is not
+//! TO CWD: the rendering backend streams video from `assets/<name>` (it is not
 //! `@embedFile`d), the engine's save/load mixin writes save files to a
 //! cwd-relative path, and games write `saves/` / `snapshots/` the same
 //! way (flying-platform-labelle#773). `labelle run` hides all of this by
@@ -84,7 +84,7 @@ const asm_cache = @import("asm_cache.zig");
 
 /// `CFBundleIconFile` value. macOS resolves it to
 /// `Contents/Resources/<value>.icns` (extension optional in the plist;
-/// we keep it off, matching Xcode's default).
+/// we keep it off, matching Apple's toolchain default).
 pub const icon_file_key = "AppIcon";
 pub const icns_name = icon_file_key ++ ".icns";
 /// Conventional iconset dir name; only used by tests as a fixture name.
@@ -109,7 +109,7 @@ pub const max_stage_depth: u32 = 32;
 
 /// Oldest macOS the bundle claims to run on. Big Sur is the first
 /// release with the current Dock/Launchpad icon pipeline and the oldest
-/// macOS the toolchain's backends (bgfx Metal, sokol Metal) still
+/// macOS the toolchain's Metal backends still
 /// target; we have no evidence for anything older, so don't claim it.
 pub const min_system_version = "11.0";
 
@@ -156,8 +156,8 @@ pub fn printUnsupported() void {
 }
 
 /// `CFBundleIdentifier` from the project `.name`, following the
-/// `com.labelle.<name>` scheme the other platform packagers use (`ios.zig`
-/// `defaultBundleId`, and the providers' package ids) so one project is
+/// `com.labelle.<name>` scheme the other platform packagers use (the
+/// providers' bundle and package ids) so one project is
 /// the same "app" everywhere.
 ///
 /// Apple's allowed alphabet is narrow: `[A-Za-z0-9-.]` — no underscore,
@@ -776,15 +776,15 @@ pub fn writeIconset(
 /// `iconutil -c icns -o <icns_path> <iconset_dir>`. Spawned like the
 /// CLI's other external tools (`util.runCmd` → `std.process.run`). A
 /// missing binary is the ONE failure worth a tailored message: iconutil
-/// ships with macOS itself, so its absence means the Xcode Command Line
+/// ships with macOS itself, so its absence means Apple's Command Line
 /// Tools were never installed.
 pub fn buildIcns(allocator: std.mem.Allocator, iconset_dir: []const u8, icns_path: []const u8) !void {
     const argv = [_][]const u8{ "iconutil", "-c", "icns", "-o", icns_path, iconset_dir };
     const result = util.runCmd(allocator, &argv) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print(
-                \\labelle bundle: `iconutil` not found — it ships with macOS / the Xcode Command Line Tools.
-                \\  fix: xcode-select --install
+                \\labelle bundle: `iconutil` not found — it ships with macOS / Apple's Command Line Tools.
+                \\  fix: install Apple's Command Line Tools, then re-run `labelle bundle`
                 \\
             , .{});
             return error.IconutilMissing;
@@ -809,7 +809,7 @@ pub fn buildIcns(allocator: std.mem.Allocator, iconset_dir: []const u8, icns_pat
 }
 
 /// Where the `.app` goes. `--output` absolute → as given; relative →
-/// anchored to the PROJECT dir (same rule as `wasm export --output`, so
+/// anchored to the PROJECT dir (same rule as the export `--output`, so
 /// `labelle bundle ../game --output dist` lands under the game, next to
 /// where its build output already lives); none → the target dir's
 /// `zig-out/bundle/desktop/`, the step output directory provider `bundle`
@@ -817,7 +817,7 @@ pub fn buildIcns(allocator: std.mem.Allocator, iconset_dir: []const u8, icns_pat
 /// core packager and every hook agree on where the artifact is. Caller
 /// owns the slice.
 ///
-/// Unlike `wasm export` this never wipes the output dir itself — only
+/// Unlike the export command this never wipes the output dir itself — only
 /// the one `<Title>.app` inside it — so no destructive-path guard is
 /// needed.
 pub fn resolveOutputDir(
@@ -905,8 +905,8 @@ pub fn binName(allocator: std.mem.Allocator, exe_name: []const u8) ![]u8 {
 /// so saves must not land beside the assets; the game has to start
 /// honouring it (flying-platform-labelle#773), this only makes the target
 /// available — and (b) appends the Homebrew prefixes to `PATH`: apps get
-/// the launchd default `/usr/bin:/bin:/usr/sbin:/sbin`, and labelle-bgfx's
-/// desktop video path shells out to `ffmpeg`/`ffprobe` via `popen`, so a
+/// the launchd default `/usr/bin:/bin:/usr/sbin:/sbin`, and the rendering
+/// backend's desktop video path shells out to `ffmpeg`/`ffprobe` via `popen`, so a
 /// Finder launch would otherwise fail to play video that a terminal
 /// launch plays (ffmpeg is a system dependency, not shipped in the app).
 ///
@@ -951,7 +951,7 @@ pub fn renderLauncher(allocator: std.mem.Allocator, exe_name: []const u8, bundle
         \\fi
         \\
         \\# LaunchServices hands apps a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
-        \\# The bgfx desktop video path shells out to ffmpeg/ffprobe, which Homebrew
+        \\# The backend's desktop video path shells out to ffmpeg/ffprobe, which Homebrew
         \\# installs under /opt/homebrew/bin or /usr/local/bin -- append them so a
         \\# Finder launch finds the same tools a terminal launch does.
         \\PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
@@ -1200,7 +1200,7 @@ fn copyTreeFollowingLinks(
 /// `CFBundleExecutable` names it) and the built exe lands beside it as
 /// `MacOS/<exe_name>-bin` (cli#364). `copyFile` with default options
 /// copies the source's permissions, so the exec bit survives without a
-/// `chmod` spawn (`ios.zig` predates that option and still shells out).
+/// `chmod` spawn.
 /// Returns the caller-owned bundle path.
 pub fn layoutBundle(
     allocator: std.mem.Allocator,
@@ -1249,7 +1249,7 @@ pub fn layoutBundle(
 
     // Type `APPL`, creator `????` (none). Modern macOS reads the plist
     // instead, but Finder still consults PkgInfo on some paths and every
-    // Xcode-built app ships it — cheap insurance.
+    // app Apple's toolchain builds ships it — cheap insurance.
     const pkginfo_path = try std.fs.path.join(allocator, &.{ bundle_dir, "Contents", "PkgInfo" });
     defer allocator.free(pkginfo_path);
     try cwd.writeFile(io, .{ .sub_path = pkginfo_path, .data = "APPL????" });
@@ -1945,19 +1945,19 @@ test "writeIconset emits all ten PNGs at their sizes, upscaling a small master" 
 test "resolveOutputDir: absolute passes through, relative anchors to the project, default is target zig-out/bundle/desktop" {
     const a = testing.allocator;
     const abs_in = if (builtin.os.tag == .windows) "C:\\dist" else "/dist";
-    const abs = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", abs_in);
+    const abs = try resolveOutputDir(a, "/proj", "/proj/.labelle/fixture_desktop", abs_in);
     defer a.free(abs);
     try testing.expectEqualStrings(abs_in, abs);
 
-    const rel = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", "dist");
+    const rel = try resolveOutputDir(a, "/proj", "/proj/.labelle/fixture_desktop", "dist");
     defer a.free(rel);
     const want_rel = try std.fs.path.join(a, &.{ "/proj", "dist" });
     defer a.free(want_rel);
     try testing.expectEqualStrings(want_rel, rel);
 
-    const def = try resolveOutputDir(a, "/proj", "/proj/.labelle/bgfx_desktop", null);
+    const def = try resolveOutputDir(a, "/proj", "/proj/.labelle/fixture_desktop", null);
     defer a.free(def);
-    const want_def = try std.fs.path.join(a, &.{ "/proj/.labelle/bgfx_desktop", "zig-out", "bundle", "desktop" });
+    const want_def = try std.fs.path.join(a, &.{ "/proj/.labelle/fixture_desktop", "zig-out", "bundle", "desktop" });
     defer a.free(want_def);
     try testing.expectEqualStrings(want_def, def);
 }
@@ -2118,7 +2118,7 @@ test "renderLauncher: cd into Resources, export LABELLE_DATA_DIR, exec <exe>-bin
         \\fi
         \\
         \\# LaunchServices hands apps a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
-        \\# The bgfx desktop video path shells out to ffmpeg/ffprobe, which Homebrew
+        \\# The backend's desktop video path shells out to ffmpeg/ffprobe, which Homebrew
         \\# installs under /opt/homebrew/bin or /usr/local/bin -- append them so a
         \\# Finder launch finds the same tools a terminal launch does.
         \\PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"

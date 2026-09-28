@@ -84,7 +84,12 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// once their comments stopped citing it: 53 entries (counted on `main`).
 /// RFC cli#466 PR A1 (contract 1.3.0) scrubbed the legacy serve wording from
 /// `cli/material_toolchain.zig`, `cli/prebuild.zig` and
-/// `cli/provider_hooks.zig`: 50 entries.
+/// `cli/provider_hooks.zig`: 50 entries. RFC cli#471 X1 neutralised the
+/// fixtures and comments of `astc/cmd.zig`, `cli/bundle.zig`,
+/// `cli/linux_desktop.zig`, `cli/pack.zig`, `cli/progress.zig`,
+/// `cli/status.zig`, `cli/screenshot_format.zig`,
+/// `cli/pipeline/screenshot.zig`, `cli/update_check.zig` and
+/// `cli/stb_image_impl.c`: 40 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -93,12 +98,10 @@ const allowed_files = [_][]const u8{
     // This file: it spells the forbidden table out.
     "agnostic_guard_test.zig",
     // Legacy platform, store, package and backend sites (RFC #406 "Migration").
-    "astc/cmd.zig",
     "cli.zig",
     "cli/args.zig",
     "cli/args_tests.zig",
     "cli/assembler_proc.zig",
-    "cli/bundle.zig",
     "cli/compatibility.zig",
     "cli/config.zig",
     "cli/docker.zig",
@@ -111,8 +114,6 @@ const allowed_files = [_][]const u8{
     "cli/install.zig",
     "cli/ios.zig",
     "cli/launcher_manifest.zig",
-    "cli/linux_desktop.zig",
-    "cli/pack.zig",
     "cli/pipeline.zig",
     // Split out of `cli/pipeline.zig` (moves only): the stage code they
     // carry names the legacy targets, backends and their toolchains.
@@ -122,17 +123,14 @@ const allowed_files = [_][]const u8{
     "cli/pipeline/generate.zig",
     "cli/pipeline/install.zig",
     "cli/pipeline/run.zig",
-    "cli/pipeline/screenshot.zig",
     "cli/pipeline/testing.zig",
     "cli/pipeline/watch.zig",
     "cli/pipeline/watch_replan.zig",
     "cli/pipeline/watch_replan_tests.zig",
-    "cli/progress.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
     "cli/python_provision.zig",
     "cli/runner.zig",
-    "cli/screenshot_format.zig",
     "cli/sdl_provision.zig",
     "cli/serve.zig",
     // Split out of `cli/serve.zig` (moves only): the serve code they carry
@@ -141,10 +139,7 @@ const allowed_files = [_][]const u8{
     "cli/serve/server.zig",
     "cli/serve/tree.zig",
     "cli/serve/watch.zig",
-    "cli/status.zig",
     "cli/stb_image.h",
-    "cli/stb_image_impl.c",
-    "cli/update_check.zig",
     "cli/upgrade.zig",
 };
 
@@ -545,13 +540,13 @@ test "a finding is reported per line and a clean allowlisted file goes stale" {
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:2: 'web' " ++ finding_note, scan.offenders.items[3]);
     // Allowlisted and dirty: no finding, entry kept. Clean name and body: stale.
     try scan.file("cli/pipeline.zig", "// wasm\n");
-    try scan.file("cli/pack.zig", "const x = 1;\n");
+    try scan.file("cli/upgrade.zig", "const x = 1;\n");
     try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/pipeline.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/pack.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/upgrade.zig"));
     try std.testing.expect(containsString(stale.items, "cli/serve.zig"));
     // The sentinel is only set by the CLI root itself.
     try std.testing.expect(!scan.saw_cli_root);
@@ -596,7 +591,7 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/emsdk_cache.zig"));
     try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/pack.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/upgrade.zig"));
 }
 
 test "package and compound affixes do not hide a forbidden root" {

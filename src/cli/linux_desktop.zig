@@ -319,9 +319,9 @@ pub const RenderSpec = struct {
         const got = try render(std.testing.allocator, .{
             .name = "Colony Ship",
             .comment = "A colony sim",
-            .exec_path = "/home/me/colony/.labelle/bgfx_desktop/zig-out/bin/colony",
-            .working_dir = "/home/me/colony/.labelle/bgfx_desktop",
-            .icon_path = "/home/me/colony/.labelle/bgfx_desktop/zig-out/colony.png",
+            .exec_path = "/home/me/colony/.labelle/fixture_desktop/zig-out/bin/colony",
+            .working_dir = "/home/me/colony/.labelle/fixture_desktop",
+            .icon_path = "/home/me/colony/.labelle/fixture_desktop/zig-out/colony.png",
         });
         defer std.testing.allocator.free(got);
         try std.testing.expectEqualStrings(
@@ -330,9 +330,9 @@ pub const RenderSpec = struct {
                 "Version=1.5\n" ++
                 "Name=Colony Ship\n" ++
                 "Comment=A colony sim\n" ++
-                "Exec=/home/me/colony/.labelle/bgfx_desktop/zig-out/bin/colony\n" ++
-                "Path=/home/me/colony/.labelle/bgfx_desktop\n" ++
-                "Icon=/home/me/colony/.labelle/bgfx_desktop/zig-out/colony.png\n" ++
+                "Exec=/home/me/colony/.labelle/fixture_desktop/zig-out/bin/colony\n" ++
+                "Path=/home/me/colony/.labelle/fixture_desktop\n" ++
+                "Icon=/home/me/colony/.labelle/fixture_desktop/zig-out/colony.png\n" ++
                 "Terminal=false\n" ++
                 "Categories=Game;\n" ++
                 "StartupNotify=false\n",
@@ -406,7 +406,7 @@ pub const CreateFromBuildSpec = struct {
 
         // A generated target: the built exe (legacy `game` name, so no
         // build.zig is needed) and the assembler's default icon.
-        const target_dir = try std.fs.path.join(allocator, &.{ root, ".labelle", "bgfx_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ root, ".labelle", "fixture_desktop" });
         defer allocator.free(target_dir);
         const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
         defer allocator.free(bin_dir);

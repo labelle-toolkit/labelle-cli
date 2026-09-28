@@ -115,7 +115,7 @@ fn prepareLookupPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     const cwd = std.Io.Dir.cwd();
 
     const full_real = cwd.realPathFileAlloc(io, trimmed, arena) catch null;
-    if (full_real) |real| return real[0 .. real.len];
+    if (full_real) |real| return real[0..real.len];
 
     var comps: std.ArrayList([]const u8) = .empty;
     var prefixes: std.ArrayList([]const u8) = .empty;
@@ -132,7 +132,7 @@ fn prepareLookupPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     for (prefixes.items, 0..) |partial, i| {
         const partial_real = cwd.realPathFileAlloc(io, partial, arena) catch null;
         if (partial_real) |real| {
-            resolved = real[0 .. real.len];
+            resolved = real[0..real.len];
             consumed = i + 1;
         }
     }
@@ -408,7 +408,7 @@ test "the trim guard reads the gfx pin from the discovered project" {
     try tmp.dir.createDirPath(io, "assets/raw/ship");
     try tmp.dir.writeFile(io, .{
         .sub_path = "project.labelle",
-        .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"x\", .gfx_version = \"1.30.0\" }\n",
     });
 
     const found = findProjectRoot(a, nested) orelse return error.TestExpectedProjectRoot;
@@ -489,7 +489,7 @@ test "trim guard: falls back to the --out-dir project when input has none" {
     try tmp.dir.createDirPath(io, "out-proj/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "out-proj/project.labelle",
-        .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"x\", .gfx_version = \"1.30.0\" }\n",
     });
 
     var buf: std.ArrayList(u8) = .empty;
@@ -520,11 +520,11 @@ test "trim guard: input-project precedence even when --out-dir is another projec
     try tmp.dir.createDirPath(io, "out-proj/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "in-proj/project.labelle",
-        .data = ".{ .name = \"in\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"in\", .gfx_version = \"1.31.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "out-proj/project.labelle",
-        .data = ".{ .name = \"out\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"out\", .gfx_version = \"1.30.0\" }\n",
     });
 
     var buf: std.ArrayList(u8) = .empty;
@@ -551,7 +551,7 @@ test "trim guard: no duplicate warning when input and output share a project" {
     try tmp.dir.createDirPath(io, "proj/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj/project.labelle",
-        .data = ".{ .name = \"x\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"x\", .gfx_version = \"1.30.0\" }\n",
     });
 
     var buf: std.ArrayList(u8) = .empty;
@@ -580,11 +580,11 @@ test "trim guard: input-project precedence warns even if --out-dir is trim-aware
     try tmp.dir.createDirPath(io, "out-proj/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "in-proj/project.labelle",
-        .data = ".{ .name = \"in\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"in\", .gfx_version = \"1.30.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "out-proj/project.labelle",
-        .data = ".{ .name = \"out\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"out\", .gfx_version = \"1.31.0\" }\n",
     });
 
     var buf: std.ArrayList(u8) = .empty;
@@ -721,11 +721,11 @@ test "trim guard: dot-segment out-dir escape does not use cwd project" {
     try tmp.dir.createDirPath(io, "proj-b/outside-atlas");
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-a/project.labelle",
-        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"a\", .gfx_version = \"1.31.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-b/project.labelle",
-        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"b\", .gfx_version = \"1.30.0\" }\n",
     });
 
     var buf: std.ArrayList(u8) = .empty;
@@ -754,11 +754,11 @@ test "trim guard: symlinked out-dir resolves to the target project" {
     try tmp.dir.createDirPath(io, "proj-b/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-a/project.labelle",
-        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"a\", .gfx_version = \"1.31.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-b/project.labelle",
-        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"b\", .gfx_version = \"1.30.0\" }\n",
     });
     try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/assets", .{ .is_directory = true });
 
@@ -786,11 +786,11 @@ test "findProjectRoot: symlinked path with nonexistent leaf" {
     try tmp.dir.createDirPath(io, "proj-b/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-a/project.labelle",
-        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"a\", .gfx_version = \"1.31.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-b/project.labelle",
-        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"b\", .gfx_version = \"1.30.0\" }\n",
     });
     try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/assets", .{ .is_directory = true });
 
@@ -817,11 +817,11 @@ test "findProjectRoot: symlink parent segment resolves before dot collapse" {
     try tmp.dir.createDirPath(io, "proj-b/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-a/project.labelle",
-        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"a\", .gfx_version = \"1.31.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-b/project.labelle",
-        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"b\", .gfx_version = \"1.30.0\" }\n",
     });
     try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/link", .{ .is_directory = true });
 
@@ -861,11 +861,11 @@ test "findProjectRoot: symlink parent segment with native windows separators" {
     try tmp.dir.createDirPath(io, "proj-b/assets");
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-a/project.labelle",
-        .data = ".{ .name = \"a\", .backend = .bgfx, .gfx_version = \"1.31.0\" }\n",
+        .data = ".{ .name = \"a\", .gfx_version = \"1.31.0\" }\n",
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "proj-b/project.labelle",
-        .data = ".{ .name = \"b\", .backend = .bgfx, .gfx_version = \"1.30.0\" }\n",
+        .data = ".{ .name = \"b\", .gfx_version = \"1.30.0\" }\n",
     });
     try tmp.dir.symLink(io, "../proj-b/assets", "proj-a/link", .{ .is_directory = true });
 
