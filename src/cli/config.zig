@@ -251,6 +251,8 @@ pub const reserved_env = [_][]const u8{
     "LABELLE_PREBUILD_FORCE_RELAY",
     "LABELLE_PROGRESS_DEBUG",
     "LABELLE_ALLOW_OLDER_CLI",
+    // Test-only: shortens the headless default timeout (cli#485).
+    "LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT",
     // Set by the CLI for the game it launches (the `labelle run` options).
     "LABELLE_SCENE",
     "LABELLE_PROFILE",

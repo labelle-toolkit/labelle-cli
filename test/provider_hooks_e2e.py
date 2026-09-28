@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zlib
 
 parser = argparse.ArgumentParser()
@@ -41,7 +42,8 @@ exe_suffix = ".exe" if os.name == "nt" else ""
 # post-build hook's edit to it is observable from the launched game — and a
 # redundant later build would visibly revert it. FAKE_MAIN_BROKEN=1 makes the
 # core build fail; FAKE_GAME_HANG=1 in the LAUNCHED game's environment makes
-# it sleep forever, so a `--timeout` run ends in the watchdog's kill. `install`
+# it sleep forever, so a `--timeout` run ends in the watchdog's kill;
+# FAKE_GAME_SLEEP_MS=<n> makes it sleep n ms and then exit 0. `install`
 # populates the package cache from
 # FAKE_INSTALL_PLUGIN="<src>|<dest>" when set (a remote package landing in
 # the ordinary cache), and only prints otherwise. FAKE_WITH_ZON=1 adds a
@@ -100,6 +102,9 @@ elif argv and argv[0] == "generate":
         '    const a = init.arena.allocator();\\n'
         '    const data = std.Io.Dir.cwd().readFileAlloc(init.io, "zig-out/bin/data.txt", a, .limited(1024)) catch "missing";\\n'
         '    std.debug.print("DATA={s}\\\\n", .{data});\\n'
+        '    if (init.minimal.environ.getAlloc(a, "FAKE_GAME_SLEEP_MS")) |ms| {\\n'
+        '        init.io.sleep(std.Io.Duration.fromMilliseconds(std.fmt.parseInt(i64, ms, 10) catch 0), .awake) catch {};\\n'
+        '    } else |_| {}\\n'
         '    if (init.minimal.environ.getAlloc(a, "FAKE_GAME_HANG")) |_| {\\n'
         '        while (true) init.io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};\\n'
         '    } else |_| {}\\n'
@@ -180,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for knob in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_PATCH", "PROVIDER_PROBE_COPY", "FAKE_MAIN_BROKEN", "FAKE_INSTALL_PLUGIN",
-                 "FAKE_GAME_HANG", "PROVIDER_PROBE_ENV", "PROBE_TOOLCHAIN", "PROBE_CONFIGURE_LOG", "FAKE_WITH_ZON"):
+                 "FAKE_GAME_HANG", "FAKE_GAME_SLEEP_MS", "LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT", "PROVIDER_PROBE_ENV", "PROBE_TOOLCHAIN", "PROBE_CONFIGURE_LOG", "FAKE_WITH_ZON"):
         env.pop(knob, None)
     checks = 0
 
@@ -462,6 +467,55 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "labelle: timed out" not in inside.stderr and "after-run hooks skipped" not in inside.stderr, inside.stderr
     assert order(log(zig_out), "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], log(zig_out)
 
+    # ── run --headless: the default budget (cli#485) ──────────────────────
+    # A headless run given no --timeout gets a default budget through the
+    # SAME watchdog as an explicit --timeout. LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT
+    # shortens the 5m default so the kill is observable here. The mechanism,
+    # not just the outcome: the notice line, the watchdog's own "timed out"
+    # (only its kill path prints it), the default's fired line and the
+    # after-hook skip every watchdog kill gets. Each launch is timed against
+    # a warm build, so a watchdog that never fired cannot pass on the
+    # subprocess timeout.
+    short = {"LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT": "2s"}
+    reset()
+    run("build")
+
+    def timed(*args, extra_env=None):
+        start = time.monotonic()
+        result = run(*args, extra_env=extra_env)
+        return result, time.monotonic() - start
+
+    defaulted, elapsed = timed("run", "--headless", extra_env=dict(short, FAKE_GAME_HANG="1"))
+    assert "labelle: headless run: stopping after 2s (use --timeout to change, --timeout=0 for none)" in defaulted.stderr, defaulted.stderr
+    assert "labelle: running (timeout: 2s)" in defaulted.stderr, defaulted.stderr
+    assert "labelle: timed out" in defaulted.stderr, defaulted.stderr
+    assert "labelle: stopped by the headless default timeout (2s); pass --timeout=<dur> to run longer" in defaulted.stderr, defaulted.stderr
+    assert "labelle: after-run hooks skipped: the game was stopped by --timeout" in defaulted.stderr, defaulted.stderr
+    assert "hook 'fixture-a/a-run-post'" not in defaulted.stderr, defaulted.stderr
+    assert elapsed < 90, f"the default watchdog took {elapsed:.1f}s to end a 2s run"
+    # An explicit --timeout wins over the default: its own budget, no notice,
+    # and the kill is not blamed on the default.
+    explicit, elapsed = timed("run", "--headless", "--timeout=3s", extra_env=dict(short, FAKE_GAME_HANG="1"))
+    assert "labelle: running (timeout: 3s)" in explicit.stderr, explicit.stderr
+    assert "labelle: timed out" in explicit.stderr, explicit.stderr
+    assert "headless run: stopping after" not in explicit.stderr and "headless default timeout" not in explicit.stderr, explicit.stderr
+    assert elapsed < 90, f"the explicit watchdog took {elapsed:.1f}s to end a 3s run"
+    # The opt-out: --timeout=0 arms no watchdog. The game outlives the 1s
+    # default by sleeping 4s and then exits on its own — a watchdog would
+    # have killed it at 1s, so the clean exit and the after hooks prove
+    # none was armed.
+    optout = run("run", "--headless", "--timeout=0",
+                 extra_env={"LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT": "1s", "FAKE_GAME_SLEEP_MS": "4000"})
+    assert "labelle: running...\n" in optout.stderr, optout.stderr
+    assert "timed out" not in optout.stderr and "headless run: stopping after" not in optout.stderr, optout.stderr
+    assert "hook 'fixture-a/a-run-post'" in optout.stderr and "after-run hooks skipped" not in optout.stderr, optout.stderr
+    # A windowed run is unchanged: the same outliving game, no default.
+    windowed = run("run", extra_env={"LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT": "1s", "FAKE_GAME_SLEEP_MS": "4000"})
+    assert "labelle: running...\n" in windowed.stderr, windowed.stderr
+    assert "timed out" not in windowed.stderr and "headless run: stopping after" not in windowed.stderr, windowed.stderr
+    assert "hook 'fixture-a/a-run-post'" in windowed.stderr, windowed.stderr
+    reset()
+
     # (The legacy `wasm serve|export` left the core in 3.0, RFC cli#466 PR B:
     # `labelle wasm` is an unknown command now, test/provider_targets_e2e.py.)
     reset()
@@ -681,6 +735,16 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000, "watch": None}, ctx
     assert Path(ctx["target_dir"]) == probe_dir.resolve() and Path(ctx["output_dir"]) == probe_out.resolve(), ctx
     assert "run options not passed" not in replaced.stderr, replaced.stderr
+    # cli#485: a headless run's default budget reaches the replacement the
+    # same way an explicit --timeout does, as `timeout_ms`, and is announced.
+    plant()
+    headless_replaced = run("run", "--platform=probe-target", "--headless",
+                            extra_env={"LABELLE_TEST_HEADLESS_DEFAULT_TIMEOUT": "2s"})
+    assert "labelle: headless run: stopping after 2s" in headless_replaced.stderr, headless_replaced.stderr
+    assert probe_context(probe_out, "deploy")["run"]["timeout_ms"] == 2000, log(probe_out)
+    plant()
+    run("run", "--platform=probe-target", "--headless", "--timeout=0")
+    assert probe_context(probe_out, "deploy")["run"]["timeout_ms"] is None, log(probe_out)
     # The same command's generate and build replacements: the target dir,
     # and no run options off the run step.
     for step_dir, hook_id in ((probe_dir, "gen"), (probe_out, "build")):
@@ -711,11 +775,20 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert ctx["contract_version"] == "1.1.0" and "run" not in ctx and "target_dir" not in ctx, ctx
     note = "labelle: note: run options not passed to 'fixture-a/deploy' (provider contract 1.1.0 < 1.2.0)"
     assert capped.stderr.count(note) == 1, capped.stderr
+    # The timeout is dropped with the rest, and the run is said to be
+    # unbounded (cli#485): the CLI does not time a replacement itself.
+    unbounded = "labelle: warning: 'fixture-a/deploy' cannot receive the run's timeout (provider contract 1.1.0 < 1.2.0)"
+    assert capped.stderr.count(unbounded) == 1, capped.stderr
+    # The headless default is a timeout like any other: the same warning.
+    plant()
+    capped_headless = run("run", "--platform=probe-target", "--headless")
+    assert "labelle: headless run: stopping after 5m" in capped_headless.stderr, capped_headless.stderr
+    assert capped_headless.stderr.count(unbounded) == 1, capped_headless.stderr
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     # No run options given: nothing was dropped, so there is no note.
     plant()
     plain = run("run", "--platform=probe-target")
-    assert "run options not passed" not in plain.stderr, plain.stderr
+    assert "run options not passed" not in plain.stderr and "cannot receive the run's timeout" not in plain.stderr, plain.stderr
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
 
     # ── contract 1.3.0: environment contributions (env_file) ──────────────
