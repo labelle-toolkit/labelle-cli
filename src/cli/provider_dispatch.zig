@@ -687,7 +687,13 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     try env.put("LABELLE_HOME", host.cache_root);
     // Zig owns the complete source/dependency/compiler/options cache identity.
     // Always run the install step: never trust a stale installed executable.
-    const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ host.zig, "build", tool.build_step, "--prefix", prefix, "--system", host.packages }, null, &env);
+    const build_argv: []const []const u8 = &.{ host.zig, "build", tool.build_step, "--prefix", prefix, "--system", host.packages };
+    // When the caller owns stdout (`ToolRun.stdout`), the tool's build must
+    // not write there either: its stdout goes to the CLI's stderr.
+    const build_code = if (run.stdout != null)
+        try runStdoutToStderr(provider.dir, build_argv, &env)
+    else
+        try runner.runZigInheritWithEnv(a, provider.dir, build_argv, null, &env);
     if (build_code != 0) return build_code;
     if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
     const exe = try executable(a, prefix, tool.executable);
@@ -708,6 +714,30 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     try argv.appendSlice(a, run.trailing);
     if (run.stdout) |sink| return runCapturingStdout(a, run.cwd, argv.items, &env, sink);
     return runner.runZigInheritWithEnv(a, run.cwd, argv.items, null, &env);
+}
+
+/// Run `argv` with stdin and stderr inherited and its stdout sent to the
+/// CLI's stderr. Returns the exit status (128 + signal for a signal death).
+fn runStdoutToStderr(cwd: []const u8, argv: []const []const u8, env: *const std.process.Environ.Map) !u8 {
+    const io = config.globalIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .{ .file = std.Io.File.stderr() },
+        .stderr = .inherit,
+        .environ_map = env,
+    });
+    return exitStatus(try child.wait(io));
+}
+
+fn exitStatus(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |sig| 128 +% @as(u8, @truncate(@intFromEnum(sig))),
+        .stopped => |sig| 128 +% @as(u8, @truncate(@intFromEnum(sig))),
+        .unknown => 1,
+    };
 }
 
 /// Run `argv` with stdin and stderr inherited and stdout captured into
@@ -734,12 +764,7 @@ fn runCapturingStdout(a: std.mem.Allocator, cwd: []const u8, argv: []const []con
     };
     const term = try child.wait(io);
     sink.* = bytes;
-    return switch (term) {
-        .exited => |code| code,
-        .signal => |sig| 128 +% @as(u8, @truncate(@intFromEnum(sig))),
-        .stopped => |sig| 128 +% @as(u8, @truncate(@intFromEnum(sig))),
-        .unknown => 1,
-    };
+    return exitStatus(term);
 }
 
 /// A project command: Debug, human progress, output under

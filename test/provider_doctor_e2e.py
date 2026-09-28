@@ -347,6 +347,22 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
         assert json.loads((outputs / package / "capture.json").read_text())["args"] == ["--json"], package
     # The human report still goes to stderr.
     assert "labelle alpha doctor" in mixed.stderr and "Provider doctors: 2 checked" in mixed.stderr, mixed.stderr
+    # ...and agrees with the document: beta exited 0, but its report is
+    # invalid, so the summary counts it as failed.
+    assert "[ FAIL ] labelle beta doctor printed an invalid --json report" in mixed.stderr, mixed.stderr
+    assert "Provider doctors: 2 checked, 1 failed (beta)" in mixed.stderr, mixed.stderr
+    assert "[  OK  ] labelle alpha doctor" in mixed.stderr, mixed.stderr
+
+    # A provider tool whose BUILD prints on stdout: in `--json` mode that
+    # text goes to stderr, and stdout stays the one document. The control
+    # (`labelle <ns> doctor`, which passes stdout through) shows the build
+    # really prints there.
+    noise = {"PROVIDER_PROBE_BUILD_STDOUT": "PROBE-BUILD-STDOUT-NOISE"}
+    control = subprocess.run([cli, "alpha", "doctor"], cwd=project, env=dict(env, **noise), text=True, capture_output=True, timeout=600)
+    assert control.returncode == 0 and "PROBE-BUILD-STDOUT-NOISE" in control.stdout, (control.returncode, control.stdout, control.stderr)
+    caps, ids, noisy = report(capability("alpha-cap"), capability("beta-cap"), extra_env=noise)
+    assert ids == [core_id, "alpha-cap", "beta-cap"], ids
+    assert "PROBE-BUILD-STDOUT-NOISE" not in noisy.stdout and "PROBE-BUILD-STDOUT-NOISE" in noisy.stderr, (noisy.stdout, noisy.stderr)
 
     # A provider that fails after a report claiming ok, beside one that
     # prints nothing: both are failed capabilities, and the document stands.
