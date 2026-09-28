@@ -143,6 +143,14 @@ pub const ParsedLock = struct {
     registry: ?[]const u8,
 };
 
+/// A lock's `registry` is one printable line: non-empty, no control bytes.
+/// `--accept` checks it before writing, so it never commits a lock this
+/// parser would refuse.
+pub fn checkRegistrySource(source: []const u8) !void {
+    if (source.len == 0) return error.InvalidProviderRegistrySource;
+    for (source) |c| if (c < 0x20 or c == 0x7f) return error.InvalidProviderRegistrySource;
+}
+
 /// Strict, like every lock read: schema 1 may not carry `registry`, schema 2
 /// must, as one printable line.
 pub fn parseLock(a: std.mem.Allocator, bytes: []const u8) !ParsedLock {
@@ -156,8 +164,7 @@ pub fn parseLock(a: std.mem.Allocator, bytes: []const u8) !ParsedLock {
         },
         lock_schema => {
             const lock = try std.json.parseFromSliceLeaky(Lock, a, bytes, .{ .allocate = .alloc_always });
-            if (lock.registry.len == 0) return error.InvalidProviderRegistrySource;
-            for (lock.registry) |c| if (c < 0x20 or c == 0x7f) return error.InvalidProviderRegistrySource;
+            try checkRegistrySource(lock.registry);
             try checkPins(lock.providers, true);
             return .{ .document = .{ .schema_version = lock.schema_version, .providers = lock.providers }, .registry = lock.registry };
         },
@@ -301,6 +308,9 @@ test "provider github: lock schema 2 records the registry source; schema 1 stays
     try std.testing.expectError(error.InvalidProviderRegistrySource, parseLock(a, "{\"schema_version\":2,\"registry\":\"\",\"providers\":[]}"));
     try std.testing.expectError(error.InvalidProviderRegistrySource, parseLock(a, "{\"schema_version\":2,\"registry\":\"a\\u001bb\",\"providers\":[]}"));
     try std.testing.expectError(error.UnsupportedProviderSchema, parseLock(a, "{\"schema_version\":3,\"registry\":\"x\",\"providers\":[]}"));
+    // The same rule `--accept` applies before it writes (a POSIX path may hold a newline).
+    try std.testing.expectError(error.InvalidProviderRegistrySource, checkRegistrySource("../reg\nistry/providers.json"));
+    try checkRegistrySource("../my registry/providers.json");
     try std.testing.expectError(error.DuplicateProviderRelease, parseLock(a, "{\"schema_version\":2,\"registry\":\"x\",\"providers\":[" ++ pin ++ "," ++ pin ++ "]}"));
     // A registry document is still schema 1 only through this parser.
     try std.testing.expectError(error.UnknownField, parse(a, "{\"schema_version\":2,\"registry\":\"x\",\"providers\":[]}", false));

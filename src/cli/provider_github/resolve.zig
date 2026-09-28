@@ -100,6 +100,11 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     // confirm it (the whole normalised document, not just the selected
     // pins), and the pins prepared below are the previewed ones.
     try checkPreview(a, preview.?, source, doc, selected.items);
+    // The source the new lock will record (#456), in the project form (a
+    // local file relative to the project root). Checked before any archive
+    // work, so an accept never commits a lock that no later read accepts.
+    const lock_source = try registry_lookup.projectSource(a, root, try registry_lookup.canonicalSource(a, source));
+    try pin_mod.checkRegistrySource(lock_source);
     // What the target-hint cache will hold after the commit: the normalised
     // form of the document just bound to the preview, so its bytes hash to
     // the reviewed `registry_digest`. `checkPreview` already refused any
@@ -154,9 +159,7 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     try contract.validateOwnership(ownership.items, reserved);
     try hooks.validateAll(a, providers.items, &.{});
     const dest = try std.fs.path.join(a, &.{ root, lock_name });
-    // The lock records which registry its pins came from (#456), in the
-    // project form: a local file relative to the project root.
-    const lock: pin_mod.Lock = .{ .schema_version = pin_mod.lock_schema, .registry = try registry_lookup.projectSource(a, root, try registry_lookup.canonicalSource(a, source)), .providers = selected.items };
+    const lock: pin_mod.Lock = .{ .schema_version = pin_mod.lock_schema, .registry = lock_source, .providers = selected.items };
     const pins = try std.json.Stringify.valueAlloc(a, lock, .{ .whitespace = .indent_2 });
     {
         // Under the project lock every lock write of the project takes
