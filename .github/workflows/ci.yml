@@ -89,6 +89,9 @@ jobs:
       - name: Provider lifecycle hooks subprocess regression
         run: python test/provider_hooks_e2e.py
 
+      - name: Run replacement outcome subprocess regression (run.outcome_file)
+        run: python test/provider_run_outcome_e2e.py
+
       - name: Provider targets subprocess regression
         run: python test/provider_targets_e2e.py
 

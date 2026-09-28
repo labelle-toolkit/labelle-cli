@@ -2,18 +2,18 @@
 const std = @import("std");
 
 /// The contract version this CLI implements: the newest wire it speaks.
-pub const version = "1.4.0";
+pub const version = "1.5.0";
 
 /// Every wire version this CLI can speak, newest first. A minor is additive:
 /// `1.1.0` is `1.0.0` plus the optional `build_number` key, `1.2.0` is
 /// `1.1.0` plus `target_dir` and the `run` options, `1.3.0` is `1.2.0`
-/// plus `cache_dir` and `env_file`, and `1.4.0` is `1.3.0` plus
-/// `final_step` (§2). The version a provider receives is
-/// negotiated from its `command_contract` range
+/// plus `cache_dir` and `env_file`, `1.4.0` is `1.3.0` plus
+/// `final_step`, and `1.5.0` is `1.4.0` plus `run.outcome_file` (§2).
+/// The version a provider receives is negotiated from its `command_contract` range
 /// (`provider_manifest.negotiate`), so a provider pinned to `<1.1.0` keeps
 /// receiving the exact `1.0.0` wire and never sees a key it would reject as
 /// unknown.
-pub const supported_versions = [_][]const u8{ version, "1.3.0", "1.2.0", "1.1.0", "1.0.0" };
+pub const supported_versions = [_][]const u8{ version, "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0" };
 
 /// The first wire version that carries `build_number`.
 pub const build_number_since = "1.1.0";
@@ -29,6 +29,9 @@ pub const watch_context_since = "1.3.0";
 
 /// The first wire version that carries `final_step`.
 pub const final_step_since = "1.4.0";
+
+/// The first wire version whose `run` context carries `outcome_file`.
+pub const outcome_context_since = "1.5.0";
 
 fn atLeast(wire_version: []const u8, since: []const u8) bool {
     const wire = std.SemanticVersion.parse(wire_version) catch return false;
@@ -63,6 +66,12 @@ pub fn carriesWatchContext(wire_version: []const u8) bool {
 /// every context).
 pub fn carriesFinalStep(wire_version: []const u8) bool {
     return atLeast(wire_version, final_step_since);
+}
+
+/// True when the wire `contract_version`'s `run` context carries the
+/// `outcome_file` key (null on every `run` hook but the replacement).
+pub fn carriesOutcomeContext(wire_version: []const u8) bool {
+    return atLeast(wire_version, outcome_context_since);
 }
 
 /// Whether a command whose last lifecycle step is `final` runs the hooks of
@@ -146,7 +155,8 @@ pub const WatchContext = struct {
 /// Every key is required; `timeout_ms` is null when `--timeout` was not
 /// given. `watch` (wire `1.3.0`+) is required there too: null outside a
 /// watch session and on every hook but the replacement; absent below
-/// `1.3.0`.
+/// `1.3.0`. `outcome_file` (wire `1.5.0`+) is required there: a path on
+/// the run replacement, null on every other `run` hook; absent below.
 pub const RunContext = struct {
     /// The run options as `LABELLE_*` variables, in the order the core
     /// launch sets them. Empty when none was given.
@@ -157,6 +167,11 @@ pub const RunContext = struct {
     timeout_ms: ?u64,
     /// The watch session, on the run replacement of `labelle run --watch`.
     watch: ?WatchContext = null,
+    /// Where the run replacement may report how the run ended (contract §2
+    /// "Run outcome", wire `1.5.0`+): an absolute path on the replacement,
+    /// null on every other `run` hook, absent below `1.5.0`. The file does
+    /// not exist when the replacement starts.
+    outcome_file: ?[]const u8 = null,
 
     /// Whether the user passed any run option at all.
     pub fn given(self: RunContext) bool {
@@ -175,6 +190,7 @@ pub const RunContext = struct {
             if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidRunArgument;
         }
         if (self.watch) |w| try w.validate();
+        if (self.outcome_file) |path| try absolute(path);
     }
 
     /// The object on `wire`: `watch` written (null or not) from `1.3.0`,
@@ -190,6 +206,10 @@ pub const RunContext = struct {
         if (carriesWatchContext(wire)) {
             try jws.objectField("watch");
             try jws.write(self.watch);
+        }
+        if (carriesOutcomeContext(wire)) {
+            try jws.objectField("outcome_file");
+            try jws.write(self.outcome_file);
         }
         try jws.endObject();
     }
@@ -323,6 +343,12 @@ pub const Context = struct {
                 // Only the replacement is the session's long-lived launch.
                 if (self.invocation.phase != .replace) return error.WatchNotAllowed;
             }
+            if (!carriesOutcomeContext(self.contract_version)) {
+                // A `1.4.0` strict decoder rejects the key.
+                if (run.outcome_file != null) return error.UnsupportedContract;
+            } else if (self.invocation.phase == .replace) {
+                if (run.outcome_file == null) return error.MissingOutcomeFile;
+            } else if (run.outcome_file != null) return error.OutcomeFileNotAllowed;
         } else if (run_hook) return error.MissingRunContext;
         if (!carriesToolchainContext(self.contract_version)) return;
         try absolute(self.cache_dir orelse return error.MissingCacheDir);
@@ -418,6 +444,10 @@ fn keyPresence(allocator: std.mem.Allocator, bytes: []const u8, wire: []const u8
         if (carriesWatchContext(wire)) {
             if (!run.object.contains("watch")) return error.MissingField;
         } else if (run.object.contains("watch")) return error.UnknownField;
+        // `run.outcome_file`: required (possibly null) from `1.5.0`.
+        if (carriesOutcomeContext(wire)) {
+            if (!run.object.contains("outcome_file")) return error.MissingField;
+        } else if (run.object.contains("outcome_file")) return error.UnknownField;
     };
 }
 
@@ -552,6 +582,7 @@ test {
     _ = @import("provider_contract_watch_test.zig");
     _ = @import("provider_contract_wire_test.zig");
     _ = @import("provider_contract_final_step_test.zig");
+    _ = @import("provider_contract_outcome_test.zig");
 }
 
 pub const fixture = if (@import("builtin").os.tag == .windows)
@@ -736,7 +767,7 @@ test "build_number is optional on the wire and only for bundle hooks" {
 }
 
 test "a 1.0.0 context never carries build_number; every wire otherwise validates" {
-    try std.testing.expectEqualStrings("1.4.0", version);
+    try std.testing.expectEqualStrings("1.5.0", version);
     try std.testing.expect(carriesBuildNumber("1.1.0"));
     try std.testing.expect(carriesBuildNumber("1.2.0"));
     try std.testing.expect(carriesBuildNumber("1.3.0"));
@@ -777,6 +808,8 @@ test "a 1.0.0 context never carries build_number; every wire otherwise validates
     value.final_step = .bundle;
     try value.validate(true);
     value.contract_version = "1.5.0";
+    try value.validate(true);
+    value.contract_version = "1.6.0";
     try std.testing.expectError(error.UnsupportedContract, value.validate(true));
 }
 

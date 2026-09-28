@@ -24,8 +24,9 @@ const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
 /// so a `--progress=json` consumer never sees `done` before the hooks
 /// finished. After hooks never run unless the game itself exited 0 —
 /// not after a nonzero exit, not after the `--timeout` watchdog's kill
-/// (exit 0 for the CLI, cli#390) and not after a detached simulator or
-/// device launch (`provider_hooks.RunOutcome`).
+/// (exit 0 for the CLI, cli#390) or a replacement's reported timeout
+/// (cli#473), and not after a detached simulator or device launch
+/// (`provider_hooks.RunOutcome`).
 ///
 /// A cross-compiled `--docker --target=<t>` binary cannot run on this
 /// host, so the core launch is skipped — and with it the whole `run`
@@ -66,9 +67,11 @@ pub fn launch(
         // while core rebuilds and publishes (`watch_session.zig`). The
         // install stage already refused a replacement that cannot watch.
         if (parsed_args.run_watch) return watch_session.run(cx, replacement, run_out, generate_out, build_out, zig_args, zig_env_ptr);
-        const code = try provider_hooks.runPhase(hook_site, &.{replacement}, .run, .replace, run_out);
-        if (code != 0) return code;
-        return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .exited_clean);
+        // A replacement that enforced `--timeout` itself reports it through
+        // `run.outcome_file` (wire 1.5.0+, cli#473): not a clean exit.
+        const outcome = try provider_hooks.runReplacement(hook_site, replacement, run_out);
+        if (outcome == .exited_error) return outcome.exited_error;
+        return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, outcome);
     }
     if (parsed.platform == .ios) {
         // iOS: deploy to simulator

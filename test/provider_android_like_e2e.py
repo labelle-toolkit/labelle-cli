@@ -290,7 +290,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
                    ("bundle", "before", "pre-bundle"), ("bundle", "replace", "bundle"),
                    ("bundle", "after", "post-bundle")], ran
     for e in entries:
-        assert e["context"]["contract_version"] == "1.4.0", e
+        assert e["context"]["contract_version"] == "1.5.0", e
         assert e["context"]["final_step"] == "bundle", e
     # The package hook saw the finished build.
     assert "lib" in hook_context(zig_out, "package")["output_entries"]

@@ -127,7 +127,36 @@ pub fn main(init: std.process.Init) !u8 {
     if (invocation == .object and ctx.value.object.get("run") != null) {
         const run_ctx = ctx.value.object.get("run").?;
         const watch_ctx = if (run_ctx == .object) run_ctx.object.get("watch") else null;
-        if (watch_ctx) |w| if (w == .object) return watchServer(init, a, output, w.object);
+        if (watch_ctx) |w| if (w == .object) return watchServer(init, a, output, w.object, outcomeFile(run_ctx));
+    }
+    // The run replacement's own outcome report (contract §2
+    // `run.outcome_file`, wire 1.5.0+, cli#473).
+    // `PROVIDER_PROBE_OUTCOME=<hook id>|<text>` makes that hook write
+    // `<text>` to its outcome file and exit 0; one whose context has no
+    // outcome file exits 9 instead. `PROVIDER_PROBE_DEADLINE=<hook id>` makes
+    // it enforce `run.timeout_ms` the way a provider's own watchdog does:
+    // it sleeps until the deadline, then writes `timeout` to its outcome
+    // file when its wire has one, and exits 0 either way.
+    if (invocation == .object and ctx.value.object.get("run") != null) {
+        const id = invocation.object.get("id").?.string;
+        const run_ctx = ctx.value.object.get("run").?;
+        const outcome_file = outcomeFile(run_ctx);
+        if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_OUTCOME")) |spec| {
+            const bar = std.mem.indexOfScalar(u8, spec, '|') orelse return error.BadProbeOutcomeSpec;
+            if (std.mem.eql(u8, id, spec[0..bar])) {
+                const path = outcome_file orelse return 9;
+                try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = spec[bar + 1 ..] });
+                return 0;
+            }
+        } else |_| {}
+        if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_DEADLINE")) |deadline_id| {
+            if (std.mem.eql(u8, id, deadline_id)) {
+                const ms = run_ctx.object.get("timeout_ms").?.integer;
+                init.io.sleep(std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
+                if (outcome_file) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = "timeout\n" });
+                return 0;
+            }
+        } else |_| {}
     }
     // `PROVIDER_PROBE_PATCH=<hook id>` makes that hook post-process the step
     // output the way a signing/stripping hook would: it overwrites
@@ -255,7 +284,7 @@ fn linger(init: std.process.Init, a: std.mem.Allocator, marker: []const u8) !voi
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn GetProcessId(process: std.os.windows.HANDLE) callconv(.winapi) u32;
 
-fn watchServer(init: std.process.Init, a: std.mem.Allocator, output: []const u8, watch: std.json.ObjectMap) !u8 {
+fn watchServer(init: std.process.Init, a: std.mem.Allocator, output: []const u8, watch: std.json.ObjectMap, outcome_file: ?[]const u8) !u8 {
     const io = init.io;
     const generation_file = watch.get("generation_file").?.string;
     const output_dir = watch.get("output_dir").?.string;
@@ -278,10 +307,25 @@ fn watchServer(init: std.process.Init, a: std.mem.Allocator, output: []const u8,
         } else |_| {}
         if (stop_path) |path| {
             if (std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16))) |code| {
+                // `timeout`: stop the way a server's own `--timeout` deadline
+                // would, reporting it through `run.outcome_file` (wire
+                // 1.5.0+, cli#473), and exit 0.
+                if (std.mem.eql(u8, std.mem.trim(u8, code, " \r\n"), "timeout")) {
+                    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outcome_file orelse return 9, .data = "timeout\n" });
+                    return 0;
+                }
                 return std.fmt.parseInt(u8, std.mem.trim(u8, code, " \r\n"), 10) catch 0;
             } else |_| {}
         }
         io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch {};
     }
     return 3;
+}
+
+/// A `run` context's `outcome_file` (wire 1.5.0+): the path on the run
+/// replacement, null on any other hook or an older wire.
+fn outcomeFile(run_ctx: std.json.Value) ?[]const u8 {
+    if (run_ctx != .object) return null;
+    const value = run_ctx.object.get("outcome_file") orelse return null;
+    return if (value == .string) value.string else null;
 }
