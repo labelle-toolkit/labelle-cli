@@ -617,10 +617,17 @@ pub fn collectPrebuildIgnorePaths(
     for (steps) |step| {
         for (step.outputs) |rel| {
             const p = watch.watchIgnorePath(allocator, project_dir, rel) catch continue;
+            // Also as the extra-root walk spells it, canonically: an output
+            // written inside a local provider outside the project
+            // (`../pkg/gen.zig`) is walked under the provider's canonical
+            // root, not under `project_dir` (cli#476).
+            const canonical = watch.tree.canonicalIgnorePath(config.globalIo(), allocator, p);
             out.append(allocator, p) catch {
                 allocator.free(p);
+                if (canonical) |c| allocator.free(c);
                 continue;
             };
+            if (canonical) |c| out.append(allocator, c) catch allocator.free(c);
         }
     }
     return out;

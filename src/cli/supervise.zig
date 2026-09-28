@@ -370,7 +370,9 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
     var joined = false;
     defer if (!joined) {
         // An error ends the child's tree so the waiting thread returns.
-        if (sup.group) |g| g.killSlot(sup.slot);
+        // The group and slot saved before the waiter started: it clears
+        // `sup.group` itself when it reaps.
+        if (waited.group) |g| g.killSlot(waited.slot);
         waiter.join();
     };
 

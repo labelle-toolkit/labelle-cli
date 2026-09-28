@@ -373,6 +373,10 @@ test "rebuild commit: the local providers outside the project are watched with i
 /// A scripted watch loop over `project` + `roots`: `edit` is written at
 /// tick 2; returns how many rebuilds fired in 10 ticks.
 fn rebuildsAfterEdit(project: []const u8, roots: []const []const u8, edit: []const u8) !u32 {
+    return rebuildsAfterEditIgnoring(project, roots, &.{}, edit);
+}
+
+fn rebuildsAfterEditIgnoring(project: []const u8, roots: []const []const u8, ignore: []const []const u8, edit: []const u8) !u32 {
     const Script = struct {
         path: []const u8,
         ticks: u32 = 0,
@@ -391,7 +395,7 @@ fn rebuildsAfterEdit(project: []const u8, roots: []const []const u8, edit: []con
     };
     var script: Script = .{ .path = edit };
     var state: watch.WatchState = .{};
-    watch.watchLoop(config.globalIo(), .{ .watch_dir = project, .extra_roots = roots, .rebuild_fn = Script.rebuild, .rebuild_ctx = &script, .clock = .{ .ctx = &script, .wait = Script.wait } }, &state);
+    watch.watchLoop(config.globalIo(), .{ .watch_dir = project, .extra_roots = roots, .ignore_files = ignore, .rebuild_fn = Script.rebuild, .rebuild_ctx = &script, .clock = .{ .ctx = &script, .wait = Script.wait } }, &state);
     return script.rebuilds;
 }
 
@@ -438,6 +442,9 @@ test "rebuild commit: nested local providers are walked once, so an inner edit r
     const edit = try std.fs.path.join(a, &.{ outer, "inner", "src", "tool.zig" });
     defer a.free(edit);
     try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEdit(project, roots.items, edit));
+    // The control edits real bytes too: back to "v1" first, so the edit
+    // below is a change, not a rewrite of the same content.
+    try tmp.dir.writeFile(io, .{ .sub_path = "outer/inner/src/tool.zig", .data = "v1" });
     const inner = try tmp.dir.realPathFileAlloc(io, "outer/inner", a);
     defer a.free(inner);
     const doubled = [_][]const u8{ outer, inner };
@@ -522,4 +529,37 @@ test "rebuild commit: a rollback restores an absent labelle.lock as absent (cli#
     try std.testing.expect(Spy.lock_existed);
     try std.testing.expectError(error.FileNotFound, fx.tmp.dir.access(io, "project/labelle.lock", .{}));
     try published.expectServes(a, "zero", 0);
+}
+
+test "rebuild commit: a prebuild output inside an external local provider is ignored by its canonical walk (cli#476)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg");
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/game.zig", .data = "g" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/plugin.labelle", .data = ".{}" });
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    const deps = [_]project_config.PluginDep{.{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" }};
+    var roots = rebuild.localProviderRoots(a, project, &deps);
+    defer freeRoots(a, &roots);
+    try std.testing.expectEqual(@as(usize, 1), roots.items.len);
+    // A step that regenerates a file inside the provider (not there yet).
+    const steps = [_]@import("../prebuild.zig").Step{.{ .run = &.{"gen"}, .outputs = &.{"../pkg/gen.zig"} }};
+    var ignore = rebuild.collectPrebuildIgnorePaths(a, project, &steps, true);
+    defer freeRoots(a, &ignore);
+    const gen = try std.fs.path.join(a, &.{ roots.items[0], "gen.zig" });
+    defer a.free(gen);
+    // The project-relative spelling, and the canonical one the walk uses.
+    try std.testing.expectEqual(@as(usize, 2), ignore.items.len);
+    try std.testing.expectEqualStrings(gen, ignore.items[1]);
+    // The step's rewrite fires nothing...
+    try std.testing.expectEqual(@as(u32, 0), try rebuildsAfterEditIgnoring(project, roots.items, ignore.items, gen));
+    // ...which the project-relative spelling alone did not achieve (the
+    // file is removed first, so the write is an addition, not a rewrite).
+    try tmp.dir.deleteFile(io, "pkg/gen.zig");
+    try std.testing.expectEqual(@as(u32, 1), try rebuildsAfterEditIgnoring(project, roots.items, ignore.items[0..1], gen));
 }

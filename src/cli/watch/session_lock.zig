@@ -62,27 +62,29 @@ pub const SessionLock = struct {
 /// is ours) with a non-blocking exclusive OS lock. Refused: another live
 /// session holds it. Granted: whatever the file recorded belongs to a
 /// session that is gone, and it is rewritten with our PID.
+///
+/// The path is opened WITHOUT following a symbolic link and must be a
+/// regular file: the lock lives in the project tree, and a link planted
+/// there (a damaged or untrusted checkout) must never make a watch session
+/// truncate and overwrite the file it names (cli#476 review).
 const Claimed = struct { file: std.Io.File, took_over: ?u64 };
 
 fn claim(lock_path: []const u8) !Claimed {
     const io = config.globalIo();
-    const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-    }) catch |err| switch (err) {
-        error.WouldBlock => {
-            var buf: [24]u8 = undefined;
-            if (readOwner(lock_path, &buf)) |owner| {
-                std.debug.print("labelle: run --watch: another watch session (pid {d}) is already running for this target; stop it first (lock: {s})\n", .{ owner, lock_path });
-            } else {
-                std.debug.print("labelle: run --watch: another watch session (pid unknown) is already running for this target; stop it first (lock: {s})\n", .{lock_path});
-            }
-            return error.WatchSessionActive;
-        },
+    const file = try openRegular(lock_path);
+    errdefer file.close(io);
+    const locked = file.tryLock(io, .exclusive) catch |err| switch (err) {
         else => return err,
     };
+    if (!locked) {
+        var buf: [24]u8 = undefined;
+        if (readOwner(lock_path, &buf)) |owner| {
+            std.debug.print("labelle: run --watch: another watch session (pid {d}) is already running for this target; stop it first (lock: {s})\n", .{ owner, lock_path });
+        } else {
+            std.debug.print("labelle: run --watch: another watch session (pid unknown) is already running for this target; stop it first (lock: {s})\n", .{lock_path});
+        }
+        return error.WatchSessionActive;
+    }
     errdefer file.close(io);
     // The lock is ours: a previous owner, if the file still names one,
     // ended without releasing it (a clean release empties the file).
@@ -99,10 +101,41 @@ fn claim(lock_path: []const u8) !Claimed {
     return .{ .file = file, .took_over = took_over };
 }
 
+/// Open (or create) `lock_path` for reading and writing, never through a
+/// symbolic link: an existing entry is opened without following links and
+/// must be a regular file; a missing one is created exclusively, which
+/// fails on any entry — a dangling link included — that appears meanwhile.
+fn openRegular(lock_path: []const u8) !std.Io.File {
+    const io = config.globalIo();
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false }) catch |err| switch (err) {
+            error.FileNotFound => {
+                return std.Io.Dir.cwd().createFile(io, lock_path, .{ .read = true, .truncate = false, .exclusive = true }) catch |create_err| switch (create_err) {
+                    error.PathAlreadyExists => continue,
+                    else => return create_err,
+                };
+            },
+            error.SymLinkLoop, error.IsDir, error.NotDir => return notRegular(lock_path),
+            else => return err,
+        };
+        errdefer file.close(io);
+        const st = try file.stat(io);
+        if (st.kind != .file) return notRegular(lock_path);
+        return file;
+    }
+    return notRegular(lock_path);
+}
+
+fn notRegular(lock_path: []const u8) error{WatchLockNotRegular} {
+    std.debug.print("labelle: run --watch: the watch session lock '{s}' is not a regular file (a symbolic link or a directory); remove it and run again\n", .{lock_path});
+    return error.WatchLockNotRegular;
+}
+
 /// The PID a lock file records, read without taking the lock.
 fn readOwner(lock_path: []const u8, buf: []u8) ?u64 {
     const io = config.globalIo();
-    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .follow_symlinks = false, .allow_directory = false }) catch return null;
     defer file.close(io);
     const n = file.readPositionalAll(io, buf, pid_offset) catch return null;
     return parseOwner(buf[0..n]);
@@ -173,4 +206,32 @@ test "session lock: a stale lock is taken over by exactly one contender (cli#474
     try std.testing.expectEqual(@as(?u64, 2147483000), owner.took_over);
     var buf: [24]u8 = undefined;
     try std.testing.expectEqual(ownPid(), readOwner(owner.path, &buf).?);
+}
+
+test "session lock: a symbolic link or directory at the lock path is refused, and never written through (cli#476)" {
+    if (is_windows) return error.SkipZigTest; // links need a privilege there
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const root = try std.fs.path.join(a, &.{ base, "session" });
+    defer a.free(root);
+    // A link planted at the lock path, naming a file of the user's.
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "precious" });
+    try tmp.dir.symLink(io, "victim.txt", "session.lock", .{});
+    try std.testing.expectError(error.WatchLockNotRegular, SessionLock.acquire(a, root));
+    const victim = try tmp.dir.readFileAlloc(io, "victim.txt", a, .limited(64));
+    defer a.free(victim);
+    try std.testing.expectEqualStrings("precious", victim);
+    // A dangling link is refused too (nothing is created through it).
+    try tmp.dir.deleteFile(io, "session.lock");
+    try tmp.dir.symLink(io, "created.txt", "session.lock", .{});
+    try std.testing.expectError(error.WatchLockNotRegular, SessionLock.acquire(a, root));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "created.txt", .{}));
+    // So is a directory.
+    try tmp.dir.deleteFile(io, "session.lock");
+    try tmp.dir.createDirPath(io, "session.lock");
+    try std.testing.expectError(error.WatchLockNotRegular, SessionLock.acquire(a, root));
 }

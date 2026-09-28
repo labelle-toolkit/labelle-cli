@@ -210,13 +210,16 @@ pub const SessionKey = struct {
 /// away) is absent, not an error: the digest is best effort like the
 /// watcher's walk, and the next edit is seen anyway.
 pub fn localSourceDigest(a: std.mem.Allocator, dirs: []const []const u8, project: []const u8) ![32]u8 {
-    return localSourceDigestWith(a, dirs, project, null);
+    var chunk: [64 * 1024]u8 = undefined;
+    return localSourceDigestWith(a, dirs, project, null, &chunk);
 }
 
 /// Test seam: runs between collecting a tree's files and reading them.
 const Between = *const fn ([]const u8, []const []const u8) void;
 
-fn localSourceDigestWith(a: std.mem.Allocator, dirs: []const []const u8, project: []const u8, between: ?Between) ![32]u8 {
+/// Files are streamed through `chunk`, so any size hashes in constant
+/// memory; a test passes a tiny one.
+fn localSourceDigestWith(a: std.mem.Allocator, dirs: []const []const u8, project: []const u8, between: ?Between, chunk: []u8) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (dirs) |dir| {
         var files: std.ArrayList([]const u8) = .empty;
@@ -236,17 +239,25 @@ fn localSourceDigestWith(a: std.mem.Allocator, dirs: []const []const u8, project
         for (files.items) |rel| {
             const path = try std.fs.path.join(a, &.{ dir, rel });
             defer a.free(path);
-            const bytes = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, a, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
+            const io = config.globalIo();
+            const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
-            defer a.free(bytes);
-            var size: [8]u8 = undefined;
-            std.mem.writeInt(u64, &size, bytes.len, .little);
+            defer file.close(io);
             hash.update(rel);
             hash.update(&.{0});
+            // The bytes, then their length: framed, whatever the size.
+            var total: u64 = 0;
+            while (true) {
+                const n = try file.readPositionalAll(io, chunk, total);
+                hash.update(chunk[0..n]);
+                total += n;
+                if (n < chunk.len) break;
+            }
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, total, .little);
             hash.update(&size);
-            hash.update(bytes);
         }
     }
     var digest: [32]u8 = undefined;
@@ -258,9 +269,12 @@ fn collectSources(a: std.mem.Allocator, top: []const u8, rel: []const u8, projec
     const io = config.globalIo();
     const abs = if (rel.len == 0) try a.dupe(u8, top) else try std.fs.path.join(a, &.{ top, rel });
     defer a.free(abs);
-    var dir = std.Io.Dir.cwd().openDir(io, abs, .{ .iterate = true }) catch |err| switch (err) {
-        // A subdirectory renamed away mid-walk; the tree itself must exist.
-        error.FileNotFound => if (rel.len != 0) return else return err,
+    // Below the tree's top, a directory is never entered through a link
+    // (one swapped in mid-walk included).
+    var dir = std.Io.Dir.cwd().openDir(io, abs, .{ .iterate = true, .follow_symlinks = rel.len == 0 }) catch |err| switch (err) {
+        // A subdirectory renamed away (or replaced) mid-walk; the tree
+        // itself must exist.
+        error.FileNotFound, error.SymLinkLoop, error.NotDir => if (rel.len != 0) return else return err,
         else => return err,
     };
     defer dir.close(io);
@@ -537,7 +551,8 @@ test "session key: a source file renamed away during the digest walk is absent, 
             };
         }
     };
-    const got = try localSourceDigestWith(a, &dirs, "", Vanish.between);
+    var chunk: [4096]u8 = undefined;
+    const got = try localSourceDigestWith(a, &dirs, "", Vanish.between, &chunk);
     // The seam really removed a listed file, and the digest is the tree's
     // without it.
     try std.testing.expect(Vanish.seen);
@@ -564,4 +579,30 @@ test "session key: a provider containing the project is hashed without the proje
     // ...an edit to the provider around it is.
     try tmp.dir.writeFile(io, .{ .sub_path = "mono/tool.zig", .data = "tool2" });
     try std.testing.expect(!std.mem.eql(u8, &first, &(try localSourceDigest(a, &dirs, project))));
+}
+
+test "session key: provider files are hashed in chunks, whatever their size (cli#476)" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pkg");
+    // A file many chunks long, and one exactly a chunk long.
+    const big = try a.alloc(u8, 10_000);
+    defer a.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i % 251);
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/big.bin", .data = big });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/even.bin", .data = big[0..64] });
+    const dir = try tmp.dir.realPathFileAlloc(io, "pkg", a);
+    defer a.free(dir);
+    const dirs = [_][]const u8{dir};
+    var tiny: [64]u8 = undefined;
+    var huge: [32 * 1024]u8 = undefined;
+    const streamed = try localSourceDigestWith(a, &dirs, "", null, &tiny);
+    const whole = try localSourceDigestWith(a, &dirs, "", null, &huge);
+    try std.testing.expectEqualSlices(u8, &whole, &streamed);
+    // A change past the first chunks is still seen.
+    big[9_999] +%= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/big.bin", .data = big });
+    try std.testing.expect(!std.mem.eql(u8, &streamed, &(try localSourceDigestWith(a, &dirs, "", null, &tiny))));
 }
