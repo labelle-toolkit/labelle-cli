@@ -1,6 +1,6 @@
 //! Command-execution pipeline for the labelle CLI (#311). Extracted from
 //! cli.zig `main` so the dispatcher stays small: this owns the
-//! generate -> build -> run flow and the docker / wasm / ios
+//! generate -> build -> run flow and the docker / ios
 //! branches. Behavior is identical to when this lived in `main`.
 //!
 //! Thin root: `run` walks the stages in order and owns every resource they
@@ -14,8 +14,7 @@
 //!                                    `--bake` prepasses, the shader re-gate
 //!   pipeline/build.zig               core build, packaging finalisation,
 //!                                    after-build, the `bundle` step
-//!   pipeline/run.zig                 run branches, `RunOutcome` plumbing,
-//!                                    `wasm serve|export --no-build`
+//!   pipeline/run.zig                 run branches, `RunOutcome` plumbing
 //!   pipeline/context.zig             `Context` + `HookPlans` the stages share
 //!   pipeline/optimize.zig            the effective optimize mode (flag, the
 //!                                    target owner's default, core fallback)
@@ -28,7 +27,6 @@
 //!   pipeline/watch_session.zig       `labelle run --watch`: refusals,
 //!                                    publication, supervision
 //!   pipeline/screenshot.zig          the post-run `--screenshot` report
-//!   pipeline/export_output.zig       the `wasm export --output` resolver
 //!   pipeline/testing.zig             helpers shared by the tests above
 const std = @import("std");
 const config = @import("config.zig");
@@ -58,18 +56,16 @@ const session_key = @import("pipeline/session_key.zig");
 const watch_session = @import("pipeline/watch_session.zig");
 const optimize_mod = @import("pipeline/optimize.zig");
 const screenshot = @import("pipeline/screenshot.zig");
-const export_output = @import("pipeline/export_output.zig");
 const testing = @import("pipeline/testing.zig");
 
 pub const ScreenshotProbeSpec = screenshot.ScreenshotProbeSpec;
 pub const CollectPrebuildIgnorePathsSpec = rebuild.CollectPrebuildIgnorePathsSpec;
-pub const ResolveExportOutputSpec = export_output.ResolveExportOutputSpec;
 
 /// Run the project-scoped pipeline: read project.labelle, then
-/// generate -> build -> run (or the docker / wasm / ios
+/// generate -> build -> run (or the docker / ios
 /// variant selected by `parsed_args`). Dispatch of the standalone
 /// subcommands stays in cli.zig `main`; this is invoked only for the
-/// project commands (generate / build / run / wasm / ios).
+/// project commands (generate / build / run / bundle / ios).
 /// Returns the process exit status the command earned: the game's own exit
 /// status for `run` (0 for a genuine `--timeout` expiry), 0 for everything
 /// that completed. `main` returns it as the CLI's exit code, so automation
@@ -85,13 +81,6 @@ pub const ResolveExportOutputSpec = export_output.ResolveExportOutputSpec;
 fn ok(result: anytype) !u8 {
     if (comptime @typeInfo(@TypeOf(result)) == .error_union) try result;
     return 0;
-}
-
-/// The core's legacy optimize fallback for a target platform: ReleaseSafe
-/// for a wasm build (Debug exceeds browser local variable limits), which a
-/// provider's declared default replaces.
-fn fallbackOptimize(platform: @import("project_config.zig").Platform) ?[]const u8 {
-    return if (platform == .wasm) "ReleaseSafe" else null;
 }
 
 pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
@@ -148,19 +137,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // ── Target resolution, the NAME half (RFC #406 phase 3b) ──────────
     // (`args_resolve.resolve`; docs/provider-targets.md "Resolution")
     const hook_arena = arena.allocator();
+    // `--docker` builds the core target only (RFC cli#466 D5): refused for
+    // a provider target before anything is read, written or built.
+    if (args_resolve.dockerRefused(parsed_args.docker, requested_target)) return 1;
     const resolved = switch (try args_resolve.resolve(allocator, hook_arena, project_dir, command, &parsed, requested_target)) {
         .proceed => |proceed| proceed,
         .exit => |code| return code,
     };
     const project_root = resolved.project_root;
     const provisional = resolved.provisional;
-
-    // `labelle wasm serve|export --no-build` — skip the generate+build
-    // pipeline and serve/package the existing build output
-    // (`run_stage.serveNoBuild`).
-    if (command == .wasm_cmd and parsed_args.serve_no_build) {
-        return run_stage.serveNoBuild(allocator, hook_arena, project_dir, project_root, parsed, &parsed_args, requested_target);
-    }
 
     // (Provider discovery, the ownership check of the provisional target
     // and the hook plans are computed further down, right after the package
@@ -226,7 +211,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // behavior instead of blocking the build.
     var reporter_storage: progress.Reporter = undefined;
     const reporter: ?*progress.Reporter = blk: {
-        if (command != .build and command != .run and command != .wasm_cmd and command != .bundle_cmd) break :blk null;
+        if (command != .build and command != .run and command != .bundle_cmd) break :blk null;
         reporter_storage = progress.Reporter.init(allocator, config.globalIo(), parsed_args.progress_mode, target_dir) catch break :blk null;
         break :blk &reporter_storage;
     };
@@ -315,12 +300,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     //
     // The effective optimize mode (`pipeline/optimize.zig`): an explicit
     // `--optimize` wins; else the target owner's `.target_defaults`; else
-    // the core's legacy ReleaseSafe for a wasm build (Debug exceeds browser
-    // local variable limits), which a provider's declared default replaces.
+    // none (Zig's default). The core keeps no per-target default of its own.
     const effective_optimize = optimize_mod.effective(
         parsed_args.optimize_override,
         optimize_mod.ownerDefault(providers, target.name),
-        fallbackOptimize(parsed.platform),
+        null,
     ).mode;
 
     // A path that cannot carry a provider's environment contribution or its
@@ -397,7 +381,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .hook_plans = hook_plans,
         .hook_site = &hook_site,
         .effective_optimize = effective_optimize,
-        .fallback_optimize = fallbackOptimize(parsed.platform),
         .watch_baseline = watch_baseline,
     };
 
@@ -433,14 +416,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
 
     // Build a base env for child `zig` that pins ZIG_*_CACHE_DIR into the
     // labelle cache tree (user-writable, never next to a read-only install).
-    // For a wasm build, ALSO layer the managed emsdk's EMSDK/EM_CONFIG/PATH
-    // wiring on top when one is already provisioned (labelle-cli#283) — an
-    // escape hatch for builds/backends that resolve `emcc` via PATH/env rather
-    // than the fetched package activated just above.
+    // A provider's toolchain reaches the compile through its hooks'
+    // environment contributions (contract §2 `env_file`), merged on top of
+    // this base by the build stage.
     var zig_env_storage: ?std.process.Environ.Map = if (parsed_args.docker)
         null
-    else if (parsed.platform == .wasm)
-        try runner.buildWasmEnv(allocator, project_dir)
     else
         try runner.buildZigEnv(allocator, &.{});
     defer if (zig_env_storage) |*m| m.deinit();
@@ -492,6 +472,5 @@ test {
     _ = watch_session;
     _ = optimize_mod;
     _ = screenshot;
-    _ = export_output;
     _ = testing;
 }

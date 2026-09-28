@@ -168,16 +168,10 @@ jobs:
 
   docker-build:
     name: Docker Build Test
-    # Validates the WASM/emscripten workarounds for the two Zig 0.16.0
-    # release bugs (both reproduce on the official tarball, not pip-specific):
-    #   * std/Io/Threaded.zig SIG__enum vs u32 mismatch — patched in the
-    #     Dockerfile via a one-line sed cherry-pick of Zig PR #31850
-    #     (see src/cli/docker.zig: install_zig).
-    #   * translate-c rejects emscripten 4.0.9's multi-arg
-    #     __attribute__((deprecated("msg1","msg2"))) — sidestepped by a
-    #     hand-rolled extern shim in the assembler's wasm.txt template
-    #     (no @cImport(emscripten.h)).
-    # Drop the workarounds once Zig 0.16.1+ + translate-c #306 land.
+    # `--docker` builds the core `desktop` target only (RFC cli#466 D5): a
+    # provider target's hooks and toolchain live on the host, so the CLI
+    # refuses `--docker` for it. This lane checks that refusal, then builds
+    # the desktop target in the container (a Windows cross build).
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
 
@@ -243,7 +237,7 @@ jobs:
       - name: Build assembler
         run: cd labelle-assembler && zig build
 
-      - name: Test --docker WASM build
+      - name: Test --docker desktop build
         env:
           LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
         run: |
@@ -267,17 +261,20 @@ jobs:
               --labelle-version="local:../../labelle-cli" \
               --assembler-version="local:../../labelle-assembler" &&
             cd docker_test &&
-            # `--platform=wasm` resolves only to a provider that declares the
-            # target (docs/provider-targets.md); the platform packages are not
-            # extracted yet, so declare the repo's own `wasm` fixture provider.
-            # The scaffold's empty `.plugins` is the seam: a template change
-            # that removes it must fail here, not as a "no provider" error.
+            # A provider target is refused before anything runs: exit 1, the
+            # D5 diagnostic, and no generated tree.
+            { ../../labelle-cli/zig-out/bin/labelle build --docker --platform=probe-target > refused.log 2>&1; test $? -eq 1; } &&
+            grep -q -- '--docker builds the `desktop` target only' refused.log &&
+            test ! -d .labelle/raylib_probe-target &&
+            # A desktop cross build: the Windows target needs no system
+            # libraries in the container. Gamepad off: the SDL2 gamepad source
+            # would need the host's SDL2 for that target.
             grep -q '\.plugins = \.{},' project.labelle &&
-            sed -i 's|\.plugins = \.{},|.plugins = .{ .{ .name = "wasm_fixture", .repo = "local:../../labelle-cli/test/fixtures/wasm-provider", .version = "1.0.0" } },|' project.labelle &&
-            grep -q 'wasm_fixture' project.labelle &&
-            ../../labelle-cli/zig-out/bin/labelle build --docker --platform=wasm &&
-            test -f .labelle/raylib_wasm/zig-out/web/game.wasm &&
-            echo "Docker WASM build produced game.wasm"
+            sed -i 's|\.plugins = \.{},|.plugins = .{},\n    .gamepad = .none,|' project.labelle &&
+            grep -q '\.gamepad = \.none' project.labelle &&
+            ../../labelle-cli/zig-out/bin/labelle build --docker --target=x86_64-windows &&
+            test -f .labelle/raylib_desktop/zig-out/bin/docker_test.exe &&
+            echo "Docker desktop cross build produced docker_test.exe"
           )
           # Backoff spans ~9 minutes. GitHub throttles tarball fetches from
           # Actions runners for far longer than a few quick attempts: the same

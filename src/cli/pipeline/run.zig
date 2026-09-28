@@ -1,149 +1,21 @@
-//! The run stage: the `run` hook phases around the launch branches (wasm
-//! serve / export with the `--watch` wiring, the iOS deploy,
-//! the host and docker launches) and the `RunOutcome` plumbing, plus the
-//! `wasm serve|export --no-build` path that skips generate and build.
+//! The run stage: the `run` hook phases around the launch branches (a
+//! provider's `replace run` hook, with the `--watch` supervision; the iOS
+//! deploy; the host and docker launches) and the `RunOutcome` plumbing.
 const std = @import("std");
 const builtin = @import("builtin");
-const config = @import("../config.zig");
 const project_config = @import("../project_config.zig");
 const runner = @import("../runner.zig");
-const prebuild = @import("../prebuild.zig");
-const serve = @import("../serve.zig");
-const export_mod = @import("../export.zig");
 const ios = @import("../ios.zig");
 const util = @import("../util.zig");
 const progress = @import("../progress.zig");
 const args_mod = @import("../args.zig");
 const provider_contract = @import("../provider_contract.zig");
-const provider_dispatch = @import("../provider_dispatch.zig");
-const provider_github = @import("../provider_github.zig");
 const provider_hooks = @import("../provider_hooks.zig");
-const refuseLegacyWasmReplacement = @import("args_resolve.zig").refuseLegacyWasmReplacement;
-const confirmTarget = @import("args_resolve.zig").confirmTarget;
-const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
-const resolveExportOutput = @import("export_output.zig").resolveExportOutput;
 const ScreenshotProbe = @import("screenshot.zig").ScreenshotProbe;
-const RebuildCtx = @import("rebuild.zig").RebuildCtx;
-const Replanner = @import("rebuild_replan.zig").Replanner;
 const watch_session = @import("watch_session.zig");
-const refuseKnownLegacyWasmReplacement = @import("args_resolve.zig").refuseKnownLegacyWasmReplacement;
-const optimize_mod = @import("optimize.zig");
 const Context = @import("context.zig").Context;
 const ParsedArgs = args_mod.ParsedArgs;
 const appendRunForwardedArgs = args_mod.appendRunForwardedArgs;
-
-/// `labelle wasm serve|export --no-build` — skip the generate+build
-/// pipeline and serve/package the existing build output. The web dir
-/// lives under the wasm target subdir (`.labelle/<backend>_wasm/`).
-///
-/// Only generate and build are skipped: serving or exporting the existing
-/// artifact IS the `run` step, so the `run` hook plan (contract §6) runs
-/// here exactly as on the building path — `--no-build` used to return
-/// before discovery and silently dropped every declared run hook (Codex
-/// P2 on #420). No installer runs on this path, so discovery is the
-/// metadata-only kind (`.unknown`, as `labelle help`): a declared remote
-/// package absent from every cache is not listed rather than reported as
-/// a broken install that never happened.
-pub fn serveNoBuild(
-    allocator: std.mem.Allocator,
-    hook_arena: std.mem.Allocator,
-    project_dir: []const u8,
-    project_root: []const u8,
-    parsed: project_config.ProjectConfig,
-    parsed_args: *const ParsedArgs,
-    requested_target: []const u8,
-) !u8 {
-    // Nothing is installed on this path, so the provisional target is
-    // confirmed against the providers discoverable as-is (`.unknown`,
-    // like `labelle targets`): a package absent from the cache cannot
-    // own a target here. Same diagnostics as the pipeline's own check.
-    var no_build_sources: provider_github.Sources = .{ .a = hook_arena };
-    defer no_build_sources.deinit();
-    const known = provider_dispatch.discover(hook_arena, project_root, parsed, &no_build_sources, .unknown) catch |err| {
-        std.debug.print("labelle: provider discovery failed: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    const served = switch (try confirmTarget(hook_arena, project_root, known, requested_target)) {
-        .resolved => |resolved| resolved,
-        .refused => return 1,
-    };
-    const no_build_plan = try provider_hooks.plan(hook_arena, known, .run, served.name);
-    if (refuseLegacyWasmReplacement(no_build_plan)) return 1;
-    const wasm_target = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), served.name });
-    defer allocator.free(wasm_target);
-    const wasm_target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", wasm_target });
-    defer allocator.free(wasm_target_dir);
-    const web_dir = try std.fs.path.join(allocator, &.{ wasm_target_dir, "zig-out", "web" });
-    defer allocator.free(web_dir);
-    if (std.Io.Dir.cwd().access(config.globalIo(), web_dir, .{})) |_| {} else |_| {
-        const verb = if (parsed_args.wasm_export) "export" else "serve";
-        std.debug.print(
-            "labelle wasm {s}: no existing WASM build at '{s}'\n" ++
-                "  run `labelle wasm {s}` (without --no-build) first.\n",
-            .{ verb, web_dir, verb },
-        );
-        return error.BuildFailed;
-    }
-    const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
-    defer allocator.free(project_web_dir);
-
-    // The same wire `optimize` the building path reports for this
-    // platform; there is no progress feed on this path.
-    const no_build_optimize = std.meta.stringToEnum(provider_contract.Optimize, optimize_mod.effective(
-        parsed_args.optimize_override,
-        optimize_mod.ownerDefault(known, served.name),
-        "ReleaseSafe",
-    ).mode.?) orelse {
-        std.debug.print("labelle: unknown optimize mode '{s}'\n", .{parsed_args.optimize_override.?});
-        return 1;
-    };
-    var no_build_site: provider_hooks.Site = .{
-        .a = hook_arena,
-        .backing = allocator,
-        .providers = known,
-        .root = project_root,
-        .cfg = parsed,
-        .target = served.name,
-        // Contract §2 `target_dir`, under the canonical root so it is
-        // absolute whatever `project_dir` was (the building path's
-        // `hook_site` does the same); `wasm_target_dir` keeps the raw
-        // `project_dir`, so `wasm serve ../game --no-build` made it relative.
-        .target_dir = try std.fs.path.join(hook_arena, &.{ project_root, ".labelle", wasm_target }),
-        .optimize = no_build_optimize,
-        .progress = switch (parsed_args.progress_mode) {
-            .human => .human,
-            .json => .json,
-            .off => .off,
-        },
-        .reporter = null,
-    };
-    const no_build_out = try provider_hooks.stepOutputDir(hook_arena, wasm_target_dir, .run, served.name, null);
-    {
-        const code = try provider_hooks.runPhase(&no_build_site, no_build_plan.before, .run, .before, no_build_out);
-        if (code != 0) return code;
-    }
-    if (no_build_plan.replace) |replacement| {
-        const code = try provider_hooks.runPhase(&no_build_site, &.{replacement}, .run, .replace, no_build_out);
-        if (code != 0) return code;
-        return provider_hooks.finishRun(&no_build_site, no_build_plan.after, no_build_out, .exited_clean);
-    }
-    if (parsed_args.wasm_export) {
-        const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
-        defer allocator.free(out_abs);
-        try export_mod.packageExport(allocator, web_dir, project_web_dir, .{
-            .output_dir = out_abs,
-            .zip = parsed_args.export_zip,
-            .platform = parsed_args.export_pkg_platform,
-        });
-        return provider_hooks.finishRun(&no_build_site, no_build_plan.after, no_build_out, .exited_clean);
-    }
-    // No watch in the `--no-build` path (the parser already rejects the
-    // `--watch --no-build` combination, so `serve_watch` is false here).
-    // The server returns on Ctrl+C / SIGTERM, the serve's clean end, and
-    // the after hooks run then — as on the building path.
-    try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
-    return provider_hooks.finishServe(&no_build_site, no_build_plan.after, no_build_out);
-}
 
 /// Provider hooks on `run` (contract §6): `before` runs once here, ahead
 /// of every branch below; a `replace` hook stands in for all of them;
@@ -153,9 +25,7 @@ pub fn serveNoBuild(
 /// finished. After hooks never run unless the game itself exited 0 —
 /// not after a nonzero exit, not after the `--timeout` watchdog's kill
 /// (exit 0 for the CLI, cli#390) and not after a detached simulator or
-/// device launch (`provider_hooks.RunOutcome`). The interactive `wasm
-/// serve` loop is the one exception in timing: its `done` record lands
-/// before the loop and the after hooks run only once the server returns.
+/// device launch (`provider_hooks.RunOutcome`).
 ///
 /// A cross-compiled `--docker --target=<t>` binary cannot run on this
 /// host, so the core launch is skipped — and with it the whole `run`
@@ -200,123 +70,7 @@ pub fn launch(
         if (code != 0) return code;
         return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .exited_clean);
     }
-    if (parsed.platform == .wasm) {
-        const web_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "web" });
-        defer allocator.free(web_dir);
-        const project_web_dir = try std.fs.path.join(allocator, &.{ project_dir, "web" });
-        defer allocator.free(project_web_dir);
-        if (parsed_args.wasm_export) {
-            // `wasm export`: package the fresh build into a deployment dir
-            // instead of serving it. Packaging runs AFTER the build, so
-            // keep the progress feed open across it (a run phase) and only
-            // mark `done` once the artifacts are on disk — otherwise a
-            // `--progress=json` consumer sees `done` before the export.
-            if (reporter) |r| {
-                r.beginPhaseOrStep(.run, "packaging wasm export");
-                r.clearSpinner();
-            }
-            const out_abs = try resolveExportOutput(allocator, project_dir, parsed_args.export_output);
-            defer allocator.free(out_abs);
-            try export_mod.packageExport(allocator, web_dir, project_web_dir, .{
-                .output_dir = out_abs,
-                .zip = parsed_args.export_zip,
-                .platform = parsed_args.export_pkg_platform,
-            });
-            return provider_hooks.finishRun(hook_site, hook_plans.run.after, run_out, .exited_clean);
-        } else {
-            // WASM serve: the loop is interactive (runs until Ctrl+C), so
-            // the terminal `done` record lands before the serve loop. The
-            // loop returns on Ctrl+C / SIGTERM (`serve.serveAndOpen`
-            // installs the handler), which is how the `after run` hooks
-            // below become reachable at all (Codex P2 on #420); a failing
-            // one revises that provisional `done` (`finishServe`).
-            if (reporter) |r| r.finishDone(0);
-            // The watched session's replan storage lives at THIS scope, not
-            // inside the `--watch` branch: once a rebuild has replanned,
-            // `hook_site.cfg`/`providers` point into its current generation,
-            // and the `after run` hooks below resolve settings through them.
-            // Destroyed at the watch branch's end, that storage was freed
-            // before the shutdown hooks read it (Codex P2 on #420). The
-            // defer runs after the `return` expression below is evaluated,
-            // i.e. after the hooks, and restores the startup storage on the
-            // site as it releases the generation.
-            const watch_installer = AssemblerInstaller{ .bin = cx.asm_bin };
-            var watch_replan = Replanner{
-                .backing = allocator,
-                .project_dir = project_dir,
-                .installer = Replanner.assemblerInstaller(&watch_installer),
-                // A running legacy serve cannot switch server
-                // implementations: a replan that adds a run replacement
-                // is refused.
-                .forbid_run_replacement = .{ .plan = refuseLegacyWasmReplacement, .known = refuseKnownLegacyWasmReplacement },
-            };
-            defer watch_replan.deinit(hook_site, cx.providers, parsed);
-            if (parsed_args.serve_watch) {
-                // `--watch` (cli#208): hand the serve loop the generic
-                // rebuild callback (`RebuildCtx`, the same one `labelle run
-                // --watch` drives). The context borrows locals that stay
-                // alive because `serveAndOpen` blocks until Ctrl+C.
-                //
-                // Every rebuild re-reads the project and replans through
-                // `watch_replan`, transactionally (cli#469); the plans
-                // computed above are only the initial state. The project
-                // the cold pipeline just installed and locked is the
-                // replan's baseline.
-                watch_replan.baseline();
-                watch_replan.seed(cx.provider_sources);
-                var rebuild_ctx = RebuildCtx{
-                    .allocator = allocator,
-                    .asm_bin = cx.asm_bin,
-                    .project_dir = project_dir,
-                    .platform_tag = target.name,
-                    .backend_tag = @tagName(parsed.backend),
-                    .output_dir = cx.output_dir,
-                    .target_dir = target_dir,
-                    .zig_args = zig_args,
-                    .zig_env = zig_env_ptr,
-                    .optimize_flag = parsed_args.optimize_override,
-                    .fallback_optimize = "ReleaseSafe",
-                    .prebuild_steps = parsed.prebuild,
-                    .prebuild_opts = .{
-                        .route_stdout_to_stderr = parsed_args.progress_mode == .json,
-                        .fatal_on_step_failure = false,
-                    },
-                    .hooks = hook_site,
-                    .generate_plan = hook_plans.generate,
-                    .build_plan = hook_plans.build,
-                    .generate_out = generate_out,
-                    .build_out = build_out,
-                    .replan = watch_replan.seam(),
-                    // The declared outputs of the prebuild steps are kept
-                    // out of the watch signature, swapped together with the
-                    // steps (cli#463) — but only while the steps actually
-                    // run (`collectPrebuildIgnorePaths`).
-                    .hooks_enabled = !prebuild.skipRequested(allocator),
-                    .prepass = .{ .legacy_target = target.legacy != null, .bake = parsed_args.bake, .fatal = false },
-                };
-                rebuild_ctx.initIgnore();
-                defer rebuild_ctx.deinit();
-
-                try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, .{
-                    .watch_dir = project_dir,
-                    .rebuild_fn = RebuildCtx.rebuild,
-                    .tick_fn = RebuildCtx.tick,
-                    .rebuild_ctx = &rebuild_ctx,
-                    .ignore = &rebuild_ctx.ignore,
-                });
-            } else {
-                try serve.serveAndOpen(allocator, web_dir, project_web_dir, parsed_args.serve_port, !parsed_args.serve_no_open, null);
-            }
-            // The server returned (Ctrl+C / SIGTERM): the serve's clean end.
-            // The feed already says `done`; only the hooks run here, and a
-            // failing one revises that record to `failed`.
-            //
-            // The hooks are the CURRENT generation's (`shutdownRunAfter`):
-            // `hook_site` already carries that generation's providers and
-            // config, and the lock on disk pins its versions.
-            return provider_hooks.finishServe(hook_site, watch_replan.shutdownRunAfter(hook_plans.run.after), run_out);
-        }
-    } else if (parsed.platform == .ios) {
+    if (parsed.platform == .ios) {
         // iOS: deploy to simulator
         if (reporter) |r| r.beginPhaseOrStep(.run, "deploying to iOS Simulator");
         std.debug.print("labelle: deploying to iOS Simulator...\n", .{});
@@ -522,14 +276,16 @@ fn noteRunSharesStdout(reporter: ?*progress.Reporter) void {
 
 /// The `--target` of a `run --docker` whose launch is skipped: a
 /// cross-compiled binary cannot run on this host. Only the host launch
-/// branch launches a binary here — `wasm` and `ios` deploy their own way,
-/// and every other provider target has a `replace run` hook (the install
-/// stage refuses it otherwise, `NoRunReplacement`), which stands in for the
+/// branch launches a binary here — `ios` deploys its own way, and every
+/// other provider target has a `replace run` hook (the install stage
+/// refuses it otherwise, `NoRunReplacement`), which stands in for the
 /// launch entirely — so neither is skipped. `null` when the launch happens.
+/// (A `--docker` run of a provider target is refused before this, RFC
+/// cli#466 D5; the table stays total over the schema platforms.)
 fn crossTargetLaunchSkipped(in_docker: bool, docker_target: ?[]const u8, platform: project_config.Platform, replaced: bool) ?[]const u8 {
     if (!in_docker or replaced) return null;
     switch (platform) {
-        .wasm, .ios => return null,
+        .ios => return null,
         else => return docker_target,
     }
 }
@@ -543,9 +299,7 @@ test "pipeline: a cross-target docker run is skipped before the run hooks" {
     // A replacement launches its own way; the deploy targets never reach
     // the host launch branch.
     try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", .desktop, true) == null);
-    for ([_]project_config.Platform{ .wasm, .ios }) |platform| {
-        try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", platform, false) == null);
-    }
+    try std.testing.expect(crossTargetLaunchSkipped(true, "aarch64-linux", .ios, false) == null);
     // `android` has no launch branch of its own any more: its provider's
     // `replace run` hook launches it (a cross target is not skipped then),
     // and without one the install stage refused the run already.

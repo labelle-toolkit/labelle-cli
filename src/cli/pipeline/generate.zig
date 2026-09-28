@@ -1,14 +1,11 @@
 //! The generate stage: the `generate` hook phases around the core
 //! generation (the ASTC and `--bake` prepasses, `assembler generate`, the
-//! fingerprint pass, emsdk activation), and the shader-override re-gate
+//! fingerprint pass), and the shader-override re-gate
 //! after the `before generate` hooks.
 const std = @import("std");
 const config = @import("../config.zig");
 const runner = @import("../runner.zig");
 const assembler_proc = @import("../assembler_proc.zig");
-const emsdk_toolchain = @import("../emsdk_toolchain.zig");
-const emsdk_activate = @import("../emsdk_activate.zig");
-const python_provision = @import("../python_provision.zig");
 const material_toolchain = @import("../material_toolchain.zig");
 const bake_mod = @import("../bake.zig");
 const progress = @import("../progress.zig");
@@ -16,7 +13,6 @@ const astc_cmd = @import("../../astc/cmd.zig");
 const provider_contract = @import("../provider_contract.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_hooks = @import("../provider_hooks.zig");
-const provider_env = @import("../provider_env.zig");
 const Context = @import("context.zig").Context;
 const gateThenInstall = @import("install.zig").gateThenInstall;
 
@@ -27,7 +23,7 @@ const gateThenInstall = @import("install.zig").gateThenInstall;
 ///
 /// `build` / `run` are not assembler subcommands: the subsequent
 /// `zig build` invocation and binary launch stay CLI-side (see below).
-/// The CLI owns docker orchestration, the WASM serve loop, the
+/// The CLI owns docker orchestration, the watch supervision, the
 /// iOS deploy path and `--timeout` — generation is the only
 /// step the assembler binary delegates.
 /// `parsed_args.scene_override` is intentionally NOT forwarded to the
@@ -126,88 +122,12 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
         // (`labelle.lock` was written before generation — see the provider
         // hook note beside `validatePluginCoreCompat`.)
         std.debug.print("  generated .labelle/{s}/\n", .{cx.target_name});
-
-        // For a wasm build: activate the emsdk checkout Zig just fetched into the
-        // project-local `zig-pkg/` (during the fingerprint pass above) so the emcc
-        // link step finds `upstream/emscripten/emcc`. Without this a fresh
-        // `labelle build --platform wasm` — or `generate --platform wasm` followed
-        // by a manual `zig build` — dies at the emcc step because the fetched emsdk
-        // package is NOT activated: the remaining half of labelle-assembler#492 (the
-        // docker path already does this in-container). Run it BEFORE the `generate`
-        // early-return so the generate-then-build path is covered too. Best-effort +
-        // idempotent; on failure the build still surfaces the clear #492 guidance.
-        // The PINNED version keeps activation deterministic.
-        //
-        // Unless a provider hook of this build already contributed the
-        // toolchain root through its `env_file` (contract §2, wire 1.3.0+):
-        // that provider owns the toolchain the build then consumes, and
-        // activating the fetched package too would install a second copy
-        // (~1 GB) nothing uses. Projects without such a provider keep this
-        // path unchanged.
-        const provider_toolchain = !parsed_args.docker and parsed.platform == .wasm and hook_site.env.sets(toolchain_root_var);
-        if (provider_toolchain) {
-            std.debug.print("labelle: {s} comes from a provider hook; skipping the core Python preflight and fetched-toolchain activation\n", .{toolchain_root_var});
-        }
-        if (coreActivatesToolchain(parsed_args.docker, parsed.platform == .wasm, &hook_site.env)) {
-            // Python preflight (cli#291): emsdk activation and emcc itself (an
-            // `env python3` script) both need a working interpreter. Fail fast
-            // with the exact fix instead of dying deep inside emsdk activation
-            // with an unrelated-looking error. `autoWireEnv` first: it puts a
-            // previously-provisioned managed Python on this process's PATH (and
-            // wires the TLS bundle on Windows), which is what makes the
-            // availability probe — and the activation below — see it.
-            python_provision.autoWireEnv(allocator);
-            if (!python_provision.isAvailable(allocator)) {
-                std.debug.print("labelle: wasm builds need Python 3 (emsdk activation + emcc) and none was found.\n" ++
-                    "  fix: labelle install python   (managed, ~25 MB into ~/.labelle/python)\n" ++
-                    "  or install Python 3 yourself and ensure `python3` is on PATH.\n", .{});
-                return error.BuildFailed;
-            }
-            const resolved_emsdk = try emsdk_toolchain.resolveRequiredVersion(allocator, project_dir);
-            defer allocator.free(resolved_emsdk.version);
-            emsdk_activate.activateFetchedEmsdk(allocator, cx.target_dir, resolved_emsdk.version);
-        }
     }
     {
         const code = try provider_hooks.runPhase(hook_site, hook_plans.generate.after, .generate, .after, generate_out);
         if (code != 0) return code;
     }
     return null;
-}
-
-/// The variable the fetched-toolchain activation exists to supply: the
-/// generated build's link step reads it, and so do the backends. A provider
-/// hook that contributes it owns the toolchain.
-pub const toolchain_root_var = "EMSDK";
-
-/// Whether the core runs its Python preflight and activates the fetched
-/// toolchain package after generation: a host (not docker) wasm build whose
-/// provider hooks did not contribute `toolchain_root_var` (`contributed` is
-/// the build's accumulated `env_file` environment at that point: the
-/// `before generate` hooks').
-pub fn coreActivatesToolchain(docker: bool, wasm: bool, contributed: *const provider_env.Accumulator) bool {
-    return !docker and wasm and !contributed.sets(toolchain_root_var);
-}
-
-test "pipeline: a provider-contributed toolchain root skips the core toolchain activation" {
-    const a = std.testing.allocator;
-    var diag: provider_env.Diagnostic = .{};
-    var none: provider_env.Accumulator = .{};
-    defer none.deinit();
-    // No provider contribution: today's behaviour, host builds only.
-    try std.testing.expect(coreActivatesToolchain(false, true, &none));
-    try std.testing.expect(!coreActivatesToolchain(true, true, &none));
-    try std.testing.expect(!coreActivatesToolchain(false, false, &none));
-    // An unrelated contribution changes nothing.
-    var other: provider_env.Accumulator = .{};
-    defer other.deinit();
-    try other.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "PROBE_TOOLCHAIN", .value = "x" }}, .path_prepend = &.{if (provider_env.native_windows) "C:\\tc\\bin" else "/tc/bin"} }, &diag);
-    try std.testing.expect(coreActivatesToolchain(false, true, &other));
-    // The provider supplies the root: the core stands down.
-    var supplied: provider_env.Accumulator = .{};
-    defer supplied.deinit();
-    try supplied.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = toolchain_root_var, .value = if (provider_env.native_windows) "C:\\sdk" else "/sdk" }} }, &diag);
-    try std.testing.expect(!coreActivatesToolchain(false, true, &supplied));
 }
 
 /// How the core generation's pre-passes run (`corePrepasses`).

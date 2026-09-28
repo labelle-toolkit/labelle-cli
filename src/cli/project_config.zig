@@ -280,7 +280,7 @@ pub const PrebuildStep = struct {
     /// editing `.run` alone (which moves no mtime) forces a re-run
     /// instead of silently reusing the artifact the old command made.
     ///
-    /// Under `wasm serve --watch` these paths are also excluded from the
+    /// Under `labelle run --watch` these paths are also excluded from the
     /// watched tree: the hook writes them, so counting them as source
     /// edits fired a second, redundant rebuild+reload.
     outputs: []const []const u8 = &.{},

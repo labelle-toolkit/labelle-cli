@@ -460,72 +460,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "labelle: timed out" not in inside.stderr and "after-run hooks skipped" not in inside.stderr, inside.stderr
     assert order(log(zig_out), "run") == [("before", "a-run-pre"), ("before", "b-run-pre"), ("after", "a-run-post"), ("after", "b-run-post")], log(zig_out)
 
-    # ── wasm export --no-build: the run hooks still run ───────────────────
-    # `--no-build` returned before discovery, so every declared run hook was
-    # silently skipped although exporting the existing artifact is the same
-    # run step the building path hooks (Codex P2 on #420). A pre-existing
-    # web dir stands in for the build; nothing is installed or generated,
-    # and the `run` hooks for the `wasm` target wrap the export.
-    #
-    # `wasm` is a provider target (docs/provider-targets.md): the no-build
-    # path confirms it against the providers discoverable as-is before any
-    # hook, so with nothing declaring it the export is refused. fixture-a
-    # declares it for this section; its run hooks are the ones that wrap.
-    reset()
-    wasm_target_dir = project / ".labelle" / "raylib_wasm"
-    wasm_web = wasm_target_dir / "zig-out" / "web"
-    wasm_web.mkdir(parents=True)
-    (wasm_web / "index.html").write_text("<html>fixture</html>")
-    release = project / "release"
-    undeclared = run("wasm", "export", "--no-build", "--output", "release", code=1)
-    assert "no provider for target 'wasm'" in undeclared.stderr and not release.exists(), undeclared.stderr
-    assert not log(wasm_target_dir / "zig-out"), "a run hook ran for a refused target"
-    a_manifest.write_text(manifest("fixture-a", A_HOOKS, targets=["wasm"]))
-    exported = run("wasm", "export", "--no-build", "--output", "release")
-    assert (release / "index.html").exists() and (release / ".labelle-export").exists(), list(release.iterdir())
-    text = exported.stderr
-    assert "FIXTURE_INSTALL_DONE" not in text and "FIXTURE_GENERATE" not in text and "build ok" not in text, text
-    assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre"), ("after", "a-wasm-run-post")], text
-    assert text.index("hook 'fixture-a/a-wasm-run-pre'") < text.index("WASM Export Complete") < text.index("hook 'fixture-a/a-wasm-run-post'"), text
-    # Contract §2 `target_dir` is absolute on the no-build path too, even
-    # when the project is named by a RELATIVE directory: it used to be joined
-    # onto the raw `project_dir`, so `wasm export ../project --no-build`
-    # handed hooks `../project/.labelle/raylib_wasm` (#460 review).
-    for e in log(wasm_target_dir / "zig-out"):
-        assert Path(e["context"]["target_dir"]) == wasm_target_dir.resolve(), e
-    shutil.rmtree(release)
-    (wasm_target_dir / "zig-out" / "hooks.log").unlink()
-    run("wasm", "export", "../project", "--no-build", "--output", "release", cwd=providers["fixture-a"])
-    relative = log(wasm_target_dir / "zig-out")
-    assert order(relative, "run") == [("before", "a-wasm-run-pre"), ("after", "a-wasm-run-post")], relative
-    for e in relative:
-        got = e["context"]["target_dir"]
-        assert os.path.isabs(got) and Path(got) == wasm_target_dir.resolve(), e
-    # A failing before hook stops the export: the hook's code is the CLI's
-    # and the output directory is never created.
-    shutil.rmtree(release)
-    (wasm_target_dir / "zig-out" / "hooks.log").unlink()
-    refused = run("wasm", "export", "--no-build", "--output", "release", code=7, extra_env={"PROVIDER_PROBE_FAIL": "a-wasm-run-pre"})
-    assert not release.exists() and "WASM Export Complete" not in refused.stderr, refused.stderr
-    assert order(log(wasm_target_dir / "zig-out"), "run") == [("before", "a-wasm-run-pre")], refused.stderr
-    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
-    reset()
-
-    # A provider server replacement must never turn legacy export into serve,
-    # or silently discard the old serve flags. Refuse before any hook/build.
-    a_manifest.write_text(manifest("fixture-a", A_HOOKS + [hook("web-server", "run", "replace", target="wasm")], targets=["wasm"]))
-    marker_script = base / "prebuild-marker.py"
-    marker_script.write_text("from pathlib import Path; Path('prebuild-ran').write_text('unexpected')")
-    declare(dep_b, dep_a, resources=f', .prebuild = .{{ .{{ .run = .{{ {json.dumps(sys.executable)}, {json.dumps(str(marker_script))} }} }} }}')
-    for verb in ("serve", "export"):
-        for flags in (("--no-build",), ()):
-            refused = run("wasm", verb, *flags, code=1, extra_env={"LABELLE_NO_PREBUILD": "0"})
-            assert not (project / "prebuild-ran").exists(), "prebuild ran before migration refusal"
-            assert "legacy `wasm serve/export`" in refused.stderr, refused.stderr
-            assert "fixture-a/web-server" in refused.stderr, refused.stderr
-            assert "FIXTURE_GENERATE" not in refused.stderr and "WASM Export Complete" not in refused.stderr, refused.stderr
-            assert not log(wasm_target_dir / "zig-out"), "a hook ran before migration refusal"
-    a_manifest.write_text(manifest("fixture-a", A_HOOKS))
+    # (The legacy `wasm serve|export` left the core in 3.0, RFC cli#466 PR B:
+    # `labelle wasm` is an unknown command now, test/provider_targets_e2e.py.)
     reset()
 
     declare(dep_b, dep_a)
@@ -898,23 +834,18 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     generated = run("generate", "--docker", extra_env=contributing)
     assert "--docker doesn't carry" not in generated.stderr and "FIXTURE_GENERATE" in generated.stderr, generated.stderr
     assert by_id(target_dir)["gen-post"]["probe_toolchain"] == "from-tc", log(target_dir)
-    # A target whose owner replaces `build`: the replacement stands in for
-    # the container build and gets the contributions like every hook, so
-    # `build --docker` is not refused and the replacement runs.
+    # A provider target never reaches the container build at all (RFC
+    # cli#466 D5): `--docker` is refused for it by name, before resolution,
+    # whatever its plan — even one whose owner replaces `build`, which used
+    # to stand in for the container build. No hook runs, nothing generates.
     replaced_dir = project / ".labelle" / "raylib_android"
     a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="android"),
                                                  hook("build-owned", "build", "replace", target="android")], targets=["android"]))
-    reset()
-    replaced = run("build", "--platform=android", "--docker", extra_env=contributing)
-    assert "--docker doesn't carry" not in replaced.stderr, replaced.stderr
-    owned_hooks = by_id(replaced_dir / "zig-out")
-    assert owned_hooks["build-owned"]["probe_toolchain"] == "from-tc", owned_hooks
-    assert "building via docker" not in replaced.stderr, replaced.stderr
-    # The mechanism: the same plan without the replacement IS refused.
-    a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="android")], targets=["android"]))
-    reset()
-    refused = run("build", "--platform=android", "--docker", code=1, extra_env=contributing)
-    assert "--docker doesn't carry provider environment contributions" in refused.stderr, refused.stderr
+    for docker_args in (("build", "--platform=android", "--docker"), ("generate", "--platform=android", "--docker")):
+        reset()
+        refused = run(*docker_args, code=1, extra_env=contributing)
+        assert "--docker builds the `desktop` target only" in refused.stderr, (docker_args, refused.stderr)
+        assert "FIXTURE_GENERATE" not in refused.stderr and not log(replaced_dir) and not log(replaced_dir / "zig-out"), refused.stderr
     a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
     # The legacy `labelle ios` runs its own zig build after generation, with
     # neither the contributions nor the optimize default: refused for either,
@@ -963,14 +894,13 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     declare(dep_b, dep_a)
 
-    # ── wasm generate: a provider-supplied EMSDK skips the core activation ─
-    # A `before generate` hook that contributes EMSDK through its env_file
-    # (contract 1.3.0) owns the toolchain: the core's Python preflight and its
-    # activation of the fetched toolchain package stand down, so the package
-    # is not installed a second time. PATH is scrubbed of Python and no
-    # managed interpreter exists, so the preflight, whenever it runs, stops
-    # the command with its fix line: its absence proves the skip. Without
-    # the contribution the core path is unchanged.
+    # ── the core provisions no target toolchain (RFC cli#466 PR B) ────────
+    # The core used to run a Python preflight and activate the fetched
+    # toolchain package after generating for the `wasm` schema target,
+    # unless a provider hook contributed the toolchain root. Both left the
+    # core with the web phase: with PATH scrubbed of Python, no managed
+    # interpreter and no contribution, generation for that target still
+    # succeeds, and nothing mentions a toolchain the core no longer knows.
     no_python_bin = base / "no-python-bin"
     no_python_bin.mkdir()
     scrubbed = str(no_python_bin)
@@ -980,25 +910,12 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert not (home / "python").exists(), "a managed interpreter already exists"
     a_manifest.write_text(manifest("fixture-a", [hook("sdk", "generate", "before", target="wasm")], targets=["wasm"]))
     declare(dep_a)
-    sdk_root = base / "provider-sdk"
-    sdk_root.mkdir()
-    sdk_contribution = base / "sdk-env.json"
-    sdk_contribution.write_text(json.dumps({"set": [{"name": "EMSDK", "value": str(sdk_root)}]}))
     wasm_dir = project / ".labelle" / "raylib_wasm"
     reset()
-    control = run("generate", "--platform=wasm", code=1, extra_env=no_python)
-    assert "wasm builds need Python 3" in control.stderr, control.stderr
-    assert "comes from a provider hook" not in control.stderr, control.stderr
+    bare = run("generate", "--platform=wasm", extra_env=no_python)
+    assert "FIXTURE_GENERATE" in bare.stderr, bare.stderr
+    assert "need Python" not in bare.stderr and "comes from a provider hook" not in bare.stderr, bare.stderr
     assert "sdk" in by_id(wasm_dir), log(wasm_dir)
-    reset()
-    supplied = run("generate", "--platform=wasm", extra_env=dict(no_python, PROVIDER_PROBE_ENV=f"sdk|{sdk_contribution}"))
-    assert "labelle: EMSDK comes from a provider hook; skipping" in supplied.stderr, supplied.stderr
-    assert "wasm builds need Python 3" not in supplied.stderr, supplied.stderr
-    assert "FIXTURE_GENERATE" in supplied.stderr, supplied.stderr
-    # An unrelated contribution does not stand the core down.
-    reset()
-    unrelated = run("generate", "--platform=wasm", code=1, extra_env=dict(no_python, PROVIDER_PROBE_ENV=f"sdk|{contribution}"))
-    assert "wasm builds need Python 3" in unrelated.stderr, unrelated.stderr
 
     # ── managed Python reaches every provider hook and command (D2) ───────
     # `labelle install python`'s interpreter joins PATH for the `.prebuild`

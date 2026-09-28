@@ -1,34 +1,13 @@
+//! `--docker`: build the core `desktop` target inside an `ubuntu:24.04`
+//! container (a native or cross `-Dtarget` build). Provider targets never
+//! reach here: their hooks, environment contributions and toolchains live
+//! on the host, so the pipeline refuses `--docker` for them before anything
+//! runs (RFC cli#466 D5, `pipeline/args_resolve.dockerRefused`).
 const std = @import("std");
 const builtin = @import("builtin");
-const project_config = @import("project_config.zig");
 const config = @import("config.zig");
-const emsdk_toolchain = @import("emsdk_toolchain.zig");
 
 const ZIG_VERSION = "0.16.0";
-
-/// emsdk version the in-container wasm build activates. Kept in lockstep with
-/// the host manager's default (labelle-cli#283) and the assembler's pin.
-const EMSDK_VERSION = emsdk_toolchain.DEFAULT_EMSDK_VERSION;
-
-// In-container emsdk activation for the wasm build (labelle-cli#283 / fixes
-// labelle-assembler#492). The generated wasm `build.zig` links via the emsdk
-// zig-dependency package's `emcc`, but that package is fetched-but-NOT-activated
-// — `upstream/emscripten/emcc` is FileNotFound until `emsdk install/activate`
-// runs. The first `zig build` (the fingerprint pass below) fetches + unpacks the
-// emsdk package into the project-local `zig-pkg/<hash>/` dir (NOT the global Zig
-// cache); this snippet then locates it, makes it writable (Zig marks package
-// dirs read-only), and runs the emsdk install + **activate** flow in place so
-// the second `zig build` finds `emcc`. `zig-pkg` is searched relative to the
-// build dir (we run after `cd /labelle/<subdir>`), with the global Zig package
-// cache as a fallback for non-vendored layouts. Exports EMSDK/EM_CONFIG so emcc
-// resolves its toolchain config.
-const activate_emsdk =
-    "EMSDK_PKG=$(find zig-pkg /root/.cache/zig/p -maxdepth 2 -type f -name emsdk.py 2>/dev/null | head -1 | xargs -r dirname) && " ++
-    "if [ -n \"$EMSDK_PKG\" ]; then " ++
-    "chmod -R u+w \"$EMSDK_PKG\" 2>/dev/null || true; " ++
-    "(cd \"$EMSDK_PKG\" && chmod +x ./emsdk 2>/dev/null; ./emsdk install " ++ EMSDK_VERSION ++ " && ./emsdk activate " ++ EMSDK_VERSION ++ ") && " ++
-    "export EMSDK=\"$(cd \"$EMSDK_PKG\" && pwd)\" && export EM_CONFIG=\"$EMSDK/.emscripten\"; " ++
-    "else echo 'labelle: could not locate the fetched emsdk package to activate' >&2; fi && ";
 
 const host_arch = switch (builtin.cpu.arch) {
     .aarch64 => "aarch64",
@@ -38,21 +17,11 @@ const host_arch = switch (builtin.cpu.arch) {
 
 const host_target = host_arch ++ "-" ++ @tagName(builtin.os.tag);
 
-// Download Zig from ziglang.org directly, then cherry-pick PR #31850's
-// one-line STOPSIG fix into the stdlib. Background: 0.16.0 ships with
-// two WASM/emscripten compile bugs —
-//   1. `std/os/emscripten.zig:STOPSIG` returns `u32` while the body
-//      `@enumFromInt`s into `SIG` (Zig issue #31849, fixed in master by
-//      PR #31850). The sed below applies the same one-line change.
-//   2. translate-c rejects recent emsdk headers' multi-arg
-//      `__attribute__((deprecated("msg1","msg2")))` form (translate-c
-//      issue #306). Avoided by hand-rolled extern shims in the
-//      assembler's WASM template — no stdlib change needed.
+// Download Zig from ziglang.org directly into the container.
 const install_zig = "apt-get update -qq > /dev/null && " ++
-    "apt-get install -y -qq curl xz-utils ca-certificates python3 > /dev/null && " ++
+    "apt-get install -y -qq curl xz-utils ca-certificates > /dev/null && " ++
     "curl -fsSL https://ziglang.org/download/" ++ ZIG_VERSION ++ "/zig-x86_64-linux-" ++ ZIG_VERSION ++ ".tar.xz | tar -xJ -C /opt > /dev/null && " ++
-    "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig && " ++
-    "sed -i 's/pub fn STOPSIG(s: u32) u32 {/pub fn STOPSIG(s: u32) SIG {/' /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/lib/std/os/emscripten.zig";
+    "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig";
 
 // Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
 // to add framework/include/lib search paths for macOS cross-compilation.
@@ -225,9 +194,8 @@ fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
 
 /// Run `zig build` inside a Docker container with inherited stdio.
 /// For macOS targets, shares the Zig cache and injects xcode-frameworks paths.
-/// For WASM, uses its own cache (host cache has macOS-native emscripten binaries).
 /// Returns the exit code of the docker process.
-pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: project_config.Platform, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
+pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
     const abs_target = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), target_dir, allocator);
     defer allocator.free(abs_target);
 
@@ -245,19 +213,11 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
     const labelle_vol = try std.fmt.allocPrint(allocator, "{s}:/labelle", .{parent});
     defer allocator.free(labelle_vol);
 
-    // Build the zig command with optional -Dtarget and -Doptimize flags.
+    // Build the zig command with -Dtarget and optional -Doptimize flags.
     // Sanitize target_override to prevent shell injection.
-    // Ignore --target for WASM builds (build.zig handles the wasm32-emscripten target).
-    const sanitized_target = if (platform != .wasm and target_override != null)
-        try sanitizeTarget(allocator, target_override.?)
-    else
-        null;
+    const sanitized_target = if (target_override) |t| try sanitizeTarget(allocator, t) else null;
     defer if (sanitized_target) |s| allocator.free(s);
-
-    const effective_target: []const u8 = if (platform == .wasm)
-        ""
-    else
-        sanitized_target orelse host_target;
+    const effective_target: []const u8 = sanitized_target orelse host_target;
 
     const optimize_part = if (optimize) |opt|
         try std.fmt.allocPrint(allocator, " -Doptimize={s}", .{opt})
@@ -265,60 +225,39 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, platform: 
         null;
     defer if (optimize_part) |o| allocator.free(o);
 
-    const effective_cmd = if (effective_target.len == 0)
-        try std.fmt.allocPrint(allocator, "zig build{s}", .{optimize_part orelse ""})
-    else
-        try std.fmt.allocPrint(allocator, "zig build -Dtarget={s}{s}", .{ effective_target, optimize_part orelse "" });
+    const effective_cmd = try std.fmt.allocPrint(allocator, "zig build -Dtarget={s}{s}", .{ effective_target, optimize_part orelse "" });
     defer allocator.free(effective_cmd);
 
     // Only set up xcode-frameworks when the effective target is macOS.
-    const is_macos_target = if (sanitized_target) |t|
-        std.mem.indexOf(u8, t, "macos") != null
-    else if (platform == .wasm)
-        false
-    else
-        std.mem.indexOf(u8, host_target, "macos") != null;
+    const is_macos_target = std.mem.indexOf(u8, effective_target, "macos") != null;
 
     const macos_setup: []const u8 = if (is_macos_target)
         setup_xcode_frameworks ++ " && "
     else
         "";
 
-    // WASM: after the fingerprint pass has fetched the emsdk package, activate
-    // it in place so `emcc` exists for the real build (fixes #492). No-op for
-    // every other platform.
-    const emsdk_setup: []const u8 = if (platform == .wasm)
-        activate_emsdk
-    else
-        "";
-
     // Fix fingerprint: run build once to get the error, patch if needed, then build for real.
     // Only re-runs the build if a fingerprint was actually found and patched.
-    // For wasm, the fingerprint pass also warms the Zig package cache so the
-    // emsdk activation snippet can find + activate the fetched emsdk package.
-    const script = try std.fmt.allocPrint(allocator,
+    const script = try std.fmt.allocPrint(
+        allocator,
         "{s} && cd /labelle/{s} && " ++
             "BUILD_OUT=$({s} 2>&1 || true) && " ++
             "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | head -1 | sed 's/.*use this value: //') && " ++
             "if [ -n \"$FP\" ]; then sed -i \"s|.fingerprint = .*,|.fingerprint = $FP,|\" build.zig.zon; fi && " ++
             "{s}" ++
-            "{s}" ++
             "{s}",
-        .{ install_zig, subdir, effective_cmd, emsdk_setup, macos_setup, effective_cmd },
+        .{ install_zig, subdir, effective_cmd, macos_setup, effective_cmd },
     );
     defer allocator.free(script);
 
-    // For non-WASM builds, share the host Zig cache for pre-fetched packages.
-    // WASM builds need their own cache since emscripten binaries are platform-specific.
-    if (platform != .wasm) {
-        if (zigCacheDir(allocator)) |cache_dir| {
-            defer allocator.free(cache_dir);
-            const cache_vol = try std.fmt.allocPrint(allocator, "{s}:/root/.cache/zig", .{cache_dir});
-            defer allocator.free(cache_vol);
+    // Share the host Zig cache for pre-fetched packages.
+    if (zigCacheDir(allocator)) |cache_dir| {
+        defer allocator.free(cache_dir);
+        const cache_vol = try std.fmt.allocPrint(allocator, "{s}:/root/.cache/zig", .{cache_dir});
+        defer allocator.free(cache_vol);
 
-            return spawnAndWait(allocator, &.{ "docker", "run", "--rm", "-v", labelle_vol, "-v", cache_vol, "ubuntu:24.04", "bash", "-c", script });
-        } else |_| {}
-    }
+        return spawnAndWait(allocator, &.{ "docker", "run", "--rm", "-v", labelle_vol, "-v", cache_vol, "ubuntu:24.04", "bash", "-c", script });
+    } else |_| {}
 
     return spawnAndWait(allocator, &.{ "docker", "run", "--rm", "-v", labelle_vol, "ubuntu:24.04", "bash", "-c", script });
 }

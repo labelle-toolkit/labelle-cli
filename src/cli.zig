@@ -6,8 +6,6 @@
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] [--linux-desktop] — generate + build (no run); on Linux (or with `--linux-desktop`) also writes `zig-out/<exe>.desktop` + `zig-out/<exe>.png` for the desktop target (cli#359)
 ///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] [--platform=<t>] — generate + build the resolved target, then package it: for `desktop`, wrap the exe in a self-contained macOS `<Title>.app` (Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it; macOS only, cli#359/#364/#363); for a provider target, run the provider's `replace` hook on `bundle` (RFC #406, docs/provider-targets.md)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
-///   labelle wasm serve [dir] [--port n] [--no-build] [--no-open] — build the WASM target and serve it locally
-///   labelle wasm export [dir] [--output dir] [--zip] [--platform itch|github-pages] [--no-build] — build + package a deployment-ready WASM dir
 ///   labelle [dir]                       — alias for `run`
 ///   labelle init <name> [dir]           — scaffold a new project
 ///   labelle install [pkg] [ver]         — fetch packages into cache
@@ -39,12 +37,7 @@ const runner = @import("cli/runner.zig");
 const assembler = @import("cli/assembler.zig");
 const assembler_proc = @import("cli/assembler_proc.zig");
 const zig_toolchain = @import("cli/zig_toolchain.zig");
-const emsdk_toolchain = @import("cli/emsdk_toolchain.zig");
-const emsdk_activate = @import("cli/emsdk_activate.zig");
 const bake_mod = @import("cli/bake.zig");
-const docker = @import("cli/docker.zig");
-const serve = @import("cli/serve.zig");
-const export_mod = @import("cli/export.zig");
 const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
 const pack = @import("cli/pack.zig");
@@ -69,8 +62,6 @@ const args_mod = @import("cli/args.zig");
 const ParsedArgs = args_mod.ParsedArgs;
 const parseDirAndScene = args_mod.parseDirAndScene;
 const parseRunArgs = args_mod.parseRunArgs;
-const parseWasmServeArgs = args_mod.parseWasmServeArgs;
-const parseWasmExportArgs = args_mod.parseWasmExportArgs;
 const parseBundleArgs = args_mod.parseBundleArgs;
 const collectExtraArgs = args_mod.collectExtraArgs;
 const appendExtraArg = args_mod.appendExtraArg;
@@ -148,13 +139,8 @@ fn handleToolchainCmd(allocator: std.mem.Allocator, cmd_args: []const []const u8
         const dir = if (cmd_args.len >= 2) cmd_args[1] else ".";
         return zig_toolchain.cmdToolchainWhich(allocator, dir);
     }
-    // `toolchain emsdk [dir]` — managed emsdk/emcc resolution (cli#283).
-    if (std.mem.eql(u8, cmd_args[0], "emsdk")) {
-        const dir = if (cmd_args.len >= 2) cmd_args[1] else ".";
-        return emsdk_toolchain.cmdEmsdkWhich(allocator, dir);
-    }
     std.debug.print("labelle toolchain: unknown subcommand '{s}'\n", .{cmd_args[0]});
-    std.debug.print("  usage: labelle toolchain list | labelle toolchain which [dir] | labelle toolchain emsdk [dir]\n", .{});
+    std.debug.print("  usage: labelle toolchain list | labelle toolchain which [dir]\n", .{});
     return error.UnknownSubcommand;
 }
 
@@ -197,8 +183,8 @@ pub fn main(proc_init: std.process.Init) !u8 {
             // A usage error must exit NON-ZERO so a CI step cannot read a
             // REJECTED command as a successful build — the same rule PR #362
             // applied to `bundle`. The parser has already printed the
-            // diagnostic; this only sets the status. (The `run` and `wasm`
-            // parsers exit `usage_error`.)
+            // diagnostic; this only sets the status. (The `run` parser exits
+            // `usage_error`.)
             const result = parseDirAndScene(&args, first) orelse return error.InvalidArguments;
             parsed_args.project_dir = result.dir;
             parsed_args.scene_override = result.scene;
@@ -346,47 +332,6 @@ pub fn main(proc_init: std.process.Init) !u8 {
                 } else {
                     parsed_args.project_dir = arg;
                 }
-            }
-        } else if (std.mem.eql(u8, first, "wasm")) {
-            // `labelle wasm <subcommand>` — `serve` and `export`.
-            const sub = args.next();
-            if (sub != null and std.mem.eql(u8, sub.?, "serve")) {
-                parsed_args.command = .wasm_cmd;
-                const result = parseWasmServeArgs(&args) orelse return usage_error;
-                parsed_args.project_dir = result.dir;
-                parsed_args.serve_port = result.port;
-                parsed_args.serve_no_build = result.no_build;
-                parsed_args.serve_no_open = result.no_open;
-                parsed_args.serve_watch = result.watch;
-                parsed_args.progress_mode = result.progress_mode;
-                // `wasm serve` always builds/serves the `wasm` target — resolved
-                // like `--platform=wasm`, so it needs the pinned provider that
-                // declares it (docs/provider-targets.md).
-                parsed_args.platform_override = "wasm";
-            } else if (sub != null and std.mem.eql(u8, sub.?, "export")) {
-                parsed_args.command = .wasm_cmd;
-                parsed_args.wasm_export = true;
-                const result = parseWasmExportArgs(&args) orelse return usage_error;
-                parsed_args.project_dir = result.dir;
-                parsed_args.export_output = result.output;
-                parsed_args.export_zip = result.zip;
-                parsed_args.export_pkg_platform = result.pkg_platform;
-                // `--no-build` is the shared "skip build, package existing
-                // output" flag (see ParsedArgs.serve_no_build).
-                parsed_args.serve_no_build = result.no_build;
-                parsed_args.progress_mode = result.progress_mode;
-                // `wasm export` always builds/packages the `wasm` target (same
-                // resolution as `wasm serve`).
-                parsed_args.platform_override = "wasm";
-            } else {
-                if (sub) |s| {
-                    std.debug.print("labelle wasm: unknown subcommand '{s}'\n", .{s});
-                } else {
-                    std.debug.print("labelle wasm: missing subcommand\n", .{});
-                }
-                std.debug.print("  usage: labelle wasm serve [dir] [--port <n>] [--no-build] [--no-open] [--watch] [--progress=<m>]\n", .{});
-                std.debug.print("         labelle wasm export [dir] [--output <dir>] [--zip] [--platform <itch|github-pages>] [--no-build] [--progress=<m>]\n", .{});
-                return 0;
             }
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
@@ -632,8 +577,6 @@ pub const ArgsParseOptimizeFlagSpec = args_tests_mod.ParseOptimizeFlagSpec;
 pub const ArgsParsePlatformValueSpec = args_tests_mod.ParsePlatformValueSpec;
 pub const ArgsParseRunArgsPassthroughSpec = args_tests_mod.ParseRunArgsPassthroughSpec;
 pub const ArgsParseHeadlessFlagsSpec = args_tests_mod.ParseHeadlessFlagsSpec;
-pub const ArgsParseWasmServeArgsSpec = args_tests_mod.ParseWasmServeArgsSpec;
-pub const ArgsParseWasmExportArgsSpec = args_tests_mod.ParseWasmExportArgsSpec;
 pub const ArgsParseBundleArgsSpec = args_tests_mod.ParseBundleArgsSpec;
 pub const ArgsParseDirAndSceneLinuxDesktopSpec = args_tests_mod.ParseDirAndSceneLinuxDesktopSpec;
 pub const ArgsAllowOlderCliFlagSpec = args_tests_mod.AllowOlderCliFlagSpec;
@@ -715,7 +658,6 @@ pub const StatusFormatHumanSpec = status_mod.FormatHumanSpec;
 // ToolchainGate (src/services/doctor.ts).
 pub const DoctorJsonReportSpec = doctor.JsonReportSpec;
 
-pub const PipelineResolveExportOutputSpec = pipeline.ResolveExportOutputSpec;
 pub const PipelineCollectPrebuildIgnorePathsSpec = pipeline.CollectPrebuildIgnorePathsSpec;
 
 // Surface the `.prebuild` hook specs (cli#355) so `zspec.runAll(@This())`

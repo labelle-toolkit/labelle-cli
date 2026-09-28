@@ -12,7 +12,7 @@ and the CLI carries no Android code (cli#405). The other platform packages
 ## Resolution
 
 Every command that runs the project pipeline (`generate`, `build`, `run`,
-`bundle`, and the legacy `wasm` and `ios` subcommands) resolves
+`bundle`, and the legacy `ios` subcommand) resolves
 one target, in two halves, before anything is generated, locked or built:
 
 1. The requested name is `--platform=<t>` when given, else the project's
@@ -151,9 +151,17 @@ the install, before the lock, generation or any compiler, with a `failed`
 progress record naming the refusal — `no provider for target`, or
 `unpinned provider for target` when the declaring package is remote and
 unpinned — and nothing else in the target directory. The `labelle-assembler#378` gate and the bundle-replacement check
-below need the hook plans, so they land at the post-install point. `labelle
-wasm serve --no-build` installs nothing and confirms the name against the
-providers discoverable as-is, like `labelle targets`.
+below need the hook plans, so they land at the post-install point.
+
+`--docker` is decided before any of this (CLI 3.0, RFC cli#466 D5): the
+container build is the core `desktop` target's only, so a provider target
+requested with `--docker` is refused by name, before the no-provider
+verdict, the prebuild steps or the install:
+
+```
+labelle: --docker builds the `desktop` target only; target 'wasm' comes from a provider, whose hooks and toolchain run on this host
+  build it without --docker (docs/migrating-to-3.0.md)
+```
 
 The resolved target is a string. It names the generated tree
 (`.labelle/<backend>_<target>/`, from the provisional name, so a refused
@@ -179,9 +187,9 @@ explicit line:
 
 - A provider target whose name is a schema platform (`wasm`, `android`,
   `ios`) is handed to the assembler as `--platform <name>`, exactly as
-  before. The legacy pipeline branches that key on the enum (`wasm`, `ios`)
-  keep working for it; `android` has none left, so its provider replaces
-  `run` (see [`labelle run`](#labelle-run)).
+  before. The legacy pipeline branch that keys on the enum (`ios`) keeps
+  working for it; `android` and `wasm` have none left, so their providers
+  replace `run` (see [`labelle run`](#labelle-run)).
 - A provider target outside the enum can only be generated for by its
   provider's `replace` hook on `generate`. Without one the command stops
   before the assembler runs:
@@ -206,7 +214,9 @@ slice, and `provider_settings.zig` is untouched.
 ## `labelle run`
 
 The CLI launches only the core `desktop` target on this host, plus the
-legacy run branches it still carries (`wasm` serve, the `ios` simulator).
+legacy run branch it still carries (the `ios` simulator). The core's own
+browser serve left in 3.0: the `web` provider's `replace run` hook serves
+`wasm` now.
 Every other provider target is launched by its provider, so it must have a
 `replace` hook on `run`, otherwise:
 
@@ -246,9 +256,9 @@ target are `DuplicateTargetDefault`. Both are discovery errors, reported at
 `labelle help` like every manifest error.
 
 The effective mode is an explicit `--optimize=<mode>` when given, else the
-owner's default, else the core's own fallback for the target (the legacy
-ReleaseSafe for a `wasm` build, until that policy moves into its provider),
-else none. The core `zig build` gets it as `-Doptimize=<mode>`, every hook
+owner's default, else none: since 3.0 the core keeps no per-target default
+of its own (the `wasm` ReleaseSafe default is the web provider's
+`.target_defaults`). The core `zig build` gets it as `-Doptimize=<mode>`, every hook
 receives it as the wire `optimize`, and a watched rebuild's replan
 recomputes it from the providers it rediscovers (in a `labelle run --watch`
 session a change of the effective mode stops the rebuild with a restart
@@ -283,7 +293,7 @@ with Flying Platform as the worked example, is
 [Migrating a project to labelle CLI 2.0](migrating-to-2.0.md):
 
 - A project that builds for `wasm`, `android` or `ios` — through `.platform`,
-  `--platform=<t>`, or `labelle wasm serve|export`, `labelle ios …` — must add the package that declares that target to
+  `--platform=<t>`, or `labelle ios …` — must add the package that declares that target to
   `.plugins` (as `.repo = "github.com/<owner>/<name>"`) and pin it
   (`labelle providers resolve`, then `--accept`). Until it does, those
   commands fail with the no-provider error above. Commit
@@ -293,8 +303,10 @@ with Flying Platform as the worked example, is
   ([pins](provider-github-pins.md#fresh-checkouts-and-ci-labelle-providers-fetch)).
 - The target name is unchanged: `--platform=wasm` stays `--platform=wasm`,
   because the web provider declares the target `wasm`. Only the pin is new.
-- The legacy `labelle wasm|ios` command words stay reserved built-ins until
-  their extraction lands; they route their target through the same resolver.
+- The legacy `labelle ios` command word stays a reserved built-in until its
+  extraction lands; it routes its target through the same resolver. The
+  legacy `labelle wasm serve|export` left the core in 3.0: `wasm` is no
+  reserved word any more ([migrating to 3.0](migrating-to-3.0.md)).
 - `labelle android …` is no built-in any more (cli#405): it is the `android`
   provider's namespace. Without that package pinned, `labelle android` is an
   unknown command — or, when the cached registry names the package that
@@ -365,6 +377,6 @@ assembler receiving `--platform android`, the after-build hook seeing the
 built library and the target dir, the run replacement receiving `run.env`
 with no host launch, `NoRunReplacement` before any build, `labelle android
 run …` reaching the tool verbatim, `bundle --build-number` and a legacy
-`.android` block passing through unchanged. The Docker WASM build in `ci.yml` declares the repo's own
-`test/fixtures/wasm-provider` (a module plugin whose manifest owns `wasm`)
-because the platform packages are not extracted yet.
+`.android` block passing through unchanged. The Docker lane in `ci.yml`
+checks the `--docker` refusal for a provider target, then cross-builds the
+core `desktop` target in the container.
