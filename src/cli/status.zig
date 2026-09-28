@@ -128,7 +128,7 @@ pub fn formatHuman(
 const Found = struct {
     /// Raw JSON file contents (owned).
     raw: []u8,
-    /// Target dir basename, e.g. "bgfx_desktop" (owned).
+    /// Target dir basename, e.g. "<backend>_desktop" (owned).
     target: []u8,
     /// Views into a parsed copy — kept alive by `parsed`.
     record: FileRecord,
@@ -202,11 +202,11 @@ pub const FormatHumanSpec = struct {
             .detail = "Semantic Analysis",
             .elapsed_ms = 74_300,
             .updated_at_ms = 1_000_000,
-        }, "bgfx_desktop", 1_000_400);
+        }, "fixture_desktop", 1_000_400);
         const out = w.buffered();
         try std.testing.expect(std.mem.indexOf(u8, out, "compile [34/210] 16.2% — Semantic Analysis") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "elapsed 74.3s") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "(.labelle/bgfx_desktop)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "(.labelle/fixture_desktop)") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "warning") == null);
     }
 
@@ -217,7 +217,7 @@ pub const FormatHumanSpec = struct {
             .phase = "compile",
             .elapsed_ms = 5000,
             .updated_at_ms = 1_000_000,
-        }, "raylib_desktop", 1_060_000); // 60s later
+        }, "fixture_desktop", 1_060_000); // 60s later
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "may no longer be running") != null);
     }
 
@@ -229,7 +229,7 @@ pub const FormatHumanSpec = struct {
             .exit_code = 0,
             .elapsed_ms = 183_200,
             .updated_at_ms = 1_000_000,
-        }, "sokol_desktop", 2_000_000); // ages ago
+        }, "fixture_desktop", 2_000_000); // ages ago
         const out = w.buffered();
         try std.testing.expect(std.mem.indexOf(u8, out, "done (exit 0)") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "warning") == null);
@@ -253,7 +253,7 @@ pub const FormatHumanSpec = struct {
 
         var buf: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try formatHuman(&w, parsed.value, "bgfx_desktop", 42);
+        try formatHuman(&w, parsed.value, "fixture_desktop", 42);
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "failed (exit 2) — zig build failed") != null);
     }
 };

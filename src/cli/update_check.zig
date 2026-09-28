@@ -39,7 +39,7 @@ pub const err_unknown_latest = "no known latest version for this package";
 pub const err_local_override = "local path override — not version-comparable";
 /// The CLI-latest fetch failed (curl missing / network / HTTP error).
 pub const err_offline = "could not reach the release server";
-/// A `backend_package` pin (e.g. bgfx): the CLI's bundled compatible set
+/// A `backend_package` pin (a rendering backend): the CLI's bundled compatible set
 /// does not track backend packages, so the pin is reported but cannot be
 /// compared (cli#336 — previously it was silently omitted altogether).
 pub const err_backend_untracked = "backend package — latest not tracked by this CLI; check the repo's tags";

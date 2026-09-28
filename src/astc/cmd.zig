@@ -70,7 +70,7 @@ fn existingBlockMatches(out: []const u8, block: convert.BlockSize) bool {
 
 /// Whether the `.astc` sibling at `out` can be kept as-is: newer than its
 /// source AND encoded at `block`. The block check is what keeps a sibling
-/// shared across platforms honest — an 8x8 file an Android build left behind
+/// shared across platforms honest — an 8x8 file another target's build left behind
 /// is NOT current for a target that needs 4x4, so
 /// switching platforms re-encodes rather than shipping an unloadable atlas.
 fn siblingIsCurrent(src: []const u8, out: []const u8, block: convert.BlockSize) bool {
@@ -120,7 +120,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // `labelle astc` is dispatched before pipeline.run, so it owns its own
     // copy of the flag (see the gate call below).
     var allow_older_cli = false;
-    // Target overrides: `labelle build --platform=wasm` resolves a platform
+    // Target overrides: `labelle build --platform=<target>` resolves a platform
     // (and backend) that project.labelle may not declare, and the loadable
     // blocks depend on both — so the pipeline passes what it resolved. The
     // target is a NAME, matched against the backend manifest's target keys.
@@ -260,7 +260,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // Resolve the astcenc binary (download + cache on first use). If that
     // fails, nothing gets re-encoded — so drop every sibling that is not
     // current for THIS target, or the PNG fallback would pick up (say) an
-    // 8x8 file an Android build left for a web build that can't load it.
+    // 8x8 file one target's build left for another target that can't load it.
     const astcenc = resolveAstcenc(allocator) catch |err| {
         for (atlases.items) |job| try discardIfNotCurrent(allocator, job);
         return err;
@@ -600,11 +600,12 @@ fn existingOutputInodeKey(allocator: std.mem.Allocator, io: std.Io, path: []cons
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, path, .{}) catch return null;
     defer file.close(io);
-    const identity = switch (builtin.os.tag) {
-        .windows => windowsFileIdentity(file.handle) catch return null,
-        .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .haiku, .serenity => posixFileIdentity(file.handle) catch return null,
-        else => return null,
-    };
+    const identity = if (builtin.os.tag == .windows)
+        windowsFileIdentity(file.handle) catch return null
+    else if (comptime usesPosixFileIdentity(builtin.os.tag))
+        posixFileIdentity(file.handle) catch return null
+    else
+        return null;
     return fileIdentityKey(allocator, identity);
 }
 
@@ -618,6 +619,44 @@ fn sourceIdentityKey(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
 
 fn fileIdentityKey(allocator: std.mem.Allocator, identity: FileIdentity) ?[]u8 {
     return std.fmt.allocPrint(allocator, "@file:{d}:{d}", .{ identity.volume, identity.inode }) catch null;
+}
+
+/// Hosts whose file identity comes from `posixFileIdentity`: every Darwin
+/// OS (the whole Apple family, via `std.Target.Os.Tag.isDarwin`) plus the
+/// other POSIX systems with a usable `fstat`/`statx`.
+fn usesPosixFileIdentity(tag: std.Target.Os.Tag) bool {
+    if (tag.isDarwin()) return true;
+    return switch (tag) {
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .haiku, .serenity => true,
+        else => false,
+    };
+}
+
+test "usesPosixFileIdentity keeps the historical host set" {
+    // The set used to be spelled as an explicit switch: `.linux`, the seven
+    // Darwin tags (`.macos`, `.driverkit` and the five Apple device and
+    // catalyst tags), `.freebsd`, `.netbsd`, `.openbsd`, `.dragonfly`,
+    // `.illumos`, `.haiku` and `.serenity`: fifteen tags. Pin both counts so
+    // a change to `isDarwin` in a future std is caught here.
+    var darwin: usize = 0;
+    var posix: usize = 0;
+    for (std.enums.values(std.Target.Os.Tag)) |tag| {
+        if (tag.isDarwin()) darwin += 1;
+        if (usesPosixFileIdentity(tag)) posix += 1;
+        // Every Darwin tag is in, and nothing outside Darwin gets in
+        // except the eight named POSIX hosts.
+        if (tag.isDarwin()) try std.testing.expect(usesPosixFileIdentity(tag));
+    }
+    try std.testing.expectEqual(@as(usize, 7), darwin);
+    try std.testing.expectEqual(@as(usize, 15), posix);
+    try std.testing.expect(usesPosixFileIdentity(.macos));
+    try std.testing.expect(usesPosixFileIdentity(.driverkit));
+    try std.testing.expect(usesPosixFileIdentity(.linux));
+    try std.testing.expect(usesPosixFileIdentity(.serenity));
+    try std.testing.expect(!usesPosixFileIdentity(.windows));
+    try std.testing.expect(!usesPosixFileIdentity(.freestanding));
+    try std.testing.expect(!usesPosixFileIdentity(.wasi));
+    try std.testing.expect(!usesPosixFileIdentity(.fuchsia));
 }
 
 fn posixFileIdentity(handle: std.posix.fd_t) !FileIdentity {
@@ -1444,7 +1483,7 @@ fn fakeAstcHeader(block: convert.BlockSize) [16]u8 {
 
 /// Temp project with `assets/rooms.png` and, written AFTER it (so the mtime
 /// check alone would call it fresh), an `assets/rooms.astc` encoded at
-/// `sibling_block` — the state an Android build leaves behind.
+/// `sibling_block` — the state another target's build leaves behind.
 fn stageSibling(tmp: *std.testing.TmpDir, buf: []u8, sibling_block: convert.BlockSize) ![]const u8 {
     const io = config.globalIo();
     try tmp.dir.createDirPath(io, "assets");

@@ -5,8 +5,8 @@ const config = @import("../config.zig");
 const screenshot_format = @import("../screenshot_format.zig");
 
 /// Extensions a backend may append to the requested screenshot path instead of
-/// honoring it verbatim. bgfx writes TGA and appends `.tga` to whatever it is
-/// given, so `--screenshot=shot.png` lands at `shot.png.tga` (labelle-bgfx#57).
+/// honoring it verbatim. A backend that writes TGA may append `.tga` to whatever
+/// it is given, so `--screenshot=shot.png` lands at `shot.png.tga`.
 ///
 /// The append itself lives in the backend, out of this repo's reach — so once
 /// the run is over `ScreenshotProbe.report` finishes the job here instead,
@@ -107,7 +107,7 @@ pub const ScreenshotProbe = struct {
         if (stale_exact) {
             std.debug.print("  note: '{s}' exists but is unchanged — it is left over from an earlier run, not this one\n", .{self.resolved});
         }
-        std.debug.print("  hint: capture needs a native surface on some backends — a headless bgfx device has no backbuffer to read back\n\n", .{});
+        std.debug.print("  hint: capture needs a native surface on some backends — a headless device has no backbuffer to read back\n\n", .{});
     }
 
     /// The capture landed at `written`. Put it on the requested path when
