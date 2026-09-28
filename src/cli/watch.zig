@@ -28,6 +28,8 @@ pub const WatchState = loop.WatchState;
 pub const IgnoreSet = loop.IgnoreSet;
 pub const watchLoop = loop.watchLoop;
 pub const watchIgnorePath = tree.watchIgnorePath;
+pub const TreeSignature = tree.TreeSignature;
+pub const computeSignature = tree.computeSignature;
 pub const Publisher = publish.Publisher;
 pub const SessionLock = publish.SessionLock;
 

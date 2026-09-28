@@ -292,6 +292,7 @@ pub fn launch(
                     // steps (cli#463) — but only while the steps actually
                     // run (`collectPrebuildIgnorePaths`).
                     .hooks_enabled = !prebuild.skipRequested(allocator),
+                    .prepass = .{ .legacy_target = target.legacy != null, .bake = parsed_args.bake, .fatal = false },
                 };
                 rebuild_ctx.initIgnore();
                 defer rebuild_ctx.deinit();

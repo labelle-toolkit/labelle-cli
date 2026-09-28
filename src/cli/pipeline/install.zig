@@ -25,6 +25,17 @@ const ParsedArgs = args_mod.ParsedArgs;
 /// Version compatibility, the `.prebuild` steps and the SDL2 env wiring:
 /// everything between the progress feed's start and the assembler
 /// resolution. Returns whether the build wants SDL2 (`wants_sdl2`).
+/// The managed-Python PATH wiring the `.prebuild` steps get (see
+/// `preInstall`): only when steps will actually run, so a project without
+/// `.prebuild` — or `LABELLE_NO_PREBUILD=1` — stays inert. Shared with a
+/// watched rebuild, whose re-read project may have gained a step
+/// mid-session. Idempotent.
+pub fn wirePrebuildPython(allocator: std.mem.Allocator, steps: []const prebuild.Step) void {
+    if (steps.len > 0 and !prebuild.skipRequested(allocator)) {
+        python_provision.autoWireEnv(allocator);
+    }
+}
+
 pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed: project_config.ProjectConfig, parsed_args: *const ParsedArgs) !bool {
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
@@ -70,9 +81,7 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     // hooks would force a toolchain fetch on every build; and
     // `sdl_provision.autoWireEnv` (just below) sets a Windows link/runtime
     // variable consumed by `zig build`, not a tool a generator spawns.
-    if (parsed.prebuild.len > 0 and !prebuild.skipRequested(allocator)) {
-        python_provision.autoWireEnv(allocator);
-    }
+    wirePrebuildPython(allocator, parsed.prebuild);
 
     try prebuild.runAll(allocator, project_dir, parsed.prebuild, .{
         .route_stdout_to_stderr = parsed_args.progress_mode == .json,

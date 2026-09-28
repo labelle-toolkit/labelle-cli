@@ -192,6 +192,19 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     else
         null;
     defer if (session_lock) |*lock| lock.release();
+    // ...and read the watched tree now, before the cold build consumes it:
+    // an edit saved while that build runs is then unbuilt when the watcher
+    // starts, and rebuilds (the same ignore set the watcher starts with).
+    const watch_baseline: ?@import("watch.zig").TreeSignature = if (parsed_args.run_watch) blk: {
+        var ignore = rebuild.watchIgnorePaths(allocator, project_dir, parsed.prebuild, !@import("prebuild.zig").skipRequested(allocator));
+        defer {
+            for (ignore.items) |f| allocator.free(f);
+            ignore.deinit(allocator);
+        }
+        var sig: @import("watch.zig").TreeSignature = .{};
+        @import("watch.zig").computeSignature(config.globalIo(), allocator, project_dir, ignore.items, &sig);
+        break :blk sig;
+    } else null;
 
     // One event source, three access modes: NDJSON on stdout
     // (`--progress=json`), the atomically-rewritten status file (all
@@ -378,6 +391,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .hook_site = &hook_site,
         .effective_optimize = effective_optimize,
         .fallback_optimize = fallbackOptimize(parsed.platform),
+        .watch_baseline = watch_baseline,
     };
 
     // Provider hooks on `generate` around the core generation

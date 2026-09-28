@@ -265,7 +265,12 @@ pub fn spawnIn(group_opt: ?*Group, io: std.Io, options: std.process.SpawnOptions
     if (is_windows) _ = win.ResumeThread(child.thread_handle);
     // A stop that arrived before this child could be reached.
     const latched = group.pending.load(.seq_cst);
-    if (latched != 0) signalTree(id, @enumFromInt(latched - 1));
+    if (latched != 0) {
+        // On Windows an interrupt is the console event, which a child that
+        // was not running then never saw: terminate its job instead.
+        const stop: Stop = @enumFromInt(latched - 1);
+        signalTree(id, if (is_windows and stop == .interrupt) .terminate else stop);
+    }
     return .{ .child = child, .group = group, .slot = slot };
 }
 
@@ -515,6 +520,22 @@ test "supervise: a stop latched before any child exists reaches the next child a
     runIn(&group, &.{ test_fixtures.child_exe, "exit:0" }, &term, &err);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term.?);
     _ = io;
+}
+
+test "supervise: a latched interrupt stops a child registered after it, on every host" {
+    var group: Group = .{};
+    group.attach();
+    defer group.detach();
+    // What the POSIX signal handler and the Windows console handler latch.
+    _ = forwardAll(.interrupt);
+    var term: ?std.process.Child.Term = null;
+    var err: ?anyerror = null;
+    runIn(&group, &.{ test_fixtures.child_exe, "sleep:60000" }, &term, &err);
+    try std.testing.expect(err == null);
+    switch (term.?) {
+        .exited => |code| try std.testing.expect(code != 0),
+        else => {},
+    }
 }
 
 test "supervise: a cancel that beats registration ends the child's whole tree" {

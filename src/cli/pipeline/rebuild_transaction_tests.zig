@@ -331,8 +331,10 @@ test "rebuild transaction: an edited prebuild step runs in the rebuild that sees
     try std.testing.expectEqual(@as(usize, 1), Steps.runs);
     try std.testing.expectEqualStrings("gen-b", Steps.last);
     try std.testing.expectEqual(@as(u64, 1), ctx.ignore.epoch);
-    try std.testing.expectEqual(@as(usize, 1), ctx.ignore.files.len);
+    // The step's declared output, and the CLI's own `labelle.lock`.
+    try std.testing.expectEqual(@as(usize, 2), ctx.ignore.files.len);
     try std.testing.expect(std.mem.endsWith(u8, ctx.ignore.files[0], "b.out"));
+    try std.testing.expect(std.mem.endsWith(u8, ctx.ignore.files[1], "labelle.lock"));
     // An unchanged rebuild keeps the set (and its epoch).
     try ctx.rebuildStaged();
     try std.testing.expectEqual(@as(u64, 1), ctx.ignore.epoch);
@@ -390,6 +392,8 @@ test "rebuild transaction: a change the running replacement depends on publishes
         .{ .spec = .{ .hooks = ".{ .id = \"prepare\", .step = .run, .target = \"probe-target\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" }" }, .prebuild_runs = 1 },
         // The Zig version the project requires.
         .{ .spec = .{ .project_extra = ", .zig_version = \"0.99.0\"" }, .prebuild_runs = 1 },
+        // The assembler the session resolved at startup.
+        .{ .spec = .{ .project_extra = ", .assembler_version = \"0.99.0\"" }, .prebuild_runs = 1 },
     };
     for (cases, 0..) |case, i| {
         try fx.write(case.spec);
@@ -477,4 +481,202 @@ test "rebuild transaction: cancelling reaps the in-flight child — provisioning
         try std.testing.expectEqual(@as(usize, 0), Publish.count);
         try std.testing.expect(replan.current == null and replan.staged == null);
     }
+}
+
+test "rebuild transaction: an edited project's lock is staged privately and committed only with the rebuild" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    const lock_v1 = try fx.lockBytes();
+    defer a.free(lock_v1);
+    // What a hook of the rebuild sees: the project's `labelle.lock` (the
+    // path the running replacement holds) and the lock it verifies against.
+    const Seen = struct {
+        var project_lock_has_new = false;
+        var staged_has_new = false;
+        var project: []const u8 = "";
+        fn run(s: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+            for (list) |planned| if (std.mem.eql(u8, planned.hook.id, "stage-probe")) {
+                const io = config.globalIo();
+                const lock = try std.fs.path.join(std.testing.allocator, &.{ project, "labelle.lock" });
+                defer std.testing.allocator.free(lock);
+                const committed = try std.Io.Dir.cwd().readFileAlloc(io, lock, std.testing.allocator, .limited(1 << 20));
+                defer std.testing.allocator.free(committed);
+                project_lock_has_new = std.mem.indexOf(u8, committed, "\"7.7.7\"") != null;
+                const staged = try std.Io.Dir.cwd().readFileAlloc(io, s.lock_path.?, std.testing.allocator, .limited(1 << 20));
+                defer std.testing.allocator.free(staged);
+                staged_has_new = std.mem.indexOf(u8, staged, "\"7.7.7\"") != null;
+            };
+            return 0;
+        }
+    };
+    Seen.project = fx.project;
+    ctx.run_hook_phase = Seen.run;
+    const hook = ".{ .id = \"stage-probe\", .step = .build, .target = \"probe-target\", .when = .after, .build_step = \"tool\", .executable = \"bin/tool\" }";
+    try fx.write(.{ .version = "7.7.7", .hooks = hook });
+    // A failing compile: during the rebuild the hook saw the new lock only
+    // at its private path; afterwards the staged lock is gone and the
+    // project's lock never changed.
+    ctx.zig_args = &fx.fail_argv;
+    try std.testing.expectError(error.BuildFailed, ctx.rebuildStaged());
+    const staged_path = try Replanner.stagedLockPath(a, fx.project);
+    defer a.free(staged_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(config.globalIo(), staged_path, .{}));
+    try std.testing.expect(site.lock_path == null);
+    {
+        const now = try fx.lockBytes();
+        defer a.free(now);
+        try std.testing.expectEqualSlices(u8, lock_v1, now);
+    }
+    // The same edit succeeding: the hook again saw only the staged lock
+    // carry the new version; the commit moves it over `labelle.lock`.
+    ctx.zig_args = &fx.ok_argv;
+    Seen.project_lock_has_new = true;
+    Seen.staged_has_new = false;
+    try ctx.rebuildStaged();
+    try std.testing.expect(!Seen.project_lock_has_new);
+    try std.testing.expect(Seen.staged_has_new);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(config.globalIo(), staged_path, .{}));
+    try std.testing.expect(site.lock_path == null);
+    const committed = try fx.lockBytes();
+    defer a.free(committed);
+    try std.testing.expect(std.mem.indexOf(u8, committed, "\"7.7.7\"") != null);
+}
+
+test "rebuild transaction: a rebuild runs the cold pipeline's pre-passes and prebuild Python wiring on the re-read project" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    // Production wiring: the defaults ARE the cold pipeline's functions.
+    const default_prepass = std.meta.fieldInfo(RebuildCtx, .run_prepasses).defaultValue() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(default_prepass == @import("generate.zig").corePrepasses);
+    const default_wire = std.meta.fieldInfo(RebuildCtx, .wire_prebuild_env).defaultValue() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(default_wire == @import("install.zig").wirePrebuildPython);
+
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    try fx.write(.{});
+    try fx.startup();
+    var site = fx.site();
+    defer site.env.deinit();
+    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    // The assembler appends to a shared log, so the order is observable.
+    const log = try std.fs.path.join(a, &.{ fx.project, "..", "order.log" });
+    defer a.free(log);
+    {
+        var buf: [512]u8 = undefined;
+        const script = try std.fmt.bufPrint(&buf, "#!/bin/sh\necho assembler >> '{s}'\n", .{log});
+        try fx.tmp.dir.writeFile(io, .{ .sub_path = "asm-log", .data = script, .flags = .{ .permissions = .executable_file } });
+    }
+    const asm_path = try fx.tmp.dir.realPathFileAlloc(io, "asm-log", a);
+    defer a.free(asm_path);
+    ctx.asm_bin = .{ .path = asm_path };
+    const Spy = struct {
+        var log_path: []const u8 = "";
+        var saw_version: [16]u8 = undefined;
+        var saw_len: usize = 0;
+        var bake = false;
+        var wired_steps: usize = 0;
+        var wired_before_prebuild = false;
+        var prebuilds: usize = 0;
+        fn append(line: []const u8) void {
+            const prev = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), log_path, std.testing.allocator, .limited(4096)) catch std.testing.allocator.dupe(u8, "") catch unreachable;
+            defer std.testing.allocator.free(prev);
+            const next = std.mem.concat(std.testing.allocator, u8, &.{ prev, line, "\n" }) catch unreachable;
+            defer std.testing.allocator.free(next);
+            std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = log_path, .data = next }) catch unreachable;
+        }
+        fn prepass(_: std.mem.Allocator, _: []const u8, cfg: project_config.ProjectConfig, opts: @import("generate.zig").Prepass) anyerror!void {
+            append("prepass");
+            const v = cfg.plugins[0].version;
+            @memcpy(saw_version[0..v.len], v);
+            saw_len = v.len;
+            bake = opts.bake;
+        }
+        fn wire(_: std.mem.Allocator, steps: []const prebuild.Step) void {
+            wired_steps = steps.len;
+            wired_before_prebuild = prebuilds == 0;
+        }
+        fn runPrebuild(_: std.mem.Allocator, _: []const u8, _: []const prebuild.Step, _: prebuild.Options) prebuild.Error!void {
+            prebuilds += 1;
+        }
+    };
+    Spy.log_path = log;
+    ctx.prepass = .{ .legacy_target = true, .bake = true, .fatal = false };
+    ctx.run_prepasses = Spy.prepass;
+    ctx.wire_prebuild_env = Spy.wire;
+    ctx.run_prebuild = Spy.runPrebuild;
+    // The edit bumps the version and ADDS a prebuild step mid-session.
+    try fx.write(.{ .version = "3.1.4", .project_extra = ", .prebuild = .{ .{ .run = .{ \"python3\", \"gen.py\" } } }" });
+    try ctx.rebuildStaged();
+    // The pre-passes ran before the assembler, on the re-read project.
+    const order = try std.Io.Dir.cwd().readFileAlloc(io, log, a, .limited(4096));
+    defer a.free(order);
+    try std.testing.expectEqualStrings("prepass\nassembler\n", order);
+    try std.testing.expectEqualStrings("3.1.4", Spy.saw_version[0..Spy.saw_len]);
+    try std.testing.expect(Spy.bake);
+    // The new step got the Python wiring before it first ran.
+    try std.testing.expectEqual(@as(usize, 1), Spy.wired_steps);
+    try std.testing.expect(Spy.wired_before_prebuild);
+    try std.testing.expectEqual(@as(usize, 1), Spy.prebuilds);
+}
+
+test "rebuild transaction: a before-run hook's OWNING provider changing is a session change" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var fx: Fixture = undefined;
+    try fx.init(a);
+    defer fx.deinit();
+    // A second local package, `aux`, attaches a `before run` hook to the
+    // target it does not own.
+    try fx.tmp.dir.createDirPath(io, "aux");
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "aux/plugin.labelle", .data = ".{ .name = \"aux\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .hooks = .{ .{ .id = \"prepare\", .step = .run, .target = \"probe-target\", .when = .before, .build_step = \"tool\", .executable = \"bin/tool\" } } }" });
+    const Project = struct {
+        fn write(dir: std.Io.Dir, aux_version: []const u8) !void {
+            var buf: [1024]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, ".{{ .name = \"game\", .plugins = .{{ .{{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" }}, .{{ .name = \"aux\", .repo = \"local:../aux\", .version = \"{s}\" }} }} }}", .{aux_version});
+            try dir.writeFile(config.globalIo(), .{ .sub_path = "project/project.labelle", .data = text });
+        }
+    };
+    try fx.write(.{});
+    try Project.write(fx.tmp.dir, "1.0.0");
+    try fx.startup();
+    try std.testing.expectEqualStrings("aux/prepare", fx.run_plan.before[0].qualified);
+    var site = fx.site();
+    defer site.env.deinit();
+    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
+    defer replan.deinit(&site, fx.providers, fx.cfg);
+    replan.baseline();
+    var dummy: u8 = 0;
+    var ctx = rebuildCtx(&fx, &site, &replan, &dummy);
+    defer ctx.deinit();
+    ctx.fallback_optimize = "ReleaseSafe";
+    Publish.reset();
+    try ctx.rebuildStaged();
+    try std.testing.expectEqual(@as(usize, 1), Publish.count);
+    // Only `aux`'s version changes: the hook id and tool are the same, the
+    // replacement's own provider is untouched.
+    try Project.write(fx.tmp.dir, "2.0.0");
+    try std.testing.expectError(error.SessionChanged, ctx.rebuildStaged());
+    try std.testing.expectEqual(@as(usize, 1), Publish.count);
 }

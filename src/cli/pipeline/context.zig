@@ -39,4 +39,7 @@ pub const Context = struct {
     /// The core's optimize fallback for the target, which a watched
     /// rebuild's replan recomputes the effective mode from.
     fallback_optimize: ?[]const u8 = null,
+    /// `labelle run --watch`: the watched tree as it was BEFORE the cold
+    /// build, the watcher's starting baseline.
+    watch_baseline: ?@import("../watch.zig").TreeSignature = null,
 };

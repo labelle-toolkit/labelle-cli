@@ -23,6 +23,8 @@ const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_hooks = @import("../provider_hooks.zig");
 const provider_env = @import("../provider_env.zig");
 const testing = @import("testing.zig");
+const generate = @import("generate.zig");
+const install = @import("install.zig");
 
 /// Rebuild context for a watch session. Bundles the generate+build inputs
 /// the initial pipeline computed so the watcher thread can re-run them on
@@ -69,6 +71,16 @@ pub const RebuildCtx = struct {
     /// generate`. A field only so the stage test below can supply the
     /// override value without touching the process environment.
     shader_preflight: *const fn (std.mem.Allocator, []const u8) anyerror!void = material_toolchain.preflight,
+    /// The core generation's pre-passes (ASTC conversion, `--bake`), run
+    /// before the assembler on every core-generated rebuild exactly as the
+    /// cold pipeline runs them (`generate.corePrepasses`), against the
+    /// rebuild's project config; `null` skips them (the plumbing tests).
+    prepass: ?generate.Prepass = null,
+    run_prepasses: *const fn (std.mem.Allocator, []const u8, project_config.ProjectConfig, generate.Prepass) anyerror!void = generate.corePrepasses,
+    /// The managed-Python PATH wiring of the prebuild steps, the cold
+    /// pipeline's (`install.wirePrebuildPython`): a step added mid-session
+    /// gets it before it first runs. A field only so a test can observe it.
+    wire_prebuild_env: *const fn (std.mem.Allocator, []const prebuild.Step) void = install.wirePrebuildPython,
     /// Provider lifecycle hooks (contract §6). A watched rebuild re-runs the
     /// `generate` and `build` plans in the same before / core-or-replace /
     /// after order as the cold pipeline. `hooks` is the rebuild's own site:
@@ -104,6 +116,11 @@ pub const RebuildCtx = struct {
     /// `LABELLE_NO_PREBUILD` kill switch.
     ignore: watch.IgnoreSet = .{},
     hooks_enabled: bool = true,
+    /// The environment the running replacement was launched with (a watch
+    /// session): a rebuild whose hooks contribute a different one ends with
+    /// the restart diagnostic and publishes nothing — the replacement
+    /// cannot pick up a new toolchain environment. `null`: no such check.
+    launch_env: ?*const provider_env.Accumulator = null,
 
     /// Which stage a rebuild stopped at. Ordered as the stages run; the
     /// watch loop only needs the bool, but the tests assert the ORDER.
@@ -163,6 +180,7 @@ pub const RebuildCtx = struct {
         generate_plan: provider_hooks.Plan,
         build_plan: provider_hooks.Plan,
         zig_args: []const []const u8,
+        lock_path: ?[]const u8,
     };
 
     fn save(self: *const RebuildCtx) Saved {
@@ -175,6 +193,7 @@ pub const RebuildCtx = struct {
             .generate_plan = self.generate_plan,
             .build_plan = self.build_plan,
             .zig_args = self.zig_args,
+            .lock_path = self.hooks.lock_path,
         };
     }
 
@@ -187,6 +206,7 @@ pub const RebuildCtx = struct {
         self.generate_plan = saved.generate_plan;
         self.build_plan = saved.build_plan;
         self.zig_args = saved.zig_args;
+        self.hooks.lock_path = saved.lock_path;
     }
 
     fn canceled(self: *const RebuildCtx) bool {
@@ -250,6 +270,8 @@ pub const RebuildCtx = struct {
         var old_env = saved.env;
         old_env.deinit();
         if (self.replan) |replan| if (replan.commit) |commit| commit(replan.ctx);
+        // The commit moved any staged lock over `labelle.lock`.
+        self.hooks.lock_path = saved.lock_path;
         self.refreshIgnore();
     }
 
@@ -278,6 +300,7 @@ pub const RebuildCtx = struct {
         //     are excluded from the watch signature (`ignore`), so the run
         //     that DOES regenerate them does not look like a fresh edit.
         try self.checkCanceled();
+        if (self.hooks_enabled) self.wire_prebuild_env(a, self.prebuild_steps);
         self.run_prebuild(a, self.project_dir, self.prebuild_steps, self.prebuild_opts) catch |err| {
             if (self.canceled()) return error.Canceled;
             std.debug.print("labelle: rebuild prebuild step failed ({s})\n", .{@errorName(err)});
@@ -314,6 +337,11 @@ pub const RebuildCtx = struct {
             try self.hookPhase(&.{replacement}, .generate, .replace, self.generate_out);
         } else {
             try self.checkCanceled();
+            if (self.prepass) |opts| self.run_prepasses(a, self.project_dir, self.hooks.cfg, opts) catch |err| {
+                if (self.canceled()) return error.Canceled;
+                std.debug.print("labelle: rebuild generation pre-pass failed ({s})\n", .{@errorName(err)});
+                return error.GenerateFailed;
+            };
             var asm_bin = self.asm_bin;
             // A failed regeneration fails this rebuild, never the session.
             asm_bin.fatal_on_failure = false;
@@ -344,8 +372,13 @@ pub const RebuildCtx = struct {
         try self.hookPhase(self.build_plan.after, .build, .after, self.build_out);
 
         // 4. Every build stage and every `after build` hook succeeded: only
-        //    now may the output be published (RFC cli#466 §3.4).
+        //    now may the output be published (RFC cli#466 §3.4) — unless
+        //    the hooks contributed an environment the running replacement
+        //    was not launched with.
         try self.checkCanceled();
+        if (self.launch_env) |launched| if (!self.hooks.env.sameAs(launched)) {
+            return @import("session_key.zig").SessionKey.report("the provider environment");
+        };
         if (self.publish) |p| p.run(p.ctx) catch |err| {
             std.debug.print("labelle: rebuild could not publish its output ({s}); the last good output stays published\n", .{@errorName(err)});
             return error.PublishFailed;
@@ -387,7 +420,7 @@ pub const RebuildCtx = struct {
     /// Recompute the ignore set from the committed prebuild steps, swapping
     /// it (and moving `epoch`) only when it changed.
     pub fn refreshIgnore(self: *RebuildCtx) void {
-        var next = collectPrebuildIgnorePaths(self.allocator, self.project_dir, self.prebuild_steps, self.hooks_enabled);
+        var next = watchIgnorePaths(self.allocator, self.project_dir, self.prebuild_steps, self.hooks_enabled);
         if (sameFiles(self.ignore.files, next.items)) {
             freePaths(self.allocator, &next);
             return;
@@ -428,6 +461,18 @@ pub const RebuildCtx = struct {
         list.deinit(a);
     }
 };
+
+/// Everything a rebuild itself writes into the watched tree: the prebuild
+/// steps' declared outputs (`collectPrebuildIgnorePaths`) and the project's
+/// `labelle.lock`, which the CLI writes (a replan's commit) and nobody edits
+/// as an input — the build reads `project.labelle`. The watch session's
+/// pre-build baseline uses the same set as the watcher. Caller owns it.
+pub fn watchIgnorePaths(allocator: std.mem.Allocator, project_dir: []const u8, steps: []const prebuild.Step, hooks_enabled: bool) std.ArrayList([]const u8) {
+    var out = collectPrebuildIgnorePaths(allocator, project_dir, steps, hooks_enabled);
+    const lock = watch.watchIgnorePath(allocator, project_dir, "labelle.lock") catch return out;
+    out.append(allocator, lock) catch allocator.free(lock);
+    return out;
+}
 
 /// The watcher's ignore set for a watch session: the absolute
 /// paths of every declared prebuild `.outputs` entry, anchored at

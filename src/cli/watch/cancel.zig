@@ -35,23 +35,45 @@ pub fn installCancelHandler() void {
     }
 }
 
-/// Async-signal-safe: an atomic swap and `kill(2)` calls. The first stop
-/// is forwarded as the same signal; the repeat kills every supervised
-/// tree, or ends the process when there is none.
-fn onSignal(sig: std.posix.SIG) callconv(.c) void {
+/// What a stop does, on every host: the FIRST one is latched on every
+/// attached supervised group and forwarded to their trees (a child that
+/// registers later is stopped the moment it registers, so no stop is lost
+/// before the session's child exists); a REPEATED one kills every tree,
+/// and asks the caller to end the process when there is none.
+/// Async-signal-safe: atomic operations and `kill(2)` / job calls only.
+pub fn handleStop(sig: supervise.Stop) enum { handled, exit } {
     if (cancel_requested.swap(true, .acq_rel)) {
-        if (supervise.forwardAll(.kill) == 0) std.c._exit(130);
-        return;
+        return if (supervise.forwardAll(.kill) == 0) .exit else .handled;
     }
-    _ = supervise.forwardAll(if (sig == .TERM) .terminate else .interrupt);
+    _ = supervise.forwardAll(sig);
+    return .handled;
+}
+
+fn onSignal(sig: std.posix.SIG) callconv(.c) void {
+    if (handleStop(if (sig == .TERM) .terminate else .interrupt) == .exit) std.c._exit(130);
 }
 
 const HandlerRoutine = *const fn (ctrl_type: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?HandlerRoutine, add: std.os.windows.BOOL) callconv(.winapi) std.os.windows.BOOL;
 
-/// Runs on a console-owned thread. Returning TRUE claims the event; the
-/// repeat returns FALSE so the console's default handling ends the process.
+/// Runs on a console-owned thread. The first event is latched like a POSIX
+/// signal (every child attached to the console already received it; one
+/// that starts later is stopped when it registers); returning TRUE claims
+/// it. A repeat with no tree left returns FALSE so the console's default
+/// handling ends the process.
 fn consoleCtrl(_: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
-    if (!cancel_requested.swap(true, .acq_rel)) return .TRUE;
-    return if (supervise.forwardAll(.kill) == 0) .FALSE else .TRUE;
+    return if (handleStop(.interrupt) == .exit) .FALSE else .TRUE;
+}
+
+test "handleStop: the first stop is latched on every attached group, on every host" {
+    const saved = cancel_requested.swap(false, .acq_rel);
+    defer cancel_requested.store(saved, .release);
+    var group: supervise.Group = .{};
+    group.attach();
+    defer group.detach();
+    // The console handler and the signal handler both go through this.
+    try std.testing.expectEqual(.handled, handleStop(.interrupt));
+    try std.testing.expect(group.pending.load(.seq_cst) == @as(u8, @intFromEnum(supervise.Stop.interrupt)) + 1);
+    // A repeat with no tree registered asks the caller to end the process.
+    try std.testing.expectEqual(.exit, handleStop(.interrupt));
 }

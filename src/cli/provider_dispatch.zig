@@ -334,7 +334,12 @@ pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectCo
 /// this exact provider, and a remote provider to carry an integrity pin.
 /// Returns the lock's real path for the wire context.
 pub fn requirePinned(a: std.mem.Allocator, root: []const u8, provider: Provider) ![]const u8 {
-    const lock_path = try std.fs.path.join(a, &.{ root, "labelle.lock" });
+    return requirePinnedAt(a, try std.fs.path.join(a, &.{ root, "labelle.lock" }), provider);
+}
+
+/// `requirePinned` against the lock at `lock_path` (a watched rebuild's
+/// staged lock). Returns its canonical path.
+pub fn requirePinnedAt(a: std.mem.Allocator, lock_path: []const u8, provider: Provider) ![]const u8 {
     const lock_bytes = read(a, lock_path) catch |err| {
         std.debug.print("labelle: provider execution requires the project's labelle.lock: {s}\n", .{@errorName(err)});
         return error.MissingProjectLock;

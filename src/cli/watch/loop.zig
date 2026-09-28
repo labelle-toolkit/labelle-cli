@@ -75,6 +75,11 @@ pub const WatchConfig = struct {
     /// `ignore_files`, so a rebuild that swaps the prebuild steps swaps
     /// their declared outputs out of the signature at the same moment.
     ignore: ?*const IgnoreSet = null,
+    /// The tree as the build the session starts from read it: a watch
+    /// session takes it BEFORE its cold build, so an edit saved while that
+    /// build ran is unbuilt and fires a rebuild. `null`: the tree when the
+    /// loop starts.
+    baseline: ?TreeSignature = null,
     clock: ?Clock = null,
     /// The line printed after a clean rebuild.
     ok_note: []const u8 = "rebuild ok",
@@ -129,7 +134,7 @@ pub fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
     var initial = TreeSignature{};
     computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignored(), &initial);
     _ = scan_arena.reset(.retain_capacity);
-    var baseline: WatchBaseline = .{ .applied = initial, .allocator = std.heap.page_allocator };
+    var baseline: WatchBaseline = .{ .applied = cfg.baseline orelse initial, .allocator = std.heap.page_allocator };
     defer baseline.deinit();
     // The two per-path snapshots bracketing each rebuild; reset after it.
     var rebuild_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -315,4 +320,27 @@ test "watchLoop: a rebuild that swaps the ignore set is confirmed once, then its
     // step's output (now ignored) triggers nothing after that.
     try std.testing.expectEqual(@as(u32, 2), script.rebuilds);
     try std.testing.expectEqual(@as(u64, 1), script.ignore.epoch);
+}
+
+test "watchLoop: an edit saved before the loop started (during the cold build) fires a rebuild" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer alloc.free(dir_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "a" });
+    // The session's baseline, taken before its cold build...
+    var before = TreeSignature{};
+    computeSignature(std.testing.io, alloc, dir_path, &.{}, &before);
+    // ...and an edit saved while that build ran.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.txt", .data = "b" });
+    var script: Script = .{ .dir = tmp.dir, .max_ticks = 6, .edits = &.{} };
+    var state: WatchState = .{};
+    watchLoop(std.testing.io, .{ .watch_dir = dir_path, .rebuild_fn = Script.rebuild, .rebuild_ctx = &script, .baseline = before, .clock = .{ .ctx = &script, .wait = Script.wait } }, &state);
+    try std.testing.expectEqual(@as(u32, 1), script.rebuilds);
+    // The mechanism: without the early baseline nothing fires.
+    var quiet: Script = .{ .dir = tmp.dir, .max_ticks = 6, .edits = &.{} };
+    var quiet_state: WatchState = .{};
+    watchLoop(std.testing.io, .{ .watch_dir = dir_path, .rebuild_fn = Script.rebuild, .rebuild_ctx = &quiet, .clock = .{ .ctx = &quiet, .wait = Script.wait } }, &quiet_state);
+    try std.testing.expectEqual(@as(u32, 0), quiet.rebuilds);
 }

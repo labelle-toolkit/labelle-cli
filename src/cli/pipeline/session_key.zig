@@ -32,8 +32,9 @@ pub const SessionKey = struct {
     /// The explicit `.watch = true` capability.
     watch: bool,
     /// The `before run` hooks, which ran once before the replacement
-    /// started and are never re-run by a rebuild: `<qualified>|<step>|<exe>`
-    /// per hook, in plan order.
+    /// started and are never re-run by a rebuild: per hook, in plan order,
+    /// its id, tool, and its owning provider's version, verified pin,
+    /// negotiated wire and `provider_config` mapping.
     before_run: []const u8,
     backend: []const u8,
     target: []const u8,
@@ -52,6 +53,9 @@ pub const SessionKey = struct {
     /// The Zig version the project requires (`zig_version`, else derived
     /// from the engine): the compiler the session resolved at startup.
     zig: []const u8,
+    /// The `assembler_version` pin: the session resolved its assembler at
+    /// startup and every rebuild generates with it.
+    assembler: []const u8,
 
     /// The key of a replanned configuration: its `run` plan's replacement,
     /// the backend and target it builds, and the effective optimize mode.
@@ -68,9 +72,21 @@ pub const SessionKey = struct {
     ) !?SessionKey {
         const replacement = run_plan.replace orelse return null;
         const provider = replacement.provider.*;
+        // Each `before run` hook with its OWNING provider's identity: a
+        // hook of another package whose version, pin, wire or settings
+        // mapping changed ran, at startup, as the old one.
         var before: std.ArrayList(u8) = .empty;
         for (run_plan.before) |planned| {
-            try before.print(a, "{s}|{s}|{s};", .{ planned.qualified, planned.hook.build_step, planned.hook.executable });
+            const owner = planned.provider.*;
+            const owner_wire: []const u8 = if (owner.meta.command_contract) |range| provider_manifest.negotiate(range) catch "none" else "none";
+            const owner_settings: []const u8 = for (cfg.provider_config) |entry| {
+                if (std.mem.eql(u8, entry.package, owner.meta.name)) break entry.file;
+            } else "";
+            try before.print(a, "{s}|{s}|{s}|{s}|{s}|{s}|{s};", .{
+                planned.qualified, planned.hook.build_step,       planned.hook.executable,
+                owner.dep.version, try pinOf(a, root, owner.dep), owner_wire,
+                owner_settings,
+            });
         }
         const settings_path: ?[]const u8 = for (cfg.provider_config) |entry| {
             if (std.mem.eql(u8, entry.package, provider.meta.name)) break entry.file;
@@ -95,6 +111,7 @@ pub const SessionKey = struct {
             .settings_path = settings_path,
             .settings = try settingsDigest(a, root, cfg, provider.meta.name),
             .zig = zig.version,
+            .assembler = cfg.assembler_version orelse "",
         };
     }
 
@@ -138,6 +155,7 @@ pub const SessionKey = struct {
         if (self.optimize != n.optimize) return "the effective optimize mode";
         if (!optEql(self.settings_path, n.settings_path) or !std.meta.eql(self.settings, n.settings)) return "the replacement's settings";
         if (!eql(self.zig, n.zig)) return "the Zig version";
+        if (!eql(self.assembler, n.assembler)) return "the assembler version";
         return null;
     }
 
@@ -204,6 +222,7 @@ test "session key: every field the replacement depends on is reported, the first
         .settings_path = null,
         .settings = null,
         .zig = "0.16.0",
+        .assembler = "",
     };
     try std.testing.expect(base.changed(base) == null);
     try std.testing.expectEqualStrings("the run replacement", base.changed(null).?);
@@ -278,6 +297,11 @@ test "session key: every field the replacement depends on is reported, the first
                 }
             }.f,
         },
+        .{ .what = "the assembler version", .edit = struct {
+            fn f(k: *SessionKey) void {
+                k.assembler = "0.99.0";
+            }
+        }.f },
         .{ .what = "the Zig version", .edit = struct {
             fn f(k: *SessionKey) void {
                 k.zig = "0.17.0";

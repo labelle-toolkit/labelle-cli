@@ -131,6 +131,20 @@ pub const Accumulator = struct {
         self.reset();
     }
 
+    /// Whether two accumulators make the same environment: the same
+    /// variables with the same values, and the same PATH entries, in order
+    /// (names folded on Windows). Which hook contributed is not compared.
+    pub fn sameAs(self: *const Accumulator, other: *const Accumulator) bool {
+        if (self.vars.items.len != other.vars.items.len or self.path.items.len != other.path.items.len) return false;
+        for (self.vars.items, other.vars.items) |x, y| {
+            if (!eqlName(x.name, y.name, self.windows) or !std.mem.eql(u8, x.value, y.value)) return false;
+        }
+        for (self.path.items, other.path.items) |x, y| {
+            if (!eqlPath(x, y, self.windows)) return false;
+        }
+        return true;
+    }
+
     /// A deep copy on its own arena (from `backing`): a second owner — a
     /// watch session's rebuild thread — may reset or free either copy
     /// without touching the other's storage.
@@ -445,4 +459,23 @@ test "provider env: a clone owns its storage; freeing or replacing either leaves
     // An empty accumulator clones without an arena.
     const empty = try (Accumulator{}).clone(a);
     try std.testing.expect(empty.arena == null);
+}
+
+test "provider env: sameAs compares the resulting environment, not who contributed it" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var x: Accumulator = .{};
+    defer x.deinit();
+    var y: Accumulator = .{};
+    defer y.deinit();
+    try std.testing.expect(x.sameAs(&y));
+    try x.add(a, a, "pkg/a", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/one" }} }, &diag);
+    try y.add(a, a, "pkg/b", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/one" }} }, &diag);
+    try std.testing.expect(x.sameAs(&y));
+    var z: Accumulator = .{};
+    defer z.deinit();
+    try z.add(a, a, "pkg/a", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/two" }} }, &diag);
+    try std.testing.expect(!x.sameAs(&z));
+    try y.add(a, a, "pkg/b", .{ .path_prepend = &.{"/abs/bin"} }, &diag);
+    try std.testing.expect(!x.sameAs(&y));
 }

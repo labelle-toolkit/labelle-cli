@@ -65,6 +65,12 @@ elif argv and argv[0] == "generate":
         '    b.installFile("data.txt", "bin/data.txt");\\n'
         '}\\n')
     (target / "data.txt").write_text((root / "assets" / "data.txt").read_text())
+    once = root.resolve().parent / "edit-during-build"
+    if once.exists():
+        # A user saving an edit while the cold build runs (after this
+        # build read its inputs): the session must rebuild for it.
+        once.unlink()
+        (root / "assets" / "data.txt").write_text("saved-during-build")
     body = "this is not zig\\n" if (root / "broken.flag").exists() else "pub fn main() void {}\\n"
     (target / "main.zig").write_text(body)
     print("FIXTURE_GENERATE", file=sys.stderr, flush=True)
@@ -323,6 +329,21 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     finally:
         s.kill()
 
+    # ── An edit saved during the cold build is rebuilt ──────────────────
+    (base / "edit-during-build").write_text("1")
+    s = Session()
+    try:
+        s.wait_gen("gen=0 data=one")
+        s.wait_gen("gen=1 data=saved-during-build")
+        assert s.finish("0") == 0, s.output()
+        checks += 1
+    except BaseException:
+        print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+        raise
+    finally:
+        (base / "edit-during-build").unlink(missing_ok=True)
+        s.kill()
+
     # ── A non-zero replacement exit skips `after run`; cleanup still runs ─
     s = Session()
     try:
@@ -332,6 +353,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         assert "after-run hooks skipped" in s.output(), s.output()
         assert "done" not in hook_ids(), hook_ids()
         assert not session_dir.exists()
+        # The status file ends in a terminal state, not the live `run` phase.
+        record = json.loads((target_dir / ".build-progress.json").read_text())
+        assert record["phase"] == "failed" and record["exit_code"] == 5, record
         checks += 1
     except BaseException:
         print('---- labelle output ----\n' + s.output(), file=sys.stderr)
@@ -383,6 +407,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
             assert status == 128 + signal.SIGTERM, (status, s.output())
             assert "done" not in hook_ids(), hook_ids()
             assert not session_dir.exists()
+            record = json.loads((target_dir / ".build-progress.json").read_text())
+            assert record["phase"] == "failed" and record["exit_code"] == 128 + signal.SIGTERM, record
             for pid in server_child:
                 wait_for(f"process {pid} to end", lambda: not alive(pid), timeout=30)
             checks += 1

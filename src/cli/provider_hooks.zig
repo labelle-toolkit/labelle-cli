@@ -294,6 +294,11 @@ pub const Site = struct {
     /// `LABELLE_*` pairs and maps nothing: how they reach the game on a
     /// provider's target is the provider's decision.
     run_options: ?contract.RunContext = null,
+    /// The lock the hooks verify their pins against and receive as
+    /// `lock_file`, when not the project's `labelle.lock`: a watched rebuild
+    /// stages the lock of an edited project privately until the rebuild
+    /// commits (a running replacement never sees an uncommitted one).
+    lock_path: ?[]const u8 = null,
     host: ?dispatch.Host = null,
     /// The environment the hooks of the CURRENT build contributed through
     /// their `env_file` (contract §2, wire `1.3.0`+), merged in hook
@@ -333,7 +338,10 @@ pub fn runPhase(site: *Site, list: []const Planned, step: contract.Step, phase: 
     // `ProviderCompilerMissing` — "install Zig" — instead of the integrity
     // failure that is the actual problem (Codex P2 on #420).
     const locks = try a.alloc([]const u8, list.len);
-    for (list, locks) |planned, *lock| lock.* = try dispatch.requirePinned(a, site.root, planned.provider.*);
+    for (list, locks) |planned, *lock| lock.* = if (site.lock_path) |path|
+        try dispatch.requirePinnedAt(a, path, planned.provider.*)
+    else
+        try dispatch.requirePinned(a, site.root, planned.provider.*);
     if (site.host == null) site.host = try site.resolve_host(site.a, site.root);
     const output = try dispatch.canonicalDir(a, output_dir);
     const target_dir = try dispatch.canonicalDir(a, site.target_dir);

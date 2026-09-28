@@ -204,12 +204,13 @@ pub const Publisher = struct {
 };
 
 /// Copy the tree at `src` into `dest` (created). A symbolic link is copied
-/// AS a link (its target text verbatim), never followed, so a link back to
-/// an ancestor cannot make the copy recurse. A RELATIVE link whose target
-/// lies outside `src` would resolve somewhere else from the published copy,
-/// and rewriting it absolute would leak host paths into the published
-/// output, so it is skipped with a warning; so is a link that cannot be
-/// created (Windows without the privilege).
+/// AS a link, never followed, so a link back to an ancestor cannot make the
+/// copy recurse. A link whose target lies inside `src` is written relative
+/// to its own directory (an absolute one is made relative), so it names the
+/// published file, never the mutable staging tree or a host path. A link
+/// whose target lies outside `src` — relative or absolute — is skipped with
+/// a warning; so is a link that cannot be created (Windows without the
+/// privilege).
 pub fn copyTree(a: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
     return copyTreeWithin(a, src, src, dest);
 }
@@ -239,14 +240,18 @@ fn copyLink(a: std.mem.Allocator, top: []const u8, from: []const u8, to: []const
     const io = config.globalIo();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try std.Io.Dir.cwd().readLink(io, from, &buf);
-    const target = buf[0..n];
-    if (!std.fs.path.isAbsolute(target)) {
-        const resolved = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(from) orelse ".", target });
-        defer a.free(resolved);
-        if (!within(top, resolved)) return error.LinkLeavesTheStagedTree;
-    }
+    const link_dir = std.fs.path.dirname(from) orelse ".";
+    const resolved = try std.fs.path.resolve(a, &.{ link_dir, buf[0..n] });
+    defer a.free(resolved);
+    if (!within(top, resolved)) return error.LinkLeavesTheStagedTree;
+    // Inside the staged tree. An absolute target would keep pointing into
+    // the MUTABLE staging tree (and name a host path), so every link is
+    // written relative to its own directory: in the copy, which mirrors the
+    // staged tree, it names the same file of the published generation.
+    const target = if (std.fs.path.isAbsolute(buf[0..n])) try std.fs.path.relative(a, link_dir, null, link_dir, resolved) else try a.dupe(u8, buf[0..n]);
+    defer a.free(target);
     const is_dir = if (std.Io.Dir.cwd().statFile(io, from, .{})) |st| st.kind == .directory else |_| false;
-    try std.Io.Dir.cwd().symLink(io, target, to, .{ .is_directory = is_dir });
+    try std.Io.Dir.cwd().symLink(io, if (target.len == 0) "." else target, to, .{ .is_directory = is_dir });
 }
 
 /// True when `path` is `top` or lies beneath it (pure path math; both are
@@ -572,6 +577,22 @@ test "publish: links inside the staged tree are copied as links; relative ones l
     const m = try tmp.dir.readLink(io, "out/sub/alias.txt", &buf);
     try std.testing.expectEqualStrings("file.txt", buf[0..m]);
     try tmp.dir.access(io, "out/sub/file.txt", .{});
+    // Absolute links: into the tree becomes relative; out of it, skipped.
+    const abs_inside = try std.fs.path.join(a, &.{ stage, "sub", "file.txt" });
+    defer a.free(abs_inside);
+    const abs_outside = try std.fs.path.join(a, &.{ base, "outside", "secret.txt" });
+    defer a.free(abs_outside);
+    try tmp.dir.symLink(io, abs_inside, "stage/abs-in.txt", .{});
+    try tmp.dir.symLink(io, abs_outside, "stage/abs-out.txt", .{});
+    const out2 = try std.fs.path.join(a, &.{ base, "out2" });
+    defer a.free(out2);
+    try copyTree(a, stage, out2);
+    const k = try tmp.dir.readLink(io, "out2/abs-in.txt", &buf);
+    try std.testing.expectEqualStrings("sub" ++ std.fs.path.sep_str ++ "file.txt", buf[0..k]);
+    const via = try tmp.dir.readFileAlloc(io, "out2/abs-in.txt", a, .limited(16));
+    defer a.free(via);
+    try std.testing.expectEqualStrings("x", via);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out2/abs-out.txt", .{ .follow_symlinks = false }));
     // Skipped: no link, and no rewritten absolute path either.
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/sub/escape.txt", .{ .follow_symlinks = false }));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/escape-dir", .{ .follow_symlinks = false }));

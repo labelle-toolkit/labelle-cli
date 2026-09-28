@@ -55,6 +55,7 @@ test "watched rebuild gates the shader override after the before-generate hooks 
         .shader_preflight = Fixture.invalidOverride,
         .hooks = &site,
     };
+    defer ctx.deinit();
 
     // Started WITHOUT materials/: the invalid override is not consulted
     // and the rebuild proceeds to generation (which fails for its own
@@ -182,6 +183,7 @@ test "watched rebuild runs the generate and build hook phases in order" {
         .build_out = "/build-out",
         .run_hook_phase = Spy.run,
     };
+    defer ctx.deinit();
 
     // Empty plans: no phase runs, the core generate is reached.
     Spy.reset();
@@ -351,6 +353,7 @@ test "watched rebuild replans the hook phases on every rebuild" {
         .run_prebuild = Spy.runPrebuild,
         .replan = .{ .ctx = &counter, .precheck = Spy.precheck, .run = Spy.replan },
     };
+    defer ctx.deinit();
     // Production wiring: the default prebuild runner IS the cold one.
     const default_prebuild = std.meta.fieldInfo(RebuildCtx, .run_prebuild).defaultValue() orelse return error.TestUnexpectedResult;
     try std.testing.expect(default_prebuild == prebuild.runAll);
@@ -479,6 +482,7 @@ test "watched rebuild keeps the last good hook environment unless the whole rebu
         .generate_plan = .{ .before = &.{Spy.planned("tc", .generate, .before)}, .replace = Spy.planned("gen", .generate, .replace) },
         .build_plan = .{ .replace = Spy.planned("build", .build, .replace) },
     };
+    defer ctx.deinit();
     // A first successful rebuild installs its environment.
     Spy.value = "first";
     try ctx.rebuildStaged();
@@ -565,6 +569,7 @@ test "a rebuild's environment changes never reach the session's copy" {
         .generate_plan = .{ .before = &.{Spy.planned("tc", .generate, .before)}, .replace = Spy.planned("gen", .generate, .replace) },
         .build_plan = .{ .replace = Spy.planned("build", .build, .replace) },
     };
+    defer ctx.deinit();
     // Two committed rebuilds: each frees the environment it replaces.
     try ctx.rebuildStaged();
     try ctx.rebuildStaged();
@@ -573,4 +578,84 @@ test "a rebuild's environment changes never reach the session's copy" {
     try std.testing.expectEqual(@as(usize, 1), session.env.vars.items.len);
     try std.testing.expectEqual(startup_value.ptr, session.env.vars.items[0].value.ptr);
     try std.testing.expectEqualStrings("startup", session.env.vars.items[0].value);
+}
+
+// The running replacement keeps the environment it was launched with: a
+// rebuild whose hooks contribute a different one must not publish output
+// built for another toolchain environment.
+test "a rebuild that contributes a different environment than the launch one publishes nothing" {
+    const a = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project");
+    const project = try tmp.dir.realPathFileAlloc(io, "project", a);
+    defer a.free(project);
+    const Spy = struct {
+        var value: []const u8 = "";
+        var published: usize = 0;
+        fn run(site: *provider_hooks.Site, list: []const provider_hooks.Planned, _: provider_contract.Step, _: provider_contract.Phase, _: []const u8) anyerror!u8 {
+            for (list) |entry| if (std.mem.eql(u8, entry.hook.id, "tc")) {
+                var diag: provider_env.Diagnostic = .{};
+                try site.env.add(site.backing, site.backing, entry.qualified, .{ .set = &.{.{ .name = "SDK_ROOT", .value = value }} }, &diag);
+            };
+            return 0;
+        }
+        fn publish(_: *anyopaque) anyerror!void {
+            published += 1;
+        }
+        var provider: provider_dispatch.Provider = .{
+            .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
+            .dir = "/pkg",
+            .meta = .{ .name = "pkg", .manifest_version = 2, .command_contract = ">=1.0.0 <2.0.0" },
+            .verified = true,
+        };
+        fn planned(id: []const u8, step: provider_contract.Step, when: provider_contract.Phase) provider_hooks.Planned {
+            return .{ .provider = &provider, .hook = .{ .id = id, .step = step, .target = "probe-target", .when = when, .build_step = "tool", .executable = "bin/tool" }, .qualified = id };
+        }
+    };
+    // What the replacement was launched with.
+    var launched: provider_env.Accumulator = .{};
+    defer launched.deinit();
+    var diag: provider_env.Diagnostic = .{};
+    try launched.add(a, a, "tc", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/one" }} }, &diag);
+    var site = testing.testSite(a, project);
+    site.env = try launched.clone(a);
+    defer site.env.deinit();
+    var dummy: u8 = 0;
+    var ctx = RebuildCtx{
+        .allocator = a,
+        .asm_bin = .{ .path = "" },
+        .project_dir = project,
+        .platform_tag = "probe-target",
+        .backend_tag = "probe",
+        .output_dir = project,
+        .target_dir = project,
+        .zig_args = &.{},
+        .zig_env = null,
+        .prebuild_steps = &.{},
+        .prebuild_opts = .{ .fatal_on_step_failure = false },
+        .hooks = &site,
+        .run_hook_phase = Spy.run,
+        .publish = .{ .ctx = &dummy, .run = Spy.publish },
+        .launch_env = &launched,
+        .generate_plan = .{ .before = &.{Spy.planned("tc", .generate, .before)}, .replace = Spy.planned("gen", .generate, .replace) },
+        .build_plan = .{ .replace = Spy.planned("build", .build, .replace) },
+    };
+    defer ctx.deinit();
+    // The same environment: published.
+    Spy.value = "/one";
+    Spy.published = 0;
+    try ctx.rebuildStaged();
+    try std.testing.expectEqual(@as(usize, 1), Spy.published);
+    // A different one: the restart diagnostic, nothing published, and the
+    // committed environment stays the launch one.
+    Spy.value = "/two";
+    try std.testing.expectError(error.SessionChanged, ctx.rebuildStaged());
+    try std.testing.expectEqual(@as(usize, 1), Spy.published);
+    try std.testing.expectEqualStrings("/one", site.env.vars.items[0].value);
+    // The check is the mechanism: without a launch environment it publishes.
+    ctx.launch_env = null;
+    try ctx.rebuildStaged();
+    try std.testing.expectEqual(@as(usize, 2), Spy.published);
 }

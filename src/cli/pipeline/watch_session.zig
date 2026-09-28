@@ -219,6 +219,12 @@ pub fn run(
         .publish = .{ .ctx = &publisher, .run = publishNext },
         .group = &rebuild_group,
         .hooks_enabled = !prebuild.skipRequested(allocator),
+        // The startup environment the replacement is launched with; the
+        // main thread does not touch it until the watcher is joined.
+        .launch_env = &site.env,
+        // The cold pipeline's generation pre-passes, failing the rebuild
+        // (not the session) on a misconfiguration.
+        .prepass = .{ .legacy_target = cx.target.legacy != null, .bake = cx.parsed_args.bake, .fatal = false },
     };
     ctx.initIgnore();
     defer ctx.deinit();
@@ -229,6 +235,7 @@ pub fn run(
         .rebuild_fn = RebuildCtx.rebuild,
         .rebuild_ctx = &ctx,
         .ignore = &ctx.ignore,
+        .baseline = cx.watch_baseline,
     }, &state }) catch |err| {
         std.debug.print("labelle: run --watch: could not start the file watcher ({s})\n", .{@errorName(err)});
         replanner.deinit(site, cx.providers, cx.parsed);
@@ -268,6 +275,10 @@ pub fn run(
     const after = replanner.shutdownRunAfter(cx.hook_plans.run.after);
     if (code != 0) {
         if (after.len != 0) std.debug.print("labelle: after-run hooks skipped: the run replacement exited with status {d}\n", .{code});
+        // A non-zero or signal exit is the run's terminal outcome: the
+        // status file leaves the live `run` phase (`failed`, the code the
+        // CLI exits with), whatever path ended the replacement.
+        if (site.reporter) |r| r.failIfActive(code, "the run replacement exited with an error");
         return code;
     }
     return provider_hooks.finishRun(site, after, run_out, .exited_clean);

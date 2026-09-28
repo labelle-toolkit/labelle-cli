@@ -88,6 +88,7 @@ test "watch replan re-reads the project and provider manifests on every call" {
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{ .backing = a, .project_dir = project };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
@@ -250,6 +251,7 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
         .run_hook_phase = TwoStage.Spy.runHook,
         .replan = replan.seam(),
     };
+    defer ctx.deinit();
 
     // Owned: the pre-check passes, the prebuild runs, the replan plans
     // the hook (generation then fails on the missing assembler).
@@ -363,6 +365,7 @@ test "watched rebuild lets a prebuild refresh an existing provider manifest" {
         .run_hook_phase = TwoStage.Spy.runHook,
         .replan = replan.seam(),
     };
+    defer ctx.deinit();
 
     // The existing manifest does not declare the target, yet the
     // pre-check defers: a local package's metadata is not final
@@ -426,6 +429,7 @@ test "watched rebuild replans after a prebuild step generates provider metadata"
         .run_hook_phase = TwoStage.Spy.runHook,
         .replan = replan.seam(),
     };
+    defer ctx.deinit();
 
     // The manifest does not exist when the rebuild starts; the prebuild
     // step generates it, owning the target and declaring a hook.
@@ -527,6 +531,7 @@ test "watch replan extracts a pinned provider once per changed pin" {
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
@@ -637,6 +642,7 @@ test "watch replan installs and relocks when project.labelle changes" {
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{
         .backing = a,
         .project_dir = project,
@@ -751,6 +757,7 @@ test "watched serve shutdown runs the replanned after-run hooks" {
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = lockfile.writeLockFile };
     defer replan.deinit(&site, startup_providers, startup_cfg);
     replan.baseline();
@@ -832,6 +839,7 @@ test "watch replan release restores the site's stable storage" {
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none };
     try runCommitted(&replan, &ctx);
     // The site now reads the replan's generation, not the startup storage.
@@ -884,6 +892,7 @@ test "watch replan installs the re-read prebuild steps" {
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
@@ -960,6 +969,7 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
     };
+    defer ctx.deinit();
     var replan = Replanner{ .backing = a, .project_dir = project };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
