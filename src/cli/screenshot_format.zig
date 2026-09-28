@@ -2,9 +2,9 @@
 //! the user asked for (cli#356).
 //!
 //! `labelle run --screenshot=<path>` forwards the path to the game via
-//! `LABELLE_SCREENSHOT_PATH`; the backend owns the final filename. bgfx
-//! APPENDS its own extension rather than honoring the request
-//! (labelle-bgfx#57 — `bgfx_callback.zig` writes `<path>.tga`), so
+//! `LABELLE_SCREENSHOT_PATH`; the backend owns the final filename. A
+//! backend may APPEND its own extension rather than honoring the request
+//! (one writes `<path>.tga`), so
 //! `--screenshot=/tmp/shot.png` used to land at `/tmp/shot.png.tga`: a
 //! name that claims BOTH formats and is wrong either way, and a file the
 //! caller has to convert before using.

@@ -876,7 +876,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -928,7 +928,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -961,7 +961,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -1008,7 +1008,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -1079,7 +1079,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "bgfx_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -1117,7 +1117,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -1146,7 +1146,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);
@@ -1176,7 +1176,7 @@ pub const ReporterPipelineSpec = struct {
 
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(io, &path_buf);
-        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "raylib_desktop" });
+        const target_dir = try std.fs.path.join(allocator, &.{ path_buf[0..n], "fixture_desktop" });
         defer allocator.free(target_dir);
 
         var rep = try Reporter.init(allocator, io, .off, target_dir);

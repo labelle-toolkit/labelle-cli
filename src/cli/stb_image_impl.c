@@ -3,7 +3,7 @@
    used in no-stdio mode — texpack feeds bytes in and out itself.
 
    TGA/BMP decode is on for cli#356: `labelle run --screenshot=x.png`
-   can land at `x.png.tga` because the bgfx backend appends its own
+   can land at `x.png.tga` because a backend may append its own
    extension, and `src/cli/screenshot_format.zig` re-encodes that
    capture into the format the user asked for. Those two are the only
    extensions `pipeline.zig`'s `screenshot_suffixes` list allows a
