@@ -207,8 +207,11 @@ fn addAgnosticGuard(b: *std.Build, test_step: *std.Build.Step, optimize: std.bui
     b.step("test-guard", "Check src/ for platform, store and package names (RFC #406 agnosticism guard)").dependOn(&guard_run.step);
 }
 
-/// Compile the vendored stb implementation (PNG/TGA/BMP decode, and
-/// PNG/BMP/TGA/JPEG encode) and put its headers on the include path.
+/// Compile the vendored stb implementation (`vendor/stb/`, unmodified
+/// upstream bytes apart from the LOCAL PATCH noted in `stb_image_write.h`;
+/// third-party code lives outside `src/`, so the agnostic guard does not
+/// scan upstream comments — cli#471 X2): PNG/TGA/BMP decode and
+/// PNG/BMP/TGA/JPEG encode, with its headers on the include path.
 /// Three consumers `@cImport` those headers: `src/cli/bake.zig` (decode,
 /// for the PNG→LRGBA prebake), `src/texpack/` (decode + encode, for
 /// `labelle pack`), and `src/cli/screenshot_format.zig` (decode + encode,
@@ -216,9 +219,9 @@ fn addAgnosticGuard(b: *std.Build, test_step: *std.Build.Step, optimize: std.bui
 /// cli#356). A single `.c` provides one definition of the symbols for all.
 fn wireStb(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFile(.{
-        .file = b.path("src/cli/stb_image_impl.c"),
+        .file = b.path("vendor/stb/stb_image_impl.c"),
         .flags = &.{"-std=c99"},
     });
-    mod.addIncludePath(b.path("src/cli"));
+    mod.addIncludePath(b.path("vendor/stb"));
     mod.link_libc = true;
 }
