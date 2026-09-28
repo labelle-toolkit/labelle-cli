@@ -392,7 +392,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
 
     # A provider reporting the core's id owns it: the core's entry gives way.
     caps, ids, _ = report(capability(core_id), capability("beta-cap"))
-    assert ids == core_ids + ["beta-cap"], ids
+    # The provider's entry takes the replaced core entry's place among the
+    # providers'; the other core entries keep theirs.
+    assert ids == [i for i in core_ids if i != core_id] + [core_id, "beta-cap"], ids
     assert caps[core_id]["items"][0]["detail"] == "probe", caps[core_id]
     # A declared package named like the core's capability id that never ran
     # (remote, unpinned, not installed: a WARN) cannot displace the core's
