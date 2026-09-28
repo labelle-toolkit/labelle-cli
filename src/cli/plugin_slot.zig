@@ -87,7 +87,12 @@ pub fn explicitOverrideSource(allocator: std.mem.Allocator, dep: project_config.
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
-    const packages_dir = try asm_cache.getPackagesDir(allocator);
+    // No cache home (no LABELLE_HOME/HOME/USERPROFILE) means no override can
+    // be registered, and reading project.labelle must not fail over it.
+    const packages_dir = asm_cache.getPackagesDir(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     defer allocator.free(packages_dir);
     const key = try slotKey(allocator, dep.repo, dep.name);
     defer allocator.free(key);
