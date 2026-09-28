@@ -27,10 +27,6 @@ const writePreview = preview_mod.writePreview;
 const checkPreview = preview_mod.checkPreview;
 const jsonText = preview_mod.jsonText;
 const removePreview = preview_mod.removePreview;
-const registry_cache = @import("registry_cache.zig");
-const cacheRegistry = registry_cache.cacheRegistry;
-const registry_cache_dir = registry_cache.registry_cache_dir;
-const registry_cache_file = registry_cache.registry_cache_file;
 const AcceptFixture = @import("test_fixtures.zig").AcceptFixture;
 
 const registry_lookup = @import("registry_lookup.zig");
@@ -164,16 +160,12 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     removePreview(a, root) catch |err| {
         std.debug.print("labelle: warning: the new pins are committed, but the consumed preview {s} could not be removed ({s}); delete it by hand before the next review\n", .{ preview_name, @errorName(err) });
     };
-    // The accepted document is kept as the hint source of the unknown-
-    // namespace diagnostic (a preview stays read-only): `reviewed`, never this
-    // run's raw fetch. Best effort: a failed cache write changes nothing about the pins.
-    registry_cache.cacheRegistry(a, reviewed) catch |err| {
-        std.debug.print("labelle: warning: could not cache the registry document: {s}\n", .{@errorName(err)});
-    };
-    // Which source this project accepted from, with the same reviewed
-    // document, as one snapshot: the no-provider diagnostic answers from that
-    // document, not the public registry, when the source is a custom or
-    // local one. Best effort, like the cache.
+    // Which source this project accepted from, with the reviewed document
+    // (never this run's raw fetch), as one snapshot: the no-provider
+    // diagnostics (target and namespace) answer from that document, not the
+    // public registry, when the source is a custom or local one. It is kept
+    // in the project, never in a global cache another project could have
+    // written (#465). Best effort: a failed write changes nothing about the pins.
     registry_lookup.recordAccepted(a, root, source, reviewed) catch |err| {
         std.debug.print("labelle: warning: could not record the accepted registry source: {s}\n", .{@errorName(err)});
     };
@@ -221,8 +213,9 @@ test "provider github: accept is bound to the whole registry document, not only 
     try std.testing.expectError(error.ProviderPreviewMismatch, fx.run(a, true));
     try std.testing.expect(!try fx.exists(a, lock_name));
     // (5) The same document with other whitespace is the same normalised
-    // document: accepted. The target-hint cache then holds exactly the
-    // reviewed document (its bytes hash to the preview's registry digest).
+    // document: accepted. The project's accepted-source record then holds
+    // exactly the reviewed document (its bytes hash to the preview's
+    // registry digest), and nothing is written to a global registry cache.
     try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", ""));
     try fx.run(a, false);
     const reviewed = try loadPreview(a, fx.root);
@@ -231,9 +224,10 @@ test "provider github: accept is bound to the whole registry document, not only 
     try fx.publishRaw(try Doc.of(a, fixture_record, "other-target", "", "\n  "));
     try fx.run(a, true);
     try std.testing.expect(try fx.exists(a, lock_name));
-    const cached = try read(a, try std.fs.path.join(a, &.{ fx.home, registry_cache_dir, registry_cache_file }), 1024 * 1024);
-    try std.testing.expectEqualStrings(reviewed.registry_digest, try sha256Hex(a, cached));
-    try std.testing.expectEqualStrings("other", (try registry_cache.cachedRegistry(a)).?.targetOwner("other-target").?);
+    const accepted = registry_lookup.readAccepted(a, fx.root).verified;
+    try std.testing.expectEqualStrings(reviewed.registry_digest, accepted.document_sha256);
+    try std.testing.expectEqualStrings("other", (try registry.parse(a, accepted.document)).targetOwner("other-target").?);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(config.globalIo(), try std.fs.path.join(a, &.{ fx.home, "registry" }), .{}));
 }
 
 test "provider github: accept refuses a schema-2 record whose claims the verified manifest contradicts" {

@@ -166,6 +166,12 @@ labelle-studio's toolchain gate, must read it from a project that pins `web`
 - `labelle run --platform=wasm` without a provider `replace run` hook is
   refused before the build (`NoRunReplacement`), like every other provider
   target. `web` 0.3.x declares one.
+- The global registry cache (`<LABELLE_HOME>/registry/providers.json`) is no
+  longer written or read. It held whichever document the last `providers
+  resolve --accept` on the machine used, possibly another project's. The
+  unknown-namespace hint now reads the same one document as the no-provider
+  target hint: the project's verified accepted source, else the public
+  registry (cli#465). An existing cache file is ignored; delete it if you like.
 
 ## Troubleshooting
 

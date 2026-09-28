@@ -14,6 +14,7 @@ Hermetic: no network, no game dependencies; every workspace is temporary.
 Runs on Windows, macOS and Linux.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -122,8 +123,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
     project = base / "project"
     project.mkdir()
     home = base / "home"
-    # Hermetic: the no-provider diagnostic's registry download is off
-    # (LABELLE_OFFLINE); only the unknown-namespace hint reads the cached registry.
+    # Hermetic: the no-provider diagnostics' registry download is off
+    # (LABELLE_OFFLINE); only the project's own accepted-source record answers.
     env = dict(os.environ, LABELLE_OFFLINE="1", LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD="1")
     for leftover in ("PROVIDER_PROBE_FAIL", "PROVIDER_PROBE_COPY", "PROVIDER_PROBE_PATCH"):
@@ -170,34 +171,51 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
         assert not target_dir.exists() or not (target_dir / "build.zig").exists(), "the assembler generated"
         assert not marker.exists(), "the host launch ran"
 
-    # A cached schema-2 registry whose `android` release declares the
-    # namespace and the target. It names the namespace's owner; the target
-    # hint never reads it (another project's accept may have written it), so
-    # offline the target steps stay generic (#459).
+    # A schema-2 registry document whose `android` release declares the
+    # namespace and the target.
     registry_doc = {"schema_version": 2, "defaults": [], "providers": [{
         "package": "android", "repo": "labelle-toolkit/labelle-android", "version": "0.2.0",
         "commit": "1" * 40, "sha256": "0" * 64, "namespace": "android", "targets": ["android"]}]}
+    fork = "https://example.test/fork/providers.json"
 
     # ── 1. Without the pin: every entry point fails, nothing is generated ──
+    # Three states: nothing recorded; the document only in the global
+    # registry cache (where an older CLI kept another project's accepted
+    # document, #465), which never answers; and the project's own verified
+    # accepted-source record, which answers both the target and the
+    # namespace hint (offline: it is read from the project, not downloaded).
     declare()
     reset()
-    for with_registry in (False, True):
-        if with_registry:
+    for state in ("none", "global-cache", "project-record"):
+        if state == "global-cache":
             (home / "registry").mkdir(parents=True, exist_ok=True)
             (home / "registry" / "providers.json").write_text(json.dumps(registry_doc))
+        if state == "project-record":
+            document = json.dumps(registry_doc, separators=(",", ":"))
+            (project / ".labelle").mkdir(parents=True, exist_ok=True)
+            (project / ".labelle" / "providers.registry.json").write_text(json.dumps({
+                "schema_version": 2, "source": fork,
+                "document_sha256": hashlib.sha256(document.encode()).hexdigest(), "document": document}))
+        named = state == "project-record"
         hint = "(registry: android)"
         for args in (("run", "--platform=android"), ("build", "--platform=android"), ("bundle", "--platform=android")):
             refused = run(*args, code=1)
             assert NO_PROVIDER in refused.stderr, (args, refused.stderr)
-            assert hint not in refused.stderr, (args, with_registry, refused.stderr)
-            assert "(registry not consulted: LABELLE_OFFLINE is set)" in refused.stderr, (args, refused.stderr)
+            assert (hint in refused.stderr) == named, (args, state, refused.stderr)
+            if named:
+                assert "\n    " + fork + "\n" in refused.stderr, (args, refused.stderr)
+            else:
+                assert "(registry not consulted: LABELLE_OFFLINE is set)" in refused.stderr, (args, refused.stderr)
             nothing_generated(refused)
         refused = run("android", "run", code=1)
-        if with_registry:
+        if named:
             assert NO_NAMESPACE in refused.stderr and hint in refused.stderr, refused.stderr
+            assert "Its newest release that declares the namespace, 0.2.0, is a candidate" in refused.stderr, refused.stderr
+            assert "\n    " + fork + "\n" in refused.stderr and "compatible" not in refused.stderr, refused.stderr
         else:
-            assert "labelle: unknown command 'android'" in refused.stderr and hint not in refused.stderr, refused.stderr
+            assert "labelle: unknown command 'android'" in refused.stderr and hint not in refused.stderr, (state, refused.stderr)
         nothing_generated(refused)
+    shutil.rmtree(home / "registry")
 
     # ── 2. With the pin: generate, the after-build hook, the run replacement ─
     declare(dep)
