@@ -15,6 +15,8 @@ const RebuildCtx = @import("rebuild.zig").RebuildCtx;
 const SessionKey = @import("session_key.zig").SessionKey;
 const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
+const coreGenerateGate = @import("install.zig").coreGenerateGate;
+const assembler_describe = @import("../assembler_describe.zig");
 const provider_contract = @import("../provider_contract.zig");
 const optimize_mod = @import("optimize.zig");
 
@@ -94,6 +96,12 @@ pub const Replanner = struct {
     /// replan that changes any of it fails with `error.SessionChanged`
     /// after printing the restart diagnostic (`session_key.zig`).
     session: ?*const SessionKey = null,
+    /// Asks the assembler whether the backend still supports the target
+    /// (`describe`, cli#471 D3), after this rebuild's install: a backend
+    /// bump that drops the pair fails the rebuild with describe's reason,
+    /// as the cold pipeline's gate does (`install.coreGenerateGate`).
+    /// `off` (the plumbing tests, a pre-7 assembler) keeps the enum check.
+    describer: assembler_describe.Describer = .off,
 
     pub const LockBefore = union(enum) { absent, bytes: []u8 };
 
@@ -435,13 +443,13 @@ pub const Replanner = struct {
             try provider_dispatch.discover(a, ctx.hooks.root, cfg, &next.sources, .populated);
         // The target must still have a pinned owner among the NEW
         // providers (Codex P1 on #421).
-        switch (try confirmTarget(a, ctx.hooks.root, providers, ctx.hooks.target)) {
-            .resolved => {},
+        const resolved = switch (try confirmTarget(a, ctx.hooks.root, providers, ctx.hooks.target)) {
+            .resolved => |r| r,
             .refused => |kind| return switch (kind) {
                 .no_provider => error.NoProviderForTarget,
                 .unpinned_owner => error.UnverifiedTargetOwner,
             },
-        }
+        };
         // The effective optimize mode, recomputed against the NEW providers.
         const optimize = optimize_mod.effective(ctx.optimize_flag, optimize_mod.ownerDefault(providers, ctx.hooks.target));
         const wire_optimize = std.meta.stringToEnum(provider_contract.Optimize, optimize.mode orelse "Debug") orelse return error.InvalidOptimizeMode;
@@ -453,6 +461,10 @@ pub const Replanner = struct {
             const replanned = try SessionKey.of(a, ctx.hooks.root, cfg, run_plan, file_backend, ctx.hooks.target, key.target_follows_file, wire_optimize);
             if (key.changed(replanned)) |what| return SessionKey.report(what);
         }
+        // The core generation's gate, as the cold pipeline applies it
+        // (`install.discoverAndPlan`): before the lock and any hook, against
+        // the project and packages as they now are.
+        try generateGate(self.describer, a, ctx.hooks.target, resolved, generate_plan.replace != null);
         // The lock follows the re-read project once the target is confirmed
         // and the plans are good — the cold pipeline's order — and before
         // any hook runs: STAGED, so this rebuild's hooks verify their pins
@@ -484,6 +496,24 @@ pub const Replanner = struct {
         next.run_after = run_plan.after;
         self.installed = true;
         self.pruneExtractions();
+    }
+
+    /// Fail the rebuild when `describe` says the backend no longer supports
+    /// `target` and the core generation would run for it. A target outside
+    /// the pinned assembler's schema is left alone here: the cold pipeline
+    /// already refused it (labelle-assembler#378) unless a `replace` hook
+    /// generated it, and a replan never judged that before. Public for the
+    /// tests.
+    pub fn generateGate(describer: assembler_describe.Describer, a: std.mem.Allocator, target: []const u8, resolved: provider_targets.Resolved, replaced: bool) !void {
+        if (resolved.legacy == null or replaced) return;
+        const described = describer.query(a, target);
+        switch (coreGenerateGate(true, false, described)) {
+            .proceed, .no_schema_target => {},
+            .unsupported => |reason| {
+                std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ described.?.backend.name, target, reason });
+                return error.BackendUnsupportedTarget;
+            },
+        }
     }
 
     /// `args` (a `zig build` argv) with its `-Doptimize=` flag replaced by

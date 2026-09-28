@@ -190,6 +190,7 @@ pub fn run(
         .project_dir = cx.project_dir,
         .installer = Replanner.assemblerInstaller(&installer),
         .session = &key,
+        .describer = .init(cx.asm_bin, cx.project_dir),
     };
     replanner.baseline();
     replanner.seed(cx.provider_sources);

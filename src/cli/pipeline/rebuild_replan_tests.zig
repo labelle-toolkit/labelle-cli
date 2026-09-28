@@ -992,3 +992,46 @@ test "watch replan: withOptimize replaces or drops the flag, keeping every other
     const dropped = try Replanner.withOptimize(a, &.{ "zig", "build", "-Doptimize=Debug" }, null);
     try std.testing.expectEqual(@as(usize, 2), dropped.len);
 }
+
+// cli#471 D3 (CodeRabbit on #504): a watched rebuild applies the cold
+// pipeline's support gate. A backend bump that makes `describe` refuse the
+// pair fails THAT rebuild (the session lives on); no answer, a supported
+// pair, a replaced generation or a target outside the schema pass.
+test "watch replan: describe's unsupported verdict fails the rebuild before generation" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var reply: ?[]const u8 = null;
+        fn spawn(_: std.mem.Allocator, _: []const []const u8) ?[]const u8 {
+            calls += 1;
+            return reply;
+        }
+        fn doc(comptime supported: []const u8, comptime reason: []const u8) []const u8 {
+            return "{\"schema\":\"labelle.describe/v1\",\"target\":\"desktop\",\"target_dir\":\".labelle/acme_desktop\"," ++
+                "\"backend\":{\"name\":\"acme\",\"id\":null,\"repo\":null,\"version\":\"2.0.0\",\"local_path\":null}," ++
+                "\"asset_format\":\"png\",\"supported\":" ++ supported ++ reason ++ ",\"capabilities_source\":\"manifest\"}";
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const describer: @import("../assembler_describe.zig").Describer = .{ .bin_path = "/asm", .protocol = 7, .project_dir = "/proj", .spawn = Fake.spawn };
+    const core: @import("../provider_targets.zig").Resolved = .{ .name = "desktop", .provider = null, .legacy = .desktop };
+
+    Fake.reply = Fake.doc("false", ",\"reason\":\"provider 'acme.gfx' does not support capability 'probe'\"");
+    try std.testing.expectError(error.BackendUnsupportedTarget, Replanner.generateGate(describer, a, "desktop", core, false));
+
+    Fake.reply = Fake.doc("true", "");
+    try Replanner.generateGate(describer, a, "desktop", core, false);
+    // No answer (describe failed): the enum behaviour, i.e. proceed.
+    Fake.reply = null;
+    try Replanner.generateGate(describer, a, "desktop", core, false);
+    try Replanner.generateGate(.off, a, "desktop", core, false);
+
+    // Never asked when the core generation does not run for the target.
+    Fake.reply = Fake.doc("false", ",\"reason\":\"x\"");
+    Fake.calls = 0;
+    try Replanner.generateGate(describer, a, "desktop", core, true);
+    const foreign: @import("../provider_targets.zig").Resolved = .{ .name = "probe-target", .provider = null, .legacy = null };
+    try Replanner.generateGate(describer, a, "probe-target", foreign, false);
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+}
