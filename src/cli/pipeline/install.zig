@@ -8,6 +8,7 @@ const project_config = @import("../project_config.zig");
 const compatibility = @import("../compatibility.zig");
 const lockfile = @import("../lockfile.zig");
 const assembler_proc = @import("../assembler_proc.zig");
+const assembler_describe = @import("../assembler_describe.zig");
 const python_provision = @import("../python_provision.zig");
 const prebuild = @import("../prebuild.zig");
 const material_toolchain = @import("../material_toolchain.zig");
@@ -178,6 +179,7 @@ pub fn discoverAndPlan(
     requested_target: []const u8,
     reporter: ?*progress.Reporter,
     provider_sources: *provider_github.Sources,
+    describer: assembler_describe.Describer,
 ) !Planned {
     const providers: []const provider_dispatch.Provider = if (parsed.plugins.len == 0)
         &.{}
@@ -213,10 +215,28 @@ pub fn discoverAndPlan(
     // Without one, stop HERE — before the lock, the assembler's `generate`
     // and any compiler — rather than hand the assembler a name it cannot
     // take.
-    if (target.legacy == null and hook_plans.generate.replace == null) {
-        std.debug.print("labelle: target '{s}' is declared by '{s}' but the pinned assembler cannot generate for it yet (labelle-assembler#378)\n", .{ target.name, target.providerName() });
-        if (reporter) |r| r.finishFailed(1, "the pinned assembler cannot generate for this target");
-        return .{ .exit = 1 };
+    //
+    // A protocol-7 assembler also judges the backend × target pair itself
+    // (`describe`'s `supported`, cli#471 D3): asked HERE, after the install,
+    // so an installed backend is judged from its own manifest — the check
+    // `generate` would fail on, reported before the lock and any compiler.
+    // Only asked when the core generation will run at all.
+    const described: ?assembler_describe.Description = if (target.legacy != null and hook_plans.generate.replace == null)
+        describer.query(hook_arena, target.name)
+    else
+        null;
+    switch (coreGenerateGate(target.legacy != null, hook_plans.generate.replace != null, described)) {
+        .proceed => {},
+        .no_schema_target => {
+            std.debug.print("labelle: target '{s}' is declared by '{s}' but the pinned assembler cannot generate for it yet (labelle-assembler#378)\n", .{ target.name, target.providerName() });
+            if (reporter) |r| r.finishFailed(1, "the pinned assembler cannot generate for this target");
+            return .{ .exit = 1 };
+        },
+        .unsupported => |reason| {
+            std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ described.?.backend.name, target.name, reason });
+            if (reporter) |r| r.finishFailed(1, "the backend does not support this target");
+            return .{ .exit = 1 };
+        },
     }
     // `labelle bundle` of a provider target is packaged by its provider, so
     // it needs a `replace` hook on `bundle` — and needs no particular host.
@@ -268,6 +288,48 @@ pub fn discoverAndPlan(
     // harmless, and `enforceCliNotStale` only reads it on the next run.
     try lockfile.writeLockFile(allocator, project_dir, parsed);
     return .{ .ready = .{ .providers = providers, .target = target, .hook_plans = hook_plans } };
+}
+
+/// The verdict on handing the target to the assembler's core `generate`.
+pub const GenerateGate = union(enum) {
+    proceed,
+    /// labelle-assembler#378: a target outside the schema enum.
+    no_schema_target,
+    /// `describe` said the resolved backend does not support the target;
+    /// carries its reason.
+    unsupported: []const u8,
+};
+
+/// Pure. `schema_target`: the target is one the pinned assembler's schema
+/// knows (`target.legacy != null`); `replaced`: a `replace` hook on
+/// `generate` stands in for the core generation; `described`: the
+/// assembler's `describe` answer, null below protocol 7 or when it could
+/// not answer (then the enum check alone decides, as before cli#471 D3).
+pub fn coreGenerateGate(schema_target: bool, replaced: bool, described: ?assembler_describe.Description) GenerateGate {
+    if (replaced) return .proceed;
+    if (!schema_target) return .no_schema_target;
+    if (described) |d| if (!d.supported) return .{ .unsupported = d.reason orelse "unsupported (no reason given)" };
+    return .proceed;
+}
+
+test "coreGenerateGate: describe refuses an unsupported pair; the enum check is the fallback" {
+    var d = std.mem.zeroInit(assembler_describe.Description, .{ .supported = true });
+    // A replacement generates: nothing else is asked.
+    try std.testing.expect(coreGenerateGate(false, true, null) == .proceed);
+    d.supported = false;
+    try std.testing.expect(coreGenerateGate(true, true, d) == .proceed);
+    // labelle-assembler#378, with or without an answer.
+    try std.testing.expect(coreGenerateGate(false, false, null) == .no_schema_target);
+    // No answer (protocol < 7, describe failed): today's behaviour.
+    try std.testing.expect(coreGenerateGate(true, false, null) == .proceed);
+    // Supported: proceed. Unsupported: refused with describe's reason.
+    d.supported = true;
+    try std.testing.expect(coreGenerateGate(true, false, d) == .proceed);
+    d.supported = false;
+    d.reason = "provider 'acme.gfx' does not support capability 'probe'";
+    try std.testing.expectEqualStrings(d.reason.?, coreGenerateGate(true, false, d).unsupported);
+    d.reason = null;
+    try std.testing.expect(coreGenerateGate(true, false, d) == .unsupported);
 }
 
 /// The platforms whose provider target the CLI still launches through a

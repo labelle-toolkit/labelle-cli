@@ -66,6 +66,10 @@ fn minProtocolFor(subcommand: []const u8) u32 {
 pub const Assembler = struct {
     /// Absolute path to the `labelle-assembler` executable. Heap-owned.
     path: []u8,
+    /// The protocol the binary reported (`--protocol-version`) when it was
+    /// resolved; 0 when unknown. Lets a caller gate an optional feature
+    /// (e.g. `describe`, protocol 7 — cli#471 D3) without a second spawn.
+    protocol: u32 = 0,
     /// A failing subcommand ends the CLI with the assembler's exit code
     /// (`progress.fatalExit`). A watched rebuild clears it: a failed
     /// regeneration must fail that rebuild and keep the session alive, and
@@ -111,8 +115,8 @@ pub fn resolve(allocator: std.mem.Allocator, project_dir: []const u8, subcommand
     const path = try assembler.resolveAssembler(allocator, project_dir) orelse
         try assembler.resolveDefault(allocator);
     errdefer allocator.free(path);
-    try checkProtocol(allocator, path, subcommand);
-    return .{ .path = path };
+    const protocol = try checkProtocol(allocator, path, subcommand);
+    return .{ .path = path, .protocol = protocol };
 }
 
 /// Verify the resolved binary speaks a protocol high enough for
@@ -121,8 +125,8 @@ pub fn resolve(allocator: std.mem.Allocator, project_dir: []const u8, subcommand
 /// outdated binary reject a delegated subcommand opaquely. The required
 /// minimum is per-subcommand (`minProtocolFor`) so newer subcommands don't
 /// reject a binary that older subcommands (and the auto-downloaded default)
-/// still work with.
-fn checkProtocol(allocator: std.mem.Allocator, path: []const u8, subcommand: []const u8) !void {
+/// still work with. Returns the reported protocol.
+fn checkProtocol(allocator: std.mem.Allocator, path: []const u8, subcommand: []const u8) !u32 {
     const required = minProtocolFor(subcommand);
     const res = std.process.run(allocator, config.globalIo(), .{
         .argv = &.{ path, "--protocol-version" },
@@ -147,6 +151,7 @@ fn checkProtocol(allocator: std.mem.Allocator, path: []const u8, subcommand: []c
         );
         return error.AssemblerFailed;
     }
+    return proto;
 }
 
 /// One-shot convenience: locate the assembler and run a single subcommand.
