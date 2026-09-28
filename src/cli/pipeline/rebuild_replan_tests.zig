@@ -24,20 +24,6 @@ fn runCommitted(replan: *Replanner, ctx: *RebuildCtx) !void {
     Replanner.commit(replan);
 }
 
-/// A forbidding session mode, as the legacy serve supplies one.
-const Refuse = struct {
-    fn plan(p: provider_hooks.Plan) bool {
-        return p.replace != null;
-    }
-    fn known(_: std.mem.Allocator, providers: []const provider_dispatch.Provider, target: []const u8) anyerror!bool {
-        for (providers) |provider| for (provider.meta.hooks) |hook| {
-            if (hook.step == .run and hook.when == .replace and std.mem.eql(u8, hook.target, target)) return true;
-        };
-        return false;
-    }
-    const forbid: Replanner.Forbid = .{ .plan = plan, .known = known };
-};
-
 // Against a real project: edits to the manifest between rebuilds change
 // the installed plans; a broken manifest fails the replan and keeps the
 // last good plans; nothing leaks across generations.
@@ -114,16 +100,6 @@ test "watch replan re-reads the project and provider manifests on every call" {
     try Manifest.write(tmp.dir, build_hook);
     try runCommitted(&replan, &ctx);
     const good = replan.current.?;
-    // A manifest edit cannot silently add a run replacement to a session
-    // that forbids one (the legacy serve). Both checks keep the old plans.
-    try Manifest.write(tmp.dir, ".{ .id = \"server\", .step = .run, .target = \"probe-target\", .when = .replace, .build_step = \"tool\", .executable = \"bin/tool\" }");
-    replan.forbid_run_replacement = Refuse.forbid;
-    try std.testing.expectError(error.RunReplacementForbidden, Replanner.precheck(&replan, &ctx));
-    try std.testing.expectError(error.RunReplacementForbidden, Replanner.run(&replan, &ctx));
-    replan.forbid_run_replacement = null;
-    try std.testing.expectEqual(good, replan.current.?);
-    try std.testing.expectEqualStrings("pkg/post", ctx.build_plan.after[0].qualified);
-    try Manifest.write(tmp.dir, build_hook);
 
     // The served target loses its owner (Codex P1 on #421). Each case
     // fails the replan with the cold pipeline's error and keeps the
@@ -970,10 +946,9 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
         .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
-        // The startup plan: the core fallback, before any replan.
+        // The startup plan, before any replan.
         .zig_args = &.{ "zig", "build", "-Doptimize=ReleaseSafe" },
         .zig_env = null,
-        .fallback_optimize = "ReleaseSafe",
         .prebuild_steps = &.{},
         .prebuild_opts = .{ .fatal_on_step_failure = false },
         .hooks = &site,
@@ -983,19 +958,20 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
-    // The owner declares a default: it replaces the core fallback.
+    // The owner declares a default: it replaces the startup mode.
     try Manifest.write(tmp.dir, ".{ .target = \"probe-target\", .optimize = .ReleaseSmall }");
     try runCommitted(&replan, &ctx);
     try std.testing.expectEqual(provider_contract.Optimize.ReleaseSmall, site.optimize);
     try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", ctx.zig_args[ctx.zig_args.len - 1]);
     try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
     try std.testing.expectEqualStrings("build", ctx.zig_args[1]);
-    // The default is edited away: back to the core fallback.
+    // The default is edited away: no mode, so the flag is dropped and the
+    // wire mode is Debug.
     try Manifest.write(tmp.dir, "");
     try runCommitted(&replan, &ctx);
-    try std.testing.expectEqual(provider_contract.Optimize.ReleaseSafe, site.optimize);
-    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", ctx.zig_args[ctx.zig_args.len - 1]);
-    try std.testing.expectEqual(@as(usize, 1), Manifest.flags(ctx.zig_args));
+    try std.testing.expectEqual(provider_contract.Optimize.Debug, site.optimize);
+    try std.testing.expectEqualStrings("build", ctx.zig_args[ctx.zig_args.len - 1]);
+    try std.testing.expectEqual(@as(usize, 0), Manifest.flags(ctx.zig_args));
     // An explicit flag wins over a declared default.
     ctx.optimize_flag = "Debug";
     try Manifest.write(tmp.dir, ".{ .target = \"probe-target\", .optimize = .ReleaseFast }");

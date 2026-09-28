@@ -289,6 +289,8 @@ test "rebuild commit: a local provider's source edit is a session change; its bu
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
+    // The startup mode with no `--optimize` and no owner default.
+    site.optimize = .Debug;
     const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
     try std.testing.expect(key.source != null);
     var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
@@ -297,7 +299,6 @@ test "rebuild commit: a local provider's source edit is a session change; its bu
     var dummy: u8 = 0;
     var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
     defer ctx.deinit();
-    ctx.fallback_optimize = "ReleaseSafe";
     Publish.reset();
     try ctx.rebuildStaged();
     try std.testing.expectEqual(@as(usize, 1), Publish.count);

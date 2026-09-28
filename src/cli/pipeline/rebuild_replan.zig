@@ -90,10 +90,6 @@ pub const Replanner = struct {
     /// Pinned provider extractions shared across this session's
     /// generations, keyed by the verified archive hash (cli#429).
     extractions: ?provider_github.Extractions = null,
-    /// A session mode that cannot switch the replacement serving it while
-    /// running (the legacy serve command): refuses a `run` replacement in
-    /// the replanned project. Supplied by that command.
-    forbid_run_replacement: ?Forbid = null,
     /// `labelle run --watch`: what the running replacement depends on. A
     /// replan that changes any of it fails with `error.SessionChanged`
     /// after printing the restart diagnostic (`session_key.zig`).
@@ -105,14 +101,6 @@ pub const Replanner = struct {
     pub const Installer = struct {
         ctx: *const anyopaque,
         run: *const fn (*const anyopaque, std.mem.Allocator, []const u8) anyerror!void,
-    };
-
-    /// The refusal of a run replacement: `plan` for a planned one, `known`
-    /// for one a metadata-only read already shows. Each prints its own
-    /// diagnostic and returns true to refuse.
-    pub const Forbid = struct {
-        plan: *const fn (provider_hooks.Plan) bool,
-        known: *const fn (std.mem.Allocator, []const provider_dispatch.Provider, []const u8) anyerror!bool,
     };
 
     /// Production installer: the pipeline's `AssemblerInstaller`, whose
@@ -455,13 +443,12 @@ pub const Replanner = struct {
             },
         }
         // The effective optimize mode, recomputed against the NEW providers.
-        const optimize = optimize_mod.effective(ctx.optimize_flag, optimize_mod.ownerDefault(providers, ctx.hooks.target), ctx.fallback_optimize);
+        const optimize = optimize_mod.effective(ctx.optimize_flag, optimize_mod.ownerDefault(providers, ctx.hooks.target));
         const wire_optimize = std.meta.stringToEnum(provider_contract.Optimize, optimize.mode orelse "Debug") orelse return error.InvalidOptimizeMode;
         const zig_args = try withOptimize(a, ctx.zig_args, optimize.mode);
         const generate_plan = try provider_hooks.plan(a, providers, .generate, ctx.hooks.target);
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         const run_plan = try provider_hooks.plan(a, providers, .run, ctx.hooks.target);
-        if (self.forbid_run_replacement) |forbid| if (forbid.plan(run_plan)) return error.RunReplacementForbidden;
         if (self.session) |key| {
             const replanned = try SessionKey.of(a, ctx.hooks.root, cfg, run_plan, file_backend, ctx.hooks.target, key.target_follows_file, wire_optimize);
             if (key.changed(replanned)) |what| return SessionKey.report(what);
@@ -529,8 +516,7 @@ pub const Replanner = struct {
     ///   step runs (`SessionKey.configChanged`);
     /// - read the manifests the declared packages have NOW, metadata-only
     ///   (`.unknown`) on a scratch arena — no install, no lock write, no
-    ///   plan — and refuse a known run replacement where the session
-    ///   forbids one, or a target whose owner is clearly gone.
+    ///   plan — and refuse a target whose owner is clearly gone.
     ///
     /// Ownership refusals are limited to what no prebuild step can mend:
     /// an owner that is a remote package without an integrity pin
@@ -562,7 +548,6 @@ pub const Replanner = struct {
         var sources: provider_github.Sources = .{ .a = a, .shared = self.extractionCache(), .extract = false };
         defer sources.deinit();
         const view = try provider_dispatch.discoverAll(a, ctx.hooks.root, cfg, &sources, .unknown);
-        if (self.forbid_run_replacement) |forbid| if (try forbid.known(a, view.providers, ctx.hooks.target)) return error.RunReplacementForbidden;
         if (view.unresolved.len != 0) return;
         if (provider_targets.resolve(view.providers, ctx.hooks.target)) |_| {
             return;

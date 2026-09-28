@@ -43,14 +43,12 @@ pub const RebuildCtx = struct {
     /// The base environment of the compile, without any hook contribution:
     /// each rebuild composes its own contributions onto it (`coreBuild`).
     zig_env: ?*const std.process.Environ.Map,
-    /// The inputs of the effective optimize mode (`optimize.zig`), which the
-    /// replan recomputes from the providers it rediscovers: the explicit
-    /// `--optimize`, and the core's fallback for the served target. A
-    /// provider edit that adds, changes or removes the owner's
+    /// The explicit `--optimize`, the input of the effective optimize mode
+    /// (`optimize.zig`) that the replan recomputes with the providers it
+    /// rediscovers. A provider edit that adds, changes or removes the owner's
     /// `.target_defaults` reaches the next rebuild's `-Doptimize` and wire
     /// `optimize`; an explicit flag always wins.
     optimize_flag: ?[]const u8 = null,
-    fallback_optimize: ?[]const u8 = null,
     /// The project's declared `.prebuild` steps (cli#355). A watched rebuild
     /// must re-run them: they are what turn an edited `.tsx`/generator into
     /// the atlas or `.zig` table the regeneration below then reads, so
