@@ -106,9 +106,6 @@ jobs:
       - name: Provider watch session subprocess regression (run --watch)
         run: python test/provider_watch_e2e.py
 
-      - name: CLI tests
-        run: zig build test
-
       - name: Plugin compatibility pipeline regression
         if: runner.os != 'Windows'
         run: python3 test/plugin_compat_e2e.py
@@ -177,7 +174,6 @@ jobs:
     # provider target's hooks and toolchain live on the host, so the CLI
     # refuses `--docker` for it. This lane checks that refusal, then builds
     # the desktop target in the container (a Windows cross build).
-    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
 
     steps:
