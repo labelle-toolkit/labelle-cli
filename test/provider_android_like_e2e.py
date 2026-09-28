@@ -85,8 +85,20 @@ DEPLOY = f'.{{ .id = "deploy", .step = .run, .target = "android", .when = .repla
 BUNDLE = f'.{{ .id = "bundle", .step = .bundle, .target = "android", .when = .replace, {TOOL} }}'
 
 
-def manifest(hooks):
-    return ('.{ .name = "android", .manifest_version = 2, .command_contract = ">=1.2.0 <2.0.0",\n'
+def phase_hook(id, step, when):
+    return f'.{{ .id = "{id}", .step = .{step}, .target = "android", .when = .{when}, {TOOL} }}'
+
+
+# A hook in every other slot a command can reach, so section 5b can assert
+# the whole order of `labelle bundle` (cli#443), `build` and `run`.
+LIFECYCLE = [phase_hook("pre-gen", "generate", "before"), phase_hook("post-gen", "generate", "after"),
+             phase_hook("pre-build", "build", "before"), PACKAGE, phase_hook("pre-bundle", "bundle", "before"),
+             BUNDLE, phase_hook("post-bundle", "bundle", "after"), phase_hook("pre-run", "run", "before"), DEPLOY,
+             phase_hook("post-run", "run", "after")]
+
+
+def manifest(hooks, contract=">=1.2.0 <2.0.0"):
+    return (f'.{{ .name = "android", .manifest_version = 2, .command_contract = "{contract}",\n'
             '    .namespace = "android", .targets = .{ "android" },\n'
             f'    .commands = .{{ .{{ .name = "run", {TOOL}, .help = "Install and launch the built APK" }} }},\n'
             f'    .hooks = .{{ {", ".join(hooks)} }} }}')
@@ -255,6 +267,55 @@ with tempfile.TemporaryDirectory(prefix="labelle-android-like-") as temp:
     packed = hook_context(bundle_dir, "bundle")
     assert packed["context"]["build_number"] == "7", packed
     assert Path(packed["output_dir"]) == bundle_dir.resolve(), packed
+
+    # ── 5b. bundle with a bundle replacement: which hooks, in what order ──
+    # cli#443: `labelle bundle` runs generate, then build, then bundle, with
+    # every hook of each (contract §6), the `after build` package hook
+    # included: a hook of another package in that slot (a signer, a symbol
+    # upload) must not be bypassed silently. The replacement stands in for
+    # the core packager only, and no `run` hook runs. Every hook is told the
+    # command's last step (`final_step`, wire 1.4.0): that is how the
+    # package hook knows the bundle replacement makes the distributable, and
+    # can skip packaging the install APK a second time.
+    def ordered(*step_dirs):
+        entries = sorted((e for d in step_dirs for e in log(d)), key=lambda e: e["nanoseconds"])
+        return entries, [(e["invocation"]["step"], e["invocation"]["phase"], e["invocation"]["id"]) for e in entries]
+
+    provider_manifest.write_text(manifest(LIFECYCLE))
+    reset()
+    run("bundle", "--platform=android", "--build-number=9")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert ran == [("generate", "before", "pre-gen"), ("generate", "after", "post-gen"),
+                   ("build", "before", "pre-build"), ("build", "after", "package"),
+                   ("bundle", "before", "pre-bundle"), ("bundle", "replace", "bundle"),
+                   ("bundle", "after", "post-bundle")], ran
+    for e in entries:
+        assert e["context"]["contract_version"] == "1.4.0", e
+        assert e["context"]["final_step"] == "bundle", e
+    # The package hook saw the finished build.
+    assert "lib" in hook_context(zig_out, "package")["output_entries"]
+    # The same hooks under `build` and `run` see those commands' last step;
+    # neither runs a bundle hook, and `build` runs no run hook.
+    reset()
+    run("build", "--platform=android")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert [r[2] for r in ran] == ["pre-gen", "post-gen", "pre-build", "package"], ran
+    assert {e["context"]["final_step"] for e in entries} == {"build"}, entries
+    reset()
+    run("run", "--platform=android")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert [r[2] for r in ran] == ["pre-gen", "post-gen", "pre-build", "package", "pre-run", "deploy", "post-run"], ran
+    assert {e["context"]["final_step"] for e in entries} == {"run"}, entries
+    # A provider capped below 1.4.0 runs the same hooks on the exact 1.3.0
+    # wire, without the key its strict decoder would reject.
+    provider_manifest.write_text(manifest(LIFECYCLE, contract=">=1.2.0 <1.4.0"))
+    reset()
+    run("bundle", "--platform=android")
+    entries, ran = ordered(target_dir, zig_out, bundle_dir)
+    assert [r[2] for r in ran] == ["pre-gen", "post-gen", "pre-build", "package", "pre-bundle", "bundle", "post-bundle"], ran
+    for e in entries:
+        assert e["context"]["contract_version"] == "1.3.0" and "final_step" not in e["context"], e
+    provider_manifest.write_text(manifest([PACKAGE, DEPLOY, BUNDLE]))
 
     # ── 6. A legacy `.android` block goes through the CLI unchanged ───────
     # Its keys belong to the provider's settings and the assembler's codegen;

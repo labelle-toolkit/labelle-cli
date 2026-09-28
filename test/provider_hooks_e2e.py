@@ -281,9 +281,11 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         assert e["optimize"] == "ReleaseSmall" and e["progress"] == "off", e
         assert Path(e["package_dir"]).name in ("fixture-a", "fixture-b"), e
         # Contract 1.2.0: every hook names the generated target dir; only
-        # `run`-step hooks carry the run options. 1.3.0 (the negotiated wire)
-        # adds the cache dir everywhere and an env_file on `before build`.
-        assert e["context"]["contract_version"] == "1.3.0", e
+        # `run`-step hooks carry the run options. 1.3.0 adds the cache dir
+        # everywhere and an env_file on `before build`; 1.4.0 (the negotiated
+        # wire) the command's last step.
+        assert e["context"]["contract_version"] == "1.4.0", e
+        assert e["context"]["final_step"] == "build", e
         assert (e["context"]["env_file"] is not None) == (e["invocation"]["phase"] == "before"), e
         assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
         assert "run" not in e["context"], e
@@ -675,7 +677,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     replaced = run("run", *run_flags)
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     ctx = probe_context(probe_out, "deploy")
-    assert ctx["contract_version"] == "1.3.0", ctx
+    assert ctx["contract_version"] == "1.4.0" and ctx["final_step"] == "run", ctx
     assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000, "watch": None}, ctx
     assert Path(ctx["target_dir"]) == probe_dir.resolve() and Path(ctx["output_dir"]) == probe_out.resolve(), ctx
     assert "run options not passed" not in replaced.stderr, replaced.stderr

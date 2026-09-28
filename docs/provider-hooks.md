@@ -100,6 +100,24 @@ that cost is accepted (it is the integrity model of #414).
 
 ## Order
 
+A command runs its steps in lifecycle order, each with every hook it has:
+`labelle generate` runs `generate`; `labelle build` adds `build`; `labelle
+run` adds `build` then `run`; `labelle bundle` adds `build` then `bundle`
+(contract §6). A replacement stands in for its own step's core operation
+only. So `labelle bundle` for a target whose owner declares an `after build`
+packaging hook and a `bundle` replacement runs
+
+    before generate → generate → after generate → before build → build →
+    after build (the packaging hook) → before bundle → bundle replacement →
+    after bundle
+
+and no `run` hook. The CLI does not skip the `after build` hooks under
+`bundle`: a hook of another package in that slot (a signer, a symbol
+upload) would silently not run. Instead every hook's context carries
+`final_step` (wire `1.4.0`+, see [Context](#context)), and a hook whose work
+the bundle replacement redoes — the owner's install package, say — skips it
+when `final_step` is `bundle` (cli#443).
+
 Within one `(step, target)`: every `before` hook, then the core step or its
 unique `replace` hook, then every `after` hook. For `generate`, the core step
 includes its input pre-passes — the ASTC conversion of declared atlases and
@@ -251,6 +269,17 @@ The full rules are in the contract:
 [environment contributions](provider-contract-v1.md#environment-contributions).
 A provider capped below `1.3.0` gets neither key, so its hooks can't
 contribute.
+
+### The command's last step
+
+On wire `1.4.0` every hook's context also carries **`final_step`**: the last
+lifecycle step of the command running the hook — `generate`, `build`, `run`
+(watched rebuilds included) or `bundle`. An `after build` hook sees `build`
+under `labelle build`, `run` under `labelle run` and `bundle` under `labelle
+bundle`; a `bundle` hook always sees `bundle`. Hook plans don't depend on it
+(the same hooks run whatever the value); it only tells a hook what the rest
+of the command will do. A provider capped below `1.4.0` gets the exact
+`1.3.0` wire without the key.
 
 `labelle.lock` is written before generation now — immediately after the
 package cache is populated and the plugin/core compatibility check ran —

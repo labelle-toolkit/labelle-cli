@@ -17,6 +17,8 @@ pub fn testSite(a: std.mem.Allocator, project: []const u8) provider_hooks.Site {
         .optimize = .ReleaseSafe,
         .progress = .off,
         .reporter = null,
+        // A watched rebuild runs under `labelle run`.
+        .final_step = .run,
     };
 }
 

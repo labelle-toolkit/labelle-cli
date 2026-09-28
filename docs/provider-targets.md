@@ -282,7 +282,13 @@ gone):
   decided with the hook plans after discovery (after the install, before
   any build). The hook runs on any host with `output_dir` =
   `<target_dir>/zig-out/bundle/<t>/` (or the resolved `--output`), per the
-  [output layout](provider-hooks.md#output-layout).
+  [output layout](provider-hooks.md#output-layout). The replacement stands
+  in for the core packager only: the `build` step's hooks, the owner's
+  `after build` hooks included, run first, as under `labelle build`. An
+  owner whose `after build` hook makes an install package that the bundle
+  replacement makes again skips it when the context's `final_step` is
+  `bundle` (wire `1.4.0`+, [provider hooks](provider-hooks.md#order),
+  cli#443).
 
 ## Migration
 
