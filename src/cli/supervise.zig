@@ -307,12 +307,40 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOptions) 
 const Waited = struct {
     sup: *Supervised,
     io: std.Io,
+    /// The child's group and slot, read once (the waiting thread clears
+    /// `sup.group` when it reaps).
+    group: ?*Group,
+    slot: usize,
     term: ?(std.process.Child.WaitError!std.process.Child.Term) = null,
     done: std.atomic.Value(bool) = .init(false),
+    /// Set when the caller's timeout ended the child.
+    timed_out: std.atomic.Value(bool) = .init(false),
+    /// Ends the watchdog early (the drain returned).
+    stop: std.atomic.Value(bool) = .init(false),
 
     fn wait(self: *Waited) void {
         self.term = self.sup.wait(self.io);
         self.done.store(true, .release);
+    }
+
+    /// Kill the child's tree once `deadline` passes while it still runs.
+    /// A thread of its own because a pipe read cannot always be timed out
+    /// (Windows): the kill closes the pipes, which ends the drain.
+    fn watchdog(self: *Waited, deadline: u64) void {
+        while (!self.done.load(.acquire) and !self.stop.load(.acquire)) {
+            const now = monotonicMs();
+            if (now >= deadline) {
+                self.expire();
+                return;
+            }
+            sleepMs(@min(10, deadline - now));
+        }
+    }
+
+    fn expire(self: *Waited) void {
+        if (self.done.load(.acquire)) return;
+        self.timed_out.store(true, .release);
+        if (self.group) |g| g.killSlot(self.slot);
     }
 };
 
@@ -334,7 +362,7 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
     sup.child.stderr = null;
     defer for (pipes) |pipe| pipe.close(io);
 
-    var waited: Waited = .{ .sup = &sup, .io = io };
+    var waited: Waited = .{ .sup = &sup, .io = io, .group = sup.group, .slot = sup.slot };
     const waiter = std.Thread.spawn(.{}, Waited.wait, .{&waited}) catch |err| {
         sup.abort(io);
         return err;
@@ -356,6 +384,11 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
         monotonicMs() +| @as(u64, @intCast(@max(d.raw.toMilliseconds(), 0)))
     else
         null;
+    const watchdog: ?std.Thread = if (deadline) |d| std.Thread.spawn(.{}, Waited.watchdog, .{ &waited, d }) catch |err| return err else null;
+    defer if (watchdog) |t| {
+        waited.stop.store(true, .release);
+        t.join();
+    };
     var exited_at: ?u64 = null;
     while (true) {
         if (exited_at == null and waited.done.load(.acquire)) exited_at = monotonicMs();
@@ -365,9 +398,9 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
         const wait_ms: u64 = if (end) |e| blk: {
             const left = e -| now;
             if (left == 0) {
-                // Past the end: a child still running timed out (the
-                // deferred cleanup kills its tree); an exited one is done.
-                if (exited_at == null) return error.Timeout;
+                // Past the end: a child still running timed out (its tree
+                // is killed); an exited one is done.
+                if (exited_at == null) waited.expire();
                 break;
             }
             break :blk @min(left, poll_ms);
@@ -381,6 +414,7 @@ fn runDrained(gpa: std.mem.Allocator, io: std.Io, options: std.process.RunOption
     try multi_reader.checkAnyError();
     waiter.join();
     joined = true;
+    if (waited.timed_out.load(.acquire)) return error.Timeout;
     const term = try waited.term.?;
     const stdout_slice = try multi_reader.toOwnedSlice(0);
     errdefer gpa.free(stdout_slice);
