@@ -773,11 +773,20 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert ctx["contract_version"] == "1.1.0" and "run" not in ctx and "target_dir" not in ctx, ctx
     note = "labelle: note: run options not passed to 'fixture-a/deploy' (provider contract 1.1.0 < 1.2.0)"
     assert capped.stderr.count(note) == 1, capped.stderr
+    # The timeout is dropped with the rest, and the run is said to be
+    # unbounded (cli#485): the CLI does not time a replacement itself.
+    unbounded = "labelle: warning: 'fixture-a/deploy' cannot receive the run's timeout (provider contract 1.1.0 < 1.2.0)"
+    assert capped.stderr.count(unbounded) == 1, capped.stderr
+    # The headless default is a timeout like any other: the same warning.
+    plant()
+    capped_headless = run("run", "--platform=probe-target", "--headless")
+    assert "labelle: headless run: stopping after 5m" in capped_headless.stderr, capped_headless.stderr
+    assert capped_headless.stderr.count(unbounded) == 1, capped_headless.stderr
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     # No run options given: nothing was dropped, so there is no note.
     plant()
     plain = run("run", "--platform=probe-target")
-    assert "run options not passed" not in plain.stderr, plain.stderr
+    assert "run options not passed" not in plain.stderr and "cannot receive the run's timeout" not in plain.stderr, plain.stderr
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
 
     # ── contract 1.3.0: environment contributions (env_file) ──────────────
