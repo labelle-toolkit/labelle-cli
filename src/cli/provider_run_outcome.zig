@@ -32,7 +32,7 @@ pub fn carried(provider: dispatch.Provider) bool {
 /// The outcome an existing outcome file reports: `timeout` (surrounding
 /// ASCII whitespace ignored). Anything else, empty included, is invalid.
 pub fn parse(bytes: []const u8) error{InvalidOutcomeFile}!RunOutcome {
-    const word = std.mem.trim(u8, bytes, " \t\r\n");
+    const word = std.mem.trim(u8, bytes, &std.ascii.whitespace);
     if (std.mem.eql(u8, word, "timeout")) return .timed_out;
     return error.InvalidOutcomeFile;
 }
@@ -72,7 +72,7 @@ pub fn runReplacement(site: *hooks.Site, replacement: hooks.Planned, output_dir:
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "provider run outcome: the outcome file says `timeout` or is invalid" {
-    for ([_][]const u8{ "timeout", "timeout\n", " timeout\r\n" }) |text| {
+    for ([_][]const u8{ "timeout", "timeout\n", " timeout\r\n", "\x0btimeout\x0c" }) |text| {
         try std.testing.expectEqual(RunOutcome.timed_out, try parse(text));
     }
     for ([_][]const u8{ "", "\n", "TIMEOUT", "timeout now", "clean", "crash" }) |text| {
