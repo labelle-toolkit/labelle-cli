@@ -1,6 +1,6 @@
-//! Opening an OS lock file inside a project tree safely, shared by the
-//! watch session lock (`watch/session_lock.zig`, cli#476) and the project
-//! lock around `labelle.lock` writes (`project_lock.zig`, cli#481).
+//! Opening a file the CLI writes inside a project tree safely: the watch
+//! session lock (`watch/session_lock.zig`, cli#476), the project lock and
+//! the lock files written under it (`project_lock.zig`, cli#481).
 //!
 //! A lock file lives in the project tree, and a symbolic link planted there
 //! (a damaged or untrusted checkout) must never make a command truncate or
@@ -51,12 +51,18 @@ pub fn openRegular(lock_path: []const u8) !std.Io.File {
     return error.LockNotRegular;
 }
 
-/// This process's id: named in a lock's refusal, and part of a watch
-/// session's private staged-lock name (cli#481).
-pub fn ownPid() u64 {
-    if (is_windows) return GetCurrentProcessId();
-    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
-    return @intCast(std.c.getpid());
+/// Write `data` to `path` through `openRegular`: never through a symbolic
+/// link planted at the path (cli#481). Replaces the file's contents.
+pub fn writeRegular(path: []const u8, data: []const u8) !void {
+    const io = config.globalIo();
+    const file = openRegular(path) catch |err| switch (err) {
+        error.LockNotRegular => {
+            std.debug.print("labelle: '{s}' is not a regular file (a symbolic link or a directory); remove it and run again\n", .{path});
+            return error.NotRegularFile;
+        },
+        else => return err,
+    };
+    defer file.close(io);
+    try file.setLength(io, 0);
+    try file.writePositionalAll(io, data, 0);
 }
-
-extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;

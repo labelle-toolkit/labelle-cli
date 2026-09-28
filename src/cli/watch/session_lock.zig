@@ -147,7 +147,13 @@ fn parseOwner(bytes: []const u8) ?u64 {
     return if (owner == 0) null else owner;
 }
 
-const ownPid = lock_open.ownPid;
+fn ownPid() u64 {
+    if (is_windows) return GetCurrentProcessId();
+    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
+    return @intCast(std.c.getpid());
+}
+
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
 // ── Tests ─────────────────────────────────────────────────────────────
 

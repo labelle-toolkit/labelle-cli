@@ -206,7 +206,7 @@ const TwoStage = struct {
             }
             return 0;
         }
-        fn lock(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig, _: []const u8) anyerror!void {}
+        fn lock(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
     };
 };
 
@@ -616,7 +616,7 @@ test "watch replan installs and relocks when project.labelle changes" {
             // What `assembler install` does for a declared remote package.
             try std.Io.Dir.cwd().createDirPath(config.globalIo(), cache_dir);
         }
-        fn lock(_: std.mem.Allocator, _: []const u8, cfg: project_config.ProjectConfig, _: []const u8) anyerror!void {
+        fn lock(_: std.mem.Allocator, _: []const u8, cfg: project_config.ProjectConfig) anyerror!void {
             events[count] = if (cfg.plugins.len == 2) "lock-2" else "lock-1";
             count += 1;
         }
@@ -758,12 +758,16 @@ test "watched serve shutdown runs the replanned after-run hooks" {
         .hooks = &site,
     };
     defer ctx.deinit();
-    const Direct = struct {
-        fn lock(la: std.mem.Allocator, dir: []const u8, cfg: project_config.ProjectConfig, _: []const u8) anyerror!void {
-            return lockfile.writeLockFile(la, dir, cfg);
+    // The lock written in place (not staged), inside the rebuild's lock
+    // transaction, which already holds the project lock (cli#481).
+    const InPlace = struct {
+        fn lock(la: std.mem.Allocator, dir: []const u8, cfg: project_config.ProjectConfig) anyerror!void {
+            const path = try std.fs.path.join(la, &.{ dir, "labelle.lock" });
+            defer la.free(path);
+            try lockfile.writeLockFileTo(la, dir, cfg, path);
         }
     };
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Direct.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = InPlace.lock };
     defer replan.deinit(&site, startup_providers, startup_cfg);
     replan.baseline();
     // No rebuild has replanned yet: the startup plan is the shutdown's.
@@ -816,7 +820,7 @@ test "watch replan release restores the site's stable storage" {
         .data = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } } }",
     });
     const Lock = struct {
-        fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig, _: []const u8) anyerror!void {}
+        fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
     };
     const stable_providers = [_]provider_dispatch.Provider{.{
         .dep = .{ .name = "pkg", .repo = "local:../pkg", .version = "1.0.0" },
@@ -877,7 +881,7 @@ test "watch replan installs the re-read prebuild steps" {
     const head = ".{ .name = \"game\", .plugins = .{ .{ .name = \"pkg\", .repo = \"local:../pkg\", .version = \"1.0.0\" } }";
     try tmp.dir.writeFile(io, .{ .sub_path = "project/project.labelle", .data = head ++ ", .prebuild = .{ .{ .run = .{ \"gen-old\" } } } }" });
     const Lock = struct {
-        fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig, _: []const u8) anyerror!void {}
+        fn none(_: std.mem.Allocator, _: []const u8, _: project_config.ProjectConfig) anyerror!void {}
     };
     const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);

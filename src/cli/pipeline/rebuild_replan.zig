@@ -4,9 +4,8 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const lockfile = @import("../lockfile.zig");
-const project_lock = @import("../project_lock.zig");
 const lock_open = @import("../lock_open.zig");
-const lock_state = @import("../lock_state.zig");
+const project_lock = @import("../project_lock.zig");
 const project_config = @import("../project_config.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
@@ -49,12 +48,12 @@ pub const Replanner = struct {
     /// plumbing tests' shape).
     installer: ?Installer = null,
     /// Writes the lock of the re-read project, as the cold pipeline does
-    /// before generation — to the STAGED path (`stagedPath`), never the
+    /// before generation — to the STAGED path (`stagedLockPath`), never the
     /// project's `labelle.lock`: the running replacement was handed that
     /// path and must never observe an uncommitted dependency set. `commit`
     /// renames the staged lock over it; `rollback` deletes it. A field only
     /// so a test can observe it.
-    write_lock: *const fn (std.mem.Allocator, []const u8, project_config.ProjectConfig, []const u8) anyerror!void = stageLock,
+    write_lock: *const fn (std.mem.Allocator, []const u8, project_config.ProjectConfig) anyerror!void = stageLock,
     /// Moves the staged lock over `labelle.lock` (`commitLock`). A field
     /// only so a test can make it fail; production never overrides it.
     rename_lock: *const fn ([]const u8, []const u8) anyerror!void = renameLock,
@@ -62,26 +61,24 @@ pub const Replanner = struct {
     /// restored, with the lock's path, so a test can play another command
     /// writing `labelle.lock` concurrently. Never set in production.
     before_restore_lock: ?*const fn ([]const u8) void = null,
-    /// Test seam: runs in `rollback` while the project lock is held, after
-    /// the compare and before the restore (the window cli#481 closes), with
-    /// the lock's path. Never set in production.
-    restore_window: ?*const fn ([]const u8) void = null,
     /// The project's `labelle.lock` as it was before `commitLock` replaced
     /// it in this rebuild, so `rollback` can put it back: `.absent` when
     /// there was none. `null`: nothing committed in this rebuild.
     lock_before: ?LockBefore = null,
     /// SHA-256 of the lock `commitLock` put in place in this rebuild:
     /// `rollback` restores `lock_before` only while `labelle.lock` still
-    /// holds exactly this, so a lock another command wrote since (a watch
-    /// session for another target, `labelle install`) is never overwritten
-    /// by an older one (cli#478). Set with `lock_before`.
+    /// holds exactly this, so a lock written since is never overwritten by
+    /// an older one (cli#478). Every labelle writer waits for this rebuild's
+    /// lock transaction (`txn`, cli#481); what this still guards against is
+    /// a writer outside labelle. Set with `lock_before`.
     lock_written: ?[32]u8 = null,
-    /// A rollback owes the restore of `lock_before` but could not take the
-    /// project lock in time (cli#481): kept, and retried on every watch
-    /// tick, at the next lock commit and at the session's end.
-    restore_pending: bool = false,
-    /// This session's private staged-lock path (`stagedPath`), owned.
-    staged_path: ?[]const u8 = null,
+    /// The project lock (cli#481), held for this rebuild's whole lock
+    /// transaction: taken before the lock of an edited project is staged,
+    /// released when the rebuild commits or rolls back. Every staged-lock
+    /// operation happens under it, so the one staged path is never shared
+    /// and a rollback restores its own `lock_before` with no other writer
+    /// in between. `null`: this rebuild does not change the lock.
+    txn: ?project_lock.Held = null,
     /// SHA-256 of the `project.labelle` bytes the package cache and the lock
     /// were last brought in line with. `null` until `baseline` or the first
     /// replan. A replan that reads the same bytes skips the install and the
@@ -133,7 +130,7 @@ pub const Replanner = struct {
 
     /// The `RebuildCtx.Replan` seam over this replanner.
     pub fn seam(self: *Replanner) RebuildCtx.Replan {
-        return .{ .ctx = self, .precheck = precheck, .run = run, .commit_lock = commitLock, .commit = commit, .rollback = rollback, .tick = tick };
+        return .{ .ctx = self, .precheck = precheck, .run = run, .commit_lock = commitLock, .commit = commit, .rollback = rollback };
     }
 
     fn digestBytes(bytes: []const u8) [32]u8 {
@@ -154,11 +151,6 @@ pub const Replanner = struct {
     /// the first replan does not repeat that work for unchanged bytes.
     pub fn baseline(self: *Replanner) void {
         self.synced = digestProject(self.backing, self.project_dir) catch null;
-        // The session starts: remove the staged locks sessions killed
-        // outright left behind (cli#481). Best effort.
-        const held = project_lock.acquire(self.backing, self.project_dir) catch return;
-        defer held.release();
-        lock_state.sweepStaged(self.backing, self.project_dir);
     }
 
     /// Lend the cold pipeline's pinned extractions (`startup`, which
@@ -259,12 +251,8 @@ pub const Replanner = struct {
         // A rebuild committed its lock at its commit point (`commitLock`);
         // a caller driving `run` + `commit` directly has it moved here.
         self.settleLock(true);
-        // A restore an earlier rollback could not do yet stays owed: a
-        // rebuild that committed no lock of its own does not cancel it.
-        if (self.restore_pending) self.retryRestore(.try_once) else {
-            self.forgetAncestry();
-            self.forgetLockBefore();
-        }
+        self.forgetLockBefore();
+        self.releaseLock();
         self.pruneExtractions();
     }
 
@@ -277,15 +265,8 @@ pub const Replanner = struct {
         if (was_installed) self.synced = self.synced_before;
         self.settleLock(false);
         self.restoreLock();
+        self.releaseLock();
         self.pruneExtractions();
-    }
-
-    /// The watch loop's per-poll tick (`RebuildCtx.Replan.tick`): retry a
-    /// restore a rollback could not do because the project lock stayed busy
-    /// (cli#481). Never waits: a lock still busy is tried again next tick.
-    pub fn tick(ptr: *anyopaque) void {
-        const self: *Replanner = @ptrCast(@alignCast(ptr));
-        if (self.restore_pending) self.retryRestore(.try_once);
     }
 
     /// The rebuild's commit point (`RebuildCtx.Replan.commit_lock`): move
@@ -297,37 +278,17 @@ pub const Replanner = struct {
         const self: *Replanner = @ptrCast(@alignCast(ptr));
         const io = config.globalIo();
         const a = self.backing;
-        const staged = try self.stagedPath();
+        // Staged only within a lock transaction: without one, this rebuild
+        // staged nothing (the path may be another session's).
+        if (self.txn == null) return;
+        const staged = try stagedLockPath(a, self.project_dir);
+        defer a.free(staged);
         std.Io.Dir.cwd().access(io, staged, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         const lock = try std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" });
         defer a.free(lock);
-        // The read of the lock it replaces and the rename are one step to
-        // every other labelle command (cli#481).
-        const held = try project_lock.acquire(a, self.project_dir);
-        defer held.release();
-        // An earlier rollback's restore still owed goes first, so the lock
-        // this rebuild replaces (and would roll back to) is the right one.
-        if (self.restore_pending) self.restoreHeld(lock);
-        const installed = try self.installStagedHeld(staged, lock);
-        self.forgetLockBefore();
-        self.lock_before = installed.before;
-        self.lock_written = installed.written;
-    }
-
-    const Installed = struct { before: LockBefore, written: [32]u8 };
-
-    /// With the project lock held: move the staged lock over `lock`, its
-    /// `.cli_version` first raised to the high-water mark of the lock it
-    /// replaces as that lock is NOW (cli#481: a newer CLI may have written
-    /// it since this rebuild rendered its bytes). Returns what it replaced
-    /// and the digest of what it put in place. A failure leaves `lock`
-    /// untouched.
-    fn installStagedHeld(self: *Replanner, staged: []const u8, lock: []const u8) !Installed {
-        const io = config.globalIo();
-        const a = self.backing;
         const before: LockBefore = if (std.Io.Dir.cwd().readFileAlloc(io, lock, a, .limited(16 * 1024 * 1024))) |bytes|
             .{ .bytes = bytes }
         else |err| switch (err) {
@@ -335,103 +296,71 @@ pub const Replanner = struct {
             else => return err,
         };
         errdefer if (before == .bytes) a.free(before.bytes);
-        const rendered = try std.Io.Dir.cwd().readFileAlloc(io, staged, a, .limited(16 * 1024 * 1024));
-        defer a.free(rendered);
-        const final = try lockfile.withHighWater(a, rendered, if (before == .bytes) before.bytes else null);
-        defer a.free(final);
-        if (!std.mem.eql(u8, final, rendered)) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staged, .data = final });
+        // The staged bytes, their `.cli_version` raised to the high-water
+        // mark of the lock they replace as it is NOW (cli#481): never lower
+        // a newer CLI's stamp. What this rebuild puts in place, for the
+        // rollback's compare-and-restore.
+        const written = blk: {
+            const rendered = try std.Io.Dir.cwd().readFileAlloc(io, staged, a, .limited(16 * 1024 * 1024));
+            defer a.free(rendered);
+            const final = try lockfile.withHighWater(a, rendered, if (before == .bytes) before.bytes else null);
+            defer a.free(final);
+            if (!std.mem.eql(u8, final, rendered)) try lock_open.writeRegular(staged, final);
+            break :blk digestBytes(final);
+        };
         try self.rename_lock(staged, lock);
-        return .{ .before = before, .written = digestBytes(final) };
+        self.forgetLockBefore();
+        self.lock_before = before;
+        self.lock_written = written;
+    }
+
+    /// Take the project lock for this rebuild's lock transaction, waiting
+    /// (interruptibly: Ctrl+C, or `ctx` cancelled) while another session's
+    /// transaction holds it. `run` takes it before staging; public so a
+    /// test can open a transaction around a direct `stageLock`.
+    pub fn holdLock(self: *Replanner, ctx: ?*const RebuildCtx) !void {
+        if (self.txn != null) return;
+        const Stop = struct {
+            fn canceled(p: *const anyopaque) bool {
+                const c: *const RebuildCtx = @ptrCast(@alignCast(p));
+                return c.canceled();
+            }
+        };
+        self.txn = try project_lock.acquireWaiting(self.backing, self.project_dir, .{
+            .note = "another labelle session's rebuild to finish",
+            .cancel = if (ctx) |c| .{ .ctx = c, .canceled = Stop.canceled } else null,
+        });
+    }
+
+    fn releaseLock(self: *Replanner) void {
+        if (self.txn) |held| held.release();
+        self.txn = null;
     }
 
     pub fn renameLock(from: []const u8, to: []const u8) anyerror!void {
         try std.Io.Dir.cwd().rename(from, std.Io.Dir.cwd(), to, config.globalIo());
     }
 
-    /// This rebuild succeeded: the lock it replaced is superseded by a
-    /// published one, so a record leading back from it (another session's
-    /// failed rebuild, `lock_state`) is dropped.
-    fn forgetAncestry(self: *Replanner) void {
-        const before = self.lock_before orelse return;
-        const bytes = switch (before) {
-            .absent => return,
-            .bytes => |b| b,
-        };
-        const held = project_lock.acquire(self.backing, self.project_dir) catch return;
-        defer held.release();
-        lock_state.forget(self.backing, self.project_dir, digestBytes(bytes));
-    }
-
     fn forgetLockBefore(self: *Replanner) void {
         if (self.lock_before) |before| if (before == .bytes) self.backing.free(before.bytes);
         self.lock_before = null;
         self.lock_written = null;
-        self.restore_pending = false;
     }
 
     /// Put back the `labelle.lock` a rolled-back rebuild's `commitLock`
-    /// replaced (`restoreHeld`), under the project lock (cli#481), which
-    /// every writer of `labelle.lock` takes, so no write can land between
-    /// the compare and the restore and be overwritten.
-    ///
-    /// A lock that stays busy past the wait does NOT abandon the restore:
-    /// the saved lock is kept (`restore_pending`) and retried on every
-    /// watch tick (`tick`), at the next commit, and at the session's end.
+    /// replaced: written aside and renamed over it, so a reader never
+    /// sees a partial lock. Compare-and-restore (cli#478): only while the
+    /// file still holds what this rebuild wrote. Another command that
+    /// rewrote (or removed) it meanwhile wins: its lock is newer than the
+    /// one this rebuild replaced, so it is left in place, with a warning.
     fn restoreLock(self: *Replanner) void {
-        if (self.lock_before == null) return;
-        const lock = std.fs.path.join(self.backing, &.{ self.project_dir, "labelle.lock" }) catch return;
-        defer self.backing.free(lock);
-        if (self.before_restore_lock) |hook| hook(lock);
-        self.restore_pending = true;
-        self.retryRestore(.wait);
-    }
-
-    fn retryRestore(self: *Replanner, how: enum { wait, try_once }) void {
-        if (self.lock_before == null) {
-            self.restore_pending = false;
-            return;
-        }
-        const a = self.backing;
-        const lock = std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" }) catch return;
-        defer a.free(lock);
-        const held: ?project_lock.Held = switch (how) {
-            .wait => project_lock.acquire(a, self.project_dir) catch |err| blk: {
-                if (err != error.ProjectLockBusy) std.debug.print("labelle: could not take the project lock ({s})\n", .{@errorName(err)});
-                break :blk null;
-            },
-            .try_once => project_lock.tryAcquire(a, self.project_dir) catch null,
-        };
-        const h = held orelse {
-            if (how == .wait) std.debug.print("labelle: labelle.lock is not rolled back yet: the project lock is busy. The previous lock is kept and the rollback retried on the next watch tick\n", .{});
-            return;
-        };
-        defer h.release();
-        const deferred = how == .try_once;
-        self.restoreHeld(lock);
-        if (deferred) std.debug.print("labelle: labelle.lock rolled back (a deferred rollback)\n", .{});
-    }
-
-    /// With the project lock held: compare-and-restore (cli#478). The saved
-    /// lock goes back only while `labelle.lock` still holds what this
-    /// rebuild wrote; another command that rewrote (or removed) it
-    /// meanwhile wins, with a warning. Written aside and renamed over it,
-    /// so a reader never sees a partial lock. Settles the owed restore
-    /// either way.
-    ///
-    /// Across overlapping watch sessions (cli#481, `lock_state`): a lock
-    /// kept in place records the one this rebuild replaced, and the lock
-    /// restored is followed back past every lock a failed rebuild
-    /// committed, so the rollbacks end on the last published lock or the
-    /// original.
-    fn restoreHeld(self: *Replanner, lock: []const u8) void {
         const before = self.lock_before orelse return;
         defer self.forgetLockBefore();
         const io = config.globalIo();
         const a = self.backing;
-        const before_bytes: lock_state.Lock = switch (before) {
-            .absent => null,
-            .bytes => |bytes| bytes,
-        };
+        const lock = std.fs.path.join(a, &.{ self.project_dir, "labelle.lock" }) catch return;
+        defer a.free(lock);
+        if (self.before_restore_lock) |hook| hook(lock);
         const still_ours = if (self.lock_written) |written| blk: {
             const now = std.Io.Dir.cwd().readFileAlloc(io, lock, a, .limited(16 * 1024 * 1024)) catch break :blk false;
             defer a.free(now);
@@ -439,89 +368,55 @@ pub const Replanner = struct {
         } else true;
         if (!still_ours) {
             std.debug.print("labelle: labelle.lock changed since this rebuild wrote it; keeping the newer lock instead of rolling it back\n", .{});
-            if (self.lock_written) |written| lock_state.record(a, self.project_dir, written, before_bytes) catch |err| {
-                std.debug.print("labelle: could not record the lock to roll back to ({s})\n", .{@errorName(err)});
-            };
             return;
         }
-        if (self.restore_window) |hook| hook(lock);
-        const target = lock_state.resolve(a, self.project_dir, before_bytes) catch |err| {
-            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
-            return;
-        };
-        defer if (target) |bytes| a.free(bytes);
-        const bytes = target orelse {
-            std.Io.Dir.cwd().deleteFile(io, lock) catch |err| switch (err) {
+        switch (before) {
+            .absent => std.Io.Dir.cwd().deleteFile(io, lock) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)}),
-            };
-            return;
-        };
-        // Beside the staged locks, under `.labelle/` (not watched).
-        const tmp = std.fs.path.join(a, &.{ self.project_dir, ".labelle", "labelle.lock.rollback" }) catch return;
-        defer a.free(tmp);
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = bytes }) catch |err| {
-            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
-            return;
-        };
-        std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), lock, io) catch |err| {
-            std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-            std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
-        };
+            },
+            .bytes => |bytes| {
+                // Beside the staged lock, under `.labelle/` (not watched).
+                const tmp = std.fs.path.join(a, &.{ self.project_dir, ".labelle", "labelle.lock.rollback" }) catch return;
+                defer a.free(tmp);
+                lock_open.writeRegular(tmp, bytes) catch |err| {
+                    std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
+                    return;
+                };
+                std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), lock, io) catch |err| {
+                    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+                    std.debug.print("labelle: could not roll labelle.lock back ({s})\n", .{@errorName(err)});
+                };
+            },
+        }
     }
 
-    /// Process-wide sequence of staged-lock names, so two replanners of one
-    /// process never share one either.
-    var staged_seq: std.atomic.Value(u32) = .init(0);
-
-    /// `<project>/.labelle/labelle.lock.staged-<pid>-<n>`: where this
-    /// session's rebuilds stage their lock until it commits (under
-    /// `.labelle/`, which no watch walk enters). Private to the session
-    /// (cli#481): two watch sessions for different targets of one project
-    /// may rebuild at once, and a shared staging file let one overwrite or
-    /// delete the other's lock before it committed. Removed at commit (the
-    /// rename), at rollback and at the session's end (`deinit`).
-    pub fn stagedPath(self: *Replanner) ![]const u8 {
-        if (self.staged_path) |path| return path;
-        var buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "labelle.lock.staged-{d}-{d}", .{ lock_open.ownPid(), staged_seq.fetchAdd(1, .monotonic) });
-        self.staged_path = try std.fs.path.join(self.backing, &.{ self.project_dir, ".labelle", name });
-        return self.staged_path.?;
+    /// `<project>/.labelle/labelle.lock.staged`: where a rebuild's lock
+    /// waits for its commit (under `.labelle/`, which no watch walk enters).
+    pub fn stagedLockPath(a: std.mem.Allocator, project_dir: []const u8) ![]const u8 {
+        return std.fs.path.join(a, &.{ project_dir, ".labelle", "labelle.lock.staged" });
     }
 
-    /// Production `write_lock`: the project's lock bytes, staged at
-    /// `staged` (`stagedPath`).
-    pub fn stageLock(a: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig, staged: []const u8) anyerror!void {
+    /// Production `write_lock`: the project's lock bytes, staged.
+    pub fn stageLock(a: std.mem.Allocator, project_dir: []const u8, cfg: project_config.ProjectConfig) anyerror!void {
+        const staged = try stagedLockPath(a, project_dir);
+        defer a.free(staged);
         if (std.fs.path.dirname(staged)) |dir| try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
         try lockfile.writeLockFileTo(a, project_dir, cfg, staged);
     }
 
-    /// Move a staged lock over `labelle.lock` (commit), or drop it.
+    /// Move a staged lock over `labelle.lock` (commit), or drop it. Only
+    /// within this rebuild's lock transaction: outside it, the staged path
+    /// may be another session's.
     fn settleLock(self: *Replanner, keep: bool) void {
-        const io = config.globalIo();
-        const staged = self.stagedPath() catch return;
-        if (!keep) {
-            std.Io.Dir.cwd().deleteFile(io, staged) catch {};
+        if (self.txn == null) return;
+        if (keep) {
+            commitLock(self) catch |err| std.debug.print("labelle: could not commit labelle.lock ({s})\n", .{@errorName(err)});
             return;
         }
-        // Nothing staged (the common rebuild): no lock to take.
-        std.Io.Dir.cwd().access(io, staged, .{}) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => {},
-        };
-        const lock = std.fs.path.join(self.backing, &.{ self.project_dir, "labelle.lock" }) catch return;
-        defer self.backing.free(lock);
-        const held = project_lock.acquire(self.backing, self.project_dir) catch |err| {
-            std.debug.print("labelle: could not commit labelle.lock ({s})\n", .{@errorName(err)});
-            return;
-        };
-        defer held.release();
-        if (self.restore_pending) self.restoreHeld(lock);
-        const installed = self.installStagedHeld(staged, lock) catch |err| {
-            std.debug.print("labelle: could not commit labelle.lock ({s})\n", .{@errorName(err)});
-            return;
-        };
-        if (installed.before == .bytes) self.backing.free(installed.before.bytes);
+        const staged = stagedLockPath(self.backing, self.project_dir) catch return;
+        defer self.backing.free(staged);
+        std.Io.Dir.cwd().deleteFile(config.globalIo(), staged) catch {};
     }
 
     pub fn run(ptr: *anyopaque, ctx: *RebuildCtx) anyerror!void {
@@ -578,8 +473,11 @@ pub const Replanner = struct {
         // committed one until the rebuild commits.
         self.synced_before = self.synced;
         if (changed) {
-            const staged = try self.stagedPath();
-            try self.write_lock(a, self.project_dir, cfg, staged);
+            // The lock transaction starts: wait for another session's to end
+            // (cli#481), then stage against the lock it left.
+            try self.holdLock(ctx);
+            try self.write_lock(a, self.project_dir, cfg);
+            const staged = try stagedLockPath(a, self.project_dir);
             if (std.Io.Dir.cwd().access(config.globalIo(), staged, .{})) |_| {
                 ctx.hooks.lock_path = staged;
             } else |_| {}
@@ -704,15 +602,8 @@ pub const Replanner = struct {
         if (self.current) |generation| generation.destroy(self.backing);
         self.current = null;
         self.settleLock(false);
-        // A restore still owed gets one last (waiting) try; a lock still
-        // busy then is reported, not silently dropped.
-        if (self.restore_pending) {
-            self.retryRestore(.wait);
-            if (self.restore_pending) std.debug.print("labelle: labelle.lock could not be rolled back before the session ended; it may describe a rebuild that failed. Run `labelle install` to rewrite it\n", .{});
-        }
         self.forgetLockBefore();
-        if (self.staged_path) |path| self.backing.free(path);
-        self.staged_path = null;
+        self.releaseLock();
         if (self.extractions) |*cache| cache.deinit();
         self.extractions = null;
     }

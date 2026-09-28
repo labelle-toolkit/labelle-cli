@@ -19,8 +19,6 @@ const supervise = @import("../supervise.zig");
 const watch = @import("../watch.zig");
 const rebuild = @import("rebuild.zig");
 const Replanner = @import("rebuild_replan.zig").Replanner;
-const project_lock = @import("../project_lock.zig");
-const lockfile = @import("../lockfile.zig");
 const SessionKey = @import("session_key.zig").SessionKey;
 const tx = @import("rebuild_transaction_tests.zig");
 const Fixture = tx.Fixture;
@@ -29,7 +27,7 @@ const target = tx.target;
 
 /// A real publisher over `<tmp>/stage`, publishing into `<tmp>/session`,
 /// with generation 0 ("zero") already published.
-pub const Published = struct {
+const Published = struct {
     publisher: watch.Publisher,
     stage: []const u8,
     root: []const u8,
@@ -39,7 +37,7 @@ pub const Published = struct {
     cancel_at: enum { never, copy, switch_ } = .never,
     gate: watch.PublishGate = undefined,
 
-    pub fn init(self: *Published, fx: *Fixture) !void {
+    fn init(self: *Published, fx: *Fixture) !void {
         const a = fx.a;
         const io = config.globalIo();
         try fx.tmp.dir.createDirPath(io, "stage");
@@ -53,13 +51,13 @@ pub const Published = struct {
         try fx.tmp.dir.writeFile(io, .{ .sub_path = "stage/index.txt", .data = "one" });
     }
 
-    pub fn deinit(self: *Published, a: std.mem.Allocator) void {
+    fn deinit(self: *Published, a: std.mem.Allocator) void {
         self.publisher.deinit(true);
         a.free(self.stage);
         a.free(self.root);
     }
 
-    pub fn seam(self: *Published) @import("rebuild.zig").RebuildCtx.Publish {
+    fn seam(self: *Published) @import("rebuild.zig").RebuildCtx.Publish {
         return .{ .ctx = self, .run = run };
     }
 
@@ -189,7 +187,8 @@ test "rebuild commit: a staged lock that cannot be committed fails the rebuild, 
     defer ctx.deinit();
     const lock_v1 = try fx.lockBytes();
     defer a.free(lock_v1);
-    const staged = try replan.stagedPath();
+    const staged = try Replanner.stagedLockPath(a, fx.project);
+    defer a.free(staged);
     const Fail = struct {
         fn rename(_: []const u8, _: []const u8) anyerror!void {
             return error.AccessDenied;

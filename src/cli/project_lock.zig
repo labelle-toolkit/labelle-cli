@@ -1,14 +1,16 @@
-//! The project lock (cli#481): one advisory OS lock per project, taken by
-//! every command around its write of `labelle.lock` (and of
-//! `labelle.providers.lock`), so a read-compare-write of the lock is one
-//! step to every other labelle command in the project.
+//! The project lock (cli#481): one advisory OS lock per project, held by
+//! every labelle command around its write of `labelle.lock` (and of
+//! `labelle.providers.lock`), so no two writers ever interleave.
 //!
-//! Why: a failed watched rebuild restores `labelle.lock` only while it still
-//! holds what that rebuild wrote (cli#478 compare-and-restore). Without a
-//! lock shared between processes, an install or another watch session could
-//! write between the compare and the restore, and the older lock would
-//! overwrite it. Holding this lock across the compare AND the restore, and
-//! across every other write, closes that window.
+//! A watch session holds it for its whole lock TRANSACTION: from staging
+//! the lock of an edited project, through the build and the publication,
+//! to the commit or the rollback (`Replanner`). A rollback therefore always
+//! restores the lock its own transaction replaced, with no other writer in
+//! between, and two sessions (one per target) whose rebuilds both change
+//! the lock run their transactions one after the other: the second waits,
+//! then renders its lock from the first's result. A rebuild that does not
+//! change the lock takes nothing. Every other writer (install, generate,
+//! build, run, `providers resolve --accept`) holds it for its write only.
 //!
 //! The lock is `<project>/.labelle/project.lock`, taken like the watch
 //! session lock (`watch/session_lock.zig`): an OS lock (`flock` /
@@ -18,30 +20,22 @@
 //! a killed command never leaves it held. The file is never deleted and
 //! carries no content.
 //!
-//! Held only for the short critical section of reading, comparing and
-//! writing the lock — never across an install, a generation or a build.
-//!
-//! Contention policy: a BOUNDED WAIT. Every critical section is a few file
-//! operations, so a contender polls for up to `wait_budget_ms` (10 s)
-//! rather than failing a build that merely collided with another command's
-//! lock write. Past the budget something is wrong (a hung command holding
-//! it), and the command fails with `error.ProjectLockBusy` and a message
-//! naming the lock file, instead of hanging forever.
+//! Contention: a contender WAITS, however long — a session's transaction
+//! spans a build — saying so once, and stays interruptible: Ctrl+C (the
+//! session stop handler's `cancel_requested`) or its own cancellation (a
+//! session ending) returns `error.Canceled`. Without a stop handler, Ctrl+C
+//! ends the process, which releases whatever it held.
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const lock_open = @import("lock_open.zig");
+const cancel = @import("watch/cancel.zig");
 
 /// Relative to the project directory (`.labelle/`, which no watch walk
 /// enters).
 pub const rel_path = ".labelle" ++ std.fs.path.sep_str ++ "project.lock";
 
-/// How long `acquire` waits for another command's critical section.
-/// A variable only so tests can shorten it.
-pub var wait_budget_ms: u64 = 10_000;
-const poll_ms: u64 = 10;
-/// A contender says it is waiting once it has waited this long.
-const notice_ms: u64 = 1_000;
+const poll_ms: u64 = 20;
 
 /// Test seam: counts the polls that found the lock held by someone else,
 /// so a test can see a contender actually waited.
@@ -56,58 +50,51 @@ pub const Held = struct {
     }
 };
 
-/// Take the project lock of `project_dir`, waiting (bounded) while another
-/// labelle command holds it. Release it with `Held.release` as soon as the
-/// lock write is done.
+/// How a contender waits.
+pub const Wait = struct {
+    /// Printed once, when the lock is first found held.
+    note: []const u8 = "another labelle command to finish writing labelle.lock",
+    /// Checked on every poll besides Ctrl+C: true stops the wait.
+    cancel: ?Cancel = null,
+
+    pub const Cancel = struct {
+        ctx: *const anyopaque,
+        canceled: *const fn (*const anyopaque) bool,
+    };
+};
+
+/// Take the project lock of `project_dir` for a lock write, waiting while
+/// another labelle command holds it. Release it with `Held.release`.
 pub fn acquire(a: std.mem.Allocator, project_dir: []const u8) !Held {
+    return acquireWaiting(a, project_dir, .{});
+}
+
+/// `acquire`, saying what it waits for, and stoppable by `wait.cancel`.
+pub fn acquireWaiting(a: std.mem.Allocator, project_dir: []const u8, wait: Wait) !Held {
     const io = config.globalIo();
     const path = try std.fs.path.join(a, &.{ project_dir, rel_path });
     defer a.free(path);
-    const file = try open(path);
-    errdefer file.close(io);
-    var waited: u64 = 0;
-    var noticed = false;
-    while (!try file.tryLock(io, .exclusive)) {
-        _ = test_busy_polls.fetchAdd(1, .monotonic);
-        if (waited >= wait_budget_ms) {
-            std.debug.print("labelle: another labelle command has held the project lock for {d} s while writing labelle.lock; gave up waiting (lock: {s}). Let it finish, or stop it, and run again\n", .{ waited / 1000, path });
-            return error.ProjectLockBusy;
-        }
-        if (!noticed and waited >= notice_ms) {
-            noticed = true;
-            std.debug.print("labelle: waiting for another labelle command writing labelle.lock (lock: {s})\n", .{path});
-        }
-        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake) catch {};
-        waited += poll_ms;
-    }
-    return .{ .file = file };
-}
-
-/// `acquire` without waiting: `null` while another command holds the lock.
-/// For a retry that must not stall its caller (a watch tick).
-pub fn tryAcquire(a: std.mem.Allocator, project_dir: []const u8) !?Held {
-    const io = config.globalIo();
-    const path = try std.fs.path.join(a, &.{ project_dir, rel_path });
-    defer a.free(path);
-    const file = try open(path);
-    errdefer file.close(io);
-    if (!try file.tryLock(io, .exclusive)) {
-        _ = test_busy_polls.fetchAdd(1, .monotonic);
-        file.close(io);
-        return null;
-    }
-    return .{ .file = file };
-}
-
-fn open(path: []const u8) !std.Io.File {
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(config.globalIo(), dir);
-    return lock_open.openRegular(path) catch |err| switch (err) {
+    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    const file = lock_open.openRegular(path) catch |err| switch (err) {
         error.LockNotRegular => {
             std.debug.print("labelle: the project lock '{s}' is not a regular file (a symbolic link or a directory); remove it and run again\n", .{path});
             return error.ProjectLockNotRegular;
         },
         else => return err,
     };
+    errdefer file.close(io);
+    var noticed = false;
+    while (!try file.tryLock(io, .exclusive)) {
+        _ = test_busy_polls.fetchAdd(1, .monotonic);
+        if (cancel.cancel_requested.load(.acquire)) return error.Canceled;
+        if (wait.cancel) |c| if (c.canceled(c.ctx)) return error.Canceled;
+        if (!noticed) {
+            noticed = true;
+            std.debug.print("labelle: waiting for {s}... (lock: {s})\n", .{ wait.note, path });
+        }
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake) catch {};
+    }
+    return .{ .file = file };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -172,23 +159,32 @@ test "project lock: a second writer waits for the first, then gets the lock (cli
     try std.testing.expectEqualStrings("second", now);
 }
 
-test "project lock: a lock held past the budget fails with ProjectLockBusy (cli#481)" {
+test "project lock: Ctrl+C or a cancellation ends the wait, and nothing is held (cli#481)" {
     const a = std.testing.allocator;
     var t = try Tmp.init(a);
     defer t.deinit(a);
     const held = try acquire(a, t.dir);
-    const saved = wait_budget_ms;
-    wait_budget_ms = 50;
-    defer wait_budget_ms = saved;
-    try std.testing.expectError(error.ProjectLockBusy, acquire(a, t.dir));
-    // Nor does a try, which returns at once.
-    try std.testing.expect(try tryAcquire(a, t.dir) == null);
+    // The session's own cancellation (a session ending).
+    const Stop = struct {
+        var polls: usize = 0;
+        fn canceled(_: *const anyopaque) bool {
+            polls += 1;
+            return polls >= 3;
+        }
+    };
+    const before = test_busy_polls.load(.monotonic);
+    try std.testing.expectError(error.Canceled, acquireWaiting(a, t.dir, .{ .cancel = .{ .ctx = &Stop.polls, .canceled = Stop.canceled } }));
+    // It waited (three busy polls) before giving up.
+    try std.testing.expectEqual(before + 3, test_busy_polls.load(.monotonic));
+    // Ctrl+C, as the session stop handler records it.
+    cancel.cancel_requested.store(true, .release);
+    const ctrl_c = acquire(a, t.dir);
+    cancel.cancel_requested.store(false, .release);
+    try std.testing.expectError(error.Canceled, ctrl_c);
+    // The canceled waits left nothing held: once released, the lock is free.
     held.release();
-    // Released: the next command takes it at once.
     const next = try acquire(a, t.dir);
     next.release();
-    const tried = (try tryAcquire(a, t.dir)) orelse return error.TestUnexpectedResult;
-    tried.release();
 }
 
 test "project lock: a symbolic link at the lock path is refused and never written through (cli#481)" {

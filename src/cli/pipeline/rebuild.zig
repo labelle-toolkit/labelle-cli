@@ -171,9 +171,6 @@ pub const RebuildCtx = struct {
         commit_lock: ?*const fn (*anyopaque) anyerror!void = null,
         commit: ?*const fn (*anyopaque) void = null,
         rollback: ?*const fn (*anyopaque) void = null,
-        /// Runs on every watch poll (`watch.WatchConfig.tick_fn`), between
-        /// rebuilds: retries work a rollback had to defer (cli#481).
-        tick: ?*const fn (*anyopaque) void = null,
     };
 
     /// The publication (`watch.Publisher.publish`). It runs the gate's
@@ -224,7 +221,7 @@ pub const RebuildCtx = struct {
         self.hooks.lock_path = saved.lock_path;
     }
 
-    fn canceled(self: *const RebuildCtx) bool {
+    pub fn canceled(self: *const RebuildCtx) bool {
         const group = self.group orelse return false;
         return group.isCancelled();
     }
@@ -269,13 +266,6 @@ pub const RebuildCtx = struct {
             return error.HookFailed;
         };
         if (code != 0) return if (self.canceled()) error.Canceled else error.HookFailed;
-    }
-
-    /// The watch loop's per-poll tick (`watch.WatchConfig.tick_fn`).
-    pub fn tick(ctx_ptr: *anyopaque) void {
-        const self: *RebuildCtx = @ptrCast(@alignCast(ctx_ptr));
-        const replan = self.replan orelse return;
-        if (replan.tick) |f| f(replan.ctx);
     }
 
     /// The watch loop's entry point. Returns true only on a clean,

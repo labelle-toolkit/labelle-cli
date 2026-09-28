@@ -48,10 +48,6 @@ pub const WatchConfig = struct {
     rebuild_fn: RebuildFn,
     /// Opaque payload handed back to `rebuild_fn`.
     rebuild_ctx: *anyopaque,
-    /// Invoked (on the watcher thread, with `rebuild_ctx`) on every poll,
-    /// changed tree or not: work a failed rebuild had to defer is retried
-    /// here (a `labelle.lock` rollback the project lock held up, cli#481).
-    tick_fn: ?*const fn (ctx: *anyopaque) void = null,
     /// Poll cadence.
     poll_interval_ms: u32 = 400,
     /// Consecutive stable polls required before firing a rebuild — debounces
@@ -170,7 +166,6 @@ pub fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
             io.sleep(std.Io.Duration.fromMilliseconds(@intCast(cfg.poll_interval_ms)), .awake) catch return;
         }
         if (state.stop.load(.acquire)) return;
-        if (cfg.tick_fn) |tick| tick(cfg.rebuild_ctx);
 
         var sig = TreeSignature{};
         cfg.signature(io, scan_arena.allocator(), &sig);
@@ -287,7 +282,6 @@ const Script = struct {
     swap_at: ?u32 = null,
     swapped: [1][]const u8 = undefined,
     out_path: []const u8 = "",
-    tick_calls: u32 = 0,
 
     fn wait(ctx: *anyopaque, _: u32) bool {
         const self: *Script = @ptrCast(@alignCast(ctx));
@@ -296,11 +290,6 @@ const Script = struct {
             if (edit.tick == self.ticks) self.dir.writeFile(std.testing.io, .{ .sub_path = edit.name, .data = edit.name }) catch unreachable;
         }
         return self.ticks <= self.max_ticks;
-    }
-
-    fn tick(ctx: *anyopaque) void {
-        const self: *Script = @ptrCast(@alignCast(ctx));
-        self.tick_calls += 1;
     }
 
     fn rebuild(ctx: *anyopaque) bool {
@@ -330,21 +319,6 @@ test "watchLoop: a debounced edit fires exactly one rebuild on a scripted clock"
     try std.testing.expectEqual(@as(u32, 1), script.rebuilds);
     try std.testing.expectEqual(@as(u32, 4), script.rebuild_ticks[0]);
     try std.testing.expectEqual(@as(u64, 1), state.version.load(.acquire));
-}
-
-test "watchLoop: tick_fn runs on every poll, quiet or not (cli#481)" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer alloc.free(dir_path);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "a" });
-    var script: Script = .{ .dir = tmp.dir, .max_ticks = 6, .edits = &.{} };
-    var state: WatchState = .{};
-    watchLoop(std.testing.io, .{ .watch_dir = dir_path, .rebuild_fn = Script.rebuild, .rebuild_ctx = &script, .tick_fn = Script.tick, .clock = .{ .ctx = &script, .wait = Script.wait } }, &state);
-    // Six polls ran (the seventh wait ends the loop), with no rebuild.
-    try std.testing.expectEqual(@as(u32, 0), script.rebuilds);
-    try std.testing.expectEqual(@as(u32, 6), script.tick_calls);
 }
 
 test "watchLoop: a rebuild that swaps the ignore set is confirmed once, then its outputs never fire" {

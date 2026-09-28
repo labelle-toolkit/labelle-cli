@@ -534,7 +534,8 @@ test "rebuild transaction: an edited project's lock is staged privately and comm
     // project's lock never changed.
     ctx.zig_args = &fx.fail_argv;
     try std.testing.expectError(error.BuildFailed, ctx.rebuildStaged());
-    const staged_path = try replan.stagedPath();
+    const staged_path = try Replanner.stagedLockPath(a, fx.project);
+    defer a.free(staged_path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(config.globalIo(), staged_path, .{}));
     try std.testing.expect(site.lock_path == null);
     {
