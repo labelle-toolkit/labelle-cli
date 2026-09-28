@@ -2,7 +2,7 @@
 ///
 /// Usage:
 ///   labelle generate [dir] [--scene=name] [--optimize=MODE] — generate .labelle/ assembler files
-///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--` forwards trailing args to the game; on a provider target whose package replaces `run`, the options travel to its hook as `run.env` (docs/provider-hooks.md)
+///   labelle run [dir] [--timeout=30s] [--scene=name] [--optimize=MODE] [--progress=json] [--screenshot=<path> [--after=<dur>]] [-- <args>...] — generate + build + run; `--screenshot` captures a frame to <path>, re-encoded to the extension you asked for (cli#356); `--headless` with no `--timeout` stops after 5m (cli#485; `--timeout=0` for none); `--` forwards trailing args to the game; on a provider target whose package replaces `run`, the options travel to its hook as `run.env` (docs/provider-hooks.md)
 ///   labelle build [dir] [--scene=name] [--optimize=MODE] [--progress=json] [--linux-desktop] — generate + build (no run); on Linux (or with `--linux-desktop`) also writes `zig-out/<exe>.desktop` + `zig-out/<exe>.png` for the desktop target (cli#359)
 ///   labelle bundle [dir] [--optimize=MODE] [--output dir] [--build-number n] [--platform=<t>] — generate + build the resolved target, then package it: for `desktop`, wrap the exe in a self-contained macOS `<Title>.app` (Info.plist + AppIcon.icns, `assets/` staged into Contents/Resources, sh launcher for the cwd; `CFBundleVersion` = `<major+1>.<minor>.<patch>` of `.version` unless `--build-number` pins it; macOS only, cli#359/#364/#363); for a provider target, run the provider's `replace` hook on `bundle` (RFC #406, docs/provider-targets.md)
 ///   labelle status [dir] [--json]       — print the current/last build progress (reads .labelle/<target>/.build-progress.json)
@@ -579,6 +579,7 @@ pub const ArgsParseHeadlessFlagsSpec = args_tests_mod.ParseHeadlessFlagsSpec;
 pub const ArgsParseBundleArgsSpec = args_tests_mod.ParseBundleArgsSpec;
 pub const ArgsParseDirAndSceneLinuxDesktopSpec = args_tests_mod.ParseDirAndSceneLinuxDesktopSpec;
 pub const ArgsAllowOlderCliFlagSpec = args_tests_mod.AllowOlderCliFlagSpec;
+pub const ArgsHeadlessDefaultTimeoutSpec = args_tests_mod.HeadlessDefaultTimeoutSpec;
 
 // Linux `.desktop` entry emission (cli#359). Re-exported HERE for the same
 // reason as the screenshot specs below: `linux_desktop` is a private import,

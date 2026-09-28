@@ -194,7 +194,9 @@ replacement launch needs:
   option the user didn't pass adds nothing. The desktop-only headless knobs
   aren't run options and never appear here.
 - `args` are the tokens after `--`, verbatim.
-- `timeout_ms` is `--timeout` in milliseconds, or null.
+- `timeout_ms` is `--timeout` in milliseconds, or null. A `--headless` run
+  given no `--timeout` carries its default budget here (5 minutes, cli#485),
+  exactly as if the user had typed it; `--timeout=0` (or `none`) is null.
 
 The CLI maps none of this to a platform. The provider decides how the pairs
 reach its game, for example as launch extras on a device.

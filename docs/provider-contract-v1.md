@@ -76,7 +76,7 @@ The `run` object holds the `labelle run` options for a hook that wraps or replac
 | --- | --- |
 | `env` | Array of `{ "name", "value" }`. These are the platform-neutral `LABELLE_*` variables the core launch sets for `--scene`, `--profile`, `--screenshot` and `--after` (`LABELLE_SCENE`, `LABELLE_PROFILE`, `LABELLE_SCREENSHOT_PATH`, `LABELLE_SCREENSHOT_AFTER_SEC`), in that order. An option the user didn't pass adds nothing. Names match `[A-Za-z_][A-Za-z0-9_]*` and are unique; values contain no NUL |
 | `args` | The tokens after `--`, verbatim, as an array of strings |
-| `timeout_ms` | `--timeout` in milliseconds, or null |
+| `timeout_ms` | `--timeout` in milliseconds, or null. A `--headless` run given no `--timeout` carries the 5-minute headless default here (cli#485); `--timeout=0`/`none` is null |
 | `watch` | **Wire `1.3.0`+, required there; absent below.** Null outside a watch session and on every `run` hook but the replacement. On the replacement of `labelle run --watch`: `{ "generation_file": "<abs>", "output_dir": "<abs>" }` (see [Watch sessions](#watch-sessions)). Unknown keys inside it are errors |
 
 The CLI doesn't map these to any platform. The provider decides how they reach its game, for example as launch extras on a device. A hook on another step, or a command, that carries `run` is an error, and so is a `1.2.0` `run`-step hook without it.
