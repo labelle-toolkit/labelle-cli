@@ -2,6 +2,8 @@ const std = @import("std");
 const project_config = @import("project_config.zig");
 const config = @import("config.zig");
 const asm_cache = @import("asm_cache.zig");
+const project_lock = @import("project_lock.zig");
+const lock_open = @import("lock_open.zig");
 
 /// Write labelle.lock into the project root.
 ///
@@ -37,6 +39,14 @@ pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cf
 
     const lock_path = try std.fs.path.join(allocator, &.{ project_dir, "labelle.lock" });
     defer allocator.free(lock_path);
+
+    // A write of the project's own `labelle.lock` holds the project lock
+    // (cli#481) from the high-water read below to the write, so no other
+    // labelle command's read-compare-write interleaves with it. A staged
+    // write (`out_path`) runs inside a watch session's lock transaction,
+    // which already holds it (`Replanner`).
+    const held: ?project_lock.Held = if (out_path == null) try project_lock.acquire(allocator, project_dir) else null;
+    defer if (held) |h| h.release();
 
     // High-water `.cli_version` — see the doc comment above. `previous`
     // owns the bytes `keep_version` points into, so it stays alive until
@@ -99,10 +109,8 @@ pub fn writeLockFileTo(allocator: std.mem.Allocator, project_dir: []const u8, cf
 
     try w.writeAll("}\n");
 
-    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{
-        .sub_path = out_path orelse lock_path,
-        .data = aw.written(),
-    });
+    // Never through a symbolic link planted at the path (cli#481).
+    try lock_open.writeRegular(out_path orelse lock_path, aw.written());
 }
 
 /// A GUI plugin name destined for the lock file, plus whether the buffer
@@ -482,6 +490,21 @@ pub fn lockCliVersion(lock_bytes: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `staged` lock bytes with their top-level `.cli_version` raised to the
+/// one `current` (the project's `labelle.lock` as it is NOW) records when
+/// that one is newer: `writeLockFile`'s high-water rule, applied again when
+/// a watched rebuild commits a lock it rendered earlier (cli#481), so a
+/// newer CLI's stamp written meanwhile is never lowered. Caller owns the
+/// returned copy.
+pub fn withHighWater(a: std.mem.Allocator, staged: []const u8, current: ?[]const u8) ![]u8 {
+    const now = current orelse return a.dupe(u8, staged);
+    const newer = lockCliVersion(now) orelse return a.dupe(u8, staged);
+    const ours = lockCliVersion(staged) orelse return a.dupe(u8, staged);
+    if (!isLockNewer(newer, ours)) return a.dupe(u8, staged);
+    const at = @intFromPtr(ours.ptr) - @intFromPtr(staged.ptr);
+    return std.mem.concat(a, u8, &.{ staged[0..at], newer, staged[at + ours.len ..] });
+}
+
 /// The guard against a stale binary silently mis-building a modern
 /// project (#353): a labelle.lock written by a NEWER CLI means this
 /// binary may not understand everything the project relies on — the
@@ -713,4 +736,46 @@ test "writeLockFile: an older or absent stamp becomes this CLI's version" {
     const written = try fresh.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
     defer alloc.free(written);
     try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(written).?);
+}
+
+test "writeLockFile: holds the project lock around the write (cli#481)" {
+    const alloc = std.testing.allocator;
+    const cancel = @import("watch/cancel.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", alloc);
+    defer alloc.free(dir);
+    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "labelle.lock", .data = "// another command's lock\n" });
+    // Another command is inside its critical section: this write waits for
+    // it, and a Ctrl+C during the wait leaves the lock untouched.
+    const other = try project_lock.acquire(alloc, dir);
+    cancel.cancel_requested.store(true, .release);
+    const stopped = writeLockFile(alloc, dir, .{ .name = "t" });
+    cancel.cancel_requested.store(false, .release);
+    try std.testing.expectError(error.Canceled, stopped);
+    const kept = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("// another command's lock\n", kept);
+    // Released: the write goes through.
+    other.release();
+    try writeLockFile(alloc, dir, .{ .name = "t" });
+    const written = try tmp.dir.readFileAlloc(config.globalIo(), "labelle.lock", alloc, .limited(64 * 1024));
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings(project_config.CLI_VERSION, lockCliVersion(written).?);
+}
+
+test "writeLockFile: never writes through a symbolic link at the lock path (cli#481)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // links need a privilege there
+    const alloc = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "precious" });
+    try tmp.dir.symLink(io, "victim.txt", "labelle.lock", .{});
+    try std.testing.expectError(error.NotRegularFile, writeLockFile(alloc, dir, .{ .name = "t" }));
+    const victim = try tmp.dir.readFileAlloc(io, "victim.txt", alloc, .limited(64));
+    defer alloc.free(victim);
+    try std.testing.expectEqualStrings("precious", victim);
 }

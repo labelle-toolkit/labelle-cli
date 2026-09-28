@@ -221,7 +221,7 @@ pub const RebuildCtx = struct {
         self.hooks.lock_path = saved.lock_path;
     }
 
-    fn canceled(self: *const RebuildCtx) bool {
+    pub fn canceled(self: *const RebuildCtx) bool {
         const group = self.group orelse return false;
         return group.isCancelled();
     }

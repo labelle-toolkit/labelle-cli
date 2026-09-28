@@ -560,6 +560,7 @@ test {
 test {
     _ = @import("cli/supervise.zig");
     _ = @import("cli/watch.zig");
+    _ = @import("cli/project_lock.zig");
 }
 
 // `labelle init` stamps the running CLI as `--labelle-version`.

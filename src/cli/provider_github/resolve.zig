@@ -2,6 +2,7 @@
 //! record the preview, and on accept verify sources and write the lock.
 const std = @import("std");
 const config = @import("../config.zig");
+const project_lock = @import("../project_lock.zig");
 const manifest = @import("../provider_manifest.zig");
 const contract = @import("../provider_contract.zig");
 const util = @import("../util.zig");
@@ -146,7 +147,14 @@ pub fn resolve(a: std.mem.Allocator, root: []const u8, source: []const u8, accep
     try contract.validateOwnership(ownership.items, reserved);
     try hooks.validateAll(a, providers.items, &.{});
     const dest = try std.fs.path.join(a, &.{ root, lock_name });
-    try writeAtomically(a, dest, try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = selected.items }, .{ .whitespace = .indent_2 }));
+    const pins = try std.json.Stringify.valueAlloc(a, Document{ .schema_version = 1, .providers = selected.items }, .{ .whitespace = .indent_2 });
+    {
+        // Under the project lock every lock write of the project takes
+        // (cli#481), held for the write only.
+        const held = try project_lock.acquire(a, root);
+        defer held.release();
+        try writeAtomically(a, dest, pins);
+    }
     // The lock rename above is the commit point: from here on the accept has
     // succeeded, so nothing below may turn it into a failed exit (a failed
     // accept promises the old lock). The preview is consumed so a second

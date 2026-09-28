@@ -758,7 +758,16 @@ test "watched serve shutdown runs the replanned after-run hooks" {
         .hooks = &site,
     };
     defer ctx.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = lockfile.writeLockFile };
+    // The lock written in place (not staged), inside the rebuild's lock
+    // transaction, which already holds the project lock (cli#481).
+    const InPlace = struct {
+        fn lock(la: std.mem.Allocator, dir: []const u8, cfg: project_config.ProjectConfig) anyerror!void {
+            const path = try std.fs.path.join(la, &.{ dir, "labelle.lock" });
+            defer la.free(path);
+            try lockfile.writeLockFileTo(la, dir, cfg, path);
+        }
+    };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = InPlace.lock };
     defer replan.deinit(&site, startup_providers, startup_cfg);
     replan.baseline();
     // No rebuild has replanned yet: the startup plan is the shutdown's.

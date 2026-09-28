@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("../config.zig");
+const lock_open = @import("../lock_open.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -117,41 +118,14 @@ fn closeClaimed(file: std.Io.File) void {
     file.close(config.globalIo());
 }
 
-/// Open (or create) `lock_path` for reading and writing, never through a
-/// symbolic link: an existing entry is opened without following links and
-/// must be a regular file; a missing one is created exclusively, which
-/// fails on any entry — a dangling link included — that appears meanwhile.
+/// Open (or create) `lock_path` without following a symbolic link, a
+/// regular file only (`lock_open.openRegular`, shared with the project
+/// lock of cli#481).
 fn openRegular(lock_path: []const u8) !std.Io.File {
-    const io = config.globalIo();
-    var attempt: u8 = 0;
-    while (attempt < 3) : (attempt += 1) {
-        // Windows: Zig 0.16 opens a no-follow handle (the reparse point
-        // itself) without synchronous I/O, so its reads panic; the entry is
-        // checked with a no-follow stat instead, then opened normally.
-        // POSIX: O_NOFOLLOW, then the handle's own stat.
-        if (is_windows) {
-            const st = std.Io.Dir.cwd().statFile(io, lock_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            };
-            if (st) |entry| if (entry.kind != .file) return notRegular(lock_path);
-        }
-        const file = std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write, .follow_symlinks = is_windows, .allow_directory = false }) catch |err| switch (err) {
-            error.FileNotFound => {
-                return std.Io.Dir.cwd().createFile(io, lock_path, .{ .read = true, .truncate = false, .exclusive = true }) catch |create_err| switch (create_err) {
-                    error.PathAlreadyExists => continue,
-                    else => return create_err,
-                };
-            },
-            error.SymLinkLoop, error.IsDir, error.NotDir => return notRegular(lock_path),
-            else => return err,
-        };
-        errdefer file.close(io);
-        const st = try file.stat(io);
-        if (st.kind != .file) return notRegular(lock_path);
-        return file;
-    }
-    return notRegular(lock_path);
+    return lock_open.openRegular(lock_path) catch |err| switch (err) {
+        error.LockNotRegular => return notRegular(lock_path),
+        else => return err,
+    };
 }
 
 fn notRegular(lock_path: []const u8) error{WatchLockNotRegular} {
