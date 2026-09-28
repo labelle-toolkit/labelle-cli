@@ -41,7 +41,7 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     compatibility.validateCompatibility(parsed);
 
     // Pre-build hooks (#355). Runs on `generate` / `build` / `run` (and
-    // the ios/wasm flows, which all generate) — the first thing
+    // the ios flow, which generates too) — the first thing
     // that touches the project after its config is validated, and ahead
     // of EVERY generation input reader: the ASTC pre-pass, the `--bake`
     // pre-pass, the assembler's cache populate and `generate`. That
@@ -63,24 +63,21 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     // "tools/gen_tiles.py", ... }` is this feature's documented example. On a
     // machine whose only interpreter is the CLI-managed one (`labelle install
     // python`), that interpreter reaches PATH solely through
-    // `python_provision.autoWireEnv`, which used to run far below inside the
-    // wasm-only block — i.e. AFTER the hooks had already failed to spawn
-    // (cli#361 review). Wire it HERE, ahead of the first spawn, so the
-    // documented generator works on every platform and not just after a wasm
-    // build has got that far.
+    // `python_provision.autoWireEnv`. It is wired HERE, ahead of the first
+    // spawn (cli#361 review), so the documented generator works on every
+    // target.
     //
     // Gated on hooks that will actually run, so the no-`.prebuild` path stays
     // byte-identical (no cache stat, no "using provisioned Python" line) and
-    // `LABELLE_NO_PREBUILD=1` stays fully inert. Idempotent and cheap: the
-    // wasm block below still calls it for projects with no hooks, and a
+    // `LABELLE_NO_PREBUILD=1` stays fully inert. Idempotent and cheap: a
     // second call returns early once the dir is on PATH.
     //
     // Nothing else a hook could reasonably need is wired later. The managed
     // Zig toolchain is spawned by absolute path and never joins PATH at all;
-    // emsdk activation exists for the emcc link step and pulling it above the
-    // hooks would force a toolchain fetch on every build; and
-    // `sdl_provision.autoWireEnv` (just below) sets a Windows link/runtime
-    // variable consumed by `zig build`, not a tool a generator spawns.
+    // a provider's toolchain reaches the build through its hooks' environment
+    // contributions; and `sdl_provision.autoWireEnv` (just below) sets a
+    // Windows link/runtime variable consumed by `zig build`, not a tool a
+    // generator spawns.
     wirePrebuildPython(allocator, parsed.prebuild);
 
     try prebuild.runAll(allocator, project_dir, parsed.prebuild, .{
@@ -210,10 +207,6 @@ pub fn discoverAndPlan(
         .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
         .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
     };
-    if (command == .wasm_cmd and @import("args_resolve.zig").refuseLegacyWasmReplacement(hook_plans.run)) {
-        if (reporter) |r| r.finishFailed(1, "legacy wasm command conflicts with a provider run replacement");
-        return .{ .exit = 1 };
-    }
     // The labelle-assembler#378 boundary: the assembler generates only for
     // the schema platforms, so a provider target outside that enum can be
     // generated for only by its provider's `replace` hook on `generate`.
@@ -281,7 +274,7 @@ pub fn discoverAndPlan(
 /// built-in `run` branch of its own (`pipeline/run.zig`). Every other
 /// provider target is launched by its provider's `replace run` hook. The
 /// set only shrinks: a platform leaves it when its launch moves into a
-/// provider (cli#405 removed `android`).
+/// provider (cli#405 removed `android`, RFC cli#466 PR B `wasm`).
 /// A build path that cannot carry what a provider supplies for the target.
 /// Such a path refuses before anything runs rather than silently bypassing
 /// the provider (RFC cli#466 A1):
@@ -327,7 +320,7 @@ pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool
 /// that goes on past generation into the shared build step.
 fn reachesContainerBuild(command: args_mod.Command) bool {
     return switch (command) {
-        .build, .run, .bundle_cmd, .wasm_cmd => true,
+        .build, .run, .bundle_cmd => true,
         else => false,
     };
 }
@@ -342,14 +335,13 @@ test "providerBypass: a path that cannot carry a provider's input refuses instea
     try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false, false).?);
     try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, true, false).?);
     try std.testing.expectEqual(Bypass.docker_env, providerBypass(.bundle_cmd, true, true, false, false).?);
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.wasm_cmd, true, true, false, false).?);
     // `labelle generate --docker` never reaches the container build: its
     // fingerprint pass runs on the host with the contributions.
     try std.testing.expect(providerBypass(.generate, true, true, false, false) == null);
     try std.testing.expect(providerBypass(.generate, true, true, true, false) == null);
     // A `replace build` hook stands in for the container build and gets the
     // contributions like every hook: nothing is bypassed.
-    for ([_]args_mod.Command{ .build, .run, .bundle_cmd, .wasm_cmd }) |command| {
+    for ([_]args_mod.Command{ .build, .run, .bundle_cmd }) |command| {
         try std.testing.expectEqual(Bypass.docker_env, providerBypass(command, true, true, false, false).?);
         try std.testing.expect(providerBypass(command, true, true, false, true) == null);
     }
@@ -367,8 +359,8 @@ test "providerBypass: a path that cannot carry a provider's input refuses instea
 pub fn legacyRunBranch(platform: ?project_config.Platform) bool {
     const p = platform orelse return false;
     return switch (p) {
-        .wasm, .ios => true,
-        .desktop, .android => false,
+        .ios => true,
+        .desktop, .android, .wasm => false,
     };
 }
 
@@ -388,19 +380,20 @@ test "NoRunReplacement: a provider target needs a run replacement unless a legac
     // A replacement launches it.
     try std.testing.expect(!noRunReplacement(.run, true, true, .android));
     try std.testing.expect(!noRunReplacement(.run, true, true, null));
-    // The legacy branches still launch their own way.
-    try std.testing.expect(!noRunReplacement(.run, true, false, .wasm));
+    // The legacy branch still launches its own way; every other schema name
+    // needs its provider's replacement (the built-in serve left in 3.0).
     try std.testing.expect(!noRunReplacement(.run, true, false, .ios));
+    try std.testing.expect(noRunReplacement(.run, true, false, .wasm));
     // The core target is launched by the host branch.
     try std.testing.expect(!noRunReplacement(.run, false, false, .desktop));
     // Only `run` launches: build, bundle and generate are never refused here.
-    for ([_]args_mod.Command{ .build, .bundle_cmd, .generate, .wasm_cmd, .ios_cmd }) |command| {
+    for ([_]args_mod.Command{ .build, .bundle_cmd, .generate, .ios_cmd }) |command| {
         try std.testing.expect(!noRunReplacement(command, true, false, .android));
     }
 }
 
-test "legacyRunBranch: only wasm and ios keep a built-in launch" {
-    try std.testing.expect(legacyRunBranch(.wasm));
+test "legacyRunBranch: only ios keeps a built-in launch" {
+    try std.testing.expect(!legacyRunBranch(.wasm));
     try std.testing.expect(legacyRunBranch(.ios));
     try std.testing.expect(!legacyRunBranch(.android));
     try std.testing.expect(!legacyRunBranch(.desktop));

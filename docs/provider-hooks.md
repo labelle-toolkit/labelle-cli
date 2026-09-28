@@ -200,9 +200,7 @@ The CLI maps none of this to a platform. The provider decides how the pairs
 reach its game, for example as launch extras on a device.
 
 The object is present, and possibly empty, on every `run`-step hook of a
-`1.2.0` wire. That includes `wasm serve`'s `run` hooks, which have no
-`labelle run` options, so their object is empty. It's absent on every other
-step.
+`1.2.0` wire. It's absent on every other step.
 
 A provider whose range stops below `1.2.0` gets the older wire, without
 either key. If its `run` hook would have received options the user passed,
@@ -285,8 +283,8 @@ to skip); the CLI's exit status is unchanged by the skip:
 A zero status alone was never a clean exit — the watchdog reports 0 after
 killing the game, and the mobile deploy paths return as soon as the launch is
 issued — so a publishing or cleanup hook used to run after a forced timeout
-or immediately after a device launch. A `replace run` hook that exits 0 and
-`wasm export` are clean ends of the step.
+or immediately after a device launch. A `replace run` hook that exits 0 is a
+clean end of the step.
 
 Hooks report under the progress phase of the step they wrap (`generate`,
 `compile` for `build`, `run` for `bundle` and `run`) as sub-steps named
@@ -316,7 +314,7 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   pinned provider like `--platform=<t>`). `labelle android …` left with
   cli#405: it is the `android` provider's namespace, and `--platform=android`
   runs the ordinary hook points.
-- A provider target other than the legacy `wasm`/`ios` run branches must
+- A provider target other than the legacy `ios` run branch must
   replace `run` (`NoRunReplacement`, [provider
   targets](provider-targets.md#labelle-run)).
 - `labelle bundle` for the core `desktop` target is still refused on Linux
@@ -325,21 +323,12 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   provider target is bundled by its provider's `replace` hook on any host,
   checked with the plans after discovery; see [provider
   targets](provider-targets.md#labelle-bundle).
-- `wasm serve` is interactive: its `done` record lands before the serve loop
-  and the `after run` hooks run once the server returns; a failing one is
-  followed by a `failed` record carrying the exit code the CLI returns, so
-  the status file ends with the real outcome. The server returns
-  on Ctrl+C or SIGTERM: the handler sets a flag, a waker thread pokes the
-  listener so the blocked `accept` returns, the loop exits cleanly and the
-  hooks run before the process ends (a second Ctrl+C while a hook is still
-  running forces the exit). On Windows the handler is registered with
-  `SetConsoleCtrlHandler` and covers Ctrl+C, Ctrl+Break and a console close;
-  it is compile-checked but not exercised by CI, so it is best-effort. A
-  `--watch` rebuild re-runs the `generate` and `build` hook phases around its
-  core steps exactly as the cold pipeline did (the feed is already terminal,
-  so the hooks' sub-step records are not emitted there); a failing hook stops
-  that rebuild and keeps the server alive, like a failing core step. Every
-  rebuild first — before its prebuild steps — re-reads `project.labelle` and
+- A `labelle run --watch` rebuild re-runs the `generate` and `build` hook
+  phases around its core steps exactly as the cold pipeline did (the feed is
+  already terminal, so the hooks' sub-step records are not emitted there); a
+  failing hook stops that rebuild and keeps the replacement running, like a
+  failing core step. Every
+rebuild first — before its prebuild steps — re-reads `project.labelle` and
   stages the `.prebuild` steps it declares (so an edited step runs in that
   very rebuild, and the watch ignore set is swapped with it, cli#463); after
   the steps it re-runs the package install and rewrites `labelle.lock` when
@@ -364,15 +353,11 @@ build` hook signed, stripped or patched in `zig-out/` is what runs.
   does not rebuild in a loop.
 - A `--docker` run whose binary was cross-compiled skips the launch and
   every `run` hook with it — decided before the `before run` hooks, so none
-  of them prepares (or fails) a launch that never happens. A `replace run`
-  hook is not skipped: it launches its own way.
-- `wasm serve|export --no-build` skips only `generate` and `build`: serving
-  or exporting the existing artifact is the `run` step, and its `before`,
-  `replace` and `after run` hooks run as on the building path (`after`
-  once the export is on disk, or once the server returns). No installer
-  runs there, so discovery is the metadata-only kind that `labelle help`
-  uses: a declared remote package absent from every cache is not listed
-  rather than reported as a failed install.
+  of them prepares (or fails) a launch that never happens. `--docker` builds
+  the core `desktop` target only: a provider target is refused by name
+  before anything runs (CLI 3.0, [migrating](migrating-to-3.0.md)), since
+  its hooks, their environment contributions and its toolchain live on the
+  host.
 
 ## Watch sessions (`labelle run --watch`)
 
@@ -410,10 +395,7 @@ the hook wire context; `zig build test` also covers the watched-rebuild
 hook plumbing (the phases, and the per-rebuild replan: invoked on every
 rebuild, its plans are the ones that run, a failing replan stops the
 rebuild before any phase, and the production replan against a real project
-follows manifest and project edits), the serve loop's stop flag and the
-waker's poke (the signal handler itself is interactive, so the Ctrl+C path
-is not driven end to end — it is the flag the handler sets that is tested)
-and the `link`-phase sub-step. The real-process regression is:
+follows manifest and project edits) and the `link`-phase sub-step. The real-process regression is:
 
 ```
 zig build
@@ -434,8 +416,7 @@ without the hook), `after build` hooks seeing the finalized artifact (the
 `--linux-desktop` entry is in their snapshot of `zig-out/` and not in the
 before hooks'), `run` hooks around the game, a `--timeout` kill running no
 `after run` hook (and printing the skip line) while a clean exit still
-does, the `run` hooks wrapping `wasm export --no-build` with nothing
-installed, generated or built, an `after build` edit to `zig-out/` reaching
+does, an `after build` edit to `zig-out/` reaching
 the launched game intact, contract `1.2.0` on a provider target (every
 hook's `target_dir` for `build`, `run` and `bundle`, including `bundle
 --output` elsewhere; a `replace run` hook receiving the three `LABELLE_*`
@@ -464,17 +445,11 @@ broken hook graph without writing the lock. Provider-target resolution and
 bundling are covered by `test/provider_targets_e2e.py`. CI runs them on
 Windows, macOS and Linux.
 
-## Legacy wasm commands
+## Removed: the legacy browser commands
 
-`labelle wasm serve/export` historically shares the `run` phase. When a pinned
-provider declares a run replacement, both legacy verbs are refused before
-generation or hooks (also with `--no-build`). Known declarations are checked
-before project prebuild commands; post-install discovery checks again for newly
-available providers. Watched manifest edits are checked before prebuild and
-before replacing the active plans, keeping the last good plans on refusal
-(legacy `wasm serve --watch` shares the generic rebuild engine of
-`labelle run --watch`, minus its run replacement). This prevents export from starting
-a server and prevents serve flags from being silently discarded. Use the
-provider's namespaced commands shown by `labelle help`, or the generic
-`labelle run/bundle --platform=wasm` pipeline. Existing before/after hooks around
-the legacy implementation continue to work when no run replacement exists.
+CLI 3.0 removed `labelle wasm serve|export` together with the core's browser
+toolchain, serve and export (RFC cli#466 PR B). `labelle wasm` is an unknown
+command now; use the pinned `web` provider through the generic pipeline
+(`labelle run|bundle --platform=wasm`, `labelle run --watch --platform=wasm`)
+or its namespaced commands (`labelle web serve|export|doctor|toolchain`). See
+[migrating to 3.0](migrating-to-3.0.md).

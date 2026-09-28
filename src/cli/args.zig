@@ -1,6 +1,6 @@
 //! Argument parsing for the labelle CLI, extracted from cli.zig so
 //! neither file exceeds ~1000 lines. Holds the Command enum, the
-//! ParsedArgs/WasmServeArgs/WasmExportArgs result structs, and the
+//! ParsedArgs/BundleArgs result structs, and the
 //! parse*/collect*/append* helpers. Behavior is unchanged from when
 //! these lived in cli.zig. Unit tests live in the sibling
 //! args_tests.zig, surfaced to the runner via re-exports in cli.zig.
@@ -8,13 +8,11 @@ const std = @import("std");
 const project_config = @import("project_config.zig");
 const util = @import("util.zig");
 const progress = @import("progress.zig");
-const export_mod = @import("export.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
-const emsdk_toolchain = @import("emsdk_toolchain.zig");
 const bundle = @import("bundle.zig");
 const contract = @import("provider_contract.zig");
 
-pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, wasm_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
+pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 
@@ -99,27 +97,12 @@ pub const ParsedArgs = struct {
     /// `.desktop` entry + 256px PNG beside `zig-out/bin` after a desktop
     /// build. Automatic on a Linux host; this flag forces it elsewhere.
     linux_desktop: bool = false,
-    // `wasm serve` options. `serve_port` is also read by the wasm
-    // branch of `run`; the others only apply to `wasm serve`.
-    serve_port: u16 = 8080,
-    serve_no_build: bool = false,
-    serve_no_open: bool = false,
-    // `wasm serve --watch` (cli#208): rebuild + live-reload on source change.
-    serve_watch: bool = false,
     /// `labelle run --watch` (RFC cli#466 A2): after the initial build,
     /// keep the target's watch-capable run replacement running and rebuild
     /// + publish on every source change.
     run_watch: bool = false,
-    // `wasm export` options. `wasm_export` selects the export action of
-    // the shared `wasm_cmd`; the rest configure packaging. `serve_no_build`
-    // (above) is reused as the shared "skip build, package existing output"
-    // flag for both `wasm serve --no-build` and `wasm export --no-build`.
-    wasm_export: bool = false,
-    export_output: []const u8 = "release",
-    export_zip: bool = false,
-    export_pkg_platform: export_mod.Platform = .none,
     // labelle-cli#227 — out-of-band screenshot capture. `--screenshot`
-    // takes a destination path (raylib picks the format from the
+    // takes a destination path (the backend picks the format from the
     // extension); `--after` is an optional delay (parsed via
     // `parseDuration`, default 0 = fire on the first frame). Wired
     // through to the spawned game via `LABELLE_SCREENSHOT_PATH` +
@@ -129,8 +112,8 @@ pub const ParsedArgs = struct {
     screenshot_after_ns: ?u64 = null,
     // Headless perf / CI knobs. Wired through to the spawned game via
     // `LABELLE_HEADLESS` / `LABELLE_HEADLESS_UNCAPPED` /
-    // `LABELLE_HEADLESS_TICKS` env vars (the sokol desktop backend reads
-    // them). `--uncapped` and `--ticks` both imply `--headless`.
+    // `LABELLE_HEADLESS_TICKS` env vars (the desktop backends that support
+    // headless runs read them). `--uncapped` and `--ticks` both imply `--headless`.
     //   - headless          windowless run (no GUI window)
     //   - headless_uncapped  drop the ~16ms/frame sleep (run flat-out)
     //   - headless_ticks     exit cleanly after N frames (null = run forever)
@@ -153,8 +136,8 @@ pub const ParsedArgs = struct {
     progress_mode: progress.Mode = .human,
     // `labelle bundle --output <dir>` (cli#359): where the macOS `.app`
     // lands. `null` = the target dir's `zig-out/bundle/desktop/`. A
-    // relative path anchors to the project dir (same rule as `wasm
-    // export --output`); see `bundle.resolveOutputDir`.
+    // relative path anchors to the project dir; see
+    // `bundle.resolveOutputDir`.
     bundle_output: ?[]const u8 = null,
     /// `--allow-older-cli` (#353): downgrade the stale-CLI lock gate from a
     /// hard error to a warning for THIS invocation. Set by the
@@ -226,7 +209,7 @@ fn parseBundleValueFlag(
 /// replaces the `bundle` step. `--zig` is accepted like everywhere else so
 /// a pinned toolchain still works. `args` is `anytype` so tests can drive
 /// it with an in-memory `Args.IteratorGeneral`, mirroring
-/// `parseWasmExportArgs`.
+/// `parseRunArgs`.
 pub fn parseBundleArgs(args: anytype) ?BundleArgs {
     var result = BundleArgs{};
     var dir_set = false;
@@ -278,149 +261,6 @@ pub fn parseBundleArgs(args: anytype) ?BundleArgs {
         } else {
             if (dir_set) {
                 std.debug.print("labelle bundle: unexpected argument '{s}'\n", .{arg});
-                return null;
-            }
-            result.dir = arg;
-            dir_set = true;
-        }
-    }
-    return result;
-}
-
-/// Parsed `wasm serve` flags. Returned by `parseWasmServeArgs`; `null`
-/// signals a parse error (the helper has already printed a message).
-pub const WasmServeArgs = struct {
-    dir: []const u8 = ".",
-    port: u16 = 8080,
-    no_build: bool = false,
-    no_open: bool = false,
-    // `--watch` (cli#208): after the initial build, watch the project
-    // source tree and re-run generate+build on change, then push a live
-    // reload to connected browsers. Mutually exclusive with `--no-build`
-    // (there's no build pipeline to re-run in the skip-build path).
-    watch: bool = false,
-    // `wasm serve` runs the same resolve→generate→build pipeline as
-    // `labelle build`, so it carries the cli#284 progress feed too (the
-    // reporter marks the pipeline `done` before the interactive serve
-    // loop takes over).
-    progress_mode: progress.Mode = .human,
-};
-
-/// Parse the flags of `labelle wasm serve [dir] [--port <n>]
-/// [--no-build] [--no-open] [--progress=<m>]`. `args` is `anytype` so
-/// tests can drive it with an in-memory `Args.IteratorGeneral`, mirroring
-/// `parseRunArgs`.
-pub fn parseWasmServeArgs(args: anytype) ?WasmServeArgs {
-    var result = WasmServeArgs{};
-    var dir_set = false;
-
-    while (args.next()) |arg| {
-        // Same tri-state idiom as parseRunArgs: consumed → next arg,
-        // not-a-progress-flag → fall through, bad value → parse error.
-        if (parseProgressFlag(arg, &result.progress_mode, "wasm serve")) |consumed| {
-            if (consumed) continue;
-        } else return null;
-        if (std.mem.eql(u8, arg, "--no-build")) {
-            result.no_build = true;
-        } else if (std.mem.eql(u8, arg, "--no-open")) {
-            result.no_open = true;
-        } else if (std.mem.eql(u8, arg, "--watch")) {
-            result.watch = true;
-        } else if (std.mem.startsWith(u8, arg, "--port=") or std.mem.eql(u8, arg, "--port")) {
-            const val = if (std.mem.eql(u8, arg, "--port"))
-                (args.next() orelse {
-                    std.debug.print("labelle wasm serve: --port requires a value (e.g. --port 3000)\n", .{});
-                    return null;
-                })
-            else
-                arg["--port=".len..];
-            result.port = std.fmt.parseInt(u16, val, 10) catch {
-                std.debug.print("labelle wasm serve: invalid --port value '{s}' (expected 1-65535)\n", .{val});
-                return null;
-            };
-            if (result.port == 0) {
-                std.debug.print("labelle wasm serve: --port must be between 1 and 65535\n", .{});
-                return null;
-            }
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            std.debug.print("labelle wasm serve: unknown flag '{s}'\n", .{arg});
-            return null;
-        } else {
-            if (dir_set) {
-                std.debug.print("labelle wasm serve: unexpected argument '{s}'\n", .{arg});
-                return null;
-            }
-            result.dir = arg;
-            dir_set = true;
-        }
-    }
-    if (result.watch and result.no_build) {
-        std.debug.print("labelle wasm serve: --watch cannot be combined with --no-build " ++
-            "(there's no build pipeline to re-run)\n", .{});
-        return null;
-    }
-    return result;
-}
-
-/// Parsed `wasm export` flags. Returned by `parseWasmExportArgs`; `null`
-/// signals a parse error (the helper has already printed a message).
-pub const WasmExportArgs = struct {
-    dir: []const u8 = ".",
-    output: []const u8 = "release",
-    zip: bool = false,
-    no_build: bool = false,
-    pkg_platform: export_mod.Platform = .none,
-    progress_mode: progress.Mode = .human,
-};
-
-/// Parse the flags of `labelle wasm export [dir] [--output <dir>]
-/// [--zip] [--platform <itch|github-pages>] [--no-build]
-/// [--progress=<m>]`. `args` is `anytype` so tests can drive it with an
-/// in-memory `Args.IteratorGeneral`, mirroring `parseWasmServeArgs`.
-pub fn parseWasmExportArgs(args: anytype) ?WasmExportArgs {
-    var result = WasmExportArgs{};
-    var dir_set = false;
-
-    while (args.next()) |arg| {
-        // Tri-state progress idiom shared with parseWasmServeArgs.
-        if (parseProgressFlag(arg, &result.progress_mode, "wasm export")) |consumed| {
-            if (consumed) continue;
-        } else return null;
-        if (std.mem.eql(u8, arg, "--zip")) {
-            result.zip = true;
-        } else if (std.mem.eql(u8, arg, "--no-build")) {
-            result.no_build = true;
-        } else if (std.mem.startsWith(u8, arg, "--output=") or std.mem.eql(u8, arg, "--output")) {
-            const val = if (std.mem.eql(u8, arg, "--output"))
-                (args.next() orelse {
-                    std.debug.print("labelle wasm export: --output requires a value (e.g. --output ./release)\n", .{});
-                    return null;
-                })
-            else
-                arg["--output=".len..];
-            if (val.len == 0) {
-                std.debug.print("labelle wasm export: --output requires a non-empty directory\n", .{});
-                return null;
-            }
-            result.output = val;
-        } else if (std.mem.startsWith(u8, arg, "--platform=") or std.mem.eql(u8, arg, "--platform")) {
-            const val = if (std.mem.eql(u8, arg, "--platform"))
-                (args.next() orelse {
-                    std.debug.print("labelle wasm export: --platform requires a value (itch | github-pages)\n", .{});
-                    return null;
-                })
-            else
-                arg["--platform=".len..];
-            result.pkg_platform = export_mod.parsePlatform(val) orelse {
-                std.debug.print("labelle wasm export: unknown --platform '{s}' (expected itch | github-pages)\n", .{val});
-                return null;
-            };
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            std.debug.print("labelle wasm export: unknown flag '{s}'\n", .{arg});
-            return null;
-        } else {
-            if (dir_set) {
-                std.debug.print("labelle wasm export: unexpected argument '{s}'\n", .{arg});
                 return null;
             }
             result.dir = arg;
@@ -497,36 +337,6 @@ fn parseZigFlag(arg: []const u8, args: anytype) ?bool {
     return false;
 }
 
-/// Parse the `--emcc <path>` / `--emcc=<path>` escape hatch (cli#283), the
-/// emsdk analog of `--zig`. Records the override in `emsdk_toolchain` so
-/// `resolveEmcc` returns it directly. `LABELLE_EMSDK` still wins (checked first
-/// in `resolveEmcc`). Returns true when consumed, false when `arg` is not
-/// `--emcc`, and null on a missing value. The stored slice borrows argv.
-fn parseEmccFlag(arg: []const u8, args: anytype) ?bool {
-    if (std.mem.startsWith(u8, arg, "--emcc=")) {
-        const val = arg["--emcc=".len..];
-        if (val.len == 0) {
-            std.debug.print("labelle: --emcc requires a path (e.g. --emcc=/opt/emsdk/upstream/emscripten/emcc)\n", .{});
-            return null;
-        }
-        emsdk_toolchain.setFlagOverride(val);
-        return true;
-    }
-    if (std.mem.eql(u8, arg, "--emcc")) {
-        const val = args.next() orelse {
-            std.debug.print("labelle: --emcc requires a path (e.g. --emcc /opt/emsdk/upstream/emscripten/emcc)\n", .{});
-            return null;
-        };
-        if (val.len == 0) {
-            std.debug.print("labelle: --emcc requires a non-empty path\n", .{});
-            return null;
-        }
-        emsdk_toolchain.setFlagOverride(val);
-        return true;
-    }
-    return false;
-}
-
 /// `--allow-older-cli` (#353): the escape hatch of the stale-CLI lock gate
 /// (`lockfile.enforceCliNotStale`). A bare boolean flag — true = consumed.
 /// Deliberately valueless: `LABELLE_ALLOW_OLDER_CLI=1` is the env form for
@@ -535,12 +345,10 @@ pub fn parseAllowOlderCliFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--allow-older-cli");
 }
 
-/// Try the managed-toolchain path overrides (`--zig`, then `--emcc`) for one
-/// arg. true = consumed, false = neither flag, null = a flag with a bad value.
+/// Try the managed-toolchain path override (`--zig`) for one arg. true =
+/// consumed, false = not the flag, null = the flag with a bad value.
 fn parseToolchainFlag(arg: []const u8, args: anytype) ?bool {
-    const zig = parseZigFlag(arg, args) orelse return null;
-    if (zig) return true;
-    return parseEmccFlag(arg, args);
+    return parseZigFlag(arg, args);
 }
 
 /// Try to parse `--progress=<mode>` (cli#284). Returns true if consumed,

@@ -6,12 +6,11 @@ const progress = @import("progress.zig");
 pub fn validateCompatibility(cfg: project_config.ProjectConfig) void {
     validateStates(cfg.states);
 
-    // Validate backend+platform combination
-    if (cfg.platform == .wasm and cfg.backend != .raylib and cfg.backend != .sokol and cfg.backend != .bgfx) {
-        std.debug.print("labelle: error: WASM builds are only supported with raylib, sokol, or bgfx backends (got {s})\n", .{@tagName(cfg.backend)});
-        std.debug.print("  hint: set backend = \"raylib\", \"sokol\", or \"bgfx\" in project.labelle\n\n", .{});
-        progress.fatalExit(1, "compatibility check failed: wasm requires a raylib, sokol, or bgfx backend");
-    }
+    // Whether the backend supports the target platform is the backend's own
+    // declaration, checked by the assembler at generation (RFC cli#466 D13):
+    // the project's required capabilities against the backend manifest's
+    // `.capabilities`, and its `.platforms.<platform>` entry. The CLI keeps
+    // no list of which backend builds for which platform.
 
     const warnings = compatWarnings(cfg, true);
 
@@ -139,21 +138,36 @@ fn compatWarnings(cfg: project_config.ProjectConfig, comptime emit: bool) u8 {
     return warnings;
 }
 
-/// The migration guide for a `cli` pin on a line older than 2.0 when this
-/// CLI is 2.x or newer: `upgrade all` bumps the pins, but moving the Android
-/// and wasm targets to their provider packages is a project edit it cannot
-/// make (cli#405). Null for every other package or line.
+/// The migration guide for a `cli` pin on an older major line than this
+/// CLI, when crossing that line needs a project edit `upgrade all` cannot
+/// make: 2.0 moved the non-desktop targets into provider packages
+/// (cli#405), and 3.0 removed the CLI's own browser toolchain, serve and
+/// export in favour of its provider package (RFC cli#466). The guide of the
+/// first line crossed comes first. Null for every other package or line.
 fn migrationGuide(d: DiamondPin) ?[]const u8 {
     if (!std.mem.eql(u8, d.name, "cli")) return null;
-    if (parseVersion(d.pinned).major >= 2 or parseVersion(d.curated).major < 2) return null;
-    return "upgrading alone is not enough: the 2.0 CLI builds Android and wasm through provider\n" ++
-        "  packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+    const pinned = parseVersion(d.pinned).major;
+    const curated = parseVersion(d.curated).major;
+    if (pinned < 2 and curated >= 2) {
+        return "upgrading alone is not enough: the 2.0 CLI builds every non-desktop target through\n" ++
+            "  provider packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+    }
+    if (pinned < 3 and curated >= 3) {
+        return "upgrading alone is not enough: the 3.0 CLI removed its built-in browser toolchain, serve and\n" ++
+            "  export, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
+    }
+    return null;
 }
 
-test "compat: a 1.x cli pin under a 2.x CLI points at the migration guide; nothing else does" {
+test "compat: a cli pin behind a breaking CLI line points at that line's migration guide; nothing else does" {
     const guide = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "2.0.0" }).?;
     try std.testing.expect(std.mem.indexOf(u8, guide, "docs/migrating-to-2.0.md") != null);
+    // Crossing both lines: the first one's guide, which links the next.
+    try std.testing.expect(std.mem.indexOf(u8, migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "3.0.0" }).?, "docs/migrating-to-2.0.md") != null);
+    const three = migrationGuide(.{ .name = "cli", .pinned = "2.1.1", .curated = "3.0.0" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, three, "docs/migrating-to-3.0.md") != null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "2.0.0", .curated = "2.1.0" }) == null);
+    try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "3.0.0", .curated = "3.1.0" }) == null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "1.60.0", .curated = "1.75.0" }) == null);
     try std.testing.expect(migrationGuide(.{ .name = "engine", .pinned = "1.67.0", .curated = "2.0.0" }) == null);
 }

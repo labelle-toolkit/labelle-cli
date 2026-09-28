@@ -171,8 +171,8 @@ pub fn runSubcommand(
 /// delegate code generation to the assembler binary instead of calling
 /// the in-process `generate()`. `build` / `run` then invoke `zig build`
 /// (and launch the binary) themselves — those steps stay CLI-side because
-/// the CLI owns docker orchestration, WASM serve, the iOS deploy
-/// path and `--timeout`; only the generation step is delegated.
+/// the CLI owns docker orchestration, the watch supervision, the legacy
+/// deploy path and `--timeout`; only the generation step is delegated.
 ///
 /// `platform` / `backend` are forwarded as plain strings (`@tagName` of
 /// the CLI's enums) so this module needs no dependency on the assembler's
@@ -218,8 +218,8 @@ fn buildGenerateArgs(
 ) !void {
     try args.appendSlice(allocator, &.{ "--project-root", project_dir });
     // Always forward platform/backend — the CLI may have mutated them
-    // (e.g. `labelle ios` forces sokol+ios) and the binary must not
-    // re-derive its own values from project.labelle.
+    // (a legacy platform subcommand forces its own backend and platform)
+    // and the binary must not re-derive its own values from project.labelle.
     try args.appendSlice(allocator, &.{ "--platform", platform });
     try args.appendSlice(allocator, &.{ "--backend", backend });
 }
@@ -247,7 +247,7 @@ pub const BuildGenerateArgsSpec = struct {
             var args: std.ArrayList([]const u8) = .empty;
             defer args.deinit(allocator);
 
-            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "raylib");
+            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "probe-backend");
 
             for (args.items) |a| {
                 try std.testing.expect(!std.mem.eql(u8, a, "--scene"));
@@ -261,12 +261,12 @@ pub const BuildGenerateArgsSpec = struct {
             var args: std.ArrayList([]const u8) = .empty;
             defer args.deinit(allocator);
 
-            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "raylib");
+            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "probe-backend");
 
             const expected: []const []const u8 = &.{
                 "--project-root", "/proj",
                 "--platform",     "desktop",
-                "--backend",      "raylib",
+                "--backend",      "probe-backend",
             };
             try std.testing.expectEqual(expected.len, args.items.len);
             for (expected, args.items) |want, got| {
