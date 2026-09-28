@@ -15,6 +15,7 @@ const dispatch = @import("provider_dispatch.zig");
 const project = @import("project_config.zig");
 const config = @import("config.zig");
 const github = @import("provider_github.zig");
+const registry = @import("provider_registry.zig");
 
 /// The one target core owns; no package may declare it (`ReservedTarget`).
 pub const core_target = "desktop";
@@ -101,28 +102,30 @@ pub fn reportUnverifiedOwner(a: std.mem.Allocator, providers: []const dispatch.P
 /// diagnostic points at it.
 pub const migration_guide_url = "https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
 
-/// The diagnostic for a target no pinned provider declares, with the steps
-/// that fix it. `lookup` is the registry's answer (`lookupRegistryOwner`):
-/// on a hit the steps name the owning package, its repository and a
-/// candidate release (registry data, never a name the CLI knows); on a miss
-/// they are generic — no package, version or source — and say why. Either
-/// way the first line, the exit status and everything else about the
-/// failure are the same.
+/// The diagnostic for a target (or command namespace) no pinned provider
+/// declares, with the steps that fix it. `lookup` is the registry's answer
+/// (`lookupRegistryOwner`): on a hit the steps name the owning package, its
+/// repository and a candidate release (registry data, never a name the CLI
+/// knows); on a miss they are generic — no package, version or source — and
+/// say why. Either way the first line, the exit status and everything else
+/// about the failure are the same.
 ///
 /// A custom source is never interpolated into a shell command (quoting
 /// differs per shell, and `cmd.exe` expands `%…%` even inside quotes): it is
 /// printed on a line of its own, and the steps say where it goes.
-pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: github.RegistryLookup) ![]const u8 {
+pub fn noProviderDiagnostic(a: std.mem.Allocator, declaration: registry.Declaration, lookup: github.RegistryLookup) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
-    try w.print("labelle: no provider for target '{s}' in this project; add and pin the package that declares target '{s}'\n", .{ target, target });
+    const kind = @tagName(declaration);
+    const name = declaration.name();
+    try w.print("labelle: no provider for {s} '{s}' in this project; add and pin the package that declares {s} '{s}'\n", .{ kind, name, kind, name });
     switch (lookup) {
         .hit => |hint| {
             const from: []const u8 = if (hint.registry != null) "The registry this project last accepted from" else "The provider registry";
             try w.print("  (registry: {s})\n", .{hint.package});
-            try w.print("  {s} lists package '{s}' as the provider of target '{s}'.\n", .{ from, hint.package, target });
-            try w.print("  Its newest release that declares the target, {s}, is a candidate: `labelle providers resolve --accept`\n", .{hint.version});
-            try w.writeAll("  checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the target).\n");
+            try w.print("  {s} lists package '{s}' as the provider of {s} '{s}'.\n", .{ from, hint.package, kind, name });
+            try w.print("  Its newest release that declares the {s}, {s}, is a candidate: `labelle providers resolve --accept`\n", .{ kind, hint.version });
+            try w.print("  checks whether this CLI supports it (on UnsupportedContract, try an older release that declares the {s}).\n", .{kind});
             if (hint.registry) |source| try w.print("  That registry's source, to pass as the argument of both resolve steps (quote or escape it for your shell, since it may contain spaces or special characters):\n    {s}\n", .{source});
             try w.writeAll("  To use it:\n");
             try w.print("    1. add it to .plugins in project.labelle:\n         .{{ .name = \"{s}\", .repo = \"github.com/{s}\", .version = \"{s}\" }},\n", .{ hint.package, hint.repo, hint.version });
@@ -137,12 +140,12 @@ pub fn noProviderDiagnostic(a: std.mem.Allocator, target: []const u8, lookup: gi
             switch (why.reason) {
                 .offline => try w.writeAll("  (registry not consulted: " ++ github.registry_offline_env ++ " is set)\n"),
                 .unreachable_registry => try w.print("  ({s} could not be read)\n", .{subject}),
-                .no_owner_table => try w.print("  ({s} does not publish target owners: registry schema 1)\n", .{subject}),
-                .not_listed => try w.print("  ({s} lists no package for this target)\n", .{subject}),
+                .no_owner_table => try w.print("  ({s} does not publish {s} owners: registry schema 1)\n", .{ subject, kind }),
+                .not_listed => try w.print("  ({s} lists no package for this {s})\n", .{ subject, kind }),
                 .unverified_source => try w.writeAll("  (the registry this project last accepted from is unknown: " ++ github.registry_accepted_name ++ " does not verify)\n"),
             }
             try w.writeAll("  To add one:\n");
-            try w.print("    1. add the package that declares target '{s}' to .plugins in project.labelle\n       (a provider registry lists each package's targets):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{target});
+            try w.print("    1. add the package that declares {s} '{s}' to .plugins in project.labelle\n       (a provider registry lists each package's {s}s):\n         .{{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" }},\n", .{ kind, name, kind });
             try writeResolveSteps(w);
             try w.writeAll("  Both resolve steps read the public provider registry; to use another one, pass its\n  providers.json path or URL as the argument of both.\n");
         },
@@ -163,9 +166,33 @@ fn writeResolveSteps(w: *std.Io.Writer) !void {
 /// of the public registry, skipped under `LABELLE_OFFLINE`): nothing is
 /// pinned or run, and a failed lookup only makes the steps generic.
 pub fn reportNoProvider(a: std.mem.Allocator, root: ?[]const u8, target: []const u8) void {
-    const lookup = github.lookupRegistryOwner(a, root, target);
-    const text = noProviderDiagnostic(a, target, lookup) catch return;
+    const declaration: registry.Declaration = .{ .target = target };
+    const text = noProviderDiagnostic(a, declaration, github.lookupRegistryOwner(a, root, declaration)) catch return;
     std.debug.print("{s}", .{text});
+}
+
+/// The namespace twin of `reportNoProvider`, for a first token that is no
+/// built-in, no pinned provider's namespace and no directory. Inside a
+/// project, the same one document the target hint reads (the project's
+/// verified custom source, else the public registry) may name the package
+/// that declares it as a namespace; then the diagnostic says so. Anything
+/// else — outside a project, offline, a miss of any kind — is the plain
+/// unknown-command error: the word is as likely a misspelled command, so a
+/// miss prints no steps. Never another project's document (#465).
+pub fn reportUnknownCommand(a: std.mem.Allocator, root: ?[]const u8, word: []const u8) void {
+    if (namespaceDiagnostic(a, root, word)) |text| {
+        std.debug.print("{s}", .{text});
+        return;
+    }
+    std.debug.print("labelle: unknown command '{s}'\nRun 'labelle help' to see available commands.\n", .{word});
+}
+
+fn namespaceDiagnostic(a: std.mem.Allocator, root: ?[]const u8, word: []const u8) ?[]const u8 {
+    const r = root orelse return null;
+    const declaration: registry.Declaration = .{ .namespace = word };
+    const lookup = github.lookupRegistryOwner(a, r, declaration);
+    if (lookup != .hit) return null;
+    return noProviderDiagnostic(a, declaration, lookup) catch null;
 }
 
 /// `labelle targets`: the core target, then every target a pinned provider
@@ -317,7 +344,7 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
         }
     }.f;
     // Public hit: the owner, a candidate release checked by --accept, literal steps.
-    const hit = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.2.0" } });
+    const hit = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "1.2.0" } });
     try std.testing.expect(std.mem.startsWith(u8, hit, head));
     try std.testing.expectEqualStrings("  (registry: fixture)\n", hit[head.len..][0.."  (registry: fixture)\n".len]);
     try std.testing.expect(has(hit, "The provider registry lists package 'fixture' as the provider of target 'probe-target'."));
@@ -329,7 +356,7 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
     try std.testing.expect(!has(hit, "<package>") and !has(hit, "source"));
     // Custom hit: the source on a line of its own, never inside a command.
     const source = "C:\\My Registry\\%20b%\\it's \"x\".json";
-    const custom = try noProviderDiagnostic(a, "probe-target", .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "2.0.0", .registry = source } });
+    const custom = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "2.0.0", .registry = source } });
     try std.testing.expect(std.mem.startsWith(u8, custom, head));
     try std.testing.expect(has(custom, "The registry this project last accepted from lists package 'fixture' as the provider"));
     try std.testing.expect(has(custom, "2.0.0, is a candidate: `labelle providers resolve --accept`"));
@@ -339,7 +366,7 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
     try std.testing.expect(!has(custom, "labelle providers resolve --accept   #") and !has(custom, "labelle providers resolve            #"));
     // Every miss: the same head and generic steps — no package, version or
     // source — and the reason that says which path ran.
-    const generic = try noProviderDiagnostic(a, "probe-target", .{ .miss = .{ .reason = .offline } });
+    const generic = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .miss = .{ .reason = .offline } });
     const reason_end = std.mem.indexOf(u8, generic, "  To add one:\n").?;
     const reasons = [_]struct { github.RegistryMiss, []const u8 }{
         .{ .{ .reason = .offline }, "  (registry not consulted: LABELLE_OFFLINE is set)\n" },
@@ -351,7 +378,7 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
         .{ .{ .reason = .unverified_source }, "  (the registry this project last accepted from is unknown: .labelle/providers.registry.json does not verify)\n" },
     };
     for (reasons) |case| {
-        const text = try noProviderDiagnostic(a, "probe-target", .{ .miss = case[0] });
+        const text = try noProviderDiagnostic(a, .{ .target = "probe-target" }, .{ .miss = case[0] });
         try std.testing.expect(std.mem.startsWith(u8, text, head));
         try std.testing.expectEqualStrings(case[1], text[head.len..std.mem.indexOf(u8, text, "  To add one:\n").?]);
         // Past the reason, every miss prints exactly the same text.
@@ -361,4 +388,28 @@ test "provider targets: the no-provider diagnostic names a candidate on a hit an
     try std.testing.expect(has(generic, ".{ .name = \"<package>\", .repo = \"github.com/<owner>/<repo>\", .version = \"<version>\" },"));
     try std.testing.expect(has(generic, "    3. labelle providers resolve --accept   #"));
     try std.testing.expect(has(generic, "labelle providers fetch") and has(generic, migration_guide_url));
+}
+
+test "provider targets: the namespace diagnostic names a candidate only on a hit, from the project's one document" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const has = struct {
+        fn f(text: []const u8, needle: []const u8) bool {
+            return std.mem.indexOf(u8, text, needle) != null;
+        }
+    }.f;
+    const source = "https://example.test/fork/providers.json";
+    const hit = try noProviderDiagnostic(a, .{ .namespace = "probe" }, .{ .hit = .{ .package = "fixture", .repo = "owner/fixture", .version = "2.0.0", .registry = source } });
+    try std.testing.expect(std.mem.startsWith(u8, hit, "labelle: no provider for namespace 'probe' in this project; add and pin the package that declares namespace 'probe'\n  (registry: fixture)\n"));
+    try std.testing.expect(has(hit, "The registry this project last accepted from lists package 'fixture' as the provider of namespace 'probe'."));
+    try std.testing.expect(has(hit, "Its newest release that declares the namespace, 2.0.0, is a candidate"));
+    try std.testing.expect(has(hit, "\n    " ++ source ++ "\n") and !has(hit, "compatible") and !has(hit, "target"));
+    // Mechanism: outside a project nothing is looked up, and in a unit test
+    // the lookup is offline with no record, so both are the plain error.
+    try std.testing.expect(namespaceDiagnostic(a, null, "probe") == null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", a);
+    try std.testing.expect(namespaceDiagnostic(a, root, "probe") == null);
 }
