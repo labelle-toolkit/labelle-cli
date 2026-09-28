@@ -230,7 +230,11 @@ fn stripPrefix(run: []const u8) ?[]const u8 {
 /// (or `get|i|Os|Config`, which the tokenizer's joins read back as `iOs`).
 /// An `i` ending a word before another acronym (`apiSDLConfig`) is not split
 /// off. That `i` is the only lowercase letter that starts a piece; every
-/// other piece starts at an uppercase one.
+/// other piece starts at an uppercase one. Deliberately strict: a word
+/// ending in `i` before a generic `OS` (`multiOSConfig`) spells the same
+/// letters as `getiOSConfig` and is read as `iOS` too. The guard cannot tell
+/// the two apart, and a false finding is cheaper than a missed platform name;
+/// write such a name another way (`multi_os_config`, `MultiOperatingSystem`).
 fn splitsBefore(text: []const u8, start: usize, i: usize) bool {
     const prev = text[i - 1];
     const cur = text[i];
@@ -416,6 +420,9 @@ test "the tokenizer keeps lowercase-leading acronyms whole" {
     // Only `iOS` keeps a one-letter prefix; other acronyms keep their own piece.
     try expectWords("apiSDLConfig taxiWASM xSDLConfig pWGPUDevice iSDLPath", &.{ "sdl", "wasm", "sdl", "wgpu", "sdl" });
     try expectWords("apiURL multiIO", &.{});
+    // Deliberately strict: a word ending in `i` before `OS` reads as `iOS`.
+    try expectWords("multiOSConfig", &.{"ios"});
+    try expectWords("multi_os_config MultiOperatingSystem", &.{});
     // Neither an all-lowercase run nor a capitalised `Io` is the platform.
     try expectWords("iostream std.Io IoReader Io", &.{});
     // Host OS names keep passing under the whole-run rule too.
