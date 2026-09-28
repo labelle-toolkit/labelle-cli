@@ -101,21 +101,5 @@ pub fn getPackagesDir(allocator: std.mem.Allocator) ![]const u8 {
     return try std.fs.path.join(allocator, &.{ cache_root, PACKAGES_SUBDIR });
 }
 
-/// Resolve a remote (non-local) plugin to its cached directory:
-/// `<cache-root>/packages/plugins/<repo>/<version>`. Caller owns the
-/// returned slice.
-///
-/// Mirrors the remote branch of the assembler's `cache.zig:resolvePlugin`
-/// — the path the assembler resolves a `.plugins` entry to once it has
-/// been fetched into the cache by `labelle install`. Local plugins are
-/// resolved by the caller directly from their `local:` / `@` path, so
-/// this helper only covers the remote case.
-pub fn resolveRemotePluginDir(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    version: []const u8,
-) ![]const u8 {
-    const packages_dir = try getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", repo, version });
-}
+// A remote plugin's directory (`.subdir` pins, `install plugin` overrides)
+// is resolved by `plugin_slot.zig:resolveRemotePlugin`.
