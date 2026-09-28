@@ -304,7 +304,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const effective_optimize = optimize_mod.effective(
         parsed_args.optimize_override,
         optimize_mod.ownerDefault(providers, target.name),
-        null,
     ).mode;
 
     // A path that cannot carry a provider's environment contribution or its
