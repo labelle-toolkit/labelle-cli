@@ -188,6 +188,8 @@ pub fn reportUnknownCommand(a: std.mem.Allocator, root: ?[]const u8, word: []con
 }
 
 fn namespaceDiagnostic(a: std.mem.Allocator, root: ?[]const u8, word: []const u8) ?[]const u8 {
+    // Only an identifier can be a namespace: `--bogus` is never looked up.
+    if (!contract.identifier(word)) return null;
     const r = root orelse return null;
     const declaration: registry.Declaration = .{ .namespace = word };
     const lookup = github.lookupRegistryOwner(a, r, declaration);
@@ -412,4 +414,5 @@ test "provider targets: the namespace diagnostic names a candidate only on a hit
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", a);
     try std.testing.expect(namespaceDiagnostic(a, root, "probe") == null);
+    try std.testing.expect(!contract.identifier("--bogus") and namespaceDiagnostic(a, root, "--bogus") == null);
 }
