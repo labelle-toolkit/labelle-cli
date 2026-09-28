@@ -85,18 +85,34 @@ pub const PluginDep = struct {
     name: []const u8,
     repo: []const u8 = "",
     version: []const u8 = "",
+    /// Directory inside the fetched `.repo` archive that holds the plugin
+    /// (assembler#771), e.g. `"plugins/debug"` for the assembler's debug
+    /// overlay. Empty = the repo root. See `plugin_slot.zig`.
+    subdir: []const u8 = "",
     /// Game states this plugin runs in. Empty = all states (plugin default).
     states: []const []const u8 = &.{},
+    /// NOT authorable (the assembler's strict parse rejects it): set after
+    /// parsing by `plugin_slot.applyOverrides` to the checkout an active
+    /// `labelle install plugin <name> local:<path>` override names
+    /// (assembler#772). While set, the dep IS local to every CLI consumer —
+    /// provider discovery, watch roots, atlases, manifests — exactly as the
+    /// assembler builds it; `repo`/`version` keep the committed pin, which
+    /// is what `labelle.lock` records.
+    cli_override_source: ?[]const u8 = null,
 
     /// Returns true if this plugin uses a local path.
-    /// Supports `local:../path` (relative to project) and `@libs/path`.
+    /// Supports `local:../path` (relative to project) and `@libs/path`,
+    /// and a remote pin with an active local override.
     pub fn isLocal(self: PluginDep) bool {
-        return std.mem.startsWith(u8, self.repo, "local:") or
+        return self.cli_override_source != null or
+            std.mem.startsWith(u8, self.repo, "local:") or
             std.mem.startsWith(u8, self.repo, "@");
     }
 
-    /// Returns the local path portion of the repo string.
+    /// Returns the local path portion of the repo string (or the absolute
+    /// override checkout).
     pub fn localPath(self: PluginDep) []const u8 {
+        if (self.cli_override_source) |source| return source;
         if (std.mem.startsWith(u8, self.repo, "local:"))
             return self.repo["local:".len..];
         if (std.mem.startsWith(u8, self.repo, "@"))

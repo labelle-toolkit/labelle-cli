@@ -85,7 +85,7 @@ one target, in two halves, before anything is generated, locked or built:
      document (`curl`, 3 s connect / 5 s total), parsed and queried by
      target. This is registry metadata only
      ([contract §4](provider-contract-v1.md)): nothing is pinned, cached,
-     extracted or run. The download is never written to the registry cache.
+     extracted or run. The download is never written anywhere.
    - **The release suggested** is the owner's newest release whose own
      record declares the target (the ownership table is the union of a
      package's releases, so the newest release may have dropped it). It is a
@@ -110,8 +110,8 @@ one target, in two halves, before anything is generated, locked or built:
      verify`.
 
    Missing information only makes the hint less specific; it never changes
-   which source the hint recommends. The global registry cache (which any
-   project's accept may have written) is never read for this hint, and no
+   which source the hint recommends. No global registry cache exists (CLI
+   3.0 removed it: any project's accept could have written it, #465), and no
    archive is scanned. The lookup never changes how the command fails: same
    first line, same exit status, same `failed` progress record, and nothing
    generated.
@@ -315,10 +315,15 @@ with Flying Platform as the worked example, is
   reserved word any more ([migrating to 3.0](migrating-to-3.0.md)).
 - `labelle android …` is no built-in any more (cli#405): it is the `android`
   provider's namespace. Without that package pinned, `labelle android` is an
-  unknown command — or, when the cached registry names the package that
-  declares the namespace, `labelle: no provider for namespace 'android' in
-  this project; add and pin the package that declares namespace 'android'`
-  with a `(registry: <package>)` line. `labelle android doctor` therefore
+  unknown command — or, inside a project, when the one document the target
+  hint reads (the project's verified custom source, else the public
+  registry; see [resolution](#resolution)) names the package that declares
+  the namespace, `labelle: no provider for namespace 'android' in this
+  project; add and pin the package that declares namespace 'android'` with a
+  `(registry: <package>)` line, a candidate release and the same steps as
+  the target hint. Any miss (offline, schema 1, not listed, a record that
+  does not verify) is the plain unknown-command error, since the word is as
+  likely a typo (#465). `labelle android doctor` therefore
   runs inside a project that pins the package; the projectless form is gone.
   The CLI's own packaging on `labelle build --platform=android`, the
   `.android` block it used to read (still accepted, and ignored, by the
@@ -340,9 +345,9 @@ public schema-2 hit naming the newest release that still declares the target,
 not listed, schema 1, unreachable, unparseable, oversize, offline with no
 fetch, a verified custom record answered from its document with no fetch, and
 records that do not verify answered generically with no public fetch, each
-asserting which URLs the fetcher was asked for), `Registry.latestDeclaring`,
-`provider_github.cachedRegistryNamespaceOwner`
-(schema 2 only), the `NoRunReplacement` decision table
+asserting which URLs the fetcher was asked for, and the same for a
+namespace), `Registry.latestDeclaring` (by target and by namespace), the
+namespace diagnostic, the `NoRunReplacement` decision table
 (`pipeline/install.zig`), `provider_registry` (schema-2 parsing, ownership
 conflicts, lookup by target and namespace), `provider_dispatch.discoverAll` (the
 unresolved packages of a partial view), the reserved-device-name rule
@@ -377,8 +382,10 @@ each failing exactly as the hermetic runs do. Every other run sets
 `LABELLE_OFFLINE=1`, so no suite touches the network. CI runs it on Windows,
 macOS and Linux. `test/provider_android_like_e2e.py` drives an
 android-shaped fixture package the same way (no NDK): the no-provider
-diagnostic staying generic offline even with a cached registry, and the
-no-namespace diagnostic with and without that cached hint, the
+and no-namespace diagnostics staying generic offline with nothing
+recorded and with another project's document in the old global registry
+cache, and naming the package, candidate and source from the project's own
+verified accepted-source record, the
 assembler receiving `--platform android`, the after-build hook seeing the
 built library and the target dir, the run replacement receiving `run.env`
 with no host launch, `NoRunReplacement` before any build, `labelle android

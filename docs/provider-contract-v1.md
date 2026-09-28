@@ -370,10 +370,11 @@ which the CLI's `src/cli/provider_registry.zig` reads alongside schema 1:
   or from the document the project's accept of a custom source recorded
   (see [provider targets](provider-targets.md#resolution)); a schema-1
   document names no owner there. The unknown-namespace diagnostic reads the
-  cached registry the last `--accept` used. That cache holds the normalised
-  document bound to the accepted preview, so its bytes hash to the preview's
-  registry digest; a later fetch nobody reviewed never reaches it. Projectless
-  bootstrap (phase 5) uses the same table for namespaces.
+  same one document, looked up by namespace (#465); no global registry cache
+  is kept or read. The recorded document is the normalised one bound to the
+  accepted preview, so its bytes hash to the preview's registry digest; a
+  later fetch nobody reviewed never reaches it. Projectless bootstrap
+  (phase 5) uses the same table for namespaces.
 - **The claims are checked, not trusted.** `labelle providers resolve --accept`
   compares every release it pins against that release's verified manifest.
   Any difference in namespace or target set fails with

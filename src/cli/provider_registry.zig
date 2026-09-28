@@ -38,6 +38,31 @@ pub const Record = struct {
     pub fn pin(self: Record) github.Pin {
         return .{ .package = self.package, .repo = self.repo, .version = self.version, .commit = self.commit, .sha256 = self.sha256 };
     }
+
+    /// This release's OWN record declares `declaration`.
+    pub fn declares(self: Record, declaration: Declaration) bool {
+        switch (declaration) {
+            .namespace => |ns| return self.namespace != null and std.mem.eql(u8, self.namespace.?, ns),
+            .target => |target| {
+                for (self.targets) |t| if (std.mem.eql(u8, t, target)) return true;
+                return false;
+            },
+        }
+    }
+};
+
+/// A name a release declares that the CLI may have to look up an owner
+/// for: a build target (`--platform=<t>`) or a command namespace
+/// (`labelle <namespace> ...`).
+pub const Declaration = union(enum) {
+    target: []const u8,
+    namespace: []const u8,
+
+    pub fn name(self: Declaration) []const u8 {
+        return switch (self) {
+            inline else => |value| value,
+        };
+    }
 };
 
 /// One default package: an exact release, never a bare name or a range, so
@@ -79,6 +104,14 @@ pub const Registry = struct {
         return null;
     }
 
+    /// The package whose releases declare `declaration`, or null.
+    pub fn owner(self: Registry, declaration: Declaration) ?[]const u8 {
+        return switch (declaration) {
+            .target => |target| self.targetOwner(target),
+            .namespace => |ns| self.namespaceOwner(ns),
+        };
+    }
+
     /// The exact records the default list names, in its order: what a
     /// consent prompt presents before anything is pinned or run.
     pub fn defaultPins(self: Registry, a: std.mem.Allocator) ![]const github.Pin {
@@ -87,19 +120,16 @@ pub const Registry = struct {
         return pins;
     }
 
-    /// The newest release of `package` whose OWN record declares `target`,
-    /// or null. The ownership table is the union of a package's releases, so
-    /// the package's newest release may have dropped a target an older one
-    /// declares; a suggestion must name a release that still provides it.
-    /// Schema 2 only (schema-1 records declare nothing).
-    pub fn latestDeclaring(self: Registry, package: []const u8, target: []const u8) ?Record {
+    /// The newest release of `package` whose OWN record declares
+    /// `declaration`, or null. The ownership table is the union of a
+    /// package's releases, so the package's newest release may have dropped
+    /// a target or namespace an older one declares; a suggestion must name a
+    /// release that still provides it. Schema 2 only (schema-1 records
+    /// declare nothing).
+    pub fn latestDeclaring(self: Registry, package: []const u8, declaration: Declaration) ?Record {
         var best: ?Record = null;
         for (self.records) |record| {
-            if (!std.mem.eql(u8, record.package, package)) continue;
-            const declares = for (record.targets) |t| {
-                if (std.mem.eql(u8, t, target)) break true;
-            } else false;
-            if (!declares) continue;
+            if (!std.mem.eql(u8, record.package, package) or !record.declares(declaration)) continue;
             if (best == null or releaseNewer(record.version, best.?.version)) best = record;
         }
         return best;
@@ -315,9 +345,9 @@ test "provider registry: the suggested release is the newest one in semver order
     const doc = try parse(a, "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++
         testRecord("fixture", "0.9.0", "null", "\"t\"") ++ "," ++ testRecord("fixture", "0.10.0", "null", "\"t\"") ++ "," ++
         testRecord("fixture", "0.2.1", "null", "\"t\"") ++ "," ++ testRecord("other", "9.0.0", "null", "\"u\"") ++ "]}");
-    try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", "t").?.version);
-    try std.testing.expectEqualStrings("9.0.0", doc.latestDeclaring("other", "u").?.version);
-    try std.testing.expect(doc.latestDeclaring("absent", "t") == null);
+    try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", .{ .target = "t" }).?.version);
+    try std.testing.expectEqualStrings("9.0.0", doc.latestDeclaring("other", .{ .target = "u" }).?.version);
+    try std.testing.expect(doc.latestDeclaring("absent", .{ .target = "t" }) == null);
 }
 
 test "provider registry: the suggested release for a target is the newest one that still declares it" {
@@ -329,10 +359,27 @@ test "provider registry: the suggested release for a target is the newest one th
         testRecord("fixture", "0.2.0", "null", "\"probe-target\"") ++ "," ++ testRecord("fixture", "0.9.0", "null", "\"probe-target\"") ++ "," ++
         testRecord("fixture", "0.10.0", "null", "\"second-target\"") ++ "]}");
     try std.testing.expectEqualStrings("fixture", doc.targetOwner("probe-target").?);
-    try std.testing.expectEqualStrings("0.9.0", doc.latestDeclaring("fixture", "probe-target").?.version);
-    try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", "second-target").?.version);
-    try std.testing.expect(doc.latestDeclaring("fixture", "absent-target") == null);
-    try std.testing.expect(doc.latestDeclaring("absent", "probe-target") == null);
+    try std.testing.expectEqualStrings("0.9.0", doc.latestDeclaring("fixture", .{ .target = "probe-target" }).?.version);
+    try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", .{ .target = "second-target" }).?.version);
+    try std.testing.expect(doc.latestDeclaring("fixture", .{ .target = "absent-target" }) == null);
+    try std.testing.expect(doc.latestDeclaring("absent", .{ .target = "probe-target" }) == null);
+}
+
+test "provider registry: the suggested release for a namespace is the newest one that still declares it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 0.10.0 dropped the `probe` namespace; the union table still names `fixture`.
+    const doc = try parse(a, "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++
+        testRecord("fixture", "0.2.0", "\"probe\"", "") ++ "," ++ testRecord("fixture", "0.9.0", "\"probe\"", "\"probe-target\"") ++ "," ++
+        testRecord("fixture", "0.10.0", "null", "\"probe-target\"") ++ "]}");
+    try std.testing.expectEqualStrings("fixture", doc.owner(.{ .namespace = "probe" }).?);
+    try std.testing.expectEqualStrings("0.9.0", doc.latestDeclaring("fixture", .{ .namespace = "probe" }).?.version);
+    try std.testing.expectEqualStrings("0.10.0", doc.latestDeclaring("fixture", .{ .target = "probe-target" }).?.version);
+    // A target is not a namespace, and the reverse.
+    try std.testing.expect(doc.owner(.{ .namespace = "probe-target" }) == null);
+    try std.testing.expect(doc.owner(.{ .target = "probe" }) == null);
+    try std.testing.expect(doc.latestDeclaring("fixture", .{ .namespace = "absent" }) == null);
 }
 
 test "provider registry: a pinned release must declare exactly what its record claims" {

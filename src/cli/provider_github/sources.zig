@@ -101,6 +101,14 @@ pub const Sources = struct {
         const doc = try parse(self.a, bytes, true);
         for (doc.providers) |pin| {
             if (!std.mem.eql(u8, pin.package, dep.name)) continue;
+            // An integrity pin names a whole-archive provider; a `.subdir`
+            // pin (assembler#771) would have its manifest one level down,
+            // which pin verification does not model yet. Refuse loudly
+            // rather than read the wrong directory.
+            if (dep.subdir.len > 0) {
+                std.debug.print("labelle: provider '{s}' is pinned in {s} but declares `.subdir = \"{s}\"`; integrity-pinned providers do not support `.subdir` yet\n", .{ dep.name, lock_name, dep.subdir });
+                return error.ProviderSubdirUnsupported;
+            }
             if (!pin.matches(dep)) {
                 _ = pin_mod.projectRepo(dep.repo) catch |err| {
                     if (err == error.NonGitHubProviderRepository) pin_mod.reportNonGitHub(dep);

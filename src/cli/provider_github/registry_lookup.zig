@@ -1,16 +1,17 @@
 //! The registry download, and the best-effort owner lookup behind the
-//! no-provider diagnostic.
+//! no-provider diagnostics (a target, or a command namespace).
 //!
 //! `labelle providers resolve` fetches the registry document to preview and
-//! pin releases. The no-provider diagnostic reads a registry document for a
-//! different, weaker purpose: to NAME the package that declares a target the
-//! project has no provider for, and a candidate release, so the error can
-//! say what to add to `.plugins`. That is registry metadata only (contract
+//! pin releases. The no-provider diagnostics read a registry document for a
+//! different, weaker purpose: to NAME the package that declares a target or
+//! namespace the project has no provider for, and a candidate release, so
+//! the error can say what to add to `.plugins`. That is registry metadata only (contract
 //! §4): nothing is pinned, cached, extracted or run, and the answer is a
 //! suggestion the user still has to add, resolve and accept.
 //!
 //! The hint is advisory and deliberately simple (#459). Only a schema-2
-//! document names an owner, and only one document is read:
+//! document names an owner, and only one document is read, the same one for
+//! a target and for a namespace (#465):
 //!
 //! - the project last accepted from a custom source: the copy of that
 //!   source's document recorded with it, read and verified as one snapshot;
@@ -139,7 +140,7 @@ pub fn readAccepted(a: std.mem.Allocator, root: []const u8) AcceptedRecord {
     return .{ .verified = record };
 }
 
-/// The owner a schema-2 document names for a target, and the release to
+/// The owner a schema-2 document names for a target or namespace, and the release to
 /// suggest: a candidate, whose compatibility with this CLI only
 /// `providers resolve --accept` checks (the registry has no contract data, #456).
 pub const OwnerHint = struct {
@@ -147,7 +148,7 @@ pub const OwnerHint = struct {
     /// `<owner>/<name>` (the registry's form; `.plugins` takes it with a
     /// `github.com/` prefix).
     repo: []const u8,
-    /// The newest release whose own record declares the target.
+    /// The newest release whose own record declares the target or namespace.
     version: []const u8,
     /// The project's verified custom source; null for the public registry.
     registry: ?[]const u8 = null,
@@ -160,7 +161,7 @@ pub const Reason = enum {
     unreachable_registry,
     /// A schema-1 document: it publishes no target owners.
     no_owner_table,
-    /// A schema-2 document lists no package for the target.
+    /// A schema-2 document lists no package for the target or namespace.
     not_listed,
     /// The project's accepted-source record does not verify, so its source
     /// is unknown (and the public registry is not asked in its place).
@@ -180,15 +181,15 @@ pub const Lookup = union(enum) {
     miss: Miss,
 };
 
-/// The answer a parsed document gives for `target`: only a schema-2
+/// The answer a parsed document gives for `declaration`: only a schema-2
 /// document names an owner, with the newest release whose own record
-/// declares the target (the ownership table is the union of a package's
-/// releases, so its newest release may have dropped it).
-pub fn ownerIn(doc: registry.Registry, target: []const u8, from: ?[]const u8) Lookup {
+/// declares it (the ownership table is the union of a package's releases,
+/// so its newest release may have dropped it).
+pub fn ownerIn(doc: registry.Registry, declaration: registry.Declaration, from: ?[]const u8) Lookup {
     const custom = from != null;
     if (!doc.claimsOwnership()) return .{ .miss = .{ .reason = .no_owner_table, .custom = custom } };
-    const package = doc.targetOwner(target) orelse return .{ .miss = .{ .reason = .not_listed, .custom = custom } };
-    const record = doc.latestDeclaring(package, target) orelse return .{ .miss = .{ .reason = .not_listed, .custom = custom } };
+    const package = doc.owner(declaration) orelse return .{ .miss = .{ .reason = .not_listed, .custom = custom } };
+    const record = doc.latestDeclaring(package, declaration) orelse return .{ .miss = .{ .reason = .not_listed, .custom = custom } };
     return .{ .hit = .{ .package = package, .repo = record.repo, .version = record.version, .registry = from } };
 }
 
@@ -199,7 +200,7 @@ fn fetchLive(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
     return download(a, url, Limits.hint);
 }
 
-/// The best-effort lookup behind the no-provider diagnostic. Never an error.
+/// The best-effort lookup behind the no-provider diagnostics. Never an error.
 ///
 /// - A verified record of a custom source: that source's recorded document
 ///   answers. Nothing is downloaded.
@@ -207,28 +208,28 @@ fn fetchLive(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
 ///   source, so the public registry is not asked in its place.
 /// - No record, or a record of the public registry: one download of the
 ///   public registry, unless offline.
-pub fn lookupOwner(a: std.mem.Allocator, root: ?[]const u8, target: []const u8, offline: bool, fetch: Fetcher) Lookup {
+pub fn lookupOwner(a: std.mem.Allocator, root: ?[]const u8, declaration: registry.Declaration, offline: bool, fetch: Fetcher) Lookup {
     if (root) |r| switch (readAccepted(a, r)) {
         .none => {},
         .unverified => return .{ .miss = .{ .reason = .unverified_source } },
         .verified => |record| if (!std.mem.eql(u8, record.source, registry_url)) {
             const doc = registry.parse(a, record.document) catch return .{ .miss = .{ .reason = .unverified_source } };
-            return ownerIn(doc, target, record.source);
+            return ownerIn(doc, declaration, record.source);
         },
     };
     if (offline) return .{ .miss = .{ .reason = .offline } };
     const bytes = fetch(a, registry_url) catch return .{ .miss = .{ .reason = .unreachable_registry } };
     if (bytes.len > max_document_bytes) return .{ .miss = .{ .reason = .unreachable_registry } };
     const doc = registry.parse(a, bytes) catch return .{ .miss = .{ .reason = .unreachable_registry } };
-    return ownerIn(doc, target, null);
+    return ownerIn(doc, declaration, null);
 }
 
 /// `lookupOwner` with the real download and `LABELLE_OFFLINE` from the
 /// environment. Unit tests never reach the network: a test binary that ends
 /// up here (a pipeline test hitting the no-provider path) is offline; the
 /// lookup itself is tested through `lookupOwner` with stand-in fetchers.
-pub fn lookupOwnerFromEnv(a: std.mem.Allocator, root: ?[]const u8, target: []const u8) Lookup {
-    return lookupOwner(a, root, target, builtin.is_test or offlineRequested(a), fetchLive);
+pub fn lookupOwnerFromEnv(a: std.mem.Allocator, root: ?[]const u8, declaration: registry.Declaration) Lookup {
+    return lookupOwner(a, root, declaration, builtin.is_test or offlineRequested(a), fetchLive);
 }
 
 /// True when `LABELLE_OFFLINE` is set to anything but empty or `0`.
@@ -240,7 +241,6 @@ pub fn offlineRequested(a: std.mem.Allocator) bool {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const AcceptFixture = @import("test_fixtures.zig").AcceptFixture;
-const registry_cache = @import("registry_cache.zig");
 
 const commit_a = "1" ** 40;
 const hash_a = "a" ** 64;
@@ -308,7 +308,7 @@ test "provider registry lookup: a public schema-2 hit names the owner and its ne
     var fx = try AcceptFixture.init(a);
     defer fx.deinit();
     fetch_calls = 0;
-    const hint = lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit;
+    const hint = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit;
     try std.testing.expectEqual(@as(usize, 1), fetch_calls);
     try std.testing.expectEqualStrings(registry_url, fetched[0]);
     try std.testing.expectEqualStrings("fixture", hint.package);
@@ -317,9 +317,9 @@ test "provider registry lookup: a public schema-2 hit names the owner and its ne
     // candidate is the newest release that still declares it.
     try std.testing.expectEqualStrings("0.10.0", hint.version);
     try std.testing.expect(hint.registry == null);
-    try std.testing.expectEqualStrings("0.11.0", lookupOwner(a, fx.root, "later-target", false, fetchLiveDoc).hit.version);
+    try std.testing.expectEqualStrings("0.11.0", lookupOwner(a, fx.root, .{ .target = "later-target" }, false, fetchLiveDoc).hit.version);
     // The registry was reached and lists nobody for this target.
-    const miss = lookupOwner(a, fx.root, "absent-target", false, fetchLiveDoc).miss;
+    const miss = lookupOwner(a, fx.root, .{ .target = "absent-target" }, false, fetchLiveDoc).miss;
     try std.testing.expectEqual(Reason.not_listed, miss.reason);
     try std.testing.expect(!miss.custom);
     try std.testing.expectEqual(@as(usize, 3), fetch_calls);
@@ -330,7 +330,7 @@ test "provider registry lookup: a schema-1 document names no owner" {
     defer arena.deinit();
     const a = arena.allocator();
     fetch_calls = 0;
-    try std.testing.expectEqual(Reason.no_owner_table, lookupOwner(a, null, "probe-target", false, fetchSchemaOne).miss.reason);
+    try std.testing.expectEqual(Reason.no_owner_table, lookupOwner(a, null, .{ .target = "probe-target" }, false, fetchSchemaOne).miss.reason);
     try std.testing.expectEqual(@as(usize, 1), fetch_calls);
 }
 
@@ -340,21 +340,19 @@ test "provider registry lookup: offline never fetches; a failed, unparseable or 
     const a = arena.allocator();
     var fx = try AcceptFixture.init(a);
     defer fx.deinit();
-    // Offline: the fetcher is not called at all (it would have answered),
-    // and no cached document answers in its place.
-    try registry_cache.cacheRegistry(a, try AcceptFixture.schemaTwo(a, fx.pin, "\"probe\"", "\"probe-target\""));
+    // Offline: the fetcher is not called at all (it would have answered).
     fetch_calls = 0;
-    try std.testing.expectEqual(Reason.offline, lookupOwner(a, fx.root, "probe-target", true, fetchLiveDoc).miss.reason);
+    try std.testing.expectEqual(Reason.offline, lookupOwner(a, fx.root, .{ .target = "probe-target" }, true, fetchLiveDoc).miss.reason);
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
-    try std.testing.expectEqual(Reason.unreachable_registry, lookupOwner(a, fx.root, "probe-target", false, fetchFails).miss.reason);
-    try std.testing.expectEqual(Reason.unreachable_registry, lookupOwner(a, null, "probe-target", false, fetchGarbage).miss.reason);
+    try std.testing.expectEqual(Reason.unreachable_registry, lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchFails).miss.reason);
+    try std.testing.expectEqual(Reason.unreachable_registry, lookupOwner(a, null, .{ .target = "probe-target" }, false, fetchGarbage).miss.reason);
     try std.testing.expectEqual(@as(usize, 2), fetch_calls);
     // The cap holds whatever the fetcher returns: the same valid document
     // answers at exactly 1 MiB and is refused one byte past it.
     padded_len = max_document_bytes;
-    try std.testing.expectEqualStrings("0.10.0", lookupOwner(a, null, "probe-target", false, fetchPadded).hit.version);
+    try std.testing.expectEqualStrings("0.10.0", lookupOwner(a, null, .{ .target = "probe-target" }, false, fetchPadded).hit.version);
     padded_len = max_document_bytes + 1;
-    try std.testing.expectEqual(Reason.unreachable_registry, lookupOwner(a, null, "probe-target", false, fetchPadded).miss.reason);
+    try std.testing.expectEqual(Reason.unreachable_registry, lookupOwner(a, null, .{ .target = "probe-target" }, false, fetchPadded).miss.reason);
 }
 
 test "provider registry lookup: the download capture is capped in the CLI, not only by curl" {
@@ -387,7 +385,7 @@ test "provider registry lookup: a verified custom source answers from its record
     // there, and the public registry (which would say `fixture` 0.10.0) is
     // never asked.
     fetch_calls = 0;
-    const miss = lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).miss;
+    const miss = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss;
     try std.testing.expectEqual(Reason.not_listed, miss.reason);
     try std.testing.expect(miss.custom);
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
@@ -395,21 +393,21 @@ test "provider registry lookup: a verified custom source answers from its record
     // names the source; nothing is downloaded, not even from that URL.
     const fork = "https://example.test/fork registry/%20b%/providers.json";
     try recordAccepted(a, fx.root, fork, custom_doc);
-    const hint = lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit;
+    const hint = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit;
     try std.testing.expectEqualStrings("custom-owner", hint.package);
     try std.testing.expectEqualStrings("2.0.0", hint.version);
     try std.testing.expectEqualStrings(fork, hint.registry.?);
-    try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, "later-target", true, fetchLiveDoc).miss.reason);
+    try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, .{ .target = "later-target" }, true, fetchLiveDoc).miss.reason);
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
     // A recorded schema-1 custom document names nobody, still without a fetch.
     try recordAccepted(a, fx.root, fork, "{\"schema_version\":1,\"providers\":[]}");
-    const one = lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).miss;
+    const one = lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss;
     try std.testing.expectEqual(Reason.no_owner_table, one.reason);
     try std.testing.expect(one.custom);
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
     // A record of the public registry is the public path: one download.
     try recordAccepted(a, fx.root, registry_url, custom_doc);
-    try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit.package);
+    try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
     try std.testing.expectEqual(@as(usize, 1), fetch_calls);
 }
 
@@ -444,17 +442,69 @@ test "provider registry lookup: a record that does not verify is a generic miss 
         try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
         try std.testing.expect(readAccepted(a, fx.root) == .unverified);
         // Online, the public registry would answer: it is not asked.
-        try std.testing.expectEqual(Reason.unverified_source, lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).miss.reason);
+        try std.testing.expectEqual(Reason.unverified_source, lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).miss.reason);
     }
     try std.testing.expectEqual(@as(usize, 0), fetch_calls);
     // Control: the intact record answers from its document; with no record
     // at all the public registry is asked.
     try cwd.writeFile(io, .{ .sub_path = path, .data = good });
-    try std.testing.expectEqualStrings("custom-owner", lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit.package);
+    try std.testing.expectEqualStrings("custom-owner", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
     try cwd.deleteFile(io, path);
     try std.testing.expect(readAccepted(a, fx.root) == .none);
-    try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, "probe-target", false, fetchLiveDoc).hit.package);
+    try std.testing.expectEqualStrings("fixture", lookupOwner(a, fx.root, .{ .target = "probe-target" }, false, fetchLiveDoc).hit.package);
     try std.testing.expectEqual(@as(usize, 1), fetch_calls);
+}
+
+fn namespaced(comptime package: []const u8, comptime version: []const u8, comptime namespace: []const u8) []const u8 {
+    return "{\"package\":\"" ++ package ++ "\",\"repo\":\"owner/" ++ package ++ "\",\"version\":\"" ++ version ++
+        "\",\"commit\":\"" ++ commit_a ++ "\",\"sha256\":\"" ++ hash_a ++ "\",\"namespace\":" ++ namespace ++ ",\"targets\":[]}";
+}
+
+const public_ns_doc = "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++
+    namespaced("public-owner", "1.0.0", "\"probe\"") ++ "," ++ namespaced("public-owner", "1.2.0", "\"probe\"") ++ "," ++
+    namespaced("public-owner", "1.3.0", "null") ++ "]}";
+
+const custom_ns_doc = "{\"schema_version\":2,\"defaults\":[],\"providers\":[" ++ namespaced("custom-owner", "2.0.0", "\"probe\"") ++ "]}";
+
+fn fetchPublicNs(a: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
+    note(url);
+    return a.dupe(u8, public_ns_doc);
+}
+
+test "provider registry lookup: a namespace is answered by the same one document as a target, never another project's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try AcceptFixture.init(a);
+    defer fx.deinit();
+    // No record: one public download names the owner and its newest release
+    // that still declares the namespace (1.3.0 dropped it).
+    fetch_calls = 0;
+    const public = lookupOwner(a, fx.root, .{ .namespace = "probe" }, false, fetchPublicNs).hit;
+    try std.testing.expectEqualStrings("public-owner", public.package);
+    try std.testing.expectEqualStrings("1.2.0", public.version);
+    try std.testing.expect(public.registry == null);
+    try std.testing.expectEqual(@as(usize, 1), fetch_calls);
+    try std.testing.expectEqualStrings(registry_url, fetched[0]);
+    try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, .{ .namespace = "other" }, false, fetchPublicNs).miss.reason);
+    // Offline and no record: nothing is read, so nothing is named.
+    try std.testing.expectEqual(Reason.offline, lookupOwner(a, fx.root, .{ .namespace = "probe" }, true, fetchPublicNs).miss.reason);
+    try std.testing.expectEqual(@as(usize, 2), fetch_calls);
+    // A verified custom record answers from its document, with no fetch.
+    const fork = "https://example.test/fork/providers.json";
+    try recordAccepted(a, fx.root, fork, custom_ns_doc);
+    const custom = lookupOwner(a, fx.root, .{ .namespace = "probe" }, false, fetchPublicNs).hit;
+    try std.testing.expectEqualStrings("custom-owner", custom.package);
+    try std.testing.expectEqualStrings("2.0.0", custom.version);
+    try std.testing.expectEqualStrings(fork, custom.registry.?);
+    // A target is not a namespace: the same document lists no target owner.
+    try std.testing.expectEqual(Reason.not_listed, lookupOwner(a, fx.root, .{ .target = "probe" }, false, fetchPublicNs).miss.reason);
+    try std.testing.expectEqual(@as(usize, 2), fetch_calls);
+    // A record that does not verify: generic, and the public registry is not asked.
+    const path = try std.fs.path.join(a, &.{ fx.root, accepted_name });
+    try std.Io.Dir.cwd().writeFile(config.globalIo(), .{ .sub_path = path, .data = "{ truncated" });
+    try std.testing.expectEqual(Reason.unverified_source, lookupOwner(a, fx.root, .{ .namespace = "probe" }, false, fetchPublicNs).miss.reason);
+    try std.testing.expectEqual(@as(usize, 2), fetch_calls);
 }
 
 test "provider registry lookup: the resolve and hint limits stay distinct and the url is the resolve default" {
