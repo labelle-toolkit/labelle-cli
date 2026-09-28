@@ -90,6 +90,7 @@ const Harness = struct {
             .optimize = .Debug,
             .progress = .off,
             .reporter = null,
+            .final_step = .build,
             .host = .{ .zig = "/z", .cache_root = self.root, .global_cache = self.root, .packages = self.root },
             .run_tool = Spy.run,
         };

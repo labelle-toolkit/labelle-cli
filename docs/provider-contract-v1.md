@@ -6,7 +6,7 @@ Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
 do not weaken the normative contract below; full phase-2 acceptance is pending.
 
-This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.3.0` and still speaks `1.2.0`, `1.1.0` and `1.0.0`, and every context carries the negotiated version.
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.4.0` and still speaks `1.3.0`, `1.2.0`, `1.1.0` and `1.0.0`, and every context carries the negotiated version.
 
 ## 1. Package declarations and installed tools
 
@@ -50,7 +50,7 @@ Every field below is required on the wires that define it, except the optional `
 
 | Field | Type / rule |
 | --- | --- |
-| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"`, `"1.2.0"` or `"1.3.0"` for this decoder |
+| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"`, `"1.2.0"`, `"1.3.0"` or `"1.4.0"` for this decoder |
 | `invocation` | Object containing `kind`, `id`, `step`, `phase` |
 | `invocation.kind` | `"command"` or `"hook"` |
 | `invocation.id` | Command name or hook ID |
@@ -69,6 +69,7 @@ Every field below is required on the wires that define it, except the optional `
 | `run` | **Optional**, **wire `1.2.0`+**: present on every `run`-step hook context (any phase) and absent (never null) everywhere else. An object with the required keys `env`, `args` and `timeout_ms`, plus `watch` from wire `1.3.0` (see below) |
 | `cache_dir` | **Wire `1.3.0`+, required there, never null**: the provider's persistent cache directory, on every context (commands and hooks). See [Provider cache](#provider-cache). The key doesn't exist below `1.3.0` |
 | `env_file` | **Wire `1.3.0`+, required there**: on a `before generate`, `after generate` or `before build` hook, an absolute path the hook may write its environment contribution to; null on every other hook and on commands. See [Environment contributions](#environment-contributions). The key doesn't exist below `1.3.0` |
+| `final_step` | **Wire `1.4.0`+, required there**: on a hook, the last lifecycle step of the CLI command that runs it (see [§6](#6-hook-execution)): `"generate"` (`labelle generate`, and the legacy `labelle ios` subcommand, which only runs the generate hooks), `"build"`, `"run"` (`labelle run`, every watched rebuild included) or `"bundle"`. It is always a step the hook's own step leads to: any value on a `generate` hook, never `"generate"` on a `build` hook, and exactly its own step on a `run` or `bundle` hook; anything else is an error. Null on a command. The key doesn't exist below `1.4.0` |
 
 The `run` object holds the `labelle run` options for a hook that wraps or replaces the launch:
 
@@ -154,10 +155,11 @@ The cold build is published as generation `0` before the replacement starts. A f
 
 ### Wire versions and negotiation
 
-The CLI implements contract `1.3.0` and speaks every wire version listed here, newest first:
+The CLI implements contract `1.4.0` and speaks every wire version listed here, newest first:
 
 | Wire | Adds |
 | --- | --- |
+| `1.4.0` | `final_step` on every context (additive minor, cli#443). |
 | `1.3.0` | `cache_dir` and `env_file` on every context, and `watch` in the `run` object (additive minor, CLI 2.1.0). |
 | `1.2.0` | `target_dir` on every context and the optional `run` key on `run`-step hooks (additive minor). |
 | `1.1.0` | The optional `build_number` key (additive minor). |
@@ -165,7 +167,8 @@ The CLI implements contract `1.3.0` and speaks every wire version listed here, n
 
 For each invocation the CLI negotiates the **newest** wire version the provider's `command_contract` range admits and writes it as `contract_version`; a range that admits none of them is `UnsupportedContract` at discovery. Keys a wire version does not define are never emitted in it, so a provider decoding strictly (unknown fields are errors, as above) keeps working:
 
-- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.3.0` and must accept the keys `1.1.0`, `1.2.0` and `1.3.0` add. A provider declaring such a range promises exactly that.
+- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.4.0` and must accept the keys `1.1.0`, `1.2.0`, `1.3.0` and `1.4.0` add. A provider declaring such a range promises exactly that.
+- `<1.4.0` (for example `>=1.0.0 <1.4.0`) receives the exact `1.3.0` wire, without `final_step`: its hooks run exactly as on `1.4.0` but cannot tell which command runs them.
 - `<1.3.0` (for example `>=1.0.0 <1.3.0`) receives the exact `1.2.0` wire, without `cache_dir`, `env_file` or `run.watch`: its hooks cannot contribute an environment and its run replacement cannot run a watch session.
 - `>=1.0.0 <1.2.0` receives the exact `1.1.0` wire, without `target_dir` or `run`. If one of its `run` hooks would have received run options the user passed, the CLI prints one `note:` line per hook (`run options not passed to '<package>/<id>' (provider contract 1.1.0 < 1.2.0)`) instead of dropping them silently.
 - `>=1.0.0 <1.1.0` (or `1.0.0`) receives the exact `1.0.0` wire. `labelle bundle --build-number=N` is then not passed to it; the CLI prints one `note:` line saying so instead of dropping it silently. The `1.2.0` rule above applies too.
@@ -377,7 +380,7 @@ The online defaults are the registry's schema-2 `defaults` list (§4), resolved 
 
 ## 6. Hook execution
 
-Resolve stable hook identities as `<package>/<hook-id>`. Within each target/step, execute before hooks, the core operation or unique replacement, then after hooks. Provider dependencies create ordering edges within a phase; explicit `after_hooks` refine hook ordering. Break independent ties by fully qualified hook ID. Reject missing hook references, cycles, dependencies on later phases, and multiple replacements before execution. A replacement belongs only to the target owner. Sequential execution is sufficient for v1.
+Resolve stable hook identities as `<package>/<hook-id>`. A command runs its steps in lifecycle order, each with all of its hooks: `labelle generate` runs `generate`; `labelle build` runs `generate` then `build`; `labelle run` runs `generate`, `build`, then `run`; `labelle bundle` runs `generate`, `build`, then `bundle`. Within each target/step, execute before hooks, the core operation or unique replacement, then after hooks. A replacement stands in for its own step's core operation and nothing else: a `bundle` replacement does not remove the `build` step's hooks, so `labelle bundle` on a target whose owner packages an installable artifact in an `after build` hook and replaces `bundle` runs that hook, then the replacement. The CLI never skips a hook by command (a hook of another package in that slot, such as a signer or a symbol upload, would be bypassed silently); a hook whose work a later step of the same command redoes reads `final_step` (§2, wire `1.4.0`+) and skips that work itself (cli#443). Provider dependencies create ordering edges within a phase; explicit `after_hooks` refine hook ordering. Break independent ties by fully qualified hook ID. Reject missing hook references, cycles, dependencies on later phases, and multiple replacements before execution. A replacement belongs only to the target owner. Sequential execution is sufficient for v1.
 
 Stop on any failed hook/operation; after hooks run only after success. For `run`, success means the game process itself exited with status 0: a game the `--timeout` watchdog stopped, or a simulator/device launch that returns while the app is still running, is not a success even though the CLI's own exit status is 0, and its after hooks are skipped with one diagnostic line. Hooks clean up their own temporary resources. Do not run publishing hooks after a failed build or reuse an old output as a new success. Graph construction/execution and its fixture tests belong to phase 3.
 

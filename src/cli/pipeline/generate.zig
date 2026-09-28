@@ -297,6 +297,7 @@ test "pipeline: the shader override is re-gated after the before-generate hooks"
         .optimize = .Debug,
         .progress = .off,
         .reporter = null,
+        .final_step = .build,
         .host = .{ .zig = "/z", .cache_root = project, .global_cache = project, .packages = project },
         .run_tool = Fixture.hook,
     };
