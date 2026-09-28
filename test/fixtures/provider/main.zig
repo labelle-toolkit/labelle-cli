@@ -70,6 +70,13 @@ pub fn main(init: std.process.Init) !u8 {
         path_value[0 .. std.mem.indexOfScalar(u8, path_value, std.fs.path.delimiter) orelse path_value.len]
     else |_|
         null;
+    // `PROVIDER_PROBE_WHICH=<name>`: where this invocation's own PATH finds
+    // the executable `<name>` (`<name>.exe` on Windows), the way a spawn of
+    // it would; null when no PATH entry holds it.
+    const which: ?[]const u8 = if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_WHICH")) |name|
+        try findOnPath(init, a, name)
+    else |_|
+        null;
     const line = try std.json.Stringify.valueAlloc(a, .{
         .invocation = invocation,
         .target = ctx.value.object.get("target").?,
@@ -85,6 +92,7 @@ pub fn main(init: std.process.Init) !u8 {
         .context = ctx.value,
         .probe_toolchain = probe_toolchain,
         .path_head = path_head,
+        .which = which,
         .nanoseconds = std.Io.Timestamp.now(init.io, .awake).nanoseconds,
     }, .{});
     const log_path = try std.fs.path.join(a, &.{ output, "hooks.log" });
@@ -184,6 +192,21 @@ pub fn main(init: std.process.Init) !u8 {
             try err.interface.flush();
         }
     } else |_| {}
+    // `PROVIDER_PROBE_STDOUT=<dir>` makes a tool print `<dir>/<name>.out`
+    // verbatim on stdout, `<name>` being its output directory's basename (a
+    // command's is its package: `.labelle/providers/<package>`), so a suite
+    // can hand each provider's doctor a valid, invalid or colliding
+    // `--json` report. Printed before the failure knobs below, so a failing
+    // doctor can still report.
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_STDOUT")) |dir| {
+        const file = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "{s}.out", .{std.fs.path.basename(output)}) });
+        if (std.Io.Dir.cwd().readFileAlloc(init.io, file, a, .limited(4 * 1024 * 1024))) |report| {
+            var out_buf: [4096]u8 = undefined;
+            var out = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
+            try out.interface.writeAll(report);
+            try out.interface.flush();
+        } else |_| {}
+    } else |_| {}
     // Hooks receive no argv, so a failing hook is selected by environment:
     // `PROVIDER_PROBE_FAIL=<hook id>` makes that hook exit 7.
     if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_FAIL")) |fail_id| {
@@ -200,6 +223,20 @@ pub fn main(init: std.process.Init) !u8 {
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "fail")) return 7;
     if (collected.items.len > 0 and std.mem.eql(u8, collected.items[0], "crash")) @panic("provider fixture crash");
     return 0;
+}
+
+fn findOnPath(init: std.process.Init, a: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    const is_windows = @import("builtin").os.tag == .windows;
+    const file = if (is_windows) try std.fmt.allocPrint(a, "{s}.exe", .{name}) else name;
+    const path_value = init.minimal.environ.getAlloc(a, "PATH") catch return null;
+    var dirs = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (dirs.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = try std.fs.path.join(a, &.{ dir, file });
+        std.Io.Dir.cwd().access(init.io, candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
 }
 
 /// Start `provider-probe linger` and write `<own pid> <its pid>\n` to

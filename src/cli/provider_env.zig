@@ -118,6 +118,17 @@ pub const Accumulator = struct {
         return self.vars.items.len == 0 and self.path.items.len == 0;
     }
 
+    /// Whether a hook of this build contributed `name` (the host's name
+    /// rules: case-insensitive on Windows). A core step that would otherwise
+    /// provision what the variable points at checks it first, so a provider
+    /// that supplies the toolchain is not second-guessed by the core.
+    pub fn sets(self: *const Accumulator, name: []const u8) bool {
+        for (self.vars.items) |entry| {
+            if (eqlName(entry.name, name, self.windows)) return true;
+        }
+        return false;
+    }
+
     /// Forget every contribution: the next build starts from the inherited
     /// environment alone, so a hook that no longer runs leaves nothing.
     pub fn reset(self: *Accumulator) void {
@@ -478,4 +489,21 @@ test "provider env: sameAs compares the resulting environment, not who contribut
     try std.testing.expect(!x.sameAs(&z));
     try y.add(a, a, "pkg/b", .{ .path_prepend = &.{"/abs/bin"} }, &diag);
     try std.testing.expect(!x.sameAs(&y));
+}
+
+test "provider env: sets reports a contributed variable under the host's name rules" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var posix: Accumulator = .{ .windows = false };
+    defer posix.deinit();
+    try std.testing.expect(!posix.sets("SDK_ROOT"));
+    try posix.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "SDK_ROOT", .value = "/one" }}, .path_prepend = &.{"/abs/bin"} }, &diag);
+    try std.testing.expect(posix.sets("SDK_ROOT"));
+    try std.testing.expect(!posix.sets("sdk_root"));
+    // A PATH prepend is not a variable assignment.
+    try std.testing.expect(!posix.sets("PATH"));
+    var windows: Accumulator = .{ .windows = true };
+    defer windows.deinit();
+    try windows.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "Sdk_Root", .value = "C:\\one" }} }, &diag);
+    try std.testing.expect(windows.sets("SDK_ROOT"));
 }

@@ -145,6 +145,9 @@ pub const Outcome = struct {
     err: ?anyerror = null,
     /// A WARN: reported, never a failure (an uninstalled package).
     warning: bool = false,
+    /// What the tool printed on stdout, when the run captured it
+    /// (`labelle doctor --json`: `provider_doctor_json.zig` reads it).
+    stdout: ?[]const u8 = null,
 
     pub fn ok(self: Outcome) bool {
         return self.code == 0 or self.warning;
@@ -168,9 +171,11 @@ pub const Report = struct {
     }
 };
 
-/// Run every step with `runner.run(step) anyerror!u8`, one after another,
-/// whatever the previous ones returned. Prints a header per provider and
-/// its result line to stderr.
+/// Run every step with `runner.run(step, &stdout) anyerror!u8`, one after
+/// another, whatever the previous ones returned. A runner that captures the
+/// tool's stdout stores it in `stdout` (kept on the outcome); one that passes
+/// it through leaves it null. Prints a header per provider and its result
+/// line to stderr.
 pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
     var outcomes: std.ArrayList(Outcome) = .empty;
     for (p.steps) |step| {
@@ -197,14 +202,21 @@ pub fn execute(a: std.mem.Allocator, p: Plan, runner: anytype) !Report {
                     break :blk .{ .label = step.label, .package = step.package, .code = null, .err = error.RemoteProviderIntegrityRequired };
                 },
             },
-            .run => if (runner.run(step)) |code|
-                .{ .label = step.label, .package = step.package, .code = code }
-            else |err|
-                .{ .label = step.label, .package = step.package, .code = null, .err = err },
+            .run => blk: {
+                var stdout: ?[]const u8 = null;
+                const code = runner.run(step, &stdout) catch |err|
+                    break :blk .{ .label = step.label, .package = step.package, .code = null, .err = err };
+                break :blk .{ .label = step.label, .package = step.package, .code = code, .stdout = stdout };
+            },
         };
         switch (step.action) {
             .unavailable, .unverified => {},
-            .run => if (outcome.code) |code| {
+            // A captured report (`--json`) is judged only once, in the
+            // merged document, and the stderr summary is derived from that
+            // (`provider_doctor_json.printSummary`): no verdict here.
+            .run => if (outcome.stdout != null) {
+                std.debug.print("  (report captured; its verdict is in the capability summary)\n", .{});
+            } else if (outcome.code) |code| {
                 if (code == 0) {
                     std.debug.print("  [  OK  ] labelle {s} {s}\n", .{ step.label, command_name });
                 } else {
@@ -282,13 +294,22 @@ const DispatchRunner = struct {
     /// offline) provisioning is attempted once and every provider after it
     /// gets the same error as its own failed line.
     hosts: *dispatch.HostCache,
+    /// `labelle doctor --json` (RFC cli#466 D7): every provider doctor gets
+    /// `--json`, and its stdout is captured for the core's one document
+    /// instead of reaching the CLI's stdout.
+    json: bool = false,
 
-    pub fn run(self: DispatchRunner, step: Step) anyerror!u8 {
+    pub fn run(self: DispatchRunner, step: Step, stdout: *?[]const u8) anyerror!u8 {
         const action = step.action.run;
+        var captured: []const u8 = "";
         // `.selected`: only this provider's settings file is opened, so a
         // bad file of another provider fails that provider alone.
-        return dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, &.{}, .selected, self.hosts);
+        const code = try dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, if (self.json) &json_args else &.{}, .selected, self.hosts, if (self.json) &captured else null);
+        if (self.json) stdout.* = captured;
+        return code;
     }
+
+    const json_args = [_][]const u8{"--json"};
 };
 
 /// The line `labelle doctor` prints instead of the provider part outside a
@@ -298,8 +319,12 @@ pub fn printOutsideProject(start: []const u8) void {
 }
 
 /// The provider part of `labelle doctor` for the project at `root` (the
-/// canonical project root the core checks used too).
-pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8) !Report {
+/// canonical project root the core checks used too). `json`: each provider
+/// doctor runs with `--json` and its stdout is captured on its outcome
+/// (`DispatchRunner.json`), and the closing summary is left to the caller,
+/// which derives it from the merged document
+/// (`provider_doctor_json.printSummary`); the headers still go to stderr.
+pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, json: bool) !Report {
     // The report outlives this call; its strings live in `allocator`'s arena
     // owned by the caller.
     const a = allocator;
@@ -335,9 +360,10 @@ pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8) !Report {
         .cfg = discovered.cfg,
         .providers = survey.providers,
         .hosts = &hosts,
+        .json = json,
     });
     if (mapping) |outcome| report.outcomes = try std.mem.concat(a, Outcome, &.{ &.{outcome}, report.outcomes });
-    printSummary(report);
+    if (!json) printSummary(report);
     return report;
 }
 
@@ -414,9 +440,14 @@ const Recorder = struct {
     calls: *std.ArrayList([]const u8),
     exit_codes: []const struct { []const u8, u8 } = &.{},
     errors: []const []const u8 = &.{},
+    /// What a namespace's doctor prints on a captured stdout (`--json`).
+    stdouts: []const struct { []const u8, []const u8 } = &.{},
 
-    pub fn run(self: Recorder, step: Step) anyerror!u8 {
+    pub fn run(self: Recorder, step: Step, stdout: *?[]const u8) anyerror!u8 {
         const command = step.action.run.command;
+        for (self.stdouts) |entry| if (std.mem.eql(u8, entry[0], step.label)) {
+            stdout.* = entry[1];
+        };
         try self.calls.append(self.a, try std.fmt.allocPrint(self.a, "{s}:{s}", .{ step.label, command.executable }));
         for (self.errors) |label| if (std.mem.eql(u8, label, step.label)) return error.ProviderCompilerMissing;
         for (self.exit_codes) |entry| if (std.mem.eql(u8, entry[0], step.label)) return entry[1];
@@ -704,4 +735,20 @@ test "provider doctor: one host resolution per doctor, failure included, and eve
     try testing.expectEqual(@as(usize, 1), hosts.calls);
     try testing.expectEqual(@as(usize, 2), report.failed());
     for (report.outcomes) |outcome| try testing.expectEqual(@as(?anyerror, error.ProbeOffline), outcome.err);
+}
+
+test "provider doctor: a captured report is kept on its outcome for the merged document" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]dispatch.Provider{
+        fake("a-pkg", "alpha", &.{cmd("doctor", "bin/a")}),
+        fake("b-pkg", "beta", &.{cmd("doctor", "bin/b")}),
+    };
+    const p = try plan(a, &providers, &.{}, &.{}, &.{}, &.{});
+    var calls: std.ArrayList([]const u8) = .empty;
+    const report = try execute(a, p, Recorder{ .a = a, .calls = &calls, .stdouts = &.{.{ "alpha", "{not json" }} });
+    try testing.expectEqualStrings("{not json", report.outcomes[0].stdout.?);
+    // Not captured: the human mode, judged by the exit code.
+    try testing.expect(report.outcomes[1].stdout == null and report.outcomes[1].ok());
 }

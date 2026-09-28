@@ -15,6 +15,7 @@ const asm_cache = @import("asm_cache.zig");
 const settings_mod = @import("provider_settings.zig");
 const provider_env = @import("provider_env.zig");
 const provider_cache = @import("provider_cache.zig");
+const python_provision = @import("python_provision.zig");
 
 // Existing platform commands remain reserved until their extraction lands;
 // an extracted one leaves the list and its namespace becomes dispatchable
@@ -309,7 +310,7 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
                 std.debug.print("labelle {s} {s} — {s}\n", .{ namespace, name, cmd.help });
                 return 0;
             }
-            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items, .all, null);
+            return try runCommand(a, root, cfg, providers, provider, cmd, trailing.items, .all, null, null);
         }
         std.debug.print("labelle: unknown command '{s}' in provider namespace '{s}'\n", .{ name, namespace });
         printCommands(provider);
@@ -321,13 +322,16 @@ pub fn dispatch(allocator: std.mem.Allocator, namespace: []const u8, args: *std.
 /// Run one provider command: the lock/integrity check, the provider settings,
 /// then the tool build and invocation. `labelle <ns> <cmd>` and the provider
 /// part of `labelle doctor` both come through here, so they cannot drift.
-pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8, scope: SettingsScope, hosts: ?*HostCache) !u8 {
+///
+/// `stdout`, when set, captures the tool's stdout instead of passing it
+/// through (`ToolRun.stdout`).
+pub fn runCommand(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, providers: []const Provider, provider: Provider, cmd: manifest.Command, trailing: []const []const u8, scope: SettingsScope, hosts: ?*HostCache, stdout: ?*[]const u8) !u8 {
     const lock_path = try requirePinned(a, root, provider);
     const settings = switch (scope) {
         .all => try resolveSettings(a, root, cfg, providers, provider.meta.name),
         .selected => try resolveOwnSettings(a, root, cfg, provider.meta.name),
     };
-    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing, hosts);
+    return execute(a, root, cfg, provider, cmd, lock_path, settings, trailing, hosts, stdout);
 }
 
 /// Execution (a command or a hook) needs the project's ordinary lock to name
@@ -581,7 +585,17 @@ pub const ToolRun = struct {
     /// to the provider tool's own process only, never to the `zig build`
     /// that compiles the tool (contract §2 "Scope").
     env: ?*const provider_env.Accumulator = null,
+    /// When set, the tool's stdout is captured into it (at most
+    /// `max_captured_stdout` bytes) instead of reaching the CLI's own: the
+    /// caller owns stdout (`labelle doctor --json` prints one document).
+    /// Its stderr still reaches the CLI's. Allocated with the run's
+    /// allocator.
+    stdout: ?*[]const u8 = null,
 };
+
+/// The most stdout `ToolRun.stdout` captures. A tool that writes more fails
+/// with `error.ProviderStdoutTooLarge`.
+pub const max_captured_stdout: usize = 1024 * 1024;
 
 /// The wire context for one invocation (contract §2), in the wire version
 /// negotiated from the provider's `command_contract` range: the newest one
@@ -658,6 +672,16 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
         std.debug.print("labelle: could not remove provider workspace '{s}': {s}\n", .{ run_dir, @errorName(err) });
     };
     const prefix = try std.fs.path.join(a, &.{ run_dir, "install" });
+    // RFC cli#466 D2: the managed interpreter (`labelle install python`)
+    // reaches every provider hook and command, the way it reaches the
+    // `.prebuild` steps (`pipeline/install.wirePrebuildPython`), so a
+    // machine whose only Python is the managed one runs a provider tool
+    // that spawns `python3`. Only an interpreter that actually runs
+    // (`managedPythonOk`): a partial or broken install left on disk must not
+    // shadow a working system Python. A no-op when none is provisioned, or
+    // when its directory is already on PATH; before the environment
+    // snapshot below.
+    if (python_provision.managedPythonOk(a)) python_provision.autoWireEnv(a);
     var env = try runner.buildZigEnv(a, &.{});
     defer env.deinit();
     // Keep relative LABELLE_HOME stable when child cwd changes to the package.
@@ -666,7 +690,13 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     try env.put("LABELLE_HOME", host.cache_root);
     // Zig owns the complete source/dependency/compiler/options cache identity.
     // Always run the install step: never trust a stale installed executable.
-    const build_code = try runner.runZigInheritWithEnv(a, provider.dir, &.{ host.zig, "build", tool.build_step, "--prefix", prefix, "--system", host.packages }, null, &env);
+    const build_argv: []const []const u8 = &.{ host.zig, "build", tool.build_step, "--prefix", prefix, "--system", host.packages };
+    // When the caller owns stdout (`ToolRun.stdout`), the tool's build must
+    // not write there either: its stdout goes to the CLI's stderr.
+    const build_code = if (run.stdout != null)
+        try runStdoutToStderr(provider.dir, build_argv, &env)
+    else
+        try runner.runZigInheritWithEnv(a, provider.dir, build_argv, null, &env);
     if (build_code != 0) return build_code;
     if (!contained(run_dir, try real(a, prefix))) return error.EscapingProviderInstall;
     const exe = try executable(a, prefix, tool.executable);
@@ -685,12 +715,75 @@ pub fn runTool(a: std.mem.Allocator, host: Host, root: []const u8, provider: Pro
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, exe);
     try argv.appendSlice(a, run.trailing);
+    if (run.stdout) |sink| return runCapturingStdout(a, run.cwd, argv.items, &env, sink);
     return runner.runZigInheritWithEnv(a, run.cwd, argv.items, null, &env);
+}
+
+/// Run `argv` with stdin and stderr inherited and its stdout relayed to the
+/// CLI's stderr. Returns the exit status (128 + signal for a signal death).
+/// The stdout is piped and copied rather than handed the CLI's stderr
+/// handle, which a Windows child cannot be given as its stdout.
+fn runStdoutToStderr(cwd: []const u8, argv: []const []const u8, env: *const std.process.Environ.Map) !u8 {
+    const io = config.globalIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .pipe,
+        .stderr = .inherit,
+        .environ_map = env,
+    });
+    var buffer: [4096]u8 = undefined;
+    var reader = child.stdout.?.readerStreaming(io, &buffer);
+    var err_buffer: [4096]u8 = undefined;
+    var relay = std.Io.File.stderr().writerStreaming(io, &err_buffer);
+    _ = reader.interface.streamRemaining(&relay.interface) catch |err| {
+        child.kill(io);
+        return err;
+    };
+    relay.interface.flush() catch {};
+    return exitStatus(try child.wait(io));
+}
+
+fn exitStatus(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |sig| 128 +% @as(u8, @truncate(@intFromEnum(sig))),
+        .stopped => |sig| 128 +% @as(u8, @truncate(@intFromEnum(sig))),
+        .unknown => 1,
+    };
+}
+
+/// Run `argv` with stdin and stderr inherited and stdout captured into
+/// `sink`. Returns the exit status (128 + signal for a signal death). More
+/// than `max_captured_stdout` bytes kills the child and fails.
+fn runCapturingStdout(a: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, env: *const std.process.Environ.Map, sink: *[]const u8) !u8 {
+    const io = config.globalIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .inherit,
+        .stdout = .pipe,
+        .stderr = .inherit,
+        .environ_map = env,
+    });
+    var buffer: [4096]u8 = undefined;
+    var reader = child.stdout.?.readerStreaming(io, &buffer);
+    const bytes = reader.interface.allocRemaining(a, .limited(max_captured_stdout)) catch |err| {
+        child.kill(io);
+        return switch (err) {
+            error.StreamTooLong => error.ProviderStdoutTooLarge,
+            else => err,
+        };
+    };
+    const term = try child.wait(io);
+    sink.* = bytes;
+    return exitStatus(term);
 }
 
 /// A project command: Debug, human progress, output under
 /// `.labelle/providers/<package>`, trailing arguments verbatim.
-fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8, hosts: ?*HostCache) !u8 {
+fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, provider: Provider, cmd: manifest.Command, lock_path: []const u8, settings: ?[]const u8, trailing: []const []const u8, hosts: ?*HostCache, stdout: ?*[]const u8) !u8 {
     const host = if (hosts) |cache| try cache.get(a, root) else try resolveHost(a, root);
     var output: []const u8 = root;
     for ([_][]const u8{ ".labelle", "providers", provider.meta.name }) |segment| {
@@ -708,6 +801,7 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
         .settings = settings,
         .trailing = trailing,
         .cwd = root,
+        .stdout = stdout,
     });
 }
 

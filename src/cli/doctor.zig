@@ -30,6 +30,7 @@ const emsdk_cache = @import("emsdk_cache.zig");
 const python_provision = @import("python_provision.zig");
 const provider_doctor = @import("provider_doctor.zig");
 const provider_dispatch = @import("provider_dispatch.zig");
+const provider_doctor_json = @import("provider_doctor_json.zig");
 
 const Check = struct {
     name: []const u8,
@@ -49,45 +50,32 @@ const Check = struct {
 // `?[]const u8` serializes to JSON `null` when absent; `std.json.Stringify`
 // emits `[]const u8` fields as strings and produces compact single-line
 // output (which is what the studio's line-based extractor looks for).
+//
+// Inside a project the pinned providers' doctors contribute capabilities of
+// their own (RFC cli#466 D7, `provider_doctor_json.zig`): the core runs them
+// with `--json`, captures their stdout and prints ONE document. A provider
+// capability replaces a core one with the same id.
 
-const JsonItem = struct {
-    id: []const u8,
-    name: []const u8,
-    ok: bool,
-    fixable: bool,
-    size_mb: u32,
-    action: ?[]const u8,
-    detail: ?[]const u8,
-    hint: ?[]const u8,
-};
+const JsonItem = provider_doctor_json.Item;
+const JsonCapability = provider_doctor_json.Capability;
 
-const JsonCapability = struct {
-    id: []const u8,
-    required: bool,
-    ok: bool,
-    items: []const JsonItem,
-};
-
-const JsonReport = struct {
-    capabilities: []const JsonCapability,
-};
-
-/// Serialize the wasm-toolchain capability (zig + python + emsdk/emcc) as the
-/// studio's capability JSON on stdout. The python item is FIXABLE when
+/// Serialize the core's toolchain capability (zig + python + emsdk/emcc),
+/// with the providers' (when `providers` is set), as the studio's capability
+/// JSON on stdout. The python item is FIXABLE when
 /// managed provisioning supports this platform: `action` carries the exact
 /// command (`labelle install python`) the studio's install flow runs
 /// (cli#291); zig/emsdk stay non-fixable status rows (the studio treats
 /// `ok || !fixable` as satisfied).
-fn emitJsonReport(zig_check: Check, python_check: Check, emsdk_check: Check) !void {
+fn emitJsonReport(a: std.mem.Allocator, zig_check: Check, python_check: Check, emsdk_check: Check, providers: ?provider_doctor.Report) !void {
     var out_buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(config.globalIo(), &out_buf);
-    try writeJsonReport(&w.interface, zig_check, python_check, emsdk_check);
+    try writeJsonReport(&w.interface, a, zig_check, python_check, emsdk_check, providers);
     try w.interface.flush();
 }
 
 /// Serialize the capability report to `w` (split out for testing). Emits a
 /// single compact JSON line + trailing newline.
-fn writeJsonReport(w: *std.Io.Writer, zig_check: Check, python_check: Check, emsdk_check: Check) !void {
+fn writeJsonReport(w: *std.Io.Writer, a: std.mem.Allocator, zig_check: Check, python_check: Check, emsdk_check: Check, providers: ?provider_doctor.Report) !void {
     // The python item used to proxy the emsdk check (no independent probe
     // existed); it now carries a REAL interpreter check and, on platforms
     // with managed provisioning, is fixable via `labelle install python`
@@ -133,9 +121,14 @@ fn writeJsonReport(w: *std.Io.Writer, zig_check: Check, python_check: Check, ems
             .items = &items,
         },
     };
-    const report = JsonReport{ .capabilities = &caps };
-    try std.json.Stringify.value(report, .{}, w);
-    try w.writeByte('\n');
+    const merged = try provider_doctor_json.aggregate(a, &caps, providers);
+    // The stderr summary is derived from the merged document, so the two
+    // cannot disagree (RFC cli#466 D7).
+    var err_buf: [1024]u8 = undefined;
+    var err_w = std.Io.File.stderr().writerStreaming(config.globalIo(), &err_buf);
+    try provider_doctor_json.printSummary(&err_w.interface, merged);
+    try err_w.interface.flush();
+    try provider_doctor_json.write(w, merged.capabilities);
 }
 
 pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void {
@@ -206,13 +199,23 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     const emsdk_check = checkEmsdk(arena, scope.dir);
 
     // `--json`: emit the studio's capability report from the toolchain
-    // checks and stop — no human report, no SDL provisioning. The wasm
-    // capability is what labelle-studio's ToolchainGate consumes. The python
+    // checks and the provider doctors, and stop — no human report, no SDL
+    // provisioning. The python
     // item is fixable via `labelle install python` (cli#291); zig/emsdk stay
     // non-fixable status rows (the gate treats non-fixable as satisfied, so
     // it renders their status without offering an install button).
+    //
+    // Inside a project, and unless `--core-only`, every provider doctor runs
+    // with `--json` and its captured capability joins the document (RFC
+    // cli#466 D7). Their human report lines go to stderr; stdout carries the
+    // one document and nothing else. The exit status stays 0: the verdict
+    // is in the document.
     if (as_json) {
-        try emitJsonReport(zig_check, python_check, emsdk_check);
+        const providers: ?provider_doctor.Report = if (core_only) null else if (scope.root) |root|
+            try provider_doctor.runForRoot(arena, root, true)
+        else
+            null;
+        try emitJsonReport(arena, zig_check, python_check, emsdk_check, providers);
         return;
     }
 
@@ -289,7 +292,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     // found: a core failure does not hide a provider's report, and one
     // provider failing does not stop the next.
     const providers: ?provider_doctor.Report = if (core_only) null else if (scope.root) |root|
-        try provider_doctor.runForRoot(arena, root)
+        try provider_doctor.runForRoot(arena, root, false)
     else blk: {
         provider_doctor.printOutsideProject(project_dir);
         break :blk null;
@@ -758,7 +761,9 @@ pub const JsonReportSpec = struct {
         const zig_check = Check{ .name = "Zig toolchain", .ok = true, .detail = "managed zig 0.16.0" };
         const python_check = Check{ .name = "Python (wasm)", .ok = false, .hint = "run `labelle install python`" };
         const emsdk_check = Check{ .name = "emsdk", .ok = true, .detail = "activated" };
-        try writeJsonReport(&w, zig_check, python_check, emsdk_check);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try writeJsonReport(&w, arena.allocator(), zig_check, python_check, emsdk_check, null);
         const line = w.buffered();
 
         // Exactly one line (the studio extractor is line-based).
