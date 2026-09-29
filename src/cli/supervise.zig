@@ -26,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const project_lock = @import("project_lock.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -265,7 +266,15 @@ pub fn spawn(io: std.Io, options: std.process.SpawnOptions) !Supervised {
     return spawnIn(current, io, options);
 }
 
-pub fn spawnIn(group_opt: ?*Group, io: std.Io, options: std.process.SpawnOptions) !Supervised {
+pub fn spawnIn(group_opt: ?*Group, io: std.Io, given: std.process.SpawnOptions) !Supervised {
+    // A child that would inherit the environment while this process holds
+    // a project lock learns so (cli#490): a nested labelle command then
+    // fails fast instead of waiting for its own ancestor. An explicit
+    // environment built before the lock was taken gets it too.
+    var held_env = try project_lock.childEnviron(std.heap.smp_allocator, given.environ_map);
+    defer if (held_env) |*map| map.deinit();
+    var options = given;
+    if (held_env) |*map| options.environ_map = map;
     const group = group_opt orelse return .{ .child = try std.process.spawn(io, options), .group = null };
     if (group.isCancelled()) return error.Canceled;
     var opts = options;

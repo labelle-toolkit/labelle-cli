@@ -10,6 +10,7 @@ const lockfile = @import("../lockfile.zig");
 const assembler_proc = @import("../assembler_proc.zig");
 const python_provision = @import("../python_provision.zig");
 const prebuild = @import("../prebuild.zig");
+const project_lock = @import("../project_lock.zig");
 const material_toolchain = @import("../material_toolchain.zig");
 const progress = @import("../progress.zig");
 const sdl_provision = @import("../sdl_provision.zig");
@@ -79,6 +80,12 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     // Windows link/runtime variable consumed by `zig build`, not a tool a
     // generator spawns.
     wirePrebuildPython(allocator, parsed.prebuild);
+
+    // Inside a hook or prebuild step of a command holding this project's
+    // lock (a watch rebuild), this command could never write the lock:
+    // refuse now, before its prebuild steps start the same step again
+    // (cli#490).
+    try project_lock.refuseNested(allocator, project_dir);
 
     try prebuild.runAll(allocator, project_dir, parsed.prebuild, .{
         .route_stdout_to_stderr = parsed_args.progress_mode == .json,
