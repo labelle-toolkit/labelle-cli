@@ -316,19 +316,29 @@ const Cfg = struct {
 /// source unless `.gamepad = .none`. An unknown backend (`describe` gave no
 /// answer) is judged by the gamepad alone, as the assembler's default
 /// backend links SDL2 for it. Outside a project there is nothing to judge.
-/// Advice, never a failure: SDL2 may be installed by other means.
+/// Advice, never a failure: SDL2 may be installed by other means. The
+/// `.gamepad = .none` way out is offered only where SDL2 comes in for the
+/// gamepad alone: the `sdl` renderer links it whatever the gamepad says.
 fn sdl2Hint(cfg: Cfg, backend: ?[]const u8) ?[]const u8 {
-    if (!cfg.found or cfg.sdl2_provider or !linksSdl2(backend, cfg.gamepad_off)) return null;
-    return "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, set LABELLE_SDL2_LIB, or use `.gamepad = .none`.";
+    if (!cfg.found or cfg.sdl2_provider) return null;
+    return switch (sdl2Use(backend, cfg.gamepad_off)) {
+        .none => null,
+        .renderer => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, or set LABELLE_SDL2_LIB.",
+        .gamepad => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, set LABELLE_SDL2_LIB, or use `.gamepad = .none`.",
+    };
 }
 
-fn linksSdl2(backend: ?[]const u8, gamepad_off: bool) bool {
-    const name = backend orelse return !gamepad_off;
-    if (std.mem.eql(u8, name, "sdl")) return true;
-    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |pad| {
-        if (std.mem.eql(u8, name, pad)) return !gamepad_off;
+/// Why a desktop build of `backend` links SDL2, if it does.
+const Sdl2Use = enum { none, renderer, gamepad };
+
+fn sdl2Use(backend: ?[]const u8, gamepad_off: bool) Sdl2Use {
+    const pad: Sdl2Use = if (gamepad_off) .none else .gamepad;
+    const name = backend orelse return pad;
+    if (std.mem.eql(u8, name, "sdl")) return .renderer;
+    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |pad_backend| {
+        if (std.mem.eql(u8, name, pad_backend)) return pad;
     }
-    return false;
+    return .none;
 }
 
 test "doctor: the SDL2 hint follows the old rule and goes quiet with the provider (cli#471 S4)" {
@@ -345,6 +355,14 @@ test "doctor: the SDL2 hint follows the old rule and goes quiet with the provide
     // Unknown backend: the gamepad decides.
     try std.testing.expect(sdl2Hint(plain, null) != null);
     try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, null) == null);
+    // Only the gamepad cases offer the gamepad opt-out: the renderer links
+    // SDL2 whatever the gamepad says.
+    const gamepad_way_out = "`.gamepad = .none`";
+    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "sdl").?, gamepad_way_out) == null);
+    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(.{ .found = true, .gamepad_off = true }, "sdl").?, gamepad_way_out) == null);
+    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "sdl").?, "set LABELLE_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "raylib").?, gamepad_way_out) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, null).?, gamepad_way_out) != null);
     // The provider listed, or no project: no hint.
     try std.testing.expect(sdl2Hint(.{ .found = true, .sdl2_provider = true }, "sdl") == null);
     try std.testing.expect(sdl2Hint(.{}, "sdl") == null);
