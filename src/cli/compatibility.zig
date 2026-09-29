@@ -149,20 +149,27 @@ fn migrationGuide(d: DiamondPin) ?[]const u8 {
     if (!std.mem.eql(u8, d.name, "cli")) return null;
     const pinned = parseVersion(d.pinned).major;
     const curated = parseVersion(d.curated).major;
+    // Crossing 4.0 from an older line also needs the 4.0 steps, which the
+    // older guides predate: chain them after the first guide.
+    const then_four = pinned < 4 and curated >= 4;
     if (pinned < 2 and curated >= 2) {
-        return "upgrading alone is not enough: the 2.0 CLI builds every non-desktop target through\n" ++
-            "  provider packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+        return if (then_four) guide_two ++ guide_then_four else guide_two;
     }
     if (pinned < 3 and curated >= 3) {
-        return "upgrading alone is not enough: the 3.0 CLI removed its built-in browser toolchain, serve and\n" ++
-            "  export, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
+        return if (then_four) guide_three ++ guide_then_four else guide_three;
     }
-    if (pinned < 4 and curated >= 4) {
-        return "upgrading alone is not enough: the 4.0 CLI needs assembler 0.118.0+ and moved the remaining platform\n" ++
-            "  code into provider packages, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
-    }
+    if (then_four) return guide_four;
     return null;
 }
+
+const guide_two = "upgrading alone is not enough: the 2.0 CLI builds every non-desktop target through\n" ++
+    "  provider packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+const guide_three = "upgrading alone is not enough: the 3.0 CLI removed its built-in browser toolchain, serve and\n" ++
+    "  export, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
+const guide_four = "upgrading alone is not enough: the 4.0 CLI needs assembler 0.118.0+ and moved the remaining platform\n" ++
+    "  code into provider packages, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
+const guide_then_four = "\n  then the 4.0 steps (assembler 0.118.0+, platform code in provider packages):\n" ++
+    "  https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
 
 test "compat: a cli pin behind a breaking CLI line points at that line's migration guide; nothing else does" {
     const guide = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "2.0.0" }).?;
@@ -173,6 +180,12 @@ test "compat: a cli pin behind a breaking CLI line points at that line's migrati
     try std.testing.expect(std.mem.indexOf(u8, three, "docs/migrating-to-3.0.md") != null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "2.0.0", .curated = "2.1.0" }) == null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "3.0.0", .curated = "3.1.0" }) == null);
+    // Crossing 4.0 from 1.x or 2.x: the first guide, then the 4.0 steps.
+    for ([_][]const u8{ "1.67.0", "2.1.1" }) |old| {
+        const chained = migrationGuide(.{ .name = "cli", .pinned = old, .curated = "4.0.0" }).?;
+        try std.testing.expect(std.mem.indexOf(u8, chained, "docs/migrating-to-4.0.md") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, migrationGuide(.{ .name = "cli", .pinned = "2.1.1", .curated = "3.1.0" }).?, "migrating-to-4.0") == null);
     const four = migrationGuide(.{ .name = "cli", .pinned = "3.1.0", .curated = "4.0.0" }).?;
     try std.testing.expect(std.mem.indexOf(u8, four, "docs/migrating-to-4.0.md") != null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "4.0.0", .curated = "4.0.1" }) == null);
