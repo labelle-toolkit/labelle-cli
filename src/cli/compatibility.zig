@@ -141,23 +141,40 @@ fn compatWarnings(cfg: project_config.ProjectConfig, comptime emit: bool) u8 {
 /// The migration guide for a `cli` pin on an older major line than this
 /// CLI, when crossing that line needs a project edit `upgrade all` cannot
 /// make: 2.0 moved the non-desktop targets into provider packages
-/// (cli#405), and 3.0 removed the CLI's own browser toolchain, serve and
-/// export in favour of its provider package (RFC cli#466). The guide of the
-/// first line crossed comes first. Null for every other package or line.
+/// (cli#405), 3.0 removed the CLI's own browser toolchain, serve and
+/// export in favour of its provider package (RFC cli#466), and 4.0 left
+/// backend identity to the assembler and the remaining platform code to
+/// providers (RFC cli#471). The guide of the first line crossed comes first. Null for every other package or line.
 fn migrationGuide(d: DiamondPin) ?[]const u8 {
     if (!std.mem.eql(u8, d.name, "cli")) return null;
     const pinned = parseVersion(d.pinned).major;
     const curated = parseVersion(d.curated).major;
+    // Every crossed major line has its own steps, and the older guides
+    // predate the newer ones: chain them all after the first guide.
+    const then_three = pinned < 3 and curated >= 3;
+    const then_four = pinned < 4 and curated >= 4;
     if (pinned < 2 and curated >= 2) {
-        return "upgrading alone is not enough: the 2.0 CLI builds every non-desktop target through\n" ++
-            "  provider packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+        if (then_four) return guide_two ++ guide_then_three ++ guide_then_four;
+        if (then_three) return guide_two ++ guide_then_three;
+        return guide_two;
     }
     if (pinned < 3 and curated >= 3) {
-        return "upgrading alone is not enough: the 3.0 CLI removed its built-in browser toolchain, serve and\n" ++
-            "  export, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
+        return if (then_four) guide_three ++ guide_then_four else guide_three;
     }
+    if (then_four) return guide_four;
     return null;
 }
+
+const guide_two = "upgrading alone is not enough: the 2.0 CLI builds every non-desktop target through\n" ++
+    "  provider packages, so the project needs migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-2.0.md";
+const guide_three = "upgrading alone is not enough: the 3.0 CLI removed its built-in browser toolchain, serve and\n" ++
+    "  export, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
+const guide_four = "upgrading alone is not enough: the 4.0 CLI needs assembler 0.118.0+ and moved the remaining platform\n" ++
+    "  code into provider packages, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
+const guide_then_three = "\n  then the 3.0 steps (the browser toolchain moved into its provider package):\n" ++
+    "  https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
+const guide_then_four = "\n  then the 4.0 steps (assembler 0.118.0+, platform code in provider packages):\n" ++
+    "  https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
 
 test "compat: a cli pin behind a breaking CLI line points at that line's migration guide; nothing else does" {
     const guide = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "2.0.0" }).?;
@@ -168,6 +185,21 @@ test "compat: a cli pin behind a breaking CLI line points at that line's migrati
     try std.testing.expect(std.mem.indexOf(u8, three, "docs/migrating-to-3.0.md") != null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "2.0.0", .curated = "2.1.0" }) == null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "3.0.0", .curated = "3.1.0" }) == null);
+    // Crossing 3.0 and 4.0 from 1.x: every crossed guide, in order.
+    const from_one = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "4.0.0" }).?;
+    const at_two = std.mem.indexOf(u8, from_one, "migrating-to-2.0").?;
+    const at_three = std.mem.indexOf(u8, from_one, "migrating-to-3.0").?;
+    const at_four = std.mem.indexOf(u8, from_one, "migrating-to-4.0").?;
+    try std.testing.expect(at_two < at_three and at_three < at_four);
+    // Crossing 4.0 from 1.x or 2.x: the first guide, then the 4.0 steps.
+    for ([_][]const u8{ "1.67.0", "2.1.1" }) |old| {
+        const chained = migrationGuide(.{ .name = "cli", .pinned = old, .curated = "4.0.0" }).?;
+        try std.testing.expect(std.mem.indexOf(u8, chained, "docs/migrating-to-4.0.md") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, migrationGuide(.{ .name = "cli", .pinned = "2.1.1", .curated = "3.1.0" }).?, "migrating-to-4.0") == null);
+    const four = migrationGuide(.{ .name = "cli", .pinned = "3.1.0", .curated = "4.0.0" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, four, "docs/migrating-to-4.0.md") != null);
+    try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "4.0.0", .curated = "4.0.1" }) == null);
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "1.60.0", .curated = "1.75.0" }) == null);
     try std.testing.expect(migrationGuide(.{ .name = "engine", .pinned = "1.67.0", .curated = "2.0.0" }) == null);
 }
