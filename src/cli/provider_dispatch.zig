@@ -17,14 +17,14 @@ const provider_env = @import("provider_env.zig");
 const provider_cache = @import("provider_cache.zig");
 const python_provision = @import("python_provision.zig");
 
-// Existing platform commands remain reserved until their extraction lands;
-// an extracted one leaves the list and its namespace becomes dispatchable
-// (cli#405, and RFC cli#466 PR B for the legacy browser commands).
+// The built-in commands are reserved; an extracted platform command leaves
+// the list and its namespace becomes dispatchable (cli#405, RFC cli#466 PR B
+// for the legacy browser commands, and RFC cli#471 I5 for the last one).
 pub const reserved = [_][]const u8{
-    "generate", "build",     "bundle",    "run",       "init",   "add",   "install", "update",
-    "upgrade",  "clean",     "test",      "pack",      "astc",   "audit", "migrate", "check",
-    "plugins",  "doctor",    "assembler", "toolchain", "status", "ios",   "help",    "version",
-    "targets",  "providers",
+    "generate",  "build",  "bundle",    "run",       "init",   "add",   "install", "update",
+    "upgrade",   "clean",  "test",      "pack",      "astc",   "audit", "migrate", "check",
+    "plugins",   "doctor", "assembler", "toolchain", "status", "help",  "version", "targets",
+    "providers",
 };
 pub const Provider = struct { dep: project.PluginDep, dir: []const u8, meta: manifest.Manifest, verified: bool };
 
@@ -830,14 +830,26 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     });
 }
 
-test "provider dispatch: an extracted platform's namespace is no longer reserved" {
-    // `android` moved into its provider (cli#405), and the legacy browser
-    // subcommands left the core (RFC cli#466 PR B): a package may declare
-    // either namespace. The legacy subcommand still built in stays reserved.
-    for ([_][]const u8{ "android", "wasm" }) |extracted| {
-        for (reserved) |name| try std.testing.expect(!std.mem.eql(u8, name, extracted));
+test "provider dispatch: only a built-in command's name is reserved" {
+    // Every extracted platform subcommand left the list with its code
+    // (cli#405, RFC cli#466 PR B, RFC cli#471 I5), so each reserved name is
+    // a command the core itself parses: an `args.Command` tag spelled
+    // `<name>` or `<name>_cmd`, or `providers` (dispatched before the
+    // command switch in `cli.zig`). A name without a built-in behind it
+    // would block a package's namespace for nothing.
+    const Command = @import("args.zig").Command;
+    for (reserved) |name| {
+        if (std.mem.eql(u8, name, "providers")) continue;
+        var found = false;
+        inline for (@typeInfo(Command).@"enum".fields) |field| {
+            const tag = field.name;
+            const bare = if (comptime std.mem.endsWith(u8, tag, "_cmd")) tag[0 .. tag.len - "_cmd".len] else tag;
+            found = found or std.mem.eql(u8, name, bare);
+        }
+        if (!found) std.debug.print("reserved namespace '{s}' has no built-in command\n", .{name});
+        try std.testing.expect(found);
     }
-    for ([_][]const u8{ "ios", "run", "build", "bundle" }) |kept| {
+    for ([_][]const u8{ "run", "build", "bundle" }) |kept| {
         var found = false;
         for (reserved) |name| found = found or std.mem.eql(u8, name, kept);
         try std.testing.expect(found);

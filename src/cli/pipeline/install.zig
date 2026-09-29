@@ -42,8 +42,8 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
 
-    // Pre-build hooks (#355). Runs on `generate` / `build` / `run` (and
-    // the ios flow, which generates too) — the first thing
+    // Pre-build hooks (#355). Runs on `generate` / `build` / `run` /
+    // `bundle` — the first thing
     // that touches the project after its config is validated, and ahead
     // of EVERY generation input reader: the ASTC pre-pass, the `--bake`
     // pre-pass, the assembler's cache populate and `generate`. That
@@ -240,11 +240,11 @@ pub fn discoverAndPlan(
     }
     // `labelle run` of a provider target is launched by its provider, so it
     // needs a `replace` hook on `run`: the CLI has no launch of its own for
-    // any provider target except the legacy branches `legacyRunBranch`
-    // still names. Without one the run would fall through to the host
+    // any provider target (the last built-in one, the simulator deploy, left
+    // with cli#471 I5). Without one the run would fall through to the host
     // launch and try to execute a binary built for another platform, so
     // stop HERE, after the install and before generation or any compiler.
-    if (noRunReplacement(command, target.provider != null, hook_plans.run.replace != null, target.legacy)) {
+    if (noRunReplacement(command, target.provider != null, hook_plans.run.replace != null)) {
         std.debug.print("labelle: target '{s}' has no run replacement; package '{s}' must declare a `.when = .replace` hook on `run`\n", .{ target.name, target.providerName() });
         return error.NoRunReplacement;
     }
@@ -321,11 +321,6 @@ test "coreGenerateGate: describe refuses an unsupported pair" {
     try std.testing.expect(coreGenerateGate(true, false, d) == .unsupported);
 }
 
-/// The platforms whose provider target the CLI still launches through a
-/// built-in `run` branch of its own (`pipeline/run.zig`). Every other
-/// provider target is launched by its provider's `replace run` hook. The
-/// set only shrinks: a platform leaves it when its launch moves into a
-/// provider (cli#405 removed `android`, RFC cli#466 PR B `wasm`).
 /// A build path that cannot carry what a provider supplies for the target.
 /// Such a path refuses before anything runs rather than silently bypassing
 /// the provider (RFC cli#466 A1):
@@ -337,32 +332,24 @@ test "coreGenerateGate: describe refuses an unsupported pair" {
 ///   one zig invocation (the host-side fingerprint pass of `tests/`) does
 ///   receive the contributions; and when the target owner replaces `build`,
 ///   its hook stands in for the container build and gets the
-///   contributions like every hook;
-/// - `labelle ios` runs its own `zig build` after generation, with neither
-///   the contributions nor the effective optimize mode.
+///   contributions like every hook.
+/// (The legacy platform subcommand's own build, refused for both the
+/// contributions and the owner's optimize default, left with cli#471 I5.)
 pub const Bypass = enum {
     docker_env,
-    ios_env,
-    ios_default,
 
     pub fn message(self: Bypass) []const u8 {
         return switch (self) {
             .docker_env => "--docker doesn't carry provider environment contributions; build without --docker",
-            .ios_env => "`labelle ios` runs its own build, which doesn't carry provider environment contributions; use `labelle build --platform=ios`",
-            .ios_default => "`labelle ios` runs its own build, which ignores the target owner's optimize default; use `labelle build --platform=ios`",
         };
     }
 };
 
 /// Pure. `contributor` is the plan's first hook that can contribute an
-/// environment (`provider_hooks.planContributor`); `owner_default` the
-/// target owner's `.target_defaults` optimize mode; `build_replaced`
-/// whether the plan has a `replace` hook on `build`.
-pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool, owner_default: bool, build_replaced: bool) ?Bypass {
-    if (command == .ios_cmd) {
-        if (contributor) return .ios_env;
-        if (owner_default) return .ios_default;
-    }
+/// environment (`provider_hooks.planContributor`); `build_replaced`
+/// whether the plan has a `replace` hook on `build`. The target owner's
+/// optimize default never refuses: `--docker` passes it as `-Doptimize`.
+pub fn providerBypass(command: args_mod.Command, docker: bool, contributor: bool, build_replaced: bool) ?Bypass {
     if (docker and contributor and reachesContainerBuild(command) and !build_replaced) return .docker_env;
     return null;
 }
@@ -378,77 +365,48 @@ fn reachesContainerBuild(command: args_mod.Command) bool {
 
 test "providerBypass: a path that cannot carry a provider's input refuses instead of bypassing it" {
     // Nothing to carry: every path keeps today's behaviour.
-    for ([_]args_mod.Command{ .build, .run, .generate, .bundle_cmd, .ios_cmd }) |command| {
-        try std.testing.expect(providerBypass(command, false, false, false, false) == null);
-        try std.testing.expect(providerBypass(command, true, false, false, false) == null);
+    for ([_]args_mod.Command{ .build, .run, .generate, .bundle_cmd }) |command| {
+        try std.testing.expect(providerBypass(command, false, false, false) == null);
+        try std.testing.expect(providerBypass(command, true, false, false) == null);
     }
-    // --docker: contributions are refused; a default is passed through.
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false, false).?);
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, true, false).?);
-    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.bundle_cmd, true, true, false, false).?);
+    // --docker: contributions are refused.
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.build, true, true, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.run, true, true, false).?);
+    try std.testing.expectEqual(Bypass.docker_env, providerBypass(.bundle_cmd, true, true, false).?);
     // `labelle generate --docker` never reaches the container build: its
     // fingerprint pass runs on the host with the contributions.
-    try std.testing.expect(providerBypass(.generate, true, true, false, false) == null);
-    try std.testing.expect(providerBypass(.generate, true, true, true, false) == null);
+    try std.testing.expect(providerBypass(.generate, true, true, false) == null);
     // A `replace build` hook stands in for the container build and gets the
     // contributions like every hook: nothing is bypassed.
     for ([_]args_mod.Command{ .build, .run, .bundle_cmd }) |command| {
-        try std.testing.expectEqual(Bypass.docker_env, providerBypass(command, true, true, false, false).?);
-        try std.testing.expect(providerBypass(command, true, true, false, true) == null);
+        try std.testing.expectEqual(Bypass.docker_env, providerBypass(command, true, true, false).?);
+        try std.testing.expect(providerBypass(command, true, true, true) == null);
     }
-    // `labelle ios` runs its own build whatever the plan replaces.
-    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, false, true).?);
-    try std.testing.expect(providerBypass(.build, true, false, true, false) == null);
-    // Without --docker the shared pipeline carries both.
-    try std.testing.expect(providerBypass(.build, false, true, true, false) == null);
-    // `labelle ios`: its own build carries neither.
-    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, false, false).?);
-    try std.testing.expectEqual(Bypass.ios_env, providerBypass(.ios_cmd, false, true, true, false).?);
-    try std.testing.expectEqual(Bypass.ios_default, providerBypass(.ios_cmd, false, false, true, false).?);
-}
-
-pub fn legacyRunBranch(platform: ?project_config.Platform) bool {
-    const p = platform orelse return false;
-    return switch (p) {
-        .ios => true,
-        .desktop, .android, .wasm => false,
-    };
+    // Without --docker the shared pipeline carries the contributions.
+    try std.testing.expect(providerBypass(.build, false, true, false) == null);
 }
 
 /// Whether `labelle run` must be refused before the build
-/// (`error.NoRunReplacement`): a provider target, no `replace run` hook in
-/// the plan, and no legacy launch branch to fall back to. Pure, so the
-/// decision table is unit-tested without a project.
-pub fn noRunReplacement(command: args_mod.Command, has_provider: bool, has_run_replacement: bool, legacy: ?project_config.Platform) bool {
-    return command == .run and has_provider and !has_run_replacement and !legacyRunBranch(legacy);
+/// (`error.NoRunReplacement`): a provider target and no `replace run` hook
+/// in the plan. The core has no launch of its own for any provider target
+/// (cli#471 I5 removed the last one), so nothing else can launch it. Pure,
+/// so the decision table is unit-tested without a project.
+pub fn noRunReplacement(command: args_mod.Command, has_provider: bool, has_run_replacement: bool) bool {
+    return command == .run and has_provider and !has_run_replacement;
 }
 
-test "NoRunReplacement: a provider target needs a run replacement unless a legacy branch launches it" {
-    // The refused shape: `run`, a provider target, no replacement, no
-    // legacy branch (a schema name that left the set, or a foreign name).
-    try std.testing.expect(noRunReplacement(.run, true, false, .android));
-    try std.testing.expect(noRunReplacement(.run, true, false, null));
+test "NoRunReplacement: a provider target needs a run replacement" {
+    // The refused shape: `run`, a provider target, no replacement — whatever
+    // its name (a former built-in, too, since cli#471 I5).
+    try std.testing.expect(noRunReplacement(.run, true, false));
     // A replacement launches it.
-    try std.testing.expect(!noRunReplacement(.run, true, true, .android));
-    try std.testing.expect(!noRunReplacement(.run, true, true, null));
-    // The legacy branch still launches its own way; every other schema name
-    // needs its provider's replacement (the built-in serve left in 3.0).
-    try std.testing.expect(!noRunReplacement(.run, true, false, .ios));
-    try std.testing.expect(noRunReplacement(.run, true, false, .wasm));
+    try std.testing.expect(!noRunReplacement(.run, true, true));
     // The core target is launched by the host branch.
-    try std.testing.expect(!noRunReplacement(.run, false, false, .desktop));
+    try std.testing.expect(!noRunReplacement(.run, false, false));
     // Only `run` launches: build, bundle and generate are never refused here.
-    for ([_]args_mod.Command{ .build, .bundle_cmd, .generate, .ios_cmd }) |command| {
-        try std.testing.expect(!noRunReplacement(command, true, false, .android));
+    for ([_]args_mod.Command{ .build, .bundle_cmd, .generate }) |command| {
+        try std.testing.expect(!noRunReplacement(command, true, false));
     }
-}
-
-test "legacyRunBranch: only ios keeps a built-in launch" {
-    try std.testing.expect(!legacyRunBranch(.wasm));
-    try std.testing.expect(legacyRunBranch(.ios));
-    try std.testing.expect(!legacyRunBranch(.android));
-    try std.testing.expect(!legacyRunBranch(.desktop));
-    try std.testing.expect(!legacyRunBranch(null));
 }
 
 test "a rejected shader override stops the cold build before any package is installed" {

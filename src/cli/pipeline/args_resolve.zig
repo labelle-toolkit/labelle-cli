@@ -26,8 +26,8 @@ pub const Resolution = union(enum) {
 /// ── Target resolution, the NAME half (RFC #406 phase 3b) ──────────
 /// (docs/provider-targets.md "Resolution")
 /// The target is the core `desktop` or one a pinned provider declares;
-/// nothing else, including the project's own `.platform` and the legacy
-/// `ios` subcommand (no shim, RFC #406 "Migration").
+/// nothing else, including the project's own `.platform` (no shim,
+/// RFC #406 "Migration").
 /// Ownership needs the providers, and provider discovery runs only
 /// after the assembler's `install` populated the package cache (below,
 /// next to `gateThenInstall`; Codex P1 on #420) — while the target
@@ -95,9 +95,6 @@ pub fn resolve(
     // is derived from the NAME only where the pinned assembler and the
     // legacy sites still need the schema enum.
     parsed.platform = provisional.legacy orelse .desktop;
-    // (`labelle ios` no longer forces a backend: the CLI names none since
-    // cli#471 D4, and the assembler's error names the backend and target
-    // when the project's own cannot build it — RFC cli#471 decision D5.)
 
     return .{ .proceed = .{ .project_root = project_root, .provisional = provisional } };
 }

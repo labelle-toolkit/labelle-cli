@@ -186,17 +186,19 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
         assert NO_PROVIDER.format(t="wasm") in refused.stderr, refused.stderr
         assert "(registry:" not in refused.stderr, "a registry owner was invented"
         untouched(refused, "wasm")
-    # The legacy subcommand requests the same target and fails the same way.
-    refused = run("ios", "build", code=1)
-    assert NO_PROVIDER.format(t="ios") in refused.stderr, refused.stderr
-    untouched(refused, "ios")
-    # `android` (cli#405) and the legacy `wasm serve|export` (RFC cli#466 PR
-    # B) are no built-ins any more: each is a provider namespace like any
-    # other, so with no package declaring it the word is an unknown command
-    # and nothing is generated (test/provider_android_like_e2e.py covers the
-    # registry hint).
+    # `ios` has no core fallback either since RFC cli#471 I5: no simulator
+    # launch, no forced backend — the plain no-provider verdict.
+    for args in (("build", "--platform=ios"), ("run", "--platform=ios")):
+        refused = run(*args, code=1)
+        assert NO_PROVIDER.format(t="ios") in refused.stderr, (args, refused.stderr)
+        untouched(refused, "ios")
+    # `android` (cli#405), the legacy `wasm serve|export` (RFC cli#466 PR B)
+    # and `ios` (RFC cli#471 I5) are no built-ins any more: each is a
+    # provider namespace like any other, so with no package declaring it the
+    # word is an unknown command and nothing is generated
+    # (test/provider_android_like_e2e.py covers the registry hint).
     for args in (("android", "build"), ("wasm", "serve", "--no-open"), ("wasm", "export"),
-                 ("wasm", "serve", "--no-build")):
+                 ("wasm", "serve", "--no-build"), ("ios", "build"), ("ios", "run")):
         refused = run(*args, code=1)
         assert f"labelle: unknown command '{args[0]}'" in refused.stderr, (args, refused.stderr)
         assert NO_PROVIDER.format(t=args[0]) not in refused.stderr, (args, refused.stderr)

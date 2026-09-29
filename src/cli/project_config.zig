@@ -7,10 +7,9 @@
 //! the CLI itself needs to read.
 //!
 //! Why the CLI needs *any* of the schema: a handful of CLI-retained
-//! commands (`build` / `run` / `upgrade` / the legacy iOS deploy path)
-//! parse `project.labelle` to drive orchestration the CLI owns —
-//! the compatibility-warning
-//! pass, the iOS `Info.plist` emission, lockfile
+//! commands (`build` / `run` / `upgrade`) parse `project.labelle` to
+//! drive orchestration the CLI owns — target-dir naming
+//! (`<backend>_<platform>`), the compatibility-warning pass, lockfile
 //! writing, docker target selection. None of that is code generation;
 //! it is the CLI deciding *which assembler subcommand to run and with
 //! what flags*, plus packaging steps the assembler never touches.
@@ -116,33 +115,6 @@ pub const PluginDep = struct {
             return self.repo["@".len..];
         return self.repo;
     }
-};
-
-// ── iOS Configuration ──────────────────────────────────────────────
-
-/// Screen-orientation policy of a platform config block that names one.
-///
-/// MIRRORED in labelle-assembler `src/config.zig` — `project.labelle` is
-/// parsed strictly there first, so both copies must learn a new value
-/// together or `generate` rejects the field before the CLI sees it (#341).
-pub const Orientation = enum {
-    portrait,
-    /// Landscape. Whether a 180° flip rotates the game is the packager's
-    /// choice: a platform may lock ONE landscape direction here and allow
-    /// both only for `.sensor_landscape`, or allow both for either value.
-    landscape,
-    /// Landscape only, but EITHER direction.
-    sensor_landscape,
-    all,
-};
-
-pub const IosConfig = struct {
-    app_name: []const u8 = "",
-    bundle_id: []const u8 = "",
-    team_id: []const u8 = "",
-    minimum_ios: []const u8 = "15.0",
-    orientation: Orientation = .all,
-    device_family: []const u8 = "1,2",
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
@@ -450,9 +422,6 @@ pub const ProjectConfig = struct {
     /// Game states for the state machine. First element is the initial state.
     states: []const []const u8 = &.{"running"},
 
-    /// iOS configuration — parsed from project.labelle `.ios` section.
-    ios: ?IosConfig = null,
-
     /// Pinned assembler version (RFC #122). When set, the CLI resolves the
     /// assembler binary from the cache instead of the paired default.
     assembler_version: ?[]const u8 = null,
@@ -521,41 +490,21 @@ test "AssetCompression.formatFor + default png" {
     try @import("std").testing.expectEqual(AssetFormat.png, m.formatFor(.wasm));
 }
 
-test "Orientation: every value parses from ZON on the .ios block" {
-    // Mirrors the assembler's parse test (labelle-assembler src/config.zig):
-    // the two copies of this enum must accept the identical value set, or a
-    // `project.labelle` that generates fine still fails when the CLI reads it.
-    // Arena, not `std.zon.parse.free`: the struct has `[]const u8` fields
-    // defaulting to a static `""`, which the testing allocator refuses to free.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    inline for (.{
-        .{ "portrait", Orientation.portrait },
-        .{ "landscape", Orientation.landscape },
-        .{ "sensor_landscape", Orientation.sensor_landscape },
-        .{ "all", Orientation.all },
-    }) |case| {
-        const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
-        const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
-        try std.testing.expectEqual(case[1], ios.orientation);
-    }
-
-    try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
-}
-
 test "a platform block the CLI no longer models still parses (the assembler owns its strictness)" {
-    // `.android` left the CLI (cli#405): its keys belong to the `android`
-    // provider's settings and the assembler's codegen. The CLI's lenient
-    // read (`config.zig`, `ignore_unknown_fields`) must keep accepting a
-    // project that still carries the block.
+    // `.android` left the CLI (cli#405) and `.ios` followed (cli#471 I5):
+    // their keys belong to the target providers' settings
+    // (`providers/<name>.json`, e.g. labelle-ios) and the assembler's
+    // codegen. The CLI's lenient read (`config.zig`,
+    // `ignore_unknown_fields`) must keep accepting a project that still
+    // carries either block, and simply ignores it.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src: [:0]const u8 =
-        \\.{ .name = "legacy", .android = .{ .package_name = "com.x.y", .orientation = .landscape, .immersive_mode = true } }
+        \\.{ .name = "legacy", .android = .{ .package_name = "com.x.y", .orientation = .landscape, .immersive_mode = true },
+        \\   .ios = .{ .app_name = "Legacy", .bundle_id = "com.x.y", .team_id = "ABCDE12345", .minimum_ios = "15.0", .orientation = .sensor_landscape, .device_family = "1,2" } }
     ;
     const cfg = try std.zon.parse.fromSliceAlloc(ProjectConfig, arena.allocator(), src, null, .{ .ignore_unknown_fields = true });
     try std.testing.expectEqualStrings("legacy", cfg.name);
     try std.testing.expect(!@hasField(ProjectConfig, "android"));
+    try std.testing.expect(!@hasField(ProjectConfig, "ios"));
 }
