@@ -171,7 +171,7 @@ const guide_three = "upgrading alone is not enough: the 3.0 CLI removed its buil
     "  export, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
 const guide_four = "upgrading alone is not enough: the 4.0 CLI needs assembler 0.118.0+ and moved the remaining platform\n" ++
     "  code into provider packages, so the project may need migrating too; see https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
-const guide_then_three = "\n  then the 3.0 steps (the browser toolchain moved to the web provider):\n" ++
+const guide_then_three = "\n  then the 3.0 steps (the browser toolchain moved into its provider package):\n" ++
     "  https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-3.0.md";
 const guide_then_four = "\n  then the 4.0 steps (assembler 0.118.0+, platform code in provider packages):\n" ++
     "  https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/migrating-to-4.0.md";
@@ -187,10 +187,10 @@ test "compat: a cli pin behind a breaking CLI line points at that line's migrati
     try std.testing.expect(migrationGuide(.{ .name = "cli", .pinned = "3.0.0", .curated = "3.1.0" }) == null);
     // Crossing 3.0 and 4.0 from 1.x: every crossed guide, in order.
     const from_one = migrationGuide(.{ .name = "cli", .pinned = "1.67.0", .curated = "4.0.0" }).?;
-    const i2 = std.mem.indexOf(u8, from_one, "migrating-to-2.0").?;
-    const i3 = std.mem.indexOf(u8, from_one, "migrating-to-3.0").?;
-    const i4 = std.mem.indexOf(u8, from_one, "migrating-to-4.0").?;
-    try std.testing.expect(i2 < i3 and i3 < i4);
+    const at_two = std.mem.indexOf(u8, from_one, "migrating-to-2.0").?;
+    const at_three = std.mem.indexOf(u8, from_one, "migrating-to-3.0").?;
+    const at_four = std.mem.indexOf(u8, from_one, "migrating-to-4.0").?;
+    try std.testing.expect(at_two < at_three and at_three < at_four);
     // Crossing 4.0 from 1.x or 2.x: the first guide, then the 4.0 steps.
     for ([_][]const u8{ "1.67.0", "2.1.1" }) |old| {
         const chained = migrationGuide(.{ .name = "cli", .pinned = old, .curated = "4.0.0" }).?;
