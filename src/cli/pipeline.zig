@@ -258,9 +258,9 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         r.beginPhase(.resolve, "resolving toolchain + packages");
     }
 
-    // Version compatibility, the pre-build hooks (#355) and the SDL2 env
-    // wiring (`install.preInstall`), scoped by the backend `describe` named.
-    const wants_sdl2 = try install.preInstall(allocator, project_dir, parsed, &parsed_args, backend_label);
+    // Version compatibility and the pre-build hooks (#355,
+    // `install.preInstall`).
+    try install.preInstall(allocator, project_dir, parsed, &parsed_args);
 
     // Issue #217: the CLI is a thin driver over the standalone
     // labelle-assembler binary. Resolved once (LABELLE_ASSEMBLER env var
@@ -465,7 +465,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
 
     // Provider hooks on `build` around the core build (`build.run`).
     const build_out = try provider_hooks.stepOutputDir(hook_arena, target_dir, .build, target.name, null);
-    if (try build.run(&cx, build_out, zig_args.items, zig_env_ptr, wants_sdl2)) |code| return code;
+    if (try build.run(&cx, build_out, zig_args.items, zig_env_ptr)) |code| return code;
 
     // `labelle bundle` (cli#359): the exe is built; wrap it
     // (`build.bundleStep`).

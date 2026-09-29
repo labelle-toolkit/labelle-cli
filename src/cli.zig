@@ -53,7 +53,6 @@ const provider_contract = @import("cli/provider_contract.zig");
 const provider_github = @import("cli/provider_github.zig");
 const provider_targets = @import("cli/provider_targets.zig");
 const doctor = @import("cli/doctor.zig");
-const sdl_provision = @import("cli/sdl_provision.zig");
 
 // Argument parsing lives in cli/args.zig (extracted so neither file
 // exceeds ~1000 lines). Alias the decls main/dispatch reference so their

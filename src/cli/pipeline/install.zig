@@ -14,7 +14,6 @@ const prebuild = @import("../prebuild.zig");
 const project_lock = @import("../project_lock.zig");
 const material_toolchain = @import("../material_toolchain.zig");
 const progress = @import("../progress.zig");
-const sdl_provision = @import("../sdl_provision.zig");
 const args_mod = @import("../args.zig");
 const provider_dispatch = @import("../provider_dispatch.zig");
 const provider_github = @import("../provider_github.zig");
@@ -24,9 +23,10 @@ const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const HookPlans = @import("context.zig").HookPlans;
 const ParsedArgs = args_mod.ParsedArgs;
 
-/// Version compatibility, the `.prebuild` steps and the SDL2 env wiring:
-/// everything between the progress feed's start and the assembler
-/// resolution. Returns whether the build wants SDL2 (`wants_sdl2`).
+/// Version compatibility and the `.prebuild` steps: everything between the
+/// progress feed's start and the assembler resolution. A desktop build's
+/// system libraries are its providers' business (the `env` hooks), not the
+/// core's (cli#471 S4).
 /// The managed-Python PATH wiring the `.prebuild` steps get (see
 /// `preInstall`): only when steps will actually run, so a project without
 /// `.prebuild` — or `LABELLE_NO_PREBUILD=1` — stays inert. Shared with a
@@ -38,7 +38,7 @@ pub fn wirePrebuildPython(allocator: std.mem.Allocator, steps: []const prebuild.
     }
 }
 
-pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed: project_config.ProjectConfig, parsed_args: *const ParsedArgs, backend: []const u8) !bool {
+pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed: project_config.ProjectConfig, parsed_args: *const ParsedArgs) !void {
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
 
@@ -77,9 +77,8 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     // Nothing else a hook could reasonably need is wired later. The managed
     // Zig toolchain is spawned by absolute path and never joins PATH at all;
     // a provider's toolchain reaches the build through its hooks' environment
-    // contributions; and `sdl_provision.autoWireEnv` (just below) sets a
-    // Windows link/runtime variable consumed by `zig build`, not a tool a
-    // generator spawns.
+    // contributions (a system library too: the core provisions none,
+    // cli#471 S4).
     wirePrebuildPython(allocator, parsed.prebuild);
 
     // Inside a hook or prebuild step of a command holding this project's
@@ -91,19 +90,6 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     try prebuild.runAll(allocator, project_dir, parsed.prebuild, .{
         .route_stdout_to_stderr = parsed_args.progress_mode == .json,
     });
-
-    // Auto-wire a cache-provisioned SDL2 (`labelle doctor --fix`) into the
-    // build/run environment so desktop games that need it link + run without
-    // the user setting LABELLE_SDL2_LIB by hand. No-op when SDL2 isn't in the
-    // cache or the user already set the var. Scoped like `labelle doctor`,
-    // by the backend package `describe` named (`backend`, cli#471 D4) and
-    // the gamepad opt-out: `sdl_provision.Needs` says which backends pull
-    // SDL2 in.
-    const wants_sdl2 = sdl_provision.Needs.of(backend, parsed.gamepad == .none).any();
-    if (parsed.platform == .desktop and wants_sdl2) {
-        sdl_provision.autoWireEnv(allocator);
-    }
-    return wants_sdl2;
 }
 
 /// Cold-path stage order (cli#387 gap 3): the shader-compiler override gate
