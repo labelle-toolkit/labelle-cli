@@ -12,7 +12,7 @@
 //! The append lives in the backend repo, so the CLI cannot stop it. What
 //! the CLI CAN do is finish the job after the run: the vendored stb
 //! single-headers already decode and encode the formats involved
-//! (`src/cli/stb_image_impl.c`), so a `.tga` capture is re-encoded to the
+//! (`vendor/stb/stb_image_impl.c`), so a `.tga` capture is re-encoded to the
 //! PNG the user asked for and the intermediate is removed. When the two
 //! formats already agree (`--screenshot=shot.tga` → `shot.tga.tga`) the
 //! file is simply moved onto the requested path — no re-encode.

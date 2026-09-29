@@ -101,7 +101,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `cli/args_tests.zig`, `cli/assembler_proc.zig`, `cli/compatibility.zig`
 /// (its backend whitelist deleted, D13), `cli/help.zig`, `cli/install.zig`,
 /// `cli/launcher_manifest.zig`, `cli/python_provision.zig` and
-/// `cli/runner.zig` came clean: 18 entries.
+/// `cli/runner.zig` came clean: 18 entries. RFC cli#471 X2 moved the
+/// vendored stb single-headers to `vendor/stb/` (third-party code lives
+/// outside `src/`), taking `cli/stb_image.h`'s upstream comment with it:
+/// 17 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -127,7 +130,6 @@ const allowed_files = [_][]const u8{
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
     "cli/sdl_provision.zig",
-    "cli/stb_image.h",
     "cli/upgrade.zig",
 };
 
