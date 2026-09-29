@@ -78,8 +78,9 @@ copies `SDL2.dll` beside the game. Any of these replaces it:
 
 Without any of them, a Windows build that needs SDL2 stops with one line:
 `SDL2 not found: set LABELLE_SDL2_LIB or use .gamepad = .none`.
-`labelle doctor` prints the same advice when the project links SDL2 and
-doesn't list `sdl2`.
+The core `labelle doctor` no longer mentions SDL2: `labelle sdl2 doctor`
+reports it, and a plain `labelle doctor` runs that too once the project
+lists `sdl2`.
 
 ## 4. Also changed
 
@@ -97,8 +98,10 @@ doesn't list `sdl2`.
   block is used instead of the conservative one.
 - **`.platform`** must be an enum literal (`.platform = .desktop`); the CLI
   reads it as a target name.
-- **`labelle doctor --fix`** has nothing left to fix in the core. Use each
-  provider's `labelle <namespace> doctor --fix`.
+- **`labelle doctor --fix`** has nothing left to fix in the core. It is
+  forwarded to every provider doctor, as `labelle <namespace> doctor --fix`
+  (`--json --fix` too). A provider's `doctor` must accept `--fix`, ignoring
+  it when it has nothing to fix; one that rejects it fails its own check.
 - **`labelle test`** always runs the generated tests in `.labelle/tests/`.
 - **`--docker`** refuses macOS targets, including a bare `--docker` on a Mac
   (since 3.1). Linux and Windows cross builds are unchanged.
