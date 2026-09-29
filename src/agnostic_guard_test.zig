@@ -221,18 +221,31 @@ fn stripPrefix(run: []const u8) ?[]const u8 {
 /// letter or digit followed by an uppercase one (`getSDL`, `Sdl2Provision`),
 /// or the last letter of an uppercase run when a lowercase letter follows
 /// it (`SDL|Path`). Digits never start a piece, so `sdl2` and `win32` stay
-/// whole. A run that opens with one lowercase letter and then two or more
-/// uppercase ones is a lowercase-leading acronym (`iOS`, `iOSConfig`): no
-/// boundary after its first letter, so it splits as `iOS|Config`, not
-/// `i|OS|Config`. Only the first piece of a run can open with a lowercase
-/// letter (every later piece starts at an uppercase one), so `start` is the
-/// run's start whenever that rule can fire.
+/// whole. A piece that opens with `iOS` is the lowercase-leading acronym
+/// (`iOS`, `iOSConfig`): no boundary after its `i`, so it splits as
+/// `iOS|Config`, not `i|OS|Config`. Only that literal: any other one-letter
+/// lowercase prefix before capitals is ordinary camelCase (`x|SDL|Config`,
+/// `p|WGPU|Device`), so the acronym keeps its own piece. The same acronym
+/// embedded after a lowercase prefix (`getiOSConfig`, `getiOsConfig`) opens
+/// its own piece: a boundary falls before an `i` that follows a lowercase
+/// letter and starts `iOS` or `iOs`, so the run splits as `get|iOS|Config`
+/// (or `get|i|Os|Config`, which the tokenizer's joins read back as `iOs`).
+/// An `i` ending a word before another acronym (`apiSDLConfig`) is not split
+/// off. That `i` is the only lowercase letter that starts a piece; every
+/// other piece starts at an uppercase one. Deliberately strict: a word
+/// ending in `i` before a generic `OS` (`multiOSConfig`) spells the same
+/// letters as `getiOSConfig` and is read as `iOS` too. The guard cannot tell
+/// the two apart, and a false finding is cheaper than a missed platform name;
+/// write such a name another way (`multi_os_config`, `MultiOperatingSystem`).
 fn splitsBefore(text: []const u8, start: usize, i: usize) bool {
     const prev = text[i - 1];
     const cur = text[i];
+    if (cur == 'i' and std.ascii.isLower(prev) and i + 2 < text.len and
+        text[i + 1] == 'O' and (text[i + 2] == 'S' or text[i + 2] == 's')) return true;
     if (!std.ascii.isUpper(cur)) return false;
     if (std.ascii.isLower(prev)) {
-        const leading_acronym = i == start + 1 and i + 1 < text.len and std.ascii.isUpper(text[i + 1]);
+        const leading_acronym = i == start + 1 and prev == 'i' and cur == 'O' and
+            i + 1 < text.len and text[i + 1] == 'S';
         return !leading_acronym;
     }
     if (std.ascii.isDigit(prev)) return true;
@@ -404,6 +417,14 @@ test "the tokenizer keeps lowercase-leading acronyms whole" {
     try expectWords("const iOSConfig = struct {};", &.{"ios"});
     // A one-letter lowercase prefix before a single capital is ordinary camelCase.
     try expectWords("getSDLPath aSdl", &.{ "sdl", "sdl" });
+    // Embedded after a lowercase prefix: `get|iOS|Config`, `get|i|Os|Config`.
+    try expectWords("getiOSConfig isiOSApp hasiOS getiOsConfig", &.{ "ios", "ios", "ios", "ios" });
+    // Only `iOS` keeps a one-letter prefix; other acronyms keep their own piece.
+    try expectWords("apiSDLConfig taxiWASM xSDLConfig pWGPUDevice iSDLPath", &.{ "sdl", "wasm", "sdl", "wgpu", "sdl" });
+    try expectWords("apiURL multiIO", &.{});
+    // Deliberately strict: a word ending in `i` before `OS` reads as `iOS`.
+    try expectWords("multiOSConfig", &.{"ios"});
+    try expectWords("multi_os_config MultiOperatingSystem", &.{});
     // Neither an all-lowercase run nor a capitalised `Io` is the platform.
     try expectWords("iostream std.Io IoReader Io", &.{});
     // Host OS names keep passing under the whole-run rule too.
