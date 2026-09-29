@@ -23,21 +23,6 @@ const install_zig = "apt-get update -qq > /dev/null && " ++
     "curl -fsSL https://ziglang.org/download/" ++ ZIG_VERSION ++ "/zig-x86_64-linux-" ++ ZIG_VERSION ++ ".tar.xz | tar -xJ -C /opt > /dev/null && " ++
     "ln -sf /opt/zig-x86_64-linux-" ++ ZIG_VERSION ++ "/zig /usr/local/bin/zig";
 
-// Shell snippet that locates or fetches xcode-frameworks, then patches build.zig
-// to add framework/include/lib search paths for macOS cross-compilation.
-const setup_xcode_frameworks =
-    "XCODE_PKG=$(find /root/.cache/zig/p/ -maxdepth 2 -name 'AppKit.framework' -path '*/Frameworks/*' 2>/dev/null | head -1 | sed 's|/Frameworks/AppKit.framework||') && " ++
-    "if [ -z \"$XCODE_PKG\" ]; then " ++
-    "apt-get install -y -qq git > /dev/null && " ++
-    "git clone --depth 1 https://github.com/Corendos/xcode-frameworks.git /tmp/xcode-fw > /dev/null 2>&1 && " ++
-    "cd /tmp/xcode-fw && git fetch --depth 1 origin 9a45f3ac977fd25dff77e58c6de1870b6808c4a7 > /dev/null 2>&1 && git checkout FETCH_HEAD > /dev/null 2>&1 && cd - > /dev/null && " ++
-    "XCODE_PKG=/tmp/xcode-fw; fi && " ++
-    "if [ -n \"$XCODE_PKG\" ] && grep -q 'exe.root_module.linkLibrary' build.zig; then " ++
-    "sed -i \"1s|^|// xcode-frameworks injected by labelle --docker\\n|\" build.zig && " ++
-    "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addFrameworkPath(.{ .cwd_relative = \\\"$XCODE_PKG/Frameworks\\\" });\" build.zig && " ++
-    "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addSystemIncludePath(.{ .cwd_relative = \\\"$XCODE_PKG/include\\\" });\" build.zig && " ++
-    "sed -i \"/exe.root_module.linkLibrary/i\\\\    exe.root_module.addLibraryPath(.{ .cwd_relative = \\\"$XCODE_PKG/lib\\\" });\" build.zig; fi";
-
 /// Recursively copy a directory tree. `src` and `dst` are absolute paths.
 ///
 /// Nested symlinks (links *inside* the copied tree) are reproduced as
@@ -192,9 +177,9 @@ fn sanitizeTarget(allocator: std.mem.Allocator, target: []const u8) ![]u8 {
     return sanitized;
 }
 
-/// Run `zig build` inside a Docker container with inherited stdio.
-/// For macOS targets, shares the Zig cache and injects xcode-frameworks paths.
-/// Returns the exit code of the docker process.
+/// Run `zig build` inside a Docker container with inherited stdio, sharing
+/// the host Zig cache. macOS targets never get here: argument parsing refuses
+/// them (cli#471 X3). Returns the exit code of the docker process.
 pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, target_override: ?[]const u8, optimize: ?[]const u8) !u8 {
     const abs_target = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), target_dir, allocator);
     defer allocator.free(abs_target);
@@ -228,14 +213,6 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, target_ove
     const effective_cmd = try std.fmt.allocPrint(allocator, "zig build -Dtarget={s}{s}", .{ effective_target, optimize_part orelse "" });
     defer allocator.free(effective_cmd);
 
-    // Only set up xcode-frameworks when the effective target is macOS.
-    const is_macos_target = std.mem.indexOf(u8, effective_target, "macos") != null;
-
-    const macos_setup: []const u8 = if (is_macos_target)
-        setup_xcode_frameworks ++ " && "
-    else
-        "";
-
     // Fix fingerprint: run build once to get the error, patch if needed, then build for real.
     // Only re-runs the build if a fingerprint was actually found and patched.
     const script = try std.fmt.allocPrint(
@@ -244,9 +221,8 @@ pub fn runBuild(allocator: std.mem.Allocator, target_dir: []const u8, target_ove
             "BUILD_OUT=$({s} 2>&1 || true) && " ++
             "FP=$(echo \"$BUILD_OUT\" | grep 'use this value:' | head -1 | sed 's/.*use this value: //') && " ++
             "if [ -n \"$FP\" ]; then sed -i \"s|.fingerprint = .*,|.fingerprint = $FP,|\" build.zig.zon; fi && " ++
-            "{s}" ++
             "{s}",
-        .{ install_zig, subdir, effective_cmd, macos_setup, effective_cmd },
+        .{ install_zig, subdir, effective_cmd, effective_cmd },
     );
     defer allocator.free(script);
 

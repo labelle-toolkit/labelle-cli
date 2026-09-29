@@ -416,6 +416,39 @@ pub const ParseRunArgsPassthroughSpec = struct {
             var pa = ParsedArgs{ .command = .run };
             try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
         }
+        test "`--docker --target=<arch>-macos` is refused; Windows stays (cli#471 X3)" {
+            {
+                var iter = testIter("--docker --target=aarch64-macos");
+                defer iter.deinit();
+                var pa = ParsedArgs{ .command = .run };
+                try std.testing.expect(parseRunArgs(&iter, "run", true, &pa) == null);
+            }
+            {
+                var iter = testIter("--docker --target=x86_64-windows");
+                defer iter.deinit();
+                var pa = ParsedArgs{ .command = .run };
+                const r = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+                try std.testing.expectEqualStrings("x86_64-windows", r.docker_target.?);
+            }
+            {
+                // `generate --docker` generates on the host: never refused.
+                var iter = testIter("--docker --target=aarch64-macos");
+                defer iter.deinit();
+                _ = parseDirAndScene(&iter, "generate") orelse return error.TestFailed;
+            }
+            {
+                var iter = testIter("--docker --target=aarch64-macos.13.0");
+                defer iter.deinit();
+                try std.testing.expect(parseDirAndScene(&iter, "build") == null);
+            }
+            {
+                // Without --docker, --target is a warned no-op, not a refusal.
+                var iter = testIter("--target=aarch64-macos");
+                defer iter.deinit();
+                var pa = ParsedArgs{ .command = .run };
+                _ = parseRunArgs(&iter, "run", true, &pa) orelse return error.TestFailed;
+            }
+        }
     };
 
     pub const no_separator = struct {

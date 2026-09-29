@@ -135,7 +135,10 @@ labelle: --docker builds the `desktop` target only; target 'wasm' comes from a p
 ```
 
 Build those targets without `--docker`. `labelle build --docker
-[--target=<triple>]` for `desktop` is unchanged.
+[--target=<triple>]` for `desktop` is unchanged for Linux and Windows
+targets. Since cli#471 X3 a macOS target is refused, whether given as
+`--target=<arch>-macos` or taken from a Mac host when `--target` is
+omitted: the container cannot link macOS, so build natively on a Mac.
 
 ## `labelle doctor`
 
