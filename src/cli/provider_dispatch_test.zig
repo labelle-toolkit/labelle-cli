@@ -386,6 +386,48 @@ test "provider dispatch: survey reports a pinned provider with no cached archive
     try std.testing.expectEqualStrings("pkg-b", found.unresolved[0]);
 }
 
+test "provider dispatch: a remote repo the host cannot name is reported, never probed (#496)" {
+    // The REAL probe path: on Windows (windows-latest CI) this panicked with
+    // OBJECT_NAME_INVALID in `Dir.access` before the guard; now the
+    // resolver refuses the `git+https:` spelling first.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = config.globalIo();
+    try tmp.dir.createDirPath(io, "project");
+    try tmp.dir.createDirPath(io, "pkg-a");
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    asm_cache.setCacheRootOverride(try tmp.dir.realPathFileAlloc(io, ".", a));
+    defer asm_cache.clearCacheRootOverride();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg-a/plugin.labelle", .data = ".{ .name = \"pkg-a\", .manifest_version = 2, .command_contract = \">=1.0.0 <2.0.0\", .namespace = \"alpha\", .commands = .{ .{ .name = \"doctor\", .build_step = \"t\", .executable = \"bin/t\", .help = \"h\" } } }" });
+    const cfg: project.ProjectConfig = .{ .name = "game", .plugins = &.{
+        .{ .name = "rem", .repo = "git+https://github.com/example/rem", .version = "1.0.0" },
+        .{ .name = "pkg-a", .repo = "local:../pkg-a", .version = "1.0.0" },
+    } };
+    var sources: github.Sources = .{ .a = a };
+    defer sources.deinit();
+    const found = try survey(a, root, cfg, &sources);
+    // The readable provider is unaffected either way.
+    try std.testing.expectEqual(@as(usize, 1), found.providers.len);
+    try std.testing.expectEqualStrings("pkg-a", found.providers[0].meta.name);
+    try std.testing.expectEqualStrings("rem", found.unresolved[0]);
+    if (builtin.os.tag == .windows) {
+        // Refused by the path builder: an unavailable package, with the cause.
+        try std.testing.expectEqual(@as(usize, 1), found.unavailable.len);
+        try std.testing.expectEqualStrings("rem", found.unavailable[0].package);
+        try std.testing.expectEqual(@as(anyerror, error.UnusableCachePath), found.unavailable[0].err);
+        // Plain discovery fails with the same error instead of panicking.
+        try std.testing.expectError(error.UnusableCachePath, discoverAll(a, root, cfg, &sources, .unknown));
+    } else {
+        // POSIX can name it: probed, not cached, so merely unread.
+        try std.testing.expectEqual(@as(usize, 0), found.unavailable.len);
+        const plain = try discoverAll(a, root, cfg, &sources, .unknown);
+        try std.testing.expectEqualStrings("rem", plain.unresolved[0]);
+    }
+}
+
 test "provider dispatch: own-settings resolution opens only the selected provider's file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
