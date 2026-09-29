@@ -169,7 +169,17 @@ fn discoverImpl(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConf
                 continue;
             } else return err,
         };
-        const dir = pinned orelse try plugins.resolvePluginDir(a, root, dep);
+        const dir = pinned orelse plugins.resolvePluginDir(a, root, dep) catch |err| switch (err) {
+            // A repo/version the host cannot name (#496): the resolver has
+            // printed why. Never probed — on Windows the probe would panic —
+            // so the survey reports it like any other package it cannot read.
+            error.UnusableCachePath => if (lists) |l| {
+                try l.unavailable.append(a, .{ .package = dep.name, .err = err });
+                try unresolved.append(a, dep.name);
+                continue;
+            } else return err,
+            else => return err,
+        };
         if (pinned == null and !dep.isLocal()) {
             std.Io.Dir.cwd().access(config.globalIo(), dir, .{}) catch |err| switch (err) {
                 error.FileNotFound => switch (cache_state) {

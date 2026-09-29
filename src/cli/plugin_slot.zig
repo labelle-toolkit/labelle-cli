@@ -24,19 +24,41 @@
 //! assembler running inside that monorepo — a question the CLI cannot
 //! answer, and one the released binary it runs answers "no" to.
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config.zig");
 const project_config = @import("project_config.zig");
 const asm_cache = @import("asm_cache.zig");
+const path_key = @import("plugin_path_key.zig");
 
 /// The cached plugin directory for a REMOTE dep: `<archive>/<subdir>`.
 /// Overrides are not consulted here — `applyOverrides` has already made an
 /// overridden dep local. Caller owns the returned slice.
+///
+/// `error.UnusableCachePath` (after one diagnostic line on stderr) when the
+/// repo, version or subdir holds a byte the host cannot put in a path (#496):
+/// on Windows such a path would make `Dir.access` & co. panic instead of
+/// failing. The archive slot comes from `plugin_path_key`, the mirror of the
+/// assembler's builder, so the two still agree on every usable spelling.
 pub fn resolveRemotePlugin(allocator: std.mem.Allocator, dep: project_config.PluginDep) ![]const u8 {
+    return resolveRemotePluginFor(allocator, builtin.os.tag, dep);
+}
+
+/// `resolveRemotePlugin` judged by `os`'s file-name rules (tests pin it).
+pub fn resolveRemotePluginFor(allocator: std.mem.Allocator, os: std.Target.Os.Tag, dep: project_config.PluginDep) ![]const u8 {
     const packages_dir = try asm_cache.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
+    const archive = path_key.pluginCachePathFor(allocator, os, packages_dir, dep.repo, dep.version) catch |err| {
+        if (err == error.UnusableCachePath) path_key.report(dep.repo, dep.version);
+        return err;
+    };
     const sub = std.mem.trimEnd(u8, dep.subdir, "/\\");
-    if (sub.len == 0) return std.fs.path.join(allocator, &.{ packages_dir, "plugins", dep.repo, dep.version });
-    return std.fs.path.join(allocator, &.{ packages_dir, "plugins", dep.repo, dep.version, sub });
+    if (sub.len == 0) return archive;
+    defer allocator.free(archive);
+    if (path_key.firstBadByte(sub, os)) |_| {
+        std.debug.print("labelle: plugin '{s}': '.subdir = \"{s}\"' cannot be used as a cache path: it contains a character {s} does not allow in a file name\n", .{ dep.name, dep.subdir, @tagName(os) });
+        return error.UnusableCachePath;
+    }
+    return std.fs.path.join(allocator, &.{ archive, sub });
 }
 
 /// Undo `applyOverrides`: every dep back to its committed declaration.
@@ -237,4 +259,52 @@ test "plugin slot: an EXPLICIT override wins, a discovered one or a dead source 
     const fallback = try resolveRemotePlugin(a, debug_dep);
     defer a.free(fallback);
     try testing.expect(std.mem.endsWith(u8, fallback, "plugins/debug"));
+}
+
+test "plugin slot: an unnameable repo/version/subdir is refused before any path exists, the layout is unchanged otherwise (#496)" {
+    _ = path_key;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(&tmp, a);
+    defer a.free(root);
+    asm_cache.setCacheRootOverride(root);
+    defer asm_cache.clearCacheRootOverride();
+
+    var git = debug_dep;
+    git.repo = "git+https://github.com/labelle-toolkit/labelle-assembler";
+    // Windows' rules: refused whatever the host is — the ':' would make
+    // `Dir.access` panic with OBJECT_NAME_INVALID there.
+    try testing.expectError(error.UnusableCachePath, resolveRemotePluginFor(a, .windows, git));
+    var bad_version = debug_dep;
+    bad_version.version = "1.0|2";
+    try testing.expectError(error.UnusableCachePath, resolveRemotePluginFor(a, .windows, bad_version));
+    var bad_sub = debug_dep;
+    bad_sub.subdir = "plugins/de:bug";
+    try testing.expectError(error.UnusableCachePath, resolveRemotePluginFor(a, .windows, bad_sub));
+
+    // POSIX can name it: the same verbatim join as before, subdir included.
+    const posix = try resolveRemotePluginFor(a, .linux, git);
+    defer a.free(posix);
+    const want = try std.fs.path.join(a, &.{ root, "packages", "plugins", git.repo, "0.118.0", "plugins/debug" });
+    defer a.free(want);
+    try testing.expectEqualStrings(want, posix);
+
+    // A usable spelling resolves to the byte-identical slot on every OS.
+    inline for (.{ std.Target.Os.Tag.windows, .linux, .macos }) |os| {
+        const got = try resolveRemotePluginFor(a, os, debug_dep);
+        defer a.free(got);
+        const old = try std.fs.path.join(a, &.{ root, "packages", "plugins", debug_dep.repo, debug_dep.version, "plugins/debug" });
+        defer a.free(old);
+        try testing.expectEqualStrings(old, got);
+    }
+
+    // The host entry point applies the host's rule.
+    if (builtin.os.tag == .windows) {
+        try testing.expectError(error.UnusableCachePath, resolveRemotePlugin(a, git));
+    } else {
+        const host = try resolveRemotePlugin(a, git);
+        defer a.free(host);
+        try testing.expectEqualStrings(want, host);
+    }
 }
