@@ -25,7 +25,10 @@ pub const Context = struct {
     parsed: project_config.ProjectConfig,
     project_dir: []const u8,
     hook_arena: std.mem.Allocator,
+    /// The generated target dir's name and the backend package's name, as
+    /// `labelle-assembler describe` answered them (cli#471 D3/D4).
     target_name: []const u8,
+    backend_name: []const u8,
     target_dir: []const u8,
     output_dir: []const u8,
     reporter: ?*progress.Reporter,

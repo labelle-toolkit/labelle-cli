@@ -41,6 +41,9 @@ const progress = @import("progress.zig");
 /// `minProtocolFor` instead of bumping this.
 pub const MIN_PROTOCOL: u32 = 3;
 
+/// The first assembler protocol with `describe` and `generate --target`.
+pub const describe_protocol: u32 = 7;
+
 /// Per-subcommand minimum protocol. Most subcommands need only the global
 /// floor (`MIN_PROTOCOL`); a subcommand that depends on an assembler feature
 /// added after the paired default declares a higher minimum here. Modelling
@@ -49,11 +52,23 @@ pub const MIN_PROTOCOL: u32 = 3;
 /// existing commands or the auto-downloaded default.
 ///
 /// Extensible: adding a new gated subcommand is a one-line entry here.
+///
+/// `generate` and `describe` need protocol 7 (RFC cli#471 D4): the CLI no
+/// longer knows any backend, so the generated target dir, the backend's
+/// name and whether it supports the target come only from `describe`, and
+/// `generate` takes the target through `--target`. The paired default
+/// (`DEFAULT_ASSEMBLER_VERSION`) speaks it; an older project pin is refused
+/// with one line naming `labelle upgrade assembler`.
 fn minProtocolFor(subcommand: []const u8) u32 {
     const Gate = struct { name: []const u8, min: u32 };
     const gates = [_]Gate{
         .{ .name = "add", .min = 4 }, // Packs scaffold (#271)
         .{ .name = "check", .min = 5 }, // Packs §6 lint (#273)
+        .{ .name = "generate", .min = describe_protocol }, // cli#471 D4
+        .{ .name = "describe", .min = describe_protocol }, // cli#471 D1/D4
+        // Not a subcommand: `upgrade backend [ver]` (cli#471 D2), which
+        // `labelle upgrade` resolves the assembler under before delegating.
+        .{ .name = "upgrade backend", .min = describe_protocol },
     };
     for (gates) |g| {
         if (std.mem.eql(u8, g.name, subcommand)) return g.min;
@@ -146,7 +161,7 @@ fn checkProtocol(allocator: std.mem.Allocator, path: []const u8, subcommand: []c
     };
     if (proto < required) {
         std.debug.print(
-            "labelle: '{s}' needs assembler protocol >= {d}, but '{s}' speaks {d} — pin a newer 'assembler_version' in project.labelle\n",
+            "labelle: '{s}' needs assembler protocol >= {d}, but '{s}' speaks {d} — run `labelle upgrade assembler` (or pin a newer 'assembler_version' in project.labelle)\n",
             .{ subcommand, required, path, proto },
         );
         return error.AssemblerFailed;
@@ -179,9 +194,9 @@ pub fn runSubcommand(
 /// the CLI owns docker orchestration, the watch supervision, the legacy
 /// deploy path and `--timeout`; only the generation step is delegated.
 ///
-/// `platform` / `backend` are forwarded as plain strings (`@tagName` of
-/// the CLI's enums) so this module needs no dependency on the assembler's
-/// type definitions. The assembler validates them against its own enums.
+/// The target is forwarded as a plain string (`--target`, protocol 7); the
+/// assembler validates it. No backend is forwarded (RFC cli#471 D4): the
+/// assembler reads the project's own `.backend` / `.backend_package`.
 ///
 /// The `--scene` flag is *not* forwarded to the assembler: PR #243 (cli#229
 /// follow-through) removed the CLI's `cfg.initial_prefab` rewrite, but the
@@ -198,13 +213,12 @@ pub fn generate(
     asm_bin: Assembler,
     allocator: std.mem.Allocator,
     project_dir: []const u8,
-    platform: []const u8,
-    backend: []const u8,
+    target: []const u8,
 ) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try buildGenerateArgs(allocator, &args, project_dir, platform, backend);
+    try buildGenerateArgs(allocator, &args, project_dir, target);
 
     try asm_bin.run(allocator, "generate", args.items);
 }
@@ -218,15 +232,12 @@ fn buildGenerateArgs(
     allocator: std.mem.Allocator,
     args: *std.ArrayList([]const u8),
     project_dir: []const u8,
-    platform: []const u8,
-    backend: []const u8,
+    target: []const u8,
 ) !void {
     try args.appendSlice(allocator, &.{ "--project-root", project_dir });
-    // Always forward platform/backend — the CLI may have mutated them
-    // (a legacy platform subcommand forces its own backend and platform)
-    // and the binary must not re-derive its own values from project.labelle.
-    try args.appendSlice(allocator, &.{ "--platform", platform });
-    try args.appendSlice(allocator, &.{ "--backend", backend });
+    // Always forward the RESOLVED target (`--platform=<t>` may differ from
+    // what project.labelle declares). Never a backend (RFC cli#471 D4).
+    try args.appendSlice(allocator, &.{ "--target", target });
 }
 
 const expect = @import("zspec").expect;
@@ -252,7 +263,7 @@ pub const BuildGenerateArgsSpec = struct {
             var args: std.ArrayList([]const u8) = .empty;
             defer args.deinit(allocator);
 
-            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "probe-backend");
+            try buildGenerateArgs(allocator, &args, "/proj", "desktop");
 
             for (args.items) |a| {
                 try std.testing.expect(!std.mem.eql(u8, a, "--scene"));
@@ -260,18 +271,17 @@ pub const BuildGenerateArgsSpec = struct {
         }
     };
 
-    pub const forwards_project_platform_backend = struct {
-        test "argv carries --project-root, --platform, --backend" {
+    pub const forwards_project_and_target = struct {
+        test "argv carries --project-root and --target, never --backend (cli#471 D4)" {
             const allocator = std.testing.allocator;
             var args: std.ArrayList([]const u8) = .empty;
             defer args.deinit(allocator);
 
-            try buildGenerateArgs(allocator, &args, "/proj", "desktop", "probe-backend");
+            try buildGenerateArgs(allocator, &args, "/proj", "desktop");
 
             const expected: []const []const u8 = &.{
                 "--project-root", "/proj",
-                "--platform",     "desktop",
-                "--backend",      "probe-backend",
+                "--target",       "desktop",
             };
             try std.testing.expectEqual(expected.len, args.items.len);
             for (expected, args.items) |want, got| {
@@ -301,12 +311,15 @@ pub const MinProtocolForSpec = struct {
         }
     };
 
-    pub const floor_commands = struct {
-        test "generate accepts the global floor (3)" {
-            try std.testing.expectEqual(MIN_PROTOCOL, minProtocolFor("generate"));
-            try std.testing.expectEqual(@as(u32, 3), minProtocolFor("generate"));
+    pub const describe_gates = struct {
+        test "generate and describe require protocol 7 (cli#471 D4)" {
+            try std.testing.expectEqual(@as(u32, 7), minProtocolFor("generate"));
+            try std.testing.expectEqual(@as(u32, 7), minProtocolFor("describe"));
+            try std.testing.expectEqual(@as(u32, 7), minProtocolFor("upgrade backend"));
         }
+    };
 
+    pub const floor_commands = struct {
         test "install/clean/upgrade/init stay at the floor" {
             for ([_][]const u8{ "install", "clean", "upgrade", "init" }) |cmd| {
                 try std.testing.expectEqual(MIN_PROTOCOL, minProtocolFor(cmd));
@@ -321,10 +334,11 @@ pub const MinProtocolForSpec = struct {
     };
 
     pub const gate_exceeds_floor = struct {
-        test "a protocol-3 binary would be rejected for add but not generate" {
+        test "a protocol-3 binary would be rejected for add and generate but not install" {
             const proto: u32 = 3;
             try std.testing.expect(proto < minProtocolFor("add"));
-            try std.testing.expect(proto >= minProtocolFor("generate"));
+            try std.testing.expect(proto < minProtocolFor("generate"));
+            try std.testing.expect(proto >= minProtocolFor("install"));
         }
     };
 };

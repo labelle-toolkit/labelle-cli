@@ -425,12 +425,9 @@ pub const Replanner = struct {
         const a = next.arena.allocator();
         var cfg = try next.read(self.project_dir);
         const digest = next.digest;
-        const file_backend = @tagName(cfg.backend);
-        // The target's platform and backend are the pipeline's resolved
-        // ones (a command may override what the file declares); a session
-        // compares the file's own values against its key.
+        // The target's platform is the pipeline's resolved one (a command
+        // may override what the file declares).
         cfg.platform = ctx.hooks.cfg.platform;
-        cfg.backend = ctx.hooks.cfg.backend;
         // An edited `project.labelle` may declare a package the startup
         // install never fetched and the startup lock never pinned: install
         // first, as the cold pipeline does ahead of discovery (Codex P2 on
@@ -458,7 +455,10 @@ pub const Replanner = struct {
         const build_plan = try provider_hooks.plan(a, providers, .build, ctx.hooks.target);
         const run_plan = try provider_hooks.plan(a, providers, .run, ctx.hooks.target);
         if (self.session) |key| {
-            const replanned = try SessionKey.of(a, ctx.hooks.root, cfg, run_plan, file_backend, ctx.hooks.target, key.target_follows_file, wire_optimize);
+            // The backend as the assembler resolves the file NOW (cli#471
+            // D4): the CLI reads no `.backend` of its own.
+            const backend = (try self.describer.require(a, ctx.hooks.target)).backend.name;
+            const replanned = try SessionKey.of(a, ctx.hooks.root, cfg, run_plan, backend, ctx.hooks.target, key.target_follows_file, wire_optimize);
             if (key.changed(replanned)) |what| return SessionKey.report(what);
         }
         // The core generation's gate, as the cold pipeline applies it
@@ -506,11 +506,11 @@ pub const Replanner = struct {
     /// tests.
     pub fn generateGate(describer: assembler_describe.Describer, a: std.mem.Allocator, target: []const u8, resolved: provider_targets.Resolved, replaced: bool) !void {
         if (resolved.legacy == null or replaced) return;
-        const described = describer.query(a, target);
+        const described = try describer.require(a, target);
         switch (coreGenerateGate(true, false, described)) {
             .proceed, .no_schema_target => {},
             .unsupported => |reason| {
-                std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ described.?.backend.name, target, reason });
+                std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ described.backend.name, target, reason });
                 return error.BackendUnsupportedTarget;
             },
         }
@@ -564,14 +564,16 @@ pub const Replanner = struct {
             self.dropStaged();
             return err;
         };
-        if (self.session) |key| if (key.configChanged(cfg)) |what| return SessionKey.report(what);
+        if (self.session) |key| {
+            const backend = (try self.describer.require(next.arena.allocator(), ctx.hooks.target)).backend.name;
+            if (key.configChanged(cfg, backend)) |what| return SessionKey.report(what);
+        }
         ctx.prebuild_steps = cfg.prebuild;
 
         var scratch = std.heap.ArenaAllocator.init(self.backing);
         defer scratch.deinit();
         const a = scratch.allocator();
         cfg.platform = ctx.hooks.cfg.platform;
-        cfg.backend = ctx.hooks.cfg.backend;
         // Lookup only: a pinned remote is read from the extraction an
         // earlier generation (or the cold pipeline) verified and unpacked,
         // never from its archive (cli#429).

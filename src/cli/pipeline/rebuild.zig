@@ -36,7 +36,6 @@ pub const RebuildCtx = struct {
     asm_bin: assembler_proc.Assembler,
     project_dir: []const u8,
     platform_tag: []const u8,
-    backend_tag: []const u8,
     output_dir: []const u8,
     target_dir: []const u8,
     zig_args: []const []const u8,
@@ -380,7 +379,7 @@ pub const RebuildCtx = struct {
             var asm_bin = self.asm_bin;
             // A failed regeneration fails this rebuild, never the session.
             asm_bin.fatal_on_failure = false;
-            assembler_proc.generate(asm_bin, a, self.project_dir, self.platform_tag, self.backend_tag) catch |err| {
+            assembler_proc.generate(asm_bin, a, self.project_dir, self.platform_tag) catch |err| {
                 if (self.canceled()) return error.Canceled;
                 std.debug.print("labelle: rebuild generate failed ({s})\n", .{@errorName(err)});
                 return error.GenerateFailed;

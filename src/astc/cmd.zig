@@ -33,7 +33,8 @@ const usage =
     \\  --platform <t>      target name (the resolved target, as the build pipeline
     \\                      passes it); default is
     \\                      project.labelle's `.platform`.
-    \\  --backend <b>       target backend; default is project.labelle's.
+    \\  --backend <b>       deprecated and ignored (cli#471 D4): the backend is
+    \\                      always the project's, resolved by the assembler.
     \\  --allow-older-cli   proceed even when labelle.lock was written by a
     \\                      NEWER labelle than this binary (#353).
     \\
@@ -122,12 +123,11 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     // `labelle astc` is dispatched before pipeline.run, so it owns its own
     // copy of the flag (see the gate call below).
     var allow_older_cli = false;
-    // Target overrides: `labelle build --platform=<target>` resolves a platform
-    // (and backend) that project.labelle may not declare, and the loadable
-    // blocks depend on both — so the pipeline passes what it resolved. The
-    // target is a NAME, matched against the backend manifest's target keys.
+    // Target override: `labelle build --platform=<target>` resolves a target
+    // that project.labelle may not declare, and the loadable blocks depend
+    // on it — so the pipeline passes what it resolved. The target is a NAME,
+    // matched against the backend manifest's target keys.
     var platform_override: ?[]const u8 = null;
-    var backend_override: ?project_config.Backend = null;
 
     var i: usize = 0;
     while (i < cmd_args.len) : (i += 1) {
@@ -147,9 +147,12 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
             if (!contract.identifier(cmd_args[i])) return usageErr("invalid --platform (targets are lowercase identifiers; run 'labelle targets')");
             platform_override = cmd_args[i];
         } else if (std.mem.eql(u8, arg, "--backend")) {
+            // Accepted for one major, ignored (cli#471 D4): the CLI names no
+            // backend, and another backend's capabilities cannot be read
+            // from this project's package anyway.
             i += 1;
             if (i >= cmd_args.len) return usageErr("--backend needs a value");
-            backend_override = std.meta.stringToEnum(project_config.Backend, cmd_args[i]) orelse return usageErr("unknown --backend");
+            std.debug.print("labelle astc: --backend is deprecated and ignored; the project's own backend is used (pass --platform <target> to pick the target)\n", .{});
         } else if (std.mem.eql(u8, arg, "--allow-older-cli")) {
             allow_older_cli = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -174,22 +177,20 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         return error.InvalidArgs;
     };
 
-    const backend = backend_override orelse cfg.backend;
     const platform = platform_override orelse @tagName(cfg.platform);
-    // An explicit backend switch cannot inherit another package's capabilities.
-    const package = if (backend == cfg.backend) cfg.backend_package else null;
+    const package = cfg.backend_package;
     // The `.backend` shorthand names no package to read, so ask the
     // assembler where the project's backend package is (cli#471 D3a):
-    // describe reports its directory once installed. An older assembler, or
+    // describe reports its directory once installed. A lookup failure, or
     // a package not installed yet, keeps the conservative default.
     var describe_arena: std.heap.ArenaAllocator = .init(allocator);
     defer describe_arena.deinit();
-    const described_dir: ?[]const u8 = if (package == null and backend == cfg.backend)
+    const described_dir: ?[]const u8 = if (package == null)
         describedPackageDir(describe_arena.allocator(), dir, platform)
     else
         null;
     const selection = if (described_dir) |root|
-        try capabilities.resolveAt(allocator, @tagName(backend), root, platform)
+        try capabilities.resolveAt(allocator, "the project's backend", root, platform)
     else
         try capabilities.resolve(allocator, dir, package, platform);
     const caps = selection.caps;
@@ -200,7 +201,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         if (!caps.supports(opts.block)) {
             std.debug.print(
                 "labelle astc: backend '{s}' on {s} cannot upload ASTC {s} (try {s})\n",
-                .{ @tagName(backend), platform, opts.block.arg(), caps.defaultBlock().arg() },
+                .{ if (package) |p| p.name else "(the project's)", platform, opts.block.arg(), caps.defaultBlock().arg() },
             );
             return error.InvalidArgs;
         }

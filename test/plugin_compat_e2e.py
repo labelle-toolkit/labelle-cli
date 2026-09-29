@@ -22,8 +22,22 @@ CLI = Path(sys.argv[1] if len(sys.argv) > 1 else "zig-out/bin/labelle").resolve(
 FAKE_ASSEMBLER = '''#!/usr/bin/env python3
 import os, sys
 from pathlib import Path
+def backend_of(root):
+    # The `.backend` shorthand as the assembler reads it (bgfx when absent):
+    # the CLI takes the backend and the target dir from `describe` (cli#471 D4).
+    text = (root / "project.labelle").read_text()
+    at = text.find(".backend = .")
+    return text[at + len(".backend = ."):].split()[0].strip(",}") if at >= 0 else "bgfx"
+argv = sys.argv[1:]
 if sys.argv[1] == "--protocol-version":
     print(99)
+elif argv and argv[0] == "describe":
+    import json
+    target_name = argv[argv.index("--target") + 1]
+    backend = backend_of(Path(argv[argv.index("--project-root") + 1]))
+    print(json.dumps({"schema": "labelle.describe/v1", "target": target_name,
+                      "target_dir": ".labelle/" + backend + "_" + target_name,
+                      "backend": {"name": backend}, "asset_format": "png", "supported": True}))
 elif sys.argv[1] == "install":
     target = Path(os.environ["COMPAT_MANIFEST"])
     if os.environ["COMPAT_SOURCE"] == "remote":

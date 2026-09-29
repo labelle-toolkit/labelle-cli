@@ -38,7 +38,7 @@ pub fn wirePrebuildPython(allocator: std.mem.Allocator, steps: []const prebuild.
     }
 }
 
-pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed: project_config.ProjectConfig, parsed_args: *const ParsedArgs) !bool {
+pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed: project_config.ProjectConfig, parsed_args: *const ParsedArgs, backend: []const u8) !bool {
     // Validate version compatibility
     compatibility.validateCompatibility(parsed);
 
@@ -93,20 +93,13 @@ pub fn preInstall(allocator: std.mem.Allocator, project_dir: []const u8, parsed:
     });
 
     // Auto-wire a cache-provisioned SDL2 (`labelle doctor --fix`) into the
-    // build/run environment so desktop games that need it (raylib/sokol
-    // gamepad, sdl backend) link + run without the user setting
-    // LABELLE_SDL2_LIB by hand. No-op when SDL2 isn't in the cache or the
-    // user already set the var. Scoped like `labelle doctor`: the sdl
-    // backend always needs SDL2; raylib/sokol only for the gamepad
-    // source, so `.gamepad = .none` projects get nothing injected.
-    // Backends that pull in SDL2: the `sdl` renderer always, and
-    // raylib/sokol/bgfx for the shared desktop gamepad source unless gamepad
-    // is opted out. Mirrors the assembler's `deps_linker.stagesSdlGamepad`
-    // (raylib/sokol/bgfx with `gamepad == .auto`) — bgfx was previously
-    // missing here, so its default gamepad-enabled desktop builds never got
-    // SDL2 auto-wired or the runtime DLL staged (cli#285 / cli#286).
-    const wants_sdl2 = parsed.backend == .sdl or
-        ((parsed.backend == .raylib or parsed.backend == .sokol or parsed.backend == .bgfx) and parsed.gamepad != .none);
+    // build/run environment so desktop games that need it link + run without
+    // the user setting LABELLE_SDL2_LIB by hand. No-op when SDL2 isn't in the
+    // cache or the user already set the var. Scoped like `labelle doctor`,
+    // by the backend package `describe` named (`backend`, cli#471 D4) and
+    // the gamepad opt-out: `sdl_provision.Needs` says which backends pull
+    // SDL2 in.
+    const wants_sdl2 = sdl_provision.Needs.of(backend, parsed.gamepad == .none).any();
     if (parsed.platform == .desktop and wants_sdl2) {
         sdl_provision.autoWireEnv(allocator);
     }
@@ -229,7 +222,10 @@ pub fn discoverAndPlan(
     // `generate` would fail on, reported before the lock and any compiler.
     // Only asked when the core generation will run at all.
     const described: ?assembler_describe.Description = if (target.legacy != null and hook_plans.generate.replace == null)
-        describer.query(hook_arena, target.name)
+        describer.require(hook_arena, target.name) catch {
+            if (reporter) |r| r.finishFailed(1, "assembler describe failed");
+            return .{ .exit = 1 };
+        }
     else
         null;
     switch (coreGenerateGate(target.legacy != null, hook_plans.generate.replace != null, described)) {
@@ -312,6 +308,8 @@ pub const GenerateGate = union(enum) {
 /// `generate` stands in for the core generation; `described`: the
 /// assembler's `describe` answer, null below protocol 7 or when it could
 /// not answer (then the enum check alone decides, as before cli#471 D3).
+/// `described` is null only when it was not asked: the generation is
+/// replaced, or the target is outside the assembler's schema.
 pub fn coreGenerateGate(schema_target: bool, replaced: bool, described: ?assembler_describe.Description) GenerateGate {
     if (replaced) return .proceed;
     if (!schema_target) return .no_schema_target;
@@ -319,7 +317,7 @@ pub fn coreGenerateGate(schema_target: bool, replaced: bool, described: ?assembl
     return .proceed;
 }
 
-test "coreGenerateGate: describe refuses an unsupported pair; the enum check is the fallback" {
+test "coreGenerateGate: describe refuses an unsupported pair" {
     var d = std.mem.zeroInit(assembler_describe.Description, .{ .supported = true });
     // A replacement generates: nothing else is asked.
     try std.testing.expect(coreGenerateGate(false, true, null) == .proceed);
@@ -327,8 +325,6 @@ test "coreGenerateGate: describe refuses an unsupported pair; the enum check is 
     try std.testing.expect(coreGenerateGate(true, true, d) == .proceed);
     // labelle-assembler#378, with or without an answer.
     try std.testing.expect(coreGenerateGate(false, false, null) == .no_schema_target);
-    // No answer (protocol < 7, describe failed): today's behaviour.
-    try std.testing.expect(coreGenerateGate(true, false, null) == .proceed);
     // Supported: proceed. Unsupported: refused with describe's reason.
     d.supported = true;
     try std.testing.expect(coreGenerateGate(true, false, d) == .proceed);

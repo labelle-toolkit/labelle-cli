@@ -23,8 +23,8 @@ const gateThenInstall = @import("install.zig").gateThenInstall;
 ///
 /// `build` / `run` are not assembler subcommands: the subsequent
 /// `zig build` invocation and binary launch stay CLI-side (see below).
-/// The CLI owns docker orchestration, the watch supervision, the
-/// iOS deploy path and `--timeout` — generation is the only
+/// The CLI owns docker orchestration, the watch supervision and
+/// `--timeout` — generation is the only
 /// step the assembler binary delegates.
 /// `parsed_args.scene_override` is intentionally NOT forwarded to the
 /// assembler. PR #243 removed the CLI's `cfg.initial_prefab` rewrite for
@@ -84,15 +84,9 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
 
         // The assembler receives the resolved target NAME; the #378 gate above
         // guarantees it is one the pinned assembler can take.
-        try assembler_proc.generate(
-            cx.asm_bin,
-            allocator,
-            project_dir,
-            target.name,
-            @tagName(parsed.backend),
-        );
+        try assembler_proc.generate(cx.asm_bin, allocator, project_dir, target.name);
 
-        // (`target_name`/`target_dir` — .labelle/raylib_desktop/, etc. — are
+        // (`target_name`/`target_dir` — .labelle/<backend>_<target>/, named by `describe` — are
         // computed up front, before the progress reporter init; see cli#284.)
 
         // fixFingerprints runs `zig build` locally per emitted target dir to
@@ -170,15 +164,13 @@ pub fn corePrepasses(allocator: std.mem.Allocator, project_dir: []const u8, pars
     // #421). Its provider owns its asset pipeline; standalone `cmdAstc`
     // can read capabilities for any declared target name.
     if (opts.legacy_target and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-        // Pass the RESOLVED target: `--platform=wasm` and `labelle ios`
-        // (forces sokol) differ from what
-        // project.labelle declares, and the loadable blocks depend on both.
+        // Pass the RESOLVED target: `--platform=<t>` may differ from what
+        // project.labelle declares, and the loadable blocks depend on it.
+        // No backend: `labelle astc` reads the project's own (cli#471 D4).
         astc_cmd.cmdAstc(allocator, &.{
             project_dir,
             "--platform",
             @tagName(parsed.platform),
-            "--backend",
-            @tagName(parsed.backend),
         }) catch |err| switch (err) {
             error.InvalidTextureCapabilities => {
                 if (!opts.fatal) return err;
@@ -190,7 +182,7 @@ pub fn corePrepasses(allocator: std.mem.Allocator, project_dir: []const u8, pars
             },
             // A stale `.astc` (wrong block for this target) that could not be
             // deleted would be swapped in by the assembler — the PNG fallback
-            // below would be a lie. Stop instead (labelle-bgfx#134).
+            // below would be a lie. Stop instead.
             error.StaleAstcSiblingUndeletable => {
                 if (!opts.fatal) return err;
                 progress.fatalExit(1, "a stale .astc sibling could not be deleted — see the error above");

@@ -14,19 +14,20 @@
 //! and why not). It is offline and config-only: nothing is fetched,
 //! written or generated.
 //!
-//! Everything here is optional. Below protocol 7, or when `describe` cannot
-//! be run or its output cannot be read, `query` returns null and the caller
-//! keeps its enum-derived answer (one debug line, no user-facing noise).
-//! Removing that fallback is cli#471 P3.
+//! Since cli#471 D4 the answer is mandatory: the CLI mirrors no backend enum
+//! any more, so there is nothing to fall back to. `require` returns the
+//! document or fails with one line saying why (an assembler below protocol
+//! 7, a `describe` that failed, output this CLI cannot read). `query` is the
+//! quiet variant, for callers with an answer of their own.
 const std = @import("std");
 const config = @import("config.zig");
 const assembler_proc = @import("assembler_proc.zig");
 
 /// The first assembler protocol that ships `describe`.
-pub const min_protocol: u32 = 7;
+pub const min_protocol: u32 = assembler_proc.describe_protocol;
 
 /// The only document shape this CLI reads. A different tag is a shape it
-/// does not know, and reads as "no answer" (the fallback).
+/// does not know, and reads as "no answer".
 pub const schema = "labelle.describe/v1";
 
 /// One `labelle.describe/v1` document. Unknown fields are ignored so a
@@ -83,7 +84,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) ParseError!Description
 }
 
 /// Runs `describe` and returns its stdout when it exited 0, else null.
-/// A seam so the fallback path is tested without an assembler binary.
+/// A seam so the failure paths are tested without an assembler binary.
 pub const SpawnFn = *const fn (arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8;
 
 fn spawnDescribe(arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
@@ -93,7 +94,7 @@ fn spawnDescribe(arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8
 }
 
 /// How the pipeline asks `describe`: the resolved assembler and the project
-/// it answers for. `off` (protocol 0) never spawns and always falls back.
+/// it answers for. `off` (protocol 0) never spawns and never answers.
 pub const Describer = struct {
     bin_path: []const u8 = "",
     protocol: u32 = 0,
@@ -106,39 +107,68 @@ pub const Describer = struct {
         return .{ .bin_path = bin.path, .protocol = bin.protocol, .project_dir = project_dir };
     }
 
-    /// The assembler's answer for `target`, or null for the fallback: the
-    /// protocol predates `describe`, the spawn failed or exited nonzero, the
-    /// output is not a `labelle.describe/v1` document, or it answers for a
-    /// different target. Strings are owned by `arena`.
+    /// The assembler's answer for `target`, or null: the protocol predates
+    /// `describe`, the spawn failed or exited nonzero, the output is not a
+    /// `labelle.describe/v1` document, it answers for a different target, or
+    /// its `target_dir` is not `.labelle/<one component>`. Quiet (a debug
+    /// line); `require` says why. Strings are owned by `arena`.
     pub fn query(self: Describer, arena: std.mem.Allocator, target: []const u8) ?Description {
-        if (self.protocol < min_protocol) return null;
+        return switch (self.ask(arena, target)) {
+            .answer => |d| d,
+            .failed => |why| {
+                std.log.debug("assembler describe gave no answer for '{s}': {s}", .{ target, why.text() });
+                return null;
+            },
+        };
+    }
+
+    /// The assembler's answer for `target`, or `error.DescribeFailed` after
+    /// one line naming the cause and the command that reproduces it. Every
+    /// backend and target-dir fact the CLI uses comes from here (cli#471 D4).
+    pub fn require(self: Describer, arena: std.mem.Allocator, target: []const u8) error{DescribeFailed}!Description {
+        return switch (self.ask(arena, target)) {
+            .answer => |d| d,
+            .failed => |why| {
+                std.debug.print("labelle: cannot resolve the backend for target '{s}': {s}\n", .{ target, why.text() });
+                switch (why) {
+                    .protocol => std.debug.print("  run `labelle upgrade assembler` (the CLI takes the backend and target dir from `labelle-assembler describe`, protocol >= {d})\n", .{min_protocol}),
+                    else => std.debug.print("  reproduce with: {s} describe --project-root {s} --target {s} --json\n", .{ self.bin_path, self.project_dir, target }),
+                }
+                return error.DescribeFailed;
+            },
+        };
+    }
+
+    pub const Failure = enum {
+        protocol,
+        spawn,
+        unreadable,
+        other_target,
+        target_dir,
+
+        pub fn text(f: Failure) []const u8 {
+            return switch (f) {
+                .protocol => "the assembler predates `describe`",
+                .spawn => "`labelle-assembler describe` failed",
+                .unreadable => "`labelle-assembler describe` printed no labelle.describe/v1 document",
+                .other_target => "`labelle-assembler describe` answered for another target",
+                .target_dir => "`labelle-assembler describe` named a target dir outside .labelle/",
+            };
+        }
+    };
+
+    const Asked = union(enum) { answer: Description, failed: Failure };
+
+    fn ask(self: Describer, arena: std.mem.Allocator, target: []const u8) Asked {
+        if (self.protocol < min_protocol) return .{ .failed = .protocol };
         const argv = [_][]const u8{ self.bin_path, "describe", "--project-root", self.project_dir, "--target", target, "--json" };
-        const out = self.spawn(arena, &argv) orelse {
-            std.log.debug("assembler describe unavailable; using the CLI's own backend/target facts", .{});
-            return null;
-        };
-        const d = parse(arena, out) catch |err| {
-            std.log.debug("assembler describe output unreadable ({s}); using the CLI's own backend/target facts", .{@errorName(err)});
-            return null;
-        };
-        if (!std.mem.eql(u8, d.target, target)) return null;
-        return d;
+        const out = self.spawn(arena, &argv) orelse return .{ .failed = .spawn };
+        const d = parse(arena, out) catch return .{ .failed = .unreadable };
+        if (!std.mem.eql(u8, d.target, target)) return .{ .failed = .other_target };
+        if (d.targetDirName() == null) return .{ .failed = .target_dir };
+        return .{ .answer = d };
     }
 };
-
-/// The generated target dir's name: describe's when it gave a usable one,
-/// else the enum-derived `<fallback_backend>_<target>` of pre-D3 CLIs.
-/// Caller owns the result.
-pub fn targetDirName(allocator: std.mem.Allocator, described: ?Description, fallback_backend: []const u8, target: []const u8) ![]u8 {
-    if (described) |d| if (d.targetDirName()) |name| return allocator.dupe(u8, name);
-    return std.fmt.allocPrint(allocator, "{s}_{s}", .{ fallback_backend, target });
-}
-
-/// The backend name for status lines: the package describe resolved, else
-/// the CLI's enum tag.
-pub fn backendLabel(described: ?Description, fallback_backend: []const u8) []const u8 {
-    return if (described) |d| d.backend.name else fallback_backend;
-}
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
@@ -269,7 +299,7 @@ test "Describer.query: protocol 7 asks describe with the documented flags" {
     for (want, Fake.last_argv) |w, got| try testing.expectEqualStrings(w, got);
 }
 
-test "Describer.query: falls back (null) without describe or a usable answer" {
+test "Describer.query/require: no answer without describe or a usable document" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -277,6 +307,7 @@ test "Describer.query: falls back (null) without describe or a usable answer" {
     Fake.reset(fixture_third_party);
     try testing.expect((Describer{ .protocol = 6, .spawn = Fake.spawn }).query(a, "desktop") == null);
     try testing.expect((Describer{ .spawn = Fake.spawn }).query(a, "desktop") == null);
+    try testing.expectError(error.DescribeFailed, (Describer{ .protocol = 6, .spawn = Fake.spawn }).require(a, "desktop"));
     try testing.expectEqual(@as(usize, 0), Fake.calls);
     // Spawn failed / nonzero exit, unreadable output, another target.
     const on: Describer = .{ .protocol = 7, .spawn = Fake.spawn };
@@ -284,26 +315,24 @@ test "Describer.query: falls back (null) without describe or a usable answer" {
         Fake.reset(reply);
         try testing.expect(on.query(a, "desktop") == null);
         try testing.expectEqual(@as(usize, 1), Fake.calls);
+        try testing.expectError(error.DescribeFailed, on.require(a, "desktop"));
     }
     Fake.reset(fixture_third_party);
     try testing.expect(on.query(a, "probe") == null);
     try testing.expectEqual(@as(usize, 1), Fake.calls);
+    // A target dir the CLI will not join under the project root.
+    const odd = try std.mem.replaceOwned(u8, a, fixture_third_party, ".labelle/acme_desktop", "elsewhere/acme_desktop");
+    Fake.reset(odd);
+    try testing.expectError(error.DescribeFailed, on.require(a, "desktop"));
 }
 
-test "targetDirName: describe wins; the enum tag is the fallback (cli#471 finding 4)" {
+test "require: describe names the dir and the backend (cli#471 finding 4, D4)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-    const d = try parse(a, fixture_third_party);
-    // A third-party `acme` package with no `.backend`: the CLI's enum says
-    // its default tag, the assembler generates into `acme_desktop`.
-    try testing.expectEqualStrings("acme_desktop", try targetDirName(a, d, "enum-default", "desktop"));
-    try testing.expectEqualStrings("acme", backendLabel(d, "enum-default"));
-    // No answer: the pre-D3 name.
-    try testing.expectEqualStrings("enum-default_desktop", try targetDirName(a, null, "enum-default", "desktop"));
-    try testing.expectEqualStrings("enum-default", backendLabel(null, "enum-default"));
-    // An unusable target_dir falls back too.
-    var odd = d;
-    odd.target_dir = "elsewhere/acme_desktop";
-    try testing.expectEqualStrings("enum-default_desktop", try targetDirName(a, odd, "enum-default", "desktop"));
+    // A third-party `acme` package with no `.backend` generates into
+    // `acme_desktop`, and the CLI has no enum of its own to disagree.
+    Fake.reset(fixture_third_party);
+    const d = try (Describer{ .protocol = 7, .spawn = Fake.spawn }).require(arena.allocator(), "desktop");
+    try testing.expectEqualStrings("acme_desktop", d.targetDirName().?);
+    try testing.expectEqualStrings("acme", d.backend.name);
 }

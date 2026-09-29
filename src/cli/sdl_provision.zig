@@ -21,6 +21,42 @@ const asm_cache = @import("asm_cache.zig");
 /// Windows backends.
 pub const SDL2_VERSION = "2.30.11";
 
+/// Which parts of SDL2 a backend pulls in, by the package NAME
+/// `labelle-assembler describe` reports (cli#471 D4: the CLI mirrors no
+/// backend enum, so this is the one place the names are spelled, until the
+/// `sdl2` provider takes SDL provisioning out of the core, RFC cli#471 S4).
+/// Mirrors the assembler's `deps_linker.stagesSdlGamepad`: the `sdl`
+/// renderer always links SDL2 (and needs its headers + SDL2_mixer), and
+/// raylib/sokol/bgfx link it for the shared desktop gamepad source unless
+/// the project sets `.gamepad = .none` (cli#285 / cli#286). Any other
+/// backend, including a third-party package, needs none.
+pub const Needs = struct {
+    render: bool = false,
+    gamepad: bool = false,
+
+    pub fn of(backend: []const u8, gamepad_off: bool) Needs {
+        const render = std.mem.eql(u8, backend, "sdl");
+        const pad_source = render or for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |name| {
+            if (std.mem.eql(u8, backend, name)) break true;
+        } else false;
+        return .{ .render = render, .gamepad = pad_source and !gamepad_off };
+    }
+
+    pub fn any(self: Needs) bool {
+        return self.render or self.gamepad;
+    }
+};
+
+test "Needs.of: the renderer always, the gamepad backends unless opted out, nothing else" {
+    try std.testing.expectEqual(Needs{ .render = true, .gamepad = true }, Needs.of("sdl", false));
+    try std.testing.expectEqual(Needs{ .render = true, .gamepad = false }, Needs.of("sdl", true));
+    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |name| {
+        try std.testing.expectEqual(Needs{ .gamepad = true }, Needs.of(name, false));
+        try std.testing.expect(!Needs.of(name, true).any());
+    }
+    for ([_][]const u8{ "null", "wgpu", "acme" }) |name| try std.testing.expect(!Needs.of(name, false).any());
+}
+
 pub const Result = enum {
     /// SDL2 is available in the cache (freshly provisioned or already there).
     ready,
