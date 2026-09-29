@@ -16,6 +16,8 @@ const lockfile = @import("../cli/lockfile.zig");
 const contract = @import("../cli/provider_contract.zig");
 const convert = @import("convert.zig");
 const capabilities = @import("capabilities.zig");
+const assembler_proc = @import("../cli/assembler_proc.zig");
+const assembler_describe = @import("../cli/assembler_describe.zig");
 const astcenc_bin = @import("astcenc_bin.zig");
 
 const usage =
@@ -176,7 +178,20 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
     const platform = platform_override orelse @tagName(cfg.platform);
     // An explicit backend switch cannot inherit another package's capabilities.
     const package = if (backend == cfg.backend) cfg.backend_package else null;
-    const selection = try capabilities.resolve(allocator, dir, package, platform);
+    // The `.backend` shorthand names no package to read, so ask the
+    // assembler where the project's backend package is (cli#471 D3a):
+    // describe reports its directory once installed. An older assembler, or
+    // a package not installed yet, keeps the conservative default.
+    var describe_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer describe_arena.deinit();
+    const described_dir: ?[]const u8 = if (package == null and backend == cfg.backend)
+        describedPackageDir(describe_arena.allocator(), dir, platform)
+    else
+        null;
+    const selection = if (described_dir) |root|
+        try capabilities.resolveAt(allocator, @tagName(backend), root, platform)
+    else
+        try capabilities.resolve(allocator, dir, package, platform);
     const caps = selection.caps;
     std.debug.print("labelle astc: {s} capabilities for {s}, default {s}\n", .{
         @tagName(selection.source), platform, caps.defaultBlock().arg(),
@@ -423,6 +438,15 @@ fn readDeclaredResources(
     };
     if (parsed.resources.len == 0) return null;
     return parsed.resources;
+}
+
+/// The installed backend package directory `describe` reports for
+/// `target`, or null (older assembler, lookup or describe failure, package
+/// not installed). Quiet: the caller falls back to the conservative default.
+fn describedPackageDir(arena: std.mem.Allocator, project_dir: []const u8, target: []const u8) ?[]const u8 {
+    const bin = assembler_proc.resolve(arena, project_dir, "generate") catch return null;
+    const d = assembler_describe.Describer.init(bin, project_dir).query(arena, target) orelse return null;
+    return d.package_dir;
 }
 
 fn usageErr(msg: []const u8) error{InvalidArgs} {

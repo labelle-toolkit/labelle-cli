@@ -79,8 +79,15 @@ pub fn resolve(a: std.mem.Allocator, project_dir: []const u8, package: ?project.
     const dep = package orelse return .{};
     const root = try plugins.resolvePluginDir(a, project_dir, dep);
     defer a.free(root);
+    return resolveAt(a, dep.name, root, target);
+}
+
+/// `resolve` for a package whose directory is already known: the one the
+/// assembler's `describe` reports for a backend given by the `.backend`
+/// shorthand (cli#471 D3a), which has no `.backend_package` to resolve.
+pub fn resolveAt(a: std.mem.Allocator, name: []const u8, root: []const u8, target: []const u8) !Selection {
     var dir = std.Io.Dir.cwd().openDir(config.globalIo(), root, .{}) catch {
-        std.debug.print("labelle astc: backend package '{s}' is unavailable at '{s}'; run labelle install first\n", .{ dep.name, root });
+        std.debug.print("labelle astc: backend package '{s}' is unavailable at '{s}'; run labelle install first\n", .{ name, root });
         return error.InvalidTextureCapabilities;
     };
     defer dir.close(config.globalIo());
@@ -97,6 +104,20 @@ pub fn resolve(a: std.mem.Allocator, project_dir: []const u8, package: ?project.
         std.debug.print("labelle astc: invalid texture_caps in '{s}/backend.manifest.zon': {s}\n", .{ root, @errorName(err) });
         return err;
     };
+}
+
+test "resolveAt reads a known package directory; a missing manifest is the conservative default" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = config.globalIo();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPathFile(io, ".", &root_buf)];
+    try std.testing.expectEqual(.conservative_default, (try resolveAt(a, "acme", root, "custom_target")).source);
+    try tmp.dir.writeFile(io, .{ .sub_path = "backend.manifest.zon", .data = ".{ .texture_caps = .{ .custom_target = .{ .astc = .{ .blocks = .{ .@\"4x4\", .@\"8x8\" }, .default_block = .@\"8x8\" } } } }" });
+    const sel = try resolveAt(a, "acme", root, "custom_target");
+    try std.testing.expectEqual(.manifest, sel.source);
+    try std.testing.expectEqual(convert.BlockSize.@"8x8", sel.caps.defaultBlock());
 }
 
 test "texture capabilities distinguish manifest and conservative paths even for identical blocks" {
