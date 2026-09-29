@@ -106,7 +106,12 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// outside `src/`), taking `cli/stb_image.h`'s upstream comment with it:
 /// 17 entries. RFC cli#471 X3 refused `--docker` for macOS targets and
 /// deleted the fetch of a third-party copy of Apple's frameworks, so
-/// `cli/docker.zig` came clean: 16 entries.
+/// `cli/docker.zig` came clean: 16 entries. RFC cli#471 D4 deleted the
+/// CLI's backend enum (the assembler's `describe` names the backend and
+/// the target dir, and `upgrade all` delegates the backend pin to
+/// `labelle-assembler upgrade backend`), so `cli/upgrade.zig` came clean,
+/// and `cli/pipeline/generate.zig` once its comments stopped citing
+/// backend and platform names: 14 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -125,13 +130,11 @@ const allowed_files = [_][]const u8{
     // carry names the legacy targets, backends and their toolchains.
     "cli/pipeline/args_resolve.zig",
     "cli/pipeline/build.zig",
-    "cli/pipeline/generate.zig",
     "cli/pipeline/install.zig",
     "cli/pipeline/run.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
     "cli/sdl_provision.zig",
-    "cli/upgrade.zig",
 };
 
 const finding_note = "(platform/store/package names belong in providers; see docs/rfc-package-commands.md#enforcement)";
@@ -554,13 +557,13 @@ test "a finding is reported per line and a clean allowlisted file goes stale" {
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:2: 'web' " ++ finding_note, scan.offenders.items[3]);
     // Allowlisted and dirty: no finding, entry kept. Clean name and body: stale.
     try scan.file("cli/pipeline.zig", "// wasm\n");
-    try scan.file("cli/upgrade.zig", "const x = 1;\n");
+    try scan.file("cli/project_config.zig", "const x = 1;\n");
     try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/pipeline.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/upgrade.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/project_config.zig"));
     try std.testing.expect(containsString(stale.items, "cli/doctor.zig"));
     // The sentinel is only set by the CLI root itself.
     try std.testing.expect(!scan.saw_cli_root);
@@ -605,7 +608,7 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/sdl_provision.zig"));
     try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/upgrade.zig"));
+    try std.testing.expect(containsString(stale.items, "cli/project_config.zig"));
 }
 
 test "package and compound affixes do not hide a forbidden root" {

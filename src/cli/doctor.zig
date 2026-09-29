@@ -21,7 +21,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
-const project_config = @import("project_config.zig");
+const assembler_proc = @import("assembler_proc.zig");
+const assembler_describe = @import("assembler_describe.zig");
+const provider_targets = @import("provider_targets.zig");
 const sdl_provision = @import("sdl_provision.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
@@ -156,26 +158,6 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     // Best-effort read of project.labelle to scope what's actually required.
     const cfg = readProjectConfig(arena, scope.dir);
-    const effective_backend = cfg.backend orelse project_config.default_backend;
-
-    const needs_sdl_render = effective_backend == .sdl;
-    // Which backends pull in SDL2 for the shared desktop gamepad source. This
-    // MUST match what the assembler actually wires, or doctor gives an
-    // all-clear and `labelle build` then fails at link with "unable to find
-    // dynamic system library 'SDL2'" (cli#286). The assembler's source of
-    // truth is `labelle-assembler/src/deps_linker.zig:stagesSdlGamepad`, which
-    // stages `backends/sdl_gamepad` (→ `-lSDL2`) for `.raylib, .sokol, .bgfx`
-    // whenever `gamepad == .auto`. bgfx was missing here, so its default
-    // (gamepad-enabled) desktop builds linked SDL2 while doctor reported
-    // `gamepad: n/a` and `--fix` refused to provision it. `.sdl` is kept in
-    // this set too: the sdl render backend links SDL2 unconditionally (as the
-    // renderer, see needs_sdl_render), so surfacing the requirement there is
-    // correct regardless of gamepad.
-    const needs_sdl_gamepad = switch (effective_backend) {
-        .raylib, .sokol, .bgfx, .sdl => !cfg.gamepad_off,
-        else => false,
-    };
-    const needs_sdl = needs_sdl_render or needs_sdl_gamepad;
 
     const zig_check = checkZig(arena, scope.dir);
     const python_check = checkPython(arena);
@@ -201,6 +183,21 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         return;
     }
 
+    // Which backend the project builds with, as the assembler resolves it
+    // (`describe`, cli#471 D4: the CLI reads no `.backend` of its own), and
+    // so which parts of SDL2 it pulls in (`sdl_provision.Needs`, the one
+    // place the backend names are spelled). Only inside a project: outside
+    // one, or when `describe` cannot answer, the assembler's default backend
+    // is assumed, which links SDL2 for the desktop gamepad source.
+    const backend: ?[]const u8 = if (cfg.found) describeBackend(arena, scope.dir) else null;
+    const needs: sdl_provision.Needs = if (backend) |name|
+        .of(name, cfg.gamepad_off)
+    else
+        .{ .gamepad = !cfg.gamepad_off };
+    const needs_sdl_render = needs.render;
+    const needs_sdl_gamepad = needs.gamepad;
+    const needs_sdl = needs.any();
+
     var checks: std.ArrayList(Check) = .empty;
 
     try checks.append(arena, zig_check);
@@ -224,10 +221,10 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     }
 
     // ── Report ──────────────────────────────────────────────────────────
-    const backend_label = if (cfg.backend) |b|
-        @tagName(b)
+    const backend_label = if (backend) |name|
+        name
     else if (cfg.found)
-        try std.fmt.allocPrint(arena, "{s} (default)", .{@tagName(project_config.default_backend)})
+        "unknown (`labelle-assembler describe` gave no answer)"
     else
         "unknown (no project.labelle)";
     const gamepad_label = if (needs_sdl_gamepad) "on" else if (needs_sdl) "off" else "n/a";
@@ -331,27 +328,27 @@ fn resolveScope(arena: std.mem.Allocator, start: []const u8) Scope {
 const Cfg = struct {
     /// A `project.labelle` was read.
     found: bool = false,
-    /// The declared `.backend`, or null when the field is absent (the
-    /// project then builds with `project_config.default_backend`).
-    backend: ?project_config.Backend = null,
     gamepad_off: bool = false,
 };
 
-/// Read backend + gamepad opt-out straight out of `project.labelle` text. A
-/// full ZON parse isn't worth a dependency here; the two fields we need are
-/// simple `.field = .value` forms.
+/// The backend package's name for the core target, from `labelle-assembler
+/// describe`; null when the assembler cannot be resolved or cannot answer
+/// (doctor is best-effort: it reports "unknown" and keeps checking).
+fn describeBackend(arena: std.mem.Allocator, project_dir: []const u8) ?[]const u8 {
+    const bin = assembler_proc.resolve(arena, project_dir, "describe") catch return null;
+    const d = assembler_describe.Describer.init(bin, project_dir).query(arena, provider_targets.core_target) orelse return null;
+    return d.backend.name;
+}
+
+/// Read the gamepad opt-out straight out of `project.labelle` text. A full
+/// ZON parse isn't worth a dependency here; the field is a simple
+/// `.field = .value` form.
 fn readProjectConfig(arena: std.mem.Allocator, project_dir: []const u8) Cfg {
     const io = config.globalIo();
     const path = std.fs.path.join(arena, &.{ project_dir, "project.labelle" }) catch return .{};
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return .{};
 
     var cfg: Cfg = .{ .found = true };
-    if (std.mem.indexOf(u8, content, ".backend = .")) |idx| {
-        const start = idx + ".backend = .".len;
-        var end = start;
-        while (end < content.len and (std.ascii.isAlphanumeric(content[end]) or content[end] == '_')) end += 1;
-        cfg.backend = std.meta.stringToEnum(project_config.Backend, content[start..end]);
-    }
     cfg.gamepad_off = std.mem.indexOf(u8, content, ".gamepad = .none") != null or
         std.mem.indexOf(u8, content, ".gamepad=.none") != null;
     return cfg;
@@ -663,7 +660,7 @@ test "doctor: run from a project subdirectory, both halves use the project root"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "game/src/deep");
-    try tmp.dir.writeFile(io, .{ .sub_path = "game/project.labelle", .data = ".{ .name = \"x\", .backend = .sokol, .zig_version = \"0.16.0\" }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/project.labelle", .data = ".{ .name = \"x\", .gamepad = .none, .zig_version = \"0.16.0\" }" });
     const root = try tmp.dir.realPathFileAlloc(io, "game", a);
     const nested = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "game", "src", "deep" });
     const scope = resolveScope(a, nested);
@@ -673,7 +670,7 @@ test "doctor: run from a project subdirectory, both halves use the project root"
     // ... so they see the project's own settings.
     const cfg = readProjectConfig(a, scope.dir);
     try std.testing.expect(cfg.found);
-    try std.testing.expectEqual(@as(?project_config.Backend, .sokol), cfg.backend);
+    try std.testing.expect(cfg.gamepad_off);
     // The Zig version comes from the project's own pin, not the default.
     const zig = try zig_toolchain.resolveRequiredVersion(a, scope.dir);
     try std.testing.expectEqual(.project_pin, zig.source);
@@ -686,24 +683,6 @@ test "doctor: run from a project subdirectory, both halves use the project root"
     const loose = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "loose" });
     const outside = resolveScope(a, loose);
     if (outside.root == null) try std.testing.expectEqualStrings(loose, outside.dir);
-}
-
-test "doctor: a project.labelle without .backend is checked as the default backend" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\" }" });
-    const cfg = readProjectConfig(a, dir);
-    try std.testing.expect(cfg.found);
-    try std.testing.expectEqual(@as(?project_config.Backend, null), cfg.backend);
-    // Read as the full schema does, so doctor and build cannot disagree.
-    const parsed = try config.readProjectConfigQuiet(a, dir);
-    try std.testing.expectEqual(parsed.backend, cfg.backend orelse project_config.default_backend);
-    try tmp.dir.writeFile(config.globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"x\", .backend = .sokol }" });
-    try std.testing.expectEqual(@as(?project_config.Backend, .sokol), readProjectConfig(a, dir).backend);
 }
 
 /// The `--json` capability report is a cross-repo contract with

@@ -9,7 +9,7 @@
 //! Why the CLI needs *any* of the schema: a handful of CLI-retained
 //! commands (`build` / `run` / `upgrade` / the legacy iOS deploy path)
 //! parse `project.labelle` to drive orchestration the CLI owns —
-//! target-dir naming (`<backend>_<platform>`), the compatibility-warning
+//! the compatibility-warning
 //! pass, the iOS `Info.plist` emission, lockfile
 //! writing, docker target selection. None of that is code generation;
 //! it is the CLI deciding *which assembler subcommand to run and with
@@ -28,12 +28,12 @@ const std = @import("std");
 /// a resource can pin its own block. Pure type — no I/O pulled in.
 const astc = @import("../astc/convert.zig");
 
-/// Graphics / windowing backend selection. `null` is a headless backend.
-pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
-/// The backend of a `project.labelle` that declares no `.backend` field,
-/// mirroring the assembler's default (assembler#768). Every CLI site that
-/// needs "the backend when none is declared" reads this, never a literal.
-pub const default_backend: Backend = .bgfx;
+// No backend enum here (RFC cli#471 D4): `project.labelle`'s `.backend`
+// shorthand is the assembler's to interpret. The CLI does not mirror the
+// field at all, so the tolerant parse (`ignore_unknown_fields`) skips it,
+// and every backend fact the CLI needs (the generated target dir, the
+// backend package's name, whether it supports the target) comes from
+// `labelle-assembler describe` (`assembler_describe.zig`).
 /// The legacy codegen platform: the strict schema type of `project.labelle`'s
 /// `.platform` (mirrored by the assembler's `config.zig`; `provider_settings.zig`
 /// is untouched). The RESOLVED target is a string — see `provider_targets.zig`
@@ -76,9 +76,6 @@ pub const CLI_VERSION = @import("build_options").cli_version;
 pub const CORE_VERSION = @import("build_options").core_version;
 pub const ENGINE_VERSION = @import("build_options").engine_version;
 pub const GFX_VERSION = @import("build_options").gfx_version;
-/// The bgfx backend package version paired with GFX_VERSION — the two
-/// cross a shared backend contract and must be bumped together.
-pub const BGFX_VERSION = @import("build_options").bgfx_version;
 
 /// A plugin dependency declared in project.labelle.
 pub const PluginDep = struct {
@@ -369,7 +366,8 @@ pub const ProjectConfig = struct {
     width: u32 = 800,
     height: u32 = 600,
     target_fps: u32 = 60,
-    backend: Backend = default_backend,
+    // `.backend` is deliberately absent (RFC cli#471 D4): see the note
+    // at the top of this file.
     platform: Platform = .desktop,
     ecs: EcsChoice = .mock,
     /// Gamepad input mode (assembler#274 opt-out flag): `.auto` (default)

@@ -6,11 +6,7 @@
     .core = "2.1.0",
     .engine = "3.4.1",
     .gfx = "2.2.0",
-    // The bgfx backend package. gfx and bgfx MUST move together: bgfx 0.21.0
-    // implements the game-owned shader-material contract of core 2.0.0 /
-    // gfx 2.0.0 (MATERIAL_CONTRACT_VERSION 2). `upgrade all` writing a 2.x gfx
-    // while leaving the backend pin on 0.20.0 (which names the RETIRED
-    // pixel-water contract) produces
-    // a project that no longer builds (codex P1 on cli#339).
-    .bgfx = "0.30.0",
+    // No backend package pin (RFC cli#471 D4): `upgrade all` delegates the
+    // backend bump to `labelle-assembler upgrade backend`, which pairs it
+    // with gfx through its own version floors.
 }

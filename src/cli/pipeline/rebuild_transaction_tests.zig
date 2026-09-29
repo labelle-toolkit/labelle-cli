@@ -182,7 +182,6 @@ pub fn rebuildCtx(fx: *Fixture, site: *provider_hooks.Site, replan: *Replanner, 
         .asm_bin = .{ .path = fx.ok },
         .project_dir = fx.project,
         .platform_tag = target,
-        .backend_tag = "probe",
         .output_dir = fx.project,
         .target_dir = fx.project,
         .zig_args = &fx.ok_argv,
@@ -365,8 +364,8 @@ test "rebuild transaction: a change the running replacement depends on publishes
     defer site.env.deinit();
     // The startup mode with no `--optimize` and no owner default.
     site.optimize = .Debug;
-    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
-    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
+    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, "probe", target, false, site.optimize)).?;
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -669,8 +668,8 @@ test "rebuild transaction: a before-run hook's OWNING provider changing is a ses
     defer site.env.deinit();
     // The startup mode with no `--optimize` and no owner default.
     site.optimize = .Debug;
-    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
-    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
+    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, "probe", target, false, site.optimize)).?;
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;

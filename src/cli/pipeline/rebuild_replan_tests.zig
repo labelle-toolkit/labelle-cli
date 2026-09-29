@@ -65,7 +65,6 @@ test "watch replan re-reads the project and provider manifests on every call" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -215,7 +214,6 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -329,7 +327,6 @@ test "watched rebuild lets a prebuild refresh an existing provider manifest" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -393,7 +390,6 @@ test "watched rebuild replans after a prebuild step generates provider metadata"
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -498,7 +494,6 @@ test "watch replan extracts a pinned provider once per changed pin" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -609,7 +604,6 @@ test "watch replan installs and relocks when project.labelle changes" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -724,7 +718,6 @@ test "watched serve shutdown runs the replanned after-run hooks" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -815,7 +808,6 @@ test "watch replan release restores the site's stable storage" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -868,7 +860,6 @@ test "watch replan installs the re-read prebuild steps" {
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         .zig_args = &.{asm_path},
@@ -943,7 +934,6 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
         .asm_bin = .{ .path = asm_path },
         .project_dir = project,
         .platform_tag = "probe-target",
-        .backend_tag = "probe",
         .output_dir = project,
         .target_dir = project,
         // The startup plan, before any replan.
@@ -995,8 +985,9 @@ test "watch replan: withOptimize replaces or drops the flag, keeping every other
 
 // cli#471 D3 (CodeRabbit on #504): a watched rebuild applies the cold
 // pipeline's support gate. A backend bump that makes `describe` refuse the
-// pair fails THAT rebuild (the session lives on); no answer, a supported
-// pair, a replaced generation or a target outside the schema pass.
+// pair fails THAT rebuild (the session lives on), and so does no answer
+// (D4: there is no enum to fall back to); a supported pair, a replaced
+// generation or a target outside the schema pass.
 test "watch replan: describe's unsupported verdict fails the rebuild before generation" {
     const Fake = struct {
         var calls: usize = 0;
@@ -1022,10 +1013,10 @@ test "watch replan: describe's unsupported verdict fails the rebuild before gene
 
     Fake.reply = Fake.doc("true", "");
     try Replanner.generateGate(describer, a, "desktop", core, false);
-    // No answer (describe failed): the enum behaviour, i.e. proceed.
+    // No answer (describe failed, or no describe at all): the rebuild fails.
     Fake.reply = null;
-    try Replanner.generateGate(describer, a, "desktop", core, false);
-    try Replanner.generateGate(.off, a, "desktop", core, false);
+    try std.testing.expectError(error.DescribeFailed, Replanner.generateGate(describer, a, "desktop", core, false));
+    try std.testing.expectError(error.DescribeFailed, Replanner.generateGate(.off, a, "desktop", core, false));
 
     // Never asked when the core generation does not run for the target.
     Fake.reply = Fake.doc("false", ",\"reason\":\"x\"");

@@ -224,6 +224,29 @@ pub fn fatalExit(code: u8, detail: []const u8) noreturn {
     std.process.exit(code);
 }
 
+/// The terminal `failed` record of a build that died before it had a
+/// target dir, and so before any `Reporter` could exist: the dir is named by
+/// the assembler (`describe`, cli#471 D4), and a lookup or `describe` that
+/// failed leaves nothing to name it with. Under `--progress=json` the one
+/// record goes to stdout, so a feed consumer still sees why the build ended;
+/// there is no status file to write. Other modes print nothing (the cause is
+/// already on stderr).
+pub fn earlyFailure(io: std.Io, mode: Mode, exit_code: u8, detail: []const u8) void {
+    if (mode != .json) return;
+    var buf: [512 + max_detail_len * 6]u8 = undefined;
+    const ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    const line = encodeRecord(&buf, .{
+        .phase = .failed,
+        .detail = detail[0..@min(detail.len, max_detail_len)],
+        .exit_code = exit_code,
+        .updated_at_ms = if (ms > 0) @intCast(ms) else 0,
+    }) catch return;
+    var w = std.Io.File.stdout().writerStreaming(io, &.{});
+    var vec = [2][]const u8{ line, "\n" };
+    w.interface.writeVecAll(&vec) catch return;
+    w.interface.flush() catch return;
+}
+
 /// Fan-out sink: takes phase transitions from the CLI command flow and
 /// compile-granularity updates from the `std.Progress` pump thread, and
 /// drives all three access modes from that single source. Thread-safe (one

@@ -2,6 +2,8 @@
 //! (`watch.zig`, `watch_replan_tests.zig`).
 const std = @import("std");
 const provider_hooks = @import("../provider_hooks.zig");
+const config = @import("../config.zig");
+const assembler_describe = @import("../assembler_describe.zig");
 
 /// A hook site with no providers, for the rebuild tests: the plans are
 /// what the tests supply; nothing here reaches a compiler or a lock.
@@ -36,4 +38,22 @@ pub fn exitTool(a: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, code: u
     const script = try std.fmt.bufPrint(&buf, "#!/bin/sh\nexit {d}\n", .{code});
     try dir.writeFile(io, .{ .sub_path = name, .data = script, .flags = .{ .permissions = .executable_file } });
     return dir.realPathFileAlloc(io, name, a);
+}
+
+/// A `describe` that reads the project the way the assembler would, for the
+/// watch-session tests (cli#471 D4: the session's backend is describe's
+/// answer). The backend is `null` when `project.labelle` spells
+/// `.backend = .null`, else `probe`; the target dir follows it.
+pub fn fakeDescriber(project: []const u8) assembler_describe.Describer {
+    return .{ .bin_path = "fake-assembler", .protocol = assembler_describe.min_protocol, .project_dir = project, .spawn = fakeDescribe };
+}
+
+fn fakeDescribe(arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
+    // argv: <bin> describe --project-root <P> --target <T> --json
+    const path = std.fs.path.join(arena, &.{ argv[3], "project.labelle" }) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, arena, .limited(1 << 20)) catch return null;
+    const backend: []const u8 = if (std.mem.indexOf(u8, text, ".backend = .null") != null) "null" else "probe";
+    return std.fmt.allocPrint(arena,
+        \\{{"schema":"labelle.describe/v1","target":"{s}","target_dir":".labelle/{s}_{s}","backend":{{"name":"{s}","id":null,"repo":null,"version":null,"local_path":null}},"asset_format":"png","supported":true}}
+    , .{ argv[5], backend, argv[5], backend }) catch null;
 }

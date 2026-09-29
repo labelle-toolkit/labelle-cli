@@ -95,12 +95,9 @@ pub fn resolve(
     // is derived from the NAME only where the pinned assembler and the
     // legacy sites still need the schema enum.
     parsed.platform = provisional.legacy orelse .desktop;
-
-    // `labelle ios` always implies the sokol backend (its target came
-    // through the resolver like everything else).
-    if (command == .ios_cmd) {
-        parsed.backend = .sokol;
-    }
+    // (`labelle ios` no longer forces a backend: the CLI names none since
+    // cli#471 D4, and the assembler's error names the backend and target
+    // when the project's own cannot build it — RFC cli#471 decision D5.)
 
     return .{ .proceed = .{ .project_root = project_root, .provisional = provisional } };
 }

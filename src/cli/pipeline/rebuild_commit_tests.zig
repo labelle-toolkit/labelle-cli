@@ -21,6 +21,7 @@ const rebuild = @import("rebuild.zig");
 const Replanner = @import("rebuild_replan.zig").Replanner;
 const SessionKey = @import("session_key.zig").SessionKey;
 const tx = @import("rebuild_transaction_tests.zig");
+const testing = @import("testing.zig");
 const Fixture = tx.Fixture;
 const Publish = tx.Publish;
 const target = tx.target;
@@ -291,9 +292,9 @@ test "rebuild commit: a local provider's source edit is a session change; its bu
     defer site.env.deinit();
     // The startup mode with no `--optimize` and no owner default.
     site.optimize = .Debug;
-    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, @tagName(fx.cfg.backend), target, false, site.optimize)).?;
+    const key = (try SessionKey.of(fx.arena.allocator(), fx.project, fx.cfg, fx.run_plan, "probe", target, false, site.optimize)).?;
     try std.testing.expect(key.source != null);
-    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .session = &key, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;

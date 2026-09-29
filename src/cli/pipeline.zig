@@ -153,7 +153,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // cache is populated — see the `gateThenInstall` call.)
 
     // ── Build-progress feed (cli#284) ──────────────────────────────────
-    // Target subdir: .labelle/raylib_desktop/, etc. Computed up front so
+    // Target subdir: .labelle/<backend>_<target>/. Computed up front so
     // the live status file `.labelle/<target>/.build-progress.json` has a
     // home from the first `resolve` record onward (the dir is created by
     // the reporter; the assembler generates into it later). Named after
@@ -162,31 +162,29 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     //
     // The name is the assembler's own answer (`describe`, protocol 7 —
     // cli#471 D3), so a third-party `.backend_package` names the dir after
-    // its package exactly as `generate` does (cli#471 finding 4). An older
-    // assembler, or a `describe` that cannot answer, keeps the enum-derived
-    // `<backend tag>_<target>`. The legacy ios subcommand forces its own
-    // backend, which `describe` (reading project.labelle alone) cannot
-    // know, so it keeps the enum name too.
+    // its package exactly as `generate` does (cli#471 finding 4). Since D4
+    // there is no other answer: the CLI knows no backend, so an assembler
+    // that cannot be found, predates `describe` or cannot answer ends the
+    // command here, with one line saying why and, under `--progress=json`,
+    // one `failed` record (`progress.earlyFailure`: no dir, no status file).
     //
     // This is why the assembler is looked up HERE, ahead of the session lock
     // and the progress feed: both live under the target dir. Looking it up
-    // touches only the assembler cache, nothing a running session owns. A
-    // lookup that fails here is not fatal yet: the dir keeps the enum name,
-    // and the lookup below fails again inside the progress feed, so a
-    // `--progress=json` consumer still gets its `failed` record.
-    const early_asm: ?assembler_proc.Assembler = if (command == .ios_cmd)
-        null
-    else
-        assembler_proc.resolve(allocator, project_dir, "generate") catch |err| blk: {
-            std.log.debug("assembler lookup before naming the target dir failed ({t}); using the enum name", .{err});
-            break :blk null;
-        };
-    var early_asm_owned = early_asm != null;
-    defer if (early_asm_owned) early_asm.?.deinit(allocator);
-    const describer: assembler_describe.Describer = if (early_asm) |a| .init(a, project_dir) else .off;
-    const described = describer.query(hook_arena, provisional.name);
-    const backend_label = assembler_describe.backendLabel(described, @tagName(parsed.backend));
-    const target_name = try assembler_describe.targetDirName(allocator, described, @tagName(parsed.backend), provisional.name);
+    // touches only the assembler cache, nothing a running session owns.
+    const feeds_progress = command == .build or command == .run or command == .bundle_cmd;
+    const early_asm = assembler_proc.resolve(allocator, project_dir, "generate") catch |err| {
+        if (feeds_progress) progress.earlyFailure(config.globalIo(), parsed_args.progress_mode, 1, "assembler lookup failed");
+        return err;
+    };
+    var early_asm_owned = true;
+    defer if (early_asm_owned) early_asm.deinit(allocator);
+    const describer: assembler_describe.Describer = .init(early_asm, project_dir);
+    const described = describer.require(hook_arena, provisional.name) catch {
+        if (feeds_progress) progress.earlyFailure(config.globalIo(), parsed_args.progress_mode, 1, "assembler describe failed");
+        return 1;
+    };
+    const backend_label = described.backend.name;
+    const target_name = try allocator.dupe(u8, described.targetDirName().?);
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", target_name });
     defer allocator.free(target_dir);
@@ -239,7 +237,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // behavior instead of blocking the build.
     var reporter_storage: progress.Reporter = undefined;
     const reporter: ?*progress.Reporter = blk: {
-        if (command != .build and command != .run and command != .bundle_cmd) break :blk null;
+        if (!feeds_progress) break :blk null;
         reporter_storage = progress.Reporter.init(allocator, config.globalIo(), parsed_args.progress_mode, target_dir) catch break :blk null;
         break :blk &reporter_storage;
     };
@@ -261,16 +259,15 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     }
 
     // Version compatibility, the pre-build hooks (#355) and the SDL2 env
-    // wiring (`install.preInstall`).
-    const wants_sdl2 = try install.preInstall(allocator, project_dir, parsed, &parsed_args);
+    // wiring (`install.preInstall`), scoped by the backend `describe` named.
+    const wants_sdl2 = try install.preInstall(allocator, project_dir, parsed, &parsed_args, backend_label);
 
     // Issue #217: the CLI is a thin driver over the standalone
-    // labelle-assembler binary. Resolve it once (LABELLE_ASSEMBLER env var
-    // > assembler_version in project.labelle > auto-downloaded default) and
-    // reuse the located binary for both the cache-populate step and code
-    // generation below. Usually it was already found before the target dir
-    // was named (see there); only a lookup that failed there runs again.
-    const asm_bin = if (early_asm) |a| a else try assembler_proc.resolve(allocator, project_dir, "generate");
+    // labelle-assembler binary. Resolved once (LABELLE_ASSEMBLER env var
+    // > assembler_version in project.labelle > auto-downloaded default),
+    // before the target dir was named (see there), and reused for the
+    // cache-populate step and code generation below.
+    const asm_bin = early_asm;
     early_asm_owned = false;
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
@@ -404,6 +401,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         .project_dir = project_dir,
         .hook_arena = hook_arena,
         .target_name = target_name,
+        .backend_name = backend_label,
         .target_dir = target_dir,
         .output_dir = output_dir,
         .reporter = reporter,

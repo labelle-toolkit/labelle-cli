@@ -34,13 +34,26 @@ fixture = Path(__file__).parent / "fixtures" / "provider"
 FAKE_ASSEMBLER = '''import sys
 from pathlib import Path
 argv = sys.argv[1:]
+def backend_of(root):
+    # The `.backend` shorthand as the assembler reads it (bgfx when absent):
+    # the CLI takes the backend and the target dir from `describe` (cli#471 D4).
+    text = (root / "project.labelle").read_text()
+    at = text.find(".backend = .")
+    return text[at + len(".backend = ."):].split()[0].strip(",}") if at >= 0 else "bgfx"
 if argv and argv[0] == "--protocol-version":
     print(99)
+elif argv and argv[0] == "describe":
+    import json
+    target_name = argv[argv.index("--target") + 1]
+    backend = backend_of(Path(argv[argv.index("--project-root") + 1]))
+    print(json.dumps({"schema": "labelle.describe/v1", "target": target_name,
+                      "target_dir": ".labelle/" + backend + "_" + target_name,
+                      "backend": {"name": backend}, "asset_format": "png", "supported": True}))
 elif argv and argv[0] == "install":
     print("FIXTURE_INSTALL_DONE", file=sys.stderr, flush=True)
 elif argv and argv[0] == "generate":
     root = Path(argv[argv.index("--project-root") + 1])
-    target = root / ".labelle" / (argv[argv.index("--backend") + 1] + "_" + argv[argv.index("--platform") + 1])
+    target = root / ".labelle" / (backend_of(root) + "_" + argv[argv.index("--target") + 1])
     target.mkdir(parents=True, exist_ok=True)
     (target / "build.zig").write_text(
         'const std = @import("std");\\n'

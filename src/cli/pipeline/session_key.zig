@@ -44,12 +44,14 @@ pub const SessionKey = struct {
     /// its id, tool, and its owning provider's version, verified pin,
     /// negotiated wire and `provider_config` mapping.
     before_run: []const u8,
+    /// The backend package's name as `labelle-assembler describe` resolved
+    /// it (cli#471 D4): the CLI reads no `.backend` of its own.
     backend: []const u8,
     /// The explicit `.backend_package`'s name, "" when none. It names the
-    /// generated target dir (`describe`'s `target_dir`, cli#471 D3) even
-    /// when the `.backend` tag stays the same, and the session builds and
-    /// publishes the dir it started with, so a renamed package is a change.
-    /// Its version is not: a bump regenerates into the same dir.
+    /// generated target dir (`describe`'s `target_dir`, cli#471 D3), and the
+    /// session builds and publishes the dir it started with, so a renamed
+    /// package is a change. Its version is not: a bump regenerates into the
+    /// same dir.
     backend_package: []const u8 = "",
     target: []const u8,
     /// Whether the target comes from `project.labelle` (no `--platform`),
@@ -186,11 +188,12 @@ pub const SessionKey = struct {
         return null;
     }
 
-    /// The config-level half, drawn from `project.labelle` alone before any
-    /// prebuild step runs: the backend and its package's name, and the
+    /// The config-level half, drawn from `project.labelle` before any
+    /// prebuild step runs: the backend (`backend`, the name `describe`
+    /// resolves for the file as it now is), its package's name, and the
     /// target when the file picks it.
-    pub fn configChanged(self: SessionKey, cfg: project_config.ProjectConfig) ?[]const u8 {
-        if (!eql(self.backend, @tagName(cfg.backend))) return "the backend";
+    pub fn configChanged(self: SessionKey, cfg: project_config.ProjectConfig, backend: []const u8) ?[]const u8 {
+        if (!eql(self.backend, backend)) return "the backend";
         if (!eql(self.backend_package, backendPackageName(cfg))) return "the backend package";
         if (self.target_follows_file and !eql(self.target, @tagName(cfg.platform))) return "the target";
         return null;
@@ -473,40 +476,39 @@ test "session key: every field the replacement depends on is reported, the first
     // file picks it.
     const cfg: project_config.ProjectConfig = .{ .name = "game" };
     var key = base;
-    key.backend = @tagName(cfg.backend);
+    key.backend = "probe";
     key.target = "probe-target";
-    try std.testing.expect(key.configChanged(cfg) == null);
+    try std.testing.expect(key.configChanged(cfg, "probe") == null);
     key.target_follows_file = true;
-    try std.testing.expectEqualStrings("the target", key.configChanged(cfg).?);
-    key.backend = "other";
-    try std.testing.expectEqualStrings("the backend", key.configChanged(cfg).?);
+    try std.testing.expectEqualStrings("the target", key.configChanged(cfg, "probe").?);
+    try std.testing.expectEqualStrings("the backend", key.configChanged(cfg, "other").?);
 }
 
-test "session key: renaming .backend_package under the same .backend asks for a restart (cli#471 D3)" {
+test "session key: renaming .backend_package asks for a restart (cli#471 D3)" {
     // The generated dir follows the package name (`describe`), so the edit
     // Codex found on #504 — same enum tag, a differently named package —
     // would otherwise generate into a new dir while the session keeps
     // building and publishing the old one.
     const started: project_config.ProjectConfig = .{ .name = "game", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } };
-    var key = std.mem.zeroInit(SessionKey, .{ .backend = @tagName(started.backend), .backend_package = SessionKey.backendPackageName(started) });
-    try std.testing.expect(key.configChanged(started) == null);
+    var key = std.mem.zeroInit(SessionKey, .{ .backend = "probe", .backend_package = SessionKey.backendPackageName(started) });
+    try std.testing.expect(key.configChanged(started, "probe") == null);
     // A version bump regenerates into the same dir: an ordinary rebuild.
     var bumped = started;
     bumped.backend_package.?.version = "1.1.0";
-    try std.testing.expect(key.configChanged(bumped) == null);
+    try std.testing.expect(key.configChanged(bumped, "probe") == null);
     // Renamed, or dropped back to the enum's own package: a restart.
     var renamed = started;
     renamed.backend_package.?.name = "other";
-    try std.testing.expectEqualStrings("the backend package", key.configChanged(renamed).?);
+    try std.testing.expectEqualStrings("the backend package", key.configChanged(renamed, "probe").?);
     var dropped = started;
     dropped.backend_package = null;
-    try std.testing.expectEqualStrings("the backend package", key.configChanged(dropped).?);
+    try std.testing.expectEqualStrings("the backend package", key.configChanged(dropped, "probe").?);
     // The full key reports it too.
     var next = key;
     next.backend_package = "other";
     try std.testing.expectEqualStrings("the backend package", key.changed(next).?);
     key.backend_package = "";
-    try std.testing.expect(key.configChanged(.{ .name = "game" }) == null);
+    try std.testing.expect(key.configChanged(.{ .name = "game" }, "probe") == null);
 }
 
 test "session key: a remote provider's pin is the accepted lock entry, so a re-pin is a change" {

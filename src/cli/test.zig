@@ -77,7 +77,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
     // read ..." which would duplicate the friendly hint below.
     var probe_arena = std.heap.ArenaAllocator.init(allocator);
     defer probe_arena.deinit();
-    const cfg = config.readProjectConfigQuiet(probe_arena.allocator(), project_dir) catch |err| {
+    _ = config.readProjectConfigQuiet(probe_arena.allocator(), project_dir) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("\n  No project.labelle found in '{s}'.\n\n", .{project_dir});
             std.debug.print("  Run `labelle test` from the root of a labelle project.\n\n", .{});
@@ -91,9 +91,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, cmd_args: []const []const u8) !void
         try discoverAndRun(allocator, project_dir, &stats, verbose);
     }
 
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
-    defer allocator.free(target_name);
-    try runGameTests(allocator, project_dir, target_name, &stats, verbose, .{});
+    try runGameTests(allocator, project_dir, &stats, verbose, .{});
 
     // "test target(s)", not "tests": each is one `zig test`/`zig build test`
     // invocation. The per-test count is Zig's own summary, printed above by
@@ -367,19 +365,18 @@ const GameTestHooks = struct {
 fn runGameTests(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
-    backend_target: []const u8,
     stats: *TestStats,
     verbose: bool,
     hooks: GameTestHooks,
 ) !void {
     const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
     defer allocator.free(tests_build_zig);
-    const backend_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", backend_target, "build.zig" });
-    defer allocator.free(backend_build_zig);
+    const generated_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
+    defer allocator.free(generated_dir);
     const authored = try std.fs.path.join(allocator, &.{ project_dir, "tests" });
     defer allocator.free(authored);
 
-    const generated_before = pathExists(tests_build_zig) or pathExists(backend_build_zig);
+    const generated_before = pathExists(tests_build_zig) or pathExists(generated_dir);
     if (!pathExists(authored) and !generated_before) return;
 
     hooks.refresh(allocator, project_dir) catch |err| {
@@ -390,17 +387,17 @@ fn runGameTests(
         return error.GenerateFailed;
     };
 
-    // Assembler >=0.14.0 emits a backend-agnostic `.labelle/tests/` dir
-    // dedicated to the test step; prefer it when present so the test build
-    // does not pull in the active backend. Older assemblers only emit the exe
-    // dir, so fall back to `.labelle/<backend>_<platform>/` — chosen from
-    // `project.labelle`, not the first dir found, so a generation left over
-    // from a prior backend switch is never picked. Probed AFTER the refresh,
-    // and on `build.zig` rather than the directory, so a `.labelle/tests/`
-    // left by a since-downgraded assembler is not preferred over the dir the
-    // refresh just wrote.
-    const target = if (pathExists(tests_build_zig)) "tests" else backend_target;
-    try hooks.run_step(allocator, project_dir, target, stats, verbose);
+    // The assembler emits a backend-agnostic `.labelle/tests/` dir dedicated
+    // to the test step (>= 0.14.0), so the test build never pulls in the
+    // active backend. Every assembler the refresh accepts (protocol 7,
+    // cli#471 D4) writes it, so the old fallback to the backend's exe dir —
+    // named by a backend tag the CLI no longer knows — is gone: a refresh
+    // that left no `tests/build.zig` is an error, not a reason to guess.
+    if (!pathExists(tests_build_zig)) {
+        std.debug.print("labelle test: the refreshed generation has no .labelle/tests/build.zig; run `labelle generate` and check its output\n", .{});
+        return error.GenerateFailed;
+    }
+    try hooks.run_step(allocator, project_dir, "tests", stats, verbose);
 }
 
 fn pathExists(path: []const u8) bool {
@@ -778,7 +775,7 @@ pub const GameTestFreshnessSpec = struct {
 
         resetHookLog(false);
         var stats = TestStats{};
-        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        try runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks);
         // The ORDER is the assertion: refresh, then the test step.
         try std.testing.expectEqualStrings("RT", hook_log[0..hook_log_len]);
         try std.testing.expectEqualStrings("tests", hook_ran_target[0..hook_ran_target_len]);
@@ -797,7 +794,7 @@ pub const GameTestFreshnessSpec = struct {
 
         resetHookLog(true);
         var stats = TestStats{};
-        try std.testing.expectError(error.GenerateFailed, runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks));
+        try std.testing.expectError(error.GenerateFailed, runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks));
         // Refresh was attempted; the test step was NOT reached.
         try std.testing.expectEqualStrings("R", hook_log[0..hook_log_len]);
         try std.testing.expectEqual(@as(usize, 0), stats.files_with_tests);
@@ -814,7 +811,7 @@ pub const GameTestFreshnessSpec = struct {
 
         resetHookLog(false);
         var stats = TestStats{};
-        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        try runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks);
         try std.testing.expectEqualStrings("RT", hook_log[0..hook_log_len]);
     }
 
@@ -826,24 +823,24 @@ pub const GameTestFreshnessSpec = struct {
 
         resetHookLog(false);
         var stats = TestStats{};
-        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
+        try runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks);
         try std.testing.expectEqual(@as(usize, 0), hook_log_len);
     }
 
-    test "an older assembler with no .labelle/tests/ — the backend dir is the target, chosen after the refresh" {
+    test "a refresh that leaves no .labelle/tests/ fails, never guessing a backend dir (cli#471 D4)" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const io = config.globalIo();
         try tmp.dir.createDirPath(io, "tests");
-        try tmp.dir.createDirPath(io, ".labelle/null_desktop");
-        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/null_desktop/build.zig", .data = "//\n" });
+        try tmp.dir.createDirPath(io, ".labelle/fixture_desktop");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/fixture_desktop/build.zig", .data = "//\n" });
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const dir = try tmpProjectPath(&tmp, &buf);
 
         resetHookLog(false);
         var stats = TestStats{};
-        try runGameTests(std.testing.allocator, dir, "null_desktop", &stats, false, recording_hooks);
-        try std.testing.expectEqualStrings("RT", hook_log[0..hook_log_len]);
-        try std.testing.expectEqualStrings("null_desktop", hook_ran_target[0..hook_ran_target_len]);
+        try std.testing.expectError(error.GenerateFailed, runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks));
+        // Refreshed; the test step was NOT reached.
+        try std.testing.expectEqualStrings("R", hook_log[0..hook_log_len]);
     }
 };

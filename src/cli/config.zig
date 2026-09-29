@@ -173,23 +173,27 @@ pub const ProjectExistsSpec = struct {
 /// keys off the CLI version the project was locked with, which is the
 /// fact that actually predicts "this binary may not understand this
 /// project", rather than guessing from field names.
-/// A `project.labelle` with no `.backend` field builds with bgfx, the
-/// assembler's default since assembler#768 (it was raylib before).
-pub const DefaultBackendSpec = struct {
-    test "a project without .backend resolves to bgfx" {
+/// The `.backend` shorthand is the assembler's (RFC cli#471 D4): the CLI
+/// mirrors no such field, so every existing project still parses, whatever
+/// tag it names, first-party or not.
+pub const BackendShorthandSpec = struct {
+    test "a project's .backend shorthand parses and is not read by the CLI" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"demo\" }" });
         const dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-        const cfg = try readProjectConfigQuiet(alloc, dir);
-        try std.testing.expectEqual(project_config.Backend.bgfx, cfg.backend);
-        try std.testing.expectEqual(project_config.Backend.bgfx, project_config.default_backend);
-        // An explicit field still wins.
-        try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = ".{ .name = \"demo\", .backend = .raylib }" });
-        try std.testing.expectEqual(project_config.Backend.raylib, (try readProjectConfigQuiet(alloc, dir)).backend);
+        for ([_][]const u8{
+            ".{ .name = \"demo\" }",
+            ".{ .name = \"demo\", .backend = .null }",
+            ".{ .name = \"demo\", .backend = .some_future_tag, .gamepad = .none }",
+        }) |data| {
+            try tmp.dir.writeFile(globalIo(), .{ .sub_path = "project.labelle", .data = data });
+            const cfg = try readProjectConfigQuiet(alloc, dir);
+            try std.testing.expectEqualStrings("demo", cfg.name);
+        }
+        try std.testing.expect(!@hasField(project_config.ProjectConfig, "backend"));
     }
 };
 
