@@ -88,7 +88,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
     def core_ok(result):
-        return "All required desktop build dependencies are present." in result.stderr
+        return "All required core dependencies are present." in result.stderr
 
     # One provider fails: both doctors still run, in namespace order, and
     # the aggregate fails whatever the core checks found.

@@ -1,17 +1,16 @@
 //! The build and bundle stages: the `build` hook phases around the core
-//! build (docker or host `zig build`, SDL2 DLL staging and the `labelle
-//! build` packaging finalisation), and the `bundle` step.
+//! build (docker or host `zig build` and the `labelle build` packaging
+//! finalisation), and the `bundle` step.
 const std = @import("std");
 const docker = @import("../docker.zig");
 const runner = @import("../runner.zig");
-const sdl_provision = @import("../sdl_provision.zig");
 const bundle = @import("../bundle.zig");
 const linux_desktop = @import("../linux_desktop.zig");
 const provider_hooks = @import("../provider_hooks.zig");
 const Context = @import("context.zig").Context;
 
 /// Provider hooks on `build` (contract §6) wrap the whole core build —
-/// docker or host `zig build` plus the runtime DLL staging — with
+/// docker or host `zig build` plus the packaging finalisation — with
 /// `output_dir` = the target's `zig-out/`. A `replace` hook stands in for
 /// all of it. Hooks report under the `compile` phase.
 ///
@@ -21,7 +20,6 @@ pub fn run(
     build_out: []const u8,
     zig_args: []const []const u8,
     zig_env_ptr: ?*const std.process.Environ.Map,
-    wants_sdl2: bool,
 ) !?u8 {
     const allocator = cx.allocator;
     const command = cx.parsed_args.command;
@@ -100,21 +98,6 @@ pub fn run(
             }
         }
         std.debug.print("  build ok\n", .{});
-
-        // Stage the runtime SDL2.dll next to the freshly-built desktop exe. A
-        // gamepad/SDL2 build's exe fails process creation with a bare
-        // `FileNotFound` when SDL2.dll isn't in its own directory (cli#285): the
-        // Windows loader resolves implicitly-linked DLLs from the exe dir first,
-        // and neither the PATH prepend from autoWireEnv nor a user-set
-        // LABELLE_SDL2_LIB puts the DLL there. Docker builds are skipped — their
-        // exe is built for the container's OS, so a host SDL2.dll is irrelevant.
-        if (!parsed_args.docker and parsed.platform == .desktop and wants_sdl2) {
-            const bin_dir = try std.fs.path.join(allocator, &.{ target_dir, "zig-out", "bin" });
-            defer allocator.free(bin_dir);
-            // `compile_env`: the SDL2 the build linked, including a hook's
-            // `LABELLE_SDL2_LIB` contribution (contract §2).
-            sdl_provision.stageSdl2DllBesideExe(allocator, bin_dir, compile_env);
-        }
 
         // `labelle build` finalization — everything that turns the compiled
         // tree into the command's final artifact. It sits INSIDE the core

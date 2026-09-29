@@ -111,7 +111,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// the target dir, and `upgrade all` delegates the backend pin to
 /// `labelle-assembler upgrade backend`), so `cli/upgrade.zig` came clean,
 /// and `cli/pipeline/generate.zig` once its comments stopped citing
-/// backend and platform names: 14 entries.
+/// backend and platform names: 14 entries. RFC cli#471 S4 moved SDL2
+/// provisioning, runtime DLL staging and the doctor rows to the opt-in
+/// `sdl2` provider (labelle-sdl), deleting `cli/sdl_provision.zig`:
+/// 13 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -134,7 +137,6 @@ const allowed_files = [_][]const u8{
     "cli/pipeline/run.zig",
     "cli/project_config.zig",
     "cli/provider_dispatch.zig",
-    "cli/sdl_provision.zig",
 };
 
 const finding_note = "(platform/store/package names belong in providers; see docs/rfc-package-commands.md#enforcement)";
@@ -600,13 +602,12 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     // An allowlisted file whose path names a platform stays dirty with
     // clean contents: the entry is only stale once the file is moved or
     // renamed.
-    try scan.file("cli/sdl_provision.zig", "const x = 1;\n");
+    try scan.file("cli/ios.zig", "const x = 1;\n");
     try scan.file("cli\\ios.zig", "");
     try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
-    try std.testing.expect(!containsString(stale.items, "cli/sdl_provision.zig"));
     try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
     try std.testing.expect(containsString(stale.items, "cli/project_config.zig"));
 }

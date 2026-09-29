@@ -274,10 +274,6 @@ pub const reserved_env = [_][]const u8{
 /// with the reason it is not CLI-owned. Kept beside `reserved_env` so the
 /// guard can tell a deliberate decision from a forgotten name.
 pub const unreserved_labelle_env = [_][]const u8{
-    // The SDL2 library directory. The CLI reads it only to find a user's
-    // install; a package that provisions SDL2 is meant to set it for the
-    // build (RFC cli#466 §9).
-    "LABELLE_SDL2_LIB",
     // Written into a bundle's launcher script for the game; never read by
     // the CLI.
     "LABELLE_DATA_DIR",
@@ -297,17 +293,17 @@ test "provider env reserved names: a fixed CLI-owned table, case-folded under Wi
         try std.testing.expect(reservedEnvName(name, false));
         try std.testing.expect(reservedEnvName(name, true));
     }
-    // Not a prefix ban: the SDL2 library variable and any other name stay
-    // settable, and an env_file setting it parses.
-    for ([_][]const u8{ "LABELLE_SDL2_LIB", "LABELLE_ANYTHING", "TOOLCHAIN_ROOT" }) |name| {
+    // Not a prefix ban: a provider's own `LABELLE_*` variable and any other
+    // name stay settable, and an env_file setting one parses.
+    for ([_][]const u8{ "LABELLE_ANYTHING", "TOOLCHAIN_ROOT" }) |name| {
         try std.testing.expect(!reservedEnvName(name, false));
         try std.testing.expect(!reservedEnvName(name, true));
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var diag: @import("provider_env.zig").Diagnostic = .{};
-    const file = try @import("provider_env.zig").parseFile(arena.allocator(), "{\"set\":[{\"name\":\"LABELLE_SDL2_LIB\",\"value\":\"/sdl/lib\"}]}", false, &diag);
-    try std.testing.expectEqualStrings("LABELLE_SDL2_LIB", file.set[0].name);
+    const file = try @import("provider_env.zig").parseFile(arena.allocator(), "{\"set\":[{\"name\":\"LABELLE_ANYTHING\",\"value\":\"/opt/lib\"}]}", false, &diag);
+    try std.testing.expectEqualStrings("LABELLE_ANYTHING", file.set[0].name);
     // `Path` is PATH under Windows rules only.
     try std.testing.expect(reservedEnvName("Path", true));
     try std.testing.expect(!reservedEnvName("Path", false));

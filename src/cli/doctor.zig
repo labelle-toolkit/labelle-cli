@@ -5,18 +5,20 @@
 //! then runs the doctor of every pinned provider whose manifest declares one
 //! (the same run as `labelle <namespace> doctor`; see `provider_doctor.zig`),
 //! and exits non-zero if the core or any provider fails. `--core-only` skips
-//! the provider part. Almost everything a
-//! labelle game needs is fetched + compiled by Zig automatically (raylib,
-//! sokol, cimgui, glfw, wgpu-native, the labelle packages). The one genuine
-//! manual system dependency is **SDL2** — used by the raylib/sokol backends
-//! for the desktop gamepad source, and by the `sdl` backend as the renderer
-//! (which additionally needs the headers + SDL2_mixer). When it is missing the
-//! build otherwise fails deep in a Zig linker dump ("unable to find dynamic
-//! system library 'SDL2'"); this command surfaces it up front instead.
+//! the provider part. The core checks only what it owns: the managed Zig and
+//! Python. Everything else a labelle game needs is fetched + compiled by Zig,
+//! or is a provider's to check and provision.
 //!
-//! `--fix` auto-provisions SDL2 into `~/.labelle/sdl2/` on Windows (see
-//! `sdl_provision.zig`); `build`/`run` then auto-wire the cached install
-//! into the child environment so it works without manual env setup.
+//! SDL2 is one such system library: the `sdl` renderer and the gamepad
+//! source of other desktop backends link it. Its provisioning, runtime DLL
+//! staging and doctor rows left the core for the opt-in `sdl2` provider
+//! (labelle-sdl; RFC cli#471 S4, D2). When the project's build links SDL2
+//! and `.plugins` does not list that provider, doctor prints a one-line
+//! hint instead (`sdl2Hint`).
+//!
+//! `--fix` has nothing to fix in the core any more; a provider's doctor
+//! fixes its own (`labelle <namespace> doctor --fix`). Forwarding `--fix` to
+//! the provider doctors (RFC cli#471 D10) is not implemented yet.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,7 +26,6 @@ const config = @import("config.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const assembler_describe = @import("assembler_describe.zig");
 const provider_targets = @import("provider_targets.zig");
-const sdl_provision = @import("sdl_provision.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
 const python_provision = @import("python_provision.zig");
@@ -163,8 +164,7 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     const python_check = checkPython(arena);
 
     // `--json`: emit the studio's capability report from the toolchain
-    // checks and the provider doctors, and stop — no human report, no SDL
-    // provisioning. The python
+    // checks and the provider doctors, and stop — no human report. The python
     // item is fixable via `labelle install python` (cli#291); zig stays a
     // non-fixable status row (the gate treats non-fixable as satisfied, so
     // it renders their status without offering an install button).
@@ -184,56 +184,28 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     }
 
     // Which backend the project builds with, as the assembler resolves it
-    // (`describe`, cli#471 D4: the CLI reads no `.backend` of its own), and
-    // so which parts of SDL2 it pulls in (`sdl_provision.Needs`, the one
-    // place the backend names are spelled). Only inside a project: outside
-    // one, or when `describe` cannot answer, the backend is unknown and
-    // doctor never claims an all-clear (`sdlNeeds`): every SDL2 part is
-    // checked, the ones it cannot be sure of as warnings.
+    // (`describe`, cli#471 D4: the CLI reads no `.backend` of its own). Only
+    // inside a project: outside one, or when `describe` cannot answer, it is
+    // unknown. It scopes nothing but the report header and the SDL2 hint.
     const backend: ?[]const u8 = if (cfg.found) describeBackend(arena, scope.dir) else null;
-    const needs = sdlNeeds(backend, cfg.gamepad_off);
-    const needs_sdl_render = needs.render;
-    const needs_sdl_gamepad = needs.gamepad;
-    const needs_sdl = needs.any();
+
+    if (do_fix) {
+        std.debug.print("labelle doctor: the core has nothing to fix; a provider's doctor fixes its own (`labelle <namespace> doctor --fix`).\n", .{});
+    }
 
     var checks: std.ArrayList(Check) = .empty;
 
     try checks.append(arena, zig_check);
     try checks.append(arena, python_check);
 
-    if (needs_sdl) {
-        var lib = checkSdl2Lib(arena);
-        if (!lib.ok and do_fix) {
-            std.debug.print("\nlabelle doctor: provisioning SDL2...\n", .{});
-            _ = sdl_provision.provisionSdl2(allocator);
-            lib = checkSdl2Lib(arena); // re-detect — the cache scan now finds it
-        }
-        lib.required = needs.libRequired();
-        try checks.append(arena, lib);
-        if (builtin.os.tag == .windows) {
-            var dll = checkSdl2Dll(arena);
-            dll.required = dll.required and needs.libRequired();
-            try checks.append(arena, dll);
-        }
-        if (needs_sdl_render) {
-            for ([_]Check{ checkSdl2Headers(arena), checkSdl2Mixer(arena) }) |c| {
-                var check = c;
-                check.required = !needs.unknown;
-                try checks.append(arena, check);
-            }
-        }
-    } else if (do_fix) {
-        std.debug.print("labelle doctor: nothing to fix — this backend needs no system libraries.\n", .{});
-    }
-
     // ── Report ──────────────────────────────────────────────────────────
     const backend_label = if (backend) |name|
         name
     else if (cfg.found)
-        "unknown (`labelle-assembler describe` gave no answer; SDL2 checks below are a superset)"
+        "unknown (`labelle-assembler describe` gave no answer)"
     else
-        "unknown (no project.labelle; SDL2 checks below are a superset)";
-    const gamepad_label = if (needs_sdl_gamepad) "on" else if (needs_sdl) "off" else "n/a";
+        "unknown (no project.labelle)";
+    const gamepad_label = if (!cfg.found) "n/a" else if (cfg.gamepad_off) "off" else "on";
     std.debug.print(
         \\
         \\labelle doctor
@@ -243,10 +215,6 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         \\
         \\
     , .{ scope.dir, backend_label, gamepad_label });
-
-    if (!needs_sdl) {
-        std.debug.print("  This backend needs no manual system libraries — everything is fetched + built by Zig.\n", .{});
-    }
 
     var failures: u32 = 0;
     var warnings: u32 = 0;
@@ -267,10 +235,11 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
 
     std.debug.print("\n", .{});
     if (failures == 0) {
-        std.debug.print("  All required desktop build dependencies are present.\n", .{});
+        std.debug.print("  All required core dependencies are present.\n", .{});
     } else {
         std.debug.print("  {d} required dependency(ies) missing — see FAIL lines above.\n", .{failures});
     }
+    if (sdl2Hint(cfg, backend)) |hint| std.debug.print("  {s}\n", .{hint});
 
     // The pinned providers' doctors, after the core checks and whatever they
     // found: a core failure does not hide a provider's report, and one
@@ -335,47 +304,50 @@ const Cfg = struct {
     /// A `project.labelle` was read.
     found: bool = false,
     gamepad_off: bool = false,
+    /// `.plugins` lists the `sdl2` provider (labelle-sdl).
+    sdl2_provider: bool = false,
 };
 
-/// Which SDL2 parts doctor checks. A known backend: exactly what it pulls in
-/// (`sdl_provision.Needs`). An unknown one (no project, or `describe` gave
-/// no answer): everything — the library as required unless the gamepad is
-/// opted out (the assembler's default backend links it for the gamepad),
-/// and the renderer's headers + SDL2_mixer as warnings, so an `sdl`
-/// renderer project is never told nothing is needed (Codex P2 on #517).
-const SdlNeeds = struct {
-    render: bool,
-    gamepad: bool,
-    unknown: bool,
-
-    fn any(self: SdlNeeds) bool {
-        return self.render or self.gamepad;
-    }
-
-    fn libRequired(self: SdlNeeds) bool {
-        return !self.unknown or self.gamepad;
-    }
-};
-
-fn sdlNeeds(backend: ?[]const u8, gamepad_off: bool) SdlNeeds {
-    const name = backend orelse return .{ .render = true, .gamepad = !gamepad_off, .unknown = true };
-    const n = sdl_provision.Needs.of(name, gamepad_off);
-    return .{ .render = n.render, .gamepad = n.gamepad, .unknown = false };
+/// The one line doctor prints about SDL2 now that the core no longer
+/// provisions it (cli#471 S4), or null. Shown when the project's desktop
+/// build links SDL2 and `.plugins` lacks the `sdl2` provider that took the
+/// provisioning over. "Links SDL2" is the rule the core used to provision
+/// by: the `sdl` renderer always; raylib, sokol and bgfx for their gamepad
+/// source unless `.gamepad = .none`. An unknown backend (`describe` gave no
+/// answer) is judged by the gamepad alone, as the assembler's default
+/// backend links SDL2 for it. Outside a project there is nothing to judge.
+/// Advice, never a failure: SDL2 may be installed by other means.
+fn sdl2Hint(cfg: Cfg, backend: ?[]const u8) ?[]const u8 {
+    if (!cfg.found or cfg.sdl2_provider or !linksSdl2(backend, cfg.gamepad_off)) return null;
+    return "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, set LABELLE_SDL2_LIB, or use `.gamepad = .none`.";
 }
 
-test "doctor: an unknown backend is never an all-clear (Codex P2 on #517)" {
-    // Unknown, gamepad on: the library required, the renderer parts as warnings.
-    const on = sdlNeeds(null, false);
-    try std.testing.expect(on.any() and on.render and on.gamepad and on.libRequired());
-    // Unknown, `.gamepad = .none`: still checked (it may be the sdl renderer),
-    // but nothing is a hard failure.
-    const off = sdlNeeds(null, true);
-    try std.testing.expect(off.any() and off.render and !off.gamepad and !off.libRequired());
-    // Known backends: exactly their needs, all required.
-    const sdl = sdlNeeds("sdl", true);
-    try std.testing.expect(sdl.render and !sdl.unknown and sdl.libRequired());
-    try std.testing.expect(!sdlNeeds("null", false).any());
-    try std.testing.expect(sdlNeeds("bgfx", false).gamepad);
+fn linksSdl2(backend: ?[]const u8, gamepad_off: bool) bool {
+    const name = backend orelse return !gamepad_off;
+    if (std.mem.eql(u8, name, "sdl")) return true;
+    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |pad| {
+        if (std.mem.eql(u8, name, pad)) return !gamepad_off;
+    }
+    return false;
+}
+
+test "doctor: the SDL2 hint follows the old rule and goes quiet with the provider (cli#471 S4)" {
+    const plain: Cfg = .{ .found = true };
+    // The renderer always, even with the gamepad opted out.
+    try std.testing.expect(sdl2Hint(plain, "sdl") != null);
+    try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, "sdl") != null);
+    // The gamepad backends unless opted out; any other backend never.
+    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |name| {
+        try std.testing.expect(sdl2Hint(plain, name) != null);
+        try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, name) == null);
+    }
+    for ([_][]const u8{ "null", "wgpu", "acme" }) |name| try std.testing.expect(sdl2Hint(plain, name) == null);
+    // Unknown backend: the gamepad decides.
+    try std.testing.expect(sdl2Hint(plain, null) != null);
+    try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, null) == null);
+    // The provider listed, or no project: no hint.
+    try std.testing.expect(sdl2Hint(.{ .found = true, .sdl2_provider = true }, "sdl") == null);
+    try std.testing.expect(sdl2Hint(.{}, "sdl") == null);
 }
 
 /// The backend package's name for the core target, from `labelle-assembler
@@ -387,18 +359,24 @@ fn describeBackend(arena: std.mem.Allocator, project_dir: []const u8) ?[]const u
     return d.backend.name;
 }
 
-/// Read the gamepad opt-out straight out of `project.labelle` text. A full
-/// ZON parse isn't worth a dependency here; the field is a simple
-/// `.field = .value` form.
+/// The gamepad opt-out and whether the `sdl2` provider is listed, from
+/// `project.labelle`. Parsed when it parses; otherwise read out of the text
+/// (doctor is best-effort and still reports on a config the build would
+/// reject).
 fn readProjectConfig(arena: std.mem.Allocator, project_dir: []const u8) Cfg {
     const io = config.globalIo();
     const path = std.fs.path.join(arena, &.{ project_dir, "project.labelle" }) catch return .{};
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return .{};
 
-    var cfg: Cfg = .{ .found = true };
-    cfg.gamepad_off = std.mem.indexOf(u8, content, ".gamepad = .none") != null or
-        std.mem.indexOf(u8, content, ".gamepad=.none") != null;
-    return cfg;
+    if (config.readProjectConfigQuiet(arena, project_dir)) |parsed| {
+        return .{ .found = true, .gamepad_off = parsed.gamepad == .none, .sdl2_provider = parsed.hasPlugin("sdl2") };
+    } else |_| {}
+    return .{
+        .found = true,
+        .gamepad_off = std.mem.indexOf(u8, content, ".gamepad = .none") != null or
+            std.mem.indexOf(u8, content, ".gamepad=.none") != null,
+        .sdl2_provider = std.mem.indexOf(u8, content, "\"sdl2\"") != null,
+    };
 }
 
 // ── Individual checks ───────────────────────────────────────────────────
@@ -476,152 +454,6 @@ fn checkPython(arena: std.mem.Allocator) Check {
         else
             "install Python 3 and ensure `python3` is on PATH",
     };
-}
-
-fn checkSdl2Lib(arena: std.mem.Allocator) Check {
-    const name = "SDL2 library (gamepad + sdl backend)";
-    switch (builtin.os.tag) {
-        .windows => {
-            if (envOwned(arena, "LABELLE_SDL2_LIB")) |dir| {
-                const probe = std.fs.path.join(arena, &.{ dir, "libSDL2.dll.a" }) catch dir;
-                if (fileExists(probe)) return ok(name, dir);
-            }
-            if (findCachedSdl2Lib(arena)) |dir| return ok(name, dir);
-            return .{ .name = name, .ok = false, .hint = "SDL2 (MinGW dev libs) not found. Download SDL2-devel-<ver>-mingw, then set LABELLE_SDL2_LIB to its x86_64-w64-mingw32\\lib dir (and put SDL2.dll on PATH). Or set `.gamepad = .none` in project.labelle if you don't need gamepad input. (`labelle doctor --fix` will automate this soon.)" };
-        },
-        .linux => {
-            if (runOk(arena, &.{ "pkg-config", "--exists", "sdl2" })) return ok(name, "pkg-config: sdl2");
-            for ([_][]const u8{ "/usr/lib/x86_64-linux-gnu/libSDL2.so", "/usr/lib/libSDL2.so", "/usr/lib64/libSDL2.so", "/usr/local/lib/libSDL2.so" }) |p| {
-                if (fileExists(p)) return ok(name, p);
-            }
-            return .{ .name = name, .ok = false, .hint = "SDL2 not found. Install it: `sudo apt install libsdl2-dev` (Debian/Ubuntu) or `sudo dnf install SDL2-devel` (Fedora). Or set `.gamepad = .none`." };
-        },
-        .macos => {
-            for ([_][]const u8{ "/opt/homebrew/lib/libSDL2.dylib", "/usr/local/lib/libSDL2.dylib" }) |p| {
-                if (fileExists(p)) return ok(name, p);
-            }
-            return .{ .name = name, .ok = false, .hint = "SDL2 not found. Install it: `brew install sdl2`. Or set `.gamepad = .none`." };
-        },
-        else => return .{ .name = name, .ok = false, .hint = "Unsupported desktop OS for SDL2 detection." },
-    }
-}
-
-fn checkSdl2Dll(arena: std.mem.Allocator) Check {
-    const name = "SDL2.dll for runtime";
-    if (onPath(arena, "SDL2.dll")) |p| return ok(name, p);
-    // The provisioner places SDL2.dll in the cache lib dir; accept that so a
-    // freshly `--fix`ed setup reports green. (Auto-wiring PATH for `run` is a
-    // later phase; until then add this dir to PATH for standalone runs.)
-    if (findCachedSdl2Lib(arena)) |libdir| {
-        const dll = std.fs.path.join(arena, &.{ libdir, "SDL2.dll" }) catch libdir;
-        if (fileExists(dll)) {
-            return .{ .name = name, .ok = true, .detail = std.fmt.allocPrint(arena, "{s} (labelle SDL2 cache — add this dir to PATH for runtime)", .{libdir}) catch dll };
-        }
-    }
-    return .{ .name = name, .ok = false, .required = false, .hint = "SDL2.dll is needed at runtime. Add the SDL2 `bin` dir to PATH, or run `labelle doctor --fix`." };
-}
-
-fn checkSdl2Headers(arena: std.mem.Allocator) Check {
-    const name = "SDL2 headers (sdl backend)";
-    switch (builtin.os.tag) {
-        .windows => {
-            if (envOwned(arena, "LABELLE_SDL2_LIB")) |dir| {
-                const inc = std.fs.path.join(arena, &.{ dir, "..", "include", "SDL2", "SDL.h" }) catch dir;
-                if (fileExists(inc)) return ok(name, inc);
-            }
-            // The --fix-provisioned MinGW package ships headers beside the
-            // lib — accept the cache here the same way checkSdl2Lib does,
-            // so a fixed setup passes the headers check too.
-            if (findCachedSdl2Lib(arena)) |libdir| {
-                const inc = std.fs.path.join(arena, &.{ libdir, "..", "include", "SDL2", "SDL.h" }) catch libdir;
-                if (fileExists(inc)) return ok(name, inc);
-            }
-            return fail(name, "SDL2 headers not found. The `sdl` render backend needs the SDL2 dev headers (SDL2/SDL.h) from the MinGW dev package.");
-        },
-        .linux => {
-            if (runOk(arena, &.{ "pkg-config", "--cflags", "sdl2" })) return ok(name, "pkg-config: sdl2 cflags");
-            if (fileExists("/usr/include/SDL2/SDL.h")) return ok(name, "/usr/include/SDL2/SDL.h");
-            return fail(name, "SDL2 headers not found. `sudo apt install libsdl2-dev` / `sudo dnf install SDL2-devel`.");
-        },
-        .macos => {
-            for ([_][]const u8{ "/opt/homebrew/include/SDL2/SDL.h", "/usr/local/include/SDL2/SDL.h" }) |p| {
-                if (fileExists(p)) return ok(name, p);
-            }
-            return fail(name, "SDL2 headers not found. `brew install sdl2`.");
-        },
-        else => return fail(name, "Unsupported OS."),
-    }
-}
-
-fn checkSdl2Mixer(arena: std.mem.Allocator) Check {
-    const name = "SDL2_mixer (sdl backend audio)";
-    switch (builtin.os.tag) {
-        .windows => {
-            if (envOwned(arena, "LABELLE_SDL2_LIB")) |dir| {
-                const probe = std.fs.path.join(arena, &.{ dir, "libSDL2_mixer.dll.a" }) catch dir;
-                if (fileExists(probe)) return ok(name, probe);
-            }
-            return fail(name, "SDL2_mixer not found. The `sdl` backend's audio needs SDL2_mixer-devel (MinGW). Download SDL2_mixer-devel-<ver>-mingw alongside SDL2.");
-        },
-        .linux => {
-            if (runOk(arena, &.{ "pkg-config", "--exists", "SDL2_mixer" })) return ok(name, "pkg-config: SDL2_mixer");
-            return fail(name, "SDL2_mixer not found. `sudo apt install libsdl2-mixer-dev` / `sudo dnf install SDL2_mixer-devel`.");
-        },
-        .macos => {
-            for ([_][]const u8{ "/opt/homebrew/lib/libSDL2_mixer.dylib", "/usr/local/lib/libSDL2_mixer.dylib" }) |p| {
-                if (fileExists(p)) return ok(name, p);
-            }
-            return fail(name, "SDL2_mixer not found. `brew install sdl2_mixer`.");
-        },
-        else => return fail(name, "Unsupported OS."),
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-fn ok(name: []const u8, detail: []const u8) Check {
-    return .{ .name = name, .ok = true, .detail = detail };
-}
-
-fn fail(name: []const u8, hint: []const u8) Check {
-    return .{ .name = name, .ok = false, .hint = hint };
-}
-
-fn fileExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
-    return true;
-}
-
-fn envOwned(arena: std.mem.Allocator, key: []const u8) ?[]u8 {
-    if (config.globalEnviron().getAlloc(arena, key)) |v| return v else |_| return null;
-}
-
-/// Run a command and report whether it exited 0. Used for `pkg-config` probes.
-fn runOk(arena: std.mem.Allocator, argv: []const []const u8) bool {
-    const res = std.process.run(arena, config.globalIo(), .{ .argv = argv }) catch return false;
-    return switch (res.term) {
-        .exited => |c| c == 0,
-        else => false,
-    };
-}
-
-/// First PATH entry containing `filename`, or null.
-fn onPath(arena: std.mem.Allocator, filename: []const u8) ?[]const u8 {
-    const path = envOwned(arena, "PATH") orelse return null;
-    var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-    while (it.next()) |dir| {
-        const full = std.fs.path.join(arena, &.{ dir, filename }) catch continue;
-        if (fileExists(full)) return full;
-    }
-    return null;
-}
-
-/// Cached SDL2 lib dir, any version. Delegates to the provisioner's scan
-/// so detection here and the build/run env wiring share one acceptance
-/// rule — doctor must never report a cache green that autoWireEnv then
-/// ignores.
-fn findCachedSdl2Lib(arena: std.mem.Allocator) ?[]const u8 {
-    return sdl_provision.findCachedLibDir(arena);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
