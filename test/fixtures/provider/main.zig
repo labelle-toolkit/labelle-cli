@@ -106,8 +106,9 @@ pub fn main(init: std.process.Init) !u8 {
     // written) run `<labelle> generate --platform=<its target>` on its own
     // project (cli#490), with this variable removed so the nested
     // command's own hooks do not recurse. It writes `<result>`: the nested
-    // exit code, how long it took, the marker the hook itself received and
-    // the nested stderr. The hook then succeeds.
+    // exit code, how long it took, the marker the hook itself received, the
+    // lock holder's token (`.labelle/project.lock.owner`) as the hook saw it
+    // and the nested stderr. The hook then succeeds.
     if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_NESTED")) |spec| {
         var parts = std.mem.splitScalar(u8, spec, '|');
         const id = parts.next() orelse return error.BadProbeNestedSpec;
@@ -353,6 +354,8 @@ fn nested(init: std.process.Init, a: std.mem.Allocator, result: []const u8, labe
     var env = try init.environ_map.clone(a);
     _ = env.swapRemove("PROVIDER_PROBE_NESTED");
     const marker: ?[]const u8 = init.environ_map.get("LABELLE_PROJECT_LOCK_HELD");
+    const owner_path = try std.fs.path.join(a, &.{ project, ".labelle", "project.lock.owner" });
+    const owner: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(io, owner_path, a, .limited(256)) catch null;
     const started = std.Io.Timestamp.now(io, .awake);
     const run = std.process.run(a, io, .{
         .argv = &.{ labelle, "generate", try std.fmt.allocPrint(a, "--platform={s}", .{target}), "--progress=off" },
@@ -364,7 +367,7 @@ fn nested(init: std.process.Init, a: std.mem.Allocator, result: []const u8, labe
         .exited => |c| try std.fmt.allocPrint(a, "{d}", .{c}),
         else => "signal",
     }, r.stderr } else |err| .{ @errorName(err), "" };
-    const report = try std.json.Stringify.valueAlloc(a, .{ .code = code, .elapsed_ms = elapsed_ms, .marker = marker, .stderr = stderr }, .{});
+    const report = try std.json.Stringify.valueAlloc(a, .{ .code = code, .elapsed_ms = elapsed_ms, .marker = marker, .owner = owner, .stderr = stderr }, .{});
     const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{result});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = report });
     try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), result, io);

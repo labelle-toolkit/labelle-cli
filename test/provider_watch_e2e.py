@@ -163,9 +163,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
     mark_script.write_text(f"from pathlib import Path\nPath({str(prebuild_marker)!r}).write_text('1')\n")
     prebuild = f', .prebuild = .{{ .{{ .run = .{{ {json.dumps(sys.executable)}, {json.dumps(str(mark_script))} }} }} }}'
 
-    def declare(plugins=True, pkg_version="1.0.0"):
+    def declare(plugins=True, pkg_version="1.0.0", steps=None):
         deps = f', .plugins = .{{ .{{ .name = "probe", .repo = "local:../probe", .version = "{pkg_version}" }} }}' if plugins else ""
-        (project / "project.labelle").write_text(f'.{{ .name = "game", .zig_version = "{version}"{deps}{prebuild} }}')
+        (project / "project.labelle").write_text(f'.{{ .name = "game", .zig_version = "{version}"{deps}{steps or prebuild} }}')
 
     def reset(data="one"):
         shutil.rmtree(project / ".labelle", ignore_errors=True)
@@ -363,15 +363,53 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         report = json.loads(wait_for("the nested labelle command (a deadlock on the project lock?)",
                                      lambda: nested_result.exists() and nested_result.read_text(), timeout=180))
         assert report["code"] != "0", report
-        assert "runs inside another labelle command that holds the lock of this project" in report["stderr"], report
+        assert "runs inside another labelle command that holds this project's lock" in report["stderr"], report
         assert "waiting for" not in report["stderr"], report
         assert report["elapsed_ms"] < 60000, report
-        # The mechanism: the hook received the marker naming this project.
-        same = (lambda x, y: x.lower() == y.lower()) if os.name == "nt" else (lambda x, y: x == y)
-        assert report["marker"] and any(same(entry, str(project)) for entry in report["marker"].split(os.pathsep)), report
+        # The mechanism: the hook inherited the token the lock's holder (its
+        # own session) recorded next to the lock.
+        assert report["owner"] and report["marker"], report
+        assert report["owner"].strip() in report["marker"].split(os.pathsep), report
         # The rebuild itself finished and published: no deadlock.
         s.wait_gen("gen=1 data=one")
         assert s.finish("0") == 0, s.output()
+        checks += 1
+    except BaseException:
+        print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+        raise
+    finally:
+        Path(f"{nested_result}.arm").unlink(missing_ok=True)
+        declare()
+        s.kill()
+
+    # ── The nested command stops before its own `.prebuild` steps ───────
+    # The same nested `labelle generate` in a project with a prebuild step:
+    # it must stop before running the step (a step that itself ran labelle
+    # would nest forever, cli#490). The step records whether it ran under
+    # the lock marker; only the nested command's run of it would.
+    nested_result.unlink(missing_ok=True)
+    step_runs = base / "prebuild-runs"
+    step_runs.unlink(missing_ok=True)
+    step_script = base / "count_step.py"
+    step_script.write_text(f"import os\nwith open({str(step_runs)!r}, 'a') as f:\n"
+                           f"    f.write(('marked' if os.environ.get('LABELLE_PROJECT_LOCK_HELD') else 'clear') + '\\n')\n")
+    declare(steps=f', .prebuild = .{{ .{{ .run = .{{ {json.dumps(sys.executable)}, {json.dumps(str(step_script))} }} }} }}')
+    s = Session({"PROVIDER_PROBE_NESTED": f"toolchain|{nested_result}|{cli}", "LABELLE_NO_PREBUILD": "0"})
+    try:
+        s.wait_gen("gen=0 data=one")
+        Path(f"{nested_result}.arm").write_text("1")
+        (project / "project.labelle").write_text((project / "project.labelle").read_text() + "\n")
+        report = json.loads(wait_for("the nested labelle command (a deadlock on the project lock?)",
+                                     lambda: nested_result.exists() and nested_result.read_text(), timeout=180))
+        assert report["code"] != "0", report
+        assert "runs inside another labelle command that holds this project's lock" in report["stderr"], report
+        assert "prebuild [" not in report["stderr"], report
+        s.wait_gen("gen=1 data=one")
+        assert s.finish("0") == 0, s.output()
+        # The session's own runs (cold build, rebuild) hold no lock; a run
+        # by the nested command would carry the marker.
+        runs = step_runs.read_text().split()
+        assert runs and "marked" not in runs, runs
         checks += 1
     except BaseException:
         print('---- labelle output ----\n' + s.output(), file=sys.stderr)
