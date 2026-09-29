@@ -371,12 +371,14 @@ fn runGameTests(
 ) !void {
     const tests_build_zig = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", "tests", "build.zig" });
     defer allocator.free(tests_build_zig);
-    const generated_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
-    defer allocator.free(generated_dir);
     const authored = try std.fs.path.join(allocator, &.{ project_dir, "tests" });
     defer allocator.free(authored);
 
-    const generated_before = pathExists(tests_build_zig) or pathExists(generated_dir);
+    // A generated tree is one with a `build.zig`: `.labelle/` also holds
+    // state that is no generation at all (prebuild recipes, locks, a failed
+    // generation's leftovers), and a project with no tests must stay a
+    // no-op there (Codex P2 on #517).
+    const generated_before = pathExists(tests_build_zig) or try hasGeneratedTree(allocator, project_dir);
     if (!pathExists(authored) and !generated_before) return;
 
     hooks.refresh(allocator, project_dir) catch |err| {
@@ -398,6 +400,25 @@ fn runGameTests(
         return error.GenerateFailed;
     }
     try hooks.run_step(allocator, project_dir, "tests", stats, verbose);
+}
+
+/// Whether any `.labelle/<dir>/build.zig` exists: a generated target tree
+/// (the backend's own dir — named by `describe`, which is not asked here —
+/// or `tests/`).
+fn hasGeneratedTree(allocator: std.mem.Allocator, project_dir: []const u8) !bool {
+    const io = config.globalIo();
+    const root = try std.fs.path.join(allocator, &.{ project_dir, ".labelle" });
+    defer allocator.free(root);
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |entry| {
+        if (entry.kind != .directory) continue;
+        const build_zig = try std.fs.path.join(allocator, &.{ root, entry.name, "build.zig" });
+        defer allocator.free(build_zig);
+        if (pathExists(build_zig)) return true;
+    }
+    return false;
 }
 
 fn pathExists(path: []const u8) bool {
@@ -825,6 +846,27 @@ pub const GameTestFreshnessSpec = struct {
         var stats = TestStats{};
         try runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks);
         try std.testing.expectEqual(@as(usize, 0), hook_log_len);
+    }
+
+    test "no tests/ and a .labelle/ holding only unrelated state — still left alone (Codex P2 on #517)" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = config.globalIo();
+        try tmp.dir.createDirPath(io, ".labelle/.watch");
+        try tmp.dir.createDirPath(io, ".labelle/fixture_desktop");
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/prebuild-recipes.json", .data = "{}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/fixture_desktop/.build-progress.json", .data = "{}" });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try tmpProjectPath(&tmp, &buf);
+
+        resetHookLog(false);
+        var stats = TestStats{};
+        try runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks);
+        try std.testing.expectEqual(@as(usize, 0), hook_log_len);
+        // A generated backend dir (a `build.zig`) is a tree: refreshed.
+        try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/fixture_desktop/build.zig", .data = "//\n" });
+        try std.testing.expectError(error.GenerateFailed, runGameTests(std.testing.allocator, dir, &stats, false, recording_hooks));
+        try std.testing.expectEqualStrings("R", hook_log[0..hook_log_len]);
     }
 
     test "a refresh that leaves no .labelle/tests/ fails, never guessing a backend dir (cli#471 D4)" {
