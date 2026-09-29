@@ -319,12 +319,15 @@ const Cfg = struct {
 /// Advice, never a failure: SDL2 may be installed by other means. The
 /// `.gamepad = .none` way out is offered only where SDL2 comes in for the
 /// gamepad alone: the `sdl` renderer links it whatever the gamepad says.
+/// `LABELLE_SDL2_LIB` only lets the build find SDL2; the Windows loader
+/// never reads it, and the core no longer stages the DLL, so that way out
+/// also names the runtime DLL (the provider's `stage` hook copies it).
 fn sdl2Hint(cfg: Cfg, backend: ?[]const u8) ?[]const u8 {
     if (!cfg.found or cfg.sdl2_provider) return null;
     return switch (sdl2Use(backend, cfg.gamepad_off)) {
         .none => null,
-        .renderer => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, or set LABELLE_SDL2_LIB.",
-        .gamepad => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, set LABELLE_SDL2_LIB, or use `.gamepad = .none`.",
+        .renderer => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, or set LABELLE_SDL2_LIB and, on Windows, put SDL2.dll on PATH or beside the exe.",
+        .gamepad => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, set LABELLE_SDL2_LIB and, on Windows, put SDL2.dll on PATH or beside the exe, or use `.gamepad = .none`.",
     };
 }
 
@@ -360,7 +363,15 @@ test "doctor: the SDL2 hint follows the old rule and goes quiet with the provide
     const gamepad_way_out = "`.gamepad = .none`";
     try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "sdl").?, gamepad_way_out) == null);
     try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(.{ .found = true, .gamepad_off = true }, "sdl").?, gamepad_way_out) == null);
-    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "sdl").?, "set LABELLE_") != null);
+    // The provider comes first; the variable alone is not enough on Windows,
+    // so both wordings name the runtime DLL.
+    for ([_]?[]const u8{ "sdl", "raylib", null }) |name| {
+        const hint = sdl2Hint(plain, name).?;
+        const provider_at = std.mem.indexOf(u8, hint, "`sdl2` provider").?;
+        const variable_at = std.mem.indexOf(u8, hint, "set LABELLE_").?;
+        try std.testing.expect(provider_at < variable_at);
+        try std.testing.expect(std.mem.indexOf(u8, hint, "SDL2.dll on PATH or beside the exe") != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "raylib").?, gamepad_way_out) != null);
     try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, null).?, gamepad_way_out) != null);
     // The provider listed, or no project: no hint.
