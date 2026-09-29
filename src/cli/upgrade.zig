@@ -142,6 +142,15 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, project_dir: []const u8, cfg: pr
         const asm_target = if (std.mem.indexOf(u8, content, ".assembler_version")) |_| blk: {
             const old_asm = cfg.assembler_version orelse "0.0.0";
             const target = pickTarget("assembler_version", old_asm, assembler.DEFAULT_ASSEMBLER_VERSION, force);
+            // The backend step below runs under the assembler this pin names:
+            // a pin left on an assembler without `upgrade backend` would make
+            // it fail and roll everything back, so a pin that cannot be
+            // located is an error here, before anything is written.
+            if (!std.mem.eql(u8, old_asm, target) and findVersionValue(content, "assembler_version", old_asm) == null) {
+                std.debug.print("labelle: could not locate the .assembler_version pin in project.labelle — nothing written (set it to {s} and re-run)\n", .{target});
+                allocator.free(content);
+                return error.AssemblerPinNotFound;
+            }
             content = try replaceAndFree(allocator, content, "assembler_version", old_asm, target);
             break :blk target;
         } else blk: {
@@ -337,20 +346,36 @@ fn replaceAndFree(allocator: std.mem.Allocator, old_content: []u8, field_name: [
 }
 
 fn replaceVersionField(allocator: std.mem.Allocator, content: []const u8, field_name: []const u8, old_value: []const u8, new_value: []const u8) ![]u8 {
-    const search = try std.fmt.allocPrint(allocator, ".{s} = \"{s}\"", .{ field_name, old_value });
-    defer allocator.free(search);
-    const replace = try std.fmt.allocPrint(allocator, ".{s} = \"{s}\"", .{ field_name, new_value });
-    defer allocator.free(replace);
+    const span = findVersionValue(content, field_name, old_value) orelse return allocator.dupe(u8, content);
+    var result: std.ArrayList(u8) = .empty;
+    try result.appendSlice(allocator, content[0..span.start]);
+    try result.print(allocator, "\"{s}\"", .{new_value});
+    try result.appendSlice(allocator, content[span.end..]);
+    return result.toOwnedSlice(allocator);
+}
 
-    if (std.mem.indexOf(u8, content, search)) |idx| {
-        var result: std.ArrayList(u8) = .empty;
-        try result.appendSlice(allocator, content[0..idx]);
-        try result.appendSlice(allocator, replace);
-        try result.appendSlice(allocator, content[idx + search.len ..]);
-        return result.toOwnedSlice(allocator);
+/// Where `.<field> = "<value>"` puts its quoted value (quotes included),
+/// whitespace-tolerant around `=` (`.assembler_version="0.117.0"` is valid
+/// ZON too, Codex P2 on #517), or null when no such pin is spelled.
+fn findVersionValue(content: []const u8, field_name: []const u8, value: []const u8) ?struct { start: usize, end: usize } {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, content, from, ".")) |dot| {
+        from = dot + 1;
+        const rest = content[dot + 1 ..];
+        if (!std.mem.startsWith(u8, rest, field_name)) continue;
+        var i = dot + 1 + field_name.len;
+        // `.core_version` must not match `.core_version_extra`.
+        if (i < content.len and (std.ascii.isAlphanumeric(content[i]) or content[i] == '_')) continue;
+        while (i < content.len and std.ascii.isWhitespace(content[i])) i += 1;
+        if (i >= content.len or content[i] != '=') continue;
+        i += 1;
+        while (i < content.len and std.ascii.isWhitespace(content[i])) i += 1;
+        if (i >= content.len or content[i] != '"') continue;
+        const body = content[i + 1 ..];
+        if (!std.mem.startsWith(u8, body, value) or body.len <= value.len or body[value.len] != '"') continue;
+        return .{ .start = i, .end = i + value.len + 2 };
     }
-
-    return try allocator.dupe(u8, content);
+    return null;
 }
 
 /// Insert a new `.field = "value"` line before the final closing `}` in a ZON file.
@@ -379,6 +404,25 @@ fn insertBeforeClosingBrace(allocator: std.mem.Allocator, old_content: []u8, fie
 // ── Tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "replaceVersionField: a non-canonical spelling is rewritten (Codex P2 on #517)" {
+    const a = testing.allocator;
+    for ([_][]const u8{
+        ".{ .assembler_version=\"0.117.0\" }",
+        ".{ .assembler_version =\t\"0.117.0\" }",
+        ".{\n    .assembler_version\n        = \"0.117.0\",\n}",
+    }) |src| {
+        const out = try replaceVersionField(a, src, "assembler_version", "0.117.0", "0.120.0");
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "\"0.120.0\"") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "0.117.0") == null);
+    }
+    // A longer field name sharing the prefix, or another value, is left alone.
+    const other = try replaceVersionField(a, ".{ .assembler_version_x = \"0.117.0\", .assembler_version = \"0.118.0\" }", "assembler_version", "0.117.0", "0.120.0");
+    defer a.free(other);
+    try testing.expect(std.mem.indexOf(u8, other, "0.120.0") == null);
+    try testing.expect(findVersionValue(".{ .assembler_version = \"0.117.00\" }", "assembler_version", "0.117.0") == null);
+}
 
 test "parseUpgradeArgs strips --force and keeps positionals" {
     var parsed = try parseUpgradeArgs(testing.allocator, &.{ "all", "--force" });
