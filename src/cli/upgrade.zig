@@ -356,26 +356,68 @@ fn replaceVersionField(allocator: std.mem.Allocator, content: []const u8, field_
 
 /// Where `.<field> = "<value>"` puts its quoted value (quotes included),
 /// whitespace-tolerant around `=` (`.assembler_version="0.117.0"` is valid
-/// ZON too, Codex P2 on #517), or null when no such pin is spelled.
+/// ZON too, Codex P2 on #517), or null when no such pin is spelled. Field-like
+/// text inside a `//` comment, a string literal or a `\\` multiline string
+/// line is not a pin: the scan skips those and keeps looking for the real
+/// field (Codex P2 round 3 on #517).
 fn findVersionValue(content: []const u8, field_name: []const u8, value: []const u8) ?struct { start: usize, end: usize } {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, content, from, ".")) |dot| {
-        from = dot + 1;
-        const rest = content[dot + 1 ..];
-        if (!std.mem.startsWith(u8, rest, field_name)) continue;
-        var i = dot + 1 + field_name.len;
-        // `.core_version` must not match `.core_version_extra`.
-        if (i < content.len and (std.ascii.isAlphanumeric(content[i]) or content[i] == '_')) continue;
-        while (i < content.len and std.ascii.isWhitespace(content[i])) i += 1;
-        if (i >= content.len or content[i] != '=') continue;
+    var i: usize = 0;
+    while (i < content.len) {
+        if (skipNonCode(content, i)) |next| {
+            i = next;
+            continue;
+        }
+        if (content[i] != '.' or !std.mem.startsWith(u8, content[i + 1 ..], field_name)) {
+            i += 1;
+            continue;
+        }
+        const dot = i;
         i += 1;
-        while (i < content.len and std.ascii.isWhitespace(content[i])) i += 1;
-        if (i >= content.len or content[i] != '"') continue;
-        const body = content[i + 1 ..];
+        var j = dot + 1 + field_name.len;
+        // `.core_version` must not match `.core_version_extra`.
+        if (j < content.len and (std.ascii.isAlphanumeric(content[j]) or content[j] == '_')) continue;
+        j = skipTrivia(content, j);
+        if (j >= content.len or content[j] != '=') continue;
+        j = skipTrivia(content, j + 1);
+        if (j >= content.len or content[j] != '"') continue;
+        const body = content[j + 1 ..];
         if (!std.mem.startsWith(u8, body, value) or body.len <= value.len or body[value.len] != '"') continue;
-        return .{ .start = i, .end = i + value.len + 2 };
+        return .{ .start = j, .end = j + value.len + 2 };
     }
     return null;
+}
+
+/// The index just past a comment, string literal or multiline-string line
+/// starting at `i`, or null when `i` starts none of them.
+fn skipNonCode(content: []const u8, i: usize) ?usize {
+    const rest = content[i..];
+    if (std.mem.startsWith(u8, rest, "//") or std.mem.startsWith(u8, rest, "\\\\")) {
+        return std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
+    }
+    if (content[i] != '"') return null;
+    var j = i + 1;
+    while (j < content.len) : (j += 1) {
+        switch (content[j]) {
+            '\\' => j += 1,
+            '"' => return j + 1,
+            '\n' => return j, // unterminated: not ZON, stop at the line end
+            else => {},
+        }
+    }
+    return content.len;
+}
+
+/// `i` advanced past whitespace and `//` comments.
+fn skipTrivia(content: []const u8, start: usize) usize {
+    var i = start;
+    while (i < content.len) {
+        if (std.ascii.isWhitespace(content[i])) {
+            i += 1;
+        } else if (std.mem.startsWith(u8, content[i..], "//")) {
+            i = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
+        } else break;
+    }
+    return i;
 }
 
 /// Insert a new `.field = "value"` line before the final closing `}` in a ZON file.
@@ -422,6 +464,38 @@ test "replaceVersionField: a non-canonical spelling is rewritten (Codex P2 on #5
     defer a.free(other);
     try testing.expect(std.mem.indexOf(u8, other, "0.120.0") == null);
     try testing.expect(findVersionValue(".{ .assembler_version = \"0.117.00\" }", "assembler_version", "0.117.0") == null);
+}
+
+test "findVersionValue: comments and strings are not the pin (Codex P2 round 3 on #517)" {
+    const a = testing.allocator;
+    // A commented-out pin before the real one: the real one is rewritten,
+    // the comment keeps its bytes.
+    const commented =
+        \\.{
+        \\    // .assembler_version="0.117.0"
+        \\    .assembler_version = "0.117.0",
+        \\}
+    ;
+    const out = try replaceVersionField(a, commented, "assembler_version", "0.117.0", "0.120.0");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "// .assembler_version=\"0.117.0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    .assembler_version = \"0.120.0\",") != null);
+    // The field name inside a string literal (escaped quotes included) or a
+    // multiline string line is skipped too.
+    const stringed =
+        \\.{
+        \\    .description = "set \".assembler_version = \"0.117.0\" by hand",
+        \\    .title =
+        \\        \\\\.assembler_version = "0.117.0"
+        \\    ,
+        \\    .assembler_version = // pinned
+        \\        "0.117.0",
+        \\}
+    ;
+    const span = findVersionValue(stringed, "assembler_version", "0.117.0").?;
+    try testing.expect(std.mem.indexOf(u8, stringed, "// pinned").? < span.start);
+    // Only a commented or quoted pin: none.
+    try testing.expect(findVersionValue(".{ .name = \".assembler_version = \\\"0.117.0\\\"\" } // .assembler_version = \"0.117.0\"", "assembler_version", "0.117.0") == null);
 }
 
 test "parseUpgradeArgs strips --force and keeps positionals" {
