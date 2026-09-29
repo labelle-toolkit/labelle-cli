@@ -223,7 +223,7 @@ pub fn run(
         .launch_env = &site.env,
         // The cold pipeline's generation pre-passes, failing the rebuild
         // (not the session) on a misconfiguration.
-        .prepass = .{ .legacy_target = cx.target.legacy != null, .bake = cx.parsed_args.bake, .fatal = false },
+        .prepass = .{ .target = cx.target.name, .describer = .init(cx.asm_bin, cx.project_dir), .bake = cx.parsed_args.bake, .fatal = false },
     };
     ctx.initIgnore();
     defer ctx.deinit();

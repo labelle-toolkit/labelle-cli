@@ -195,7 +195,7 @@ pub const SessionKey = struct {
     pub fn configChanged(self: SessionKey, cfg: project_config.ProjectConfig, backend: []const u8) ?[]const u8 {
         if (!eql(self.backend, backend)) return "the backend";
         if (!eql(self.backend_package, backendPackageName(cfg))) return "the backend package";
-        if (self.target_follows_file and !eql(self.target, @tagName(cfg.platform))) return "the target";
+        if (self.target_follows_file and !eql(self.target, cfg.declared_target)) return "the target";
         return null;
     }
 

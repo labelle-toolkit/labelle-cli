@@ -177,7 +177,7 @@ pub fn cmdAstc(gpa: std.mem.Allocator, cmd_args: []const []const u8) !void {
         return error.InvalidArgs;
     };
 
-    const platform = platform_override orelse @tagName(cfg.platform);
+    const platform = platform_override orelse cfg.declared_target;
     const package = cfg.backend_package;
     // The `.backend` shorthand names no package to read, so ask the
     // assembler where the project's backend package is (cli#471 D3a):

@@ -122,12 +122,11 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     parsed.normalizeInitialPrefab();
 
     // The requested target (RFC #406 phase 3b, docs/provider-targets.md):
-    // `--platform=<t>` — the legacy platform subcommands set the same
-    // override — else the project's declared platform. It is resolved below
-    // against the core target and the pinned providers' declarations;
-    // `parsed.platform` is derived from the RESULT only where the pinned
-    // assembler and the legacy sites still need the schema enum.
-    const requested_target: []const u8 = parsed_args.platform_override orelse @tagName(parsed.platform);
+    // `--platform=<t>`, else the target the project declares (`.platform`).
+    // It is a name, resolved below against the core target and the pinned
+    // providers' declarations; the assembler says whether it can generate
+    // it (cli#471 P3).
+    const requested_target: []const u8 = parsed_args.platform_override orelse parsed.declared_target;
 
     // Upgrade modifies project.labelle in the project directory
     if (command == .upgrade_cmd) {
@@ -140,7 +139,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // `--docker` builds the core target only (RFC cli#466 D5): refused for
     // a provider target before anything is read, written or built.
     if (args_resolve.dockerRefused(parsed_args.docker, requested_target)) return 1;
-    const resolved = switch (try args_resolve.resolve(allocator, hook_arena, project_dir, command, &parsed, requested_target)) {
+    const resolved = switch (try args_resolve.resolve(allocator, hook_arena, project_dir, command, parsed, requested_target)) {
         .proceed => |proceed| proceed,
         .exit => |code| return code,
     };
@@ -461,9 +460,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     if (command == .bundle_cmd) return build.bundleStep(&cx);
 
     if (command == .build) {
-        // (The build's finalization — the Linux `.desktop` entry and the
-        // APK packaging — ran inside the core build above, ahead of the
-        // `after build` hooks.)
+        // (The build's finalization — the Linux `.desktop` entry — ran
+        // inside the core build above, ahead of the `after build` hooks.)
         if (reporter) |r| r.finishDone(0);
         return 0;
     }

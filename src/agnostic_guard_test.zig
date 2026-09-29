@@ -119,7 +119,12 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `cli/args.zig`, `cli/pipeline/args_resolve.zig`, `cli/pipeline/run.zig`
 /// and `cli/provider_dispatch.zig` came clean; merged onto D4/S4,
 /// `cli/config.zig` and `cli/pipeline/install.zig` came clean too:
-/// 6 entries.
+/// 6 entries. RFC cli#471 P3 deleted the CLI's platform and
+/// asset-compression mirrors (a target is a name; the assembler's `describe`
+/// says whether it can generate it and whether it ships ASTC), so
+/// `cli/project_config.zig` came clean, and `cli.zig`, `cli/pipeline.zig`
+/// and `cli/pipeline/build.zig` once their comments and fixtures stopped
+/// citing platform names: 2 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -128,13 +133,7 @@ const allowed_files = [_][]const u8{
     // This file: it spells the forbidden table out.
     "agnostic_guard_test.zig",
     // Legacy platform, store, package and backend sites (RFC #406 "Migration").
-    "cli.zig",
     "cli/doctor.zig",
-    "cli/pipeline.zig",
-    // Split out of `cli/pipeline.zig` (moves only): the stage code they
-    // carry names the legacy targets, backends and their toolchains.
-    "cli/pipeline/build.zig",
-    "cli/project_config.zig",
 };
 
 const finding_note = "(platform/store/package names belong in providers; see docs/rfc-package-commands.md#enforcement)";
@@ -516,16 +515,16 @@ test "host OS names never flag" {
 }
 
 test "the allowlist matches Windows-style walker paths, one file per entry" {
-    try std.testing.expect(allowedIndex("cli/pipeline.zig") != null);
-    try std.testing.expect(allowedIndex("cli\\pipeline.zig") != null);
-    try std.testing.expect(allowedIndex("cli\\pipeline\\build.zig") != null);
     try std.testing.expect(allowedIndex("cli/doctor.zig") != null);
-    // A new file under a legacy directory is NOT exempt.
-    try std.testing.expect(allowedIndex("cli/pipeline/not_yet_written.zig") == null);
-    try std.testing.expect(allowedIndex("cli/pipeline/") == null);
-    try std.testing.expect(allowedIndex("cli/pipelinex/run.zig") == null);
-    // A removed file's entry left with it.
+    try std.testing.expect(allowedIndex("cli\\doctor.zig") != null);
+    // A new file beside or under an entry is NOT exempt.
+    try std.testing.expect(allowedIndex("cli/doctor/not_yet_written.zig") == null);
+    try std.testing.expect(allowedIndex("cli/doctor.zig/") == null);
+    try std.testing.expect(allowedIndex("cli/doctorx.zig") == null);
+    // A removed or cleaned file's entry left with it.
     try std.testing.expect(allowedIndex("cli/serve/http.zig") == null);
+    try std.testing.expect(allowedIndex("cli\\pipeline.zig") == null);
+    try std.testing.expect(allowedIndex("cli/project_config.zig") == null);
     try std.testing.expect(allowedIndex("cli/ios.zig") == null);
     try std.testing.expect(allowedIndex("cli/sdl_provision.zig") == null);
     // An extracted platform's files left the allowlist with the platform.
@@ -558,15 +557,21 @@ test "a finding is reported per line and a clean allowlisted file goes stale" {
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:1: 'ios' " ++ finding_note, scan.offenders.items[2]);
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:2: 'web' " ++ finding_note, scan.offenders.items[3]);
     // Allowlisted and dirty: no finding, entry kept. Clean name and body: stale.
-    try scan.file("cli/pipeline.zig", "// wasm\n");
-    try scan.file("cli/project_config.zig", "const x = 1;\n");
+    try scan.file("cli/doctor.zig", "// wasm\n");
+    try scan.file("agnostic_guard_test.zig", "const x = 1;\n");
     try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
-    try std.testing.expect(!containsString(stale.items, "cli/pipeline.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/project_config.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/doctor.zig"));
+    try std.testing.expect(!containsString(stale.items, "cli/doctor.zig"));
+    try std.testing.expect(containsString(stale.items, "agnostic_guard_test.zig"));
+    // An entry no scanned file exercised is stale too.
+    var unscanned: Scan = .{ .gpa = gpa };
+    defer unscanned.deinit();
+    var unexercised: std.ArrayList([]const u8) = .empty;
+    defer unexercised.deinit(gpa);
+    try unscanned.stale(&unexercised);
+    try std.testing.expect(containsString(unexercised.items, "cli/doctor.zig"));
     // The sentinel is only set by the CLI root itself.
     try std.testing.expect(!scan.saw_cli_root);
     try scan.file(cli_root, "// android\n");

@@ -95,12 +95,19 @@ fn readProjectConfigImpl(allocator: std.mem.Allocator, project_dir: []const u8, 
     // mirror — without this, a newer project.labelle would fail to parse
     // and break the CLI for no good reason.
     try @import("provider_settings.zig").validateProject(allocator, source, if (verbose) labelle_path else null);
-    const cfg = std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
+    var cfg = std.zon.parse.fromSliceAlloc(project_config.ProjectConfig, allocator, source, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         if (verbose) std.debug.print("labelle: could not parse '{s}': {any}\n", .{ labelle_path, err });
         return error.ParseError;
     };
+    // `.platform` is a target NAME to the CLI (RFC cli#471 P3), which the
+    // typed parse above cannot read (an enum literal is not a string), so
+    // it is read on its own; the tolerant parse skipped it.
+    if (project_config.declaredTarget(allocator, source) catch |err| {
+        if (verbose) std.debug.print("labelle: could not parse '{s}': `.platform` must name a target, e.g. `.platform = .desktop` ({s})\n", .{ labelle_path, @errorName(err) });
+        return error.ParseError;
+    }) |name| cfg.declared_target = name;
     // `labelle install plugin <name> local:<path>` overrides (assembler#772)
     // live outside the project; fold them in once, here, so every consumer
     // sees the plugin where the assembler builds it from.

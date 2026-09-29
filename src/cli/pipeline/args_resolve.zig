@@ -31,8 +31,8 @@ pub const Resolution = union(enum) {
 /// Ownership needs the providers, and provider discovery runs only
 /// after the assembler's `install` populated the package cache (below,
 /// next to `gateThenInstall`; Codex P1 on #420) — while the target
-/// directory, the progress feed and the schema platform every
-/// pre-install step keys off need the name now. So the name is settled
+/// directory and the progress feed every pre-install step keys off need
+/// the name now. So the name is settled
 /// here from the string alone: `desktop` is core; any other name is
 /// PROVISIONALLY a provider target, confirmed against the discovered
 /// providers right after the install and refused there when nobody
@@ -42,7 +42,7 @@ pub fn resolve(
     hook_arena: std.mem.Allocator,
     project_dir: []const u8,
     command: args_mod.Command,
-    parsed: *project_config.ProjectConfig,
+    parsed: project_config.ProjectConfig,
     requested_target: []const u8,
 ) !Resolution {
     const project_root = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, hook_arena);
@@ -83,19 +83,11 @@ pub fn resolve(
     //     so the pinned archives it reads are not held again beside the
     //     authoritative discovery's copies (Codex P2 on #421).
     if (!provisional.is_core) {
-        switch (earlyTargetCheck(allocator, project_root, parsed.*, requested_target) catch return .{ .exit = 1 }) {
+        switch (earlyTargetCheck(allocator, project_root, parsed, requested_target) catch return .{ .exit = 1 }) {
             .confirmed, .deferred => {},
             .refused => return .{ .exit = 1 },
         }
     }
-    // The legacy sites below (`parsed.platform == .X`; the guard's migration
-    // allowlist) keep working for the schema-named provider targets. A
-    // target outside the enum reaches only steps its provider does not
-    // replace, which treat it as the generic host baseline. `parsed.platform`
-    // is derived from the NAME only where the pinned assembler and the
-    // legacy sites still need the schema enum.
-    parsed.platform = provisional.legacy orelse .desktop;
-
     return .{ .proceed = .{ .project_root = project_root, .provisional = provisional } };
 }
 

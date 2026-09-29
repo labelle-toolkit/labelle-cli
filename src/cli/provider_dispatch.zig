@@ -818,7 +818,7 @@ fn execute(a: std.mem.Allocator, root: []const u8, cfg: project.ProjectConfig, p
     return runTool(a, host, root, provider, cmd.tool(), .{
         .invocation = .{ .kind = .command, .id = cmd.name, .step = null, .phase = null },
         .needs_project = cmd.needs_project,
-        .target = @tagName(cfg.platform),
+        .target = cfg.declared_target,
         .lock_file = lock_path,
         .output_dir = output,
         .optimize = .Debug,

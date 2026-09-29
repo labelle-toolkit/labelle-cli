@@ -195,35 +195,26 @@ pub fn discoverAndPlan(
         .bundle = try provider_hooks.plan(hook_arena, providers, .bundle, target.name),
         .run = try provider_hooks.plan(hook_arena, providers, .run, target.name),
     };
-    // The labelle-assembler#378 boundary: the assembler generates only for
-    // the schema platforms, so a provider target outside that enum can be
-    // generated for only by its provider's `replace` hook on `generate`.
-    // Without one, stop HERE — before the lock, the assembler's `generate`
-    // and any compiler — rather than hand the assembler a name it cannot
-    // take.
-    //
-    // A protocol-7 assembler also judges the backend × target pair itself
-    // (`describe`'s `supported`, cli#471 D3): asked HERE, after the install,
-    // so an installed backend is judged from its own manifest — the check
-    // `generate` would fail on, reported before the lock and any compiler.
-    // Only asked when the core generation will run at all.
-    const described: ?assembler_describe.Description = if (target.legacy != null and hook_plans.generate.replace == null)
+    // Whether the assembler can generate the target at all is ITS answer
+    // (`describe`'s `supported`, cli#471 D3/P3): a name its codegen does not
+    // know, or a backend × target pair the backend does not support, comes
+    // back unsupported with a reason. Asked HERE, after the install, so an
+    // installed backend is judged from its own manifest — before the lock,
+    // the assembler's `generate` and any compiler. Only asked when the core
+    // generation will run at all: a `replace` hook on `generate` stands in
+    // for it, whatever the assembler knows.
+    const described: ?assembler_describe.Description = if (hook_plans.generate.replace == null)
         describer.require(hook_arena, target.name) catch {
             if (reporter) |r| r.finishFailed(1, "assembler describe failed");
             return .{ .exit = 1 };
         }
     else
         null;
-    switch (coreGenerateGate(target.legacy != null, hook_plans.generate.replace != null, described)) {
+    switch (coreGenerateGate(hook_plans.generate.replace != null, described)) {
         .proceed => {},
-        .no_schema_target => {
-            std.debug.print("labelle: target '{s}' is declared by '{s}' but the pinned assembler cannot generate for it yet (labelle-assembler#378)\n", .{ target.name, target.providerName() });
-            if (reporter) |r| r.finishFailed(1, "the pinned assembler cannot generate for this target");
-            return .{ .exit = 1 };
-        },
         .unsupported => |reason| {
-            std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ described.?.backend.name, target.name, reason });
-            if (reporter) |r| r.finishFailed(1, "the backend does not support this target");
+            reportUnsupported(target, described.?.backend.name, reason);
+            if (reporter) |r| r.finishFailed(1, "the assembler cannot generate this target");
             return .{ .exit = 1 };
         },
     }
@@ -282,43 +273,46 @@ pub fn discoverAndPlan(
 /// The verdict on handing the target to the assembler's core `generate`.
 pub const GenerateGate = union(enum) {
     proceed,
-    /// labelle-assembler#378: a target outside the schema enum.
-    no_schema_target,
-    /// `describe` said the resolved backend does not support the target;
-    /// carries its reason.
+    /// `describe` said the assembler cannot generate the target with the
+    /// resolved backend (an unknown target name included); carries its
+    /// reason.
     unsupported: []const u8,
 };
 
-/// Pure. `schema_target`: the target is one the pinned assembler's schema
-/// knows (`target.legacy != null`); `replaced`: a `replace` hook on
-/// `generate` stands in for the core generation; `described`: the
-/// assembler's `describe` answer, null below protocol 7 or when it could
-/// not answer (then the enum check alone decides, as before cli#471 D3).
-/// `described` is null only when it was not asked: the generation is
-/// replaced, or the target is outside the assembler's schema.
-pub fn coreGenerateGate(schema_target: bool, replaced: bool, described: ?assembler_describe.Description) GenerateGate {
+/// Pure. `replaced`: a `replace` hook on `generate` stands in for the core
+/// generation; `described`: the assembler's `describe` answer, null only
+/// when it was not asked (the generation is replaced).
+pub fn coreGenerateGate(replaced: bool, described: ?assembler_describe.Description) GenerateGate {
     if (replaced) return .proceed;
-    if (!schema_target) return .no_schema_target;
     if (described) |d| if (!d.supported) return .{ .unsupported = d.reason orelse "unsupported (no reason given)" };
     return .proceed;
+}
+
+/// The refusal of a target the assembler cannot generate: its reason, and
+/// for a provider target, what the provider could do about it. The CLI
+/// keeps no list of targets, so an unknown name reads the same way — the
+/// assembler's reason names what it does generate for.
+pub fn reportUnsupported(target: provider_targets.Resolved, backend: []const u8, reason: []const u8) void {
+    std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ backend, target.name, reason });
+    if (target.provider) |provider|
+        std.debug.print("  package '{s}' declares target '{s}' but no `.when = .replace` hook on `generate`, so the assembler must generate it\n", .{ provider.meta.name, target.name });
 }
 
 test "coreGenerateGate: describe refuses an unsupported pair" {
     var d = std.mem.zeroInit(assembler_describe.Description, .{ .supported = true });
     // A replacement generates: nothing else is asked.
-    try std.testing.expect(coreGenerateGate(false, true, null) == .proceed);
+    try std.testing.expect(coreGenerateGate(true, null) == .proceed);
     d.supported = false;
-    try std.testing.expect(coreGenerateGate(true, true, d) == .proceed);
-    // labelle-assembler#378, with or without an answer.
-    try std.testing.expect(coreGenerateGate(false, false, null) == .no_schema_target);
-    // Supported: proceed. Unsupported: refused with describe's reason.
+    try std.testing.expect(coreGenerateGate(true, d) == .proceed);
+    // Supported: proceed. Unsupported — an unknown target name included —
+    // refused with describe's reason.
     d.supported = true;
-    try std.testing.expect(coreGenerateGate(true, false, d) == .proceed);
+    try std.testing.expect(coreGenerateGate(false, d) == .proceed);
     d.supported = false;
-    d.reason = "provider 'acme.gfx' does not support capability 'probe'";
-    try std.testing.expectEqualStrings(d.reason.?, coreGenerateGate(true, false, d).unsupported);
+    d.reason = "backend 'acme' has no target 'probe-target': this assembler generates for desktop";
+    try std.testing.expectEqualStrings(d.reason.?, coreGenerateGate(false, d).unsupported);
     d.reason = null;
-    try std.testing.expect(coreGenerateGate(true, false, d) == .unsupported);
+    try std.testing.expect(coreGenerateGate(false, d) == .unsupported);
 }
 
 /// A build path that cannot carry what a provider supplies for the target.

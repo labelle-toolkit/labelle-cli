@@ -208,7 +208,7 @@ test "rebuild transaction: a failure after the replan restores every replanned p
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -275,7 +275,7 @@ test "rebuild transaction: publication happens only after the after-build hooks,
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -315,7 +315,7 @@ test "rebuild transaction: an edited prebuild step runs in the rebuild that sees
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -453,7 +453,7 @@ test "rebuild transaction: cancelling reaps the in-flight child — provisioning
         try fx.startup();
         var site = fx.site();
         defer site.env.deinit();
-        var replan = Replanner{ .backing = a, .project_dir = fx.project };
+        var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
         defer replan.deinit(&site, fx.providers, fx.cfg);
         replan.baseline();
         var dummy: u8 = 0;
@@ -496,7 +496,7 @@ test "rebuild transaction: an edited project's lock is staged privately and comm
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -575,7 +575,7 @@ test "rebuild transaction: a rebuild runs the cold pipeline's pre-passes and pre
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -623,7 +623,7 @@ test "rebuild transaction: a rebuild runs the cold pipeline's pre-passes and pre
         }
     };
     Spy.log_path = log;
-    ctx.prepass = .{ .legacy_target = true, .bake = true, .fatal = false };
+    ctx.prepass = .{ .target = "desktop", .describer = .off, .bake = true, .fatal = false };
     ctx.run_prepasses = Spy.prepass;
     ctx.wire_prebuild_env = Spy.wire;
     ctx.run_prebuild = Spy.runPrebuild;

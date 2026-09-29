@@ -329,8 +329,8 @@ pub fn main(proc_init: std.process.Init) !u8 {
             // ../game` from a broken project reports `provider command
             // failed` instead of running that directory (#460 review). A
             // namespace-shaped token still dispatches before the directory
-            // shorthand, so `labelle web …` keeps meaning the provider in
-            // a project that also has a `web/` folder.
+            // shorthand, so `labelle probe …` keeps meaning the provider in
+            // a project that also has a `probe/` folder.
             if (mayNameProvider(first)) {
                 if (provider_dispatch.dispatch(allocator, first, &args) catch |err| {
                     std.debug.print("labelle: provider command failed: {s}\n", .{@errorName(err)});
@@ -437,7 +437,7 @@ fn mayNameProvider(token: []const u8) bool {
 }
 
 test "mayNameProvider: only a namespace-shaped token reaches provider dispatch" {
-    for ([_][]const u8{ "android", "web", "probe", "my-provider", "ns_2" }) |token| {
+    for ([_][]const u8{ "acme", "tools", "probe", "my-provider", "ns_2" }) |token| {
         try std.testing.expect(mayNameProvider(token));
     }
     for ([_][]const u8{ "../game", "./game", "..", ".", "/abs/game", "game/", "C:\\game", "Game", "" }) |token| {
