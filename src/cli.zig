@@ -577,6 +577,8 @@ pub const ArgsParseBundleArgsSpec = args_tests_mod.ParseBundleArgsSpec;
 pub const ArgsParseDirAndSceneLinuxDesktopSpec = args_tests_mod.ParseDirAndSceneLinuxDesktopSpec;
 pub const ArgsAllowOlderCliFlagSpec = args_tests_mod.AllowOlderCliFlagSpec;
 pub const ArgsHeadlessDefaultTimeoutSpec = args_tests_mod.HeadlessDefaultTimeoutSpec;
+// cli#396: the shared value-flag parser (in cli/args_value_flag_tests.zig).
+pub const ArgsValueFlagSpec = @import("cli/args_value_flag_tests.zig").ValueFlagSpec;
 
 // Linux `.desktop` entry emission (cli#359). Re-exported HERE for the same
 // reason as the screenshot specs below: `linux_desktop` is a private import,
