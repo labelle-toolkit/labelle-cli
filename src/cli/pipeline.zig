@@ -34,6 +34,7 @@ const upgrade = @import("upgrade.zig");
 const lockfile = @import("lockfile.zig");
 const runner = @import("runner.zig");
 const assembler_proc = @import("assembler_proc.zig");
+const assembler_describe = @import("assembler_describe.zig");
 const material_toolchain = @import("material_toolchain.zig");
 const ios = @import("ios.zig");
 const progress = @import("progress.zig");
@@ -158,7 +159,34 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // the reporter; the assembler generates into it later). Named after
     // the PROVISIONAL target: the name depends on the string alone, and a
     // target refused after the install leaves only a `failed` record here.
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(parsed.backend), provisional.name });
+    //
+    // The name is the assembler's own answer (`describe`, protocol 7 —
+    // cli#471 D3), so a third-party `.backend_package` names the dir after
+    // its package exactly as `generate` does (cli#471 finding 4). An older
+    // assembler, or a `describe` that cannot answer, keeps the enum-derived
+    // `<backend tag>_<target>`. The legacy ios subcommand forces its own
+    // backend, which `describe` (reading project.labelle alone) cannot
+    // know, so it keeps the enum name too.
+    //
+    // This is why the assembler is looked up HERE, ahead of the session lock
+    // and the progress feed: both live under the target dir. Looking it up
+    // touches only the assembler cache, nothing a running session owns. A
+    // lookup that fails here is not fatal yet: the dir keeps the enum name,
+    // and the lookup below fails again inside the progress feed, so a
+    // `--progress=json` consumer still gets its `failed` record.
+    const early_asm: ?assembler_proc.Assembler = if (command == .ios_cmd)
+        null
+    else
+        assembler_proc.resolve(allocator, project_dir, "generate") catch |err| blk: {
+            std.log.debug("assembler lookup before naming the target dir failed ({t}); using the enum name", .{err});
+            break :blk null;
+        };
+    var early_asm_owned = early_asm != null;
+    defer if (early_asm_owned) early_asm.?.deinit(allocator);
+    const describer: assembler_describe.Describer = if (early_asm) |a| .init(a, project_dir) else .off;
+    const described = describer.query(hook_arena, provisional.name);
+    const backend_label = assembler_describe.backendLabel(described, @tagName(parsed.backend));
+    const target_name = try assembler_describe.targetDirName(allocator, described, @tagName(parsed.backend), provisional.name);
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ project_dir, ".labelle", target_name });
     defer allocator.free(target_dir);
@@ -237,11 +265,13 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     const wants_sdl2 = try install.preInstall(allocator, project_dir, parsed, &parsed_args);
 
     // Issue #217: the CLI is a thin driver over the standalone
-    // labelle-assembler binary. Resolve it once here (LABELLE_ASSEMBLER
-    // env var > assembler_version in project.labelle > auto-downloaded
-    // default) and reuse the located binary for both the cache-populate
-    // step and code generation below.
-    const asm_bin = try assembler_proc.resolve(allocator, project_dir, "generate");
+    // labelle-assembler binary. Resolve it once (LABELLE_ASSEMBLER env var
+    // > assembler_version in project.labelle > auto-downloaded default) and
+    // reuse the located binary for both the cache-populate step and code
+    // generation below. Usually it was already found before the target dir
+    // was named (see there); only a lookup that failed there runs again.
+    const asm_bin = if (early_asm) |a| a else try assembler_proc.resolve(allocator, project_dir, "generate");
+    early_asm_owned = false;
     defer asm_bin.deinit(allocator);
     std.debug.print("  using assembler: {s}\n", .{asm_bin.path});
 
@@ -273,7 +303,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // docs/provider-targets.md)
     var provider_sources: provider_github.Sources = .{ .a = hook_arena };
     defer provider_sources.deinit();
-    const planned = switch (try install.discoverAndPlan(allocator, hook_arena, project_dir, project_root, command, parsed_args.run_watch, parsed, requested_target, reporter, &provider_sources)) {
+    const planned = switch (try install.discoverAndPlan(allocator, hook_arena, project_dir, project_root, command, parsed_args.run_watch, parsed, requested_target, reporter, &provider_sources, describer)) {
         .ready => |ready| ready,
         .exit => |code| return code,
     };
@@ -293,7 +323,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     if (reporter) |r| r.beginPhase(.generate, "assembler generate");
     std.debug.print("labelle: generating '{s}'...\n", .{parsed.name});
     std.debug.print("  backend: {s}  target: {s}  ecs: {s}  gui: {s}  window: {d}x{d}\n", .{
-        @tagName(parsed.backend), target.name, @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
+        backend_label, target.name, @tagName(parsed.ecs), gui_label, parsed.width, parsed.height,
     });
 
     // Scenes and prefabs are always embedded via @embedFile
@@ -479,6 +509,7 @@ test "finalStep: each project command's last hook step" {
 // Reference every module so its tests run: a file reached only lazily
 // (or not at all from here) would silently drop out of `zig build test`.
 test {
+    _ = assembler_describe;
     _ = args_resolve;
     _ = install;
     _ = generate;

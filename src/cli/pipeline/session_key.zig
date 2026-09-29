@@ -45,6 +45,12 @@ pub const SessionKey = struct {
     /// negotiated wire and `provider_config` mapping.
     before_run: []const u8,
     backend: []const u8,
+    /// The explicit `.backend_package`'s name, "" when none. It names the
+    /// generated target dir (`describe`'s `target_dir`, cli#471 D3) even
+    /// when the `.backend` tag stays the same, and the session builds and
+    /// publishes the dir it started with, so a renamed package is a change.
+    /// Its version is not: a bump regenerates into the same dir.
+    backend_package: []const u8 = "",
     target: []const u8,
     /// Whether the target comes from `project.labelle` (no `--platform`),
     /// so an edit to the file's `.platform` changes it.
@@ -122,6 +128,7 @@ pub const SessionKey = struct {
             .watch = replacement.hook.watch,
             .before_run = before.items,
             .backend = backend,
+            .backend_package = backendPackageName(cfg),
             .target = target,
             .target_follows_file = target_follows_file,
             .output = try outputOf(a, backend, target),
@@ -169,6 +176,7 @@ pub const SessionKey = struct {
         if (self.watch != n.watch) return "the watch capability";
         if (!eql(self.before_run, n.before_run)) return "the before-run hooks";
         if (!eql(self.backend, n.backend)) return "the backend";
+        if (!eql(self.backend_package, n.backend_package)) return "the backend package";
         if (!eql(self.target, n.target)) return "the target";
         if (!eql(self.output, n.output)) return "the output location";
         if (self.optimize != n.optimize) return "the effective optimize mode";
@@ -179,12 +187,18 @@ pub const SessionKey = struct {
     }
 
     /// The config-level half, drawn from `project.labelle` alone before any
-    /// prebuild step runs: the backend, and the target when the file picks
-    /// it.
+    /// prebuild step runs: the backend and its package's name, and the
+    /// target when the file picks it.
     pub fn configChanged(self: SessionKey, cfg: project_config.ProjectConfig) ?[]const u8 {
         if (!eql(self.backend, @tagName(cfg.backend))) return "the backend";
+        if (!eql(self.backend_package, backendPackageName(cfg))) return "the backend package";
         if (self.target_follows_file and !eql(self.target, @tagName(cfg.platform))) return "the target";
         return null;
+    }
+
+    /// The `backend_package` a key records for `cfg`.
+    pub fn backendPackageName(cfg: project_config.ProjectConfig) []const u8 {
+        return if (cfg.backend_package) |bp| bp.name else "";
     }
 
     /// Print the restart diagnostic for `what`.
@@ -405,6 +419,11 @@ test "session key: every field the replacement depends on is reported, the first
                 k.backend = "other";
             }
         }.f },
+        .{ .what = "the backend package", .edit = struct {
+            fn f(k: *SessionKey) void {
+                k.backend_package = "acme";
+            }
+        }.f },
         .{ .what = "the target", .edit = struct {
             fn f(k: *SessionKey) void {
                 k.target = "other";
@@ -461,6 +480,33 @@ test "session key: every field the replacement depends on is reported, the first
     try std.testing.expectEqualStrings("the target", key.configChanged(cfg).?);
     key.backend = "other";
     try std.testing.expectEqualStrings("the backend", key.configChanged(cfg).?);
+}
+
+test "session key: renaming .backend_package under the same .backend asks for a restart (cli#471 D3)" {
+    // The generated dir follows the package name (`describe`), so the edit
+    // Codex found on #504 — same enum tag, a differently named package —
+    // would otherwise generate into a new dir while the session keeps
+    // building and publishing the old one.
+    const started: project_config.ProjectConfig = .{ .name = "game", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } };
+    var key = std.mem.zeroInit(SessionKey, .{ .backend = @tagName(started.backend), .backend_package = SessionKey.backendPackageName(started) });
+    try std.testing.expect(key.configChanged(started) == null);
+    // A version bump regenerates into the same dir: an ordinary rebuild.
+    var bumped = started;
+    bumped.backend_package.?.version = "1.1.0";
+    try std.testing.expect(key.configChanged(bumped) == null);
+    // Renamed, or dropped back to the enum's own package: a restart.
+    var renamed = started;
+    renamed.backend_package.?.name = "other";
+    try std.testing.expectEqualStrings("the backend package", key.configChanged(renamed).?);
+    var dropped = started;
+    dropped.backend_package = null;
+    try std.testing.expectEqualStrings("the backend package", key.configChanged(dropped).?);
+    // The full key reports it too.
+    var next = key;
+    next.backend_package = "other";
+    try std.testing.expectEqualStrings("the backend package", key.changed(next).?);
+    key.backend_package = "";
+    try std.testing.expect(key.configChanged(.{ .name = "game" }) == null);
 }
 
 test "session key: a remote provider's pin is the accepted lock entry, so a re-pin is a change" {
