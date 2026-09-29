@@ -132,7 +132,7 @@ pub const Prepass = struct {
     target: []const u8,
     /// Asks the assembler whether the target ships ASTC atlases
     /// (`describe`'s `asset_format`, from `.asset_compression` keyed by the
-    /// target name). `off`, or no answer, means PNG: no conversion.
+    /// target name). No answer (`off` included) fails the generation.
     describer: assembler_describe.Describer,
     /// `--bake`.
     bake: bool,
@@ -167,10 +167,20 @@ pub fn corePrepasses(allocator: std.mem.Allocator, project_dir: []const u8, pars
     // target never borrows another target's setting (Codex on #421), and the
     // CLI keeps no mirror of the schema. Asked on every generation, so a
     // watched rebuild follows an edited `.asset_compression`.
+    //
+    // No answer is a failure, not PNG: for a target that ships ASTC,
+    // skipping the conversion would let the assembler swap in a STALE
+    // `.astc` sibling from an earlier build (the same hazard as
+    // `StaleAstcSiblingUndeletable`). The cold pipeline stops; a watched
+    // rebuild fails only itself, and the session lives on.
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const described = opts.describer.query(scratch.allocator(), opts.target);
-    if (described != null and std.mem.eql(u8, described.?.asset_format, "astc")) {
+    const described = opts.describer.require(scratch.allocator(), opts.target) catch |err| {
+        if (opts.fatal) progress.fatalExit(1, "cannot tell whether the target ships ASTC atlases (assembler describe failed) — see the error above");
+        std.debug.print("labelle: cannot tell whether target '{s}' ships ASTC atlases; not generating with possibly stale .astc siblings\n", .{opts.target});
+        return err;
+    };
+    if (std.mem.eql(u8, described.asset_format, "astc")) {
         // Pass the RESOLVED target: `--platform=<t>` may differ from what
         // project.labelle declares, and the loadable blocks depend on it.
         // No backend: `labelle astc` reads the project's own (cli#471 D4).
@@ -235,6 +245,33 @@ pub fn beforeGenerate(
     if (code != 0) return code;
     if (before.len != 0) try gate(site.backing, project_dir);
     return 0;
+}
+
+test "pipeline: no describe answer fails the prepass instead of skipping the ASTC conversion" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn spawn(_: std.mem.Allocator, _: []const []const u8) ?[]const u8 {
+            calls += 1;
+            return null; // describe failed (a mid-edit project file, say)
+        }
+    };
+    const describer: assembler_describe.Describer = .{ .bin_path = "/asm", .protocol = assembler_describe.min_protocol, .project_dir = "/proj", .spawn = Fake.spawn };
+    const cfg: @import("../project_config.zig").ProjectConfig = .{ .name = "game" };
+    // A watched rebuild (`fatal = false`): the error fails that rebuild only.
+    try std.testing.expectError(error.DescribeFailed, corePrepasses(std.testing.allocator, "/proj", cfg, .{
+        .target = "desktop",
+        .describer = describer,
+        .bake = false,
+        .fatal = false,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    // No describer at all is no answer either.
+    try std.testing.expectError(error.DescribeFailed, corePrepasses(std.testing.allocator, "/proj", cfg, .{
+        .target = "desktop",
+        .describer = .off,
+        .bake = false,
+        .fatal = false,
+    }));
 }
 
 test "pipeline: the shader override is re-gated after the before-generate hooks" {
