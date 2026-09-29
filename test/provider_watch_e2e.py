@@ -344,6 +344,43 @@ with tempfile.TemporaryDirectory(prefix="labelle-watch-") as temp:
         (base / "edit-during-build").unlink(missing_ok=True)
         s.kill()
 
+    # ── A nested lock-writing command from a hook fails fast (cli#490) ──
+    # A rebuild of an edited project.labelle holds the project lock through
+    # its hooks. Its `before generate` hook runs `labelle generate` on the
+    # same project: that child must recognise, from the marker the rebuild
+    # exported, that its own ancestor holds the lock, and fail at once with
+    # the diagnostic instead of waiting forever. Bounded: a regression fails
+    # here after three minutes instead of hanging the suite.
+    nested_result = base / "nested.json"
+    nested_result.unlink(missing_ok=True)
+    s = Session({"PROVIDER_PROBE_NESTED": f"toolchain|{nested_result}|{cli}"})
+    try:
+        s.wait_gen("gen=0 data=one")
+        Path(f"{nested_result}.arm").write_text("1")
+        # Changes project.labelle's bytes (the rebuild takes the lock
+        # transaction), not what the session depends on.
+        (project / "project.labelle").write_text((project / "project.labelle").read_text() + "\n")
+        report = json.loads(wait_for("the nested labelle command (a deadlock on the project lock?)",
+                                     lambda: nested_result.exists() and nested_result.read_text(), timeout=180))
+        assert report["code"] != "0", report
+        assert "runs inside another labelle command that holds the lock of this project" in report["stderr"], report
+        assert "waiting for" not in report["stderr"], report
+        assert report["elapsed_ms"] < 60000, report
+        # The mechanism: the hook received the marker naming this project.
+        same = (lambda x, y: x.lower() == y.lower()) if os.name == "nt" else (lambda x, y: x == y)
+        assert report["marker"] and any(same(entry, str(project)) for entry in report["marker"].split(os.pathsep)), report
+        # The rebuild itself finished and published: no deadlock.
+        s.wait_gen("gen=1 data=one")
+        assert s.finish("0") == 0, s.output()
+        checks += 1
+    except BaseException:
+        print('---- labelle output ----\n' + s.output(), file=sys.stderr)
+        raise
+    finally:
+        Path(f"{nested_result}.arm").unlink(missing_ok=True)
+        declare()
+        s.kill()
+
     # ── A non-zero replacement exit skips `after run`; cleanup still runs ─
     s = Session()
     try:

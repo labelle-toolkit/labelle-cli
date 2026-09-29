@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const project_lock = @import("project_lock.zig");
 const supervise = @import("supervise.zig");
 const zig_toolchain = @import("zig_toolchain.zig");
 const zig_cache = @import("zig_cache.zig");
@@ -528,6 +529,10 @@ pub fn buildEnvironWithExtra(
     for (extras) |kv| {
         try map.put(kv.key, kv.value);
     }
+    // A child spawned while this process holds a project lock learns so
+    // (cli#490): a nested labelle command then fails fast instead of
+    // waiting for its own ancestor.
+    try project_lock.exportHeld(allocator, &map);
     return map;
 }
 

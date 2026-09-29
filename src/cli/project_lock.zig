@@ -25,6 +25,20 @@
 //! session stop handler's `cancel_requested`) or its own cancellation (a
 //! session ending) returns `error.Canceled`. Without a stop handler, Ctrl+C
 //! ends the process, which releases whatever it held.
+//!
+//! Nested commands (cli#490): while this process holds a project's lock,
+//! every child it spawns through `runner.buildEnvironWithExtra` (hooks,
+//! provider tools, `zig build`) or as a `.prebuild` step gets
+//! `LABELLE_PROJECT_LOCK_HELD` naming the canonical project directory
+//! (`exportHeld`; several are joined with the PATH delimiter, an inherited
+//! value kept in front). A labelle process that finds the lock of a
+//! project named there BUSY fails at once with `error.ProjectLockHeldByParent`
+//! instead of waiting: the holder is its own ancestor, waiting for it to
+//! exit, so the wait could never end. It never writes, so the holder's
+//! transaction (and its compare-and-restore) stays exclusive. A FREE lock
+//! is taken as usual even with the marker (a hook's detached process that
+//! outlived the holder is not refused). One watch session runs per
+//! process, so every lock this process holds is its caller's.
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
@@ -41,14 +55,91 @@ const poll_ms: u64 = 20;
 /// so a test can see a contender actually waited.
 pub var test_busy_polls: std.atomic.Value(usize) = .init(0);
 
+/// Names the projects whose lock an ancestor labelle process holds
+/// (cli#490): canonical directories joined with `std.fs.path.delimiter`.
+pub const held_env = "LABELLE_PROJECT_LOCK_HELD";
+
+/// The canonical directories of the project locks this process holds, for
+/// `exportHeld`. Owned by `std.heap.smp_allocator`.
+const Registry = struct {
+    mutex: std.Io.Mutex = .init,
+    dirs: std.ArrayList([]u8) = .empty,
+};
+var registry: Registry = .{};
+
 pub const Held = struct {
     file: std.Io.File,
+    /// This lock's entry in `registry`.
+    dir: []u8,
 
     /// Drop the lock (closing the handle releases it).
     pub fn release(self: Held) void {
-        self.file.close(config.globalIo());
+        const io = config.globalIo();
+        registry.mutex.lockUncancelable(io);
+        for (registry.dirs.items, 0..) |dir, i| if (dir.ptr == self.dir.ptr) {
+            _ = registry.dirs.swapRemove(i);
+            break;
+        };
+        registry.mutex.unlock(io);
+        std.heap.smp_allocator.free(self.dir);
+        self.file.close(io);
     }
 };
+
+/// Tell a child process which project locks it runs under (cli#490): sets
+/// `held_env` in `map` to the inherited value followed by every lock this
+/// process holds. Leaves `map` untouched while it holds none.
+pub fn exportHeld(a: std.mem.Allocator, map: *std.process.Environ.Map) !void {
+    const io = config.globalIo();
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    if (registry.dirs.items.len == 0) return;
+    var value: std.ArrayList(u8) = .empty;
+    defer value.deinit(a);
+    if (map.get(held_env)) |inherited| if (inherited.len > 0) try value.appendSlice(a, inherited);
+    for (registry.dirs.items) |dir| {
+        if (value.items.len > 0) try value.append(a, std.fs.path.delimiter);
+        try value.appendSlice(a, dir);
+    }
+    try map.put(held_env, value.items);
+}
+
+/// The environment for a child spawned while this process may hold a
+/// project lock: `null` (inherit as usual) when it holds none, else the
+/// full environment with `exportHeld` applied.
+pub fn childEnviron(a: std.mem.Allocator) !?std.process.Environ.Map {
+    const io = config.globalIo();
+    registry.mutex.lockUncancelable(io);
+    const holding = registry.dirs.items.len > 0;
+    registry.mutex.unlock(io);
+    if (!holding) return null;
+    var map = try config.globalEnviron().createMap(a);
+    errdefer map.deinit();
+    try exportHeld(a, &map);
+    return map;
+}
+
+/// True when `list` (a `held_env` value) names `dir`, compared the way the
+/// host compares paths.
+pub fn namesProject(list: []const u8, dir: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, std.fs.path.delimiter);
+    while (it.next()) |entry| {
+        if (if (builtin.os.tag == .windows) std.ascii.eqlIgnoreCase(entry, dir) else std.mem.eql(u8, entry, dir)) return true;
+    }
+    return false;
+}
+
+/// Test seam: stands in for an inherited `held_env` value (the process
+/// environment is a snapshot a test cannot change). Never set in production.
+pub var test_inherited: ?[]const u8 = null;
+
+/// True when an ancestor labelle process holds the lock of `dir`.
+fn heldByAncestor(a: std.mem.Allocator, dir: []const u8) bool {
+    if (test_inherited) |list| return namesProject(list, dir);
+    const list = config.globalEnviron().getAlloc(a, held_env) catch return false;
+    defer a.free(list);
+    return namesProject(list, dir);
+}
 
 /// How a contender waits.
 pub const Wait = struct {
@@ -83,9 +174,16 @@ pub fn acquireWaiting(a: std.mem.Allocator, project_dir: []const u8, wait: Wait)
         else => return err,
     };
     errdefer file.close(io);
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, project_dir, std.heap.smp_allocator) catch
+        try std.heap.smp_allocator.dupe(u8, project_dir);
+    errdefer std.heap.smp_allocator.free(canonical);
     var noticed = false;
     while (!try file.tryLock(io, .exclusive)) {
         _ = test_busy_polls.fetchAdd(1, .monotonic);
+        if (!noticed and heldByAncestor(a, canonical)) {
+            std.debug.print("labelle: this command writes labelle.lock, but it runs inside another labelle command that holds the lock of this project ('{s}'), e.g. from a hook or a prebuild step of a watch rebuild; that command waits for this one, so waiting here would never end. Run it outside the hook. (lock: {s})\n", .{ canonical, path });
+            return error.ProjectLockHeldByParent;
+        }
         if (cancel.cancel_requested.load(.acquire)) return error.Canceled;
         if (wait.cancel) |c| if (c.canceled(c.ctx)) return error.Canceled;
         if (!noticed) {
@@ -94,7 +192,10 @@ pub fn acquireWaiting(a: std.mem.Allocator, project_dir: []const u8, wait: Wait)
         }
         io.sleep(std.Io.Duration.fromMilliseconds(@intCast(poll_ms)), .awake) catch {};
     }
-    return .{ .file = file };
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    try registry.dirs.append(std.heap.smp_allocator, canonical);
+    return .{ .file = file, .dir = canonical };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -214,4 +315,79 @@ test "project lock: a directory at the lock path is refused (cli#481)" {
     defer t.deinit(a);
     try t.tmp.dir.createDirPath(io, ".labelle/project.lock");
     try std.testing.expectError(error.ProjectLockNotRegular, acquire(a, t.dir));
+}
+
+test "project lock: a nested command whose ancestor holds the lock fails at once, without waiting (cli#490)" {
+    const a = std.testing.allocator;
+    var t = try Tmp.init(a);
+    defer t.deinit(a);
+    // The ancestor: a watch rebuild holding its lock transaction.
+    const held = try acquire(a, t.dir);
+    defer held.release();
+    defer test_inherited = null;
+    // The child inherits the marker naming this very project.
+    const list = try std.mem.concat(a, u8, &.{ "/elsewhere", &.{std.fs.path.delimiter}, held.dir });
+    defer a.free(list);
+    test_inherited = list;
+    const before = test_busy_polls.load(.monotonic);
+    try std.testing.expectError(error.ProjectLockHeldByParent, acquire(a, t.dir));
+    // Exactly one busy poll: it recognised its ancestor on the first one
+    // and never slept in the wait loop.
+    try std.testing.expectEqual(before + 1, test_busy_polls.load(.monotonic));
+}
+
+test "project lock: a marker for another project, or a free lock, changes nothing (cli#490)" {
+    const a = std.testing.allocator;
+    var t = try Tmp.init(a);
+    defer t.deinit(a);
+    defer test_inherited = null;
+    // A free lock is taken even though the marker names this project (a
+    // hook's process that outlived its caller).
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), t.dir, a);
+    defer a.free(canonical);
+    test_inherited = canonical;
+    const free = try acquire(a, t.dir);
+    // Busy, but the marker names another project: an ordinary wait (ended
+    // here by a cancellation after three polls), not the nested refusal.
+    test_inherited = "/some/other/project";
+    const Stop = struct {
+        var polls: usize = 0;
+        fn canceled(_: *const anyopaque) bool {
+            polls += 1;
+            return polls >= 3;
+        }
+    };
+    const before = test_busy_polls.load(.monotonic);
+    try std.testing.expectError(error.Canceled, acquireWaiting(a, t.dir, .{ .cancel = .{ .ctx = &Stop.polls, .canceled = Stop.canceled } }));
+    try std.testing.expectEqual(before + 3, test_busy_polls.load(.monotonic));
+    free.release();
+}
+
+test "project lock: children of a holder are told which project lock it holds (cli#490)" {
+    const a = std.testing.allocator;
+    var t = try Tmp.init(a);
+    defer t.deinit(a);
+    var map = std.process.Environ.Map.init(a);
+    defer map.deinit();
+    // Holding nothing: the environment is left alone.
+    try exportHeld(a, &map);
+    try std.testing.expect(map.get(held_env) == null);
+    try std.testing.expect((try childEnviron(a)) == null);
+    const held = try acquire(a, t.dir);
+    // The canonical project directory, after what an ancestor exported.
+    try map.put(held_env, "/ancestor/project");
+    try exportHeld(a, &map);
+    const value = map.get(held_env).?;
+    try std.testing.expect(namesProject(value, "/ancestor/project"));
+    try std.testing.expect(namesProject(value, held.dir));
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), t.dir, a);
+    defer a.free(canonical);
+    try std.testing.expectEqualStrings(canonical, held.dir);
+    // A spawn that would inherit gets a full environment carrying it.
+    var child = (try childEnviron(a)).?;
+    defer child.deinit();
+    try std.testing.expect(namesProject(child.get(held_env).?, canonical));
+    held.release();
+    // Released: nothing is exported any more.
+    try std.testing.expect((try childEnviron(a)) == null);
 }

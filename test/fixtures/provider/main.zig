@@ -101,6 +101,24 @@ pub fn main(init: std.process.Init) !u8 {
         .sub_path = log_path,
         .data = try std.mem.concat(a, u8, &.{ previous, line, "\n" }),
     });
+    // `PROVIDER_PROBE_NESTED=<hook id>|<result>|<labelle>` makes that hook
+    // (once the file `<result>.arm` exists, and only until `<result>` is
+    // written) run `<labelle> generate --platform=<its target>` on its own
+    // project (cli#490), with this variable removed so the nested
+    // command's own hooks do not recurse. It writes `<result>`: the nested
+    // exit code, how long it took, the marker the hook itself received and
+    // the nested stderr. The hook then succeeds.
+    if (init.minimal.environ.getAlloc(a, "PROVIDER_PROBE_NESTED")) |spec| {
+        var parts = std.mem.splitScalar(u8, spec, '|');
+        const id = parts.next() orelse return error.BadProbeNestedSpec;
+        const result = parts.next() orelse return error.BadProbeNestedSpec;
+        const labelle = parts.next() orelse return error.BadProbeNestedSpec;
+        const armed = if (std.Io.Dir.cwd().access(init.io, try std.fmt.allocPrint(a, "{s}.arm", .{result}), .{})) |_| true else |_| false;
+        const done = if (std.Io.Dir.cwd().access(init.io, result, .{})) |_| true else |_| false;
+        if (armed and !done and invocation == .object and std.mem.eql(u8, invocation.object.get("id").?.string, id)) {
+            try nested(init, a, result, labelle, ctx.value.object.get("project_dir").?.string, ctx.value.object.get("target").?.string);
+        }
+    } else |_| {}
     // `PROVIDER_PROBE_SLOW=<hook id>|<marker>` makes that hook — once the
     // file `<marker>.arm` exists — start a lingering grandchild, write
     // `<own pid> <grandchild pid>` to <marker> and then sleep, so a suite
@@ -328,4 +346,26 @@ fn outcomeFile(run_ctx: std.json.Value) ?[]const u8 {
     if (run_ctx != .object) return null;
     const value = run_ctx.object.get("outcome_file") orelse return null;
     return if (value == .string) value.string else null;
+}
+
+fn nested(init: std.process.Init, a: std.mem.Allocator, result: []const u8, labelle: []const u8, project: []const u8, target: []const u8) !void {
+    const io = init.io;
+    var env = try init.environ_map.clone(a);
+    _ = env.swapRemove("PROVIDER_PROBE_NESTED");
+    const marker: ?[]const u8 = init.environ_map.get("LABELLE_PROJECT_LOCK_HELD");
+    const started = std.Io.Timestamp.now(io, .awake);
+    const run = std.process.run(a, io, .{
+        .argv = &.{ labelle, "generate", try std.fmt.allocPrint(a, "--platform={s}", .{target}), "--progress=off" },
+        .cwd = .{ .path = project },
+        .environ_map = &env,
+    });
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds, std.time.ns_per_ms);
+    const code: []const u8, const stderr: []const u8 = if (run) |r| .{ switch (r.term) {
+        .exited => |c| try std.fmt.allocPrint(a, "{d}", .{c}),
+        else => "signal",
+    }, r.stderr } else |err| .{ @errorName(err), "" };
+    const report = try std.json.Stringify.valueAlloc(a, .{ .code = code, .elapsed_ms = elapsed_ms, .marker = marker, .stderr = stderr }, .{});
+    const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{result});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = report });
+    try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), result, io);
 }

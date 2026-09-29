@@ -91,6 +91,7 @@ const std = @import("std");
 const supervise = @import("supervise.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const project_lock = @import("project_lock.zig");
 const progress = @import("progress.zig");
 const project_config = @import("project_config.zig");
 const prebuild_relay = @import("prebuild_relay.zig");
@@ -552,11 +553,21 @@ pub fn runStep(
         .relay => .pipe,
     };
 
+    // Inside a watch rebuild's lock transaction the step learns which
+    // project lock its caller holds (cli#490); otherwise it inherits the
+    // environment as is.
+    var held_env = project_lock.childEnviron(allocator) catch |err| {
+        if (relay) |r| r.cancel();
+        std.debug.print("labelle: prebuild could not prepare the environment of a step ({s})\n", .{@errorName(err)});
+        return error.PrebuildSpawnFailed;
+    };
+    defer if (held_env) |*map| map.deinit();
     // Supervised inside a watch session (`supervise.zig`): the step then
     // runs in its own cancellable process tree.
     var sup = supervise.spawn(io, .{
         .argv = step.run,
         .cwd = .{ .path = project_dir },
+        .environ_map = if (held_env) |*map| map else null,
         .stdin = .inherit,
         .stdout = child_stdout,
         .stderr = .inherit,
