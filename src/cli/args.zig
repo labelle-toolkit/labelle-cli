@@ -13,7 +13,7 @@ const zig_toolchain = @import("zig_toolchain.zig");
 const bundle = @import("bundle.zig");
 const contract = @import("provider_contract.zig");
 
-pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, ios_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
+pub const Command = enum { generate, build, run, init_cmd, add_cmd, install_cmd, upgrade_cmd, update_cmd, clean_cmd, help_cmd, version, targets, assembler_cmd, test_cmd, pack_cmd, astc_cmd, audit_cmd, migrate_cmd, doctor_cmd, check_cmd, plugins_cmd, toolchain_cmd, status_cmd, bundle_cmd };
 
 const SceneResult = enum { not_scene, parsed, needs_next, err };
 

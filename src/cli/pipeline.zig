@@ -1,7 +1,7 @@
 //! Command-execution pipeline for the labelle CLI (#311). Extracted from
 //! cli.zig `main` so the dispatcher stays small: this owns the
-//! generate -> build -> run flow and the docker / ios
-//! branches. Behavior is identical to when this lived in `main`.
+//! generate -> build -> run flow and the docker
+//! branch. Behavior is identical to when this lived in `main`.
 //!
 //! Thin root: `run` walks the stages in order and owns every resource they
 //! borrow; each stage lives in `pipeline/`, one responsibility per file.
@@ -36,7 +36,6 @@ const runner = @import("runner.zig");
 const assembler_proc = @import("assembler_proc.zig");
 const assembler_describe = @import("assembler_describe.zig");
 const material_toolchain = @import("material_toolchain.zig");
-const ios = @import("ios.zig");
 const progress = @import("progress.zig");
 const args_mod = @import("args.zig");
 const provider_contract = @import("provider_contract.zig");
@@ -63,10 +62,10 @@ pub const ScreenshotProbeSpec = screenshot.ScreenshotProbeSpec;
 pub const CollectPrebuildIgnorePathsSpec = rebuild.CollectPrebuildIgnorePathsSpec;
 
 /// Run the project-scoped pipeline: read project.labelle, then
-/// generate -> build -> run (or the docker / ios
+/// generate -> build -> run (or the docker
 /// variant selected by `parsed_args`). Dispatch of the standalone
 /// subcommands stays in cli.zig `main`; this is invoked only for the
-/// project commands (generate / build / run / bundle / ios).
+/// project commands (generate / build / run / bundle).
 /// Returns the process exit status the command earned: the game's own exit
 /// status for `run` (0 for a genuine `--timeout` expiry), 0 for everything
 /// that completed. `main` returns it as the CLI's exit code, so automation
@@ -164,9 +163,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // cli#471 D3), so a third-party `.backend_package` names the dir after
     // its package exactly as `generate` does (cli#471 finding 4). An older
     // assembler, or a `describe` that cannot answer, keeps the enum-derived
-    // `<backend tag>_<target>`. The legacy ios subcommand forces its own
-    // backend, which `describe` (reading project.labelle alone) cannot
-    // know, so it keeps the enum name too.
+    // `<backend tag>_<target>`.
     //
     // This is why the assembler is looked up HERE, ahead of the session lock
     // and the progress feed: both live under the target dir. Looking it up
@@ -174,13 +171,10 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // lookup that fails here is not fatal yet: the dir keeps the enum name,
     // and the lookup below fails again inside the progress feed, so a
     // `--progress=json` consumer still gets its `failed` record.
-    const early_asm: ?assembler_proc.Assembler = if (command == .ios_cmd)
-        null
-    else
-        assembler_proc.resolve(allocator, project_dir, "generate") catch |err| blk: {
-            std.log.debug("assembler lookup before naming the target dir failed ({t}); using the enum name", .{err});
-            break :blk null;
-        };
+    const early_asm: ?assembler_proc.Assembler = assembler_proc.resolve(allocator, project_dir, "generate") catch |err| blk: {
+        std.log.debug("assembler lookup before naming the target dir failed ({t}); using the enum name", .{err});
+        break :blk null;
+    };
     var early_asm_owned = early_asm != null;
     defer if (early_asm_owned) early_asm.?.deinit(allocator);
     const describer: assembler_describe.Describer = if (early_asm) |a| .init(a, project_dir) else .off;
@@ -232,9 +226,8 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
     // stderr (default human mode — a TTY-only spinner while `zig build`
     // runs, "still working" heartbeat lines while the assembler child
     // owns stderr during resolve/generate, cli#321). Enabled for the
-    // commands that run the shared build pipeline; `labelle generate` and
-    // the ios subcommand (which owns its own build flow) stay
-    // report-free. A
+    // commands that run the shared build pipeline; `labelle generate`
+    // stays report-free. A
     // reporter that fails to initialize downgrades to the pre-#284
     // behavior instead of blocking the build.
     var reporter_storage: progress.Reporter = undefined;
@@ -336,21 +329,17 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
         optimize_mod.ownerDefault(providers, target.name),
     ).mode;
 
-    // A path that cannot carry a provider's environment contribution or its
-    // optimize default refuses here, before any hook, generation or build,
-    // rather than silently bypassing the provider (`install.providerBypass`).
+    // A path that cannot carry a provider's environment contribution
+    // refuses here, before any hook, generation or build, rather than
+    // silently bypassing the provider (`install.providerBypass`).
+    const contributor = provider_hooks.planContributor(hook_plans.generate, hook_plans.build);
     if (install.providerBypass(
         command,
         parsed_args.docker,
-        provider_hooks.planContributor(hook_plans.generate, hook_plans.build) != null,
-        optimize_mod.ownerDefault(providers, target.name) != null,
+        contributor != null,
         hook_plans.build.replace != null,
     )) |bypass| {
-        if (provider_hooks.planContributor(hook_plans.generate, hook_plans.build)) |hook| {
-            std.debug.print("labelle: hook '{s}' may contribute an environment for target '{s}'\n", .{ hook.qualified, target.name });
-        } else {
-            std.debug.print("labelle: '{s}' declares an optimize default for target '{s}'\n", .{ target.providerName(), target.name });
-        }
+        std.debug.print("labelle: hook '{s}' may contribute an environment for target '{s}'\n", .{ contributor.?.qualified, target.name });
         std.debug.print("labelle: {s}\n", .{bypass.message()});
         if (reporter) |r| r.finishFailed(1, "the build path cannot carry the provider's inputs");
         return 1;
@@ -424,11 +413,6 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
 
     if (command == .generate) return 0;
 
-    // `labelle ios` subcommand — handles its own build/xcode/run
-    if (command == .ios_cmd) {
-        return ok(ios.handleIos(allocator, parsed_args.extra_args[0..parsed_args.extra_count], parsed, target_dir));
-    }
-
     // Warn if --target is used without --docker (it has no effect otherwise)
     if (parsed_args.docker_target != null and !parsed_args.docker) {
         std.debug.print("labelle: warning: --target has no effect without --docker\n", .{});
@@ -487,8 +471,7 @@ pub fn run(allocator: std.mem.Allocator, parsed_args: ParsedArgs) !u8 {
 }
 
 /// The last lifecycle step `command` runs its hooks for (contract §2
-/// `final_step`). The legacy `labelle ios` subcommand only shares the
-/// `generate` hooks, so its hooks see `generate`.
+/// `final_step`).
 fn finalStep(command: args_mod.Command) provider_contract.Step {
     return switch (command) {
         .build => .build,
@@ -500,7 +483,6 @@ fn finalStep(command: args_mod.Command) provider_contract.Step {
 
 test "finalStep: each project command's last hook step" {
     try std.testing.expectEqual(provider_contract.Step.generate, finalStep(.generate));
-    try std.testing.expectEqual(provider_contract.Step.generate, finalStep(.ios_cmd));
     try std.testing.expectEqual(provider_contract.Step.build, finalStep(.build));
     try std.testing.expectEqual(provider_contract.Step.run, finalStep(.run));
     try std.testing.expectEqual(provider_contract.Step.bundle, finalStep(.bundle_cmd));

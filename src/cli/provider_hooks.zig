@@ -518,7 +518,7 @@ pub const RunOutcome = union(enum) {
     /// The game was stopped at the `--timeout` deadline: by the CLI's
     /// watchdog, or by a run replacement that reported it.
     timed_out,
-    /// The launch returned while the app runs elsewhere (`simctl launch`,
+    /// The launch returned while the app runs elsewhere (a simulator,
     /// or any launcher that hands the app to a device): its exit is never
     /// observed.
     launched_detached,

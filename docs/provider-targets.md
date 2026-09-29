@@ -12,7 +12,7 @@ and the CLI carries no Android code (cli#405). The other platform packages
 ## Resolution
 
 Every command that runs the project pipeline (`generate`, `build`, `run`,
-`bundle`, and the legacy `ios` subcommand) resolves
+`bundle`) resolves
 one target, in two halves, before anything is generated, locked or built:
 
 1. The requested name is `--platform=<t>` when given, else the project's
@@ -201,9 +201,9 @@ explicit line:
 
 - A provider target whose name is a schema platform (`wasm`, `android`,
   `ios`) is handed to the assembler as `--platform <name>`, exactly as
-  before. The legacy pipeline branch that keys on the enum (`ios`) keeps
-  working for it; `android` and `wasm` have none left, so their providers
-  replace `run` (see [`labelle run`](#labelle-run)).
+  before. No pipeline branch keys on the enum any more (the last, the `ios`
+  simulator launch, left with RFC cli#471 I5), so their providers replace
+  `run` (see [`labelle run`](#labelle-run)).
 - A provider target outside the enum can only be generated for by its
   provider's `replace` hook on `generate`. Without one the command stops
   before the assembler runs:
@@ -227,10 +227,11 @@ slice, and `provider_settings.zig` is untouched.
 
 ## `labelle run`
 
-The CLI launches only the core `desktop` target on this host, plus the
-legacy run branch it still carries (the `ios` simulator). The core's own
-browser serve left in 3.0: the `web` provider's `replace run` hook serves
-`wasm` now.
+The CLI launches only the core `desktop` target on this host. The core's
+own browser serve left in 3.0 (the `web` provider's `replace run` hook
+serves `wasm` now), and its `ios` simulator launch with RFC cli#471 I5
+([labelle-ios](https://github.com/labelle-toolkit/labelle-ios)'s `replace
+run` hook launches it now).
 Every other provider target is launched by its provider, so it must have a
 `replace` hook on `run`, otherwise:
 
@@ -312,8 +313,8 @@ package injection (RFC #406 "Migration", #410). The user-facing walkthrough,
 with Flying Platform as the worked example, is
 [Migrating a project to labelle CLI 2.0](migrating-to-2.0.md):
 
-- A project that builds for `wasm`, `android` or `ios` — through `.platform`,
-  `--platform=<t>`, or `labelle ios …` — must add the package that declares that target to
+- A project that builds for `wasm`, `android` or `ios` — through `.platform`
+  or `--platform=<t>` — must add the package that declares that target to
   `.plugins` (as `.repo = "github.com/<owner>/<name>"`) and pin it
   (`labelle providers resolve`, then `--accept`). Until it does, those
   commands fail with the no-provider error above. Commit
@@ -323,10 +324,14 @@ with Flying Platform as the worked example, is
   ([pins](provider-github-pins.md#fresh-checkouts-and-ci-labelle-providers-fetch)).
 - The target name is unchanged: `--platform=wasm` stays `--platform=wasm`,
   because the web provider declares the target `wasm`. Only the pin is new.
-- The legacy `labelle ios` command word stays a reserved built-in until its
-  extraction lands; it routes its target through the same resolver. The
-  legacy `labelle wasm serve|export` left the core in 3.0: `wasm` is no
-  reserved word any more ([migrating to 3.0](migrating-to-3.0.md)).
+- The legacy `labelle wasm serve|export` left the core in 3.0: `wasm` is no
+  reserved word any more ([migrating to 3.0](migrating-to-3.0.md)). The
+  legacy `labelle ios` subcommand followed (RFC cli#471 I5): the word is an
+  unknown command unless a pinned package declares it as a namespace, and
+  iOS builds, runs and bundles through
+  [labelle-ios](https://github.com/labelle-toolkit/labelle-ios) with
+  `--platform=ios`; its settings (formerly the `.ios` block, which the CLI
+  now ignores) live in `providers/ios.json`.
 - `labelle android …` is no built-in any more (cli#405): it is the `android`
   provider's namespace. Without that package pinned, `labelle android` is an
   unknown command — or, inside a project, when the one document the target

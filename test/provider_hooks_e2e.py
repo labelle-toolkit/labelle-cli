@@ -924,22 +924,23 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         assert "--docker builds the `desktop` target only" in refused.stderr, (docker_args, refused.stderr)
         assert "FIXTURE_GENERATE" not in refused.stderr and not log(replaced_dir) and not log(replaced_dir / "zig-out"), refused.stderr
     a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
-    # The legacy `labelle ios` runs its own zig build after generation, with
-    # neither the contributions nor the optimize default: refused for either,
-    # before any hook or generation.
-    ios_dir = project / ".labelle" / "sokol_ios"
+    # iOS left the core (RFC cli#471 I5): `labelle ios` is no built-in any
+    # more, so even with a pinned owner of `ios` (which declares no `ios`
+    # namespace) the word is an unknown command — no hook runs, nothing
+    # generates. And `run --platform=ios` has no core simulator launch to
+    # fall back to: without the owner's `replace run` it is refused like
+    # any provider target (`NoRunReplacement`), before any hook runs.
+    ios_dir = project / ".labelle" / "raylib_ios"
     a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="ios")], targets=["ios"]))
     reset()
     refused = run("ios", "build", code=1)
-    assert "hook 'fixture-a/tc' may contribute an environment for target 'ios'" in refused.stderr, refused.stderr
-    assert "`labelle ios` runs its own build, which doesn't carry provider environment contributions" in refused.stderr, refused.stderr
+    assert "labelle: unknown command 'ios'" in refused.stderr, refused.stderr
     assert "FIXTURE_GENERATE" not in refused.stderr and not log(ios_dir), refused.stderr
-    a_manifest.write_text(manifest("fixture-a", [], targets=["ios"], defaults=(("ios", "ReleaseSafe"),)))
     reset()
-    refused = run("ios", "build", code=1)
-    assert "'fixture-a' declares an optimize default for target 'ios'" in refused.stderr, refused.stderr
-    assert "`labelle ios` runs its own build, which ignores the target owner's optimize default" in refused.stderr, refused.stderr
-    assert "FIXTURE_GENERATE" not in refused.stderr, refused.stderr
+    refused = run("run", "--platform=ios", code=1)
+    assert "target 'ios' has no run replacement; package 'fixture-a' must declare a `.when = .replace` hook on `run`" in refused.stderr, refused.stderr
+    assert "NoRunReplacement" in refused.stderr, refused.stderr
+    assert "FIXTURE_GENERATE" not in refused.stderr and not log(ios_dir), refused.stderr
     a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
 
     # ── contract 1.3.0: the target owner's optimize default ───────────────

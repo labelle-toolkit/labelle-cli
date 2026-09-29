@@ -104,7 +104,10 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// `cli/runner.zig` came clean: 18 entries. RFC cli#471 X2 moved the
 /// vendored stb single-headers to `vendor/stb/` (third-party code lives
 /// outside `src/`), taking `cli/stb_image.h`'s upstream comment with it:
-/// 17 entries.
+/// 17 entries. RFC cli#471 I5 removed iOS from the core (the `labelle-ios`
+/// provider owns it now): `cli/ios.zig` went with its file, and
+/// `cli/args.zig`, `cli/pipeline/args_resolve.zig`, `cli/pipeline/run.zig`
+/// and `cli/provider_dispatch.zig` came clean: 12 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -114,21 +117,16 @@ const allowed_files = [_][]const u8{
     "agnostic_guard_test.zig",
     // Legacy platform, store, package and backend sites (RFC #406 "Migration").
     "cli.zig",
-    "cli/args.zig",
     "cli/config.zig",
     "cli/docker.zig",
     "cli/doctor.zig",
-    "cli/ios.zig",
     "cli/pipeline.zig",
     // Split out of `cli/pipeline.zig` (moves only): the stage code they
     // carry names the legacy targets, backends and their toolchains.
-    "cli/pipeline/args_resolve.zig",
     "cli/pipeline/build.zig",
     "cli/pipeline/generate.zig",
     "cli/pipeline/install.zig",
-    "cli/pipeline/run.zig",
     "cli/project_config.zig",
-    "cli/provider_dispatch.zig",
     "cli/sdl_provision.zig",
     "cli/upgrade.zig",
 };
@@ -514,8 +512,8 @@ test "host OS names never flag" {
 test "the allowlist matches Windows-style walker paths, one file per entry" {
     try std.testing.expect(allowedIndex("cli/pipeline.zig") != null);
     try std.testing.expect(allowedIndex("cli\\pipeline.zig") != null);
-    try std.testing.expect(allowedIndex("cli\\pipeline\\run.zig") != null);
-    try std.testing.expect(allowedIndex("cli/ios.zig") != null);
+    try std.testing.expect(allowedIndex("cli\\pipeline\\generate.zig") != null);
+    try std.testing.expect(allowedIndex("cli/sdl_provision.zig") != null);
     // A new file under a legacy directory is NOT exempt.
     try std.testing.expect(allowedIndex("cli/pipeline/not_yet_written.zig") == null);
     try std.testing.expect(allowedIndex("cli/pipeline/") == null);
@@ -597,13 +595,11 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     // clean contents: the entry is only stale once the file is moved or
     // renamed.
     try scan.file("cli/sdl_provision.zig", "const x = 1;\n");
-    try scan.file("cli\\ios.zig", "");
     try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
     try std.testing.expect(!containsString(stale.items, "cli/sdl_provision.zig"));
-    try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
     try std.testing.expect(containsString(stale.items, "cli/upgrade.zig"));
 }
 

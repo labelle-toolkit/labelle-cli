@@ -23,8 +23,8 @@ const gateThenInstall = @import("install.zig").gateThenInstall;
 ///
 /// `build` / `run` are not assembler subcommands: the subsequent
 /// `zig build` invocation and binary launch stay CLI-side (see below).
-/// The CLI owns docker orchestration, the watch supervision, the
-/// iOS deploy path and `--timeout` — generation is the only
+/// The CLI owns docker orchestration, the watch supervision and
+/// `--timeout` — generation is the only
 /// step the assembler binary delegates.
 /// `parsed_args.scene_override` is intentionally NOT forwarded to the
 /// assembler. PR #243 removed the CLI's `cfg.initial_prefab` rewrite for
@@ -170,9 +170,9 @@ pub fn corePrepasses(allocator: std.mem.Allocator, project_dir: []const u8, pars
     // #421). Its provider owns its asset pipeline; standalone `cmdAstc`
     // can read capabilities for any declared target name.
     if (opts.legacy_target and parsed.asset_compression.formatFor(parsed.platform) == .astc) {
-        // Pass the RESOLVED target: `--platform=wasm` and `labelle ios`
-        // (forces sokol) differ from what
-        // project.labelle declares, and the loadable blocks depend on both.
+        // Pass the RESOLVED target: `--platform=<target>` differs from
+        // what project.labelle declares, and the loadable blocks depend on
+        // both.
         astc_cmd.cmdAstc(allocator, &.{
             project_dir,
             "--platform",
