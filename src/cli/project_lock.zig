@@ -99,8 +99,8 @@ pub const Held = struct {
 
 /// Tell a child process which project locks it runs under (cli#490): sets
 /// `held_env` in `map` to the inherited value followed by the token of
-/// every lock this process holds. Leaves `map` untouched while it holds
-/// none.
+/// every lock this process holds that it does not name yet. Leaves `map`
+/// untouched while it holds none.
 pub fn exportHeld(a: std.mem.Allocator, map: *std.process.Environ.Map) !void {
     const io = config.globalIo();
     registry.mutex.lockUncancelable(io);
@@ -110,22 +110,25 @@ pub fn exportHeld(a: std.mem.Allocator, map: *std.process.Environ.Map) !void {
     defer value.deinit(a);
     if (map.get(held_env)) |inherited| if (inherited.len > 0) try value.appendSlice(a, inherited);
     for (registry.tokens.items) |token| {
+        if (namesToken(value.items, &token)) continue;
         if (value.items.len > 0) try value.append(a, std.fs.path.delimiter);
         try value.appendSlice(a, &token);
     }
     try map.put(held_env, value.items);
 }
 
-/// The environment for a child spawned without one while this process may
-/// hold a project lock: `null` (inherit as usual) when it holds none, else
-/// the full environment with `exportHeld` applied.
-pub fn childEnviron(a: std.mem.Allocator) !?std.process.Environ.Map {
+/// The environment for a child about to be spawned with `given` (`null`:
+/// the inherited one) while this process may hold a project lock: `null`
+/// (spawn with `given` as is) when it holds none, else a copy with
+/// `exportHeld` applied. Applied at spawn time, so an environment built
+/// before the lock was taken still carries its token.
+pub fn childEnviron(a: std.mem.Allocator, given: ?*const std.process.Environ.Map) !?std.process.Environ.Map {
     const io = config.globalIo();
     registry.mutex.lockUncancelable(io);
     const holding = registry.tokens.items.len > 0;
     registry.mutex.unlock(io);
     if (!holding) return null;
-    var map = try config.globalEnviron().createMap(a);
+    var map = if (given) |env| try env.clone(a) else try config.globalEnviron().createMap(a);
     errdefer map.deinit();
     try exportHeld(a, &map);
     return map;
@@ -167,15 +170,26 @@ fn reportNested(lock_path: []const u8) error{ProjectLockHeldByParent} {
 /// start again, and could nest forever) instead of meeting it only at its
 /// lock write.
 pub fn refuseNested(a: std.mem.Allocator, project_dir: []const u8) !void {
-    if (!ownerIsAncestor(a, project_dir)) return;
+    if (!inherits(a)) return;
     const io = config.globalIo();
     const path = try std.fs.path.join(a, &.{ project_dir, rel_path });
     defer a.free(path);
-    // A holder that died leaves its token but not its lock.
     const file = lock_open.openRegular(path) catch return;
     defer file.close(io);
+    // The owner is read only once the lock is seen busy, as in
+    // `acquireWaiting`: a holder records its token after taking the lock
+    // and clears it before releasing, so a token read then names a holder
+    // that still holds it (a dead holder leaves its token, not its lock).
     if (try file.tryLock(io, .exclusive)) return;
-    return reportNested(path);
+    if (ownerIsAncestor(a, project_dir)) return reportNested(path);
+}
+
+/// True when this process inherited any project-lock token.
+fn inherits(a: std.mem.Allocator) bool {
+    if (test_inherited) |list| return list.len > 0;
+    const list = config.globalEnviron().getAlloc(a, held_env) catch return false;
+    defer a.free(list);
+    return list.len > 0;
 }
 
 /// How a contender waits.
@@ -423,7 +437,7 @@ test "project lock: children of a holder inherit its token, recorded next to the
     // Holding nothing: the environment is left alone.
     try exportHeld(a, &map);
     try std.testing.expect(map.get(held_env) == null);
-    try std.testing.expect((try childEnviron(a)) == null);
+    try std.testing.expect((try childEnviron(a, null)) == null);
     const held = try acquire(a, t.dir);
     // The owner record names the holder.
     const owner = try t.tmp.dir.readFileAlloc(io, ".labelle/project.lock.owner", a, .limited(256));
@@ -436,12 +450,25 @@ test "project lock: children of a holder inherit its token, recorded next to the
     try std.testing.expect(namesToken(value, "ancestor"));
     try std.testing.expect(namesToken(value, &held.token));
     // A spawn that would inherit gets a full environment carrying it.
-    var child = (try childEnviron(a)).?;
+    var child = (try childEnviron(a, null)).?;
     defer child.deinit();
     try std.testing.expect(namesToken(child.get(held_env).?, &held.token));
+    // An environment built before the lock was taken gets it at spawn
+    // time, once: a map that already names it is not extended.
+    var early = std.process.Environ.Map.init(a);
+    defer early.deinit();
+    try early.put("KEPT", "1");
+    var spawned = (try childEnviron(a, &early)).?;
+    defer spawned.deinit();
+    try std.testing.expectEqualStrings("1", spawned.get("KEPT").?);
+    try std.testing.expectEqualStrings(&held.token, spawned.get(held_env).?);
+    try std.testing.expect(early.get(held_env) == null);
+    var again = (try childEnviron(a, &spawned)).?;
+    defer again.deinit();
+    try std.testing.expectEqualStrings(&held.token, again.get(held_env).?);
     held.release();
     // Released: nothing is exported any more, and the record is cleared.
-    try std.testing.expect((try childEnviron(a)) == null);
+    try std.testing.expect((try childEnviron(a, null)) == null);
     const cleared = try t.tmp.dir.readFileAlloc(io, ".labelle/project.lock.owner", a, .limited(256));
     defer a.free(cleared);
     try std.testing.expectEqualStrings("", cleared);

@@ -165,6 +165,9 @@ pub fn runInheritTerm(
         };
         return .{ .exited = exitStatus(try sup.wait(io)) };
     }
+    // The project-lock marker (cli#490), as `supervise.spawnIn` adds it.
+    var held_env = try project_lock.childEnviron(allocator, environ_map);
+    defer if (held_env) |*map| map.deinit();
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = cwd },
@@ -172,7 +175,7 @@ pub fn runInheritTerm(
         .stdout = .inherit,
         .stderr = .inherit,
         .pgid = if (!is_windows and timeout_ns != null) 0 else null,
-        .environ_map = environ_map,
+        .environ_map = if (held_env) |*map| map else environ_map,
     }) catch |err| {
         reportSpawnFailure(err, argv, cwd);
         return err;
@@ -387,13 +390,16 @@ pub fn runZigInheritProgress(
     try wrapped.appendSlice(allocator, argv);
 
     const io = config.globalIo();
+    // The project-lock marker (cli#490), as `supervise.spawnIn` adds it.
+    var held_env = try project_lock.childEnviron(allocator, environ_map);
+    defer if (held_env) |*map| map.deinit();
     var child = std.process.spawn(io, .{
         .argv = wrapped.items,
         .cwd = .{ .path = cwd },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
-        .environ_map = environ_map,
+        .environ_map = if (held_env) |*map| map else environ_map,
     }) catch |err| {
         closeFd(fds[0]);
         closeFd(fds[1]);
