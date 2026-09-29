@@ -298,6 +298,21 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert passthrough.returncode == 0, (passthrough.returncode, passthrough.stderr)
     assert json.loads((outputs / "alpha-pkg" / "capture.json").read_text())["args"] == ["--zig", dead_zig]
 
+    # `--fix` is forwarded to every provider doctor (RFC cli#471 D10): the
+    # core has nothing to fix, and each doctor gets `--fix` as its trailing
+    # argument, as `labelle <ns> doctor --fix` would.
+    before = (len(invocations("alpha-pkg")), len(invocations("beta-pkg")))
+    fixing = run("--fix")
+    assert "--fix is forwarded to every provider doctor" in fixing.stderr, fixing.stderr
+    assert "Provider doctors: 2 checked, 0 failed" in fixing.stderr, fixing.stderr
+    assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (before[0] + 1, before[1] + 1)
+    for package in ("alpha-pkg", "beta-pkg"):
+        assert json.loads((outputs / package / "capture.json").read_text())["args"] == ["--fix"], package
+    # `--core-only --fix` fixes nothing and runs no provider.
+    core_fix = run("--core-only", "--fix")
+    assert "nothing is fixed" in core_fix.stderr, core_fix.stderr
+    assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (before[0] + 1, before[1] + 1)
+
     # ── `--json` aggregates the provider doctors (RFC cli#466 D7) ────────
     # Each provider doctor runs with `--json`; its stdout is captured, never
     # passed through, and validated as one capability object. The core
@@ -350,6 +365,13 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert (len(invocations("alpha-pkg")), len(invocations("beta-pkg"))) == (runs[0] + 1, runs[1] + 1)
     for package in ("alpha-pkg", "beta-pkg"):
         assert json.loads((outputs / package / "capture.json").read_text())["args"] == ["--json"], package
+    # `--json --fix`: every provider doctor gets both, `--json` first; the
+    # core's `--fix` line goes to stderr and stdout stays the one document.
+    caps, ids, json_fix = report(capability("alpha-cap"), capability("beta-cap"), "--fix")
+    assert ids == core_ids + ["alpha-cap", "beta-cap"], ids
+    assert "--fix is forwarded to every provider doctor" in json_fix.stderr, json_fix.stderr
+    for package in ("alpha-pkg", "beta-pkg"):
+        assert json.loads((outputs / package / "capture.json").read_text())["args"] == ["--json", "--fix"], package
     # The stderr summary is derived from the document: beta exited 0, but
     # its report is invalid, so it counts as failed.
     assert "labelle alpha doctor" in mixed.stderr, mixed.stderr

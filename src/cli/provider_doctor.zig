@@ -18,6 +18,12 @@
 //! since only its manifest could tell whether it is a provider. Projectless
 //! provider commands are a later phase (decision D8), so outside a project
 //! only the core checks run.
+//!
+//! `labelle doctor --json` and `--fix` are forwarded to every provider doctor
+//! (`Forward`, `Forward.args`): `--json` since RFC cli#466 D7, `--fix` since
+//! RFC cli#471 D10. A manifest declares no flags, so the contract requires a
+//! `doctor` command to accept both (`--fix` may do nothing); a doctor that
+//! rejects one fails its own check like any other failed doctor.
 const std = @import("std");
 const config = @import("config.zig");
 const project = @import("project_config.zig");
@@ -27,6 +33,24 @@ const github = @import("provider_github.zig");
 
 /// The command a provider declares to take part.
 pub const command_name = "doctor";
+
+/// The `labelle doctor` flags every provider doctor gets, as trailing
+/// arguments of `labelle <namespace> doctor`.
+pub const Forward = struct {
+    /// `--json`: the doctor prints one capability object on stdout, which
+    /// the core captures (RFC cli#466 D7).
+    json: bool = false,
+    /// `--fix`: the doctor fixes what it can (RFC cli#471 D10).
+    fix: bool = false,
+
+    /// The trailing arguments, `--json` before `--fix`. Static storage.
+    pub fn args(self: Forward) []const []const u8 {
+        if (self.json and self.fix) return &.{ "--json", "--fix" };
+        if (self.json) return &.{"--json"};
+        if (self.fix) return &.{"--fix"};
+        return &.{};
+    }
+};
 
 pub const Step = struct {
     /// The namespace (the header and the order key); the package name for a
@@ -294,22 +318,21 @@ const DispatchRunner = struct {
     /// offline) provisioning is attempted once and every provider after it
     /// gets the same error as its own failed line.
     hosts: *dispatch.HostCache,
-    /// `labelle doctor --json` (RFC cli#466 D7): every provider doctor gets
-    /// `--json`, and its stdout is captured for the core's one document
-    /// instead of reaching the CLI's stdout.
-    json: bool = false,
+    /// The flags every provider doctor gets. With `json` (RFC cli#466 D7)
+    /// its stdout is captured for the core's one document instead of
+    /// reaching the CLI's stdout.
+    forward: Forward = .{},
 
     pub fn run(self: DispatchRunner, step: Step, stdout: *?[]const u8) anyerror!u8 {
         const action = step.action.run;
         var captured: []const u8 = "";
         // `.selected`: only this provider's settings file is opened, so a
         // bad file of another provider fails that provider alone.
-        const code = try dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, if (self.json) &json_args else &.{}, .selected, self.hosts, if (self.json) &captured else null);
-        if (self.json) stdout.* = captured;
+        const json = self.forward.json;
+        const code = try dispatch.runCommand(self.a, self.root, self.cfg, self.providers, self.providers[action.provider], action.command, self.forward.args(), .selected, self.hosts, if (json) &captured else null);
+        if (json) stdout.* = captured;
         return code;
     }
-
-    const json_args = [_][]const u8{"--json"};
 };
 
 /// The line `labelle doctor` prints instead of the provider part outside a
@@ -319,12 +342,12 @@ pub fn printOutsideProject(start: []const u8) void {
 }
 
 /// The provider part of `labelle doctor` for the project at `root` (the
-/// canonical project root the core checks used too). `json`: each provider
-/// doctor runs with `--json` and its stdout is captured on its outcome
-/// (`DispatchRunner.json`), and the closing summary is left to the caller,
-/// which derives it from the merged document
+/// canonical project root the core checks used too). Each provider doctor
+/// gets `forward.args()`. `forward.json`: its stdout is captured on its
+/// outcome (`DispatchRunner.forward`), and the closing summary is left to
+/// the caller, which derives it from the merged document
 /// (`provider_doctor_json.printSummary`); the headers still go to stderr.
-pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, json: bool) !Report {
+pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, forward: Forward) !Report {
     // The report outlives this call; its strings live in `allocator`'s arena
     // owned by the caller.
     const a = allocator;
@@ -360,10 +383,10 @@ pub fn runForRoot(allocator: std.mem.Allocator, root: []const u8, json: bool) !R
         .cfg = discovered.cfg,
         .providers = survey.providers,
         .hosts = &hosts,
-        .json = json,
+        .forward = forward,
     });
     if (mapping) |outcome| report.outcomes = try std.mem.concat(a, Outcome, &.{ &.{outcome}, report.outcomes });
-    if (!json) printSummary(report);
+    if (!forward.json) printSummary(report);
     return report;
 }
 
@@ -751,4 +774,19 @@ test "provider doctor: a captured report is kept on its outcome for the merged d
     try testing.expectEqualStrings("{not json", report.outcomes[0].stdout.?);
     // Not captured: the human mode, judged by the exit code.
     try testing.expect(report.outcomes[1].stdout == null and report.outcomes[1].ok());
+}
+
+test "provider doctor: --json and --fix are forwarded as trailing arguments, --json first" {
+    try testing.expectEqual(@as(usize, 0), (Forward{}).args().len);
+    const Case = struct { Forward, []const []const u8 };
+    const cases = [_]Case{
+        .{ .{ .json = true }, &.{"--json"} },
+        .{ .{ .fix = true }, &.{"--fix"} },
+        .{ .{ .json = true, .fix = true }, &.{ "--json", "--fix" } },
+    };
+    for (cases) |case| {
+        const got = case[0].args();
+        try testing.expectEqual(case[1].len, got.len);
+        for (case[1], got) |want, arg| try testing.expectEqualStrings(want, arg);
+    }
 }

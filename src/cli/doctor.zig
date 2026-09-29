@@ -7,18 +7,14 @@
 //! and exits non-zero if the core or any provider fails. `--core-only` skips
 //! the provider part. The core checks only what it owns: the managed Zig and
 //! Python. Everything else a labelle game needs is fetched + compiled by Zig,
-//! or is a provider's to check and provision.
+//! or is a provider's to check and provision: a system library a backend
+//! links is reported by the provider that provisions it, never by the core.
 //!
-//! SDL2 is one such system library: the `sdl` renderer and the gamepad
-//! source of other desktop backends link it. Its provisioning, runtime DLL
-//! staging and doctor rows left the core for the opt-in `sdl2` provider
-//! (labelle-sdl; RFC cli#471 S4, D2). When the project's build links SDL2
-//! and `.plugins` does not list that provider, doctor prints a one-line
-//! hint instead (`sdl2Hint`).
-//!
-//! `--fix` has nothing to fix in the core any more; a provider's doctor
-//! fixes its own (`labelle <namespace> doctor --fix`). Forwarding `--fix` to
-//! the provider doctors (RFC cli#471 D10) is not implemented yet.
+//! `--fix` has nothing to fix in the core; it is forwarded to every provider
+//! doctor (RFC cli#471 D10), which fixes its own, exactly as `labelle
+//! <namespace> doctor --fix` would. With `--json` too, each provider doctor
+//! gets `--json --fix` and its capability object reports the state after
+//! its fix. `--core-only` skips the providers, so nothing is fixed.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -174,9 +170,15 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     // cli#466 D7). Their human report lines go to stderr; stdout carries the
     // one document and nothing else. The exit status stays 0: the verdict
     // is in the document.
+    //
+    // `--fix --json` is allowed: every provider doctor gets `--json --fix`,
+    // fixes what it can and reports the state after it. The core line about
+    // `--fix` goes to stderr, never into the document.
+    const forward: provider_doctor.Forward = .{ .json = as_json, .fix = do_fix };
     if (as_json) {
+        if (do_fix) printFixNote(core_only, scope.root != null);
         const providers: ?provider_doctor.Report = if (core_only) null else if (scope.root) |root|
-            try provider_doctor.runForRoot(arena, root, true)
+            try provider_doctor.runForRoot(arena, root, forward)
         else
             null;
         try emitJsonReport(arena, zig_check, python_check, providers);
@@ -186,12 +188,10 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     // Which backend the project builds with, as the assembler resolves it
     // (`describe`, cli#471 D4: the CLI reads no `.backend` of its own). Only
     // inside a project: outside one, or when `describe` cannot answer, it is
-    // unknown. It scopes nothing but the report header and the SDL2 hint.
+    // unknown. It scopes nothing but the report header.
     const backend: ?[]const u8 = if (cfg.found) describeBackend(arena, scope.dir) else null;
 
-    if (do_fix) {
-        std.debug.print("labelle doctor: the core has nothing to fix; a provider's doctor fixes its own (`labelle <namespace> doctor --fix`).\n", .{});
-    }
+    if (do_fix) printFixNote(core_only, scope.root != null);
 
     var checks: std.ArrayList(Check) = .empty;
 
@@ -239,13 +239,12 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     } else {
         std.debug.print("  {d} required dependency(ies) missing — see FAIL lines above.\n", .{failures});
     }
-    if (sdl2Hint(cfg, backend)) |hint| std.debug.print("  {s}\n", .{hint});
 
     // The pinned providers' doctors, after the core checks and whatever they
     // found: a core failure does not hide a provider's report, and one
     // provider failing does not stop the next.
     const providers: ?provider_doctor.Report = if (core_only) null else if (scope.root) |root|
-        try provider_doctor.runForRoot(arena, root, false)
+        try provider_doctor.runForRoot(arena, root, forward)
     else blk: {
         provider_doctor.printOutsideProject(project_dir);
         break :blk null;
@@ -255,6 +254,24 @@ pub fn cmdDoctor(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     // Clean non-zero exit (scriptable) without a Zig error-return trace —
     // this is a user-facing diagnostic, not an internal failure.
     if (code != 0) std.process.exit(code);
+}
+
+/// The one line `--fix` prints on stderr: the core has nothing to fix, and
+/// whether the provider doctors get the flag.
+fn printFixNote(core_only: bool, in_project: bool) void {
+    std.debug.print("labelle doctor: {s}\n", .{fixNote(core_only, in_project)});
+}
+
+fn fixNote(core_only: bool, in_project: bool) []const u8 {
+    if (core_only) return "the core has nothing to fix, and --core-only skips the provider doctors: nothing is fixed.";
+    if (!in_project) return "the core has nothing to fix; --fix reaches the provider doctors only inside a project.";
+    return "the core has nothing to fix; --fix is forwarded to every provider doctor.";
+}
+
+test "doctor: the --fix note says where the flag goes" {
+    try std.testing.expect(std.mem.indexOf(u8, fixNote(false, true), "forwarded to every provider doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixNote(true, true), "nothing is fixed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixNote(false, false), "only inside a project") != null);
 }
 
 // ── `--zig` ─────────────────────────────────────────────────────────────
@@ -304,80 +321,7 @@ const Cfg = struct {
     /// A `project.labelle` was read.
     found: bool = false,
     gamepad_off: bool = false,
-    /// `.plugins` lists the `sdl2` provider (labelle-sdl).
-    sdl2_provider: bool = false,
 };
-
-/// The one line doctor prints about SDL2 now that the core no longer
-/// provisions it (cli#471 S4), or null. Shown when the project's desktop
-/// build links SDL2 and `.plugins` lacks the `sdl2` provider that took the
-/// provisioning over. "Links SDL2" is the rule the core used to provision
-/// by: the `sdl` renderer always; raylib, sokol and bgfx for their gamepad
-/// source unless `.gamepad = .none`. An unknown backend (`describe` gave no
-/// answer) is judged by the gamepad alone, as the assembler's default
-/// backend links SDL2 for it. Outside a project there is nothing to judge.
-/// Advice, never a failure: SDL2 may be installed by other means. The
-/// `.gamepad = .none` way out is offered only where SDL2 comes in for the
-/// gamepad alone: the `sdl` renderer links it whatever the gamepad says.
-/// `LABELLE_SDL2_LIB` only lets the build find SDL2; the Windows loader
-/// never reads it, and the core no longer stages the DLL, so that way out
-/// also names the runtime DLL (the provider's `stage` hook copies it).
-fn sdl2Hint(cfg: Cfg, backend: ?[]const u8) ?[]const u8 {
-    if (!cfg.found or cfg.sdl2_provider) return null;
-    return switch (sdl2Use(backend, cfg.gamepad_off)) {
-        .none => null,
-        .renderer => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, or set LABELLE_SDL2_LIB and, on Windows, put SDL2.dll on PATH or beside the exe.",
-        .gamepad => "SDL2: this build links SDL2, which the CLI no longer provisions: add the `sdl2` provider (labelle-sdl) to .plugins, set LABELLE_SDL2_LIB and, on Windows, put SDL2.dll on PATH or beside the exe, or use `.gamepad = .none`.",
-    };
-}
-
-/// Why a desktop build of `backend` links SDL2, if it does.
-const Sdl2Use = enum { none, renderer, gamepad };
-
-fn sdl2Use(backend: ?[]const u8, gamepad_off: bool) Sdl2Use {
-    const pad: Sdl2Use = if (gamepad_off) .none else .gamepad;
-    const name = backend orelse return pad;
-    if (std.mem.eql(u8, name, "sdl")) return .renderer;
-    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |pad_backend| {
-        if (std.mem.eql(u8, name, pad_backend)) return pad;
-    }
-    return .none;
-}
-
-test "doctor: the SDL2 hint follows the old rule and goes quiet with the provider (cli#471 S4)" {
-    const plain: Cfg = .{ .found = true };
-    // The renderer always, even with the gamepad opted out.
-    try std.testing.expect(sdl2Hint(plain, "sdl") != null);
-    try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, "sdl") != null);
-    // The gamepad backends unless opted out; any other backend never.
-    for ([_][]const u8{ "raylib", "sokol", "bgfx" }) |name| {
-        try std.testing.expect(sdl2Hint(plain, name) != null);
-        try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, name) == null);
-    }
-    for ([_][]const u8{ "null", "wgpu", "acme" }) |name| try std.testing.expect(sdl2Hint(plain, name) == null);
-    // Unknown backend: the gamepad decides.
-    try std.testing.expect(sdl2Hint(plain, null) != null);
-    try std.testing.expect(sdl2Hint(.{ .found = true, .gamepad_off = true }, null) == null);
-    // Only the gamepad cases offer the gamepad opt-out: the renderer links
-    // SDL2 whatever the gamepad says.
-    const gamepad_way_out = "`.gamepad = .none`";
-    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "sdl").?, gamepad_way_out) == null);
-    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(.{ .found = true, .gamepad_off = true }, "sdl").?, gamepad_way_out) == null);
-    // The provider comes first; the variable alone is not enough on Windows,
-    // so both wordings name the runtime DLL.
-    for ([_]?[]const u8{ "sdl", "raylib", null }) |name| {
-        const hint = sdl2Hint(plain, name).?;
-        const provider_at = std.mem.indexOf(u8, hint, "`sdl2` provider").?;
-        const variable_at = std.mem.indexOf(u8, hint, "set LABELLE_").?;
-        try std.testing.expect(provider_at < variable_at);
-        try std.testing.expect(std.mem.indexOf(u8, hint, "SDL2.dll on PATH or beside the exe") != null);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, "raylib").?, gamepad_way_out) != null);
-    try std.testing.expect(std.mem.indexOf(u8, sdl2Hint(plain, null).?, gamepad_way_out) != null);
-    // The provider listed, or no project: no hint.
-    try std.testing.expect(sdl2Hint(.{ .found = true, .sdl2_provider = true }, "sdl") == null);
-    try std.testing.expect(sdl2Hint(.{}, "sdl") == null);
-}
 
 /// The backend package's name for the core target, from `labelle-assembler
 /// describe`; null when the assembler cannot be resolved or cannot answer
@@ -388,7 +332,7 @@ fn describeBackend(arena: std.mem.Allocator, project_dir: []const u8) ?[]const u
     return d.backend.name;
 }
 
-/// The gamepad opt-out and whether the `sdl2` provider is listed, from
+/// The gamepad opt-out, for the report header, from
 /// `project.labelle`. Parsed when it parses; otherwise read out of the text
 /// (doctor is best-effort and still reports on a config the build would
 /// reject).
@@ -398,13 +342,12 @@ fn readProjectConfig(arena: std.mem.Allocator, project_dir: []const u8) Cfg {
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return .{};
 
     if (config.readProjectConfigQuiet(arena, project_dir)) |parsed| {
-        return .{ .found = true, .gamepad_off = parsed.gamepad == .none, .sdl2_provider = parsed.hasPlugin("sdl2") };
+        return .{ .found = true, .gamepad_off = parsed.gamepad == .none };
     } else |_| {}
     return .{
         .found = true,
         .gamepad_off = std.mem.indexOf(u8, content, ".gamepad = .none") != null or
             std.mem.indexOf(u8, content, ".gamepad=.none") != null,
-        .sdl2_provider = std.mem.indexOf(u8, content, "\"sdl2\"") != null,
     };
 }
 

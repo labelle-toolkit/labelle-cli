@@ -111,7 +111,8 @@ exactly `doctor`, sorted by namespace, whatever their order in `.plugins`.
 Each goes through the same path as `labelle <namespace> doctor`
 (`provider_dispatch.runCommand`): the `labelle.lock` pin and the remote
 integrity pin, the provider settings, the isolated tool build and the command
-context, with no trailing arguments. Each provider gets a header
+context, with no trailing arguments unless `--json` or `--fix` is forwarded
+(below). Each provider gets a header
 (`labelle <namespace> doctor  (provider '<package>')`) and an OK/FAIL line;
 a closing line counts them and names the failed ones and the providers that
 declare no `doctor` command.
@@ -158,6 +159,13 @@ declare no `doctor` command.
   provider doctors run inside a project. Projectless provider commands are a
   later phase (decision D8).
 - `--core-only` skips the provider part.
+- `--fix` (RFC cli#471 D10) has nothing to fix in the core, which says so in
+  one stderr line, and is forwarded to every provider doctor as its trailing
+  argument, exactly as `labelle <namespace> doctor --fix`. The contract
+  requires every `doctor` command to accept `--fix` (one with nothing to fix
+  ignores it); a doctor that rejects it fails its own check, like any failed
+  doctor, and the others still run. With `--core-only`, or outside a
+  project, nothing is fixed.
 - `--json` (the studio capability report, RFC cli#466 D7) passes `--json` to
   every provider doctor and captures its stdout; the core owns stdout and
   prints one document, `{"capabilities":[...]}`. A provider prints one
@@ -172,7 +180,10 @@ declare no `doctor` command.
   from a doctor that exited non-zero is kept with `ok: false`. The stderr
   summary (`Provider capabilities: N reported, M failed`) is derived from the
   merged document, so the two agree. The exit status stays 0: the verdict is
-  in the document. `--core-only` still skips the providers.
+  in the document. `--core-only` still skips the providers. `--json --fix`
+  is allowed: every provider doctor gets `--json --fix` (in that order),
+  fixes what it can and reports the state after it; the core's `--fix` line
+  goes to stderr, never into the document.
 - Every provider command and hook runs with the managed interpreter
   (`labelle install python`) on PATH when one is provisioned and runs
   (RFC cli#466 D2), as the `.prebuild` steps do; a broken install is not
