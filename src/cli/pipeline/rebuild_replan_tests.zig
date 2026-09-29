@@ -74,7 +74,7 @@ test "watch replan re-reads the project and provider manifests on every call" {
         .hooks = &site,
     };
     defer ctx.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = project };
+    var replan = Replanner{ .backing = a, .project_dir = project, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
@@ -206,7 +206,7 @@ test "watched rebuild refuses a target whose owner disappeared before the prebui
     const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
     var ctx = RebuildCtx{
@@ -319,7 +319,7 @@ test "watched rebuild lets a prebuild refresh an existing provider manifest" {
     const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
     var ctx = RebuildCtx{
@@ -382,7 +382,7 @@ test "watched rebuild replans after a prebuild step generates provider metadata"
     const asm_path = try testing.okTool(a, tmp.dir);
     defer a.free(asm_path);
     var site = testing.testSite(a, project);
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
     var ctx = RebuildCtx{
@@ -503,7 +503,7 @@ test "watch replan extracts a pinned provider once per changed pin" {
         .hooks = &site,
     };
     defer ctx.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = TwoStage.Spy.lock, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
     replan.seed(&startup_sources);
@@ -618,6 +618,7 @@ test "watch replan installs and relocks when project.labelle changes" {
         .project_dir = project,
         .installer = .{ .ctx = &Spy.count, .run = Spy.install },
         .write_lock = Spy.lock,
+        .describer = testing.fakeDescriber(project),
     };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
@@ -648,7 +649,7 @@ test "watch replan installs and relocks when project.labelle changes" {
 
     // Without the install the same edit is the reported failure: the
     // cache never learns about the package.
-    var bare = Replanner{ .backing = a, .project_dir = project, .write_lock = Spy.lock };
+    var bare = Replanner{ .backing = a, .project_dir = project, .write_lock = Spy.lock, .describer = testing.fakeDescriber(project) };
     defer bare.deinit(&site, &.{}, startup_cfg);
     try std.Io.Dir.cwd().deleteTree(io, Spy.cache_dir);
     try std.testing.expectError(error.ProviderPackageMissing, Replanner.run(&bare, &ctx));
@@ -736,7 +737,7 @@ test "watched serve shutdown runs the replanned after-run hooks" {
             try lockfile.writeLockFileTo(la, dir, cfg, path);
         }
     };
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = InPlace.lock };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = InPlace.lock, .describer = testing.fakeDescriber(project) };
     defer replan.deinit(&site, startup_providers, startup_cfg);
     replan.baseline();
     // No rebuild has replanned yet: the startup plan is the shutdown's.
@@ -817,7 +818,7 @@ test "watch replan release restores the site's stable storage" {
         .hooks = &site,
     };
     defer ctx.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none, .describer = testing.fakeDescriber(project) };
     try runCommitted(&replan, &ctx);
     // The site now reads the replan's generation, not the startup storage.
     try std.testing.expect(site.providers.ptr != &stable_providers);
@@ -869,7 +870,7 @@ test "watch replan installs the re-read prebuild steps" {
         .hooks = &site,
     };
     defer ctx.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none };
+    var replan = Replanner{ .backing = a, .project_dir = project, .write_lock = Lock.none, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
@@ -944,7 +945,7 @@ test "watch replan recomputes the effective optimize mode from the owner's defau
         .hooks = &site,
     };
     defer ctx.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = project };
+    var replan = Replanner{ .backing = a, .project_dir = project, .describer = testing.fakeDescriber(project) };
     const startup_cfg = site.cfg;
     defer replan.deinit(&site, &.{}, startup_cfg);
 
@@ -986,8 +987,9 @@ test "watch replan: withOptimize replaces or drops the flag, keeping every other
 // cli#471 D3 (CodeRabbit on #504): a watched rebuild applies the cold
 // pipeline's support gate. A backend bump that makes `describe` refuse the
 // pair fails THAT rebuild (the session lives on), and so does no answer
-// (D4: there is no enum to fall back to); a supported pair, a replaced
-// generation or a target outside the schema pass.
+// (D4: there is no enum to fall back to); a supported pair or a replaced
+// generation pass. Since P3 a provider target is judged the same way: the
+// CLI knows no schema of targets to exempt it by.
 test "watch replan: describe's unsupported verdict fails the rebuild before generation" {
     const Fake = struct {
         var calls: usize = 0;
@@ -1006,23 +1008,28 @@ test "watch replan: describe's unsupported verdict fails the rebuild before gene
     defer arena.deinit();
     const a = arena.allocator();
     const describer: @import("../assembler_describe.zig").Describer = .{ .bin_path = "/asm", .protocol = 7, .project_dir = "/proj", .spawn = Fake.spawn };
-    const core: @import("../provider_targets.zig").Resolved = .{ .name = "desktop", .provider = null, .legacy = .desktop };
+    const core: @import("../provider_targets.zig").Resolved = .{ .name = "desktop", .provider = null };
 
     Fake.reply = Fake.doc("false", ",\"reason\":\"provider 'acme.gfx' does not support capability 'probe'\"");
-    try std.testing.expectError(error.BackendUnsupportedTarget, Replanner.generateGate(describer, a, "desktop", core, false));
+    try std.testing.expectError(error.BackendUnsupportedTarget, Replanner.generateGate(describer, a, core, false));
 
     Fake.reply = Fake.doc("true", "");
-    try Replanner.generateGate(describer, a, "desktop", core, false);
+    try Replanner.generateGate(describer, a, core, false);
     // No answer (describe failed, or no describe at all): the rebuild fails.
     Fake.reply = null;
-    try std.testing.expectError(error.DescribeFailed, Replanner.generateGate(describer, a, "desktop", core, false));
-    try std.testing.expectError(error.DescribeFailed, Replanner.generateGate(.off, a, "desktop", core, false));
+    try std.testing.expectError(error.DescribeFailed, Replanner.generateGate(describer, a, core, false));
+    try std.testing.expectError(error.DescribeFailed, Replanner.generateGate(.off, a, core, false));
 
     // Never asked when the core generation does not run for the target.
     Fake.reply = Fake.doc("false", ",\"reason\":\"x\"");
     Fake.calls = 0;
-    try Replanner.generateGate(describer, a, "desktop", core, true);
-    const foreign: @import("../provider_targets.zig").Resolved = .{ .name = "probe-target", .provider = null, .legacy = null };
-    try Replanner.generateGate(describer, a, "probe-target", foreign, false);
+    try Replanner.generateGate(describer, a, core, true);
     try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+    // A target the assembler does not know is refused with its reason.
+    Fake.reply = "{\"schema\":\"labelle.describe/v1\",\"target\":\"probe-target\",\"target_dir\":\".labelle/acme_probe-target\"," ++
+        "\"backend\":{\"name\":\"acme\",\"id\":null,\"repo\":null,\"version\":\"2.0.0\",\"local_path\":null}," ++
+        "\"asset_format\":\"png\",\"supported\":false,\"reason\":\"backend 'acme' has no target 'probe-target': this assembler generates for desktop\",\"capabilities_source\":\"manifest\"}";
+    const foreign: @import("../provider_targets.zig").Resolved = .{ .name = "probe-target", .provider = null };
+    try std.testing.expectError(error.BackendUnsupportedTarget, Replanner.generateGate(describer, a, foreign, false));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
 }

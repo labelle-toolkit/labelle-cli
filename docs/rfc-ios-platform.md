@@ -1,5 +1,11 @@
 # RFC: iOS Platform Support
 
+> **Status: superseded.** iOS left the CLI core with RFC cli#471 I5: the
+> `labelle ios` subcommand, the simulator deploy and the `.ios` block are
+> gone. iOS is the [labelle-ios](https://github.com/labelle-toolkit/labelle-ios)
+> provider now (`--platform=ios`, settings in `providers/ios.json`). This
+> document is kept as the historical design.
+
 ## Problem Statement
 
 labelle-cli v1.x recognizes `--platform=ios` and generates callback-based Zig code via sokol's `mobile.txt` template, but the platform is non-functional. A developer who runs `labelle build --platform=ios` gets a binary that **cannot run on iOS** because:

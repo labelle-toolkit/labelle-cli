@@ -7,11 +7,9 @@
 //! the CLI itself needs to read.
 //!
 //! Why the CLI needs *any* of the schema: a handful of CLI-retained
-//! commands (`build` / `run` / `upgrade` / the legacy iOS deploy path)
-//! parse `project.labelle` to drive orchestration the CLI owns —
-//! the compatibility-warning
-//! pass, the iOS `Info.plist` emission, lockfile
-//! writing, docker target selection. None of that is code generation;
+//! commands (`build` / `run` / `upgrade`) parse `project.labelle` to
+//! drive orchestration the CLI owns — the compatibility-warning pass,
+//! lockfile writing, the declared target. None of that is code generation;
 //! it is the CLI deciding *which assembler subcommand to run and with
 //! what flags*, plus packaging steps the assembler never touches.
 //!
@@ -34,38 +32,17 @@ const astc = @import("../astc/convert.zig");
 // and every backend fact the CLI needs (the generated target dir, the
 // backend package's name, whether it supports the target) comes from
 // `labelle-assembler describe` (`assembler_describe.zig`).
-/// The legacy codegen platform: the strict schema type of `project.labelle`'s
-/// `.platform` (mirrored by the assembler's `config.zig`; `provider_settings.zig`
-/// is untouched). The RESOLVED target is a string — see `provider_targets.zig`
-/// (RFC #406 phase 3b): `desktop` is core, every other name must be declared
-/// by a pinned provider, and this enum is derived from the name only where
-/// the pinned assembler still needs it. Enum values other than `desktop`,
-/// and every `parsed.platform == .X` site, are on the agnosticism guard's
-/// migration allowlist until extraction / labelle-assembler#378.
-pub const Platform = enum { desktop, ios, android, wasm };
+// No platform enum or asset-compression mirror either (RFC cli#471 P3):
+// a target is a NAME (`provider_targets.zig`: `desktop` is core, every
+// other name is declared by a pinned provider), and whether a target ships
+// ASTC atlases is the assembler's answer (`describe`'s `asset_format`, which
+// reads `.asset_compression` keyed by the target name). Both keys still
+// parse: `ignore_unknown_fields` skips `.asset_compression`, and `.platform`
+// is read as a name into `declared_target` (`declaredTarget`).
 
-/// Texture container a platform ships atlases in — `.png` (CPU-decoded) or
-/// `.astc` (GPU-native, zero decode). Mirrors the assembler's `AssetFormat`
-/// (the assembler does the catalog swap; the CLI reads this to know whether to
-/// run `labelle astc` before generating). See labelle-gfx#269 / #340.
-pub const AssetFormat = enum { png, astc };
+/// The name the project's `.platform` gives when it names none.
+pub const default_target = "desktop";
 
-/// Per-platform `AssetFormat` selection; default `.png` everywhere (opt-in).
-pub const AssetCompression = struct {
-    desktop: AssetFormat = .png,
-    android: AssetFormat = .png,
-    ios: AssetFormat = .png,
-    web: AssetFormat = .png,
-
-    pub fn formatFor(self: AssetCompression, platform: Platform) AssetFormat {
-        return switch (platform) {
-            .desktop => self.desktop,
-            .android => self.android,
-            .ios => self.ios,
-            .wasm => self.web,
-        };
-    }
-};
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 
 /// CLI version — injected from build.zig via build options.
@@ -116,33 +93,6 @@ pub const PluginDep = struct {
             return self.repo["@".len..];
         return self.repo;
     }
-};
-
-// ── iOS Configuration ──────────────────────────────────────────────
-
-/// Screen-orientation policy of a platform config block that names one.
-///
-/// MIRRORED in labelle-assembler `src/config.zig` — `project.labelle` is
-/// parsed strictly there first, so both copies must learn a new value
-/// together or `generate` rejects the field before the CLI sees it (#341).
-pub const Orientation = enum {
-    portrait,
-    /// Landscape. Whether a 180° flip rotates the game is the packager's
-    /// choice: a platform may lock ONE landscape direction here and allow
-    /// both only for `.sensor_landscape`, or allow both for either value.
-    landscape,
-    /// Landscape only, but EITHER direction.
-    sensor_landscape,
-    all,
-};
-
-pub const IosConfig = struct {
-    app_name: []const u8 = "",
-    bundle_id: []const u8 = "",
-    team_id: []const u8 = "",
-    minimum_ios: []const u8 = "15.0",
-    orientation: Orientation = .all,
-    device_family: []const u8 = "1,2",
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
@@ -204,7 +154,7 @@ pub const ResourceDef = struct {
     lazy: ?bool = null,
 
     /// Per-atlas ASTC block size, overriding the backend default for THIS
-    /// atlas only. Ignored unless the target platform actually compresses
+    /// atlas only. Ignored unless the target actually compresses
     /// (`asset_compression`), and ignored on sound/font resources.
     ///
     /// Block size trades fidelity against memory at a fixed 128 bits per
@@ -368,11 +318,17 @@ pub const ProjectConfig = struct {
     target_fps: u32 = 60,
     // `.backend` is deliberately absent (RFC cli#471 D4): see the note
     // at the top of this file.
-    platform: Platform = .desktop,
+    /// NOT a `project.labelle` key: the target the project declares with
+    /// `.platform = .<name>`, as a name (`declaredTarget`). The assembler
+    /// owns `.platform`'s strictness; the CLI only needs the name, for the
+    /// target a command resolves when no `--platform` overrides it.
+    /// `config.readProjectConfig` fills it in after the tolerant parse.
+    declared_target: []const u8 = default_target,
     ecs: EcsChoice = .mock,
     /// Gamepad input mode (assembler#274 opt-out flag): `.auto` (default)
-    /// pulls the shared SDL gamepad source into raylib/sokol desktop
-    /// builds; `.none` disables it (and drops the SDL2 link dependency).
+    /// pulls the shared gamepad source into the desktop builds of the
+    /// backends that use it; `.none` disables it (and drops its link
+    /// dependency).
     gamepad: GamepadMode = .auto,
     /// GUI plugin reference — parsed from project.labelle.
     gui: ?GuiPlugin = null,
@@ -388,7 +344,7 @@ pub const ProjectConfig = struct {
     gfx_version: []const u8 = GFX_VERSION,
     labelle_version: []const u8 = CLI_VERSION,
 
-    /// The graphics backend package (e.g. bgfx), pinned like a plugin.
+    /// The graphics backend package, pinned like a plugin.
     /// The assembler is the primary consumer; the CLI parses it so
     /// `upgrade --check` can REPORT the pin instead of silently omitting
     /// it from the version report (cli#336). Shape matches `PluginDep`
@@ -415,10 +371,6 @@ pub const ProjectConfig = struct {
     /// See `PrebuildStep` for the shape and the assembler-side ownership
     /// caveat.
     prebuild: []const PrebuildStep = &.{},
-    /// Per-platform texture-compression selection (read by `build`/`run` to
-    /// auto-run `labelle astc` before generating; the assembler does the
-    /// catalog `.png → .astc` swap). Default `.png` everywhere.
-    asset_compression: AssetCompression = .{},
     /// App icon — a PNG path relative to the PROJECT ROOT. The assembler
     /// owns this field (`labelle-assembler` `src/config.zig` /
     /// `src/app_icon.zig`); the CLI mirrors it because the packaging the
@@ -449,9 +401,6 @@ pub const ProjectConfig = struct {
 
     /// Game states for the state machine. First element is the initial state.
     states: []const []const u8 = &.{"running"},
-
-    /// iOS configuration — parsed from project.labelle `.ios` section.
-    ios: ?IosConfig = null,
 
     /// Pinned assembler version (RFC #122). When set, the CLI resolves the
     /// assembler binary from the cache instead of the paired default.
@@ -512,50 +461,67 @@ pub const ProjectConfig = struct {
     }
 };
 
-test "AssetCompression.formatFor + default png" {
-    const def = AssetCompression{};
-    inline for (.{ Platform.desktop, .android, .ios, .wasm }) |p|
-        try @import("std").testing.expectEqual(AssetFormat.png, def.formatFor(p));
-    const m = AssetCompression{ .android = .astc, .desktop = .astc };
-    try @import("std").testing.expectEqual(AssetFormat.astc, m.formatFor(.android));
-    try @import("std").testing.expectEqual(AssetFormat.png, m.formatFor(.wasm));
-}
-
-test "Orientation: every value parses from ZON on the .ios block" {
-    // Mirrors the assembler's parse test (labelle-assembler src/config.zig):
-    // the two copies of this enum must accept the identical value set, or a
-    // `project.labelle` that generates fine still fails when the CLI reads it.
-    // Arena, not `std.zon.parse.free`: the struct has `[]const u8` fields
-    // defaulting to a static `""`, which the testing allocator refuses to free.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    inline for (.{
-        .{ "portrait", Orientation.portrait },
-        .{ "landscape", Orientation.landscape },
-        .{ "sensor_landscape", Orientation.sensor_landscape },
-        .{ "all", Orientation.all },
-    }) |case| {
-        const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
-        const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
-        try std.testing.expectEqual(case[1], ios.orientation);
+/// The target `project.labelle` declares with `.platform = .<name>`, as a
+/// name owned by `a`; null when the key is absent. Any enum literal is a
+/// name here: the CLI keeps no list of targets (the resolution judges it,
+/// `provider_targets.provisional`, and the assembler judges whether it can
+/// generate it). `error.InvalidDeclaredTarget` when `.platform` is not an
+/// enum literal. Pure: parses `source`, reads nothing else.
+pub fn declaredTarget(a: std.mem.Allocator, source: [:0]const u8) !?[]const u8 {
+    var ast = try std.zig.Ast.parse(a, source, .zon);
+    defer ast.deinit(a);
+    if (ast.errors.len != 0) return null; // The owning project parser diagnoses it.
+    var zoir = try std.zig.ZonGen.generate(a, ast, .{ .parse_str_lits = false });
+    defer zoir.deinit(a);
+    if (zoir.hasCompileErrors()) return null;
+    const fields = switch (std.zig.Zoir.Node.Index.root.get(zoir)) {
+        .struct_literal => |fields| fields,
+        else => return null,
+    };
+    for (fields.names, 0..) |name, i| {
+        if (!std.mem.eql(u8, name.get(zoir), "platform")) continue;
+        return switch (fields.vals.at(@intCast(i)).get(zoir)) {
+            .enum_literal => |literal| try a.dupe(u8, literal.get(zoir)),
+            else => error.InvalidDeclaredTarget,
+        };
     }
-
-    try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
+    return null;
 }
 
-test "a platform block the CLI no longer models still parses (the assembler owns its strictness)" {
-    // `.android` left the CLI (cli#405): its keys belong to the `android`
-    // provider's settings and the assembler's codegen. The CLI's lenient
-    // read (`config.zig`, `ignore_unknown_fields`) must keep accepting a
-    // project that still carries the block.
+test "declaredTarget: `.platform` is read as a name, any name" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try declaredTarget(a, ".{ .name = \"x\" }")) == null);
+    const cases = [_][2][:0]const u8{
+        .{ ".{ .name = \"x\", .platform = .desktop }", "desktop" },
+        .{ ".{ .name = \"x\", .platform = .other_target }", "other_target" },
+        .{ ".{ .platform = .@\"probe-target\", .name = \"x\" }", "probe-target" },
+    };
+    for (cases) |case| {
+        const got = (try declaredTarget(a, case[0])).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
+    try std.testing.expectError(error.InvalidDeclaredTarget, declaredTarget(a, ".{ .platform = \"desktop\" }"));
+    // A key the CLI never parses stays unread; the project parser skips it too.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const src: [:0]const u8 = ".{ .name = \"x\", .platform = .probe, .asset_compression = .{ .probe = .astc, .desktop = .png } }";
+    const cfg = try std.zon.parse.fromSliceAlloc(ProjectConfig, arena.allocator(), src, null, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings(default_target, cfg.declared_target);
+}
+
+test "a target block the CLI does not model still parses (the assembler owns its strictness)" {
+    // Target settings blocks left the CLI with their targets (cli#405,
+    // cli#471 I5): their keys belong to the target providers' settings
+    // (`providers/<name>.json`) and the assembler's codegen. The CLI's
+    // lenient read (`config.zig`, `ignore_unknown_fields`) must keep
+    // accepting a project that still carries one, and simply ignores it.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const src: [:0]const u8 =
-        \\.{ .name = "legacy", .android = .{ .package_name = "com.x.y", .orientation = .landscape, .immersive_mode = true } }
+        \\.{ .name = "legacy", .probe_target = .{ .package_name = "com.x.y", .orientation = .landscape, .immersive_mode = true },
+        \\   .other_target = .{ .app_name = "Legacy", .bundle_id = "com.x.y", .minimum = "15.0", .orientation = .sensor_landscape } }
     ;
     const cfg = try std.zon.parse.fromSliceAlloc(ProjectConfig, arena.allocator(), src, null, .{ .ignore_unknown_fields = true });
     try std.testing.expectEqualStrings("legacy", cfg.name);
-    try std.testing.expect(!@hasField(ProjectConfig, "android"));
 }

@@ -112,7 +112,7 @@ test "rebuild commit: labelle.lock is committed before the generation advances, 
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -180,7 +180,7 @@ test "rebuild commit: a staged lock that cannot be committed fails the rebuild, 
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -237,7 +237,7 @@ test "rebuild commit: a cancel during the publication is honoured before the swi
         try fx.startup();
         var site = fx.site();
         defer site.env.deinit();
-        var replan = Replanner{ .backing = a, .project_dir = fx.project };
+        var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
         defer replan.deinit(&site, fx.providers, fx.cfg);
         replan.baseline();
         var dummy: u8 = 0;
@@ -355,7 +355,7 @@ test "rebuild commit: the local providers outside the project are watched with i
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     var dummy: u8 = 0;
     var ctx = tx.rebuildCtx(&fx, &site, &replan, &dummy);
@@ -503,7 +503,7 @@ test "rebuild commit: a rollback restores an absent labelle.lock as absent (cli#
     try fx.tmp.dir.deleteFile(io, "project/labelle.lock");
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -604,7 +604,7 @@ test "rebuild commit: a newly declared provider whose manifest fails the replan 
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -652,7 +652,7 @@ test "rebuild commit: a rollback leaves a labelle.lock another command rewrote m
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;
@@ -717,7 +717,7 @@ test "rebuild commit: a local provider whose manifest is deleted stays watched, 
     try fx.startup();
     var site = fx.site();
     defer site.env.deinit();
-    var replan = Replanner{ .backing = a, .project_dir = fx.project };
+    var replan = Replanner{ .backing = a, .project_dir = fx.project, .describer = testing.fakeDescriber(fx.project) };
     defer replan.deinit(&site, fx.providers, fx.cfg);
     replan.baseline();
     var dummy: u8 = 0;

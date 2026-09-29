@@ -114,7 +114,17 @@ const allowed_words = [_][]const u8{ "macos", "windows", "linux", "darwin", "win
 /// backend and platform names: 14 entries. RFC cli#471 S4 moved SDL2
 /// provisioning, runtime DLL staging and the doctor rows to the opt-in
 /// `sdl2` provider (labelle-sdl), deleting `cli/sdl_provision.zig`:
-/// 13 entries.
+/// 13 entries. RFC cli#471 I5 removed iOS from the core (the `labelle-ios`
+/// provider owns it now): `cli/ios.zig` went with its file, and
+/// `cli/args.zig`, `cli/pipeline/args_resolve.zig`, `cli/pipeline/run.zig`
+/// and `cli/provider_dispatch.zig` came clean; merged onto D4/S4,
+/// `cli/config.zig` and `cli/pipeline/install.zig` came clean too:
+/// 6 entries. RFC cli#471 P3 deleted the CLI's platform and
+/// asset-compression mirrors (a target is a name; the assembler's `describe`
+/// says whether it can generate it and whether it ships ASTC), so
+/// `cli/project_config.zig` came clean, and `cli.zig`, `cli/pipeline.zig`
+/// and `cli/pipeline/build.zig` once their comments and fixtures stopped
+/// citing platform names: 2 entries.
 /// Shrink only: an entry whose file is clean fails the test until it is
 /// removed. Note the path scan: an entry
 /// under `cli/android/` or named `cli/ios.zig` stays dirty until the file is
@@ -123,20 +133,7 @@ const allowed_files = [_][]const u8{
     // This file: it spells the forbidden table out.
     "agnostic_guard_test.zig",
     // Legacy platform, store, package and backend sites (RFC #406 "Migration").
-    "cli.zig",
-    "cli/args.zig",
-    "cli/config.zig",
     "cli/doctor.zig",
-    "cli/ios.zig",
-    "cli/pipeline.zig",
-    // Split out of `cli/pipeline.zig` (moves only): the stage code they
-    // carry names the legacy targets, backends and their toolchains.
-    "cli/pipeline/args_resolve.zig",
-    "cli/pipeline/build.zig",
-    "cli/pipeline/install.zig",
-    "cli/pipeline/run.zig",
-    "cli/project_config.zig",
-    "cli/provider_dispatch.zig",
 };
 
 const finding_note = "(platform/store/package names belong in providers; see docs/rfc-package-commands.md#enforcement)";
@@ -518,16 +515,18 @@ test "host OS names never flag" {
 }
 
 test "the allowlist matches Windows-style walker paths, one file per entry" {
-    try std.testing.expect(allowedIndex("cli/pipeline.zig") != null);
-    try std.testing.expect(allowedIndex("cli\\pipeline.zig") != null);
-    try std.testing.expect(allowedIndex("cli\\pipeline\\run.zig") != null);
-    try std.testing.expect(allowedIndex("cli/ios.zig") != null);
-    // A new file under a legacy directory is NOT exempt.
-    try std.testing.expect(allowedIndex("cli/pipeline/not_yet_written.zig") == null);
-    try std.testing.expect(allowedIndex("cli/pipeline/") == null);
-    try std.testing.expect(allowedIndex("cli/pipelinex/run.zig") == null);
-    // A removed file's entry left with it.
+    try std.testing.expect(allowedIndex("cli/doctor.zig") != null);
+    try std.testing.expect(allowedIndex("cli\\doctor.zig") != null);
+    // A new file beside or under an entry is NOT exempt.
+    try std.testing.expect(allowedIndex("cli/doctor/not_yet_written.zig") == null);
+    try std.testing.expect(allowedIndex("cli/doctor.zig/") == null);
+    try std.testing.expect(allowedIndex("cli/doctorx.zig") == null);
+    // A removed or cleaned file's entry left with it.
     try std.testing.expect(allowedIndex("cli/serve/http.zig") == null);
+    try std.testing.expect(allowedIndex("cli\\pipeline.zig") == null);
+    try std.testing.expect(allowedIndex("cli/project_config.zig") == null);
+    try std.testing.expect(allowedIndex("cli/ios.zig") == null);
+    try std.testing.expect(allowedIndex("cli/sdl_provision.zig") == null);
     // An extracted platform's files left the allowlist with the platform.
     try std.testing.expect(allowedIndex("cli/android.zig") == null);
     try std.testing.expect(allowedIndex("cli\\android\\run.zig") == null);
@@ -558,22 +557,28 @@ test "a finding is reported per line and a clean allowlisted file goes stale" {
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:1: 'ios' " ++ finding_note, scan.offenders.items[2]);
     try std.testing.expectEqualStrings("src/cli/provider_manifest.zig:2: 'web' " ++ finding_note, scan.offenders.items[3]);
     // Allowlisted and dirty: no finding, entry kept. Clean name and body: stale.
-    try scan.file("cli/pipeline.zig", "// wasm\n");
-    try scan.file("cli/project_config.zig", "const x = 1;\n");
+    try scan.file("cli/doctor.zig", "// wasm\n");
+    try scan.file("agnostic_guard_test.zig", "const x = 1;\n");
     try std.testing.expectEqual(@as(usize, 4), scan.offenders.items.len);
     var stale: std.ArrayList([]const u8) = .empty;
     defer stale.deinit(gpa);
     try scan.stale(&stale);
-    try std.testing.expect(!containsString(stale.items, "cli/pipeline.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/project_config.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/doctor.zig"));
+    try std.testing.expect(!containsString(stale.items, "cli/doctor.zig"));
+    try std.testing.expect(containsString(stale.items, "agnostic_guard_test.zig"));
+    // An entry no scanned file exercised is stale too.
+    var unscanned: Scan = .{ .gpa = gpa };
+    defer unscanned.deinit();
+    var unexercised: std.ArrayList([]const u8) = .empty;
+    defer unexercised.deinit(gpa);
+    try unscanned.stale(&unexercised);
+    try std.testing.expect(containsString(unexercised.items, "cli/doctor.zig"));
     // The sentinel is only set by the CLI root itself.
     try std.testing.expect(!scan.saw_cli_root);
     try scan.file(cli_root, "// android\n");
     try std.testing.expect(scan.saw_cli_root);
 }
 
-test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
+test "a platform in the path is a finding" {
     const gpa = std.testing.allocator;
     var scan: Scan = .{ .gpa = gpa };
     defer scan.deinit();
@@ -599,17 +604,10 @@ test "a platform in the path is a finding, and keeps an allowlist entry dirty" {
     try scan.file("cli/provider_settings.zig", "");
     try scan.file("cli/webhook_biosphere.zig", "");
     try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
-    // An allowlisted file whose path names a platform stays dirty with
-    // clean contents: the entry is only stale once the file is moved or
-    // renamed.
-    try scan.file("cli/ios.zig", "const x = 1;\n");
-    try scan.file("cli\\ios.zig", "");
-    try std.testing.expectEqual(@as(usize, 7), scan.offenders.items.len);
-    var stale: std.ArrayList([]const u8) = .empty;
-    defer stale.deinit(gpa);
-    try scan.stale(&stale);
-    try std.testing.expect(!containsString(stale.items, "cli/ios.zig"));
-    try std.testing.expect(containsString(stale.items, "cli/project_config.zig"));
+    // (An allowlisted file whose path names a platform stays dirty with
+    // clean contents — `Scan.file` marks it on the path hit. No entry names
+    // one since I5 and S4 deleted `cli/ios.zig` and `cli/sdl_provision.zig`,
+    // so there is no allowlisted path left to exercise that here.)
 }
 
 test "package and compound affixes do not hide a forbidden root" {

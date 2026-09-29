@@ -131,7 +131,7 @@ pub fn run(
 
 /// `labelle bundle` (cli#359): the exe is built; wrap it. Packaging
 /// runs AFTER the compile, so keep the progress feed open across it
-/// (a `run` phase, as `wasm export` does) and only mark `done` once
+/// (a `run` phase) and only mark `done` once
 /// the `.app` is on disk — a `--progress=json` consumer must not see
 /// `done` before the artifact exists.
 pub fn bundleStep(cx: *const Context) !u8 {

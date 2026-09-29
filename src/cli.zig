@@ -38,7 +38,6 @@ const assembler = @import("cli/assembler.zig");
 const assembler_proc = @import("cli/assembler_proc.zig");
 const zig_toolchain = @import("cli/zig_toolchain.zig");
 const bake_mod = @import("cli/bake.zig");
-const ios = @import("cli/ios.zig");
 const util = @import("cli/util.zig");
 const pack = @import("cli/pack.zig");
 const progress = @import("cli/progress.zig");
@@ -313,25 +312,6 @@ pub fn main(proc_init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, first, "doctor")) {
             parsed_args.command = .doctor_cmd;
             try collectExtraArgs(&args, &parsed_args);
-        } else if (std.mem.eql(u8, first, "ios")) {
-            parsed_args.command = .ios_cmd;
-            // The legacy platform subcommand requests its target by name and
-            // goes through the same resolver as `--platform=ios`: without a
-            // pinned provider declaring it, it fails with the no-provider
-            // error (RFC #406 "Migration", no shim; docs/provider-targets.md).
-            parsed_args.platform_override = "ios";
-            // First non-flag arg that isn't a subcommand is the project dir
-            while (args.next()) |arg| {
-                if (std.mem.startsWith(u8, arg, "-") or
-                    std.mem.eql(u8, arg, "build") or
-                    std.mem.eql(u8, arg, "xcode") or
-                    std.mem.eql(u8, arg, "run"))
-                {
-                    try appendExtraArg(&parsed_args, arg);
-                } else {
-                    parsed_args.project_dir = arg;
-                }
-            }
         } else if (std.mem.eql(u8, first, "assembler")) {
             parsed_args.command = .assembler_cmd;
             try collectExtraArgs(&args, &parsed_args);
@@ -349,8 +329,8 @@ pub fn main(proc_init: std.process.Init) !u8 {
             // ../game` from a broken project reports `provider command
             // failed` instead of running that directory (#460 review). A
             // namespace-shaped token still dispatches before the directory
-            // shorthand, so `labelle web …` keeps meaning the provider in
-            // a project that also has a `web/` folder.
+            // shorthand, so `labelle probe …` keeps meaning the provider in
+            // a project that also has a `probe/` folder.
             if (mayNameProvider(first)) {
                 if (provider_dispatch.dispatch(allocator, first, &args) catch |err| {
                     std.debug.print("labelle: provider command failed: {s}\n", .{@errorName(err)});
@@ -380,26 +360,6 @@ pub fn main(proc_init: std.process.Init) !u8 {
     }
 
     const command = parsed_args.command;
-
-    // ── Help resolution — BEFORE any dispatch ────────────────────────
-    //
-    // A usage request must never reach a handler that DOES something.
-    // This is the one place that decides "this invocation can only print
-    // usage", and it sits above EVERY dispatch below it: the standalone
-    // switch and `pipeline.run`. Any fast path added later lands
-    // underneath it by construction, so the bug cannot recur at a new
-    // site.
-    //
-    // That ordering is the whole point. The same blind spot was fixed at
-    // several sites during cli#355 and cli#361 review, each time as a
-    // check placed after some earlier `return` (a legacy platform
-    // subcommand's `--help` ran a whole build, or probed a toolchain).
-    // Hoisting the decision above every fast path retires the pattern
-    // instead of patching one more site.
-    if (helpOnlyPrinter(command, parsed_args.extra_args[0..parsed_args.extra_count])) |printUsage| {
-        printUsage();
-        return 0;
-    }
 
     // Standalone commands (no project.labelle needed)
     switch (command) {
@@ -477,7 +437,7 @@ fn mayNameProvider(token: []const u8) bool {
 }
 
 test "mayNameProvider: only a namespace-shaped token reaches provider dispatch" {
-    for ([_][]const u8{ "android", "web", "probe", "my-provider", "ns_2" }) |token| {
+    for ([_][]const u8{ "acme", "tools", "probe", "my-provider", "ns_2" }) |token| {
         try std.testing.expect(mayNameProvider(token));
     }
     for ([_][]const u8{ "../game", "./game", "..", ".", "/abs/game", "game/", "C:\\game", "Game", "" }) |token| {
@@ -485,64 +445,16 @@ test "mayNameProvider: only a namespace-shaped token reaches provider dispatch" 
     }
 }
 
-/// The usage printer for an invocation that can ONLY print usage, or null
-/// when it asks for real work. Pure and total: the single decision point
-/// `main` consults before any dispatch, so a new fast path cannot be
-/// ordered ahead of it.
-///
-/// Help-only invocations of the legacy `ios` subcommand must not enter the
-/// build pipeline (cli#355). Its handler prints usage for a missing
-/// subcommand and for `--help`/`-h`, but it is only reached at the END of
-/// `pipeline.run`, so merely asking for usage executed the project's
-/// declared `.prebuild` commands plus a whole generate+build. It needs no
-/// project.labelle.
-///
-/// The per-command predicate lives beside the handler's own parse loop
-/// (`ios.wantsHelpOnly`) so the two stay in step, and covers EVERY help
-/// form, not just a token in the first extra-argument position.
-///
-/// Commands whose handler is already a pure printer, or which parse their
-/// own `--help` before doing anything, are absent by design: this is for
-/// commands whose help would otherwise be reached only after work.
-fn helpOnlyPrinter(command: args_mod.Command, extra_args: []const []const u8) ?*const fn () void {
-    return switch (command) {
-        .ios_cmd => if (ios.wantsHelpOnly(extra_args)) &ios.printIosHelp else null,
-        else => null,
-    };
-}
-
 // --- Tests ---
 
-/// `main` consults `helpOnlyPrinter` before EVERY dispatch, so these cases
-/// pin the whole "a usage request does no work" contract in one place
-/// (cli#355, cli#361 review).
-pub const HelpOnlyPrinterSpec = struct {
-    pub const resolves_to_usage = struct {
-        test "ios build --help prints usage" {
-            try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{ "build", "--help" }) != null);
-        }
-    };
+pub const FirstArgumentSpec = struct {
+    test "an existing directory keeps the implicit run shorthand" {
+        try std.testing.expect(isDirectoryShorthand("."));
+    }
 
-    pub const FirstArgumentSpec = struct {
-        test "an existing directory keeps the implicit run shorthand" {
-            try std.testing.expect(isDirectoryShorthand("."));
-        }
-
-        test "a missing directory is not accepted as an implicit run command" {
-            try std.testing.expect(!isDirectoryShorthand("definitely-not-a-labelle-directory"));
-        }
-    };
-
-    pub const falls_through_to_work = struct {
-        test "ios run without a help token still runs" {
-            try std.testing.expect(helpOnlyPrinter(.ios_cmd, &.{"run"}) == null);
-        }
-
-        test "commands with no help-only form are never intercepted" {
-            try std.testing.expect(helpOnlyPrinter(.build, &.{"--help"}) == null);
-            try std.testing.expect(helpOnlyPrinter(.doctor_cmd, &.{"--help"}) == null);
-        }
-    };
+    test "a missing directory is not accepted as an implicit run command" {
+        try std.testing.expect(!isDirectoryShorthand("definitely-not-a-labelle-directory"));
+    }
 };
 
 const expect = @import("zspec").expect;

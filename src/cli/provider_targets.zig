@@ -3,16 +3,14 @@
 //! `desktop` is the core target. Every other target name is accepted only
 //! because a pinned provider declares it in `.targets`; the CLI keeps no
 //! list of its own (`docs/provider-targets.md`). The resolved target is a
-//! string. `project_config.Platform` stays the strict schema type of
-//! `.platform` and is derived from the name only where the pinned assembler
-//! still needs it — the labelle-assembler#378 boundary the pipeline enforces.
+//! string, and only a string: whether the assembler can generate for it is
+//! the assembler's answer (`describe`'s `supported`, RFC cli#471 P3).
 //!
 //! Nothing here knows a platform, store or package name: the CLI is agnostic
 //! (`docs/rfc-package-commands.md`).
 const std = @import("std");
 const contract = @import("provider_contract.zig");
 const dispatch = @import("provider_dispatch.zig");
-const project = @import("project_config.zig");
 const config = @import("config.zig");
 const github = @import("provider_github.zig");
 const registry = @import("provider_registry.zig");
@@ -24,9 +22,6 @@ pub const Resolved = struct {
     name: []const u8,
     /// The owning provider, or null for the core target.
     provider: ?*const dispatch.Provider,
-    /// The schema platform of the same name, when the pinned assembler can
-    /// generate for it; null for every other provider target.
-    legacy: ?project.Platform,
 
     pub fn providerName(self: Resolved) []const u8 {
         return if (self.provider) |p| p.meta.name else "core";
@@ -36,25 +31,22 @@ pub const Resolved = struct {
 /// The name-only half of resolution: everything the requested STRING alone
 /// decides. The pipeline discovers providers only after the assembler's
 /// `install` populated the package cache (docs/provider-hooks.md), but the
-/// target directory, the progress feed and the schema platform of the
-/// pre-install steps need a name before that. `desktop` is the core target;
+/// target directory and the progress feed of the pre-install steps need a
+/// name before that. `desktop` is the core target;
 /// any other well-formed name is provisionally a provider target — never a
 /// resolved one — until `resolve` confirms a discovered provider owns it.
 pub const Provisional = struct {
     name: []const u8,
     /// The core target: resolved by name alone, no provider can own it.
     is_core: bool,
-    /// The schema platform of the same name, when the pinned assembler can
-    /// generate for it; null for every other name.
-    legacy: ?project.Platform,
 };
 
 /// Pure. `InvalidTarget` for a non-identifier or a Windows reserved device
 /// name (the parsers reject those first, with their own message).
 pub fn provisional(requested: []const u8) !Provisional {
     if (!contract.targetName(requested)) return error.InvalidTarget;
-    if (std.mem.eql(u8, requested, core_target)) return .{ .name = core_target, .is_core = true, .legacy = .desktop };
-    return .{ .name = requested, .is_core = false, .legacy = std.meta.stringToEnum(project.Platform, requested) };
+    if (std.mem.eql(u8, requested, core_target)) return .{ .name = core_target, .is_core = true };
+    return .{ .name = requested, .is_core = false };
 }
 
 /// The discovered provider declaring `target`, if any (ownership is unique:
@@ -78,10 +70,10 @@ pub fn ownerOf(providers: []const dispatch.Provider, target: []const u8) ?*const
 /// This is the only place ownership of a requested target is decided.
 pub fn resolve(providers: []const dispatch.Provider, requested: []const u8) !Resolved {
     const candidate = try provisional(requested);
-    if (candidate.is_core) return .{ .name = core_target, .provider = null, .legacy = .desktop };
+    if (candidate.is_core) return .{ .name = core_target, .provider = null };
     const provider = ownerOf(providers, candidate.name) orelse return error.NoProviderForTarget;
     if (!provider.verified) return error.UnverifiedTargetOwner;
-    return .{ .name = candidate.name, .provider = provider, .legacy = candidate.legacy };
+    return .{ .name = candidate.name, .provider = provider };
 }
 
 /// The diagnostic for `UnverifiedTargetOwner`: names the package, and the
@@ -279,7 +271,6 @@ test "provider targets: the core target resolves with no providers and never to 
     const core = try resolve(&.{}, core_target);
     try std.testing.expectEqualStrings(core_target, core.name);
     try std.testing.expect(core.provider == null);
-    try std.testing.expectEqual(project.Platform.desktop, core.legacy.?);
     try std.testing.expectEqualStrings("core", core.providerName());
     const owner = fixtureProvider("fixture", &.{"probe-target"});
     const with = try resolve(&.{owner}, core_target);
@@ -290,18 +281,14 @@ test "provider targets: the provisional target is decided by the name alone and 
     const core = try provisional(core_target);
     try std.testing.expect(core.is_core);
     try std.testing.expectEqualStrings(core_target, core.name);
-    try std.testing.expectEqual(project.Platform.desktop, core.legacy.?);
-    // A schema name is provisionally a provider target with its legacy
-    // platform; a name outside the enum has none. Neither is resolved.
-    for (std.enums.values(project.Platform)) |platform| {
-        if (platform == .desktop) continue;
-        const schema = try provisional(@tagName(platform));
-        try std.testing.expect(!schema.is_core);
-        try std.testing.expectEqual(platform, schema.legacy.?);
+    // Every other name is provisionally a provider target, never resolved;
+    // no name is special (the CLI keeps no list of targets).
+    for ([_][]const u8{ "other-target", "probe-target" }) |name| {
+        const other = try provisional(name);
+        try std.testing.expect(!other.is_core);
+        try std.testing.expectEqualStrings(name, other.name);
     }
     const foreign = try provisional("probe-target");
-    try std.testing.expect(!foreign.is_core);
-    try std.testing.expect(foreign.legacy == null);
     try std.testing.expectError(error.InvalidTarget, provisional("Probe"));
     try std.testing.expectError(error.InvalidTarget, provisional("nul"));
     // `resolve` is the provisional step plus ownership: the same names
@@ -309,7 +296,6 @@ test "provider targets: the provisional target is decided by the name alone and 
     const owner = fixtureProvider("fixture", &.{"probe-target"});
     const resolved = try resolve(&.{owner}, "probe-target");
     try std.testing.expectEqualStrings(foreign.name, resolved.name);
-    try std.testing.expectEqual(foreign.legacy, resolved.legacy);
     try std.testing.expectError(error.NoProviderForTarget, resolve(&.{}, "probe-target"));
 }
 
@@ -321,7 +307,6 @@ test "provider targets: a declared target resolves to its provider; an undeclare
     try std.testing.expectEqualStrings("probe-target", resolved.name);
     try std.testing.expectEqualStrings("fixture", resolved.providerName());
     try std.testing.expect(resolved.provider.? == &providers[1]);
-    try std.testing.expect(resolved.legacy == null);
     try std.testing.expectError(error.NoProviderForTarget, resolve(&.{other}, "probe-target"));
     try std.testing.expectError(error.NoProviderForTarget, resolve(&.{}, "probe-target"));
     // Shape is checked before ownership: a non-identifier never resolves.
@@ -329,19 +314,14 @@ test "provider targets: a declared target resolves to its provider; an undeclare
     try std.testing.expectError(error.InvalidTarget, resolve(&providers, ""));
 }
 
-test "provider targets: schema platforms map by name only through a provider; other targets never map" {
-    for (std.enums.values(project.Platform)) |platform| {
-        if (platform == .desktop) continue;
-        const name = @tagName(platform);
-        // The schema name alone resolves nothing: the provider is required.
+test "provider targets: no name but the core one resolves without a provider" {
+    for ([_][]const u8{ "other-target", "third-target", "probe-target" }) |name| {
         try std.testing.expectError(error.NoProviderForTarget, resolve(&.{}, name));
         const owner = fixtureProvider("owner", &.{name});
         const resolved = try resolve(&.{owner}, name);
         try std.testing.expectEqualStrings("owner", resolved.providerName());
-        try std.testing.expectEqual(platform, resolved.legacy.?);
+        try std.testing.expectEqualStrings(name, resolved.name);
     }
-    const owner = fixtureProvider("owner", &.{"probe-target"});
-    try std.testing.expect((try resolve(&.{owner}, "probe-target")).legacy == null);
 }
 
 test "provider targets: the no-provider diagnostic names a candidate on a hit and stays generic on a miss" {

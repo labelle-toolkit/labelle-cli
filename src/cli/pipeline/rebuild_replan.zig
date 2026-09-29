@@ -16,6 +16,7 @@ const SessionKey = @import("session_key.zig").SessionKey;
 const confirmTarget = @import("args_resolve.zig").confirmTarget;
 const AssemblerInstaller = @import("install.zig").AssemblerInstaller;
 const coreGenerateGate = @import("install.zig").coreGenerateGate;
+const reportUnsupported = @import("install.zig").reportUnsupported;
 const assembler_describe = @import("../assembler_describe.zig");
 const provider_contract = @import("../provider_contract.zig");
 const optimize_mod = @import("optimize.zig");
@@ -100,7 +101,8 @@ pub const Replanner = struct {
     /// (`describe`, cli#471 D3), after this rebuild's install: a backend
     /// bump that drops the pair fails the rebuild with describe's reason,
     /// as the cold pipeline's gate does (`install.coreGenerateGate`).
-    /// `off` (the plumbing tests, a pre-7 assembler) keeps the enum check.
+    /// `off` (the plumbing tests, a pre-7 assembler) cannot answer, so the
+    /// rebuild fails (`Describer.require`).
     describer: assembler_describe.Describer = .off,
 
     pub const LockBefore = union(enum) { absent, bytes: []u8 };
@@ -423,11 +425,8 @@ pub const Replanner = struct {
             self.pruneExtractions();
         };
         const a = next.arena.allocator();
-        var cfg = try next.read(self.project_dir);
+        const cfg = try next.read(self.project_dir);
         const digest = next.digest;
-        // The target's platform is the pipeline's resolved one (a command
-        // may override what the file declares).
-        cfg.platform = ctx.hooks.cfg.platform;
         // An edited `project.labelle` may declare a package the startup
         // install never fetched and the startup lock never pinned: install
         // first, as the cold pipeline does ahead of discovery (Codex P2 on
@@ -464,7 +463,7 @@ pub const Replanner = struct {
         // The core generation's gate, as the cold pipeline applies it
         // (`install.discoverAndPlan`): before the lock and any hook, against
         // the project and packages as they now are.
-        try generateGate(self.describer, a, ctx.hooks.target, resolved, generate_plan.replace != null);
+        try generateGate(self.describer, a, resolved, generate_plan.replace != null);
         // The lock follows the re-read project once the target is confirmed
         // and the plans are good — the cold pipeline's order — and before
         // any hook runs: STAGED, so this rebuild's hooks verify their pins
@@ -498,19 +497,17 @@ pub const Replanner = struct {
         self.pruneExtractions();
     }
 
-    /// Fail the rebuild when `describe` says the backend no longer supports
-    /// `target` and the core generation would run for it. A target outside
-    /// the pinned assembler's schema is left alone here: the cold pipeline
-    /// already refused it (labelle-assembler#378) unless a `replace` hook
-    /// generated it, and a replan never judged that before. Public for the
+    /// Fail the rebuild when `describe` says the assembler cannot generate
+    /// `resolved` (a backend that no longer supports it, or a name it does
+    /// not know) and the core generation would run for it. Public for the
     /// tests.
-    pub fn generateGate(describer: assembler_describe.Describer, a: std.mem.Allocator, target: []const u8, resolved: provider_targets.Resolved, replaced: bool) !void {
-        if (resolved.legacy == null or replaced) return;
-        const described = try describer.require(a, target);
-        switch (coreGenerateGate(true, false, described)) {
-            .proceed, .no_schema_target => {},
+    pub fn generateGate(describer: assembler_describe.Describer, a: std.mem.Allocator, resolved: provider_targets.Resolved, replaced: bool) !void {
+        if (replaced) return;
+        const described = try describer.require(a, resolved.name);
+        switch (coreGenerateGate(false, described)) {
+            .proceed => {},
             .unsupported => |reason| {
-                std.debug.print("labelle: backend '{s}' cannot build target '{s}': {s}\n", .{ described.backend.name, target, reason });
+                reportUnsupported(resolved, described.backend.name, reason);
                 return error.BackendUnsupportedTarget;
             },
         }
@@ -560,7 +557,7 @@ pub const Replanner = struct {
         // stale: read afresh.
         if (!self.installed) self.dropStaged();
         const next = try self.stage();
-        var cfg = next.read(self.project_dir) catch |err| {
+        const cfg = next.read(self.project_dir) catch |err| {
             self.dropStaged();
             return err;
         };
@@ -573,7 +570,6 @@ pub const Replanner = struct {
         var scratch = std.heap.ArenaAllocator.init(self.backing);
         defer scratch.deinit();
         const a = scratch.allocator();
-        cfg.platform = ctx.hooks.cfg.platform;
         // Lookup only: a pinned remote is read from the extraction an
         // earlier generation (or the cold pipeline) verified and unpacked,
         // never from its archive (cli#429).

@@ -12,11 +12,11 @@ and the CLI carries no Android code (cli#405). The other platform packages
 ## Resolution
 
 Every command that runs the project pipeline (`generate`, `build`, `run`,
-`bundle`, and the legacy `ios` subcommand) resolves
+`bundle`) resolves
 one target, in two halves, before anything is generated, locked or built:
 
 1. The requested name is `--platform=<t>` when given, else the project's
-   declared `.platform`. The parsers check only that it is identifier-shaped
+   declared `.platform` (read as a name: `.platform = .<t>`). The parsers check only that it is identifier-shaped
    (`[a-z][a-z0-9_-]*`); anything else is `invalid target '<t>' (targets are
    lowercase identifiers; run 'labelle targets')`. A Windows reserved device
    name (`con`, `nul`, `prn`, `aux`, `com1`-`com9`, `lpt1`-`lpt9`) is
@@ -138,8 +138,8 @@ one target, in two halves, before anything is generated, locked or built:
 The two halves are the **name** and the **ownership**. The name is settled
 from the string alone, first thing: `desktop` is core, any other name is
 *provisionally* a provider target. That is enough for everything the
-pipeline needs before a provider can be read — the target directory, the
-progress feed, the schema platform the pre-install steps key off — and for
+pipeline needs before a provider can be read — the target directory and the
+progress feed the pre-install steps key off — and for
 two verdicts that need no provider: a project with no `.plugins` cannot own
 a provider target and is refused before anything is read, written or built,
 and `labelle bundle` of the core target is refused off macOS before any
@@ -164,8 +164,9 @@ package that does not declare the requested name is refused there — after
 the install, before the lock, generation or any compiler, with a `failed`
 progress record naming the refusal — `no provider for target`, or
 `unpinned provider for target` when the declaring package is remote and
-unpinned — and nothing else in the target directory. The `labelle-assembler#378` gate and the bundle-replacement check
-below need the hook plans, so they land at the post-install point.
+unpinned — and nothing else in the target directory. The
+[generation gate](#what-the-assembler-generates) and the bundle-replacement
+check below need the hook plans, so they land at the post-install point.
 
 `--docker` is decided before any of this (CLI 3.0, RFC cli#466 D5): the
 container build is the core `desktop` target's only, so a provider target
@@ -192,45 +193,43 @@ wasm  provided by labelle-web
 It is metadata only (like `labelle help`): a broken provider manifest is a
 warning on that listing, not a failure.
 
-## The labelle-assembler#378 boundary
+## What the assembler generates
 
-`project.labelle`'s `.platform` keeps its strict schema type
-(`project_config.Platform`, mirrored by the assembler), and the assembler
-still parses `--platform` against that enum. The CLI therefore draws one
-explicit line:
+The CLI keeps no list of targets and no mirror of the project schema's
+platform or asset-compression types (CLI 4.0, RFC cli#471 P3). Whether the
+core generation can produce a target is the assembler's answer: after the
+install, unless the target's provider replaces `generate`, the pipeline asks
+`labelle-assembler describe --target <t>` and stops — before the lock, the
+assembler's `generate` and any compiler — when it answers `supported: false`.
+That covers a backend that does not support the target and a name the
+assembler does not generate for at all; the reason is the assembler's own:
 
-- A provider target whose name is a schema platform (`wasm`, `android`,
-  `ios`) is handed to the assembler as `--platform <name>`, exactly as
-  before. The legacy pipeline branch that keys on the enum (`ios`) keeps
-  working for it; `android` and `wasm` have none left, so their providers
-  replace `run` (see [`labelle run`](#labelle-run)).
-- A provider target outside the enum can only be generated for by its
-  provider's `replace` hook on `generate`. Without one the command stops
-  before the assembler runs:
+```
+labelle: backend 'bgfx' cannot build target 'probe-target': backend 'bgfx' has no target 'probe-target': this assembler generates for desktop ios android wasm
+  package 'fixture' declares target 'probe-target' but no `.when = .replace` hook on `generate`, so the assembler must generate it
+```
 
-  ```
-  labelle: target 'probe-target' is declared by 'fixture' but the pinned assembler cannot generate for it yet (labelle-assembler#378)
-  ```
+A watched rebuild applies the same gate to the project as it now is. With a
+`replace` hook on `generate` the provider generates, whatever the assembler
+knows; the core steps it does not replace (`build`, `run`) treat the target
+as the generic host baseline.
 
-  With one, the provider generates; the core steps it does not replace
-  (`build`, `run`) treat the target as the generic host baseline. The ASTC
-  prepass is not among them: it keys on the requested target, and a target
-  outside the enum has no `asset_compression` setting (standalone `labelle astc`
-  can read that target's backend manifest declaration),
-  so the prepass is skipped rather than run with the derived `desktop` — a
-  provider owns its target's asset pipeline.
+The ASTC prepass keys on the resolved target the same way: `describe`'s
+`asset_format` (the assembler reads `.asset_compression` by the target
+name, `web` a warned alias for `wasm`) decides whether `labelle astc
+--platform <t>` runs before generation. It is never asked for a target whose
+generation a provider replaces: that provider owns its asset pipeline.
 
-What waits for assembler#378: string-resolved platforms in `generate`, the
-removal of the `Capability.{wasm,android,ios}` derivation, and the enum
-leaving both schema mirrors. Nothing in `project.labelle` changes in this
-slice, and `provider_settings.zig` is untouched.
+`project.labelle`'s `.platform` and `.asset_compression` still parse
+unchanged; the assembler owns their strictness.
 
 ## `labelle run`
 
-The CLI launches only the core `desktop` target on this host, plus the
-legacy run branch it still carries (the `ios` simulator). The core's own
-browser serve left in 3.0: the `web` provider's `replace run` hook serves
-`wasm` now.
+The CLI launches only the core `desktop` target on this host. The core's
+own browser serve left in 3.0 (the `web` provider's `replace run` hook
+serves `wasm` now), and its `ios` simulator launch with RFC cli#471 I5
+([labelle-ios](https://github.com/labelle-toolkit/labelle-ios)'s `replace
+run` hook launches it now).
 Every other provider target is launched by its provider, so it must have a
 `replace` hook on `run`, otherwise:
 
@@ -312,8 +311,8 @@ package injection (RFC #406 "Migration", #410). The user-facing walkthrough,
 with Flying Platform as the worked example, is
 [Migrating a project to labelle CLI 2.0](migrating-to-2.0.md):
 
-- A project that builds for `wasm`, `android` or `ios` — through `.platform`,
-  `--platform=<t>`, or `labelle ios …` — must add the package that declares that target to
+- A project that builds for `wasm`, `android` or `ios` — through `.platform`
+  or `--platform=<t>` — must add the package that declares that target to
   `.plugins` (as `.repo = "github.com/<owner>/<name>"`) and pin it
   (`labelle providers resolve`, then `--accept`). Until it does, those
   commands fail with the no-provider error above. Commit
@@ -323,10 +322,14 @@ with Flying Platform as the worked example, is
   ([pins](provider-github-pins.md#fresh-checkouts-and-ci-labelle-providers-fetch)).
 - The target name is unchanged: `--platform=wasm` stays `--platform=wasm`,
   because the web provider declares the target `wasm`. Only the pin is new.
-- The legacy `labelle ios` command word stays a reserved built-in until its
-  extraction lands; it routes its target through the same resolver. The
-  legacy `labelle wasm serve|export` left the core in 3.0: `wasm` is no
-  reserved word any more ([migrating to 3.0](migrating-to-3.0.md)).
+- The legacy `labelle wasm serve|export` left the core in 3.0: `wasm` is no
+  reserved word any more ([migrating to 3.0](migrating-to-3.0.md)). The
+  legacy `labelle ios` subcommand followed (RFC cli#471 I5): the word is an
+  unknown command unless a pinned package declares it as a namespace, and
+  iOS builds, runs and bundles through
+  [labelle-ios](https://github.com/labelle-toolkit/labelle-ios) with
+  `--platform=ios`; its settings (formerly the `.ios` block, which the CLI
+  now ignores) live in `providers/ios.json`.
 - `labelle android …` is no built-in any more (cli#405): it is the `android`
   provider's namespace. Without that package pinned, `labelle android` is an
   unknown command — or, inside a project, when the one document the target
@@ -386,8 +389,8 @@ early verdict for a local provider that does not own the name, including a
 typo that leaves a `.prebuild` marker step unrun (while a resolving target
 runs it); a remote package on a cold cache deferring the verdict to after
 the install (the `failed` record) and, unpinned, refused as an owner both
-after the install and — warm — before it; the #378 message before the
-assembler runs; `NoBundleReplacement`; a provider replacing
+after the install and — warm — before it; the generation gate's refusal
+(`describe`'s reason) before the assembler generates; `NoBundleReplacement`; a provider replacing
 `generate`/`build`/`bundle` for `probe-target`, including `labelle bundle
 --platform=probe-target` running the replacement on every host with the
 contract's `output_dir`; the ASTC prepass running for `desktop` and not for

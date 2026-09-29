@@ -15,6 +15,7 @@ const provider_hooks = @import("../provider_hooks.zig");
 const lockfile = @import("../lockfile.zig");
 const project_lock = @import("../project_lock.zig");
 const Replanner = @import("rebuild_replan.zig").Replanner;
+const testing = @import("testing.zig");
 const tx = @import("rebuild_transaction_tests.zig");
 const commit_tests = @import("rebuild_commit_tests.zig");
 const Fixture = tx.Fixture;
@@ -33,8 +34,8 @@ const Sessions = struct {
         try s.fx.write(.{});
         try s.fx.startup();
         s.site = s.fx.site();
-        s.one = .{ .backing = a, .project_dir = s.fx.project };
-        s.two = .{ .backing = a, .project_dir = s.fx.project };
+        s.one = .{ .backing = a, .project_dir = s.fx.project, .describer = testing.fakeDescriber(s.fx.project) };
+        s.two = .{ .backing = a, .project_dir = s.fx.project, .describer = testing.fakeDescriber(s.fx.project) };
     }
 
     fn deinit(s: *Sessions) void {

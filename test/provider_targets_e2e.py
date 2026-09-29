@@ -46,10 +46,22 @@ if argv and argv[0] == "--protocol-version":
 elif argv and argv[0] == "describe":
     import json
     target_name = argv[argv.index("--target") + 1]
-    backend = backend_of(Path(argv[argv.index("--project-root") + 1]))
-    print(json.dumps({"schema": "labelle.describe/v1", "target": target_name,
-                      "target_dir": ".labelle/" + backend + "_" + target_name,
-                      "backend": {"name": backend}, "asset_format": "png", "supported": True}))
+    root = Path(argv[argv.index("--project-root") + 1])
+    backend = backend_of(root)
+    # Like the real assembler: it generates for its own four targets and
+    # answers `supported: false` with a reason for any other name (exit 0),
+    # and reads `.asset_compression` by the target name.
+    known = target_name in ("desktop", "ios", "android", "wasm")
+    text = (root / "project.labelle").read_text()
+    at = text.find(".asset_compression = .{")
+    compression = text[at:text.find("}", at)] if at >= 0 else ""
+    astc = f".{target_name} = .astc" in compression
+    doc = {"schema": "labelle.describe/v1", "target": target_name,
+           "target_dir": ".labelle/" + backend + "_" + target_name,
+           "backend": {"name": backend}, "asset_format": "astc" if astc else "png", "supported": known}
+    if not known:
+        doc["reason"] = f"backend '{backend}' has no target '{target_name}': this assembler generates for desktop ios android wasm"
+    print(json.dumps(doc))
 elif argv and argv[0] == "install":
     if os.environ.get("FAKE_INSTALL_PLUGIN"):
         src, dest = os.environ["FAKE_INSTALL_PLUGIN"].split("|")
@@ -78,6 +90,10 @@ else:
 TOOL = '.build_step = "probe-tool", .executable = "bin/provider-probe"'
 NO_PROVIDER = ("labelle: no provider for target '{t}' in this project; "
                "add and pin the package that declares target '{t}'")
+# The generation gate's refusal: `describe`'s reason for a name the
+# assembler does not generate for (the fake's backend is raylib).
+UNGENERATABLE = ("labelle: backend 'raylib' cannot build target 'probe-target': "
+                 "backend 'raylib' has no target 'probe-target'")
 
 
 def hook(id, step, when, target):
@@ -186,17 +202,19 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
         assert NO_PROVIDER.format(t="wasm") in refused.stderr, refused.stderr
         assert "(registry:" not in refused.stderr, "a registry owner was invented"
         untouched(refused, "wasm")
-    # The legacy subcommand requests the same target and fails the same way.
-    refused = run("ios", "build", code=1)
-    assert NO_PROVIDER.format(t="ios") in refused.stderr, refused.stderr
-    untouched(refused, "ios")
-    # `android` (cli#405) and the legacy `wasm serve|export` (RFC cli#466 PR
-    # B) are no built-ins any more: each is a provider namespace like any
-    # other, so with no package declaring it the word is an unknown command
-    # and nothing is generated (test/provider_android_like_e2e.py covers the
-    # registry hint).
+    # `ios` has no core fallback either since RFC cli#471 I5: no simulator
+    # launch, no forced backend — the plain no-provider verdict.
+    for args in (("build", "--platform=ios"), ("run", "--platform=ios")):
+        refused = run(*args, code=1)
+        assert NO_PROVIDER.format(t="ios") in refused.stderr, (args, refused.stderr)
+        untouched(refused, "ios")
+    # `android` (cli#405), the legacy `wasm serve|export` (RFC cli#466 PR B)
+    # and `ios` (RFC cli#471 I5) are no built-ins any more: each is a
+    # provider namespace like any other, so with no package declaring it the
+    # word is an unknown command and nothing is generated
+    # (test/provider_android_like_e2e.py covers the registry hint).
     for args in (("android", "build"), ("wasm", "serve", "--no-open"), ("wasm", "export"),
-                 ("wasm", "serve", "--no-build")):
+                 ("wasm", "serve", "--no-build"), ("ios", "build"), ("ios", "run")):
         refused = run(*args, code=1)
         assert f"labelle: unknown command '{args[0]}'" in refused.stderr, (args, refused.stderr)
         assert NO_PROVIDER.format(t=args[0]) not in refused.stderr, (args, refused.stderr)
@@ -316,8 +334,8 @@ sys.stdout.write(data)
         assert "(registry not consulted: LABELLE_OFFLINE is set)" in err and generic in err and "(registry:" not in err, err
 
     # ── A provider that owns the target but replaces nothing on generate ──
-    # The pinned assembler cannot generate for a name outside its enum, so
-    # the build stops with the #378 message before the assembler's
+    # The assembler's `describe` says it cannot generate a name it does not
+    # know, so the build stops with its reason before the assembler's
     # `generate`. With a package declared, every verdict that needs its
     # manifest — this one, ownership, the bundle replacement — is reached
     # only after the install populated the cache; the target directory is
@@ -327,7 +345,8 @@ sys.stdout.write(data)
     for args in (("build", "--platform=probe-target"), ("generate", "--platform=probe-target"), ("bundle", "--platform=probe-target")):
         reset()
         stopped = run(*args, code=1)
-        assert "target 'probe-target' is declared by 'fixture' but the pinned assembler cannot generate for it yet (labelle-assembler#378)" in stopped.stderr, stopped.stderr
+        assert UNGENERATABLE in stopped.stderr, stopped.stderr
+        assert "package 'fixture' declares target 'probe-target' but no `.when = .replace` hook on `generate`" in stopped.stderr, stopped.stderr
         installed_only(stopped, "probe-target")
     # Ownership is per target: this provider does not make `wasm` resolvable.
     # Its manifest is local, so every declared package is readable before
@@ -354,7 +373,7 @@ sys.stdout.write(data)
     untouched(typo, "waasm")
     reset()
     control = run("build", "--platform=probe-target", code=1, extra_env={"LABELLE_NO_PREBUILD": "0"})
-    assert "labelle-assembler#378" in control.stderr, control.stderr
+    assert UNGENERATABLE in control.stderr, control.stderr
     assert marker.exists(), "the prebuild marker step did not run for a declared target"
     marker.unlink()
     declare(dep)
@@ -502,11 +521,10 @@ sys.stdout.write(data)
     assert entries and Path(entries[0]["output_dir"]) == (project / "dist").resolve(), entries
     assert not bundle_dir.exists(), "the default bundle directory was created despite --output"
 
-    # ── The ASTC prepass keys on the target, not on the derived enum ───────
-    # A provider target outside the schema enum derives `.desktop` for the
-    # legacy sites, but it is not the desktop target: with desktop atlases
-    # set to ASTC the prepass runs for `desktop` (the control: it reports
-    # its tally even with no atlas) and never for `probe-target`.
+    # ── The ASTC prepass keys on the target's own describe answer ─────────
+    # With desktop atlases set to ASTC the prepass runs for `desktop` (the
+    # control: it reports its tally even with no atlas) and never for
+    # `probe-target`, whose generation its provider replaces.
     astc = ', .asset_compression = .{ .desktop = .astc }'
     declare(dep, extra=astc)
     reset()
