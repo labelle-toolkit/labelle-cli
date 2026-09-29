@@ -10,6 +10,12 @@
 //!   inherited environment; `apply`/`compose` make them on an
 //!   `Environ.Map`.
 //!
+//! - From wire `1.6.0` the target owner's `before generate` / `before build`
+//!   file may also carry `build_options`, appended as `-D<name>=<value>` to
+//!   the fingerprint pass and the core compile (`Accumulator.zigArgs`). The
+//!   owner, slot and wire gates need the hook, so `provider_hooks` applies
+//!   them; this file checks the shape.
+//!
 //! The Windows rules (case-insensitive names that keep the inherited
 //! spelling) are a parameter rather than the build target, so they are
 //! exercised by the tests on every host.
@@ -22,12 +28,36 @@ pub const native_windows = builtin.os.tag == .windows;
 
 pub const Var = struct { name: []const u8, value: []const u8 };
 
-/// The `env_file` document. Both keys may be omitted; any other key is an
-/// error.
+/// The `env_file` document. Every key may be omitted; any other key is an
+/// error. `build_options` (wire `1.6.0`+) is null when absent, so the caller
+/// can refuse the key itself from a hook that may not send it.
 pub const File = struct {
     set: []const Var = &.{},
     path_prepend: []const []const u8 = &.{},
+    build_options: ?[]const Var = null,
 };
+
+/// Zig build options the CLI passes (or may pass) itself: `-Doptimize` (from
+/// `--optimize` or the target owner's `target_defaults`) and `-Dtarget`
+/// (`--docker --target`). A provider may not contribute them.
+pub const cli_owned_build_options = [_][]const u8{ "optimize", "target" };
+
+/// A Zig build option name: `[A-Za-z_][A-Za-z0-9_-]*`.
+pub fn buildOptionName(name: []const u8) bool {
+    if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
+}
+
+/// The `-D` argument `arg` sets `name` (`-Dname` or `-Dname=...`).
+fn setsBuildOption(arg: []const u8, name: []const u8) bool {
+    if (!std.mem.startsWith(u8, arg, "-D")) return false;
+    const rest = arg[2..];
+    if (!std.mem.startsWith(u8, rest, name)) return false;
+    return rest.len == name.len or rest[name.len] == '=';
+}
 
 /// Why a file or a merge was refused, as one line for the diagnostic that
 /// names the hook. Owned by the allocator the failing call received.
@@ -78,6 +108,16 @@ pub fn parseFile(a: std.mem.Allocator, bytes: []const u8, windows: bool, diag: *
             if (eqlName(previous.name, entry.name, windows)) return fail(a, diag, "'{s}' is set twice", .{entry.name});
         }
     }
+    if (parsed.build_options) |options| for (options, 0..) |option, i| {
+        if (!buildOptionName(option.name)) return fail(a, diag, "invalid build option name '{s}' (names match [A-Za-z_][A-Za-z0-9_-]*)", .{option.name});
+        for (cli_owned_build_options) |owned| {
+            if (std.mem.eql(u8, owned, option.name)) return fail(a, diag, "build option '{s}' is owned by the CLI (it passes -D{s} itself)", .{ option.name, owned });
+        }
+        if (std.mem.indexOfAny(u8, option.value, "\x00\n\r") != null) return fail(a, diag, "the value of build option '{s}' contains a NUL byte or a line break", .{option.name});
+        for (options[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, option.name)) return fail(a, diag, "build option '{s}' is given twice", .{option.name});
+        }
+    };
     const sep = pathSeparator(windows);
     for (parsed.path_prepend) |dir| {
         if (dir.len == 0 or std.mem.indexOfScalar(u8, dir, 0) != null or !absoluteOn(dir, windows))
@@ -109,13 +149,16 @@ pub const Accumulator = struct {
     arena: ?std.heap.ArenaAllocator = null,
     vars: std.ArrayList(Entry) = .empty,
     path: std.ArrayList([]const u8) = .empty,
+    /// The target owner's `build_options` (wire `1.6.0`+), in hook order then
+    /// list order: `-D<name>=<value>` on every later `zig build`.
+    options: std.ArrayList(Entry) = .empty,
     /// The Windows name and path rules. The host's; a parameter for tests.
     windows: bool = native_windows,
 
     pub const Entry = struct { name: []const u8, value: []const u8, hook: []const u8 };
 
     pub fn isEmpty(self: *const Accumulator) bool {
-        return self.vars.items.len == 0 and self.path.items.len == 0;
+        return self.vars.items.len == 0 and self.path.items.len == 0 and self.options.items.len == 0;
     }
 
     /// Whether a hook of this build contributed `name` (the host's name
@@ -136,6 +179,7 @@ pub const Accumulator = struct {
         self.arena = null;
         self.vars = .empty;
         self.path = .empty;
+        self.options = .empty;
     }
 
     pub fn deinit(self: *Accumulator) void {
@@ -144,7 +188,9 @@ pub const Accumulator = struct {
 
     /// Whether two accumulators make the same environment: the same
     /// variables with the same values, and the same PATH entries, in order
-    /// (names folded on Windows). Which hook contributed is not compared.
+    /// (names folded on Windows). Which hook contributed is not compared,
+    /// nor are the build options: they reach the compile, never the process
+    /// environment of a running replacement.
     pub fn sameAs(self: *const Accumulator, other: *const Accumulator) bool {
         if (self.vars.items.len != other.vars.items.len or self.path.items.len != other.path.items.len) return false;
         for (self.vars.items, other.vars.items) |x, y| {
@@ -169,6 +215,9 @@ pub const Accumulator = struct {
             try copy.vars.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try a.dupe(u8, entry.value), .hook = try a.dupe(u8, entry.hook) });
         }
         for (self.path.items) |dir| try copy.path.append(a, try a.dupe(u8, dir));
+        for (self.options.items) |entry| {
+            try copy.options.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try a.dupe(u8, entry.value), .hook = try a.dupe(u8, entry.hook) });
+        }
         return copy;
     }
 
@@ -182,6 +231,14 @@ pub const Accumulator = struct {
                 if (!eqlName(existing.name, entry.name, self.windows)) continue;
                 if (!std.mem.eql(u8, existing.value, entry.value))
                     return fail(diag_a, diag, "'{s}' is set to different values by hooks '{s}' and '{s}'", .{ entry.name, existing.hook, hook });
+            }
+        }
+        const options = file.build_options orelse &.{};
+        for (options) |option| {
+            for (self.options.items) |existing| {
+                if (!std.mem.eql(u8, existing.name, option.name)) continue;
+                if (!std.mem.eql(u8, existing.value, option.value))
+                    return fail(diag_a, diag, "build option '-D{s}' is set to different values by hooks '{s}' and '{s}'", .{ option.name, existing.hook, hook });
             }
         }
         if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(backing);
@@ -199,6 +256,32 @@ pub const Accumulator = struct {
             }
             try self.path.append(a, try a.dupe(u8, dir));
         }
+        outer: for (options) |option| {
+            for (self.options.items) |existing| {
+                if (std.mem.eql(u8, existing.name, option.name)) continue :outer;
+            }
+            try self.options.append(a, .{ .name = try a.dupe(u8, option.name), .value = try a.dupe(u8, option.value), .hook = owned_hook });
+        }
+    }
+
+    /// `base` (a `zig build` argv the CLI assembled) followed by one
+    /// `-D<name>=<value>` per contributed build option, in contribution
+    /// order. An option `base` already sets is a conflict naming the hook's
+    /// argument and the CLI's (`diag`, allocated with `a`):
+    /// `error.BuildOptionConflict`. With no options, `base` itself.
+    pub fn zigArgs(self: *const Accumulator, a: std.mem.Allocator, base: []const []const u8, diag: *Diagnostic) ![]const []const u8 {
+        if (self.options.items.len == 0) return base;
+        for (self.options.items) |option| {
+            for (base) |arg| {
+                if (!setsBuildOption(arg, option.name)) continue;
+                diag.message = try std.fmt.allocPrint(a, "build option '-D{s}={s}' from hook '{s}' conflicts with the CLI's '{s}'", .{ option.name, option.value, option.hook, arg });
+                return error.BuildOptionConflict;
+            }
+        }
+        const out = try a.alloc([]const u8, base.len + self.options.items.len);
+        @memcpy(out[0..base.len], base);
+        for (self.options.items, out[base.len..]) |option, *arg| arg.* = try std.fmt.allocPrint(a, "-D{s}={s}", .{ option.name, option.value });
+        return out;
     }
 
     /// The assignments that make the merged environment out of `inherited`:
@@ -506,4 +589,68 @@ test "provider env: sets reports a contributed variable under the host's name ru
     defer windows.deinit();
     try windows.add(a, a, "pkg/tc", .{ .set = &.{.{ .name = "Sdk_Root", .value = "C:\\one" }} }, &diag);
     try std.testing.expect(windows.sets("SDK_ROOT"));
+}
+
+test "provider env: build_options are parsed and validated (wire 1.6.0)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try parseOk(a, "{\"build_options\":[{\"name\":\"device\",\"value\":\"true\"},{\"name\":\"sdk-root_2\",\"value\":\"/abs sdk\"}]}", false);
+    try std.testing.expectEqual(@as(usize, 2), file.build_options.?.len);
+    try std.testing.expectEqualStrings("device", file.build_options.?[0].name);
+    // Absent is null (so the caller can refuse the key where it isn't
+    // allowed); an empty list is present.
+    try std.testing.expect((try parseOk(a, "{}", false)).build_options == null);
+    try std.testing.expectEqual(@as(usize, 0), (try parseOk(a, "{\"build_options\":[]}", false)).build_options.?.len);
+    for ([_][]const u8{ "", "1abc", "-dash", "has space", "a=b", "a.b" }) |name| {
+        const doc = try std.fmt.allocPrint(a, "{{\"build_options\":[{{\"name\":\"{s}\",\"value\":\"x\"}}]}}", .{name});
+        try parseFails(a, doc, false, "invalid build option name");
+    }
+    for (cli_owned_build_options) |name| {
+        const doc = try std.fmt.allocPrint(a, "{{\"build_options\":[{{\"name\":\"{s}\",\"value\":\"x\"}}]}}", .{name});
+        try parseFails(a, doc, false, "owned by the CLI");
+    }
+    try parseFails(a, "{\"build_options\":[{\"name\":\"a\",\"value\":\"x\\ny\"}]}", false, "line break");
+    try parseFails(a, "{\"build_options\":[{\"name\":\"a\",\"value\":\"x\\ry\"}]}", false, "line break");
+    try parseFails(a, "{\"build_options\":[{\"name\":\"a\",\"value\":\"x\\u0000\"}]}", false, "NUL");
+    try parseFails(a, "{\"build_options\":[{\"name\":\"a\",\"value\":\"1\"},{\"name\":\"a\",\"value\":\"1\"}]}", false, "given twice");
+    try parseFails(a, "{\"build_options\":[{\"name\":\"a\"}]}", false, "MissingField");
+    try parseFails(a, "{\"build_options\":[{\"name\":\"a\",\"value\":true}]}", false, "not a valid env_file");
+}
+
+test "provider env: build_options merge in hook order and become -D arguments after the CLI's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var acc: Accumulator = .{ .windows = false };
+    defer acc.deinit();
+    var diag: Diagnostic = .{};
+    const base = [_][]const u8{ "/zig", "build", "-Doptimize=ReleaseFast" };
+    // Nothing contributed: the CLI's argv unchanged.
+    try std.testing.expectEqual(@as(usize, 3), (try acc.zigArgs(a, &base, &diag)).len);
+    try acc.add(std.testing.allocator, a, "owner/toolchain", try parseOk(a, "{\"build_options\":[{\"name\":\"device\",\"value\":\"true\"},{\"name\":\"sdk\",\"value\":\"probe-device\"}]}", false), &diag);
+    try std.testing.expect(!acc.isEmpty());
+    // The same value again is fine; a new one follows; a different value
+    // conflicts naming both hooks.
+    try acc.add(std.testing.allocator, a, "owner/sign", try parseOk(a, "{\"build_options\":[{\"name\":\"device\",\"value\":\"true\"},{\"name\":\"team\",\"value\":\"ABC\"}]}", false), &diag);
+    try std.testing.expectError(error.InvalidEnvFile, acc.add(std.testing.allocator, a, "owner/late", try parseOk(a, "{\"build_options\":[{\"name\":\"sdk\",\"value\":\"probe-sim\"}]}", false), &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "'owner/toolchain' and 'owner/late'") != null);
+    const argv = try acc.zigArgs(a, &base, &diag);
+    const expected = [_][]const u8{ "/zig", "build", "-Doptimize=ReleaseFast", "-Ddevice=true", "-Dsdk=probe-device", "-Dteam=ABC" };
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, got| try std.testing.expectEqualStrings(want, got);
+    // A build option the CLI's argv already sets: a conflict naming both.
+    const clashing = [_][]const u8{ "/zig", "build", "-Dsdk=macosx" };
+    try std.testing.expectError(error.BuildOptionConflict, acc.zigArgs(a, &clashing, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "'-Dsdk=probe-device' from hook 'owner/toolchain'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "the CLI's '-Dsdk=macosx'") != null);
+    // A longer name sharing the prefix is not the same option.
+    _ = try acc.zigArgs(a, &.{ "/zig", "build", "-Dsdk-root=/x", "-Ddevices" }, &diag);
+    // Clones carry them; the environment comparison ignores them.
+    var copy = try acc.clone(std.testing.allocator);
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 3), copy.options.items.len);
+    try std.testing.expect(copy.sameAs(&Accumulator{ .windows = false }));
+    acc.reset();
+    try std.testing.expect(acc.isEmpty());
 }

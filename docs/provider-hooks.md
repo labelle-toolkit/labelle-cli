@@ -275,8 +275,16 @@ pass, which already configures the generated build; an `after generate` hook
 - The environment is rebuilt for every build, including every watched
   rebuild, so a hook that stops running leaves nothing behind.
 
+- On wire `1.6.0` the **target owner**'s `before generate` and `before
+  build` hooks may also write `"build_options": [{"name": "device",
+  "value": "true"}]`: each becomes `-D<name>=<value>` after the CLI's own
+  arguments on the fingerprint pass and the core compile. Any other hook,
+  or an owner capped below `1.6.0`, may not send the key; `optimize` and
+  `target` are the CLI's.
+
 The full rules are in the contract:
-[environment contributions](provider-contract-v1.md#environment-contributions).
+[environment contributions](provider-contract-v1.md#environment-contributions)
+and [build options](provider-contract-v1.md#build-options).
 A provider capped below `1.3.0` gets neither key, so its hooks can't
 contribute.
 

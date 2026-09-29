@@ -765,7 +765,17 @@ pub fn fixFingerprint(allocator: std.mem.Allocator, project_dir: []const u8, out
     // fingerprint — swallowing the real build into this probe (~0.15s vs
     // minutes; found while wiring the cli#284 progress feed, which showed
     // the cold compile landing inside the "generate" phase).
-    const result = try runZigWithEnv(allocator, output_dir, &.{ zig_exe, "build", "--list-steps" }, &zig_env);
+    // The target owner's `build_options` (wire 1.6.0+) reach the probe too:
+    // it configures the generated build, as the compile will.
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const probe_args: []const []const u8 = &.{ zig_exe, "build", "--list-steps" };
+    var diag: provider_env.Diagnostic = .{};
+    const args = if (contributed) |env| env.zigArgs(args_arena.allocator(), probe_args, &diag) catch |err| {
+        if (err == error.BuildOptionConflict) std.debug.print("labelle: {s}\n", .{diag.message});
+        return err;
+    } else probe_args;
+    const result = try runZigWithEnv(allocator, output_dir, args, &zig_env);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 

@@ -50,7 +50,7 @@ exe_suffix = ".exe" if os.name == "nt" else ""
 # `build.zig.zon` with a valid fingerprint, so the CLI's generation-time
 # fingerprint pass configures the build; PROBE_CONFIGURE_LOG=1 in a zig
 # invocation's environment makes the build's configure step append
-# `<optimize>|<PROBE_TOOLCHAIN or ->|<first PATH entry>` to
+# `<optimize>|<PROBE_TOOLCHAIN or ->|<first PATH entry>|<-Dprobe_opt or ->` to
 # `<target>/configure.log`, one line per zig invocation that configured it.
 FAKE_ASSEMBLER = '''import os, shutil, sys, zlib
 from pathlib import Path
@@ -85,13 +85,14 @@ elif argv and argv[0] == "generate":
         'const std = @import("std");\\n'
         'pub fn build(b: *std.Build) void {\\n'
         '    const optimize = b.standardOptimizeOption(.{});\\n'
+        '    const probe_opt = b.option([]const u8, "probe_opt", "an e2e build option") orelse "-";\\n'
         '    if (b.graph.environ_map.get("PROBE_CONFIGURE_LOG") != null) {\\n'
         '        const log_path = b.pathFromRoot("configure.log");\\n'
         '        const previous = std.Io.Dir.cwd().readFileAlloc(b.graph.io, log_path, b.allocator, .limited(65536)) catch "";\\n'
         '        const value = b.graph.environ_map.get("PROBE_TOOLCHAIN") orelse "-";\\n'
         '        const path_env = b.graph.environ_map.get("PATH") orelse "";\\n'
         '        const head = path_env[0 .. std.mem.indexOfScalar(u8, path_env, std.fs.path.delimiter) orelse path_env.len];\\n'
-        '        const line = b.fmt("{s}{s}|{s}|{s}\\\\n", .{ previous, @tagName(optimize), value, head });\\n'
+        '        const line = b.fmt("{s}{s}|{s}|{s}|{s}\\\\n", .{ previous, @tagName(optimize), value, head, probe_opt });\\n'
         '        std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = log_path, .data = line }) catch @panic("configure.log");\\n'
         '    }\\n'
         '    const exe = b.addExecutable(.{ .name = "game", .root_module = b.createModule(.{\\n'
@@ -301,8 +302,8 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
         # Contract 1.2.0: every hook names the generated target dir; only
         # `run`-step hooks carry the run options. 1.3.0 adds the cache dir
         # everywhere and an env_file on `before build`; 1.4.0 the command's
-        # last step (1.5.0, run.outcome_file, is the negotiated wire).
-        assert e["context"]["contract_version"] == "1.5.0", e
+        # last step; 1.5.0 run.outcome_file (1.6.0, build_options, is the negotiated wire).
+        assert e["context"]["contract_version"] == "1.6.0", e
         assert e["context"]["final_step"] == "build", e
         assert (e["context"]["env_file"] is not None) == (e["invocation"]["phase"] == "before"), e
         assert Path(e["context"]["target_dir"]) == target_dir.resolve(), e
@@ -744,7 +745,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     replaced = run("run", *run_flags)
     assert not marker.exists(), "the core launch ran although a replace run hook stands in for it"
     ctx = probe_context(probe_out, "deploy")
-    assert ctx["contract_version"] == "1.5.0" and ctx["final_step"] == "run", ctx
+    assert ctx["contract_version"] == "1.6.0" and ctx["final_step"] == "run", ctx
     # Its outcome file (wire 1.5.0) is covered by test/provider_run_outcome_e2e.py.
     assert Path(ctx["run"].pop("outcome_file")).name == "outcome", ctx
     assert ctx["run"] == {"env": expected_env, "args": ["a", "b"], "timeout_ms": 30000, "watch": None}, ctx
@@ -982,6 +983,39 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     assert "TargetDefaultRequiresOwnedTarget" in run("help").stderr
     a_manifest.write_text(manifest("fixture-a", OWNED, targets=["android"], defaults=(("android", "ReleaseSafe"), ("android", "ReleaseFast"))))
     assert "DuplicateTargetDefault" in run("help").stderr
+
+    # ── contract 1.6.0: the target owner's build_options (cli#471 D3) ─────
+    # The owner's `before generate` hook contributes `-Dprobe_opt=on`: the
+    # fingerprint pass and the compile both configure with it, after the
+    # CLI's own `-Doptimize`.
+    options_file = base / "build-options.json"
+    options_file.write_text(json.dumps({"build_options": [{"name": "probe_opt", "value": "on"}]}))
+    OPTS = [hook("tc", "generate", "before", target="android"), hook("stamp-owned", "build", "after", target="android")]
+    opts_env = {"PROBE_CONFIGURE_LOG": "1", "FAKE_WITH_ZON": "1", "PROVIDER_PROBE_ENV": f"tc|{options_file}"}
+    a_manifest.write_text(manifest("fixture-a", OPTS, targets=["android"], defaults=(("android", "ReleaseSafe"),)))
+    reset()
+    run("build", "--platform=android", extra_env=opts_env)
+    lines = [line.split("|") for line in owned_log.read_text().splitlines()]
+    assert [(c[0], c[3]) for c in lines] == [("Debug", "on"), ("ReleaseSafe", "on")], lines
+    # A CLI-owned option is refused before generation, naming the hook.
+    options_file.write_text(json.dumps({"build_options": [{"name": "optimize", "value": "Debug"}]}))
+    reset()
+    bad = run("build", "--platform=android", code=1, extra_env=opts_env)
+    assert "labelle: hook 'fixture-a/tc' wrote an invalid env_file: build option 'optimize' is owned by the CLI" in bad.stderr, bad.stderr
+    assert "FIXTURE_GENERATE" not in bad.stderr, bad.stderr
+    # The owner capped below wire 1.6.0 can't send the key.
+    options_file.write_text(json.dumps({"build_options": [{"name": "probe_opt", "value": "on"}]}))
+    a_manifest.write_text(manifest("fixture-a", OPTS, targets=["android"], contract=">=1.3.0 <1.6.0"))
+    reset()
+    bad = run("build", "--platform=android", code=1, extra_env=opts_env)
+    assert "build_options need provider contract >= 1.6.0; package 'fixture-a' speaks 1.5.0" in bad.stderr, bad.stderr
+    # Nor can a provider that doesn't own the target (`desktop` is the core's).
+    a_manifest.write_text(manifest("fixture-a", ENV_HOOKS))
+    reset()
+    bad = run("build", code=1, extra_env=dict(opts_env))
+    assert "build_options may only come from the owner of target 'desktop', not package 'fixture-a'" in bad.stderr, bad.stderr
+    assert "build ok" not in bad.stderr, bad.stderr
+
     a_manifest.write_text(manifest("fixture-a", A_HOOKS))
     declare(dep_b, dep_a)
 
