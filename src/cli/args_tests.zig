@@ -431,6 +431,17 @@ pub const ParseRunArgsPassthroughSpec = struct {
                 try std.testing.expectEqualStrings("x86_64-windows", r.docker_target.?);
             }
             {
+                // `generate --docker` generates on the host: never refused.
+                var iter = testIter("--docker --target=aarch64-macos");
+                defer iter.deinit();
+                _ = parseDirAndScene(&iter, "generate") orelse return error.TestFailed;
+            }
+            {
+                var iter = testIter("--docker --target=aarch64-macos.13.0");
+                defer iter.deinit();
+                try std.testing.expect(parseDirAndScene(&iter, "build") == null);
+            }
+            {
                 // Without --docker, --target is a warned no-op, not a refusal.
                 var iter = testIter("--target=aarch64-macos");
                 defer iter.deinit();

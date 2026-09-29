@@ -139,7 +139,9 @@ pub const ValueFlagSpec = struct {
             try std.testing.expect(parseDirAndScene(&iter, "build") == null);
         }
         test "`build --scene intro --docker`: both parsed" {
-            var iter = testIter("--scene intro --docker");
+            // An explicit Linux target: a bare --docker on a Mac host is
+            // refused (cli#471 X3), and this test is about flag values.
+            var iter = testIter("--scene intro --docker --target=x86_64-linux");
             defer iter.deinit();
             const r = parseDirAndScene(&iter, "build") orelse return error.TestFailed;
             try std.testing.expectEqualStrings("intro", r.scene.?);

@@ -392,14 +392,17 @@ pub fn parseOptimizeFlag(arg: []const u8, optimize: *?[]const u8, cmd_name: []co
 /// fetches a third-party copy of them. Linux and Windows cross builds stay.
 /// The effective target is the explicit `--target`, else the host's own
 /// (`docker.runBuild` falls back to it), so a bare `--docker` on a Mac is
-/// refused too. Without `--docker`, `--target` is a no-op the pipeline warns
-/// about, so nothing is refused here.
+/// refused too; an OS version suffix (`aarch64-macos.13.0`) does not hide
+/// it. Without `--docker`, `--target` is a no-op the pipeline warns about,
+/// so nothing is refused here. Only commands that reach the container build
+/// ask (`build`, `run`): `generate --docker` generates on the host.
 fn dockerBuildRefused(docker_build: bool, target: ?[]const u8, host_os: std.Target.Os.Tag) bool {
     if (!docker_build) return false;
     const t = target orelse return host_os == .macos;
     var parts = std.mem.splitScalar(u8, t, '-');
     _ = parts.next() orelse return false; // arch
-    const os = parts.next() orelse return false;
+    const os_query = parts.next() orelse return false;
+    const os = os_query[0 .. std.mem.indexOfScalar(u8, os_query, '.') orelse os_query.len];
     return std.mem.eql(u8, os, "macos");
 }
 
@@ -415,6 +418,8 @@ test "dockerBuildRefused: the effective docker target, macOS only" {
     try std.testing.expect(!dockerBuildRefused(true, "x86_64-windows", .macos));
     try std.testing.expect(!dockerBuildRefused(true, "x86_64-linux-gnu", .macos));
     try std.testing.expect(!dockerBuildRefused(true, "x86_64-linux-macosish", .linux));
+    try std.testing.expect(dockerBuildRefused(true, "aarch64-macos.13.0", .linux));
+    try std.testing.expect(dockerBuildRefused(true, "x86_64-macos.12.0...14.0-none", .linux));
     // No --target: the host's own target.
     try std.testing.expect(dockerBuildRefused(true, null, .macos));
     try std.testing.expect(!dockerBuildRefused(true, null, .linux));
@@ -496,7 +501,8 @@ pub fn parseDirAndScene(args: anytype, cmd_name: []const u8) ?struct { dir: []co
             dir_set = true;
         }
     }
-    if (refuseDockerBuild(cmd_name, docker_build, docker_target)) return null;
+    // `generate --docker` never reaches the container build.
+    if (!std.mem.eql(u8, cmd_name, "generate") and refuseDockerBuild(cmd_name, docker_build, docker_target)) return null;
     return .{ .dir = dir, .scene = scene, .platform = platform, .optimize = optimize, .docker_build = docker_build, .docker_target = docker_target, .bake = bake, .progress_mode = progress_mode, .linux_desktop = linux_desktop, .allow_older_cli = allow_older_cli };
 }
 
