@@ -252,8 +252,9 @@ in a fresh per-invocation directory, where it may write
 ```
 
 to contribute to the environment of everything that runs after it in the
-same command: the generation-time fingerprint pass (`zig build
---list-steps`), the core compile, and every later hook and replacement. The
+same command: the core generation itself (the `labelle-assembler generate`
+process, so a `before generate` hook can steer what is generated), the
+generation-time fingerprint pass (`zig build --list-steps`), the core compile, and every later hook and replacement. The
 build of a provider's own tool never sees it. This is how a provider that
 provisions a toolchain hands it to the build without the CLI knowing the
 toolchain: a `before generate` hook is early enough for the fingerprint
