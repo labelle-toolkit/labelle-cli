@@ -379,7 +379,7 @@ pub const RebuildCtx = struct {
             var asm_bin = self.asm_bin;
             // A failed regeneration fails this rebuild, never the session.
             asm_bin.fatal_on_failure = false;
-            assembler_proc.generate(asm_bin, a, self.project_dir, self.platform_tag) catch |err| {
+            assembler_proc.generate(asm_bin, a, self.project_dir, self.platform_tag, &self.hooks.env) catch |err| {
                 if (self.canceled()) return error.Canceled;
                 std.debug.print("labelle: rebuild generate failed ({s})\n", .{@errorName(err)});
                 return error.GenerateFailed;

@@ -86,7 +86,9 @@ pub fn run(cx: *const Context, generate_out: []const u8) !?u8 {
 
         // The assembler receives the resolved target NAME; the gate after the
         // install (`describe`'s `supported`) guarantees it can take it.
-        try assembler_proc.generate(cx.asm_bin, allocator, project_dir, target.name);
+        // The `before generate` hooks' environment reaches the assembler too
+        // (contract §2): a provider can steer generation, not only the compile.
+        try assembler_proc.generate(cx.asm_bin, allocator, project_dir, target.name, &hook_site.env);
 
         // (`target_name`/`target_dir` — .labelle/<backend>_<target>/, named by `describe` — are
         // computed up front, before the progress reporter init; see cli#284.)

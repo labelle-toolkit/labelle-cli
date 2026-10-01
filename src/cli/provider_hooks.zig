@@ -313,7 +313,8 @@ pub const Site = struct {
     /// The environment the hooks of the CURRENT build contributed through
     /// their `env_file` (contract §2, wire `1.3.0`+), merged in hook
     /// execution order. Every later hook and replacement runs with it, and
-    /// the pipeline applies it to the fingerprint pass and the compile. A
+    /// the pipeline applies it to the assembler's generate, the fingerprint
+    /// pass and the compile. A
     /// rebuild `reset`s it first, so a hook that no longer runs leaves
     /// nothing behind. The pipeline deinits it.
     env: provider_env.Accumulator = .{},

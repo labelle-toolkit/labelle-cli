@@ -29,6 +29,8 @@ const config = @import("config.zig");
 const supervise = @import("supervise.zig");
 const assembler = @import("assembler.zig");
 const progress = @import("progress.zig");
+const provider_env = @import("provider_env.zig");
+const runner = @import("runner.zig");
 
 /// Global floor: every subcommand the CLI delegates needs at least this
 /// protocol (`install`/`clean`/`upgrade` arrived at protocol 2, `init` at
@@ -104,7 +106,18 @@ pub const Assembler = struct {
         subcommand: []const u8,
         args: []const []const u8,
     ) !void {
-        return spawnAndWait(allocator, self.path, subcommand, args, self.fatal_on_failure);
+        return spawnAndWait(allocator, self.path, subcommand, args, self.fatal_on_failure, null);
+    }
+
+    /// `run` with an explicit child environment (null inherits ours).
+    pub fn runWithEnv(
+        self: Assembler,
+        allocator: std.mem.Allocator,
+        subcommand: []const u8,
+        args: []const []const u8,
+        env: ?*const std.process.Environ.Map,
+    ) !void {
+        return spawnAndWait(allocator, self.path, subcommand, args, self.fatal_on_failure, env);
     }
 };
 
@@ -207,6 +220,12 @@ pub fn runSubcommand(
 /// user-facing `--scene` flag; the assembler always compiles a stable
 /// artifact with `initial_prefab` taken straight from `project.labelle`.
 ///
+/// `contributed` is the environment this build's provider hooks have
+/// contributed so far (contract §2 `env_file`): the `before generate` hooks
+/// run first, so a provider can steer generation itself, not only the
+/// compile (a provider-owned generation switch, say).
+/// Null or empty: the assembler inherits the CLI's environment, as before.
+///
 /// On a non-zero exit code, returns `error.AssemblerFailed`; the binary's
 /// inherited stderr already explains the failure.
 pub fn generate(
@@ -214,13 +233,31 @@ pub fn generate(
     allocator: std.mem.Allocator,
     project_dir: []const u8,
     target: []const u8,
+    contributed: ?*const provider_env.Accumulator,
 ) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
     try buildGenerateArgs(allocator, &args, project_dir, target);
 
-    try asm_bin.run(allocator, "generate", args.items);
+    var base = try runner.buildEnvironWithExtra(allocator, &.{});
+    defer base.deinit();
+    var env_storage = try generateEnv(allocator, &base, contributed);
+    defer if (env_storage) |*m| m.deinit();
+    try asm_bin.runWithEnv(allocator, "generate", args.items, if (env_storage) |*m| m else null);
+}
+
+/// The environment `generate` hands the assembler: `base` (our own
+/// environment) with the hooks' contribution merged on top, or null (inherit
+/// unchanged) when nothing was contributed. Caller deinits a returned map.
+fn generateEnv(
+    allocator: std.mem.Allocator,
+    base: *const std.process.Environ.Map,
+    contributed: ?*const provider_env.Accumulator,
+) !?std.process.Environ.Map {
+    const env = contributed orelse return null;
+    if (env.isEmpty()) return null;
+    return try env.compose(allocator, base);
 }
 
 /// Build the argv slice for the assembler's `generate` subcommand.
@@ -256,6 +293,37 @@ test {
 /// argv this module sends to `labelle-assembler generate` must NOT
 /// contain `--scene`. The override travels at runtime via the
 /// `LABELLE_SCENE` env var the CLI injects when it spawns the game.
+/// The `before generate` hooks' environment reaches the assembler process
+/// (contract §2): a provider can steer generation, not only the compile.
+pub const GenerateEnvSpec = struct {
+    test "a contributed variable reaches the assembler's environment" {
+        const a = std.testing.allocator;
+        var acc: provider_env.Accumulator = .{};
+        defer acc.deinit();
+        var diag: provider_env.Diagnostic = .{};
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try acc.add(a, arena.allocator(), "p/toolchain", .{ .set = &.{.{ .name = "PROBE_GENERATE_SWITCH", .value = "1" }} }, &diag);
+        var base = std.process.Environ.Map.init(a);
+        defer base.deinit();
+        try base.put("KEEP_ME", "yes");
+        var env = (try generateEnv(a, &base, &acc)).?;
+        defer env.deinit();
+        try std.testing.expectEqualStrings("1", env.get("PROBE_GENERATE_SWITCH").?);
+        try std.testing.expectEqualStrings("yes", env.get("KEEP_ME").?);
+    }
+
+    test "no contribution: the assembler inherits our environment unchanged" {
+        const a = std.testing.allocator;
+        var base = std.process.Environ.Map.init(a);
+        defer base.deinit();
+        try std.testing.expect((try generateEnv(a, &base, null)) == null);
+        var empty: provider_env.Accumulator = .{};
+        defer empty.deinit();
+        try std.testing.expect((try generateEnv(a, &base, &empty)) == null);
+    }
+};
+
 pub const BuildGenerateArgsSpec = struct {
     pub const no_scene_forwarding = struct {
         test "argv to assembler never contains --scene" {
@@ -352,6 +420,7 @@ fn spawnAndWait(
     subcommand: []const u8,
     args: []const []const u8,
     fatal_on_failure: bool,
+    env: ?*const std.process.Environ.Map,
 ) !void {
     const io = config.globalIo();
 
@@ -366,6 +435,7 @@ fn spawnAndWait(
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
+        .environ_map = env,
     }) catch |err| {
         std.debug.print("labelle: could not launch assembler '{s}': {any}\n", .{ exe_path, err });
         return error.AssemblerFailed;
