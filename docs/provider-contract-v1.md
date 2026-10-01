@@ -6,7 +6,7 @@ Implementation progress: [project-local dispatch](provider-local-dispatch.md)
 implements the first executable slice of phase 2. Its explicit limitations
 do not weaken the normative contract below; full phase-2 acceptance is pending.
 
-This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.5.0` and still speaks `1.4.0`, `1.3.0`, `1.2.0`, `1.1.0` and `1.0.0`, and every context carries the negotiated version.
+This document supplies normative v1 details for [the architecture RFC](rfc-package-commands.md). Where the illustrative RFC conflicts, this contract takes precedence. Migration is breaking: no legacy forwarding or implicit provider injection. Contract negotiation checks a provider's declared semver range against the wire versions the CLI speaks; it never warns and proceeds. See [Wire versions and negotiation](#wire-versions-and-negotiation) below: the CLI implements `1.6.0` and still speaks `1.5.0`, `1.4.0`, `1.3.0`, `1.2.0`, `1.1.0` and `1.0.0`, and every context carries the negotiated version.
 
 ## 1. Package declarations and installed tools
 
@@ -50,7 +50,7 @@ Every field below is required on the wires that define it, except the optional `
 
 | Field | Type / rule |
 | --- | --- |
-| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"`, `"1.2.0"`, `"1.3.0"`, `"1.4.0"` or `"1.5.0"` for this decoder |
+| `contract_version` | The negotiated wire version: `"1.0.0"`, `"1.1.0"`, `"1.2.0"`, `"1.3.0"`, `"1.4.0"`, `"1.5.0"` or `"1.6.0"` for this decoder |
 | `invocation` | Object containing `kind`, `id`, `step`, `phase` |
 | `invocation.kind` | `"command"` or `"hook"` |
 | `invocation.id` | Command name or hook ID |
@@ -111,7 +111,22 @@ A `before generate`, `after generate` or `before build` hook receives `env_file`
 - **Format.** Strict JSON; both keys are optional; unknown keys, duplicate keys and wrong types are errors. Each `set` entry has exactly `name` and `value`.
 - **Names** match `[A-Za-z_][A-Za-z0-9_]*`, appear once per file, and are not CLI-owned. The CLI-owned names are a fixed table (`config.reserved_env` in `src/cli/config.zig`), not a `LABELLE_*` prefix ban: `PATH` (extend it with `path_prepend`), `ZIG_GLOBAL_CACHE_DIR`, `ZIG_LOCAL_CACHE_DIR`, every `LABELLE_*` variable the CLI reads (`LABELLE_HOME`, `LABELLE_CONTEXT`, `LABELLE_OFFLINE`, `LABELLE_ZIG`, `LABELLE_ASSEMBLER`, …) and the `labelle run` options it sets for the game. Any other name may be set, `LABELLE_*` or not; a toolchain library directory such as `LABELLE_SDL2_LIB` stays settable. A test fails when the CLI source spells a `LABELLE_*` name the table does not classify.
 - **`path_prepend`** entries are absolute paths for the host (drive-qualified or UNC on Windows) and contain no PATH separator.
-- **File states.** Missing: no contribution, which is normal. Empty, malformed (including a reserved name, a bad name or a relative PATH entry) or larger than 1 MiB: the command fails right after that hook, before any later zig invocation, with `labelle: hook '<package>/<id>' wrote an invalid env_file: <reason>`. Written by a hook that then failed: ignored; the hook's failure is the outcome.
+- **`build_options`** (wire `1.6.0`+, cli#471 D3): `[{"name": ..., "value": ...}]`, each appended as `-D<name>=<value>` to the core `zig build`. See [Build options](#build-options).
+- **File states.** Missing: no contribution, which is normal. Empty, malformed (including a reserved name, a bad name, a relative PATH entry or a refused build option) or larger than 1 MiB: the command fails right after that hook, before any later zig invocation, with `labelle: hook '<package>/<id>' wrote an invalid env_file: <reason>`. Written by a hook that then failed: ignored; the hook's failure is the outcome.
+
+#### Build options
+
+From wire `1.6.0` the file may also carry `build_options`, the Zig build options the target needs (a device build rather than a simulator one, say):
+
+```json
+{ "set": [ { "name": "SDK_ROOT", "value": "/abs/sdk" } ], "build_options": [ { "name": "device", "value": "true" } ] }
+```
+
+- **Who.** Only the **target owner**'s `before generate` and `before build` hooks, on a negotiated wire of `1.6.0` or newer. The key from any other provider, from an `after generate` hook or from an owner capped below `1.6.0` makes the file invalid, even as an empty list, with `labelle: hook '<package>/<id>' wrote an invalid env_file: build_options may only come from the owner of target '<t>', not package '<p>'` (or `... from a 'before generate' or 'before build' hook, not '<phase> <step>'`, or `build_options need provider contract >= 1.6.0; package '<p>' speaks <wire>`).
+- **Shape.** Each entry has exactly `name` and `value`. Names match `[A-Za-z_][A-Za-z0-9_-]*` and appear once per file (case-sensitive, like Zig's own options); values are strings without a NUL byte or a line break.
+- **CLI-owned options.** `optimize` (the CLI passes `-Doptimize` from `--optimize` or the owner's `target_defaults`) and `target` (`--docker --target`) are refused in the file: `build option 'optimize' is owned by the CLI (it passes -Doptimize itself)`. When the argv is assembled, a contributed option the CLI's own arguments already set fails the command before the zig invocation, naming both: `labelle: build option '-D<name>=<value>' from hook '<package>/<id>' conflicts with the CLI's '-D<name>=...'`.
+- **Merge.** As for `set`: hook execution order, then list order; two hooks giving one option different values is `labelle: hook environment conflict: build option '-D<name>' is set to different values by hooks '<a>' and '<b>'`; the same value twice is fine.
+- **Scope.** The options follow the CLI's own arguments, in that order, on every later `zig build` of the same build: the generation-time fingerprint pass (`zig build --list-steps -D...`, which a `before generate` contribution reaches and a `before build` one does not) and the core compile (`zig build -Doptimize=ReleaseFast -Ddevice=true`), watched rebuilds included (each starts over, like the environment). They never reach a hook's process, a provider's own tool build or the game. A `replace build` hook stands in for the compile, so there the options reach only the fingerprint pass. A watched rebuild whose options changed publishes normally: the running replacement's environment is what a session compares, not the options.
 
 **Merge.** Contributions apply in hook execution order (phases, `after_hooks` edges, then qualified ID) and accumulate across the phases of one build:
 
@@ -169,10 +184,11 @@ The cold build is published as generation `0` before the replacement starts. A f
 
 ### Wire versions and negotiation
 
-The CLI implements contract `1.5.0` and speaks every wire version listed here, newest first:
+The CLI implements contract `1.6.0` and speaks every wire version listed here, newest first:
 
 | Wire | Adds |
 | --- | --- |
+| `1.6.0` | `build_options` in env_file (additive minor, cli#471 D3). The context itself is unchanged; only the target owner's `before generate` / `before build` `env_file` may carry the key. |
 | `1.5.0` | `outcome_file` in the `run` object (additive minor, cli#473). |
 | `1.4.0` | `final_step` on every context (additive minor, cli#443). |
 | `1.3.0` | `cache_dir` and `env_file` on every context, and `watch` in the `run` object (additive minor, CLI 2.1.0). |
@@ -182,7 +198,8 @@ The CLI implements contract `1.5.0` and speaks every wire version listed here, n
 
 For each invocation the CLI negotiates the **newest** wire version the provider's `command_contract` range admits and writes it as `contract_version`; a range that admits none of them is `UnsupportedContract` at discovery. Keys a wire version does not define are never emitted in it, so a provider decoding strictly (unknown fields are errors, as above) keeps working:
 
-- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.5.0` and must accept the keys `1.1.0`, `1.2.0`, `1.3.0`, `1.4.0` and `1.5.0` add. A provider declaring such a range promises exactly that.
+- `>=1.0.0 <2.0.0` admits every additive v1 minor, so it receives `1.6.0` and must accept the keys `1.1.0`, `1.2.0`, `1.3.0`, `1.4.0` and `1.5.0` add (`1.6.0` adds none to the context, only what an owner may write). A provider declaring such a range promises exactly that.
+- `<1.6.0` (for example `>=1.3.0 <1.6.0`) receives the exact `1.5.0` wire: its `env_file` may not carry `build_options`.
 - `<1.5.0` (for example `>=1.3.0 <1.5.0`) receives the exact `1.4.0` wire, without `run.outcome_file`: its run replacement cannot report a timeout, so a status-0 exit is always a clean one.
 - `<1.4.0` (for example `>=1.0.0 <1.4.0`) receives the exact `1.3.0` wire, without `final_step`: its hooks run exactly as on `1.4.0` but cannot tell which command runs them.
 - `<1.3.0` (for example `>=1.0.0 <1.3.0`) receives the exact `1.2.0` wire, without `cache_dir`, `env_file` or `run.watch`: its hooks cannot contribute an environment and its run replacement cannot run a watch session.

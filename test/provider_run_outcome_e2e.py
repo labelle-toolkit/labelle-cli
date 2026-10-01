@@ -142,7 +142,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-run-outcome-") as temp:
     assert ran() == both, ran()
     assert "after-run hooks skipped" not in clean.stderr, clean.stderr
     ctx = deploy_context()
-    assert ctx["contract_version"] == "1.5.0", ctx
+    assert ctx["contract_version"] == "1.6.0", ctx
     outcome_file = Path(ctx["run"]["outcome_file"])
     # Absolute, in a private directory the CLI removed once the replacement exited.
     assert outcome_file.is_absolute() and outcome_file.name == "outcome", ctx

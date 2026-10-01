@@ -161,7 +161,7 @@ test "provider run outcome: the wire context carries outcome_file from 1.5.0 onl
     provider.dir = try std.fs.path.join(a, &.{ abs, "pkg" });
     const open = try dispatch.wireContext(provider, host, abs, run, cache);
     try open.validate(true);
-    try std.testing.expectEqualStrings("1.5.0", open.contract_version);
+    try std.testing.expectEqualStrings(contract.version, open.contract_version);
     try std.testing.expectEqualStrings(run.run_options.?.outcome_file.?, open.run.?.outcome_file.?);
     try std.testing.expect(carried(provider));
     // Capped below 1.5.0: the run options without `outcome_file`.

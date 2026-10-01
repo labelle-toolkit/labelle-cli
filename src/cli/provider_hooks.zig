@@ -419,7 +419,7 @@ pub fn runPhaseReporting(site: *Site, list: []const Planned, step: contract.Step
             if (site.reporter) |r| r.finishFailed(code, "hook failed");
             return code;
         }
-        if (env_file) |path| try absorbEnvFile(site, a, planned.qualified, path);
+        if (env_file) |path| try absorbEnvFile(site, a, planned, invocation, path);
         if (outcome_file) |path| reported.?.* = try run_outcome.absorb(site, a, planned.qualified, path);
     }
     return 0;
@@ -448,7 +448,13 @@ fn privateDir(a: std.mem.Allocator, host: dispatch.Host, kind: []const u8) ![]co
 /// environment (contract §2): absent is no contribution; empty, malformed
 /// or conflicting fails the command here, before any later zig invocation,
 /// naming the hook.
-fn absorbEnvFile(site: *Site, a: std.mem.Allocator, qualified: []const u8, path: []const u8) !void {
+///
+/// `build_options` (wire `1.6.0`+) are accepted only from the target
+/// owner's `before generate` / `before build` hooks on a negotiated wire of
+/// `1.6.0` or newer: the key from anyone else is an invalid file, even
+/// empty, since that wire or slot does not define it.
+fn absorbEnvFile(site: *Site, a: std.mem.Allocator, planned: Planned, invocation: contract.Invocation, path: []const u8) !void {
+    const qualified = planned.qualified;
     const read = provider_env.readFile(a, path, site.env_file_cap) catch |err| switch (err) {
         error.StreamTooLong => return rejectEnvFile(site, qualified, try std.fmt.allocPrint(a, "the file is larger than the {d}-byte cap", .{site.env_file_cap})),
         else => return err,
@@ -459,6 +465,16 @@ fn absorbEnvFile(site: *Site, a: std.mem.Allocator, qualified: []const u8, path:
         error.InvalidEnvFile => return rejectEnvFile(site, qualified, diag.message),
         else => return err,
     };
+    if (file.build_options != null) {
+        const provider = planned.provider;
+        if (!provider.meta.ownsTarget(site.target))
+            return rejectEnvFile(site, qualified, try std.fmt.allocPrint(a, "build_options may only come from the owner of target '{s}', not package '{s}'", .{ site.target, provider.meta.name }));
+        if (!contract.buildOptionsSlot(invocation))
+            return rejectEnvFile(site, qualified, try std.fmt.allocPrint(a, "build_options may only come from a 'before generate' or 'before build' hook, not '{s} {s}'", .{ @tagName(invocation.phase.?), @tagName(invocation.step.?) }));
+        const wire = manifest.negotiate(provider.meta.command_contract orelse "") catch "none";
+        if (!contract.carriesBuildOptions(wire))
+            return rejectEnvFile(site, qualified, try std.fmt.allocPrint(a, "build_options need provider contract >= {s}; package '{s}' speaks {s}", .{ contract.build_options_since, provider.meta.name, wire }));
+    }
     site.env.add(site.backing, a, qualified, file, &diag) catch |err| switch (err) {
         error.InvalidEnvFile => {
             std.debug.print("labelle: hook environment conflict: {s}\n", .{diag.message});

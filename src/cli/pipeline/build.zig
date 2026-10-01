@@ -7,6 +7,7 @@ const runner = @import("../runner.zig");
 const bundle = @import("../bundle.zig");
 const linux_desktop = @import("../linux_desktop.zig");
 const provider_hooks = @import("../provider_hooks.zig");
+const provider_env = @import("../provider_env.zig");
 const Context = @import("context.zig").Context;
 
 /// Provider hooks on `build` (contract §6) wrap the whole core build —
@@ -46,6 +47,11 @@ pub fn run(
         null;
     defer if (composed_env) |*m| m.deinit();
     const compile_env: ?*const std.process.Environ.Map = if (composed_env) |*m| m else zig_env_ptr;
+    // The target owner's `build_options` (wire 1.6.0+) follow the CLI's own
+    // arguments; one the CLI already passes is a conflict naming both.
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const compile_args = try compileArgs(args_arena.allocator(), hook_site, zig_args, reporter);
     core_build: {
         if (hook_plans.build.replace) |replacement| {
             const code = try provider_hooks.runPhase(hook_site, &.{replacement}, .build, .replace, build_out);
@@ -72,7 +78,7 @@ pub fn run(
             // terminal unaltered (nothing is captured or eaten).
             std.debug.print("labelle: building...\n", .{});
             r.beginPhaseOrStep(.compile, "zig build");
-            const build_code = try runner.runZigInheritProgress(allocator, target_dir, zig_args, compile_env, r);
+            const build_code = try runner.runZigInheritProgress(allocator, target_dir, compile_args, compile_env, r);
             // Wipe the spinner line before anything else prints on it.
             r.clearSpinner();
             if (build_code != 0) {
@@ -82,7 +88,7 @@ pub fn run(
             }
         } else {
             std.debug.print("labelle: building...\n", .{});
-            const build_result = try runner.runZigWithEnv(allocator, target_dir, zig_args, compile_env);
+            const build_result = try runner.runZigWithEnv(allocator, target_dir, compile_args, compile_env);
             defer allocator.free(build_result.stdout);
             defer allocator.free(build_result.stderr);
 
@@ -127,6 +133,21 @@ pub fn run(
         if (code != 0) return code;
     }
     return null;
+}
+
+/// `zig_args` plus the build options the hooks contributed so far (contract
+/// §2 `build_options`), or the conflict with a CLI-owned argument reported
+/// and `error.BuildOptionConflict`.
+pub fn compileArgs(a: std.mem.Allocator, hook_site: *const provider_hooks.Site, zig_args: []const []const u8, reporter: anytype) ![]const []const u8 {
+    var diag: provider_env.Diagnostic = .{};
+    return hook_site.env.zigArgs(a, zig_args, &diag) catch |err| switch (err) {
+        error.BuildOptionConflict => {
+            std.debug.print("labelle: {s}\n", .{diag.message});
+            if (reporter) |r| r.finishFailed(1, "build option conflict");
+            return err;
+        },
+        else => return err,
+    };
 }
 
 /// `labelle bundle` (cli#359): the exe is built; wrap it. Packaging

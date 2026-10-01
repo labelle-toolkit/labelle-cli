@@ -230,3 +230,52 @@ test "provider hooks env: the contributing hook of a plan is found by slot and n
     provider.meta.command_contract = "<1.3.0";
     try std.testing.expect(hooks.planContributor(try plan_for(a, &provider, .generate), try plan_for(a, &provider, .build)) == null);
 }
+
+test "provider hooks env: build_options come only from the target owner's before generate/build hooks on wire 1.6.0+" {
+    const list = [_]manifest.Hook{ hook("gen", .generate, .before), hook("post", .generate, .after), hook("pre", .build, .before) };
+    var h: Harness = undefined;
+    try h.init(&list);
+    defer h.deinit();
+    const opts = "{\"build_options\":[{\"name\":\"device\",\"value\":\"true\"}]}";
+    // Not the owner of `desktop`: refused, even though the wire and slot fit.
+    Spy.writes = &.{.{ .id = "gen", .bytes = opts }};
+    try std.testing.expectError(error.InvalidHookEnvFile, hooks.runPhase(&h.site, &.{h.planned(0)}, .generate, .before, h.out()));
+    try std.testing.expect(h.site.env.isEmpty());
+    // An empty list is the key all the same.
+    Spy.writes = &.{.{ .id = "gen", .bytes = "{\"build_options\":[]}" }};
+    try std.testing.expectError(error.InvalidHookEnvFile, hooks.runPhase(&h.site, &.{h.planned(0)}, .generate, .before, h.out()));
+    // The owner, in `before generate` and `before build`: accepted, in hook order.
+    h.provider.meta.targets = &.{"desktop"};
+    Spy.writes = &.{
+        .{ .id = "gen", .bytes = opts },
+        .{ .id = "pre", .bytes = "{\"set\":[{\"name\":\"PROBE_VAR\",\"value\":\"v\"}],\"build_options\":[{\"name\":\"sdk\",\"value\":\"probe-device\"}]}" },
+    };
+    try std.testing.expectEqual(@as(u8, 0), try hooks.runPhase(&h.site, &.{h.planned(0)}, .generate, .before, h.out()));
+    try std.testing.expectEqual(@as(u8, 0), try hooks.runPhase(&h.site, &.{h.planned(2)}, .build, .before, h.out()));
+    try std.testing.expectEqual(@as(usize, 2), h.site.env.options.items.len);
+    try std.testing.expectEqualStrings("pkg/gen", h.site.env.options.items[0].hook);
+    try std.testing.expectEqualStrings("sdk", h.site.env.options.items[1].name);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: @import("provider_env.zig").Diagnostic = .{};
+    const argv = try h.site.env.zigArgs(arena.allocator(), &.{ "zig", "build", "-Doptimize=Debug" }, &diag);
+    try std.testing.expectEqual(@as(usize, 5), argv.len);
+    try std.testing.expectEqualStrings("-Ddevice=true", argv[3]);
+    try std.testing.expectEqualStrings("-Dsdk=probe-device", argv[4]);
+    h.site.env.reset();
+    // `after generate` may contribute an environment, never build options.
+    Spy.writes = &.{.{ .id = "post", .bytes = opts }};
+    try std.testing.expectError(error.InvalidHookEnvFile, hooks.runPhase(&h.site, &.{h.planned(1)}, .generate, .after, h.out()));
+    Spy.writes = &.{.{ .id = "post", .bytes = "{\"set\":[{\"name\":\"PROBE_VAR\",\"value\":\"v\"}]}" }};
+    try std.testing.expectEqual(@as(u8, 0), try hooks.runPhase(&h.site, &.{h.planned(1)}, .generate, .after, h.out()));
+    h.site.env.reset();
+    // The owner on a 1.5.0 wire: the key doesn't exist there.
+    h.provider.meta.command_contract = ">=1.3.0 <1.6.0";
+    Spy.writes = &.{.{ .id = "gen", .bytes = opts }};
+    try std.testing.expectError(error.InvalidHookEnvFile, hooks.runPhase(&h.site, &.{h.planned(0)}, .generate, .before, h.out()));
+    try std.testing.expect(h.site.env.isEmpty());
+    // Its plain environment still merges.
+    Spy.writes = &.{.{ .id = "gen", .bytes = "{\"set\":[{\"name\":\"PROBE_VAR\",\"value\":\"v\"}]}" }};
+    try std.testing.expectEqual(@as(u8, 0), try hooks.runPhase(&h.site, &.{h.planned(0)}, .generate, .before, h.out()));
+    try h.envDirsGone();
+}

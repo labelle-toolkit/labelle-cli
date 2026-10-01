@@ -101,7 +101,7 @@ test "provider dispatch: build_number reaches only a provider whose range admits
     try std.testing.expectEqualStrings("42", open.build_number.?);
     const open_wire = try std.json.Stringify.valueAlloc(a, open, .{});
     try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"build_number\":\"42\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"contract_version\":\"1.5.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open_wire, "\"contract_version\":\"1.6.0\"") != null);
     // A range capped at the 1.1 wire still gets the key, and nothing newer.
     provider.meta.command_contract = ">=1.0.0 <1.2.0";
     const mid = try wireContext(provider, host, abs, run, cache);

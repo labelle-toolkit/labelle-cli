@@ -2,18 +2,20 @@
 const std = @import("std");
 
 /// The contract version this CLI implements: the newest wire it speaks.
-pub const version = "1.5.0";
+pub const version = "1.6.0";
 
 /// Every wire version this CLI can speak, newest first. A minor is additive:
 /// `1.1.0` is `1.0.0` plus the optional `build_number` key, `1.2.0` is
 /// `1.1.0` plus `target_dir` and the `run` options, `1.3.0` is `1.2.0`
 /// plus `cache_dir` and `env_file`, `1.4.0` is `1.3.0` plus
-/// `final_step`, and `1.5.0` is `1.4.0` plus `run.outcome_file` (§2).
+/// `final_step`, `1.5.0` is `1.4.0` plus `run.outcome_file` (§2), and
+/// `1.6.0` is `1.5.0` plus `build_options` in the target owner's
+/// `env_file` (§2 "Environment contributions"; the context is unchanged).
 /// The version a provider receives is negotiated from its `command_contract` range
 /// (`provider_manifest.negotiate`), so a provider pinned to `<1.1.0` keeps
 /// receiving the exact `1.0.0` wire and never sees a key it would reject as
 /// unknown.
-pub const supported_versions = [_][]const u8{ version, "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0" };
+pub const supported_versions = [_][]const u8{ version, "1.5.0", "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0" };
 
 /// The first wire version that carries `build_number`.
 pub const build_number_since = "1.1.0";
@@ -32,6 +34,9 @@ pub const final_step_since = "1.4.0";
 
 /// The first wire version whose `run` context carries `outcome_file`.
 pub const outcome_context_since = "1.5.0";
+
+/// The first wire version whose `env_file` may carry `build_options`.
+pub const build_options_since = "1.6.0";
 
 fn atLeast(wire_version: []const u8, since: []const u8) bool {
     const wire = std.SemanticVersion.parse(wire_version) catch return false;
@@ -72,6 +77,22 @@ pub fn carriesFinalStep(wire_version: []const u8) bool {
 /// `outcome_file` key (null on every `run` hook but the replacement).
 pub fn carriesOutcomeContext(wire_version: []const u8) bool {
     return atLeast(wire_version, outcome_context_since);
+}
+
+/// True when a provider on the wire `contract_version` may write
+/// `build_options` to its `env_file` (the target owner's `before generate`
+/// and `before build` hooks only, `buildOptionsSlot`).
+pub fn carriesBuildOptions(wire_version: []const u8) bool {
+    return atLeast(wire_version, build_options_since);
+}
+
+/// Whether the hook `invocation` may contribute `build_options` through its
+/// `env_file`, ownership and wire aside: `before generate` and `before build`
+/// only (an `after generate` hook's `env_file` may carry the environment but
+/// not build options).
+pub fn buildOptionsSlot(invocation: Invocation) bool {
+    if (!envFileSlot(invocation)) return false;
+    return invocation.phase.? == .before;
 }
 
 /// Whether a command whose last lifecycle step is `final` runs the hooks of
@@ -767,7 +788,7 @@ test "build_number is optional on the wire and only for bundle hooks" {
 }
 
 test "a 1.0.0 context never carries build_number; every wire otherwise validates" {
-    try std.testing.expectEqualStrings("1.5.0", version);
+    try std.testing.expectEqualStrings("1.6.0", version);
     try std.testing.expect(carriesBuildNumber("1.1.0"));
     try std.testing.expect(carriesBuildNumber("1.2.0"));
     try std.testing.expect(carriesBuildNumber("1.3.0"));
@@ -809,8 +830,31 @@ test "a 1.0.0 context never carries build_number; every wire otherwise validates
     try value.validate(true);
     value.contract_version = "1.5.0";
     try value.validate(true);
+    // `1.6.0` adds no context key (its `build_options` live in the env_file).
     value.contract_version = "1.6.0";
+    try value.validate(true);
+    value.contract_version = "1.7.0";
     try std.testing.expectError(error.UnsupportedContract, value.validate(true));
+}
+
+test "1.6.0: build_options are wire-gated and slot-gated to before generate / before build" {
+    try std.testing.expect(carriesBuildOptions("1.6.0"));
+    try std.testing.expect(!carriesBuildOptions("1.5.0"));
+    try std.testing.expect(!carriesBuildOptions("1.0.0"));
+    const slot = struct {
+        fn of(step: Step, phase: Phase) bool {
+            return buildOptionsSlot(.{ .kind = .hook, .id = "h", .step = step, .phase = phase });
+        }
+    }.of;
+    try std.testing.expect(slot(.generate, .before));
+    try std.testing.expect(slot(.build, .before));
+    // `after generate` contributes an environment, never build options.
+    try std.testing.expect(!slot(.generate, .after));
+    try std.testing.expect(!slot(.build, .after));
+    try std.testing.expect(!slot(.build, .replace));
+    try std.testing.expect(!slot(.run, .before));
+    try std.testing.expect(!slot(.bundle, .before));
+    try std.testing.expect(!buildOptionsSlot(.{ .kind = .command, .id = "c", .step = null, .phase = null }));
 }
 
 /// A project hook context on `wire` for `step`, from the projectless fixture.

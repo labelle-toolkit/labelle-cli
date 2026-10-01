@@ -437,7 +437,14 @@ pub const RebuildCtx = struct {
             null;
         defer if (composed) |*m| m.deinit();
         const env: ?*const std.process.Environ.Map = if (composed) |*m| m else self.zig_env;
-        const res = runner.runZigWithEnv(a, self.target_dir, self.zig_args, env) catch |err| {
+        var args_arena = std.heap.ArenaAllocator.init(a);
+        defer args_arena.deinit();
+        var diag: @import("../provider_env.zig").Diagnostic = .{};
+        const args = self.hooks.env.zigArgs(args_arena.allocator(), self.zig_args, &diag) catch |err| {
+            std.debug.print("labelle: rebuild: {s}\n", .{if (err == error.BuildOptionConflict) diag.message else @errorName(err)});
+            return error.BuildFailed;
+        };
+        const res = runner.runZigWithEnv(a, self.target_dir, args, env) catch |err| {
             if (self.canceled()) return error.Canceled;
             std.debug.print("labelle: rebuild could not spawn zig ({s})\n", .{@errorName(err)});
             return error.ZigSpawnFailed;
