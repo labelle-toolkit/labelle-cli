@@ -97,6 +97,14 @@ pub fn parseFile(a: std.mem.Allocator, bytes: []const u8, windows: bool, diag: *
         .duplicate_field_behavior = .@"error",
         .allocate = .alloc_always,
     }) catch |err| return fail(a, diag, "not a valid env_file document ({s}); expected {{\"set\":[{{\"name\":...,\"value\":...}}],\"path_prepend\":[...]}}", .{@errorName(err)});
+    // An optional slice reads an omitted key and an explicit `null` alike,
+    // and only a present key is gated (owner, step, wire) by the caller. So
+    // `null` is refused here: the key is either absent or an array.
+    if (parsed.build_options == null) {
+        const raw = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch null;
+        if (raw) |value| if (value == .object and value.object.contains("build_options"))
+            return fail(a, diag, "build_options must be an array (omit the key to contribute none)", .{});
+    }
     for (parsed.set, 0..) |entry, i| {
         if (!contract.envName(entry.name)) return fail(a, diag, "invalid variable name '{s}' (names match [A-Za-z_][A-Za-z0-9_]*)", .{entry.name});
         if (config.reservedEnvName(entry.name, windows)) {
@@ -601,6 +609,11 @@ test "provider env: build_options are parsed and validated (wire 1.6.0)" {
     // Absent is null (so the caller can refuse the key where it isn't
     // allowed); an empty list is present.
     try std.testing.expect((try parseOk(a, "{}", false)).build_options == null);
+    // An explicit null is not "absent": it would dodge the caller's gating.
+    {
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(error.InvalidEnvFile, parseFile(a, "{\"build_options\":null}", false, &diag));
+    }
     try std.testing.expectEqual(@as(usize, 0), (try parseOk(a, "{\"build_options\":[]}", false)).build_options.?.len);
     for ([_][]const u8{ "", "1abc", "-dash", "has space", "a=b", "a.b" }) |name| {
         const doc = try std.fmt.allocPrint(a, "{{\"build_options\":[{{\"name\":\"{s}\",\"value\":\"x\"}}]}}", .{name});
