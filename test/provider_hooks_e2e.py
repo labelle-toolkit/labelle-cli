@@ -914,7 +914,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     # plan with a hook that may contribute is refused before anything runs:
     # no hook, no generation, no build.
     reset()
-    refused = run("build", "--docker", code=1, extra_env=probe_env)
+    # Choose a container-supported target explicitly; a Mac host otherwise
+    # fails target validation before reaching the contribution guard.
+    refused = run("build", "--docker", "--target=x86_64-linux", code=1, extra_env=probe_env)
     assert "hook 'fixture-a/tc' may contribute an environment for target 'desktop'" in refused.stderr, refused.stderr
     assert "--docker doesn't carry provider environment contributions; build without --docker" in refused.stderr, refused.stderr
     assert "FIXTURE_GENERATE" not in refused.stderr and not log(target_dir) and not log(zig_out), refused.stderr
