@@ -934,7 +934,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     replaced_dir = project / ".labelle" / "raylib_android"
     a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="android"),
                                                  hook("build-owned", "build", "replace", target="android")], targets=["android"]))
-    for docker_args in (("build", "--platform=android", "--docker"), ("generate", "--platform=android", "--docker")):
+    for docker_args in (("build", "--platform=android", "--docker", "--target=x86_64-linux"), ("generate", "--platform=android", "--docker")):
         reset()
         refused = run(*docker_args, code=1, extra_env=contributing)
         assert "--docker builds the `desktop` target only" in refused.stderr, (docker_args, refused.stderr)
