@@ -222,7 +222,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-targets-") as temp:
     # `--docker` builds the core target only (RFC cli#466 D5): a provider
     # target is refused before resolution, so before the no-provider verdict
     # and before anything is installed or generated.
-    for args in (("build", "--docker", "--platform=wasm"), ("run", "--docker", "--platform=probe-target"),
+    # A Mac's default target is rejected before provider resolution. Use a
+    # supported container target to exercise the provider-target guard.
+    for args in (("build", "--docker", "--platform=wasm", "--target=x86_64-linux"), ("run", "--docker", "--platform=probe-target", "--target=x86_64-linux"),
                  ("generate", "--docker", "--platform=probe-target")):
         refused = run(*args, code=1)
         assert "--docker builds the `desktop` target only" in refused.stderr, (args, refused.stderr)

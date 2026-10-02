@@ -914,7 +914,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     # plan with a hook that may contribute is refused before anything runs:
     # no hook, no generation, no build.
     reset()
-    refused = run("build", "--docker", code=1, extra_env=probe_env)
+    # Choose a container-supported target explicitly; a Mac host otherwise
+    # fails target validation before reaching the contribution guard.
+    refused = run("build", "--docker", "--target=x86_64-linux", code=1, extra_env=probe_env)
     assert "hook 'fixture-a/tc' may contribute an environment for target 'desktop'" in refused.stderr, refused.stderr
     assert "--docker doesn't carry provider environment contributions; build without --docker" in refused.stderr, refused.stderr
     assert "FIXTURE_GENERATE" not in refused.stderr and not log(target_dir) and not log(zig_out), refused.stderr
@@ -932,7 +934,7 @@ with tempfile.TemporaryDirectory(prefix="labelle-hooks-") as temp:
     replaced_dir = project / ".labelle" / "raylib_android"
     a_manifest.write_text(manifest("fixture-a", [hook("tc", "generate", "before", target="android"),
                                                  hook("build-owned", "build", "replace", target="android")], targets=["android"]))
-    for docker_args in (("build", "--platform=android", "--docker"), ("generate", "--platform=android", "--docker")):
+    for docker_args in (("build", "--platform=android", "--docker", "--target=x86_64-linux"), ("generate", "--platform=android", "--docker")):
         reset()
         refused = run(*docker_args, code=1, extra_env=contributing)
         assert "--docker builds the `desktop` target only" in refused.stderr, (docker_args, refused.stderr)
