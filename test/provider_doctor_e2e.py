@@ -59,9 +59,9 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     project = base / "project"
     project.mkdir()
     # `.backend = .wgpu`, `.gamepad = .none`: the core checks need no system
-    # library here, so whether they pass depends only on the host's Python
-    # (checked below). The explicit backend also shows which project the
-    # core half read.
+    # library here. Backend interpretation belongs to the assembler, which
+    # this provider-only fixture deliberately does not install. The explicit
+    # project-root report below proves which project the core half read.
     def write_project(extra_deps=(), extra=""):
         all_deps = ", ".join([*deps, *extra_deps])
         (project / "project.labelle").write_text(
@@ -127,13 +127,12 @@ with tempfile.TemporaryDirectory(prefix="labelle-provider-doctor-") as temp:
     assert len(invocations("alpha-pkg")) == 3
 
     # From a subdirectory, BOTH halves use the project root: the core half
-    # reports the root and the project's own backend, and the provider
+    # reports the root, and the provider
     # doctors run. The count check comes first so it tracks the runs above.
     nested = project / "src" / "deep"
     nested.mkdir(parents=True)
     sub = run(cwd=nested)
     assert f"  project: {project}\n" in sub.stderr, sub.stderr
-    assert "backend: wgpu" in sub.stderr, sub.stderr
     assert "Provider doctors: 2 checked, 0 failed" in sub.stderr, sub.stderr
     assert len(invocations("alpha-pkg")) == 4 and len(invocations("beta-pkg")) == 4
     # Neither the core half nor a provider wrote anything under the subdirectory.
