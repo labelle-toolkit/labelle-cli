@@ -63,7 +63,8 @@ check_caches() {
 
 # First `.<field> = "<value>"` that is not in a comment.
 zon_field() {
-  sed -n -E "s/^[[:space:]]*\\.$1[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\\1/p" "$2" 2>/dev/null | head -n 1
+  [ -f "$2" ] || return 0
+  sed -n -E "s/^[[:space:]]*\.$1[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" "$2" | head -n 1 || true
 }
 
 check_project() {
@@ -100,7 +101,13 @@ check_project() {
 check_emsdk() {
   local lock="$1" manifest="$2" web settings rel
   # The web provider pinned in labelle.lock (.name = "web" ... .version).
-  web="$(grep -E '\.name[[:space:]]*=[[:space:]]*"web"' "$lock" 2>/dev/null | sed -n -E 's/.*\.version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' | head -n 1)"
+  # labelle.lock first; a project without one yet declares it in project.labelle.
+  web=""
+  local f
+  for f in "$lock" "$manifest"; do
+    if [ -n "$web" ] || [ ! -f "$f" ]; then continue; fi
+    web="$(grep -E '\.name[[:space:]]*=[[:space:]]*"web"' "$f" | sed -n -E 's/.*\.version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' | head -n 1 || true)"
+  done
   if [ -z "$web" ]; then
     say "no web provider in labelle.lock; emsdk check skipped"
     return
