@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# labelle-builder-smoke-python: print the Python to run a project's
+# Playwright smoke with, given its requirements file.
+#
+# Usage:  py="$(labelle-builder-smoke-python tools/web_smoke/requirements.txt)"
+#
+# When the requirements are the image's own pins (Playwright + Pillow from
+# versions.env), that is the image's read-only venv, whose Chromium and system
+# libraries were installed at image build time: no download, no pip.
+# Otherwise a venv keyed on the file's contents is created in the cache
+# ($XDG_CACHE_HOME/labelle-web-smoke/<hash>) and its Chromium is installed into
+# $XDG_CACHE_HOME/ms-playwright; the printed path is then a wrapper that sets
+# PLAYWRIGHT_BROWSERS_PATH. That fallback cannot install system libraries
+# (no root): a Playwright far from the image's may need a newer image.
+# Progress goes to stderr; stdout is only the path.
+set -euo pipefail
+
+req="${1:?usage: labelle-builder-smoke-python <requirements.txt>}"
+[ -f "$req" ] || { echo "labelle-builder-smoke-python: no file '$req'" >&2; exit 2; }
+
+# Compare ignoring comments, blank lines, case, whitespace and CRLF.
+normalize() { sed -e 's/#.*//' -e 's/\r$//' -e 's/[[:space:]]//g' "$1" | grep -v '^$' | tr '[:upper:]' '[:lower:]' | sort; }
+
+if [ "$(normalize "$req")" = "$(normalize "${LABELLE_BUILDER_ROOT:-/opt/labelle}/web-smoke-requirements.txt")" ]; then
+  echo "labelle-builder-smoke-python: requirements match the image; using $LABELLE_WEB_SMOKE_VENV" >&2
+  echo "$LABELLE_WEB_SMOKE_VENV/bin/python"
+  exit 0
+fi
+
+hash="$(normalize "$req" | sha256sum | cut -c1-12)"
+venv="$XDG_CACHE_HOME/labelle-web-smoke/$hash"
+browsers="$XDG_CACHE_HOME/ms-playwright"
+echo "labelle-builder-smoke-python: requirements differ from the image's pins; using the cached venv $venv" >&2
+mkdir -p "$(dirname "$venv")"
+exec 9> "$venv.lock"
+flock 9
+if [ ! -x "$venv/run-python" ]; then
+  rm -rf "$venv"
+  python3 -m venv "$venv"
+  "$venv/bin/pip" install -q -r "$req" >&2
+  cat > "$venv/run-python" <<EOF
+#!/bin/sh
+PLAYWRIGHT_BROWSERS_PATH="$browsers" exec "$venv/bin/python" "\$@"
+EOF
+  chmod 0755 "$venv/run-python"
+fi
+PLAYWRIGHT_BROWSERS_PATH="$browsers" "$venv/bin/python" -m playwright install chromium >&2
+echo "$venv/run-python"

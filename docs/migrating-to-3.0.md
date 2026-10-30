@@ -134,7 +134,10 @@ labelle: --docker builds the `desktop` target only; target 'wasm' comes from a p
   build it without --docker (docs/migrating-to-3.0.md)
 ```
 
-Build those targets without `--docker`. `labelle build --docker
+Build those targets without `--docker`. For a containerised `wasm` build in
+CI, run the whole `labelle` pipeline inside the
+[WASM builder image](wasm-builder-image.md) instead (a CI `image:`, not a
+`--docker` path). `labelle build --docker
 [--target=<triple>]` for `desktop` is unchanged for Linux and Windows
 targets. Since cli#471 X3 a macOS target is refused, whether given as
 `--target=<arch>-macos` or taken from a Mac host when `--target` is

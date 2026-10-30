@@ -1,0 +1,185 @@
+# Build, test and publish the Labelle WASM builder image (labelle-cli#529).
+#
+# Never runs on PRs or branch pushes:
+#   - tag `wasm-builder-v<IMAGE_VERSION>` (IMAGE_VERSION = <LABELLE_CLI_VERSION>
+#     -<IMAGE_REVISION> from docker/wasm-builder/versions.env, e.g.
+#     wasm-builder-v4.1.2-1): build, test, push, attest;
+#   - manual dispatch: build and test; push only when `push` is ticked.
+# The CLI's own release tags (`v*`) do not match and never trigger this.
+#
+# The registry is a parameter until one is agreed (docs/wasm-builder-image.md
+# "Publishing"): dispatch input, else repository variable
+# WASM_BUILDER_REGISTRY / WASM_BUILDER_IMAGE, else GHCR. GHCR logs in with the
+# workflow token; any other registry needs the WASM_BUILDER_REGISTRY_USERNAME
+# and WASM_BUILDER_REGISTRY_PASSWORD secrets.
+#
+# What is pushed is the exact image the tests ran against (docker push of the
+# tested build), under one immutable version tag; an existing tag is refused.
+name: WASM builder image
+
+on:
+  push:
+    tags:
+      - 'wasm-builder-v*'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push to the registry after the tests (otherwise build + test only)
+        type: boolean
+        default: false
+      registry:
+        description: Registry host (default vars.WASM_BUILDER_REGISTRY, else ghcr.io)
+        type: string
+        default: ''
+      image:
+        description: Repository path (default vars.WASM_BUILDER_IMAGE, else labelle-toolkit/labelle-wasm-builder)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-builder-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Lint Dockerfile and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: docker/wasm-builder/Dockerfile
+          config: docker/wasm-builder/.hadolint.yaml
+      - name: shellcheck
+        working-directory: docker/wasm-builder/bin
+        run: shellcheck -x -P .. labelle-builder-check labelle-builder-inventory labelle-builder-smoke-python
+
+  image:
+    name: Build, test, publish
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      PUSH: ${{ github.event_name == 'push' || inputs.push }}
+      REGISTRY: ${{ inputs.registry || vars.WASM_BUILDER_REGISTRY || 'ghcr.io' }}
+      IMAGE: ${{ inputs.image || vars.WASM_BUILDER_IMAGE || 'labelle-toolkit/labelle-wasm-builder' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Read versions.env
+        id: v
+        run: |
+          set -euo pipefail
+          get() { sed -n "s/^$1=//p" docker/wasm-builder/versions.env; }
+          version="$(get LABELLE_CLI_VERSION)-$(get IMAGE_REVISION)"
+          {
+            echo "version=$version"
+            echo "ref=$REGISTRY/$IMAGE:$version"
+            echo "epoch=$(git log -1 --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "wasm-builder-v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match versions.env (expected wasm-builder-v$version)"
+            exit 1
+          fi
+          echo "Image version $version -> $REGISTRY/$IMAGE (push: $PUSH)"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          SOURCE_DATE_EPOCH: ${{ steps.v.outputs.epoch }}
+        run: |
+          docker build \
+            --pull \
+            --build-arg IMAGE_VERSION="$VERSION" \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            --tag labelle-wasm-builder:test \
+            docker/wasm-builder
+
+      - name: Self-test as the image's non-root user
+        run: docker run --rm labelle-wasm-builder:test labelle-builder-check --self-test
+
+      - name: Fresh named volume, then a second fresh container on it
+        run: |
+          set -euo pipefail
+          docker volume create wasm-builder-ci-cache
+          # A new named volume takes /cache's ownership from the image, so the
+          # non-root user can write it without a chown.
+          docker run --rm -v wasm-builder-ci-cache:/cache labelle-wasm-builder:test \
+            bash -c 'labelle-builder-check --self-test && echo first > "$LABELLE_HOME/probe"'
+          docker run --rm -v wasm-builder-ci-cache:/cache labelle-wasm-builder:test \
+            bash -c 'test "$(cat "$LABELLE_HOME/probe")" = first && ls -la "$LABELLE_BUILDER_CACHE_ROOT"'
+
+      - name: Inventory
+        run: |
+          docker run --rm labelle-wasm-builder:test labelle-builder-check --inventory | tee inventory.json
+          {
+            echo '### Toolchain inventory'
+            echo '```json'
+            cat inventory.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in (GHCR)
+        if: env.PUSH == 'true' && env.REGISTRY == 'ghcr.io'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Log in (other registry)
+        if: env.PUSH == 'true' && env.REGISTRY != 'ghcr.io'
+        env:
+          USERNAME: ${{ secrets.WASM_BUILDER_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.WASM_BUILDER_REGISTRY_PASSWORD }}
+        run: |
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+            echo "::error::set WASM_BUILDER_REGISTRY_USERNAME/PASSWORD secrets to push to $REGISTRY"
+            exit 1
+          fi
+          echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+
+      - name: Push the tested image
+        id: push
+        if: env.PUSH == 'true'
+        env:
+          REF: ${{ steps.v.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # Version tags are immutable: a rebuild is a new IMAGE_REVISION.
+          if docker manifest inspect "$REF" > /dev/null 2>&1; then
+            echo "::error::$REF already exists; bump IMAGE_REVISION in versions.env instead of overwriting it"
+            exit 1
+          fi
+          docker tag labelle-wasm-builder:test "$REF"
+          docker push "$REF"
+          repo_digest="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$REF" | grep -F "$REGISTRY/$IMAGE@" | head -n 1)"
+          digest="${repo_digest#*@}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Published'
+            echo
+            echo "- tag: \`$REF\`"
+            echo "- digest: \`$digest\`"
+            echo "- pin consumers to: \`$REF@$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Provenance attestation
+        if: env.PUSH == 'true' && env.REGISTRY == 'ghcr.io'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# labelle-builder-check: preflight for a job running in the Labelle WASM
+# builder image (docs/wasm-builder-image.md).
+#
+# Usage:
+#   labelle-builder-check [--project DIR]   # in CI, from the project root
+#   labelle-builder-check --self-test       # the image alone (publish CI)
+#   labelle-builder-check --inventory       # print the baked inventory
+#
+# Project mode:
+#   1. the caches under $LABELLE_BUILDER_CACHE_ROOT are writable by this user
+#      (creates the keyed directories; prints the chown fix when they're not);
+#   2. the project's pins agree with the image: labelle.lock .cli_version =
+#      the image's CLI, project.labelle .zig_version (when set) = the image's
+#      Zig, and the web provider's emsdk.version (settings file, else the
+#      default) = the image's emsdk. A mismatch fails: the image would build
+#      with a toolchain the project did not ask for. Set
+#      LABELLE_BUILDER_ALLOW_PIN_MISMATCH=1 to downgrade that to a warning.
+#   3. seeds the assembler: when project.labelle's .assembler_version is the
+#      image's seed version and the cache has none, the verified seed is
+#      copied in, so the CLI does not download it. Any other version is left
+#      to the CLI, which downloads and verifies it as usual.
+set -euo pipefail
+
+# shellcheck source=../versions.env
+LABELLE_BUILDER_ROOT="${LABELLE_BUILDER_ROOT:-/opt/labelle}"
+. "$LABELLE_BUILDER_ROOT/versions.env"
+
+project="."
+mode=project
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) project="${2:?--project needs a directory}"; shift 2 ;;
+    --self-test) mode=self-test; shift ;;
+    --inventory) mode=inventory; shift ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "labelle-builder-check: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+failures=0
+say() { echo "labelle-builder-check: $*"; }
+warn() { echo "labelle-builder-check: warning: $*" >&2; }
+fail() { echo "labelle-builder-check: error: $*" >&2; failures=$((failures + 1)); }
+pin_mismatch() {
+  if [ "${LABELLE_BUILDER_ALLOW_PIN_MISMATCH:-0}" = 1 ]; then warn "$* (allowed by LABELLE_BUILDER_ALLOW_PIN_MISMATCH=1)"; else fail "$*"; fi
+}
+
+check_caches() {
+  local d
+  say "user $(id -u):$(id -g), cache key ${LABELLE_BUILDER_CACHE_KEY}"
+  for d in "$LABELLE_HOME" "$EM_CACHE" "$XDG_CACHE_HOME"; do
+    if ! mkdir -p "$d" 2>/dev/null || ! [ -w "$d" ]; then
+      fail "cache directory $d is not writable by uid $(id -u)"
+      echo "  fix the mount's ownership once, e.g.:" >&2
+      echo "    docker run --rm -u 0 -v <volume>:${LABELLE_BUILDER_CACHE_ROOT} <image> chown -R $(id -u):$(id -g) ${LABELLE_BUILDER_CACHE_ROOT}" >&2
+    fi
+  done
+  # Mark the key as used, for age-based pruning of old keys.
+  touch "${LABELLE_BUILDER_CACHE_ROOT}/${LABELLE_BUILDER_CACHE_KEY}/.last-used" 2>/dev/null || true
+  say "LABELLE_HOME=$LABELLE_HOME EM_CACHE=$EM_CACHE"
+}
+
+# First `.<field> = "<value>"` that is not in a comment.
+zon_field() {
+  sed -n -E "s/^[[:space:]]*\\.$1[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\\1/p" "$2" 2>/dev/null | head -n 1
+}
+
+check_project() {
+  local lock="$project/labelle.lock" manifest="$project/project.labelle" v
+  if [ ! -f "$manifest" ]; then
+    fail "no project.labelle in '$project' (run from the project root or pass --project)"
+    return
+  fi
+
+  # CLI: labelle.lock's .cli_version is what developers and the shell
+  # runner use (FP ensure-tool.sh); the image must carry the same CLI.
+  v="$(zon_field cli_version "$lock")"
+  if [ -z "$v" ]; then
+    warn "labelle.lock has no .cli_version; image CLI is ${LABELLE_CLI_VERSION}"
+  elif [ "$v" != "$LABELLE_CLI_VERSION" ]; then
+    pin_mismatch "labelle.lock pins CLI $v, this image carries ${LABELLE_CLI_VERSION}: use the image built for CLI $v (docs/wasm-builder-image.md, compatibility)"
+  else
+    say "CLI ${LABELLE_CLI_VERSION} matches labelle.lock"
+  fi
+
+  # Zig: LABELLE_ZIG overrides the CLI's own resolution, so a project pin
+  # must be checked here or it would be silently ignored.
+  v="$(zon_field zig_version "$manifest")"
+  if [ -n "$v" ] && [ "$v" != "$ZIG_VERSION" ]; then
+    pin_mismatch "project.labelle pins Zig $v, this image's LABELLE_ZIG is ${ZIG_VERSION}"
+  else
+    say "Zig ${ZIG_VERSION}${v:+ matches project.labelle}"
+  fi
+
+  check_emsdk "$lock" "$manifest"
+  seed_assembler "$manifest"
+}
+
+check_emsdk() {
+  local lock="$1" manifest="$2" web settings rel
+  # The web provider pinned in labelle.lock (.name = "web" ... .version).
+  web="$(grep -E '\.name[[:space:]]*=[[:space:]]*"web"' "$lock" 2>/dev/null | sed -n -E 's/.*\.version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' | head -n 1)"
+  if [ -z "$web" ]; then
+    say "no web provider in labelle.lock; emsdk check skipped"
+    return
+  fi
+  case ",${LABELLE_WEB_VERSIONS}," in
+    *",$web,"*) ;;
+    *) warn "labelle-web $web is not one this image was checked against (${LABELLE_WEB_VERSIONS}); its default emsdk may not be ${EMSDK_VERSION}" ;;
+  esac
+  # Its settings file, from project.labelle's .provider_config entry.
+  rel="$(tr -d '\n' < "$manifest" | grep -o -E '\.package[[:space:]]*=[[:space:]]*"web"[[:space:]]*,[[:space:]]*\.file[[:space:]]*=[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' | head -n 1 || true)"
+  settings=""
+  [ -n "$rel" ] && settings="$project/$rel"
+  local out source version
+  out="$(python3 - "$settings" "$EMSDK_VERSION" <<'PY'
+import json, sys
+path, default = sys.argv[1], sys.argv[2]
+cfg = {}
+if path:
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        pass
+em = cfg.get("emsdk") or {}
+print(em.get("source") or "managed", em.get("version") or default)
+PY
+)"
+  source="${out% *}"
+  version="${out#* }"
+  case "$source" in
+    managed|inherited)
+      if [ "$version" != "$EMSDK_VERSION" ]; then
+        pin_mismatch "the web provider asks for emsdk $version, this image's EMSDK is ${EMSDK_VERSION} and the provider would use it without comparing; run with EMSDK unset (env -u EMSDK) to let the provider install $version into the cache, or use a matching image"
+      else
+        say "emsdk ${EMSDK_VERSION} (labelle-web $web, emsdk.source $source)"
+      fi ;;
+    *) warn "emsdk.source is '$source': the image's EMSDK is not used; the provider resolves emsdk $version itself (into the cache)" ;;
+  esac
+}
+
+seed_assembler() {
+  local v dest
+  v="$(zon_field assembler_version "$1")"
+  if [ "$v" != "$LABELLE_ASSEMBLER_VERSION" ]; then
+    say "assembler ${v:-<default>} is not the image seed (${LABELLE_ASSEMBLER_VERSION}); the CLI resolves it"
+    return
+  fi
+  dest="$LABELLE_HOME/assembler/$v/labelle-assembler"
+  if [ -x "$dest" ]; then
+    say "assembler $v already cached"
+  elif mkdir -p "$(dirname "$dest")" && install -m 0755 "$LABELLE_BUILDER_ROOT/seed/assembler/$v/labelle-assembler" "$dest.tmp.$$" && mv -f "$dest.tmp.$$" "$dest"; then
+    say "assembler $v seeded into the cache"
+  else
+    warn "could not seed assembler $v; the CLI will download it"
+  fi
+}
+
+expect() { # expect <description> <command...>: say on success, fail otherwise
+  local what="$1"; shift
+  if "$@"; then say "$what"; else fail "$what: check failed"; fi
+}
+contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+
+self_test() {
+  local got
+  got="$("$LABELLE_ZIG" version 2>&1 || true)"
+  expect "zig '$got' = ${ZIG_VERSION}" test "$got" = "$ZIG_VERSION"
+  got="$(labelle version 2>&1 | head -n 1 || true)"
+  expect "labelle '$got' carries ${LABELLE_CLI_VERSION}" contains "$got" "$LABELLE_CLI_VERSION"
+  # A throwaway cache: the self-test must not populate the real one.
+  got="$(EM_CACHE="$(mktemp -d)" "$EMSDK/upstream/emscripten/emcc" --version 2>&1 | head -n 1 || true)"
+  expect "emcc '$got' carries ${EMSDK_VERSION}" contains "$got" "$EMSDK_VERSION"
+  got="$(node --version 2>&1 || true)"
+  expect "node '$got' = v${EMSDK_NODE_VERSION}" test "$got" = "v${EMSDK_NODE_VERSION}"
+  expect "libatomic.so.1 present" test -e /usr/lib/x86_64-linux-gnu/libatomic.so.1
+  expect "wasm-opt runs" "$EMSDK/upstream/bin/wasm-opt" --version
+  expect "running as non-root uid $(id -u)" test "$(id -u)" != 0
+  if "$LABELLE_WEB_SMOKE_VENV/bin/python" - <<'PY'
+import asyncio
+from playwright.async_api import async_playwright
+async def main():
+    async with async_playwright() as p:
+        b = await p.chromium.launch(headless=True, args=["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"])
+        page = await b.new_page()
+        webgl2 = await page.evaluate("() => !!document.createElement('canvas').getContext('webgl2')")
+        await b.close()
+        if not webgl2:
+            raise SystemExit("labelle-builder-check: chromium launched without WebGL2 (SwiftShader)")
+        print("labelle-builder-check: chromium", b.version, "launches headless with WebGL2")
+asyncio.run(main())
+PY
+  then :; else fail "headless Chromium did not launch"; fi
+}
+
+case "$mode" in
+  inventory) cat "$LABELLE_BUILDER_ROOT/toolchain-inventory.json"; exit 0 ;;
+  self-test) check_caches; self_test ;;
+  project) check_caches; check_project ;;
+esac
+
+if [ "$failures" -gt 0 ]; then
+  echo "labelle-builder-check: $failures problem(s); see docs/wasm-builder-image.md in labelle-cli" >&2
+  exit 1
+fi
+say "ok"

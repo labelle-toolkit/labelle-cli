@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# labelle-builder-inventory: print the image's toolchain inventory as JSON.
+#
+# Run once at image build time (as root) to write
+# /opt/labelle/toolchain-inventory.json; safe to re-run in a container to
+# compare what is actually installed with what that file recorded.
+# Pins come from /opt/labelle/versions.env; everything under "measured" is
+# asked of the installed tool itself.
+set -euo pipefail
+
+# shellcheck source=../versions.env
+. /opt/labelle/versions.env
+
+first_line() { "$@" 2>&1 | head -n 1 || true; }
+
+# emcc --version must not write into a real cache: give it a throwaway one.
+em_tmp="$(mktemp -d)"
+trap 'rm -rf "$em_tmp"' EXIT
+
+INV_ZIG="$(first_line "${LABELLE_ZIG:-zig}" version)"
+INV_LABELLE="$(first_line labelle version)"
+INV_EMCC="$(EM_CACHE="$em_tmp" first_line "${EMSDK:-/opt/emsdk}/upstream/emscripten/emcc" --version)"
+INV_NODE="$(first_line node --version)"
+INV_PYTHON="$(first_line python3 --version)"
+INV_PLAYWRIGHT="$(first_line "${LABELLE_WEB_SMOKE_VENV:-/opt/labelle/web-smoke-venv}/bin/python" -m playwright --version)"
+INV_BROWSERS="$(find "${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}" -mindepth 1 -maxdepth 1 -printf "%f " 2>/dev/null || true)"
+INV_DPKG="$(dpkg-query -W -f '${Package}=${Version}\n' libatomic1 git python3 ca-certificates curl libnss3 libgbm1 2>/dev/null || true)"
+# shellcheck source=/dev/null
+INV_OS="$(. /etc/os-release && echo "$PRETTY_NAME")"
+INV_ARCH="$(uname -m)"
+INV_PIP="$("${LABELLE_WEB_SMOKE_VENV:-/opt/labelle/web-smoke-venv}/bin/python" -m pip freeze --all 2>/dev/null || true)"
+export INV_ZIG INV_LABELLE INV_EMCC INV_NODE INV_PYTHON INV_PLAYWRIGHT INV_BROWSERS INV_DPKG INV_OS INV_ARCH INV_PIP
+
+python3 - <<'PY'
+import json, os
+
+def pins(path="/opt/labelle/versions.env"):
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k] = v
+    return out
+
+e = os.environ.get
+print(json.dumps({
+    "schema": 1,
+    "image": {
+        "name": "labelle-wasm-builder",
+        "version": e("LABELLE_BUILDER_IMAGE_VERSION", "dev"),
+        "vcs_ref": e("LABELLE_BUILDER_VCS_REF", "unknown"),
+        "base": e("LABELLE_BUILDER_BASE_IMAGE", "unknown"),
+        "os": e("INV_OS"),
+        "arch": e("INV_ARCH"),
+    },
+    "pins": pins(),
+    "measured": {
+        "zig": e("INV_ZIG"),
+        "labelle": e("INV_LABELLE"),
+        "emcc": e("INV_EMCC"),
+        "node": e("INV_NODE"),
+        "python": e("INV_PYTHON"),
+        "playwright": e("INV_PLAYWRIGHT"),
+        "playwright_browsers": e("INV_BROWSERS", "").split(),
+        "dpkg": [l for l in e("INV_DPKG", "").splitlines() if l],
+        "web_smoke_venv": [l for l in e("INV_PIP", "").splitlines() if l],
+    },
+    "paths": {
+        "zig": e("LABELLE_ZIG"),
+        "emsdk": e("EMSDK"),
+        "playwright_browsers": e("PLAYWRIGHT_BROWSERS_PATH"),
+        "web_smoke_venv": e("LABELLE_WEB_SMOKE_VENV"),
+        "assembler_seed": "/opt/labelle/seed/assembler",
+    },
+    "caches": {
+        "key": e("LABELLE_BUILDER_CACHE_KEY"),
+        "root": e("LABELLE_BUILDER_CACHE_ROOT"),
+        "LABELLE_HOME": e("LABELLE_HOME"),
+        "EM_CACHE": e("EM_CACHE"),
+        "XDG_CACHE_HOME": e("XDG_CACHE_HOME"),
+    },
+}, indent=2))
+PY

@@ -178,6 +178,10 @@ labelle: --docker builds the `desktop` target only; target 'wasm' comes from a p
   build it without --docker (docs/migrating-to-3.0.md)
 ```
 
+A container build of `wasm` runs the CLI itself inside the
+[WASM builder image](wasm-builder-image.md), so the provider's hooks run where
+the build runs and this refusal is not involved.
+
 The resolved target is a string. It names the generated tree
 (`.labelle/<backend>_<target>/`, from the provisional name, so a refused
 target leaves only the `failed` record there), is passed to the assembler's

@@ -1,0 +1,54 @@
+# Example: Flying Platform's `test-game-wasm` on a GitLab Docker executor,
+# running in the Labelle WASM builder image (labelle-cli#529).
+#
+# A sketch for adoption (FP's own change is a separate ticket); the
+# commands are FP's current .gitlab-ci.yml job, minus the shell-executor
+# toolchain bootstrap (`.toolchain` / tools/ci/ensure-tool.sh), which the
+# image replaces. Runner-side setup (the /cache volume, memory, shm,
+# concurrency) is in docs/wasm-builder-image.md "GitLab Docker executor".
+#
+# Pin the image by DIGEST. The tag is for humans; the digest is what runs.
+# Bump both together when labelle.lock's .cli_version moves (the preflight
+# fails on a mismatch).
+
+.wasm-builder:
+  image:
+    name: ghcr.io/labelle-toolkit/labelle-wasm-builder:4.1.2-1@sha256:<digest from the release summary>
+  # A runner registered with the Docker executor. A shell-executor runner
+  # (fp-ubuntu today) ignores `image:` and would run on the host toolchain.
+  tags: [fp-docker]
+  variables:
+    # The repo is cloned fresh into the job's container; keep it shallow.
+    GIT_DEPTH: "50"
+
+test-game-wasm:
+  extends: .wasm-builder
+  stage: test
+  timeout: 30m
+  script:
+    # Caches writable, labelle.lock/project.labelle/web settings agree with
+    # the image (CLI, Zig, emsdk), assembler seeded. Fails before anything
+    # is fetched when the image does not match the project's pins.
+    - labelle-builder-check
+    - labelle version
+    # Pinned, sha256-verified android/web provider archives (labelle-cli#405).
+    - labelle providers fetch
+    - labelle bundle --platform=wasm --optimize=ReleaseSafe --output dist
+    - tools/ci/prepare-web-dist.sh
+    # The image's Playwright venv + Chromium when the requirements match its
+    # pins; otherwise a venv keyed on the file, in the cache volume.
+    - py="$(labelle-builder-smoke-python tools/web_smoke/requirements.txt)"
+    - '"$py" -m unittest discover -s tools/web_smoke -p "test_*.py" -v'
+    # Threaded build with the production COOP/COEP headers, then the
+    # single-threaded fallback without them.
+    - timeout 8m "$py" tools/web_smoke/smoke.py --bundle dist --isolated --expect-threads yes --output .labelle/web-smoke-threaded
+    - timeout 8m "$py" tools/web_smoke/smoke.py --bundle dist --expect-threads no --output .labelle/web-smoke-fallback
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths:
+      - .labelle/web-smoke-threaded/
+      - .labelle/web-smoke-fallback/
+      - .labelle/web-smoke-controls/
+      # The game bundle itself, so a failed smoke can be reproduced locally.
+      - dist/

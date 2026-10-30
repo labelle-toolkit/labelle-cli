@@ -1,0 +1,11 @@
+# hadolint config for docker/wasm-builder/Dockerfile (labelle-cli#529).
+ignored:
+  # FROM uses ${BASE_IMAGE}, whose default is a tag pinned by digest.
+  - DL3006
+  # apt packages follow noble-updates at build time on a digest-pinned base;
+  # their installed versions are recorded in toolchain-inventory.json. Every
+  # toolchain that decides build output (Zig, CLI, assembler, emsdk,
+  # Playwright/Chromium) is pinned by version and checksum or commit.
+  - DL3008
+  # versions.env is COPYed into the image before every RUN that sources it.
+  - SC1091
