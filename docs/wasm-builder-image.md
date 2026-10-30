@@ -3,22 +3,23 @@
 A versioned Docker image in which the ordinary `labelle` pipeline builds,
 bundles and smoke-tests a game for `--platform=wasm`, as a non-root user, with
 no host toolchain (labelle-cli#529, epic #528 work package 1). It is meant for
-CI runners with a Docker executor, GitLab first.
+CI: GitHub Actions (`docker run`) and GitLab runners with a Docker
+executor.
 
 | | |
 |---|---|
-| Source | [`docker/wasm-builder/`](../docker/wasm-builder/): `Dockerfile`, `versions.env` (every pin), `bin/` (the helper scripts baked into the image), `gitlab-ci.example.yml` |
-| Publish | [`.github/workflows/wasm-builder-image.yml`](../.github/workflows/wasm-builder-image.yml), on a `wasm-builder-v<version>` tag or a manual dispatch |
-| Image | `ghcr.io/labelle-toolkit/labelle-wasm-builder:<cli version>-<revision>` until a registry is agreed ([Publishing](#publishing)) |
-| Platform | `linux/amd64` only. Android (SDK/NDK) is out of scope: a separate future variant (cli#331). |
+| Source | [`docker/wasm-builder/`](../docker/wasm-builder/): `Dockerfile`, `versions.env` (every pin, per architecture), `web-smoke-requirements.lock`, `lib/pins.sh` (build helper), `bin/` (the helper scripts baked into the image), `e2e/` (end-to-end fixture), `gitlab-ci.example.yml` |
+| Build, test, publish | [`.github/workflows/wasm-builder-image.yml`](../.github/workflows/wasm-builder-image.yml): tests on pull requests; publishes on a `wasm-builder-v<version>` tag or a manual dispatch |
+| Image | `ghcr.io/labelle-toolkit/labelle-wasm-builder:<cli version>-<revision>`, a **public** GHCR package ([Publishing](#publishing)) |
+| Platforms | `linux/amd64` and `linux/arm64`, one multi-arch tag. Android (SDK/NDK) is out of scope: a separate future variant (cli#331). |
 
 Contents:
 
-- [What is in the image](#what-is-in-the-image)
+- [What is in the image](#what-is-in-the-image), [arm64](#arm64)
 - [Relationship to `--docker`](#relationship-to---docker)
 - [Image and toolkit compatibility](#image-and-toolkit-compatibility)
 - [Caches](#caches): layout, mounts, ownership and UID, cache keys and invalidation, concurrency, pruning
-- [GitLab Docker executor](#gitlab-docker-executor)
+- [GitHub Actions](#github-actions), [GitLab Docker executor](#gitlab-docker-executor)
 - [Resources](#resources)
 - [Publishing](#publishing), [Upgrading](#upgrading), [Rolling back](#rolling-back)
 - [Validation status](#validation-status)
@@ -26,25 +27,34 @@ Contents:
 ## What is in the image
 
 Every version and checksum lives in
-[`docker/wasm-builder/versions.env`](../docker/wasm-builder/versions.env);
-the Dockerfile sources it and verifies each download against it. The image
-carries a copy (`/opt/labelle/versions.env`) and a **toolchain inventory**
-measured from the installed tools at build time,
-`/opt/labelle/toolchain-inventory.json` (`labelle-builder-check --inventory`
-prints it; the publish run also puts it in the workflow summary).
+[`docker/wasm-builder/versions.env`](../docker/wasm-builder/versions.env),
+per architecture where the artifact differs (`_amd64` / `_arm64`, picked by
+Docker's `TARGETARCH`). The Dockerfile sources it and verifies **every
+download** against it before use; each checksum was recomputed from a
+download of the published file when it was pinned. The image carries a copy
+(`/opt/labelle/versions.env`) and a **toolchain inventory** measured from the
+installed tools at build time, `/opt/labelle/toolchain-inventory.json`
+(`labelle-builder-check --inventory` prints it; CI puts it in the run
+summary).
 
-| Component | Version (image 4.1.2-1) | Where it comes from | In the image |
-|---|---|---|---|
-| Base | `ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852` | Docker Hub index digest for `24.04`, resolved 2026-10-30 | `FROM` |
-| labelle CLI | 4.1.2, sha256 `43d84d3b…1712d28` | Flying Platform's `labelle.lock` `.cli_version` and `tools/ci/ensure-tool.sh` (`labelle@v4.1.2`); checksum re-verified against `releases.labelle.games` | `/usr/local/bin/labelle` |
-| Zig | 0.16.0, sha256 `70e49664…2ba3d00` | the CLI's `DEFAULT_ZIG_VERSION`/`minimum_zig_version`, FP's `ensure-tool.sh zig@0.16.0` | `/opt/zig`, `LABELLE_ZIG=/opt/zig/zig` |
-| labelle-assembler | 0.124.0, sha256 `4d169a6c…5b82d5af` | FP's `project.labelle` `.assembler_version`; digest from the release's `SHA256SUMS` | a **seed** at `/opt/labelle/seed/assembler/0.124.0/` ([below](#image-and-toolkit-compatibility)) |
-| emsdk / Emscripten | 4.0.9, commit `3bcf1dcd01f0…` | labelle-web 0.4.0's default `emsdk.version` and pinned tag commit (`src/provider/emsdk.zig`) | `/opt/emsdk`, activated, `EMSDK=/opt/emsdk` |
-| Node | 20.18.0 | bundled by emsdk 4.0.9 (`node-20.18.0-64bit` in its manifest) | `/opt/emsdk/node/20.18.0_64bit/bin`, on `PATH` |
-| Python | 3.12 (Ubuntu 24.04 `python3`) | what emsdk/emcc and FP's smoke run with; FP's `tools/web_smoke/README.md` uses 3.12 | `/usr/bin/python3` |
-| Playwright + Pillow | 1.64.1 + 11.3.0 | FP's `tools/web_smoke/requirements.txt` | venv `/opt/labelle/web-smoke-venv` (`LABELLE_WEB_SMOKE_VENV`) |
-| Chromium | Playwright 1.64.1's Chrome for Testing headless shell (H.264 capable), with `playwright install --with-deps` system libraries | Playwright | `/opt/ms-playwright` (`PLAYWRIGHT_BROWSERS_PATH`) |
-| System | `libatomic1` (binaryen's `wasm-opt` needs `libatomic.so.1`, as on FP's runner, `setup-ci-host.sh`), `git`, `curl`, `ca-certificates`, `xz-utils` | noble at build time; versions recorded in the inventory | apt |
+| Component | Version (image 4.1.2-2) | Where it comes from | Verified by | In the image |
+|---|---|---|---|---|
+| Base | `ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852` | Docker Hub multi-platform index digest for `24.04`, resolved 2026-10-30 | digest | `FROM` |
+| Ubuntu packages | snapshot `20261030T000000Z`; top level pinned (`APT_PACKAGES`): `ca-certificates`, `curl`, `git`, `xz-utils`, `bzip2`, `unzip`, `python3`, `python3-venv`, `libatomic1` | `snapshot.ubuntu.com` (noble, -updates, -security; main + universe) | apt's archive signatures + a fixed snapshot | apt |
+| labelle CLI | 4.1.2 (`labelle-linux-x86_64` / `labelle-linux-arm64`) | FP's `labelle.lock` `.cli_version` and `tools/ci/ensure-tool.sh` (amd64 checksum); `releases.labelle.games` | sha256 per arch | `/usr/local/bin/labelle` |
+| Zig | 0.16.0 (`x86_64` / `aarch64`) | the CLI's `DEFAULT_ZIG_VERSION`; FP's `ensure-tool.sh`; `ziglang.org/download/index.json` | sha256 per arch | `/opt/zig`, `LABELLE_ZIG=/opt/zig/zig` |
+| labelle-assembler | 0.124.0 (`linux-x86_64` / `linux-aarch64`) | FP's `project.labelle` `.assembler_version`; the release's `SHA256SUMS` | sha256 per arch | a **seed** at `/opt/labelle/seed/assembler/0.124.0/` ([below](#image-and-toolkit-compatibility)) |
+| emsdk | 4.0.9, commit `3bcf1dcd01f0…` | labelle-web 0.4.0's default `emsdk.version` and pinned tag commit (`src/provider/emsdk.zig`) | git commit | `/opt/emsdk`, activated, `EMSDK=/opt/emsdk` |
+| Emscripten / LLVM / binaryen | emscripten-releases build `cb2a69bc…` (`wasm-binaries.tar.xz` / `wasm-binaries-arm64.tar.xz`) | emsdk 4.0.9's `emscripten-releases-tags.json` | sha256 per arch, fetched before `emsdk install`, which must then download nothing else | `/opt/emsdk/upstream` |
+| Node | 20.18.0 (`linux-x64` / `linux-arm64`) | bundled by emsdk 4.0.9 (its manifest) | sha256 per arch, equal to nodejs.org's `SHASUMS256.txt` | `/opt/emsdk/node/20.18.0_64bit/bin`, on `PATH` |
+| Python | 3.12.3 (`python3` from the snapshot) | what emsdk/emcc and FP's smoke run with | apt | `/usr/bin/python3` |
+| Playwright + Pillow | 1.64.1 + 11.3.0, with pyee 14.0.0, greenlet 3.5.6, typing-extensions 4.16.0 | FP's `tools/web_smoke/requirements.txt` | `pip --require-hashes` ([`web-smoke-requirements.lock`](../docker/wasm-builder/web-smoke-requirements.lock), both architectures' wheels) | venv `/opt/labelle/web-smoke-venv` (`LABELLE_WEB_SMOKE_VENV`) |
+| Chromium | Playwright 1.64.1's Chrome for Testing **headless shell** 156.0.8078.4 (revision 1248) + ffmpeg 1013, with their system libraries (`--with-deps`, from the snapshot) | `cdn.playwright.dev` (`linux64` / `linux-arm64` builds) | sha256 per arch; served to `playwright install --only-shell chromium` from a local mirror, so it installs exactly those bytes | `/opt/ms-playwright` (`PLAYWRIGHT_BROWSERS_PATH`) |
+
+Only the headless shell is installed (`--only-shell`):
+`chromium.launch(headless=True)` uses it, as FP's smoke does. A job that runs
+`playwright install chromium` itself would try to add the full browser to the
+read-only `/opt/ms-playwright`; use `labelle-builder-smoke-python` instead.
 
 Helpers on `PATH`:
 
@@ -52,11 +62,34 @@ Helpers on `PATH`:
 - `labelle-builder-smoke-python <requirements.txt>`: prints the Python to run a Playwright smoke with ([GitLab](#gitlab-docker-executor)).
 - `labelle-builder-inventory`: regenerates the inventory from the installed tools.
 
-The image holds **no credentials and no game source**: no `COPY` of anything
-outside `docker/wasm-builder/`, no tokens in build arguments, and every
-toolchain is fetched over HTTPS and checked against a recorded checksum or
-commit. Toolchains (`/opt`, `/usr/local/bin`) are root-owned and read-only to
-the build user, so a job cannot modify the compiler a later job runs.
+The image holds **no credentials and no game source**: nothing outside
+`docker/wasm-builder/` is copied in (and of that only `versions.env`, the pip
+lock, `lib/` and `bin/`), no tokens go into build arguments, and every
+toolchain is checked against a recorded checksum, commit or signed apt
+snapshot. Toolchains (`/opt`, `/usr/local/bin`) are root-owned and read-only
+to the build user, so a job cannot modify the compiler a later job runs.
+
+### arm64
+
+Every upstream publishes linux arm64 artifacts for the pinned versions, so
+arm64 is a first-class variant: built natively on GitHub's `ubuntu-24.04-arm`
+runners (no QEMU) and published in the same multi-arch tag. It is on by
+default; a manual dispatch can leave it out (`arm64: false`), and amd64 never
+depends on it. Checked when pinning (2026-10-30):
+
+| Toolchain | arm64 artifact | Note |
+|---|---|---|
+| labelle CLI 4.1.2 | `labelle-linux-arm64` | the CLI release publishes **no checksum file**; the pin is the sha256 of the downloaded file (the amd64 pin also matches FP's `ensure-tool.sh`) |
+| labelle-assembler 0.124.0 | `labelle-assembler-linux-aarch64` | listed in the release's `SHA256SUMS` |
+| Zig 0.16.0 | `zig-aarch64-linux-0.16.0.tar.xz` | listed in `ziglang.org/download/index.json` |
+| Emscripten 4.0.9 | `wasm-binaries-arm64.tar.xz` (linux) | emsdk's manifest has a linux `arm64` releases tool; the emsdk tree itself is arch-neutral |
+| Node 20.18.0 | `node-v20.18.0-linux-arm64.tar.xz` | matches nodejs.org |
+| Chromium headless shell 156.0.8078.4 | `linux-arm64/chrome-headless-shell-linux-arm64.zip` | Playwright 1.64.1 maps `ubuntu24.04-arm64` to Chrome for Testing |
+| Ubuntu packages | same versions as amd64 in the snapshot | |
+
+Not established on arm64: H.264 playback in its headless shell (FP's intro
+clip) and anything FP-specific. The CI end-to-end check covers a template
+project, both builds and both smokes, on both architectures.
 
 ## Relationship to `--docker`
 
@@ -88,7 +121,7 @@ behaviour and belong to their own issue.
 ## Image and toolkit compatibility
 
 One image version carries one labelle CLI. The image version is
-`<CLI version>-<image revision>` (`4.1.2-1`): the revision counts image-only
+`<CLI version>-<image revision>` (`4.1.2-2`): the revision counts image-only
 changes (base digest, Playwright, emsdk, Zig, scripts) for the same CLI.
 
 Pins the project owns are respected, and a mismatch fails before any fetch
@@ -172,16 +205,20 @@ runner `chown`s the checkout to the image's user instead; either works.
 
 **Key.** `LABELLE_BUILDER_CACHE_KEY` is
 `v1-<arch>-<os>-zig<version>-emsdk<version>`, today
-`v1-x86_64-linux-zig0.16.0-emsdk4.0.9`. It is literal in the Dockerfile and
-the build fails if it drifts from `versions.env`. It names what makes cached
-*outputs* incompatible:
+`v1-amd64-linux-zig0.16.0-emsdk4.0.9` and
+`v1-arm64-linux-zig0.16.0-emsdk4.0.9`. It is built in the Dockerfile from
+`TARGETARCH`, the build fails if it drifts from `versions.env`, and the
+self-test fails if it does not name the architecture the container runs on.
+It names what makes cached *outputs* incompatible:
 
 - **Toolchain**: Zig decides every compiled object and Zig-built provider
   binary; emsdk decides the Emscripten sysroot and system libraries. A new Zig
   or emsdk gives a new key, so a new image starts a fresh subtree beside the
   old one and never reuses or corrupts it.
-- **Platform**: `<arch>-<os>` of the builder (an arm64 variant would get its
-  own key).
+- **Platform**: `<arch>-<os>` of the builder. Zig's local cache holds host
+  build tools (`build.zig` runners, provider binaries) compiled for the
+  builder, so amd64 and arm64 jobs sharing one volume (or one CI cache
+  entry) get separate subtrees and never see each other's binaries.
 - **Layout** (`v1`): bumped if the cache layout itself changes.
 
 The CLI version, the assembler version, Playwright and the base image are not
@@ -233,6 +270,56 @@ docker run --rm -v labelle-wasm-cache:/cache <image> bash -c '
 The Zig local cache grows with every distinct source state; on a busy runner
 also cap it (delete `…/labelle/zig-local-cache` when the volume passes a size
 budget; the next build re-fills it from the global cache and sources).
+
+## GitHub Actions
+
+GitHub-hosted runners have Docker, so a job can build in the image with
+`docker run`, the runner's checkout bind-mounted, and the cache directory
+persisted with `actions/cache`:
+
+```yaml
+    env:
+      IMAGE: ghcr.io/labelle-toolkit/labelle-wasm-builder:4.1.2-2@sha256:<index digest>
+      CACHE_KEY: v1-amd64-linux-zig0.16.0-emsdk4.0.9   # the image's LABELLE_BUILDER_CACHE_KEY
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/labelle-cache
+          # Toolchain key first (see "Cache keys"), then the project's pins;
+          # restore-keys reuse the newest cache of the same toolchain.
+          key: labelle-wasm-${{ env.CACHE_KEY }}-${{ hashFiles('labelle.lock', 'labelle.providers.lock', 'project.labelle') }}-${{ github.sha }}
+          restore-keys: |
+            labelle-wasm-${{ env.CACHE_KEY }}-${{ hashFiles('labelle.lock', 'labelle.providers.lock', 'project.labelle') }}-
+            labelle-wasm-${{ env.CACHE_KEY }}-
+      - run: |
+          mkdir -p "$RUNNER_TEMP/labelle-cache"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP/labelle-cache:/cache" -v "$PWD:/work/project" -w /work/project \
+            "$IMAGE" bash -euo pipefail -c '
+              labelle-builder-check
+              labelle providers fetch
+              labelle bundle --platform=wasm --optimize=ReleaseSafe --output dist'
+```
+
+- `--user "$(id -u):$(id -g)"` runs as the runner's user, so the checkout,
+  `dist/` and the cache stay owned by it and `actions/cache` can save them
+  (the image works under any UID; only `HOME` is then unwritable, which
+  nothing needs).
+- The key ends in the commit so every run saves a fresh cache (a cache entry
+  is immutable once saved) and restores the newest one with the same
+  toolchain and pins, falling back to the same toolchain. GitHub keeps 10 GB
+  of caches per repository and evicts the least recently used; a Zig cache
+  for a large game can be several GB, so keep the number of keys low.
+- GitHub-hosted standard runners (docs, 2026-10-30): public repositories
+  4 vCPU / 16 GB (x64 `ubuntu-24.04` and arm64 `ubuntu-24.04-arm`, free);
+  private repositories 2 vCPU / 8 GB. See [Resources](#resources): a private
+  repository's standard runner is below today's measured compiler peak
+  (10.4 GiB) and is expected to fit only after labelle-engine#921 (5.3 GiB).
+- Use `docker run` rather than a job-level `container:`: GitHub runs
+  `container:` jobs' steps expecting the image's default user to be root
+  (it cannot reach `GITHUB_WORKSPACE` otherwise), and this image is
+  deliberately non-root.
 
 ## GitLab Docker executor
 
@@ -327,57 +414,95 @@ are the only ones available now.
 
 ## Publishing
 
-[`.github/workflows/wasm-builder-image.yml`](../.github/workflows/wasm-builder-image.yml)
-runs only on a `wasm-builder-v*` tag or a manual dispatch (never on PRs; the
-CLI's own `v*` release tags do not match). It lints (hadolint, shellcheck),
-builds, runs the self-test as the non-root user, checks that a fresh named
-volume is writable and that a second fresh container sees the first one's
-cache, records the inventory, then pushes **the image it tested** under one
-immutable tag `<registry>/<image>:<IMAGE_VERSION>` (an existing tag is
-refused) and, on GHCR, a build-provenance attestation. The tag and the
-**digest** are in the run's summary.
+[`.github/workflows/wasm-builder-image.yml`](../.github/workflows/wasm-builder-image.yml):
 
-Registry (not yet agreed): dispatch input `registry`/`image`, else repository
-variables `WASM_BUILDER_REGISTRY`/`WASM_BUILDER_IMAGE`, else
-`ghcr.io/labelle-toolkit/labelle-wasm-builder`. GHCR logs in with the workflow
-token; another registry (for example FP's GitLab container registry, which a
-LAN runner can reach without the internet) needs the
-`WASM_BUILDER_REGISTRY_USERNAME`/`WASM_BUILDER_REGISTRY_PASSWORD` secrets.
-A new GHCR package is private; make it public (or give the runner a pull
-token) after the first push.
+- **Pull requests** touching `docker/wasm-builder/**` or the workflow: lint
+  (hadolint, shellcheck), then per architecture, natively (amd64 on
+  `ubuntu-24.04`, arm64 on `ubuntu-24.04-arm`): build; self-test as the
+  non-root user; two fresh containers on one fresh named volume; and the
+  end-to-end build ([below](#end-to-end-check)) cold and then warm in a second
+  fresh container. Timings, peak memory and the inventory go to the run
+  summary; reports and bundles are artifacts. **Never pushes.**
+- **Tag** `wasm-builder-v<IMAGE_VERSION>` (refused if it does not match
+  `versions.env`), or a **manual dispatch** with `push` ticked: the same
+  tests, then each architecture's **tested image** is pushed as
+  `<version>-<arch>` and one multi-arch index `<version>` is created from those
+  digests, with a build-provenance attestation on GHCR. Every tag is
+  immutable: an existing one is refused. The index digest is in the run
+  summary.
+- The CLI's own `v*` release tags do not match and never trigger it.
+
+**Registry (decided): GHCR, public.** The default is
+`ghcr.io/labelle-toolkit/labelle-wasm-builder`, logged in with the workflow
+token (no secret to manage). A GHCR package created by the first push is
+**private**: an organisation owner must then open the package settings
+(github.com/orgs/labelle-toolkit/packages/container/labelle-wasm-builder/settings)
+and set its visibility to **public**, once. After that, consumers (GitHub
+Actions, GitLab runners, developers) pull it anonymously: **no pull token or
+registry login is needed**. The workflow keeps the registry a parameter
+(dispatch input `registry`/`image`, else repository variables
+`WASM_BUILDER_REGISTRY`/`WASM_BUILDER_IMAGE`; another registry needs the
+`WASM_BUILDER_REGISTRY_USERNAME`/`WASM_BUILDER_REGISTRY_PASSWORD` secrets), for
+example to mirror into a LAN registry later.
 
 To release:
 
 1. Edit `versions.env` (bump `IMAGE_REVISION`, or set the new
-   `LABELLE_CLI_VERSION` and reset it to 1), merge.
-2. Optionally dispatch the workflow with `push` unticked to build and test it.
-3. Tag the merge commit `wasm-builder-v<LABELLE_CLI_VERSION>-<IMAGE_REVISION>`
-   and push the tag; the workflow refuses a tag that does not match
-   `versions.env`.
+   `LABELLE_CLI_VERSION` and reset it to 1); the PR runs the full test.
+   Merge.
+2. Tag the merge commit `wasm-builder-v<LABELLE_CLI_VERSION>-<IMAGE_REVISION>`
+   and push the tag.
+3. First release only: make the GHCR package public (above).
 
 Consumers **pin the digest**, not the tag:
-`image: ghcr.io/labelle-toolkit/labelle-wasm-builder:4.1.2-1@sha256:<digest>`.
+`image: ghcr.io/labelle-toolkit/labelle-wasm-builder:4.1.2-2@sha256:<index digest>`.
 When both are given the digest decides what runs; the tag only documents it.
+The index digest serves both architectures; a per-arch digest
+(`<version>-amd64@…`) pins one.
 
-Reproducibility: the base is pinned by digest and every toolchain by version
-plus checksum or commit, so rebuilding a `versions.env` gives the same
-toolchains. Ubuntu packages (`libatomic1`, Chromium's libraries) follow
-`noble-updates` at build time and are recorded in the inventory rather than
-pinned; two builds of one revision can differ there, which is why a published
-tag is never rebuilt in place.
+**Reproducibility.** The base is pinned by digest; every toolchain by version
+plus checksum or commit; pip by `--require-hashes`; Playwright's browsers by
+checksum through the local mirror; and Ubuntu packages by the apt snapshot
+(`UBUNTU_SNAPSHOT`, with the top-level packages also pinned to their snapshot
+versions). Two builds of one `versions.env` therefore install the same files.
+Layer timestamps follow `SOURCE_DATE_EPOCH` (the commit time); byte-identical
+image digests are not claimed (file mtimes inside layers, apt's own state
+files), which is why a published tag is never rebuilt in place.
 
 ## Upgrading
 
-1. Release a new image ([Publishing](#publishing)).
-   - Base image: resolve the current digest of `ubuntu:24.04` (for example
-     `docker buildx imagetools inspect ubuntu:24.04`) and update `BASE_IMAGE`.
-   - Zig, CLI, assembler: version and sha256 from the release (the CLI's,
-     Zig's `ziglang.org/download`, the assembler's `SHA256SUMS`).
-   - emsdk: take the version *and* commit from the labelle-web release the
-     projects pin (`src/provider/emsdk.zig`), update `EMSDK_NODE_VERSION`
-     from that emsdk's manifest, `LABELLE_WEB_VERSIONS`, and the literal cache
-     key and node `PATH` in the Dockerfile (the build fails until they agree).
-   - Playwright/Pillow: from the consumer's smoke `requirements.txt`.
+1. Release a new image ([Publishing](#publishing)). For each pin, update both
+   `_amd64` and `_arm64` values and recompute every checksum from a download:
+   - **Base image**: the current digest of `ubuntu:24.04` (for example
+     `docker buildx imagetools inspect ubuntu:24.04`; take the index digest,
+     which covers both architectures) into `BASE_IMAGE`.
+   - **Ubuntu snapshot**: set `UBUNTU_SNAPSHOT` to a new instant
+     (`YYYYMMDDTHHMMSSZ`; any instant works, the service resolves it to the
+     archive state at that time). Then refresh `APT_PACKAGES`: for each
+     package take its version in that snapshot, preferring `noble-updates`,
+     then `noble-security`, then `noble`, e.g.
+     `curl -fsSL http://snapshot.ubuntu.com/ubuntu/<T>/dists/noble-updates/main/binary-amd64/Packages.xz | xz -dc | grep -A1 '^Package: curl$'`
+     (`python3-venv` is in `universe`); check arm64 has the same versions.
+     A version the snapshot lacks fails the build at `apt-get install`. Bumping
+     the snapshot is how security updates reach the image: do it at least with
+     every image release.
+   - **Zig, CLI, assembler**: version and per-arch sha256 (Zig's
+     `download/index.json`, the assembler's `SHA256SUMS`; the CLI publishes
+     no checksum file, so hash the downloads).
+   - **emsdk**: the version *and* commit from the labelle-web release the
+     projects pin (`src/provider/emsdk.zig`); `EMSDK_RELEASE_HASH` from that
+     emsdk's `emscripten-releases-tags.json`; the per-arch `wasm-binaries*`
+     archives under
+     `storage.googleapis.com/webassembly/emscripten-releases-builds/linux/<hash>/`;
+     the Node version from emsdk's manifest (archives under `.../deps/`, cross-
+     check nodejs.org); `LABELLE_WEB_VERSIONS`; and the literal cache key and
+     node `PATH` in the Dockerfile (the build fails until they agree).
+   - **Playwright/Pillow**: from the consumer's smoke `requirements.txt`;
+     regenerate `web-smoke-requirements.lock` (transitive deps, both
+     architectures' wheel hashes, e.g. with `pip-compile --generate-hashes`
+     or from PyPI's JSON) and the browser pins from that Playwright's
+     `browsers.json` and `registry/index.ts` download paths
+     (`--only-shell chromium` = headless shell + ffmpeg).
 2. In the consumer, change the `image:` tag and digest in the same commit as
    the matching `labelle.lock` bump (CLI) or on its own (image revision).
    The preflight fails if the two disagree.
@@ -393,22 +518,42 @@ cache key subtree is still on the volume unless it was pruned, so the
 rollback is warm. If a bad image wrote a broken cache under a shared key,
 delete `/cache/<key>` for that key.
 
+## End-to-end check
+
+[`docker/wasm-builder/e2e/`](../docker/wasm-builder/e2e/) is the fixture the
+workflow builds on every PR, on both architectures:
+`game/` is a `labelle init` project (CLI 4.1.2: engine 3.4.1, bgfx backend,
+assembler 0.120.0, so the assembler is downloaded rather than seeded) with
+the released labelle-web 0.4.0 provider pinned (`labelle.providers.lock`)
+and threads on (`providers/web.json`). `run.sh <image> <volume> <out>
+<label>` runs, in a fresh container as UID 10001 with only the cache volume
+persisting: `labelle-builder-check`, `labelle providers fetch`,
+`labelle bundle --platform=wasm --optimize=ReleaseSafe` (threaded build plus
+single-threaded fallback), then `smoke.py` twice in the headless shell: with
+COOP/COEP (must be cross-origin isolated and load `threaded/game.js`) and
+without (must load the fallback `game.js`); both must reach the loader's
+`onRuntimeInitialized` and run 10 s with no page error. It records per-phase
+seconds and the container's peak memory (cgroup `memory.peak`). The workflow
+runs it twice, cold then warm, on one volume.
+
+The fixture is generic on purpose: FP's own smoke (menu, intro, demo) stays in
+FP and runs there ([GitHub Actions](#github-actions)).
+
 ## Validation status
 
-At the time of this change (labelle-cli#529):
+See the PR (labelle-cli#530) for the latest CI runs. Statically, at the time
+of writing:
 
-- Linted: the Dockerfile with hadolint 2.12.0 (`docker/wasm-builder/.hadolint.yaml`
-  documents the ignored rules), the helper scripts with shellcheck 0.10.0, the
-  workflow with actionlint 1.7.12.
+- Linted: the Dockerfile with hadolint 2.12.0
+  (`docker/wasm-builder/.hadolint.yaml` documents the ignored rules), the
+  scripts with shellcheck 0.10.0, the workflow with actionlint 1.7.12.
 - Checked outside a container: `labelle-builder-check` against a Flying
   Platform checkout (all pins matching; assembler seeded once, then reused)
   and against a copy with a different CLI, emsdk and assembler pin (fails,
   and passes as warnings with `LABELLE_BUILDER_ALLOW_PIN_MISMATCH=1`);
   `labelle-builder-smoke-python` matching FP's CRLF-checked-out requirements.
-- Downloads verified: the CLI, Zig and assembler checksums above were
-  re-computed from the published files; the emsdk commit and Node version
-  come from the emsdk 4.0.9 tag.
-- **Not yet done**: building the image, running it, and the acceptance runs
-  (FP's WASM bundle in a fresh container as non-root; a second fresh container
-  reusing the caches; Linux memory peaks). The first workflow run performs the
-  image-level checks; the FP runs belong to the FP adoption ticket.
+- Every checksum in `versions.env` was recomputed from a download on
+  2026-10-30 (Node also matches nodejs.org; assembler and Zig match their
+  published sums; pip hashes are PyPI's).
+- Not covered by CI here: FP's own build and smoke (see the FP workflow),
+  GitLab runners, and Linux memory peaks for FP.

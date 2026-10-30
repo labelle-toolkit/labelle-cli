@@ -13,7 +13,7 @@
 
 .wasm-builder:
   image:
-    name: ghcr.io/labelle-toolkit/labelle-wasm-builder:4.1.2-1@sha256:<digest from the release summary>
+    name: ghcr.io/labelle-toolkit/labelle-wasm-builder:4.1.2-2@sha256:<index digest from the release summary>
   # A runner registered with the Docker executor. A shell-executor runner
   # (fp-ubuntu today) ignores `image:` and would run on the host toolchain.
   tags: [fp-docker]

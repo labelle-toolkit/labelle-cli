@@ -175,7 +175,8 @@ self_test() {
   expect "emcc '$got' carries ${EMSDK_VERSION}" contains "$got" "$EMSDK_VERSION"
   got="$(node --version 2>&1 || true)"
   expect "node '$got' = v${EMSDK_NODE_VERSION}" test "$got" = "v${EMSDK_NODE_VERSION}"
-  expect "libatomic.so.1 present" test -e /usr/lib/x86_64-linux-gnu/libatomic.so.1
+  expect "libatomic.so.1 present" contains "$(ldconfig -p 2>/dev/null || true)" "libatomic.so.1"
+  expect "architecture $(uname -m) matches cache key ${LABELLE_BUILDER_CACHE_KEY}" contains "${LABELLE_BUILDER_CACHE_KEY}" "-$(case "$(uname -m)" in x86_64) echo amd64 ;; aarch64) echo arm64 ;; *) uname -m ;; esac)-"
   expect "wasm-opt runs" "$EMSDK/upstream/bin/wasm-opt" --version
   expect "running as non-root uid $(id -u)" test "$(id -u)" != 0
   if "$LABELLE_WEB_SMOKE_VENV/bin/python" - <<'PY'

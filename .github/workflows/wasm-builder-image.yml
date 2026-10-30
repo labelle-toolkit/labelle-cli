@@ -1,23 +1,36 @@
 # Build, test and publish the Labelle WASM builder image (labelle-cli#529).
 #
-# Never runs on PRs or branch pushes:
+# Triggers:
+#   - pull_request touching docker/wasm-builder/** or this file: build and
+#     test both architectures; never pushes;
 #   - tag `wasm-builder-v<IMAGE_VERSION>` (IMAGE_VERSION = <LABELLE_CLI_VERSION>
 #     -<IMAGE_REVISION> from docker/wasm-builder/versions.env, e.g.
-#     wasm-builder-v4.1.2-1): build, test, push, attest;
+#     wasm-builder-v4.1.2-2): build, test, push, attest;
 #   - manual dispatch: build and test; push only when `push` is ticked.
 # The CLI's own release tags (`v*`) do not match and never trigger this.
 #
-# The registry is a parameter until one is agreed (docs/wasm-builder-image.md
-# "Publishing"): dispatch input, else repository variable
-# WASM_BUILDER_REGISTRY / WASM_BUILDER_IMAGE, else GHCR. GHCR logs in with the
-# workflow token; any other registry needs the WASM_BUILDER_REGISTRY_USERNAME
-# and WASM_BUILDER_REGISTRY_PASSWORD secrets.
+# Each architecture builds natively (amd64 on ubuntu-24.04, arm64 on
+# ubuntu-24.04-arm), then runs, as the image's non-root user: the self-test,
+# two fresh containers on one fresh cache volume, and an end-to-end build of a
+# small Labelle project (docker/wasm-builder/e2e: `labelle init` + the web
+# provider, threads on) with a threaded and a fallback Chromium smoke, cold
+# and then warm from the cache in a second container.
 #
-# What is pushed is the exact image the tests ran against (docker push of the
-# tested build), under one immutable version tag; an existing tag is refused.
+# Publishing pushes the exact images the tests ran against (docker push of the
+# tested builds) as <version>-<arch>, then one multi-arch index <version>.
+# Tags are immutable: an existing one is refused. The registry is a parameter:
+# dispatch input, else repository variables WASM_BUILDER_REGISTRY /
+# WASM_BUILDER_IMAGE, else ghcr.io/labelle-toolkit/labelle-wasm-builder (the
+# agreed default; the package is public, see docs/wasm-builder-image.md). GHCR
+# logs in with the workflow token; another registry needs the
+# WASM_BUILDER_REGISTRY_USERNAME / WASM_BUILDER_REGISTRY_PASSWORD secrets.
 name: WASM builder image
 
 on:
+  pull_request:
+    paths:
+      - 'docker/wasm-builder/**'
+      - '.github/workflows/wasm-builder-image.yml'
   push:
     tags:
       - 'wasm-builder-v*'
@@ -27,6 +40,10 @@ on:
         description: Push to the registry after the tests (otherwise build + test only)
         type: boolean
         default: false
+      arm64:
+        description: Also build and test linux/arm64
+        type: boolean
+        default: true
       registry:
         description: Registry host (default vars.WASM_BUILDER_REGISTRY, else ghcr.io)
         type: string
@@ -41,12 +58,17 @@ permissions:
 
 concurrency:
   group: wasm-builder-image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PUSH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
+  REGISTRY: ${{ inputs.registry || vars.WASM_BUILDER_REGISTRY || 'ghcr.io' }}
+  IMAGE: ${{ inputs.image || vars.WASM_BUILDER_IMAGE || 'labelle-toolkit/labelle-wasm-builder' }}
 
 jobs:
   lint:
     name: Lint Dockerfile and scripts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -57,23 +79,24 @@ jobs:
           dockerfile: docker/wasm-builder/Dockerfile
           config: docker/wasm-builder/.hadolint.yaml
       - name: shellcheck
-        working-directory: docker/wasm-builder/bin
-        run: shellcheck -x -P .. labelle-builder-check labelle-builder-inventory labelle-builder-smoke-python
+        working-directory: docker/wasm-builder
+        run: shellcheck -x -P bin:lib bin/labelle-builder-check bin/labelle-builder-inventory bin/labelle-builder-smoke-python lib/pins.sh
 
   image:
-    name: Build, test, publish
+    name: Build and test (${{ matrix.arch }})
     needs: lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.arm64) && '["amd64"]' || '["amd64","arm64"]') }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     env:
-      PUSH: ${{ github.event_name == 'push' || inputs.push }}
-      REGISTRY: ${{ inputs.registry || vars.WASM_BUILDER_REGISTRY || 'ghcr.io' }}
-      IMAGE: ${{ inputs.image || vars.WASM_BUILDER_IMAGE || 'labelle-toolkit/labelle-wasm-builder' }}
+      ARCH: ${{ matrix.arch }}
+      TEST_IMAGE: labelle-wasm-builder:test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -94,23 +117,29 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match versions.env (expected wasm-builder-v$version)"
             exit 1
           fi
-          echo "Image version $version -> $REGISTRY/$IMAGE (push: $PUSH)"
+          echo "Image version $version ($ARCH) -> $REGISTRY/$IMAGE (push: $PUSH)"
+          echo "| phase | seconds |" > "$RUNNER_TEMP/timings.md"
+          echo "|---|---:|" >> "$RUNNER_TEMP/timings.md"
 
       - name: Build
         env:
           VERSION: ${{ steps.v.outputs.version }}
           SOURCE_DATE_EPOCH: ${{ steps.v.outputs.epoch }}
         run: |
-          docker build \
+          set -euo pipefail
+          t0=$(date +%s)
+          DOCKER_BUILDKIT=1 docker build \
             --pull \
             --build-arg IMAGE_VERSION="$VERSION" \
             --build-arg VCS_REF="$GITHUB_SHA" \
             --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-            --tag labelle-wasm-builder:test \
+            --tag "$TEST_IMAGE" \
             docker/wasm-builder
+          echo "| image build | $(( $(date +%s) - t0 )) |" >> "$RUNNER_TEMP/timings.md"
+          docker image inspect "$TEST_IMAGE" --format 'image size: {{.Size}} bytes, arch {{.Architecture}}'
 
       - name: Self-test as the image's non-root user
-        run: docker run --rm labelle-wasm-builder:test labelle-builder-check --self-test
+        run: docker run --rm "$TEST_IMAGE" labelle-builder-check --self-test
 
       - name: Fresh named volume, then a second fresh container on it
         run: |
@@ -118,20 +147,45 @@ jobs:
           docker volume create wasm-builder-ci-cache
           # A new named volume takes /cache's ownership from the image, so the
           # non-root user can write it without a chown.
-          docker run --rm -v wasm-builder-ci-cache:/cache labelle-wasm-builder:test \
+          docker run --rm -v wasm-builder-ci-cache:/cache "$TEST_IMAGE" \
             bash -c 'labelle-builder-check --self-test && echo first > "$LABELLE_HOME/probe"'
-          docker run --rm -v wasm-builder-ci-cache:/cache labelle-wasm-builder:test \
-            bash -c 'test "$(cat "$LABELLE_HOME/probe")" = first && ls -la "$LABELLE_BUILDER_CACHE_ROOT"'
+          docker run --rm -v wasm-builder-ci-cache:/cache "$TEST_IMAGE" \
+            bash -c 'test "$(cat "$LABELLE_HOME/probe")" = first && rm "$LABELLE_HOME/probe" && ls -la "$LABELLE_BUILDER_CACHE_ROOT"'
 
-      - name: Inventory
+      - name: End-to-end WASM build + smoke, cold cache
+        run: docker/wasm-builder/e2e/run.sh "$TEST_IMAGE" wasm-builder-ci-cache "$RUNNER_TEMP/e2e-cold" cold "$RUNNER_TEMP/timings.md"
+
+      - name: End-to-end again in a fresh container, warm cache
+        run: docker/wasm-builder/e2e/run.sh "$TEST_IMAGE" wasm-builder-ci-cache "$RUNNER_TEMP/e2e-warm" warm "$RUNNER_TEMP/timings.md"
+
+      - name: Inventory and timings
+        if: always()
         run: |
-          docker run --rm labelle-wasm-builder:test labelle-builder-check --inventory | tee inventory.json
+          docker run --rm "$TEST_IMAGE" labelle-builder-check --inventory > "$RUNNER_TEMP/inventory.json" || true
+          docker system df -v | sed -n '/VOLUME NAME/,/^$/p' || true
           {
-            echo '### Toolchain inventory'
+            echo "### $ARCH timings"
+            cat "$RUNNER_TEMP/timings.md"
+            echo
+            echo "<details><summary>$ARCH toolchain inventory</summary>"
+            echo
             echo '```json'
-            cat inventory.json
+            cat "$RUNNER_TEMP/inventory.json"
             echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload e2e reports and bundle
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/e2e-cold/
+            ${{ runner.temp }}/e2e-warm/
+            ${{ runner.temp }}/inventory.json
+            ${{ runner.temp }}/timings.md
+          if-no-files-found: warn
 
       - name: Log in (GHCR)
         if: env.PUSH == 'true' && env.REGISTRY == 'ghcr.io'
@@ -151,35 +205,86 @@ jobs:
           fi
           echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
 
-      - name: Push the tested image
-        id: push
+      - name: Push the tested image (per architecture)
         if: env.PUSH == 'true'
         env:
           REF: ${{ steps.v.outputs.ref }}
         run: |
           set -euo pipefail
           # Version tags are immutable: a rebuild is a new IMAGE_REVISION.
-          if docker manifest inspect "$REF" > /dev/null 2>&1; then
-            echo "::error::$REF already exists; bump IMAGE_REVISION in versions.env instead of overwriting it"
-            exit 1
-          fi
-          docker tag labelle-wasm-builder:test "$REF"
-          docker push "$REF"
-          repo_digest="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$REF" | grep -F "$REGISTRY/$IMAGE@" | head -n 1)"
-          digest="${repo_digest#*@}"
+          for r in "$REF" "$REF-$ARCH"; do
+            if docker manifest inspect "$r" > /dev/null 2>&1; then
+              echo "::error::$r already exists; bump IMAGE_REVISION in versions.env instead of overwriting it"
+              exit 1
+            fi
+          done
+          docker tag "$TEST_IMAGE" "$REF-$ARCH"
+          docker push "$REF-$ARCH"
+          repo_digest="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$REF-$ARCH" | grep -F "$REGISTRY/$IMAGE@" | head -n 1)"
+          mkdir -p "$RUNNER_TEMP/digest"
+          echo "${repo_digest#*@}" > "$RUNNER_TEMP/digest/$ARCH"
+          echo "- $ARCH: \`$REF-$ARCH@${repo_digest#*@}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload digest
+        if: env.PUSH == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest/${{ matrix.arch }}
+
+  publish:
+    name: Multi-arch index
+    needs: image
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digest
+          merge-multiple: true
+      - name: Log in (GHCR)
+        if: env.REGISTRY == 'ghcr.io'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Log in (other registry)
+        if: env.REGISTRY != 'ghcr.io'
+        env:
+          USERNAME: ${{ secrets.WASM_BUILDER_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.WASM_BUILDER_REGISTRY_PASSWORD }}
+        run: echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+      - name: Create the index from the tested per-arch images
+        id: index
+        run: |
+          set -euo pipefail
+          get() { sed -n "s/^$1=//p" docker/wasm-builder/versions.env; }
+          ref="$REGISTRY/$IMAGE:$(get LABELLE_CLI_VERSION)-$(get IMAGE_REVISION)"
+          sources=()
+          for f in "$RUNNER_TEMP"/digest/*; do sources+=("$REGISTRY/$IMAGE@$(cat "$f")"); done
+          docker buildx imagetools create --tag "$ref" "${sources[@]}"
+          digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
             echo '### Published'
             echo
-            echo "- tag: \`$REF\`"
-            echo "- digest: \`$digest\`"
-            echo "- pin consumers to: \`$REF@$digest\`"
+            echo "- tag: \`$ref\` ($(find "$RUNNER_TEMP/digest" -type f -printf '%f '))"
+            echo "- index digest: \`$digest\`"
+            echo "- pin consumers to: \`$ref@$digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Provenance attestation
-        if: env.PUSH == 'true' && env.REGISTRY == 'ghcr.io'
+        if: env.REGISTRY == 'ghcr.io'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE }}
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true

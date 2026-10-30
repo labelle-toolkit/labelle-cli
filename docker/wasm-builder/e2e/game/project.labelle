@@ -1,0 +1,37 @@
+// labelle-cli docker/wasm-builder e2e fixture: `labelle init game` (CLI
+// 4.1.2) plus the released labelle-web provider, threads on, and Flying
+// Platform's toolkit pins. Built by e2e/run.sh in the builder image.
+.{
+    .name = "game",
+    .title = "game",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    .backend = .bgfx,
+    // The threaded web build needs assembler >= 0.124 and bgfx >= the
+    // labelle-bgfx#199 release; these are Flying Platform's pins (FP#1093).
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.37.1" },
+    // Logical Y-axis convention (RFC-Y-AXIS-CONVENTION). `.down` is
+    // the screen-native default for new projects (y=0 at the top,
+    // +Y down); use `.up` for the math-/platformer-natural bottom
+    // origin. This key is REQUIRED — an absent `.y_axis` is a hard
+    // build error during the convention transition.
+    .y_axis = .down,
+    .ecs = .zig_ecs,
+    .plugins = .{
+        .{ .name = "web", .repo = "github.com/labelle-toolkit/labelle-web", .version = "0.4.0" },
+    },
+    .provider_config = .{
+        .{ .package = "web", .file = "providers/web.json" },
+    },
+    .layers = .{
+        .{ .name = "background", .order = 0, .space = .screen },
+        .{ .name = "world", .order = 1, .space = .world },
+        .{ .name = "ui", .order = 2, .space = .screen },
+    },
+    .core_version = "2.2.0",
+    .engine_version = "4.2.0-rc.2",
+    .gfx_version = "2.2.1",
+    .labelle_version = "4.1.2",
+    .assembler_version = "0.124.0",
+}
