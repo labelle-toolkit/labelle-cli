@@ -40,7 +40,7 @@ summary).
 | Component | Version (image 4.1.2-2) | Where it comes from | Verified by | In the image |
 |---|---|---|---|---|
 | Base | `ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852` | Docker Hub multi-platform index digest for `24.04`, resolved 2026-10-30 | digest | `FROM` |
-| Ubuntu packages | snapshot `20261030T000000Z`; top level pinned (`APT_PACKAGES`): `ca-certificates`, `curl`, `git`, `xz-utils`, `bzip2`, `unzip`, `python3`, `python3-venv`, `libatomic1` | `snapshot.ubuntu.com` (noble, -updates, -security; main + universe) | apt's archive signatures + a fixed snapshot | apt |
+| Ubuntu packages | snapshot `20261030T000000Z`; top level pinned (`APT_PACKAGES`): `ca-certificates`, `curl`, `git`, `xz-utils`, `bzip2`, `unzip`, `python3`, `python3-venv`, `libatomic1` | `snapshot.ubuntu.com` (noble, -updates, -security; main + universe) | apt's archive signatures + a fixed snapshot (the first apt run skips TLS verification, as the base has no CA bundle; integrity rests on the signed indices) | apt |
 | labelle CLI | 4.1.2 (`labelle-linux-x86_64` / `labelle-linux-arm64`) | FP's `labelle.lock` `.cli_version` and `tools/ci/ensure-tool.sh` (amd64 checksum); `releases.labelle.games` | sha256 per arch | `/usr/local/bin/labelle` |
 | Zig | 0.16.0 (`x86_64` / `aarch64`) | the CLI's `DEFAULT_ZIG_VERSION`; FP's `ensure-tool.sh`; `ziglang.org/download/index.json` | sha256 per arch | `/opt/zig`, `LABELLE_ZIG=/opt/zig/zig` |
 | labelle-assembler | 0.124.0 (`linux-x86_64` / `linux-aarch64`) | FP's `project.labelle` `.assembler_version`; the release's `SHA256SUMS` | sha256 per arch | a **seed** at `/opt/labelle/seed/assembler/0.124.0/` ([below](#image-and-toolkit-compatibility)) |

@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
 #
 # Labelle WASM builder image (labelle-cli#529, epic #528 WP1).
 #
@@ -34,9 +35,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 COPY versions.env web-smoke-requirements.lock /opt/labelle/
 COPY lib/pins.sh /opt/labelle/lib/pins.sh
 
-# Ubuntu packages from snapshot.ubuntu.com at UBUNTU_SNAPSHOT (http: the
-# base has no CA bundle yet; apt checks the archive's signatures), with the
-# top-level packages pinned to their snapshot versions. The snapshot serves
+# Ubuntu packages from snapshot.ubuntu.com at UBUNTU_SNAPSHOT, with the
+# top-level packages pinned to their snapshot versions. The service answers
+# only over https and the base has no CA bundle yet, so this one apt run
+# skips TLS peer verification. Integrity does not rest on TLS: apt checks the
+# archive's signed InRelease and every index and .deb hash against it, as it
+# does over plain http. Later apt runs (Playwright's) verify TLS. The snapshot
+# serves
 # amd64 and arm64 from one URL. libatomic1: binaryen's wasm-opt (emsdk) links
 # it. git: provider/package fetches and the emsdk checkout. python3: emsdk,
 # emcc and the smoke harness. xz-utils: the Zig and emsdk archives.
@@ -46,15 +51,16 @@ RUN . /opt/labelle/lib/pins.sh \
  && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
  && printf '%s\n' \
       'Types: deb' \
-      "URIs: http://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}" \
+      "URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}" \
       'Suites: noble noble-updates noble-security' \
       'Components: main universe' \
       'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
       > /etc/apt/sources.list.d/ubuntu-snapshot.sources \
  && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot \
- && apt-get update \
+ && bootstrap=(-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false) \
+ && apt-get "${bootstrap[@]}" update \
  && IFS=, read -r -a pkgs <<< "${APT_PACKAGES}" \
- && apt-get install -y --no-install-recommends "${pkgs[@]}" \
+ && apt-get "${bootstrap[@]}" install -y --no-install-recommends "${pkgs[@]}" \
  && rm -rf /var/lib/apt/lists/* \
  && git config --system --add safe.directory '*'
 
