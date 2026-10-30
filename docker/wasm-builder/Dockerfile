@@ -113,7 +113,7 @@ RUN . /opt/labelle/lib/pins.sh \
  && test -f .emscripten \
  && test -x "node/${EMSDK_NODE_VERSION}_64bit/bin/node" \
  && rm -rf downloads/* /tmp/emsdk-expected upstream/emscripten/cache \
- && python3 -m compileall -q -j 0 upstream/emscripten > /dev/null
+ && { python3 -W ignore -m compileall -q -j 0 -x '/(test|third_party)/' upstream/emscripten > /dev/null 2>&1 || true; }
 WORKDIR /
 
 # Chromium WASM smoke: a venv with Flying Platform's pinned Playwright and
