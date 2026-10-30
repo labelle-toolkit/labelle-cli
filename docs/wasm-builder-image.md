@@ -188,7 +188,16 @@ for a custom build). `/cache` and `/work` are owned by it in the image.
   `/cache` copies the image's ownership on first use, so the non-root user can
   write it with no setup. The publish workflow tests exactly this.
 - **Host bind mount**: the host directory must be writable by UID 10001:
-  `sudo install -d -o 10001 -g 10001 /srv/labelle-cache`.
+  `sudo install -d -o 10001 -g 10001 /srv/labelle-cache`. It must be a
+  **Linux filesystem**. On Docker Desktop for Windows (and likely macOS) a
+  bind mount of a host drive (`-v D:/cache:/cache`) breaks Zig: it renames
+  finished compilation directories into its cache, and that rename fails
+  (`failed to rename compilation results … into local cache …: AccessDenied`,
+  seen in the web provider's `toolchain` hook). Use a named volume. To keep
+  the bytes on another drive, put an ext4 image file there and loop-mount it
+  at `/cache`; that needs `--privileged` and a root entrypoint that drops to
+  10001 (see the local FP test on labelle-cli#530). The checkout itself can
+  be a Windows bind mount.
 - **A volume created by another image or as root**: fix it once with
   `docker run --rm -u 0 -v <volume>:/cache <image> chown -R 10001:10001 /cache`.
   `labelle-builder-check` detects an unwritable cache and prints this command.
@@ -405,6 +414,37 @@ Guidance per WASM job container:
 | concurrent WASM jobs | `(host RAM − 6 GiB for the OS, GitLab and other jobs) / 14 GiB`; on FP's 32 GiB box: **1** | `/ 8 GiB`: **2–3** on FP's box |
 | job `timeout` | 30 min (cold ~15 min on FP's box) | same |
 | disk for `/cache` | budget ~10 GiB per key (an estimate, not measured; emsdk is in the image, not here); prune old keys | same |
+
+**Measured in the image** (2026-10-30, Docker Desktop on Windows: WSL2 VM
+with 16 GiB / 24 CPUs, container `--memory=14g`, non-root; FP at
+`efc8b1a`, engine 4.2.0-rc.2, so before engine#921; `/cache` on an ext4
+image, [above](#mounts-ownership-and-uid)). Each run used a fresh container
+on a clean checkout (`git clean -xfd`), with only `/cache` persisting:
+
+| FP `test-game-wasm` run | bundle | whole job | container peak memory (cgroup) | OOM |
+|---|---:|---:|---:|---|
+| cold cache | 1144 s | 1215 s | **11.5 GiB** | no |
+| warm cache, same source | 297 s | 368 s | 1.8 GiB | no |
+| warm cache, one game script changed | 979 s | 1052 s | **10.8 GiB** | no |
+
+The rest of the job is small: prepare-web-dist 3 s, the smoke unit tests
+26 s, each smoke about 20 s. Two things follow:
+
+- **A source change costs nearly a cold compile, in time and in memory.** The
+  game is one Zig compilation unit, so the warm cache only saves the
+  libraries and the toolchain. Size runners for the cold peak: 14 GiB holds;
+  GitHub's 8 GB private-repo runners do not, until engine#921.
+- **FP's build installs a second emsdk inside the checkout.** The generated
+  `.labelle/bgfx_wasm/build.zig.zon` depends on
+  `git+https://github.com/emscripten-core/emsdk#4.0.9` as a Zig package
+  (for `labelle_audio`/`sokol` headers). The build installs it under
+  `.labelle/bgfx_wasm/zig-pkg/` (about 1.4 GB, including its own Node
+  download), and **not** in `/cache` or from `/opt/emsdk`, so every fresh
+  checkout downloads it again. That is part of the 297 s warm bundle. It is
+  a toolkit issue (the generated build should use the provider's `EMSDK`),
+  not an image one.
+
+`/cache` held 2.1 GiB after the three runs (one key).
 
 An out-of-memory kill shows as the compiler exiting with signal 9 (`Killed`)
 and the job failing; raise `memory` or lower WASM concurrency rather than
