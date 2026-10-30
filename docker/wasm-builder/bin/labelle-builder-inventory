@@ -19,7 +19,7 @@ trap 'rm -rf "$em_tmp"' EXIT
 
 INV_ZIG="$(first_line "${LABELLE_ZIG:-zig}" version)"
 INV_LABELLE="$(first_line labelle version)"
-INV_EMCC="$(EM_CACHE="$em_tmp" first_line "${EMSDK:-/opt/emsdk}/upstream/emscripten/emcc" --version)"
+INV_EMCC="$(EM_CACHE="$em_tmp" "${EMSDK:-/opt/emsdk}/upstream/emscripten/emcc" --version 2>/dev/null | grep -m1 "^emcc" || true)"
 INV_NODE="$(first_line node --version)"
 INV_PYTHON="$(first_line python3 --version)"
 INV_PLAYWRIGHT="$(first_line "${LABELLE_WEB_SMOKE_VENV:-/opt/labelle/web-smoke-venv}/bin/python" -m playwright --version)"

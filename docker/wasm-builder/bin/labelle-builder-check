@@ -171,7 +171,7 @@ self_test() {
   got="$(labelle version 2>&1 | head -n 1 || true)"
   expect "labelle '$got' carries ${LABELLE_CLI_VERSION}" contains "$got" "$LABELLE_CLI_VERSION"
   # A throwaway cache: the self-test must not populate the real one.
-  got="$(EM_CACHE="$(mktemp -d)" "$EMSDK/upstream/emscripten/emcc" --version 2>&1 | head -n 1 || true)"
+  got="$(EM_CACHE="$(mktemp -d)" "$EMSDK/upstream/emscripten/emcc" --version 2>/dev/null | grep -m1 "^emcc" || true)"
   expect "emcc '$got' carries ${EMSDK_VERSION}" contains "$got" "$EMSDK_VERSION"
   got="$(node --version 2>&1 || true)"
   expect "node '$got' = v${EMSDK_NODE_VERSION}" test "$got" = "v${EMSDK_NODE_VERSION}"
