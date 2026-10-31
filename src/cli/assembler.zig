@@ -33,9 +33,18 @@ const config = @import("config.zig");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
 const runner = @import("runner.zig");
+const cache_publish = @import("cache_publish.zig");
 
 /// GitHub release URL template for assembler binaries.
 const ASSEMBLER_RELEASE_BASE = "https://github.com/labelle-toolkit/labelle-assembler/releases/download";
+
+/// Test-only: serve releases from here (a `file://` fixture) instead of
+/// `ASSEMBLER_RELEASE_BASE`. Production code never sets it.
+var release_base_override: ?[]const u8 = null;
+
+fn releaseBase() []const u8 {
+    return release_base_override orelse ASSEMBLER_RELEASE_BASE;
+}
 
 /// The LAST assembler release published WITHOUT a `SHA256SUMS` manifest.
 ///
@@ -204,15 +213,19 @@ fn digestFor(manifest: []const u8, asset: []const u8) ?[]const u8 {
 /// manifest that does not list this asset, fails. That way the older
 /// releases start being verified the moment someone backfills a manifest
 /// onto them, with no code change here.
+///
+/// Returns the verified digest (lowercase hex), or null for a pre-manifest
+/// release that could not be verified. `downloadAssembler` uses it to check a
+/// binary a concurrent process published while we downloaded.
 fn verifyAgainstManifest(
     allocator: std.mem.Allocator,
     version: []const u8,
     asset: []const u8,
     path: []const u8,
-) !void {
+) !?[64]u8 {
     const io = config.globalIo();
     const manifest_url = try std.fmt.allocPrint(allocator, "{s}/v{s}/SHA256SUMS", .{
-        ASSEMBLER_RELEASE_BASE,
+        releaseBase(),
         version,
     });
     defer allocator.free(manifest_url);
@@ -225,7 +238,7 @@ fn verifyAgainstManifest(
         .olderThan(compatibility.parseVersion(version));
 
     const fetched = fetch: {
-        const r = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", manifest_path, manifest_url }) catch break :fetch false;
+        const r = util.runCmd(allocator, &.{ "curl", "-fSL", "--connect-timeout", "30", "--max-time", "600", "-o", manifest_path, manifest_url }) catch break :fetch false;
         defer allocator.free(r.stdout);
         defer allocator.free(r.stderr);
         break :fetch switch (r.term) {
@@ -244,7 +257,7 @@ fn verifyAgainstManifest(
         }
         std.debug.print("labelle: WARNING — assembler v{s} predates published checksums; the download\n", .{version});
         std.debug.print("  could NOT be verified. Releases after v{s} are verified automatically.\n", .{LAST_UNVERIFIED_ASSEMBLER_VERSION});
-        return;
+        return null;
     }
 
     const manifest = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(64 << 10)) catch {
@@ -272,6 +285,7 @@ fn verifyAgainstManifest(
     }
 
     std.debug.print("  checksum ok (SHA256SUMS)\n", .{});
+    return expected[0..64].*;
 }
 
 /// Download an assembler binary from GitHub releases and cache it.
@@ -288,47 +302,72 @@ fn verifyAgainstManifest(
 /// the CLI would `chmod +x` and execute whatever arrived
 /// (labelle-assembler#616).
 ///
-/// Staging matters as much as the check. The bytes land on a `.part` sibling
-/// and are moved to `dest_path` ONLY after they verify, because `dest_path`
-/// is not a scratch location: it is the cache slot, and every caller decides
-/// "already downloaded?" by `access()`ing exactly that path. Writing the
-/// unverified download there directly — as this function used to — means a
-/// failed verification would leave a file that the NEXT run treats as a good
-/// cache hit and never re-downloads or re-checks. So a rejected download
-/// must leave nothing at `dest_path`: nothing cached, nothing executable.
+/// Staging matters as much as the check. The bytes land on a UNIQUE sibling
+/// (`<dest>.tmp-<pid>-<random>`) and are moved to `dest_path` ONLY after they
+/// verify, because `dest_path` is not a scratch location: it is the cache
+/// slot, and every caller decides "already downloaded?" by `access()`ing
+/// exactly that path. Writing the unverified download there directly — as
+/// this function once did — means a failed verification would leave a file
+/// that the NEXT run treats as a good cache hit and never re-downloads or
+/// re-checks. So a rejected download must leave nothing at `dest_path`:
+/// nothing cached, nothing executable.
+///
+/// The staging name must be unique, not merely different from `dest_path`:
+/// `LABELLE_HOME` is shared by every labelle process, and a CI shell runner
+/// runs several jobs at once. With a fixed `<dest>.part`, two jobs downloaded
+/// into the same file; one renamed it into place and the other's verification
+/// found nothing to read ("could not read the download to verify it" →
+/// `AssemblerNotCached`). Now each process stages privately, an
+/// `InstallLock` lets only one of them download, and the publish keeps a
+/// concurrent winner's verified binary instead of failing
+/// (`cache_publish.zig`).
 pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest_path: []const u8) !void {
     const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
     const asset = try std.fmt.allocPrint(allocator, "labelle-assembler-{s}-{s}", .{
         try osName(),
         try archName(),
     });
     defer allocator.free(asset);
     const url = try std.fmt.allocPrint(allocator, "{s}/v{s}/{s}", .{
-        ASSEMBLER_RELEASE_BASE,
+        releaseBase(),
         version,
         asset,
     });
     defer allocator.free(url);
 
-    std.debug.print("labelle: downloading assembler v{s}...\n", .{version});
-    std.debug.print("  url: {s}\n", .{url});
-
     // Ensure the parent directory exists.
     if (std.fs.path.dirname(dest_path)) |dir| {
-        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+        cwd.createDirPath(io, dir) catch |err| {
             std.debug.print("labelle: could not create directory {s}: {any}\n", .{ dir, err });
             return error.AssemblerDownloadFailed;
         };
     }
 
+    // One download per version across processes: a concurrent labelle that
+    // got here first holds the lock until its binary is published (or its
+    // attempt failed), and we then find it in place instead of fetching again.
+    var lock = cache_publish.InstallLock.acquire(allocator, dest_path) catch return error.AssemblerDownloadFailed;
+    defer lock.release();
+    if (cwd.access(io, dest_path, .{})) |_| {
+        std.debug.print("labelle: assembler v{s} was installed by a concurrent labelle: {s}\n", .{ version, dest_path });
+        return;
+    } else |_| {}
+
+    std.debug.print("labelle: downloading assembler v{s}...\n", .{version});
+    std.debug.print("  url: {s}\n", .{url});
+
     // Staging path: everything below writes HERE, never to dest_path, until
-    // the bytes have been verified. See the doc comment above.
-    const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{dest_path});
+    // the bytes have been verified. See the doc comment above. Removed on
+    // every exit (after a successful publish it no longer exists).
+    const part_path = try cache_publish.tempSibling(allocator, dest_path, "tmp");
     defer allocator.free(part_path);
-    defer std.Io.Dir.cwd().deleteFile(io, part_path) catch {};
+    defer cwd.deleteFile(io, part_path) catch {};
 
     // Use curl with -L to follow redirects (GitHub releases redirect to S3).
-    const result = util.runCmd(allocator, &.{ "curl", "-fSL", "-o", part_path, url }) catch {
+    // Bounded so a stalled mirror cannot hang this process — or every other
+    // labelle waiting on the install lock — forever.
+    const result = util.runCmd(allocator, &.{ "curl", "-fSL", "--connect-timeout", "30", "--max-time", "600", "-o", part_path, url }) catch {
         std.debug.print("labelle: download failed (is curl installed?)\n", .{});
         std.debug.print("  url: {s}\n", .{url});
         std.debug.print("  you can download manually and place it at: {s}\n", .{dest_path});
@@ -358,30 +397,37 @@ pub fn downloadAssembler(allocator: std.mem.Allocator, version: []const u8, dest
     // own manifest rather than a pinned constant (a pinned constant per
     // assembler version would need a CLI release for every assembler
     // release).
-    try verifyAgainstManifest(allocator, version, asset, part_path);
+    const digest = try verifyAgainstManifest(allocator, version, asset, part_path);
 
-    // Verified: move the staged bytes into the cache slot. Only now does
-    // `dest_path` exist, so a caller's `access()` cache-hit check can never
-    // see an unverified binary.
-    std.Io.Dir.cwd().rename(part_path, std.Io.Dir.cwd(), dest_path, io) catch |err| {
-        std.debug.print("labelle: could not move the verified download into place: {any}\n", .{err});
-        std.debug.print("  staged at: {s}\n", .{part_path});
-        return error.AssemblerDownloadFailed;
-    };
-
-    // Make executable on Unix.
+    // Executable BEFORE it is published: the moment `dest_path` exists a
+    // concurrent labelle may run it, so it must never appear without +x.
     if (builtin.os.tag != .windows) {
-        const file = std.Io.Dir.cwd().openFile(io, dest_path, .{}) catch |err| {
-            std.debug.print("labelle: could not open {s} for chmod: {any}\n", .{ dest_path, err });
-            return;
-        };
-        defer file.close(io);
-        file.setPermissions(io, .fromMode(0o755)) catch |err| {
-            std.debug.print("labelle: chmod failed for {s}: {any}\n", .{ dest_path, err });
-        };
+        if (cwd.openFile(io, part_path, .{})) |file| {
+            defer file.close(io);
+            file.setPermissions(io, .fromMode(0o755)) catch |err| {
+                std.debug.print("labelle: chmod failed for {s}: {any}\n", .{ part_path, err });
+            };
+        } else |err| {
+            std.debug.print("labelle: could not open {s} for chmod: {any}\n", .{ part_path, err });
+        }
     }
 
-    std.debug.print("  cached at {s}\n", .{dest_path});
+    // Verified: move the staged bytes into the cache slot with one atomic
+    // rename. Only now does `dest_path` exist, so a caller's `access()`
+    // cache-hit check can never see an unverified or partial binary. If a
+    // concurrent process (e.g. an older CLI that does not take the lock)
+    // already published a binary that verifies, theirs is kept.
+    const outcome = cache_publish.publishFile(part_path, dest_path, cache_publish.Sha256File{
+        .sha256 = if (digest) |*d| d else null,
+    }) catch |err| {
+        std.debug.print("labelle: could not move the verified download into place: {any}\n", .{err});
+        std.debug.print("  destination: {s}\n", .{dest_path});
+        return error.AssemblerDownloadFailed;
+    };
+    switch (outcome) {
+        .published => std.debug.print("  cached at {s}\n", .{dest_path}),
+        .kept_existing => std.debug.print("  a concurrent labelle already cached a verified copy at {s}\n", .{dest_path}),
+    }
 }
 
 /// Resolve the default assembler version. Downloads it if not cached.
@@ -979,5 +1025,151 @@ pub const DownloadVerification = struct {
         // util.sha256Matches only accepts lowercase.
         try std.testing.expect(util.sha256Matches("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
         try std.testing.expect(!util.sha256Matches("abc", "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"));
+    }
+};
+
+/// Concurrent installs into ONE shared cache (FP pipeline #57: two CI jobs on
+/// one shell runner fetched the same assembler into the same `.part`, and the
+/// loser failed `AssemblerNotCached`). Drives the real `downloadAssembler`
+/// — curl, SHA256SUMS verification, staging, publish — against a `file://`
+/// release fixture, from several threads at once.
+pub const ConcurrentDownload = struct {
+    const fixture_version = "9.9.9";
+
+    fn fileUrl(a: std.mem.Allocator, abs: []const u8) ![]u8 {
+        const fwd = try a.dupe(u8, abs);
+        defer a.free(fwd);
+        std.mem.replaceScalar(u8, fwd, '\\', '/');
+        // `file:///C:/x` on Windows, `file:///tmp/x` elsewhere.
+        return if (fwd.len > 0 and fwd[0] == '/')
+            std.fmt.allocPrint(a, "file://{s}", .{fwd})
+        else
+            std.fmt.allocPrint(a, "file:///{s}", .{fwd});
+    }
+
+    fn haveCurl() bool {
+        const r = util.runCmd(std.testing.allocator, &.{ "curl", "--version" }) catch return false;
+        defer std.testing.allocator.free(r.stdout);
+        defer std.testing.allocator.free(r.stderr);
+        return r.term == .exited and r.term.exited == 0;
+    }
+
+    const Worker = struct {
+        dest: []const u8,
+        failures: *std.atomic.Value(u32),
+        fn run(w: Worker) void {
+            downloadAssembler(std.heap.page_allocator, fixture_version, w.dest) catch |err| {
+                std.debug.print("concurrent downloadAssembler failed: {s}\n", .{@errorName(err)});
+                _ = w.failures.fetchAdd(1, .monotonic);
+            };
+        }
+    };
+
+    test "parallel installs of one version into one cache all succeed and the binary verifies" {
+        if (!haveCurl()) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+
+        // Release fixture: <root>/rel/v9.9.9/{<asset>, SHA256SUMS}.
+        const asset = try std.fmt.allocPrint(a, "labelle-assembler-{s}-{s}", .{ try osName(), try archName() });
+        defer a.free(asset);
+        const rel_dir = try std.fs.path.join(a, &.{ root, "rel", "v" ++ fixture_version });
+        defer a.free(rel_dir);
+        try std.Io.Dir.cwd().createDirPath(io, rel_dir);
+        // A few MiB so unsynchronized writers would genuinely interleave.
+        const payload = try a.alloc(u8, 6 << 20);
+        defer a.free(payload);
+        for (payload, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
+        const asset_path = try std.fs.path.join(a, &.{ rel_dir, asset });
+        defer a.free(asset_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = asset_path, .data = payload });
+        const sha = try @import("provider_github/files.zig").sha256Hex(a, payload);
+        defer a.free(sha);
+        const sums = try std.fmt.allocPrint(a, "{s}  {s}\n", .{ sha, asset });
+        defer a.free(sums);
+        const sums_path = try std.fs.path.join(a, &.{ rel_dir, "SHA256SUMS" });
+        defer a.free(sums_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sums_path, .data = sums });
+
+        const rel_root = try std.fs.path.join(a, &.{ root, "rel" });
+        defer a.free(rel_root);
+        const base = try fileUrl(a, rel_root);
+        defer a.free(base);
+        release_base_override = base;
+        defer release_base_override = null;
+
+        const ver_dir = try std.fs.path.join(a, &.{ root, "home", "assembler", fixture_version });
+        defer a.free(ver_dir);
+        const dest = try std.fs.path.join(a, &.{ ver_dir, exe_name });
+        defer a.free(dest);
+
+        var failures: std.atomic.Value(u32) = .init(0);
+        var threads: [6]std.Thread = undefined;
+        for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .dest = dest, .failures = &failures }});
+        for (threads) |t| t.join();
+
+        try std.testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+        const got = try std.Io.Dir.cwd().readFileAlloc(io, dest, a, .limited(64 << 20));
+        defer a.free(got);
+        try std.testing.expect(util.sha256Matches(got, sha));
+
+        // Nothing but the binary and its lock file is left in the slot.
+        var dir = try std.Io.Dir.cwd().openDir(io, ver_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            const ok = std.mem.eql(u8, e.name, exe_name) or std.mem.eql(u8, e.name, exe_name ++ ".lock");
+            if (!ok) std.debug.print("leftover in cache slot: {s}\n", .{e.name});
+            try std.testing.expect(ok);
+        }
+    }
+
+    test "a rejected download leaves nothing at the final path, even with a stale lock file" {
+        if (!haveCurl()) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const io = config.globalIo();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const asset = try std.fmt.allocPrint(a, "labelle-assembler-{s}-{s}", .{ try osName(), try archName() });
+        defer a.free(asset);
+        const rel_dir = try std.fs.path.join(a, &.{ root, "rel", "v" ++ fixture_version });
+        defer a.free(rel_dir);
+        try std.Io.Dir.cwd().createDirPath(io, rel_dir);
+        const asset_path = try std.fs.path.join(a, &.{ rel_dir, asset });
+        defer a.free(asset_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = asset_path, .data = "tampered" });
+        const sums = try std.fmt.allocPrint(a, "{s}  {s}\n", .{ "0" ** 64, asset });
+        defer a.free(sums);
+        const sums_path = try std.fs.path.join(a, &.{ rel_dir, "SHA256SUMS" });
+        defer a.free(sums_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sums_path, .data = sums });
+        const rel_root = try std.fs.path.join(a, &.{ root, "rel" });
+        defer a.free(rel_root);
+        const base = try fileUrl(a, rel_root);
+        defer a.free(base);
+        release_base_override = base;
+        defer release_base_override = null;
+
+        const ver_dir = try std.fs.path.join(a, &.{ root, "home", "assembler", fixture_version });
+        defer a.free(ver_dir);
+        const dest = try std.fs.path.join(a, &.{ ver_dir, exe_name });
+        defer a.free(dest);
+        try std.Io.Dir.cwd().createDirPath(io, ver_dir);
+        const lock_path = try std.fmt.allocPrint(a, "{s}.lock", .{dest});
+        defer a.free(lock_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lock_path, .data = "" });
+
+        try std.testing.expectError(error.AssemblerChecksumMismatch, downloadAssembler(a, fixture_version, dest));
+        try std.testing.expect(!util.fileExists(dest));
+        var dir = try std.Io.Dir.cwd().openDir(io, ver_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| try std.testing.expectEqualStrings(exe_name ++ ".lock", e.name);
     }
 };

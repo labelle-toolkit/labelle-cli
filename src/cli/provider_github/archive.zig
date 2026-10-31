@@ -4,6 +4,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const contract = @import("../provider_contract.zig");
 const util = @import("../util.zig");
+const cache_publish = @import("../cache_publish.zig");
 const Pin = @import("pin.zig").Pin;
 const files_mod = @import("files.zig");
 const read = files_mod.read;
@@ -55,7 +56,9 @@ pub fn archive(a: std.mem.Allocator, pin: Pin, allow_download: bool) ![]u8 {
         try download(a, try pin.archiveUrl(a), tmp, max_archive_size);
         const downloaded = try read(a, tmp, max_archive_size);
         if (!util.sha256Matches(downloaded, pin.sha256)) return error.ProviderArchiveHashMismatch;
-        try std.Io.Dir.renameAbsolute(tmp, path, io);
+        // One rename publishes it; a concurrent labelle that cached the same
+        // verified archive first wins and ours is discarded (cache_publish).
+        _ = try cache_publish.publishFile(tmp, path, cache_publish.Sha256File{ .sha256 = pin.sha256, .max_bytes = max_archive_size });
         break :blk downloaded;
     };
     if (!util.sha256Matches(bytes, pin.sha256)) return error.ProviderArchiveHashMismatch;

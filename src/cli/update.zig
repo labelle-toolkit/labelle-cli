@@ -2,6 +2,7 @@ const std = @import("std");
 const project_config = @import("project_config.zig");
 const asm_cache = @import("asm_cache.zig");
 const util = @import("util.zig");
+const cache_publish = @import("cache_publish.zig");
 const config = @import("config.zig");
 const update_check = @import("update_check.zig");
 
@@ -290,34 +291,6 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
     });
     defer allocator.free(download_url);
 
-    const tmp_path = try util.getTempFilePath(allocator, "labelle-update");
-    defer allocator.free(tmp_path);
-    std.debug.print("  downloading {s}...\n", .{download_url});
-
-    const dl_result = util.runCmd(allocator, &.{ "curl", "-s", "-f", "-o", tmp_path, download_url }) catch {
-        std.debug.print("labelle: download failed (is curl installed?)\n", .{});
-        printManualUpdateInstructions(target_version);
-        return;
-    };
-    defer allocator.free(dl_result.stdout);
-    defer allocator.free(dl_result.stderr);
-
-    switch (dl_result.term) {
-        .exited => |code| if (code != 0) {
-            std.debug.print("labelle: download failed (HTTP error)\n", .{});
-            printManualUpdateInstructions(target_version);
-            return;
-        },
-        else => {
-            std.debug.print("labelle: download process terminated abnormally\n", .{});
-            return;
-        },
-    }
-
-    if (builtin.os.tag != .windows) {
-        _ = util.runCmd(allocator, &.{ "chmod", "+x", tmp_path }) catch {};
-    }
-
     const cache_root = asm_cache.getCacheRoot(allocator) catch {
         std.debug.print("labelle: could not determine cache root\n", .{});
         return;
@@ -335,6 +308,42 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, cmd_args: []const []const u8) !vo
         std.debug.print("labelle: could not create {s}: {any}\n", .{ bin_dir, err });
         return;
     };
+
+    // Stage the download NEXT TO the installed binary under a unique name
+    // (`<bin>.tmp-<pid>-<random>`): same filesystem, so the final move is one
+    // atomic rename and a concurrently starting `labelle` never runs a
+    // partially written binary; unique, so two updates cannot clobber each
+    // other's download.
+    const tmp_path = try cache_publish.tempSibling(allocator, bin_path, "tmp");
+    defer allocator.free(tmp_path);
+    std.debug.print("  downloading {s}...\n", .{download_url});
+
+    const dl_result = util.runCmd(allocator, &.{ "curl", "-s", "-f", "-o", tmp_path, download_url }) catch {
+        std.debug.print("labelle: download failed (is curl installed?)\n", .{});
+        std.Io.Dir.cwd().deleteFile(config.globalIo(), tmp_path) catch {};
+        printManualUpdateInstructions(target_version);
+        return;
+    };
+    defer allocator.free(dl_result.stdout);
+    defer allocator.free(dl_result.stderr);
+
+    switch (dl_result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("labelle: download failed (HTTP error)\n", .{});
+            std.Io.Dir.cwd().deleteFile(config.globalIo(), tmp_path) catch {};
+            printManualUpdateInstructions(target_version);
+            return;
+        },
+        else => {
+            std.debug.print("labelle: download process terminated abnormally\n", .{});
+            std.Io.Dir.cwd().deleteFile(config.globalIo(), tmp_path) catch {};
+            return;
+        },
+    }
+
+    if (builtin.os.tag != .windows) {
+        _ = util.runCmd(allocator, &.{ "chmod", "+x", tmp_path }) catch {};
+    }
 
     if (builtin.os.tag == .windows) {
         const bat_path = try std.fs.path.join(allocator, &.{ bin_dir, "labelle-update.bat" });

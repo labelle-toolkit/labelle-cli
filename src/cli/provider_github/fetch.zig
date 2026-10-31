@@ -21,6 +21,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const util = @import("../util.zig");
+const cache_publish = @import("../cache_publish.zig");
 const pin_mod = @import("pin.zig");
 const Pin = pin_mod.Pin;
 const Document = pin_mod.Document;
@@ -157,7 +158,9 @@ pub fn fetch(a: std.mem.Allocator, root: []const u8, offline: bool, download: Do
     // back, and the temporaries not yet renamed are removed.
     committed = true;
     for (temps.items) |t| {
-        std.Io.Dir.renameAbsolute(t.tmp, t.path, io) catch |err| {
+        // `publishFile` keeps an archive a concurrent `providers fetch`
+        // already cached and verified, and replaces a damaged one.
+        _ = cache_publish.publishFile(t.tmp, t.path, cache_publish.Sha256File{ .sha256 = t.pin.sha256, .max_bytes = max_archive_size }) catch |err| {
             std.debug.print("labelle: provider '{s}' {s}: the verified archive could not be moved into the cache at {s} ({s}); the {d} archive(s) cached before it are verified and kept. Run `labelle providers fetch` again.\n", .{ t.pin.package, t.pin.version, t.path, @errorName(err), summary.fetched });
             for (temps.items) |left| cwd.deleteFile(io, left.tmp) catch {};
             return err;

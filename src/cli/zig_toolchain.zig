@@ -41,6 +41,7 @@ const zig_cache = @import("zig_cache.zig");
 const config = @import("config.zig");
 const launcher_manifest = @import("launcher_manifest.zig");
 const util = @import("util.zig");
+const cache_publish = @import("cache_publish.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -512,12 +513,11 @@ fn ensureInstalledWithSeed(allocator: std.mem.Allocator, version: []const u8, se
     // touch the published dir.
     if (cwd.access(io, bin_path, .{})) |_| return else |_| {}
 
-    // Stage everything under a temp sibling of the version dir. The suffix
-    // only needs to avoid collisions with a concurrent/stale staging dir, not
-    // be cryptographic — 0.16 has no std.crypto.random, so seed a PRNG from a
-    // stack address mixed with the dest path.
-    var prng = std.Random.DefaultPrng.init(@intFromPtr(&dest_dir) ^ std.hash.Wyhash.hash(0, dest_dir));
-    const staging = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ dest_dir, prng.random().int(u32) });
+    // Stage everything under a UNIQUE temp sibling of the version dir
+    // (`<dest>.tmp-<pid>-<random>`, cache_publish.zig): same filesystem, so
+    // the publishing rename below is atomic, and distinct across processes
+    // and threads even if a crashed holder left its staging dir behind.
+    const staging = try cache_publish.tempSibling(allocator, dest_dir, "tmp");
     defer allocator.free(staging);
     cwd.deleteTree(io, staging) catch {};
     try cwd.createDirPath(io, staging);
