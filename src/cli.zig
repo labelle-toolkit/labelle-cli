@@ -471,6 +471,14 @@ test {
     _ = @import("cli/project_lock.zig");
 }
 
+// Concurrency-safe cache publication (shared LABELLE_HOME on CI runners) and
+// the downloaders built on it.
+test {
+    _ = @import("cli/cache_publish.zig");
+    _ = @import("cli/assembler.zig");
+    _ = @import("astc/astcenc_bin.zig");
+}
+
 // `labelle init` stamps the running CLI as `--labelle-version`.
 pub const InitCliVersionSpec = init.InitCliVersionSpec;
 

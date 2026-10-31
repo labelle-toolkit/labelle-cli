@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const util = @import("util.zig");
 const asm_cache = @import("asm_cache.zig");
+const cache_publish = @import("cache_publish.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const path_sep: u8 = if (is_windows) ';' else ':';
@@ -163,11 +164,27 @@ fn provisionInto(gpa: std.mem.Allocator) Result {
         std.debug.print("  provisioned Python at {s} is broken — reprovisioning...\n", .{py_dir});
     }
 
-    // Clean start so a partial prior extract can't leave a broken tree.
-    std.Io.Dir.cwd().deleteTree(io, py_dir) catch {};
-    std.Io.Dir.cwd().createDirPath(io, py_dir) catch return .failed;
+    // Serialize provisioning across processes sharing this labelle home (CI
+    // shell runners run several jobs at once). A waiter re-checks after the
+    // lock: the holder may have just provisioned it.
+    var lock = cache_publish.InstallLock.acquire(a, py_dir) catch return .failed;
+    defer lock.release();
+    if (util.fileExists(py_exe) and runOk(a, &.{ py_exe, "--version" })) {
+        std.debug.print("  Python {s} provisioned by a concurrent labelle: {s}\n", .{ PY_VERSION, py_dir });
+        return .ready;
+    }
 
-    const archive = join(a, &.{ cache_root, "python-download.tar.gz" }) orelse return .failed;
+    // Everything is staged on UNIQUE siblings and published with one
+    // directory rename, so `py_dir` never holds a half-extracted tree and two
+    // processes never write through the same archive path. A broken prior
+    // install at `py_dir` is replaced wholesale by the publish.
+    const cwd = std.Io.Dir.cwd();
+    const archive = cache_publish.tempSibling(a, join(a, &.{ cache_root, "python-download.tar.gz" }) orelse return .failed, "tmp") catch return .failed;
+    defer cwd.deleteFile(io, archive) catch {};
+    const staging = cache_publish.tempSibling(a, py_dir, "tmp") catch return .failed;
+    defer cwd.deleteTree(io, staging) catch {};
+    cwd.createDirPath(io, staging) catch return .failed;
+
     const url = std.fmt.allocPrint(
         a,
         "https://github.com/astral-sh/python-build-standalone/releases/download/" ++
@@ -184,23 +201,33 @@ fn provisionInto(gpa: std.mem.Allocator) Result {
     }
 
     // Integrity: verify the download against the pinned hash before extracting.
-    const arc_data = std.Io.Dir.cwd().readFileAlloc(io, archive, a, .limited(256 << 20)) catch {
+    const arc_data = cwd.readFileAlloc(io, archive, a, .limited(256 << 20)) catch {
         std.debug.print("  could not read the download to verify it.\n", .{});
         return .failed;
     };
     if (!util.sha256Matches(arc_data, dist.sha256)) {
         std.debug.print("  checksum mismatch — refusing the Python download (expected {s}).\n", .{dist.sha256});
-        std.Io.Dir.cwd().deleteFile(io, archive) catch {};
         return .failed;
     }
 
     std.debug.print("  extracting...\n", .{});
-    if (!extractArchive(a, archive, py_dir)) {
+    if (!extractArchive(a, archive, staging)) {
         std.debug.print("  extract failed.\n", .{});
         return .failed;
     }
-    std.Io.Dir.cwd().deleteFile(io, archive) catch {};
+    cwd.deleteFile(io, archive) catch {};
 
+    // python-build-standalone is relocatable: validate the staged tree, then
+    // publish it.
+    const staged_exe = interpreterPath(a, staging) orelse return .failed;
+    if (!util.fileExists(staged_exe) or !runOk(a, &.{ staged_exe, "--version" })) {
+        std.debug.print("  provisioning incomplete (python missing or won't run).\n", .{});
+        return .failed;
+    }
+    _ = cache_publish.publishDir(a, staging, py_dir, RunnablePython{}) catch |err| {
+        std.debug.print("  could not move the provisioned Python into {s}: {s}\n", .{ py_dir, @errorName(err) });
+        return .failed;
+    };
     if (!util.fileExists(py_exe) or !runOk(a, &.{ py_exe, "--version" })) {
         std.debug.print("  provisioning incomplete (python missing or won't run).\n", .{});
         return .failed;
@@ -209,6 +236,17 @@ fn provisionInto(gpa: std.mem.Allocator) Result {
     std.debug.print("  Python {s} ready: {s}\n", .{ PY_VERSION, py_dir });
     return .ready;
 }
+
+/// `publishDir` validator: `<dir>`'s interpreter exists and runs.
+const RunnablePython = struct {
+    pub fn valid(_: RunnablePython, dir: []const u8) bool {
+        var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_inst.deinit();
+        const a = arena_inst.allocator();
+        const exe = interpreterPath(a, dir) orelse return false;
+        return util.fileExists(exe) and runOk(a, &.{ exe, "--version" });
+    }
+};
 
 /// Extract the `.tar.gz` so its contents land directly in `py_dir`
 /// (`--strip-components=1` drops the leading `python/` wrapper).
